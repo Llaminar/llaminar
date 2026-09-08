@@ -1,6 +1,10 @@
 /**
  * @file BenchmarkRunner.cpp
  * @brief Implementation of benchmark runner for prefill/decode performance
+ *
+ * Measures warmed production requests and exports tokens, runtime-path evidence,
+ * and the runner-resolved configuration. Profiling remains separate from clean
+ * timing; hardware default selection belongs to execution planning, not here.
  * @author David Sanftenberg
  * @date 2025
  */
@@ -13,6 +17,7 @@
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
 #include "PerfStatsCollector.h"
+#include "Sha256.h"
 #include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
 
@@ -20,20 +25,30 @@
 #include "../backends/IBackend.h"
 #include "fort.hpp"
 #include <algorithm>
+#include <cmath>
+#include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <print>
 #include <sstream>
-#include <mpi.h>
+#include <stdexcept>
 #include <numeric>
+#include <limits>
 #include <nlohmann/json.hpp>
 
 namespace llaminar2
 {
 
-    // Number of benchmark iterations (after warmup)
-    static constexpr int BENCHMARK_ITERATIONS = 3;
-    static constexpr int WARMUP_ITERATIONS = 1;
-    static constexpr int PREFILL_GRAPH_WARMUP_ITERATIONS = 2;
+    /**
+     * @brief Maximum request submissions needed by the prefill graph lifecycle.
+     *
+     * A graph key can require one submission for Cold -> Warmup, one for
+     * Warmup -> Ready/capture, and one Ready replay. Long segmented prompts
+     * commonly cross all three edges inside one request. Preparation therefore
+     * observes readiness after every submission and stops immediately instead
+     * of always replaying the whole prompt three times.
+     */
+    static constexpr int kMaxPrefillGraphPreparationSubmissions = 3;
 
     // Log GPU memory on all GPUs (enabled via LLAMINAR_BENCH_MEM_LOG=1).
     static void logGPUMemorySnapshot(const char *label)
@@ -124,7 +139,8 @@ namespace llaminar2
                snapshot.prefill_chunks != 0 ||
                snapshot.prefill_chunk_real_tokens != 0 ||
                snapshot.prefill_chunk_padded_tokens != 0 ||
-               snapshot.prefill_chunk_failures != 0;
+               snapshot.prefill_chunk_failures != 0 ||
+               !snapshot.prefill_graphs.empty();
     }
 
     static nlohmann::json prefixRequestToJson(const PrefixCacheRequestSummary &request)
@@ -143,6 +159,9 @@ namespace llaminar2
             {"mtp_state_restored", request.mtp_state_restored},
             {"hybrid_state_restored", request.hybrid_state_restored},
             {"storage_tier", request.storage_tier},
+            {"admission_movement_epoch", request.admission_movement_epoch},
+            {"completion_movement_epoch", request.completion_movement_epoch},
+            {"crossed_movement_epoch", request.crossedMovementEpoch()},
         };
     }
 
@@ -180,6 +199,489 @@ namespace llaminar2
         return attempted_tokens > 0
                    ? static_cast<double>(accepted_tokens) / static_cast<double>(attempted_tokens)
                    : 0.0;
+    }
+
+    static bool prefillGraphProbeShowsCaptureOrReplay(
+        const PrefixRuntimeStateSnapshot &snapshot)
+    {
+        return std::any_of(
+            snapshot.prefill_graphs.begin(),
+            snapshot.prefill_graphs.end(),
+            [](const PrefillGraphRuntimeProbe &probe)
+            {
+                /*
+                 * Lifecycle observations are historical evidence; readiness is
+                 * current executable state. In particular, a segmented prefill
+                 * may retain its last "replay" observation after the underlying
+                 * graph has been invalidated. Require the backend-neutral probe
+                 * to prove a live, non-empty Ready executable before benchmark
+                 * setup or the HTTP/server readiness surface can call it usable.
+                 */
+                return probe.phase == "ready" &&
+                       probe.node_count > 0 &&
+                       probe.capture_count > 0 &&
+                       probe.replay_count > 0 &&
+                       (probe.capture_phase == "capture" ||
+                        probe.capture_phase == "replay");
+            });
+    }
+
+    /**
+     * @brief Prove that one measured prefill used only already-captured graphs.
+     *
+     * The setup gate above proves that a graph exists. A throughput sample has
+     * a stronger contract: every participant/chunk observed before the sample
+     * must advance its replay counter, no capture counter may change, and the
+     * final phase must remain ready/replay. Comparing stable probe identity in
+     * order also rejects cache replacement disguised as a successful replay.
+     */
+    static bool prefillGraphProbeShowsReplayAdvance(
+        const PrefixRuntimeStateSnapshot &before,
+        const PrefixRuntimeStateSnapshot &after,
+        std::string *reason)
+    {
+        const auto fail = [&](std::string message) -> bool
+        {
+            if (reason)
+                *reason = std::move(message);
+            return false;
+        };
+
+        if (before.prefill_graphs.empty() || after.prefill_graphs.empty())
+            return fail("prefill graph probe is empty");
+        if (before.prefill_graphs.size() != after.prefill_graphs.size())
+        {
+            return fail(
+                "prefill graph entry count changed from " +
+                std::to_string(before.prefill_graphs.size()) + " to " +
+                std::to_string(after.prefill_graphs.size()));
+        }
+
+        const auto same_identity = [](
+            const PrefillGraphRuntimeProbe &lhs,
+            const PrefillGraphRuntimeProbe &rhs)
+        {
+            return lhs.domain_id == rhs.domain_id &&
+                   lhs.participant_id == rhs.participant_id &&
+                   lhs.chunk_index == rhs.chunk_index &&
+                   lhs.bucket_seq_len == rhs.bucket_seq_len &&
+                   lhs.real_token_count == rhs.real_token_count &&
+                   lhs.placement_epoch == rhs.placement_epoch &&
+                   lhs.topology_signature == rhs.topology_signature;
+        };
+        const auto ready_executable = [](
+            const PrefillGraphRuntimeProbe &probe)
+        {
+            return probe.phase == "ready" &&
+                   probe.node_count > 0 &&
+                   probe.capture_count > 0 &&
+                   probe.replay_count > 0;
+        };
+
+        size_t prior_ready_count = 0;
+        for (size_t index = 0; index < before.prefill_graphs.size(); ++index)
+        {
+            const auto &prior = before.prefill_graphs[index];
+            if (!ready_executable(prior))
+                continue;
+            ++prior_ready_count;
+
+            const auto current_it = std::find_if(
+                after.prefill_graphs.begin(),
+                after.prefill_graphs.end(),
+                [&](const PrefillGraphRuntimeProbe &candidate)
+                {
+                    return same_identity(prior, candidate);
+                });
+            if (current_it == after.prefill_graphs.end())
+            {
+                return fail(
+                    "ready prefill graph identity disappeared at probe " +
+                    std::to_string(index));
+            }
+            const auto &current = *current_it;
+            if (current.capture_count != prior.capture_count)
+            {
+                return fail(
+                    "prefill graph captured during measurement at probe " +
+                    std::to_string(index));
+            }
+            if (current.replay_count <= prior.replay_count)
+            {
+                return fail(
+                    "prefill graph replay counter did not advance at probe " +
+                    std::to_string(index));
+            }
+            if (current.phase != "ready" ||
+                current.capture_phase != "replay")
+            {
+                return fail(
+                    "prefill graph did not finish in ready/replay phase at probe " +
+                    std::to_string(index));
+            }
+        }
+
+        if (prior_ready_count == 0)
+            return fail("prefill graph probe contains no ready executable");
+
+        for (const auto &current : after.prefill_graphs)
+        {
+            if (!ready_executable(current))
+                continue;
+            const bool existed_before = std::any_of(
+                before.prefill_graphs.begin(),
+                before.prefill_graphs.end(),
+                [&](const PrefillGraphRuntimeProbe &prior)
+                {
+                    return ready_executable(prior) &&
+                           same_identity(prior, current);
+                });
+            if (!existed_before)
+                return fail("a new prefill graph became ready during measurement");
+        }
+        return true;
+    }
+
+    static std::string summarizePrefillGraphProbe(
+        const PrefixRuntimeStateSnapshot &snapshot)
+    {
+        uint64_t warmups = 0;
+        uint64_t captures = 0;
+        uint64_t replays = 0;
+        uint64_t ready_entries = 0;
+        std::string last_phase = "none";
+        std::string last_domain;
+        std::string last_reject_stage;
+        std::string last_reject_type;
+        for (const auto &probe : snapshot.prefill_graphs)
+        {
+            warmups += probe.warmup_count;
+            captures += probe.capture_count;
+            replays += static_cast<uint64_t>(std::max(0, probe.replay_count));
+            if (probe.phase == "ready")
+                ++ready_entries;
+            if (!probe.capture_phase.empty())
+                last_phase = probe.capture_phase;
+            if (!probe.domain_id.empty())
+                last_domain = probe.domain_id;
+            if (!probe.reject_stage_name.empty())
+                last_reject_stage = probe.reject_stage_name;
+            if (!probe.reject_stage_type.empty())
+                last_reject_type = probe.reject_stage_type;
+        }
+
+        std::ostringstream out;
+        out << "entries=" << snapshot.prefill_graphs.size()
+            << " ready=" << ready_entries
+            << " warmups=" << warmups
+            << " captures=" << captures
+            << " replays=" << replays
+            << " last_phase=" << last_phase;
+        if (!last_domain.empty())
+            out << " domain=" << last_domain;
+        if (!last_reject_stage.empty())
+            out << " reject_stage=" << last_reject_stage;
+        if (!last_reject_type.empty())
+            out << " reject_type=" << last_reject_type;
+        return out.str();
+    }
+
+    static nlohmann::json prefillGraphProbeToJson(
+        const PrefillGraphRuntimeProbe &probe)
+    {
+        return nlohmann::json{
+            {"forward_cache_valid", probe.forward_cache_valid},
+            {"prefill_cache_initialized", probe.prefill_cache_initialized},
+            {"phase", probe.phase},
+            {"cache_size", probe.cache_size},
+            {"node_count", probe.node_count},
+            {"replay_count", probe.replay_count},
+            {"warmup_count", probe.warmup_count},
+            {"initialized_count", probe.initialized_count},
+            {"capture_count", probe.capture_count},
+            {"eviction_count", probe.eviction_count},
+            {"observation_valid", probe.observation_valid},
+            {"chunk_index", probe.chunk_index},
+            {"bucket_seq_len", probe.bucket_seq_len},
+            {"real_token_start", probe.real_token_start},
+            {"real_token_count", probe.real_token_count},
+            {"real_token_end", probe.real_token_end},
+            {"domain_id", probe.domain_id},
+            {"participant_id", probe.participant_id},
+            {"placement_epoch", probe.placement_epoch},
+            {"topology_signature", probe.topology_signature},
+            {"capture_phase", probe.capture_phase},
+            {"recapture_reason", probe.recapture_reason},
+            {"reject_stage_name", probe.reject_stage_name},
+            {"reject_stage_type", probe.reject_stage_type},
+        };
+    }
+
+    static nlohmann::json prefillGraphSummaryToJson(
+        const PrefixRuntimeStateSnapshot &snapshot)
+    {
+        uint64_t warmups = 0;
+        uint64_t captures = 0;
+        uint64_t replays = 0;
+        uint64_t ready_entries = 0;
+        nlohmann::json entries = nlohmann::json::array();
+        for (const auto &probe : snapshot.prefill_graphs)
+        {
+            warmups += probe.warmup_count;
+            captures += probe.capture_count;
+            replays += static_cast<uint64_t>(std::max(0, probe.replay_count));
+            if (probe.phase == "ready")
+                ++ready_entries;
+            entries.push_back(prefillGraphProbeToJson(probe));
+        }
+
+        return nlohmann::json{
+            {"required", debugEnv().execution.prefill_graph_required},
+            {"captured_or_replayed", prefillGraphProbeShowsCaptureOrReplay(snapshot)},
+            {"entries", snapshot.prefill_graphs.size()},
+            {"ready_entries", ready_entries},
+            {"warmups", warmups},
+            {"captures", captures},
+            {"replays", replays},
+            {"probes", std::move(entries)},
+        };
+    }
+
+    static const std::vector<std::string> &benchmarkPerfStatFilters()
+    {
+        static const std::vector<std::string> filters{
+            "kernel",
+            "memory",
+            "moe_overlay",
+            "moe_overlay_controller",
+            "moe_rebalance",
+            "tp_allreduce_bom",
+            "tp_allreduce_runtime",
+            "tp_allreduce_small_gpu",
+            "forward_graph",
+            "stage_gpu",
+            "transfer"};
+        return filters;
+    }
+
+    static const char *perfStatKindToString(PerfStatRecord::Kind kind)
+    {
+        switch (kind)
+        {
+        case PerfStatRecord::Kind::Counter:
+            return "counter";
+        case PerfStatRecord::Kind::Timer:
+            return "timer";
+        }
+        return "unknown";
+    }
+
+    static nlohmann::json perfStatRecordToJson(const PerfStatRecord &record)
+    {
+        const double total_ms = static_cast<double>(record.total_ns) / 1.0e6;
+        const double avg_us = record.count > 0
+                                  ? (static_cast<double>(record.total_ns) /
+                                     static_cast<double>(record.count)) /
+                                        1.0e3
+                                  : 0.0;
+        const double min_us = static_cast<double>(record.min_ns) / 1.0e3;
+        const double max_us = static_cast<double>(record.max_ns) / 1.0e3;
+
+        return nlohmann::json{
+            {"kind", perfStatKindToString(record.kind)},
+            {"domain", record.domain},
+            {"name", record.name},
+            {"phase", record.phase},
+            {"device", record.device},
+            {"tags", record.tags},
+            {"count", record.count},
+            {"value", record.value},
+            {"total_ns", record.total_ns},
+            {"total_ms", total_ms},
+            {"avg_us", avg_us},
+            {"min_us", min_us},
+            {"max_us", max_us}};
+    }
+
+    static nlohmann::json benchmarkPerfStatsToJson()
+    {
+        const auto &filters = benchmarkPerfStatFilters();
+        const auto records = PerfStatsCollector::snapshot(filters);
+
+        nlohmann::json records_json = nlohmann::json::array();
+        for (const auto &record : records)
+            records_json.push_back(perfStatRecordToJson(record));
+
+        return nlohmann::json{
+            {"schema", "llaminar.perf_stats.v1"},
+            {"enabled", PerfStatsCollector::isEnabled()},
+            {"filters", filters},
+            {"records", std::move(records_json)}};
+    }
+
+    /**
+     * @brief Snapshot completed Dynamic work from the sole runtime authority.
+     *
+     * The runner projects host- or device-owned operational totals without a
+     * GPU event wait, stream synchronization, or host placement mirror. The
+     * optional PerfStats ledger is deliberately not consulted: disabling or
+     * filtering telemetry cannot change benchmark movement attribution.
+     */
+    static MoEOptimizationMovementTotals
+    completedDynamicMovementSnapshot(const IInferenceRunner *runner)
+    {
+        return runner
+                   ? runner->moeOptimizationStatus().completed_movement
+                   : MoEOptimizationMovementTotals{};
+    }
+
+    /** Return a saturating delta across a measurement interval. */
+    static std::uint64_t monotonicDelta(
+        std::uint64_t before,
+        std::uint64_t after) noexcept
+    {
+        return after >= before ? after - before : 0u;
+    }
+
+    /**
+     * @brief Publish only movement completed during one measured request.
+     *
+     * PerfStats is cumulative after the post-warmup reset. Taking an explicit
+     * boundary delta prevents later benchmark iterations from double-counting
+     * every transaction completed by earlier requests.
+     */
+    static void captureCompletedDynamicMovement(
+        BenchmarkIterationResult *iteration,
+        const MoEOptimizationMovementTotals &before,
+        const IInferenceRunner *runner)
+    {
+        if (!iteration)
+            return;
+        const auto after = completedDynamicMovementSnapshot(runner);
+        iteration->dynamic_movement_transactions =
+            monotonicDelta(before.transactions, after.transactions);
+        iteration->dynamic_movement_commands =
+            monotonicDelta(before.commands, after.commands);
+        iteration->dynamic_physical_bytes =
+            monotonicDelta(before.physical_bytes, after.physical_bytes);
+        iteration->dynamic_promotions =
+            monotonicDelta(before.promotions, after.promotions);
+        iteration->dynamic_demotions =
+            monotonicDelta(before.demotions, after.demotions);
+        iteration->dynamic_same_priority_moves = monotonicDelta(
+            before.same_priority_moves, after.same_priority_moves);
+    }
+
+    /** @return JSON representation of one measured adaptive-policy request. */
+    static nlohmann::json benchmarkIterationToJson(
+        const BenchmarkIterationResult &iteration)
+    {
+        nlohmann::json result{
+            {"iteration", iteration.iteration},
+            {"tokens", {{"prefill", iteration.prefill_tokens},
+                        {"decode", iteration.decode_tokens},
+                        {"decode_after_prefill",
+                         iteration.decode_after_prefill_tokens}}},
+            {"timing_ms", {{"prefill", iteration.prefill_time_ms},
+                           {"decode", iteration.decode_time_ms}}},
+            {"throughput_tokens_per_sec",
+             {{"prefill", iteration.prefill_tokens_per_sec},
+              {"decode", iteration.decode_tokens_per_sec},
+              {"decode_after_prefill",
+               iteration.decode_after_prefill_tokens_per_sec}}},
+            {"generated_token_ids", iteration.generated_token_ids},
+            {"moe_runtime_movement_epoch_start",
+             iteration.moe_runtime_movement_epoch_start},
+            {"moe_runtime_movement_epoch",
+             iteration.moe_runtime_movement_epoch},
+            {"completed_dynamic_movement",
+             {{"transactions", iteration.dynamic_movement_transactions},
+              {"commands", iteration.dynamic_movement_commands},
+              {"physical_bytes", iteration.dynamic_physical_bytes},
+              {"promotions", iteration.dynamic_promotions},
+              {"demotions", iteration.dynamic_demotions},
+              {"same_priority_moves",
+               iteration.dynamic_same_priority_moves}}},
+            {"mtp",
+             {{"draft_steps", iteration.mtp_draft_steps},
+              {"accepted_tokens", iteration.mtp_accepted_tokens},
+              {"rejected_tokens", iteration.mtp_rejected_tokens},
+              {"verifier_runs", iteration.mtp_verifier_runs},
+              {"verifier_token_count", iteration.mtp_verifier_token_count},
+              {"acceptance_rate",
+               mtpTokenAcceptanceRate(
+                   iteration.mtp_accepted_tokens,
+                   iteration.mtp_rejected_tokens)}}}};
+        result["decode_windows"] = nlohmann::json::array();
+        for (const auto &window : iteration.decode_windows)
+        {
+            result["decode_windows"].push_back(
+                {{"start_token", window.start_token},
+                 {"token_count", window.token_count},
+                 {"time_ms", window.time_ms},
+                 {"tokens_per_sec", window.tokens_per_sec}});
+        }
+        return result;
+    }
+
+    /** Partition existing per-token samples without instrumenting inference. */
+    static void appendDecodeWindows(
+        BenchmarkIterationResult *iteration,
+        const std::vector<double> &latencies_ms,
+        int requested_window_size)
+    {
+        if (!iteration || latencies_ms.empty())
+            return;
+        const std::size_t window_size = static_cast<std::size_t>(
+            std::max(1, requested_window_size));
+        for (std::size_t begin = 0u; begin < latencies_ms.size();
+             begin += window_size)
+        {
+            const std::size_t end = std::min(
+                latencies_ms.size(), begin + window_size);
+            const double elapsed_ms = std::accumulate(
+                latencies_ms.begin() + static_cast<std::ptrdiff_t>(begin),
+                latencies_ms.begin() + static_cast<std::ptrdiff_t>(end),
+                0.0);
+            const int count = static_cast<int>(end - begin);
+            iteration->decode_windows.push_back(
+                BenchmarkDecodeWindowResult{
+                    .start_token = static_cast<int>(begin),
+                    .token_count = count,
+                    .time_ms = elapsed_ms,
+                    .tokens_per_sec =
+                        elapsed_ms > 0.0
+                            ? (static_cast<double>(count) * 1000.0) /
+                                  elapsed_ms
+                            : 0.0,
+                });
+        }
+    }
+
+    static double meanLatencyMs(const std::vector<double> &samples)
+    {
+        if (samples.empty())
+            return 0.0;
+        return std::accumulate(samples.begin(), samples.end(), 0.0) /
+               static_cast<double>(samples.size());
+    }
+
+    static double percentileLatencyMs(std::vector<double> samples, double quantile)
+    {
+        if (samples.empty())
+            return 0.0;
+        if (samples.size() == 1)
+            return samples.front();
+
+        quantile = std::clamp(quantile, 0.0, 1.0);
+        std::sort(samples.begin(), samples.end());
+
+        const double position = quantile * static_cast<double>(samples.size() - 1);
+        const auto lower_index = static_cast<size_t>(position);
+        const size_t upper_index = std::min(lower_index + 1, samples.size() - 1);
+        const double fraction = position - static_cast<double>(lower_index);
+        return samples[lower_index] +
+               (samples[upper_index] - samples[lower_index]) * fraction;
     }
 
     /**
@@ -286,19 +788,32 @@ namespace llaminar2
             {"failure_reason", result.failure_reason},
             {"prefill_success", result.prefill_success},
             {"decode_success", result.decode_success},
-            {"measurement_iterations", BENCHMARK_ITERATIONS},
+            {"measurement_iterations", result.measurement_iterations},
+            {"warmup_iterations", result.warmup_iterations},
+            {"prompt", {{"source", benchmarkPromptSourceToString(result.prompt_source)},
+                        {"bytes", result.prompt_bytes},
+                        {"sha256", result.prompt_sha256}}},
             {"tokens", {{"prefill", result.prefill_tokens},
                          {"decode", result.decode_tokens},
+                         {"decode_after_prefill",
+                          result.decode_after_prefill_tokens},
                          {"total", result.prefill_tokens + result.decode_tokens}}},
             {"timing_ms", {{"prefill", result.prefill_time_ms},
                             {"decode", result.decode_time_ms},
                             {"total", result.total_time_ms}}},
             {"throughput_tokens_per_sec", {{"prefill", result.prefill_tokens_per_sec},
                                             {"decode", result.decode_tokens_per_sec},
+                                            {"decode_after_prefill",
+                                             result.decode_after_prefill_tokens_per_sec},
                                             {"overall", result.total_time_ms > 0.0
                                                             ? ((result.prefill_tokens + result.decode_tokens) * 1000.0) /
                                                                   result.total_time_ms
                                                             : 0.0}}},
+            {"decode_latency_ms", {{"mean", result.decode_latency_mean_ms},
+                                    {"p50", result.decode_latency_p50_ms},
+                                    {"p90", result.decode_latency_p90_ms},
+                                    {"samples", result.decode_token_latencies_ms.size()}}},
+            {"iterations", nlohmann::json::array()},
             {"generated_text_bytes", result.generated_text.size()},
             {"generated_token_ids", result.generated_token_ids},
             {"runtime_state", {{"initialized", state.initialized},
@@ -307,6 +822,8 @@ namespace llaminar2
                                 {"primary_device", state.primary_device.toString()},
                                 {"current_position", state.current_position},
                                 {"session_epoch", state.session_epoch},
+                                {"moe_runtime_movement_epoch",
+                                 state.moe_runtime_movement_epoch},
                                 {"prefill_logits_ready", state.prefill_logits_ready},
                                 {"has_hidden", state.has_hidden},
                                 {"has_logits", state.has_logits},
@@ -377,7 +894,16 @@ namespace llaminar2
                                  {"real_tokens", state.prefill_chunk_real_tokens},
                                  {"padded_tokens", state.prefill_chunk_padded_tokens},
                                  {"failures", state.prefill_chunk_failures}}},
+            {"prefill_graphs", prefillGraphSummaryToJson(state)},
+            {"perf_stats", benchmarkPerfStatsToJson()},
         };
+
+        for (const auto &iteration : result.iterations)
+            doc["iterations"].push_back(
+                benchmarkIterationToJson(iteration));
+
+        if (!result.prompt_file_path.empty())
+            doc["prompt"]["file_path"] = result.prompt_file_path;
 
         if (config)
         {
@@ -387,6 +913,8 @@ namespace llaminar2
                 {"prefix_cache_enabled", config->prefix_cache.enabled},
                 {"mtp_enabled", config->mtp.enabled},
                 {"mtp_draft_tokens", config->mtp.draft_tokens},
+                {"mtp_graph_capacity_draft_tokens",
+                 config->mtp.graph_capacity_draft_tokens},
                 {"mtp_max_request_batch", config->mtp.max_request_batch},
                 {"mtp_verify_mode", mtpVerifyModeToString(config->mtp.verify_mode)},
                 {"mtp_depth_policy", mtpDepthPolicyModeToString(config->mtp.depth_policy.mode)},
@@ -394,6 +922,10 @@ namespace llaminar2
                 {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
                 {"mtp_depth_window", config->mtp.depth_policy.window_size},
                 {"mtp_depth_generated_policy", config->mtp.depth_policy.use_generated_policy},
+                {"mtp_depth_defaults_profile", mtpDepthDefaultsProfileToString(config->mtp.depth_defaults_profile)},
+                {"mtp_depth_demote_zero_accept", resolveMTPZeroAcceptDemotionRate(config->mtp)},
+                {"mtp_depth_demote_zero_accept_source",
+                 config->mtp.depth_policy.demote_zero_accept_rate ? "explicit" : "hardware_default"},
                 {"mtp_depth_promote_windows",
                  config->mtp.depth_policy.promote_consecutive_windows},
                 {"sampling",
@@ -440,80 +972,188 @@ namespace llaminar2
         return oss.str();
     }
 
-    BenchmarkRunner::BenchmarkRunner(
-        std::shared_ptr<IInferenceRunner> runner,
-        std::shared_ptr<ITokenizer> tokenizer,
-        std::shared_ptr<IMPIContext> mpi_ctx)
-        : runner_(std::move(runner)), tokenizer_(std::move(tokenizer)), mpi_ctx_(std::move(mpi_ctx))
+    namespace
     {
+        /**
+         * @brief Return the stable built-in benchmark corpus.
+         *
+         * This text is intentionally centralized beside prompt resolution so an
+         * omitted prompt has exactly one byte representation and one SHA-256.
+         */
+        std::string builtInBenchmarkPrompt()
+        {
+            return "The following is a comprehensive analysis of machine learning systems "
+                   "and their applications in modern computing environments. "
+                   "We will explore the fundamental concepts, examine practical implementations, "
+                   "and discuss the future directions of this rapidly evolving field. "
+                   "Machine learning has transformed how we approach problem-solving across "
+                   "numerous domains, from natural language processing to computer vision, "
+                   "from autonomous vehicles to medical diagnosis. "
+                   "The key to understanding these systems lies in grasping the underlying "
+                   "mathematical foundations while also appreciating the engineering challenges "
+                   "involved in deploying them at scale. "
+                   "Let us begin our exploration with an overview of the main paradigms: "
+                   "supervised learning, unsupervised learning, and reinforcement learning. "
+                   "Each of these approaches has its own strengths and is suited to different "
+                   "types of problems. In supervised learning, we train models using labeled data, "
+                   "where the correct output is known for each input example. "
+                   "This approach is particularly effective for classification and regression tasks. "
+                   "Unsupervised learning, on the other hand, deals with finding patterns in data "
+                   "without explicit labels. Clustering, dimensionality reduction, and anomaly detection "
+                   "are common applications. Reinforcement learning takes a different approach, "
+                   "where agents learn optimal behaviors through interaction with an environment, "
+                   "receiving rewards or penalties based on their actions. "
+                   "Deep learning, a subset of machine learning, has revolutionized the field "
+                   "by enabling the training of neural networks with many layers. "
+                   "These deep neural networks can learn hierarchical representations of data, "
+                   "automatically extracting features at multiple levels of abstraction. "
+                   "Convolutional neural networks have become the standard for image processing, "
+                   "while recurrent neural networks and transformers excel at sequential data. "
+                   "The transformer architecture, introduced in 2017, has become particularly influential, "
+                   "forming the basis for large language models like GPT, BERT, and LLaMA. "
+                   "These models are trained on vast amounts of text data and can perform "
+                   "a wide range of natural language tasks with impressive accuracy. "
+                   "The training process involves optimizing millions or billions of parameters "
+                   "using gradient descent and backpropagation algorithms. "
+                   "Modern training infrastructure relies on specialized hardware like GPUs and TPUs, "
+                   "distributed computing frameworks, and sophisticated optimization techniques. "
+                   "Transfer learning has emerged as a powerful paradigm, allowing models "
+                   "pre-trained on large datasets to be fine-tuned for specific tasks "
+                   "with relatively little additional data. This approach has democratized "
+                   "access to state-of-the-art AI capabilities for researchers and practitioners "
+                   "who may not have the resources to train large models from scratch. "
+                   "As we look to the future, several exciting developments are on the horizon. "
+                   "Multimodal models that can process text, images, audio, and video together "
+                   "are becoming increasingly sophisticated. Federated learning enables "
+                   "training on distributed data while preserving privacy. "
+                   "Neural architecture search automates the design of optimal network structures. "
+                   "And new hardware accelerators promise to make AI more efficient and accessible. "
+                   "The ethical implications of these technologies cannot be overlooked. "
+                   "Issues of bias, fairness, transparency, and accountability must be addressed "
+                   "as AI systems become more prevalent in society. Responsible AI development "
+                   "requires collaboration between technologists, policymakers, and the public "
+                   "to ensure these powerful tools benefit humanity as a whole.";
+        }
+    } // namespace
+
+    const char *benchmarkPromptSourceToString(BenchmarkPromptSource source) noexcept
+    {
+        switch (source)
+        {
+        case BenchmarkPromptSource::BuiltIn:
+            return "built_in";
+        case BenchmarkPromptSource::Inline:
+            return "inline";
+        case BenchmarkPromptSource::File:
+            return "file";
+        }
+        return "unknown";
     }
 
-    std::string BenchmarkRunner::generateDefaultPrompt() const
+    ResolvedBenchmarkPrompt resolveBenchmarkPrompt(const OrchestrationConfig &config)
     {
-        // A standardized prompt that tokenizes to ~512 tokens
-        // This is a comprehensive text covering various topics to exercise the model
-        return "The following is a comprehensive analysis of machine learning systems "
-               "and their applications in modern computing environments. "
-               "We will explore the fundamental concepts, examine practical implementations, "
-               "and discuss the future directions of this rapidly evolving field. "
-               "Machine learning has transformed how we approach problem-solving across "
-               "numerous domains, from natural language processing to computer vision, "
-               "from autonomous vehicles to medical diagnosis. "
-               "The key to understanding these systems lies in grasping the underlying "
-               "mathematical foundations while also appreciating the engineering challenges "
-               "involved in deploying them at scale. "
-               "Let us begin our exploration with an overview of the main paradigms: "
-               "supervised learning, unsupervised learning, and reinforcement learning. "
-               "Each of these approaches has its own strengths and is suited to different "
-               "types of problems. In supervised learning, we train models using labeled data, "
-               "where the correct output is known for each input example. "
-               "This approach is particularly effective for classification and regression tasks. "
-               "Unsupervised learning, on the other hand, deals with finding patterns in data "
-               "without explicit labels. Clustering, dimensionality reduction, and anomaly detection "
-               "are common applications. Reinforcement learning takes a different approach, "
-               "where agents learn optimal behaviors through interaction with an environment, "
-               "receiving rewards or penalties based on their actions. "
-               "Deep learning, a subset of machine learning, has revolutionized the field "
-               "by enabling the training of neural networks with many layers. "
-               "These deep neural networks can learn hierarchical representations of data, "
-               "automatically extracting features at multiple levels of abstraction. "
-               "Convolutional neural networks have become the standard for image processing, "
-               "while recurrent neural networks and transformers excel at sequential data. "
-               "The transformer architecture, introduced in 2017, has become particularly influential, "
-               "forming the basis for large language models like GPT, BERT, and LLaMA. "
-               "These models are trained on vast amounts of text data and can perform "
-               "a wide range of natural language tasks with impressive accuracy. "
-               "The training process involves optimizing millions or billions of parameters "
-               "using gradient descent and backpropagation algorithms. "
-               "Modern training infrastructure relies on specialized hardware like GPUs and TPUs, "
-               "distributed computing frameworks, and sophisticated optimization techniques. "
-               "Transfer learning has emerged as a powerful paradigm, allowing models "
-               "pre-trained on large datasets to be fine-tuned for specific tasks "
-               "with relatively little additional data. This approach has democratized "
-               "access to state-of-the-art AI capabilities for researchers and practitioners "
-               "who may not have the resources to train large models from scratch. "
-               "As we look to the future, several exciting developments are on the horizon. "
-               "Multimodal models that can process text, images, audio, and video together "
-               "are becoming increasingly sophisticated. Federated learning enables "
-               "training on distributed data while preserving privacy. "
-               "Neural architecture search automates the design of optimal network structures. "
-               "And new hardware accelerators promise to make AI more efficient and accessible. "
-               "The ethical implications of these technologies cannot be overlooked. "
-               "Issues of bias, fairness, transparency, and accountability must be addressed "
-               "as AI systems become more prevalent in society. Responsible AI development "
-               "requires collaboration between technologists, policymakers, and the public "
-               "to ensure these powerful tools benefit humanity as a whole.";
+        const bool has_inline_prompt =
+            config.prompt_was_explicitly_provided || !config.prompt.empty();
+        const bool has_prompt_file =
+            config.benchmark_prompt_file_was_provided ||
+            !config.benchmark_prompt_file_path.empty();
+
+        if (has_inline_prompt && has_prompt_file)
+        {
+            throw std::invalid_argument(
+                "--prompt and --prompt-file are mutually exclusive benchmark prompt sources");
+        }
+
+        ResolvedBenchmarkPrompt resolved;
+        if (has_inline_prompt)
+        {
+            if (config.prompt.empty())
+                throw std::invalid_argument("--prompt must not be empty");
+            resolved.source = BenchmarkPromptSource::Inline;
+            resolved.text = config.prompt;
+        }
+        else if (has_prompt_file)
+        {
+            if (config.benchmark_prompt_file_path.empty())
+                throw std::invalid_argument("--prompt-file path must not be empty");
+
+            resolved.source = BenchmarkPromptSource::File;
+            resolved.file_path = config.benchmark_prompt_file_path;
+            std::ifstream input(resolved.file_path, std::ios::binary);
+            if (!input)
+            {
+                throw std::runtime_error(
+                    "unable to open benchmark prompt file: " + resolved.file_path);
+            }
+
+            resolved.text.assign(
+                std::istreambuf_iterator<char>(input),
+                std::istreambuf_iterator<char>());
+            if (input.bad())
+            {
+                throw std::runtime_error(
+                    "failed while reading benchmark prompt file: " + resolved.file_path);
+            }
+            if (resolved.text.empty())
+            {
+                throw std::invalid_argument(
+                    "benchmark prompt file is empty: " + resolved.file_path);
+            }
+        }
+        else
+        {
+            resolved.source = BenchmarkPromptSource::BuiltIn;
+            resolved.text = builtInBenchmarkPrompt();
+        }
+
+        std::string digest_error;
+        const auto digest = sha256BytesHex(resolved.text, &digest_error);
+        if (!digest)
+        {
+            throw std::runtime_error(
+                "failed to authenticate benchmark prompt bytes: " + digest_error);
+        }
+        resolved.sha256 = *digest;
+        return resolved;
+    }
+
+    BenchmarkRunner::BenchmarkRunner(
+        std::shared_ptr<IInferenceRunner> runner,
+        std::shared_ptr<ITokenizer> tokenizer)
+        : runner_(std::move(runner)), tokenizer_(std::move(tokenizer))
+    {
     }
 
     std::pair<bool, double> BenchmarkRunner::runPrefill(const std::vector<int> &tokens)
     {
-        // Synchronize all ranks before timing (skip for single-rank)
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->barrier();
+        /*
+         * Throughput benchmarks have a fixed `-n` response contract and every
+         * decode invocation below deliberately ignores model stop tokens.  That
+         * policy must be admitted identically on CPU and GPU: publishing the
+         * tokenizer's stop set to the device while only the host ignores it lets
+         * a device-owned generation loop terminate early.  The benchmark then
+         * attempts a second decode transaction against the already-consumed
+         * request admission.
+         *
+         * An empty request stop set makes `-n` the sole terminal condition for
+         * the complete request, including captured MTP verifier/controller
+         * execution.  It is published before prefill through the ordinary
+         * request-admission path; decode never polls or repairs the policy.
+         */
+        static const std::vector<int32_t> kFixedLengthBenchmarkStopTokens;
+        if (!runner_->configureMTPRequestStopTokens(
+                kFixedLengthBenchmarkStopTokens))
+        {
+            last_failure_reason_ =
+                "benchmark runner rejected fixed-length stop policy at request admission";
+            return {false, 0.0};
+        }
 
         auto start = std::chrono::high_resolution_clock::now();
 
         bool success = false;
+        const char *const synchronization_phase =
+            decode_request_batch_ > 1 ? "request-batched prefill" : "prefill";
         if (decode_request_batch_ > 1)
         {
             const int request_batch = decode_request_batch_;
@@ -539,15 +1179,34 @@ namespace llaminar2
                     last_failure_reason_ = "request-batched benchmark prefill failed";
             }
 
-            success = synchronizeSuccess(success, "request-batched prefill");
         }
         else
         {
             success = runner_->forward(tokens.data(), tokens.size());
-
-            // Synchronize after forward and propagate failures to every rank.
-            success = synchronizeSuccess(success, "prefill");
         }
+
+        /*
+         * GPU forward() publishes an exact terminal event and returns
+         * asynchronously. The benchmark clock must include completed GPU
+         * work, while production inference remains free to chain consumers
+         * directly from that event. This wait performs no D2H and does not
+         * synchronize unrelated streams or the whole device.
+         */
+        if (success &&
+            !runner_->waitForLastInferenceCompletionForBenchmark())
+        {
+            last_failure_reason_ =
+                "prefill benchmark could not observe the durable inference-transaction completion event";
+            success = false;
+        }
+
+        /*
+         * The orchestrated runner synchronizes its participant ranks inside
+         * forward().  BenchmarkRunner deliberately owns no second MPI
+         * protocol: a second barrier/all-reduce schedule can race the worker
+         * command loop and deadlock at request boundaries.
+         */
+        (void)synchronization_phase;
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -565,16 +1224,49 @@ namespace llaminar2
         DecodeRunResult result;
         result.generated_text.reserve(n_tokens * 4); // Pre-allocate ~4 bytes/token to avoid reallocs
         result.generated_token_ids.reserve(static_cast<size_t>(std::max(0, n_tokens)));
+        result.token_latencies_ms.reserve(static_cast<size_t>(std::max(0, n_tokens)));
         int tokens_generated = 0;
 
-        // Sampler profiling (enabled when LLAMINAR_PROFILING=1)
-        const bool profile_sampler = debugEnv().profile.enabled;
+        /*
+         * Host decode-loop timing is opt-in because two clock reads per token
+         * are measurable overhead at high decode rates. Use the same explicit
+         * timing gate as graph replay profiling; generic JSON/CSV counter
+         * export alone must remain passive.
+         */
+        const bool profile_sampler = KernelProfiler::isEnabled();
         double sampler_total_us = 0.0;
         double inter_step_total_us = 0.0;
 
-        // Synchronize before timing decode phase (skip for single-rank)
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->barrier();
+        /**
+         * Record host work surrounding a production decode transaction.
+         *
+         * Orchestrated MTP does not pass through the legacy token-by-token
+         * sampler below: `decodeStepForBenchmark()` owns proposal, grouped
+         * verification, acceptance, and result publication.  Measuring that
+         * call boundary therefore captures the real host-visible transaction
+         * cost without inserting instrumentation inside captured GPU graphs.
+         */
+        const auto record_decode_loop_interval =
+            [profile_sampler](
+                const char *name,
+                std::chrono::high_resolution_clock::time_point interval_start,
+                PerfStatsCollector::Tags tags = {})
+        {
+            if (!profile_sampler)
+                return;
+
+            const auto interval_end = std::chrono::high_resolution_clock::now();
+            const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         interval_end - interval_start)
+                                         .count();
+            PerfStatsCollector::recordTimingNs(
+                "decode_loop",
+                name,
+                duration_ns > 0 ? static_cast<uint64_t>(duration_ns) : 0,
+                "decode",
+                {},
+                std::move(tags));
+        };
 
         auto start = std::chrono::high_resolution_clock::now();
         // Track the end of the last forward() call for inter-step measurement
@@ -621,6 +1313,7 @@ namespace llaminar2
 
             while (!all_requests_done())
             {
+                const auto step_start = std::chrono::high_resolution_clock::now();
                 int remaining_budget = 0;
                 for (int i = 0; i < request_batch; ++i)
                 {
@@ -633,7 +1326,17 @@ namespace llaminar2
                 }
 
                 runner_->setDecodeStepTokenBudget(remaining_budget);
+                const auto decode_step_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
                 DecodeBatchStepOutput step = runner_->decodeBatchStepForBenchmark(request_batch);
+                record_decode_loop_interval(
+                    "request_batch_step",
+                    decode_step_start,
+                    {
+                        {"implementation", "orchestrated_decode_step"},
+                        {"request_batch", std::to_string(request_batch)},
+                    });
                 runner_->setDecodeStepTokenBudget(0);
 
                 const bool local_step_ok =
@@ -641,7 +1344,7 @@ namespace llaminar2
                     static_cast<int>(step.tokens_by_request.size()) == request_batch &&
                     (step.is_complete_by_request.empty() ||
                      static_cast<int>(step.is_complete_by_request.size()) == request_batch);
-                if (!synchronizeSuccess(local_step_ok, "request-batched decode step"))
+                if (!local_step_ok)
                 {
                     last_failure_reason_ = !step.error.empty()
                                                ? step.error
@@ -709,8 +1412,20 @@ namespace llaminar2
                     return result;
                 }
 
-                const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
-                if (!synchronizeSuccess(maintenance_success, "request-batched decode maintenance"))
+                const auto maintenance_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
+                const bool maintenance_success =
+                    runner_->maybeApplyDecodeBoundaryMaintenance(
+                        static_cast<uint64_t>(emitted_this_step));
+                record_decode_loop_interval(
+                    "request_batch_maintenance",
+                    maintenance_start,
+                    {
+                        {"implementation", "decode_boundary_maintenance"},
+                        {"request_batch", std::to_string(request_batch)},
+                    });
+                if (!maintenance_success)
                 {
                     last_failure_reason_ = "request-batched decode maintenance failed";
                     auto end = std::chrono::high_resolution_clock::now();
@@ -719,15 +1434,24 @@ namespace llaminar2
                     result.tokens_generated = tokens_generated;
                     return result;
                 }
+
+                if (emitted_this_step > 0)
+                {
+                    const auto step_end = std::chrono::high_resolution_clock::now();
+                    const double per_token_ms =
+                        std::chrono::duration<double, std::milli>(step_end - step_start).count() /
+                        static_cast<double>(emitted_this_step);
+                    result.token_latencies_ms.insert(
+                        result.token_latencies_ms.end(),
+                        static_cast<size_t>(emitted_this_step),
+                        per_token_ms);
+                }
             }
 
-            const bool decode_success = synchronizeSuccess(true, "request-batched decode complete");
             auto end = std::chrono::high_resolution_clock::now();
-            result.success = decode_success;
+            result.success = true;
             result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
             result.tokens_generated = tokens_generated;
-            if (!decode_success)
-                last_failure_reason_ = "request-batched decode synchronization failed";
             return result;
         }
 
@@ -737,12 +1461,23 @@ namespace llaminar2
 
             while (tokens_generated < n_tokens)
             {
+                const auto step_start = std::chrono::high_resolution_clock::now();
                 const int remaining = n_tokens - tokens_generated;
                 runner_->setDecodeStepTokenBudget(remaining);
+                const auto decode_step_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
                 DecodeStepOutput step = runner_->decodeStepForBenchmark();
+                record_decode_loop_interval(
+                    "orchestrated_step",
+                    decode_step_start,
+                    {
+                        {"implementation", "orchestrated_decode_step"},
+                        {"request_batch", "1"},
+                    });
                 runner_->setDecodeStepTokenBudget(0);
 
-                if (!synchronizeSuccess(step.error.empty(), "decode step"))
+                if (!step.error.empty())
                 {
                     last_failure_reason_ = step.error.empty() ? "decode step failed" : step.error;
                     auto end = std::chrono::high_resolution_clock::now();
@@ -752,13 +1487,8 @@ namespace llaminar2
                     return result;
                 }
 
-                int step_token_count = mpi_ctx_->rank() == 0
-                                           ? static_cast<int>(std::min<size_t>(
-                                                 step.tokens.size(),
-                                                 static_cast<size_t>(remaining)))
-                                           : 0;
-                if (mpi_ctx_->world_size() > 1)
-                    mpi_ctx_->broadcast_int32(&step_token_count, 1, 0);
+                const int step_token_count = static_cast<int>(std::min<size_t>(
+                    step.tokens.size(), static_cast<size_t>(remaining)));
 
                 if (step_token_count <= 0)
                 {
@@ -777,33 +1507,53 @@ namespace llaminar2
                 }
 
                 int stop_reached = 0;
-                if (mpi_ctx_->rank() == 0)
+                for (int j = 0; j < step_token_count; ++j)
                 {
-                    for (int j = 0; j < step_token_count; ++j)
+                    const int32_t token = step.tokens[static_cast<size_t>(j)];
+                    result.generated_token_ids.push_back(token);
+                    if (!tokenizer_->is_stop_token(token))
                     {
-                        const int32_t token = step.tokens[static_cast<size_t>(j)];
-                        result.generated_token_ids.push_back(token);
-                        if (!tokenizer_->is_stop_token(token))
-                        {
-                            result.generated_text += tokenizer_->decode_token(token);
-                        }
-                        else if (!ignore_stop_tokens)
-                        {
-                            stop_reached = 1;
-                            break;
-                        }
+                        result.generated_text += tokenizer_->decode_token(token);
+                    }
+                    else if (!ignore_stop_tokens)
+                    {
+                        stop_reached = 1;
+                        break;
                     }
                 }
-                if (mpi_ctx_->world_size() > 1)
-                    mpi_ctx_->broadcast_int32(&stop_reached, 1, 0);
 
                 tokens_generated += step_token_count;
 
                 if (stop_reached != 0)
+                {
+                    if (step_token_count > 0)
+                    {
+                        const auto step_end = std::chrono::high_resolution_clock::now();
+                        const double per_token_ms =
+                            std::chrono::duration<double, std::milli>(step_end - step_start).count() /
+                            static_cast<double>(step_token_count);
+                        result.token_latencies_ms.insert(
+                            result.token_latencies_ms.end(),
+                            static_cast<size_t>(step_token_count),
+                            per_token_ms);
+                    }
                     break;
+                }
 
-                const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
-                if (!synchronizeSuccess(maintenance_success, "decode maintenance"))
+                const auto maintenance_start =
+                    profile_sampler ? std::chrono::high_resolution_clock::now()
+                                    : std::chrono::high_resolution_clock::time_point{};
+                const bool maintenance_success =
+                    runner_->maybeApplyDecodeBoundaryMaintenance(
+                        static_cast<uint64_t>(step_token_count));
+                record_decode_loop_interval(
+                    "orchestrated_maintenance",
+                    maintenance_start,
+                    {
+                        {"implementation", "decode_boundary_maintenance"},
+                        {"request_batch", "1"},
+                    });
+                if (!maintenance_success)
                 {
                     last_failure_reason_ = "decode maintenance failed";
                     auto end = std::chrono::high_resolution_clock::now();
@@ -812,11 +1562,22 @@ namespace llaminar2
                     result.tokens_generated = tokens_generated;
                     return result;
                 }
+
+                if (step_token_count > 0)
+                {
+                    const auto step_end = std::chrono::high_resolution_clock::now();
+                    const double per_token_ms =
+                        std::chrono::duration<double, std::milli>(step_end - step_start).count() /
+                        static_cast<double>(step_token_count);
+                    result.token_latencies_ms.insert(
+                        result.token_latencies_ms.end(),
+                        static_cast<size_t>(step_token_count),
+                        per_token_ms);
+                }
             }
 
-            const bool decode_success = synchronizeSuccess(true, "decode complete");
             auto end = std::chrono::high_resolution_clock::now();
-            result.success = decode_success;
+            result.success = true;
             result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
             result.tokens_generated = tokens_generated;
             return result;
@@ -824,53 +1585,59 @@ namespace llaminar2
 
         for (int i = 0; i < n_tokens; ++i)
         {
+            const auto token_start = std::chrono::high_resolution_clock::now();
             int next_token = -1;
 
-            // Rank 0: Sample next token (greedy for deterministic benchmark)
-            if (mpi_ctx_->rank() == 0)
+            // The sole benchmark controller samples deterministically.
+            auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+
+            // Try device-side argmax first. CPU-only runners then use the
+            // host-logits CPU implementation; GPU runners fail loudly
+            // instead of silently paying a D2H logits transfer.
+            next_token = runner_->sampleGreedyOnDevice();
+
+            if (next_token < 0)
             {
-                auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-
-                // Try GPU-side argmax first (avoids ~600 KB D2H + CPU scan)
-                next_token = runner_->sampleGreedyOnDevice();
-
-                if (next_token < 0)
+                if (runner_->primaryDeviceId().is_gpu())
                 {
-                    // GPU argmax not available (CPU device or unsupported backend).
-                    // Fall back to host-side argmax over gathered logits.
-                    const float *logit_data = runner_->logits();
-                    if (!logit_data)
-                    {
-                        LOG_ERROR("CPU sampling fallback failed at decode step " << i
-                                                                                 << ": logits() returned nullptr.");
-                        last_failure_reason_ = "CPU sampling fallback failed: logits unavailable";
-                        auto end = std::chrono::high_resolution_clock::now();
-                        result.success = false;
-                        result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                        result.tokens_generated = tokens_generated;
-                        return result;
-                    }
-                    const int vs = runner_->vocab_size();
-                    next_token = static_cast<int>(
-                        std::distance(logit_data, std::max_element(logit_data, logit_data + vs)));
+                    LOG_ERROR("GPU device sampling failed at decode step " << i
+                                                                            << "; host logits sampling is CPU-only.");
+                    last_failure_reason_ =
+                        "GPU device sampling failed: host logits sampling is CPU-only";
+                    auto end = std::chrono::high_resolution_clock::now();
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
                 }
 
-                if (profile_sampler)
+                // CPU-only host sampling over local logits.
+                const float *logit_data = runner_->logits();
+                if (!logit_data)
                 {
-                    auto t1 = std::chrono::high_resolution_clock::now();
-                    sampler_total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                    LOG_ERROR("CPU host sampling failed at decode step " << i
+                                                                         << ": logits() returned nullptr.");
+                    last_failure_reason_ = "CPU host sampling failed: logits unavailable";
+                    auto end = std::chrono::high_resolution_clock::now();
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
                 }
-
-                // Collect generated text for verification (but don't print during benchmark)
-                if (!tokenizer_->is_stop_token(next_token))
-                {
-                    result.generated_text += tokenizer_->decode_token(next_token);
-                }
+                const int vs = runner_->vocab_size();
+                next_token = static_cast<int>(
+                    std::distance(logit_data, std::max_element(logit_data, logit_data + vs)));
             }
 
-            // Broadcast token to all ranks (skip for single-rank)
-            if (mpi_ctx_->world_size() > 1)
-                mpi_ctx_->broadcast_int32(&next_token, 1, 0);
+            if (profile_sampler)
+            {
+                auto t1 = std::chrono::high_resolution_clock::now();
+                sampler_total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+            }
+
+            // Collect generated text for verification (but don't print during benchmark)
+            if (!tokenizer_->is_stop_token(next_token))
+                result.generated_text += tokenizer_->decode_token(next_token);
 
             // Check for stop token (unless benchmarking throughput)
             if (!ignore_stop_tokens && tokenizer_->is_stop_token(next_token))
@@ -878,10 +1645,7 @@ namespace llaminar2
                 break;
             }
 
-            if (mpi_ctx_->rank() == 0)
-            {
-                result.generated_token_ids.push_back(next_token);
-            }
+            result.generated_token_ids.push_back(next_token);
             tokens_generated++;
 
             // Measure inter-step gap: time from last forward() return to this forward() call
@@ -897,7 +1661,7 @@ namespace llaminar2
             if (profile_sampler)
                 last_forward_end = std::chrono::high_resolution_clock::now();
 
-            if (!synchronizeSuccess(forward_success, "decode forward"))
+            if (!forward_success)
             {
                 last_failure_reason_ = "decode forward failed";
                 auto end = std::chrono::high_resolution_clock::now();
@@ -910,29 +1674,31 @@ namespace llaminar2
             // Optional per-step callback (e.g., incremental MoE expert rebalancing)
             if (decode_step_cb_)
                 decode_step_cb_();
-        }
 
-        // Synchronize after decode phase (skip for single-rank)
-        const bool decode_success = synchronizeSuccess(true, "decode complete");
+            const auto token_end = std::chrono::high_resolution_clock::now();
+            result.token_latencies_ms.push_back(
+                std::chrono::duration<double, std::milli>(token_end - token_start).count());
+        }
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
-        if (!decode_success)
-        {
-            last_failure_reason_ = "decode synchronization failed";
-            result.success = false;
-            result.time_ms = time_ms;
-            result.tokens_generated = tokens_generated;
-            return result;
-        }
-
         // Accumulate inter-step profiling data across benchmark iterations
-        if (profile_sampler && mpi_ctx_->rank() == 0 && tokens_generated > 0)
+        if (profile_sampler && tokens_generated > 0)
         {
             decode_loop_profile_.sampler_total_us += sampler_total_us;
             decode_loop_profile_.inter_step_total_us += inter_step_total_us;
             decode_loop_profile_.decode_tokens += tokens_generated;
+            PerfStatsCollector::recordTimingNs(
+                "decode_loop",
+                "sampler",
+                static_cast<uint64_t>(std::max(0.0, sampler_total_us) * 1000.0),
+                "decode");
+            PerfStatsCollector::recordTimingNs(
+                "decode_loop",
+                "inter_step",
+                static_cast<uint64_t>(std::max(0.0, inter_step_total_us) * 1000.0),
+                "decode");
 
             double avg_us = sampler_total_us / tokens_generated;
             double pct = (sampler_total_us / 1000.0) / time_ms * 100.0;
@@ -948,41 +1714,15 @@ namespace llaminar2
         return result;
     }
 
-    bool BenchmarkRunner::synchronizeSuccess(bool local_success, const char *phase) const
-    {
-        if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)
-            return local_success;
-
-        const float local = local_success ? 1.0f : 0.0f;
-        float global_sum = 0.0f;
-
-        try
-        {
-            mpi_ctx_->allreduce_sum(&local, &global_sum, 1);
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("Benchmark " << phase << " failure synchronization failed: " << e.what());
-            return false;
-        }
-        catch (...)
-        {
-            LOG_ERROR("Benchmark " << phase << " failure synchronization failed: unknown exception");
-            return false;
-        }
-
-        const bool global_success = global_sum >= static_cast<float>(mpi_ctx_->world_size()) - 0.5f;
-        if (!global_success && mpi_ctx_->rank() == 0)
-        {
-            LOG_ERROR("Benchmark " << phase << " failed on at least one rank (success_sum="
-                                   << global_sum << "/" << mpi_ctx_->world_size() << ")");
-        }
-        return global_success;
-    }
-
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
     {
         BenchmarkResult result;
+        const int benchmark_iterations =
+            std::max(1, debugEnv().runtime_debug.benchmark_iterations);
+        const int warmup_iterations =
+            std::max(0, debugEnv().runtime_debug.benchmark_warmup_iterations);
+        result.measurement_iterations = benchmark_iterations;
+        result.warmup_iterations = warmup_iterations;
         last_failure_reason_.clear();
         PrefixRuntimeStateSnapshot measured_mtp_state;
         bool has_measured_mtp_state = false;
@@ -996,64 +1736,79 @@ namespace llaminar2
             return result;
         };
 
-        // Determine prompt (use default if not provided or empty)
-        std::string prompt = config.prompt;
-        if (prompt.empty() || prompt == "Hello, my name is")
+        /*
+         * Application startup owns all model preparation through the same
+         * generic readiness boundary used by serving. BenchmarkRunner must not
+         * know which subsystem prepared the model, nor submit hidden workloads
+         * whose cost and routing differ from ordinary admitted requests.
+         */
+        const InferenceReadiness readiness = runner_->inferenceReadiness();
+        if (!readiness.ready())
         {
-            prompt = generateDefaultPrompt();
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_DEBUG("Using default benchmark prompt (~512 tokens)");
-            }
+            last_failure_reason_ = readiness.failed()
+                                       ? "inference preparation failed"
+                                       : "inference runner is not ready";
+            if (!readiness.diagnostic.empty())
+                last_failure_reason_ += ": " + readiness.diagnostic;
+            LOG_ERROR(last_failure_reason_);
+            return capture_and_return();
         }
 
-        // Tokenize prompt (rank 0 only, then broadcast)
+        // Resolve and tokenize once in the sole benchmark controller.
+        std::string prompt;
         std::vector<int> tokens;
         int token_count = 0;
 
-        if (mpi_ctx_->rank() == 0)
+        try
         {
+            const ResolvedBenchmarkPrompt resolved = resolveBenchmarkPrompt(config);
+            prompt = resolved.text;
+            result.prompt_source = resolved.source;
+            result.prompt_file_path = resolved.file_path;
+            result.prompt_bytes = resolved.text.size();
+            result.prompt_sha256 = resolved.sha256;
+
+            LOG_DEBUG("Benchmark prompt source="
+                      << benchmarkPromptSourceToString(resolved.source)
+                      << " bytes=" << resolved.text.size()
+                      << " sha256=" << resolved.sha256);
+
             tokens = tokenizer_->encode(prompt, /*add_bos=*/false, /*add_eos=*/false);
             token_count = static_cast<int>(tokens.size());
-
             if (tokens.empty())
             {
-                LOG_ERROR("Failed to tokenize benchmark prompt");
+                last_failure_reason_ = "benchmark prompt tokenization failed";
+                LOG_ERROR(last_failure_reason_);
                 token_count = -1;
             }
         }
-
-        // Broadcast token count (skip for single-rank)
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->broadcast_int32(&token_count, 1, 0);
+        catch (const std::exception &error)
+        {
+            last_failure_reason_ =
+                std::string("benchmark prompt resolution failed: ") + error.what();
+            LOG_ERROR(last_failure_reason_);
+            token_count = -1;
+        }
 
         if (token_count <= 0)
         {
-            last_failure_reason_ = "benchmark prompt tokenization failed";
+            if (last_failure_reason_.empty())
+                last_failure_reason_ = "benchmark prompt resolution or tokenization failed";
             return capture_and_return(); // Return empty result on error
         }
         result.prefill_tokens = token_count;
+
+        const bool has_gpu = runner_->primaryDeviceId().is_gpu();
 
         if (config.max_seq_len > 0 && token_count > config.max_seq_len)
         {
             last_failure_reason_ =
                 "benchmark prompt has " + std::to_string(token_count) +
                 " tokens but context length is " + std::to_string(config.max_seq_len) +
-                "; pass a shorter -p/--prompt or increase -c/--context-length";
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_ERROR(last_failure_reason_);
-            }
+                "; pass a shorter -p/--prompt or --prompt-file, or increase -c/--context-length";
+            LOG_ERROR(last_failure_reason_);
             return capture_and_return();
         }
-
-        // Broadcast tokens to all ranks
-        if (mpi_ctx_->rank() != 0)
-        {
-            tokens.resize(token_count);
-        }
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->broadcast_int32(tokens.data(), token_count, 0);
 
         // Determine number of decode tokens
         // -1 means "use default" (128 for benchmark)
@@ -1076,29 +1831,23 @@ namespace llaminar2
                     " total tokens (" + std::to_string(token_count) +
                     " prompt + " + std::to_string(n_decode) +
                     " decode) but context length is " + std::to_string(config.max_seq_len) +
-                    "; reduce -n/--n-predict, pass a shorter -p/--prompt, or increase -c/--context-length";
-                if (mpi_ctx_->rank() == 0)
-                {
-                    LOG_ERROR(last_failure_reason_);
-                }
+                    "; reduce -n/--n-predict, pass a shorter -p/--prompt or --prompt-file, "
+                    "or increase -c/--context-length";
+                LOG_ERROR(last_failure_reason_);
                 return capture_and_return();
             }
         }
 
-        if (mpi_ctx_->rank() == 0)
-        {
-            LOG_DEBUG("Benchmark configuration:");
-            LOG_DEBUG("  Prefill tokens: " << token_count);
-            LOG_DEBUG("  Decode tokens:  " << n_decode);
-            LOG_DEBUG("  Warmup runs:    " << WARMUP_ITERATIONS);
-            LOG_DEBUG("  Benchmark runs: " << BENCHMARK_ITERATIONS);
-            LOG_DEBUG("");
-        }
+        LOG_DEBUG("Benchmark configuration:");
+        LOG_DEBUG("  Prefill tokens: " << token_count);
+        LOG_DEBUG("  Decode tokens:  " << n_decode);
+        LOG_DEBUG("  Warmup runs:    " << warmup_iterations);
+        LOG_DEBUG("  Benchmark runs: " << benchmark_iterations);
+        LOG_DEBUG("");
 
         // Enable GPU-side greedy sampling to skip D2H logits gather during decode.
         // Only enabled on GPU — CPU has no device-side argmax, so logits must be
         // gathered to host for CPU-side sampling.
-        const bool has_gpu = runner_->primaryDeviceId().is_gpu();
         runner_->setSkipLogitsGatherDecode(has_gpu);
 
         decode_sampling_params_ = SamplingParams{};
@@ -1118,127 +1867,283 @@ namespace llaminar2
         }
 
         // ========================================================================
-        // Warmup Phase - Run once to warm up caches, JIT, etc.
+        // Warmup Phase - Run before measurement to warm caches, JIT, etc.
         // ========================================================================
-        if (mpi_ctx_->rank() == 0)
-        {
+        if (warmup_iterations > 0)
             LOG_INFO("Running warmup...");
-        }
-
-        // Reset pipeline state before warmup
-        runner_->clear_cache();
-        logGPUMemorySnapshot("before-warmup");
 
         // Suppress GPU stage timeline during warmup — warmup includes one-time costs
         // (weight H2D transfers, buffer allocation, kernel JIT) that inflate overhead
         // numbers and don't reflect steady-state performance.
         runner_->setSuppressTimeline(true);
 
-        // Skip D2H logits gather for prefill — prefill logits are never consumed
-        // in the benchmark flow (sampling happens during decode via GPU-side argmax).
-        // This eliminates ~405ms of PCIe traffic for TP=2 prefill.
-        runner_->setSkipLogitsGatherPrefill(true);
+        // Skip D2H logits gather for GPU prefill. CPU benchmarks keep host logits
+        // visible because host-side sampling is the CPU implementation.
+        runner_->setSkipLogitsGatherPrefill(has_gpu);
 
-        auto warmPrefillGraphCapture = [&]() -> bool
+        /*
+         * A throughput sample named "prefill" must execute the prompt, not
+         * restore an identical prompt archived by graph preparation or the
+         * preceding warmup. Request reset deliberately preserves reusable
+         * prefix records for serving, so benchmark mode composes that boundary
+         * with the distinct administrative purge before every full-prefill
+         * submission. Both operations remain outside the measured interval;
+         * retained graph topology and prepared weights survive both.
+         */
+        auto resetForFullPrefill = [&](const char *context) -> bool
         {
-            if (!debugEnv().execution.gpu_graphs)
+            runner_->clear_cache();
+            if (runner_->purgePrefixCache())
                 return true;
 
-            if (mpi_ctx_->rank() == 0)
+            last_failure_reason_ =
+                std::string("benchmark could not purge reusable prefix state before ") +
+                (context && *context ? context : "full prefill");
+            LOG_ERROR(last_failure_reason_);
+            return false;
+        };
+
+        auto requirePrefillGraphCapture = [&](const char *context) -> bool
+        {
+            if (!debugEnv().execution.prefill_graph_required)
+                return true;
+            const PrefixRuntimeStateSnapshot snapshot =
+                runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+            if (prefillGraphProbeShowsCaptureOrReplay(snapshot))
+                return true;
+
+            std::ostringstream reason;
+            reason << "required prefill graph capture/replay was not observed";
+            if (context && *context)
+                reason << " after " << context;
+            reason << " (" << summarizePrefillGraphProbe(snapshot) << ")";
+            last_failure_reason_ = reason.str();
+            LOG_ERROR(last_failure_reason_);
+            return false;
+        };
+
+        auto preparePrefillGraphCapture = [&]() -> bool
+        {
+            if (!has_gpu)
             {
-                LOG_INFO("Preparing prefill graph capture for steady-state benchmark...");
+                if (debugEnv().execution.prefill_graph_required)
+                {
+                    last_failure_reason_ =
+                        "LLAMINAR_PREFILL_GRAPH_REQUIRED=1 but the benchmark runner is CPU-only";
+                    LOG_ERROR(last_failure_reason_);
+                    return false;
+                }
+                return true;
             }
 
-            for (int iter = 0; iter < PREFILL_GRAPH_WARMUP_ITERATIONS; ++iter)
+            if (!debugEnv().execution.gpu_graphs)
             {
-                runner_->clear_cache();
+                if (debugEnv().execution.prefill_graph_required)
+                {
+                    last_failure_reason_ =
+                        "LLAMINAR_PREFILL_GRAPH_REQUIRED=1 but GPU graphs are disabled";
+                    LOG_ERROR(last_failure_reason_);
+                    return false;
+                }
+                return true;
+            }
+
+            const auto graph_is_ready = [&]()
+            {
+                const PrefixRuntimeStateSnapshot snapshot =
+                    runner_->prefixStateProbe();
+                return prefillGraphProbeShowsCaptureOrReplay(snapshot);
+            };
+
+            const PrefixRuntimeStateSnapshot initial_graph_snapshot =
+                runner_->prefixStateProbe();
+            if (prefillGraphProbeShowsCaptureOrReplay(initial_graph_snapshot))
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "prefill_graph_preparation_ready_reuse",
+                    1.0,
+                    "model_setup",
+                    runner_->primaryDeviceId().toString(),
+                    {{"hidden_prefill_submissions", "0"}});
+                return true;
+            }
+
+            LOG_INFO(
+                "Preparing retained prefill graph to its first replay-ready state; "
+                "current_state="
+                << summarizePrefillGraphProbe(initial_graph_snapshot));
+            const auto preparation_start =
+                std::chrono::steady_clock::now();
+            int submissions = 0;
+            for (; submissions < kMaxPrefillGraphPreparationSubmissions;
+                 ++submissions)
+            {
+                if (!resetForFullPrefill("prefill graph preparation"))
+                    return false;
                 auto [graph_warmup_success, graph_warmup_time] = runPrefill(tokens);
                 if (!graph_warmup_success)
                 {
-                    if (mpi_ctx_->rank() == 0)
-                    {
-                        LOG_ERROR("Prefill graph warmup failed on iteration " << (iter + 1));
-                    }
+                    LOG_ERROR(
+                        "Prefill graph preparation failed on submission "
+                        << (submissions + 1));
                     return false;
+                }
+
+                const bool ready = graph_is_ready();
+                PerfStatsCollector::recordTimingNs(
+                    "forward_graph",
+                    "prefill_graph_preparation_submission",
+                    static_cast<std::uint64_t>(
+                        std::max(0.0, graph_warmup_time) * 1.0e6),
+                    "model_setup",
+                    runner_->primaryDeviceId().toString(),
+                    {{"submission", std::to_string(submissions + 1)},
+                     {"ready_after_submission", ready ? "true" : "false"}});
+
+                /*
+                 * A backend-neutral probe is available on production runners.
+                 * Minimal GPU test doubles may expose no graph inventory when
+                 * capture is not mandatory; one ordinary request remains the
+                 * complete warmup contract for those callers.
+                 */
+                const auto snapshot = runner_->prefixStateProbe();
+                if (ready ||
+                    (snapshot.prefill_graphs.empty() &&
+                     !debugEnv().execution.prefill_graph_required))
+                {
+                    ++submissions;
+                    break;
                 }
             }
 
-            return true;
+            const auto preparation_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - preparation_start)
+                    .count();
+            PerfStatsCollector::recordTimingNs(
+                "forward_graph",
+                "prefill_graph_preparation_total",
+                static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(0, preparation_ns)),
+                "model_setup",
+                runner_->primaryDeviceId().toString(),
+                {{"submissions", std::to_string(submissions)},
+                 {"state_driven", "true"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "prefill_graph_preparation_submissions",
+                static_cast<double>(submissions),
+                "model_setup",
+                runner_->primaryDeviceId().toString(),
+                {{"maximum",
+                  std::to_string(kMaxPrefillGraphPreparationSubmissions)},
+                 {"state_driven", "true"}});
+
+            return requirePrefillGraphCapture("prefill graph warmup");
         };
 
-        // Warmup prefill
-        auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
-        if (!warmup_prefill_success)
+        /*
+         * Prefill graph capture clears graph/runtime state as it warms capture
+         * buckets. Run it before the decode warmup so post-warmup rebalance sees
+         * the histogram from the immediately preceding decode window. Dynamic
+         * ExpertOverlay placement uses persistent ticketed residency banks:
+         * publishing a new epoch changes immutable ticket data and stable
+         * engine bindings, never captured topology or embedded buffer addresses,
+         * so maintenance does not invalidate these warmed bucket families.
+         */
+        if (!preparePrefillGraphCapture())
         {
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_ERROR("Warmup prefill failed");
-            }
-            if (last_failure_reason_.empty())
-                last_failure_reason_ = "warmup prefill failed";
             return capture_and_return();
         }
 
-        // Warmup decode (if requested)
-        if (n_decode > 0)
+        for (int iter = 0; iter < warmup_iterations; ++iter)
         {
-            int eos_token = tokenizer_->eos_token();
-            auto warmup_decode = runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
-            if (!warmup_decode.success)
+            if (!resetForFullPrefill("warmup"))
+                return capture_and_return();
+            logGPUMemorySnapshot(("before-warmup iter=" + std::to_string(iter + 1)).c_str());
+
+            auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
+            if (!warmup_prefill_success)
             {
-                if (mpi_ctx_->rank() == 0)
+                LOG_ERROR("Warmup prefill failed on iteration " << (iter + 1));
+                if (last_failure_reason_.empty())
+                    last_failure_reason_ = "warmup prefill failed";
+                return capture_and_return();
+            }
+
+            if (n_decode > 0)
+            {
+                int eos_token = tokenizer_->eos_token();
+                auto warmup_decode = runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
+                if (!warmup_decode.success)
                 {
-                    LOG_ERROR("Warmup decode failed");
+                    LOG_ERROR("Warmup decode failed on iteration " << (iter + 1));
                     if (!last_failure_reason_.empty())
                     {
                         LOG_ERROR("Warmup decode failure reason: "
                                   << last_failure_reason_);
                     }
+                    if (last_failure_reason_.empty())
+                        last_failure_reason_ = "warmup decode failed";
+                    return capture_and_return();
                 }
-                if (last_failure_reason_.empty())
-                    last_failure_reason_ = "warmup decode failed";
-                return capture_and_return();
             }
         }
 
-        if (!warmPrefillGraphCapture())
-        {
-            return capture_and_return();
-        }
-
-        if (mpi_ctx_->rank() == 0)
-        {
+        if (warmup_iterations > 0)
             LOG_INFO("Warmup complete.");
-        }
         logGPUMemorySnapshot("after-warmup");
 
         // Post-warmup callback (e.g., MoE expert rebalancing)
-        if (post_warmup_cb_)
+        if (post_warmup_cb_ && n_decode > 0)
         {
             post_warmup_cb_();
 
             // Re-warm caches after post-warmup work (e.g., MPI expert weight
             // transfers can evict hot data from LLC, causing the first benchmark
             // iteration to measure cold-cache performance).
-            if (mpi_ctx_->rank() == 0)
-                LOG_DEBUG("Re-warming caches after post-warmup setup...");
-            runner_->clear_cache();
+            LOG_DEBUG("Re-warming caches after post-warmup setup...");
+            if (!resetForFullPrefill("post-warmup cache rewarm"))
+                return capture_and_return();
             auto [rw_ok, rw_time] = runPrefill(tokens);
             if (rw_ok && n_decode > 0)
             {
                 int eos_token = tokenizer_->eos_token();
                 (void)runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
             }
-            if (rw_ok && !warmPrefillGraphCapture())
+            if (!rw_ok)
+            {
+                if (last_failure_reason_.empty())
+                    last_failure_reason_ =
+                        "post-warmup cache rewarm prefill failed";
+                return capture_and_return();
+            }
+            if (!preparePrefillGraphCapture())
             {
                 return capture_and_return();
             }
         }
-
-        if (mpi_ctx_->rank() == 0)
+        else if (!preparePrefillGraphCapture())
         {
-            LOG_INFO("Running " << BENCHMARK_ITERATIONS << " benchmark iterations...");
+            return capture_and_return();
         }
+
+        PrefixRuntimeStateSnapshot measured_prefill_graph_baseline;
+        if (debugEnv().execution.prefill_graph_required)
+        {
+            measured_prefill_graph_baseline = runner_->prefixStateProbe();
+            if (!prefillGraphProbeShowsCaptureOrReplay(
+                    measured_prefill_graph_baseline))
+            {
+                last_failure_reason_ =
+                    "required prefill graph was absent immediately before the measured replay";
+                LOG_ERROR(last_failure_reason_);
+                return capture_and_return();
+            }
+        }
+
+        LOG_INFO("Running " << benchmark_iterations << " benchmark iterations...");
 
         // Reset profiling after warmup (only track actual benchmark iterations)
         if (KernelProfiler::isEnabled())
@@ -1248,7 +2153,60 @@ namespace llaminar2
             CUDAKernelProfiler::reset();
             ROCmKernelProfiler::reset();
         }
-        PerfStatsCollector::reset();
+        /*
+         * Warmup and post-warmup setup are deliberately outside the measured
+         * benchmark loop. Keep immutable setup evidence: the memory lifecycle,
+         * captured-graph kernel inventory, and collective graph-template bills
+         * of materials. TP stage constructors execute while graph families are
+         * materialized, so discarding their BOM records here would leave an
+         * optimized captured replay with no stage/payload attribution at all.
+         *
+         * Runtime collective and MoE rebalance records are intentionally not
+         * preserved. They must describe only steady-state measured work. Exact
+         * ExpertOverlay capacity and named materialization records are setup
+         * BOM evidence, however, and must survive so auto-capacity, shadow
+         * width, and movement concurrency remain auditable beside throughput.
+         */
+        PerfStatsCollector::resetPreserving(
+            {"memory",
+             "weight_loading",
+             "gpu_graph_inventory",
+             "moe_overlay_capacity",
+             "tp_allreduce_bom",
+             "tp_rooted_collective_bom"},
+            {
+                {"forward_graph", "full_graph_plan_graphs"},
+                {"forward_graph", "graph_replay_plan_graphs"},
+                {"forward_graph", "full_graph_capture_executable_nodes"},
+                {"forward_graph", "prefill_graph_lifecycle"},
+                {"forward_graph", "prefill_graph_phase"},
+                {"forward_graph", "prefill_graph_preparation_submission"},
+                {"forward_graph", "prefill_graph_preparation_total"},
+                {"forward_graph", "prefill_graph_preparation_submissions"},
+                {"forward_graph", "prefill_graph_preparation_ready_reuse"},
+                {"forward_graph", "decode_graph_phase"},
+                {"moe_overlay_activation_epoch",
+                 "shared_physical_dispatch_d2h_bytes"},
+                {"moe_overlay_transport", "selection"},
+                {"moe_overlay_controller",
+                 "captured_participant_graphs"},
+                {"moe_overlay_residency",
+                 "physical_fabrics_materialized"},
+                {"moe_overlay_residency",
+                 "production_maintenance_composed"},
+                {"kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"},
+                {"kernel", "cuda_moe_grouped_prefill_active_expert_grid_calls"},
+                {"kernel", "cuda_moe_grouped_prefill_swiglu_path_calls"},
+                /*
+                 * Fused projection schedules are selected while the retained
+                 * graph family is captured.  Replays contain only CUDA graph
+                 * nodes, so there is no host callback that can republish this
+                 * evidence after warmup.  Keep these exact families without
+                 * retaining unrelated warmup kernel counters.
+                 */
+                {"kernel", "cuda_fused_projection_stream_pool_calls"},
+                {"kernel", "cuda_native_vnni_small_m_fused_projection_calls"},
+            });
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 
@@ -1266,20 +2224,26 @@ namespace llaminar2
         std::vector<double> prefill_times;
         std::vector<double> decode_times;
         std::vector<int> decode_token_counts;
+        std::vector<double> decode_token_latencies_ms;
         std::string last_generated_text;
 
         logGPUMemorySnapshot("pre-iter-loop");
 
-        for (int iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
+        for (int iter = 0; iter < benchmark_iterations; ++iter)
         {
-            // Reset pipeline state before each iteration
-            runner_->clear_cache();
+            // Reset live request state and force an actual full-prefill sample.
+            if (!resetForFullPrefill("measured iteration"))
+                return capture_and_return();
             logGPUMemorySnapshot(("after-clear-cache iter=" + std::to_string(iter + 1)).c_str());
 
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_DEBUG("  Iteration " << (iter + 1) << "/" << BENCHMARK_ITERATIONS << "...");
-            }
+            LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
+            BenchmarkIterationResult iteration_result;
+            iteration_result.iteration = iter + 1;
+            iteration_result.prefill_tokens = result.prefill_tokens;
+            iteration_result.moe_runtime_movement_epoch_start =
+                runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
+            const auto dynamic_movement_start =
+                completedDynamicMovementSnapshot(runner_.get());
 
             // Run prefill
             KernelProfiler::setCurrentPhase(KernelProfiler::Phase::PREFILL);
@@ -1290,16 +2254,45 @@ namespace llaminar2
             auto [prefill_success, prefill_time] = runPrefill(tokens);
             if (!prefill_success)
             {
-                if (mpi_ctx_->rank() == 0)
-                {
-                    LOG_ERROR("Prefill failed on iteration " << (iter + 1));
-                }
+                LOG_ERROR("Prefill failed on iteration " << (iter + 1));
                 if (last_failure_reason_.empty())
                     last_failure_reason_ = "prefill failed on benchmark iteration";
                 logGPUMemorySnapshot(("prefill-fail iter=" + std::to_string(iter + 1)).c_str());
                 return capture_and_return();
             }
+            if (debugEnv().execution.prefill_graph_required)
+            {
+                PrefixRuntimeStateSnapshot measured_prefill_graph_after =
+                    runner_->prefixStateProbe();
+                std::string replay_failure;
+                if (!prefillGraphProbeShowsReplayAdvance(
+                        measured_prefill_graph_baseline,
+                        measured_prefill_graph_after,
+                        &replay_failure))
+                {
+                    last_failure_reason_ =
+                        "required warmed prefill graph replay was not observed on measured iteration " +
+                        std::to_string(iter + 1) + ": " + replay_failure +
+                        " (before: " +
+                        summarizePrefillGraphProbe(
+                            measured_prefill_graph_baseline) +
+                        "; after: " +
+                        summarizePrefillGraphProbe(
+                            measured_prefill_graph_after) + ")";
+                    LOG_ERROR(last_failure_reason_);
+                    logGPUMemorySnapshot(("prefill-graph-replay-required-fail iter=" + std::to_string(iter + 1)).c_str());
+                    return capture_and_return();
+                }
+                measured_prefill_graph_baseline =
+                    std::move(measured_prefill_graph_after);
+            }
             prefill_times.push_back(prefill_time);
+            iteration_result.prefill_time_ms = prefill_time;
+            iteration_result.prefill_tokens_per_sec =
+                prefill_time > 0.0
+                    ? (static_cast<double>(result.prefill_tokens) * 1000.0) /
+                          prefill_time
+                    : 0.0;
             logGPUMemorySnapshot(("after-prefill iter=" + std::to_string(iter + 1)).c_str());
 
             // Run decode (if requested)
@@ -1315,14 +2308,11 @@ namespace llaminar2
                     runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
                 if (!decode_result.success)
                 {
-                    if (mpi_ctx_->rank() == 0)
+                    LOG_ERROR("Decode failed on iteration " << (iter + 1));
+                    if (!last_failure_reason_.empty())
                     {
-                        LOG_ERROR("Decode failed on iteration " << (iter + 1));
-                        if (!last_failure_reason_.empty())
-                        {
-                            LOG_ERROR("Decode failure reason: "
-                                      << last_failure_reason_);
-                        }
+                        LOG_ERROR("Decode failure reason: "
+                                  << last_failure_reason_);
                     }
                     if (last_failure_reason_.empty())
                         last_failure_reason_ = "decode failed on benchmark iteration";
@@ -1330,10 +2320,62 @@ namespace llaminar2
                 }
                 decode_times.push_back(decode_result.time_ms);
                 decode_token_counts.push_back(decode_result.tokens_generated);
+                iteration_result.decode_tokens =
+                    decode_result.tokens_generated;
+                iteration_result.decode_time_ms = decode_result.time_ms;
+                iteration_result.decode_tokens_per_sec =
+                    decode_result.time_ms > 0.0
+                        ? (static_cast<double>(decode_result.tokens_generated) *
+                           1000.0) /
+                              decode_result.time_ms
+                        : 0.0;
+                /*
+                 * Prefill has already produced the logits for the first
+                 * output of every logical request. Keep user-visible emitted
+                 * throughput, but also expose the work-normalized rate used
+                 * to compare steady decode kernels and protocols. The rule is
+                 * a property of autoregressive inference, not ExpertOverlay.
+                 */
+                iteration_result.decode_after_prefill_tokens = std::max(
+                    0,
+                    decode_result.tokens_generated - decode_request_batch_);
+                iteration_result.decode_after_prefill_tokens_per_sec =
+                    decode_result.time_ms > 0.0
+                        ? (static_cast<double>(
+                               iteration_result.decode_after_prefill_tokens) *
+                           1000.0) /
+                              decode_result.time_ms
+                        : 0.0;
+                appendDecodeWindows(
+                    &iteration_result,
+                    decode_result.token_latencies_ms,
+                    config.moe_rebalance.window_size);
+                decode_token_latencies_ms.insert(
+                    decode_token_latencies_ms.end(),
+                    decode_result.token_latencies_ms.begin(),
+                    decode_result.token_latencies_ms.end());
                 last_generated_text = decode_result.generated_text;
+                iteration_result.generated_token_ids =
+                    decode_result.generated_token_ids;
                 result.generated_token_ids = std::move(decode_result.generated_token_ids);
                 const PrefixRuntimeStateSnapshot iteration_state =
                     runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+                /* Request reset also resets the runner-owned MTP ledger. Copy
+                 * this request's exact terminal projection before the next
+                 * reset so adaptive placement timing can be normalized by
+                 * verifier work without enabling hot-path instrumentation. */
+                iteration_result.mtp_draft_steps =
+                    iteration_state.mtp_draft_steps;
+                iteration_result.mtp_accepted_tokens =
+                    iteration_state.mtp_accepted_tokens;
+                iteration_result.mtp_rejected_tokens =
+                    iteration_state.mtp_rejected_tokens;
+                iteration_result.mtp_verifier_runs =
+                    iteration_state.mtp_verifier_runs;
+                iteration_result.mtp_verifier_token_count =
+                    iteration_state.mtp_verifier_token_count;
+                iteration_result.moe_runtime_movement_epoch =
+                    runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
                 if (!has_measured_mtp_state)
                 {
                     measured_mtp_state = iteration_state;
@@ -1345,12 +2387,11 @@ namespace llaminar2
                 }
                 logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
-
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
-                                          << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));
-            }
+            captureCompletedDynamicMovement(
+                &iteration_result, dynamic_movement_start, runner_.get());
+            result.iterations.push_back(std::move(iteration_result));
+            LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
+                                      << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));
         }
 
         // ========================================================================
@@ -1372,6 +2413,16 @@ namespace llaminar2
             result.decode_time_ms = avg_decode_time;
             result.decode_tokens = avg_decode_tokens;
             result.decode_tokens_per_sec = (avg_decode_tokens * 1000.0) / avg_decode_time;
+            result.decode_after_prefill_tokens = std::max(
+                0, avg_decode_tokens - decode_request_batch_);
+            result.decode_after_prefill_tokens_per_sec =
+                (static_cast<double>(result.decode_after_prefill_tokens) *
+                 1000.0) /
+                avg_decode_time;
+            result.decode_latency_mean_ms = meanLatencyMs(decode_token_latencies_ms);
+            result.decode_latency_p50_ms = percentileLatencyMs(decode_token_latencies_ms, 0.50);
+            result.decode_latency_p90_ms = percentileLatencyMs(decode_token_latencies_ms, 0.90);
+            result.decode_token_latencies_ms = std::move(decode_token_latencies_ms);
             result.decode_success = true;
             result.generated_text = last_generated_text;
         }
@@ -1381,6 +2432,12 @@ namespace llaminar2
             result.decode_tokens = 0;
             result.decode_time_ms = 0.0;
             result.decode_tokens_per_sec = 0.0;
+            result.decode_after_prefill_tokens = 0;
+            result.decode_after_prefill_tokens_per_sec = 0.0;
+            result.decode_token_latencies_ms.clear();
+            result.decode_latency_mean_ms = 0.0;
+            result.decode_latency_p50_ms = 0.0;
+            result.decode_latency_p90_ms = 0.0;
         }
 
         // Calculate totals
@@ -1388,20 +2445,17 @@ namespace llaminar2
         result.success = result.prefill_success && result.decode_success;
         result.failure_reason.clear();
 
-        if (mpi_ctx_->rank() == 0)
-        {
-            LOG_INFO("Benchmark complete.");
-        }
+        LOG_INFO("Benchmark complete.");
+
+        if (runner_)
+            runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
 
         return capture_and_return();
     }
 
     void BenchmarkRunner::printResults(const BenchmarkResult &result)
     {
-        if (mpi_ctx_->rank() != 0)
-        {
-            return; // Only rank 0 prints
-        }
+        const int measurement_iterations = std::max(1, result.measurement_iterations);
 
         std::print("\n");
 
@@ -1410,7 +2464,7 @@ namespace llaminar2
             fort::utf8_table title;
             title.set_border_style(FT_DOUBLE2_STYLE);
             std::ostringstream title_ss;
-            title_ss << "BENCHMARK RESULTS (average of " << BENCHMARK_ITERATIONS << " runs after warmup)";
+            title_ss << "BENCHMARK RESULTS (average of " << measurement_iterations << " runs after warmup)";
             title << title_ss.str() << fort::endr;
             title[0][0].set_cell_text_align(fort::text_align::center);
             title.row(0).set_cell_row_type(fort::row_type::header);
@@ -1425,6 +2479,15 @@ namespace llaminar2
         table.column(0).set_cell_text_align(fort::text_align::left);
         table.column(1).set_cell_text_align(fort::text_align::left);
         table.column(2).set_cell_text_align(fort::text_align::right);
+
+        // Input identity is deliberately shown without echoing prompt text.
+        table << "INPUT" << "Prompt source"
+              << benchmarkPromptSourceToString(result.prompt_source) << fort::endr;
+        table << "" << "Prompt bytes" << std::to_string(result.prompt_bytes) << fort::endr;
+        if (!result.prompt_file_path.empty())
+            table << "" << "Prompt file" << result.prompt_file_path << fort::endr;
+        if (!result.prompt_sha256.empty())
+            table << "" << "Prompt SHA-256" << result.prompt_sha256 << fort::endr;
 
         // Prefill results
         if (result.prefill_tokens > 0)
@@ -1448,14 +2511,22 @@ namespace llaminar2
         // Decode results
         if (result.decode_tokens > 0)
         {
-            std::ostringstream tokens_ss, time_ss, throughput_ss;
+            std::ostringstream tokens_ss, time_ss, throughput_ss,
+                after_prefill_ss;
             tokens_ss << result.decode_tokens << " tokens";
             time_ss << std::fixed << std::setprecision(2) << result.decode_time_ms << " ms";
             throughput_ss << std::fixed << std::setprecision(2) << result.decode_tokens_per_sec << " tok/s";
+            after_prefill_ss << std::fixed << std::setprecision(2)
+                             << result.decode_after_prefill_tokens_per_sec
+                             << " tok/s ("
+                             << result.decode_after_prefill_tokens
+                             << " tokens)";
 
             table << "DECODE" << "Tokens" << tokens_ss.str() << fort::endr;
             table << "" << "Time" << time_ss.str() << fort::endr;
             table << "" << "Throughput" << throughput_ss.str() << fort::endr;
+            table << "" << "After prefill" << after_prefill_ss.str()
+                  << fort::endr;
         }
         else
         {
@@ -1710,11 +2781,11 @@ namespace llaminar2
             // but result.prefill_time_ms/decode_time_ms are averages.
             // Scale wall clocks and token counts by iteration count so %
             // calculations use the total accumulated wall clock as denominator.
-            uint64_t total_tokens = (result.prefill_tokens + result.decode_tokens) * BENCHMARK_ITERATIONS;
-            double total_prefill_ms = result.prefill_time_ms * BENCHMARK_ITERATIONS;
-            double total_decode_ms = result.decode_time_ms * BENCHMARK_ITERATIONS;
-            uint64_t total_prefill_tokens = result.prefill_tokens * BENCHMARK_ITERATIONS;
-            uint64_t total_decode_tokens = result.decode_tokens * BENCHMARK_ITERATIONS;
+            uint64_t total_tokens = (result.prefill_tokens + result.decode_tokens) * measurement_iterations;
+            double total_prefill_ms = result.prefill_time_ms * measurement_iterations;
+            double total_decode_ms = result.decode_time_ms * measurement_iterations;
+            uint64_t total_prefill_tokens = result.prefill_tokens * measurement_iterations;
+            uint64_t total_decode_tokens = result.decode_tokens * measurement_iterations;
 
             KernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
                                          total_prefill_tokens, total_decode_tokens);
@@ -1744,7 +2815,7 @@ namespace llaminar2
             }
         }
 
-        // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1).
+        // Print the legacy executor table only for LLAMINAR_PROFILE_KERNELS=1.
         // These are host executor timings, not GPU stage timings; graph-captured
         // execution is represented in forward_graph/stage_gpu perf records.
         if (print_legacy_profile_tables && runner_)
@@ -1752,8 +2823,8 @@ namespace llaminar2
             const auto *stats = runner_->executorStats();
             if (stats && stats->total_stages_executed > 0)
             {
-                uint64_t ep_prefill = result.prefill_tokens * BENCHMARK_ITERATIONS;
-                uint64_t ep_decode = result.decode_tokens * BENCHMARK_ITERATIONS;
+                uint64_t ep_prefill = result.prefill_tokens * measurement_iterations;
+                uint64_t ep_decode = result.decode_tokens * measurement_iterations;
                 stats->printProfilingSummary(ep_prefill, ep_decode);
             }
         }
@@ -1778,7 +2849,7 @@ namespace llaminar2
             if (avg_other_us < 0)
                 avg_other_us = 0;
             double decode_wall_ms = result.decode_time_ms;
-            double inter_step_pct = (dlp.inter_step_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0;
+            double inter_step_pct = (dlp.inter_step_total_us / 1000.0 / measurement_iterations) / decode_wall_ms * 100.0;
 
             fort::utf8_table tbl;
             tbl.set_border_style(FT_DOUBLE2_STYLE);
@@ -1788,7 +2859,7 @@ namespace llaminar2
                 s << std::fixed << std::setprecision(1) << avg_sampler_us << " μs";
                 std::ostringstream p;
                 p << std::fixed << std::setprecision(1)
-                  << (dlp.sampler_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0 << "%";
+                  << (dlp.sampler_total_us / 1000.0 / measurement_iterations) / decode_wall_ms * 100.0 << "%";
                 tbl << "  Sampling (argmax)" << s.str() << p.str() << fort::endr;
             }
             {
@@ -1799,7 +2870,7 @@ namespace llaminar2
                 if (other_total_us < 0)
                     other_total_us = 0;
                 p << std::fixed << std::setprecision(1)
-                  << (other_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0 << "%";
+                  << (other_total_us / 1000.0 / measurement_iterations) / decode_wall_ms * 100.0 << "%";
                 tbl << "  Other (broadcast, prep)" << s.str() << p.str() << fort::endr;
             }
             tbl << fort::separator;

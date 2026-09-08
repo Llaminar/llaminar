@@ -16,6 +16,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "fort.hpp"
 
@@ -270,6 +272,8 @@ namespace
                 return result;
 
             ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ScopedGPUStream stream(DeviceId::rocm(0));
+            kernel.setGPUStream(stream.get());
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
@@ -297,7 +301,9 @@ namespace
             {
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(
+                    output,
+                    kernel.requireGPUStream());
 
                 if (gpu_weights.d_weights)
                 {
@@ -327,7 +333,8 @@ namespace
             // Warmup
             for (int i = 0; i < WARMUP_RUNS; ++i)
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-            (void)hipDeviceSynchronize();
+            auto hip_stream = static_cast<hipStream_t>(kernel.requireGPUStream());
+            (void)hipStreamSynchronize(hip_stream);
 
             // Timed runs using HIP events for accurate GPU timing
             hipEvent_t start = nullptr, stop = nullptr;
@@ -339,10 +346,9 @@ namespace
 
             for (int i = 0; i < BENCH_RUNS; ++i)
             {
-                (void)hipDeviceSynchronize();
-                (void)hipEventRecord(start);
+                (void)hipEventRecord(start, hip_stream);
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-                (void)hipEventRecord(stop);
+                (void)hipEventRecord(stop, hip_stream);
                 (void)hipEventSynchronize(stop);
 
                 float ms = 0.0f;
@@ -394,6 +400,8 @@ namespace
                 return result;
 
             ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ScopedGPUStream stream(DeviceId::rocm(0));
+            kernel.setGPUStream(stream.get());
 
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
@@ -422,7 +430,9 @@ namespace
             {
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(
+                    output,
+                    kernel.requireGPUStream());
 
                 if (gpu_weights.d_weights)
                 {
@@ -452,7 +462,8 @@ namespace
             // Warmup
             for (int i = 0; i < WARMUP_RUNS; ++i)
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-            (void)hipDeviceSynchronize();
+            auto hip_stream = static_cast<hipStream_t>(kernel.requireGPUStream());
+            (void)hipStreamSynchronize(hip_stream);
 
             // Timed runs
             hipEvent_t start = nullptr, stop = nullptr;
@@ -464,10 +475,9 @@ namespace
 
             for (int i = 0; i < BENCH_RUNS; ++i)
             {
-                (void)hipDeviceSynchronize();
-                (void)hipEventRecord(start);
+                (void)hipEventRecord(start, hip_stream);
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-                (void)hipEventRecord(stop);
+                (void)hipEventRecord(stop, hip_stream);
                 (void)hipEventSynchronize(stop);
 
                 float ms = 0.0f;

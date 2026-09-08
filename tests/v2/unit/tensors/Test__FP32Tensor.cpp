@@ -11,6 +11,8 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../mocks/MockBackend.h"
+#include "transfer/TransferEngine.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include <memory>
@@ -108,12 +110,20 @@ TEST(Test__FP32Tensor, DataInitialization)
 
 TEST(Test__FP32Tensor, MarkHostDirtyRestoresHostAuthorityAfterDirectWrite)
 {
+    test::MockBackend backend(DeviceType::CUDA);
     FP32Tensor tensor({1, 2});
     float *data = static_cast<float *>(tensor.raw_mutable_data());
     data[0] = 1.0f;
     data[1] = 2.0f;
 
-    tensor.transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::cuda(0));
+    // Publication must describe real residency even in a CPU-only unit test.
+    // MockBackend supplies host-backed simulated CUDA storage, allowing this
+    // test to exercise the authority state machine without touching a GPU.
+    tensor.setBackendForTesting(&backend);
+    ASSERT_TRUE(tensor.allocateOnDevice(DeviceId::cuda(0)));
+    TransferEngine::publishGraphOwnedDeviceWrite(
+        &tensor,
+        DeviceId::cuda(0));
     EXPECT_FALSE(tensor.hostValid());
     EXPECT_TRUE(tensor.needsDownload());
     EXPECT_TRUE(tensor.getAuthoritativeDevice().has_value());
@@ -121,7 +131,7 @@ TEST(Test__FP32Tensor, MarkHostDirtyRestoresHostAuthorityAfterDirectWrite)
     data = static_cast<float *>(tensor.raw_mutable_data());
     data[0] = 3.0f;
     data[1] = 4.0f;
-    tensor.mark_host_dirty();
+    TransferEngine::publishHostWrite(&tensor);
 
     EXPECT_TRUE(tensor.hostValid());
     EXPECT_FALSE(tensor.needsDownload());

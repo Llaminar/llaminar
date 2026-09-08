@@ -124,6 +124,40 @@ namespace llaminar2
             threshold);
     }
 
+    MTPRejectionSampleRowResult sampleMTPSerialEquivalentTargetRow(
+        const std::vector<SamplingDistributionEntry> &target_distribution,
+        int32_t draft_token,
+        float sample_threshold)
+    {
+        if (draft_token < 0)
+            return rejectionSampleFailure(draft_token, "draft token is invalid");
+        if (target_distribution.empty())
+        {
+            return rejectionSampleFailure(
+                draft_token,
+                "target distribution is empty");
+        }
+
+        MTPRejectionSampleRowResult result;
+        result.ok = true;
+        result.draft_token = draft_token;
+        result.accept_threshold =
+            sampling_math::clamp_unit_threshold(sample_threshold);
+        result.token = sampleMTPDistributionWithThreshold(
+            target_distribution,
+            result.accept_threshold);
+        if (result.token < 0)
+        {
+            return rejectionSampleFailure(
+                draft_token,
+                "serial-equivalent target distribution sampling produced no token");
+        }
+
+        result.accepted = result.token == draft_token;
+        result.accept_probability = result.accepted ? 1.0f : 0.0f;
+        return result;
+    }
+
     MTPRejectionSampleRowResult sampleMTPRejectionRowFromDistributions(
         const std::vector<SamplingDistributionEntry> &target_distribution,
         const std::vector<SamplingDistributionEntry> &draft_distribution,
@@ -747,6 +781,8 @@ namespace llaminar2
         device_outcome.consumed_verifier_rows =
             outcome.consumed_verifier_rows;
         device_outcome.sampled_terminal = outcome.sampled_terminal;
+        device_outcome.commit_boundary_clipped =
+            outcome.commit_boundary_clipped;
 
         return buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
             request,
@@ -803,6 +839,43 @@ namespace llaminar2
             return stochasticOutcomeFailure(
                 "device stochastic verifier sampled terminal token is invalid");
         }
+        if (device_outcome.all_speculative_accepted &&
+            !device_outcome.stopped_on_output &&
+            (device_outcome.commit_boundary_clipped ||
+             !device_outcome.sampled_terminal ||
+             device_outcome.ready_token < 0 ||
+             device_outcome.rejected_verified_token >= 0 ||
+             device_outcome.consumed_verifier_rows <= 0 ||
+             device_outcome.output_token_count !=
+                 device_outcome.consumed_verifier_rows + 1 ||
+             device_outcome.accepted_speculative_prefix !=
+                 device_outcome.consumed_verifier_rows ||
+             device_outcome.target_verifier_state_commit_count !=
+                 device_outcome.consumed_verifier_rows + 1))
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier all-accepted active-width outcome is inconsistent");
+        }
+        if (!device_outcome.all_speculative_accepted &&
+            device_outcome.sampled_terminal)
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier non-terminal outcome sampled a terminal ready token");
+        }
+        if (device_outcome.commit_boundary_clipped &&
+            (device_outcome.ready_token < 0 ||
+             device_outcome.sampled_terminal ||
+             device_outcome.all_speculative_accepted ||
+             device_outcome.stopped_on_output ||
+             device_outcome.rejected_verified_token >= 0 ||
+             device_outcome.accepted_speculative_prefix !=
+                 device_outcome.consumed_verifier_rows ||
+             device_outcome.consumed_verifier_rows >=
+                 static_cast<int>(request.draft_tokens.size()) - 1))
+        {
+            return stochasticOutcomeFailure(
+                "device stochastic verifier commit-boundary outcome is inconsistent");
+        }
 
         MTPRejectionBatchOutcome result;
         result.ok = true;
@@ -835,6 +908,8 @@ namespace llaminar2
         result.all_speculative_accepted =
             device_outcome.all_speculative_accepted;
         result.sampled_terminal = device_outcome.sampled_terminal;
+        result.commit_boundary_clipped =
+            device_outcome.commit_boundary_clipped;
         return result;
     }
 

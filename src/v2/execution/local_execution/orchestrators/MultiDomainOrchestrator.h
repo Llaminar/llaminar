@@ -139,6 +139,15 @@ namespace llaminar2
          * @return true if forward succeeded
          */
         bool forward(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::forwardPrefill */
+        bool forwardPrefill(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::forwardRestoredPrefixMTPDecodeBridge */
+        bool forwardRestoredPrefixMTPDecodeBridge(
+            const RestoredPrefixMTPDecodeBridgeRequest &request) override;
+
+        /** @brief Forward the sparse MoE request generation to the owned graph runner. */
+        bool setMoEOverlayCollectiveRequestGeneration(
+            uint64_t generation_id) override;
 
         /**
          * @brief Get logits from last forward pass
@@ -156,6 +165,8 @@ namespace llaminar2
          * @brief Clear KV cache (reset for new sequence)
          */
         void clear_cache() override;
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
 
         /**
          * @brief Get current position in cache

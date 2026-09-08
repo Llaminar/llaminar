@@ -10,19 +10,23 @@
  */
 
 #include "ShmemSpinBackend.h"
+#include "../CollectiveTimeoutPolicy.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstring>    // memcpy
 #include <fcntl.h>    // O_CREAT, O_RDWR
 #include <immintrin.h>
 #include <limits>
 #include <mpi.h>
+#include <omp.h>
 #include <sstream>
 #include <sys/mman.h> // shm_open, mmap, munmap, shm_unlink
 #include <unistd.h>   // ftruncate, close
@@ -32,17 +36,14 @@ namespace llaminar2
     namespace
     {
         constexpr uint64_t kAbortEpoch = std::numeric_limits<uint64_t>::max();
-        constexpr int kDefaultReleaseTimeoutMs = 300000;
         constexpr int kMaxCreateAttempts = 64;
 
         std::atomic<uint64_t> g_shmem_name_counter{0};
 
         int shmemSpinTimeoutMs()
         {
-            const int configured = debugEnv().tp_collect_timeout_ms;
-            if (configured < 0)
-                return 0;
-            return configured > 0 ? configured : kDefaultReleaseTimeoutMs;
+            return collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms);
         }
 
         std::string makeUniqueShmemName(int domain_id)
@@ -58,6 +59,23 @@ namespace llaminar2
                  << "_s" << sequence;
             return name.str();
         }
+
+        /** Return the byte width of one collective element. */
+        size_t collectiveElementSize(CollectiveDataType dtype)
+        {
+            switch (dtype)
+            {
+            case CollectiveDataType::FLOAT32:
+            case CollectiveDataType::INT32:
+                return 4u;
+            case CollectiveDataType::FLOAT16:
+            case CollectiveDataType::BFLOAT16:
+                return 2u;
+            case CollectiveDataType::INT8:
+                return 1u;
+            }
+            return 0u;
+        }
     } // namespace
 
 
@@ -66,8 +84,9 @@ namespace llaminar2
     // =========================================================================
 
     ShmemSpinBackend::ShmemSpinBackend(int domain_id, int my_rank,
-                                       std::unique_ptr<UPICollectiveBackend> fallback)
-        : domain_id_(domain_id), my_rank_(my_rank), fallback_(std::move(fallback))
+                                       std::unique_ptr<UPICollectiveBackend> general_backend)
+        : domain_id_(domain_id), my_rank_(my_rank),
+          general_backend_(std::move(general_backend))
     {
         LOG_DEBUG("ShmemSpinBackend: Created for domain " << domain_id_
                                                           << " rank " << my_rank_);
@@ -94,7 +113,7 @@ namespace llaminar2
 
     bool ShmemSpinBackend::isAvailable() const
     {
-        return arena_ != nullptr && fallback_ && fallback_->isAvailable();
+        return arena_ != nullptr && general_backend_ && general_backend_->isAvailable();
     }
 
     // =========================================================================
@@ -124,13 +143,20 @@ namespace llaminar2
             return false;
         }
 
-        // Initialize fallback backend FIRST — setupSharedMemory() uses
-        // fallback_->synchronize() for inter-rank barriers.
-        if (fallback_ && !fallback_->isInitialized())
+        rooted_publication_element_counts_.assign(
+            static_cast<size_t>(num_ranks_),
+            0u);
+        rooted_publication_element_offsets_.assign(
+            static_cast<size_t>(num_ranks_),
+            0u);
+
+        // Initialize the general backend first because setupSharedMemory() uses
+        // its communicator for one-time construction barriers.
+        if (general_backend_ && !general_backend_->isInitialized())
         {
-            if (!fallback_->initialize(group))
+            if (!general_backend_->initialize(group))
             {
-                last_error_ = "Failed to initialize fallback UPI backend";
+                last_error_ = "Failed to initialize general UPI backend";
                 LOG_ERROR("ShmemSpinBackend::initialize - " << last_error_);
                 return false;
             }
@@ -143,13 +169,14 @@ namespace llaminar2
             return false;
         }
 
+        my_epoch_ = 0;
         abort_requested_.store(false, std::memory_order_release);
         initialized_ = true;
 
         LOG_DEBUG("ShmemSpinBackend initialized: domain=" << domain_id_
                                                           << " rank=" << my_rank_
                                                           << " num_ranks=" << num_ranks_
-                                                          << " max_count=" << ShmemSpinArena::MAX_COUNT
+                                                          << " chunk_capacity=" << ShmemSpinArena::CHUNK_CAPACITY
                                                           << " arena_bytes=" << arena_size_);
         return true;
     }
@@ -169,9 +196,9 @@ namespace llaminar2
         initialized_ = false;
         teardownSharedMemory();
 
-        if (fallback_)
+        if (general_backend_)
         {
-            fallback_->shutdown();
+            general_backend_->shutdown();
         }
 
         LOG_DEBUG("ShmemSpinBackend shutdown: domain=" << domain_id_ << " rank=" << my_rank_);
@@ -182,8 +209,8 @@ namespace llaminar2
         abort_requested_.store(true, std::memory_order_release);
         if (arena_ && my_rank_ >= 0)
             arena_->epoch_at(my_rank_)->epoch.store(kAbortEpoch, std::memory_order_release);
-        if (fallback_)
-            fallback_->abort();
+        if (general_backend_)
+            general_backend_->abort();
     }
 
     // =========================================================================
@@ -199,14 +226,14 @@ namespace llaminar2
 
         arena_size_ = ShmemSpinArena::compute_size(num_ranks_);
 
-        if (!fallback_ || fallback_->domainComm() == MPI_COMM_NULL)
+        if (!general_backend_ || general_backend_->domainComm() == MPI_COMM_NULL)
         {
-            last_error_ = "fallback UPI backend has no domain communicator";
+            last_error_ = "general UPI backend has no domain communicator";
             LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
             return false;
         }
 
-        MPI_Comm comm = fallback_->domainComm();
+        MPI_Comm comm = general_backend_->domainComm();
         int create_success = 1;
         int name_len = 0;
 
@@ -314,14 +341,19 @@ namespace llaminar2
             return false;
         }
 
-        // Rank 0 zero-initializes the arena and writes the header
+        // Rank 0 initializes only metadata. Touching the complete arena here
+        // would place every persistent payload page on NUMA node zero and make
+        // every other socket perform remote writes for the backend's lifetime.
         if (my_rank_ == 0)
         {
-            std::memset(arena_, 0, arena_size_);
+            const size_t metadata_bytes =
+                sizeof(ShmemSpinArena) +
+                static_cast<size_t>(num_ranks_) * sizeof(ShmemSpinArena::EpochSlot);
+            std::memset(arena_, 0, metadata_bytes);
             arena_->num_ranks = num_ranks_;
         }
 
-        // Barrier: ensure zero-init completes before anyone uses it
+        // Publish num_ranks before buffer_at() computes participant offsets.
         if (MPI_Barrier(comm) != MPI_SUCCESS)
         {
             last_error_ = "MPI_Barrier failed after shared-memory initialization";
@@ -330,6 +362,30 @@ namespace llaminar2
             return false;
         }
 
+        // First-touch each rank's payload region from the socket that owns and
+        // writes it during inference. Linux then backs those pages from the
+        // appropriate NUMA node instead of concentrating the arena on rank 0.
+        std::memset(
+            arena_->buffer_at(my_rank_),
+            0,
+            ShmemSpinArena::CHUNK_CAPACITY * sizeof(float));
+
+        if (MPI_Barrier(comm) != MPI_SUCCESS)
+        {
+            last_error_ = "MPI_Barrier failed after shared-memory NUMA first-touch";
+            LOG_ERROR("ShmemSpinBackend::setupSharedMemory - " << last_error_);
+            teardownSharedMemory();
+            return false;
+        }
+
+        /* `initialize()` promises that the public name is gone on return, not
+         * merely that every participant has mapped the segment.  Without the
+         * publication below, a non-root rank can leave this method while rank
+         * zero is still between the preceding barrier and `shm_unlink()`.  A
+         * root-authored broadcast is the exact construction edge: observing a
+         * successful value proves that unlink already completed, while all
+         * open descriptors and mappings continue to own the anonymous object. */
+        int unlink_success = 1;
         if (my_rank_ == 0)
         {
             if (shm_unlink(shm_name_.c_str()) == 0 || errno == ENOENT)
@@ -338,9 +394,30 @@ namespace llaminar2
             }
             else
             {
-                LOG_WARN("ShmemSpinBackend::setupSharedMemory - shm_unlink(" << shm_name_
-                                                                              << ") failed after mmap: " << strerror(errno));
+                unlink_success = 0;
+                last_error_ =
+                    "shm_unlink failed after every rank mapped " +
+                    shm_name_ + ": " + std::string(strerror(errno));
             }
+        }
+        if (MPI_Bcast(&unlink_success, 1, MPI_INT, 0, comm) != MPI_SUCCESS)
+        {
+            last_error_ =
+                "MPI_Bcast failed while publishing shared-memory unlink completion";
+            teardownSharedMemory();
+            return false;
+        }
+        if (!unlink_success)
+        {
+            if (my_rank_ != 0)
+            {
+                last_error_ =
+                    "rank 0 failed to unlink shared-memory arena after every rank mapped it";
+            }
+            LOG_ERROR(
+                "ShmemSpinBackend::setupSharedMemory - " << last_error_);
+            teardownSharedMemory();
+            return false;
         }
 
         LOG_DEBUG("ShmemSpinBackend: Shared memory mapped at " << ptr
@@ -387,10 +464,13 @@ namespace llaminar2
     // Fast-Path Check
     // =========================================================================
 
-    bool ShmemSpinBackend::isFastPath(size_t count, CollectiveDataType dtype,
-                                      CollectiveOp op) const
+    bool ShmemSpinBackend::usesSharedMemoryAllreduce(
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op) const
     {
-        if (op != CollectiveOp::ALLREDUCE_SUM || count > ShmemSpinArena::MAX_COUNT)
+        (void)count;
+        if (op != CollectiveOp::ALLREDUCE_SUM)
             return false;
 
         switch (dtype)
@@ -472,10 +552,13 @@ namespace llaminar2
             return false;
         }
 
-        // Fast path: SUM with count within shared buffer capacity
-        if (isFastPath(count, dtype, op))
+        // The native SUM path is total over payload size. Large tensors are
+        // reduced in bounded chunks so geometry never selects a different
+        // protocol merely because it crossed an arena-size threshold.
+        if (usesSharedMemoryAllreduce(count, dtype, op))
         {
-            // Element size depends on dtype (isFastPath gates to these three)
+            // Element size depends on dtype; the support predicate admits only
+            // these three representations.
             size_t elem_size;
             switch (dtype)
             {
@@ -487,107 +570,226 @@ namespace llaminar2
                 elem_size = sizeof(uint16_t);
                 break;
             default:
-                LLAMINAR_UNREACHABLE("isFastPath passed unsupported dtype");
+                LLAMINAR_UNREACHABLE("shared-memory allreduce passed unsupported dtype");
             }
 
-            // 1. Stage my data into shared memory
-            std::memcpy(arena_->buffer_at(my_rank_), buffer, count * elem_size);
-
-            // 2. Increment and signal ready (store-release)
-            my_epoch_++;
-            arena_->epoch_at(my_rank_)->epoch.store(my_epoch_, std::memory_order_release);
-
-            // 3. Spin-wait for ALL peers (load-acquire)
-            for (int r = 0; r < num_ranks_; ++r)
+            if (count == 0 || num_ranks_ == 1)
+                return true;
+            if (!buffer)
             {
-                if (r == my_rank_)
-                    continue;
-                if (!waitForPeerEpoch(r, my_epoch_, "entering allreduce fast path", count))
-                    return false;
+                last_error_ = "Shared-memory allreduce received a null non-empty payload";
+                LOG_ERROR("ShmemSpinBackend::allreduce - " << last_error_);
+                return false;
             }
 
-            // 4. N-way reduce: accumulate all rank buffers
-            if (num_ranks_ == 1)
-            {
-                // Trivial: just copy our own buffer back
-                std::memcpy(buffer, arena_->buffer_at(0), count * elem_size);
-            }
-            else
-            {
+            auto *payload = static_cast<std::byte *>(buffer);
+            const auto publish_epoch = [&](const char *phase,
+                                           size_t chunk_count) {
+                ++my_epoch_;
+                arena_->epoch_at(my_rank_)->epoch.store(
+                    my_epoch_,
+                    std::memory_order_release);
+                for (int rank = 0; rank < num_ranks_; ++rank)
+                {
+                    if (rank == my_rank_)
+                        continue;
+                    if (!waitForPeerEpoch(
+                            rank,
+                            my_epoch_,
+                            phase,
+                            chunk_count))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            const auto reduce_range = [&](
+                                          void *chunk_output,
+                                          size_t range_begin,
+                                          size_t range_count) {
                 switch (dtype)
                 {
                 case CollectiveDataType::FLOAT32:
                 {
-                    auto *out = static_cast<float *>(buffer);
-                    reduce(out, arena_->buffer_at(0), arena_->buffer_at(1), count);
-                    for (int r = 2; r < num_ranks_; ++r)
-                        reduce(out, out, arena_->buffer_at(r), count);
-                    break;
+                    auto *out = static_cast<float *>(chunk_output) + range_begin;
+                    reduce(
+                        out,
+                        arena_->buffer_at(0) + range_begin,
+                        arena_->buffer_at(1) + range_begin,
+                        range_count);
+                    for (int rank = 2; rank < num_ranks_; ++rank)
+                    {
+                        reduce(
+                            out,
+                            out,
+                            arena_->buffer_at(rank) + range_begin,
+                            range_count);
+                    }
+                    return;
                 }
                 case CollectiveDataType::FLOAT16:
                 {
-                    auto *out = static_cast<uint16_t *>(buffer);
-                    const auto *buf0 = reinterpret_cast<const uint16_t *>(arena_->buffer_at(0));
-                    const auto *buf1 = reinterpret_cast<const uint16_t *>(arena_->buffer_at(1));
-                    reduce_fp16(out, buf0, buf1, count);
-                    for (int r = 2; r < num_ranks_; ++r)
+                    auto *out = static_cast<uint16_t *>(chunk_output) + range_begin;
+                    const auto *buffer0 =
+                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(0)) + range_begin;
+                    const auto *buffer1 =
+                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(1)) + range_begin;
+                    reduce_fp16(out, buffer0, buffer1, range_count);
+                    for (int rank = 2; rank < num_ranks_; ++rank)
                     {
-                        const auto *bufr = reinterpret_cast<const uint16_t *>(arena_->buffer_at(r));
-                        reduce_fp16(out, out, bufr, count);
+                        const auto *rank_buffer =
+                            reinterpret_cast<const uint16_t *>(arena_->buffer_at(rank)) + range_begin;
+                        reduce_fp16(out, out, rank_buffer, range_count);
                     }
-                    break;
+                    return;
                 }
                 case CollectiveDataType::BFLOAT16:
                 {
-                    auto *out = static_cast<uint16_t *>(buffer);
-                    const auto *buf0 = reinterpret_cast<const uint16_t *>(arena_->buffer_at(0));
-                    const auto *buf1 = reinterpret_cast<const uint16_t *>(arena_->buffer_at(1));
-                    reduce_bf16(out, buf0, buf1, count);
-                    for (int r = 2; r < num_ranks_; ++r)
+                    auto *out = static_cast<uint16_t *>(chunk_output) + range_begin;
+                    const auto *buffer0 =
+                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(0)) + range_begin;
+                    const auto *buffer1 =
+                        reinterpret_cast<const uint16_t *>(arena_->buffer_at(1)) + range_begin;
+                    reduce_bf16(out, buffer0, buffer1, range_count);
+                    for (int rank = 2; rank < num_ranks_; ++rank)
                     {
-                        const auto *bufr = reinterpret_cast<const uint16_t *>(arena_->buffer_at(r));
-                        reduce_bf16(out, out, bufr, count);
+                        const auto *rank_buffer =
+                            reinterpret_cast<const uint16_t *>(arena_->buffer_at(rank)) + range_begin;
+                        reduce_bf16(out, out, rank_buffer, range_count);
                     }
-                    break;
+                    return;
                 }
                 default:
-                    break; // unreachable — isFastPath guards this
+                    LLAMINAR_UNREACHABLE(
+                        "shared-memory allreduce reduction reached unsupported dtype");
                 }
-            }
+            };
 
-            // 5. Read-completion barrier: ensure all ranks finished reducing
-            //    before any rank re-enters and overwrites arena buffers.
-            my_epoch_++;
-            arena_->epoch_at(my_rank_)->epoch.store(my_epoch_, std::memory_order_release);
-            for (int r = 0; r < num_ranks_; ++r)
+            constexpr size_t kParallelThresholdElements = 64u * 1024u;
+            constexpr size_t kWorkSliceElements = 16u * 1024u;
+            const bool parallelize =
+                count >= kParallelThresholdElements && omp_in_parallel() == 0;
+
+            if (parallelize)
             {
-                if (r == my_rank_)
-                    continue;
-                if (!waitForPeerEpoch(r, my_epoch_, "leaving allreduce fast path", count))
-                    return false;
+                bool protocol_ok = true;
+#pragma omp parallel shared(payload, protocol_ok)
+                {
+                    for (size_t chunk_offset = 0;
+                         chunk_offset < count && protocol_ok;)
+                    {
+                        const size_t chunk_count = std::min(
+                            ShmemSpinArena::CHUNK_CAPACITY,
+                            count - chunk_offset);
+                        void *chunk_output = payload + chunk_offset * elem_size;
+                        const size_t work_slices =
+                            (chunk_count + kWorkSliceElements - 1u) /
+                            kWorkSliceElements;
+
+#pragma omp for schedule(static)
+                        for (size_t slice = 0; slice < work_slices; ++slice)
+                        {
+                            const size_t range_begin = slice * kWorkSliceElements;
+                            const size_t range_count = std::min(
+                                kWorkSliceElements,
+                                chunk_count - range_begin);
+                            std::memcpy(
+                                reinterpret_cast<std::byte *>(arena_->buffer_at(my_rank_)) +
+                                    range_begin * elem_size,
+                                static_cast<std::byte *>(chunk_output) +
+                                    range_begin * elem_size,
+                                range_count * elem_size);
+                        }
+
+#pragma omp master
+                        {
+                            protocol_ok = publish_epoch(
+                                "entering parallel chunked allreduce",
+                                chunk_count);
+                        }
+#pragma omp barrier
+
+                        if (protocol_ok)
+                        {
+#pragma omp for schedule(static)
+                            for (size_t slice = 0; slice < work_slices; ++slice)
+                            {
+                                const size_t range_begin = slice * kWorkSliceElements;
+                                const size_t range_count = std::min(
+                                    kWorkSliceElements,
+                                    chunk_count - range_begin);
+                                reduce_range(
+                                    chunk_output,
+                                    range_begin,
+                                    range_count);
+                            }
+                        }
+
+                        // No participant may overwrite its sole staging buffer
+                        // until every peer has completed the reduction reads.
+#pragma omp master
+                        {
+                            if (protocol_ok)
+                            {
+                                protocol_ok = publish_epoch(
+                                    "leaving parallel chunked allreduce",
+                                    chunk_count);
+                            }
+                        }
+#pragma omp barrier
+
+                        chunk_offset += chunk_count;
+                    }
+                }
+
+                return protocol_ok;
             }
 
+            for (size_t chunk_offset = 0; chunk_offset < count;)
+            {
+                const size_t chunk_count = std::min(
+                    ShmemSpinArena::CHUNK_CAPACITY,
+                    count - chunk_offset);
+                void *chunk_output = payload + chunk_offset * elem_size;
+                std::memcpy(
+                    arena_->buffer_at(my_rank_),
+                    chunk_output,
+                    chunk_count * elem_size);
+                if (!publish_epoch(
+                        "entering chunked allreduce",
+                        chunk_count))
+                    return false;
+
+                reduce_range(chunk_output, 0, chunk_count);
+                if (!publish_epoch(
+                        "leaving chunked allreduce",
+                        chunk_count))
+                    return false;
+                chunk_offset += chunk_count;
+            }
             return true;
         }
 
-        // Fallback to MPI for non-fast-path operations
-        if (fallback_)
+        // Other collective semantics are implemented by the general UPI backend.
+        if (general_backend_)
         {
-            return fallback_->allreduce(buffer, count, dtype, op);
+            return general_backend_->allreduce(buffer, count, dtype, op);
         }
 
-        last_error_ = "No fallback backend for non-fast-path allreduce";
+        last_error_ = "No general backend for non-SUM allreduce";
         return false;
     }
 
     bool ShmemSpinBackend::allgather(const void *send_buf, void *recv_buf,
                                      size_t send_count, CollectiveDataType dtype)
     {
-        if (fallback_)
+        if (general_backend_)
         {
-            return fallback_->allgather(send_buf, recv_buf, send_count, dtype);
+            return general_backend_->allgather(send_buf, recv_buf, send_count, dtype);
         }
-        last_error_ = "No fallback backend for allgather";
+        last_error_ = "No general backend for allgather";
         return false;
     }
 
@@ -597,12 +799,12 @@ namespace llaminar2
                                       const std::vector<int> &displacements,
                                       CollectiveDataType dtype)
     {
-        if (fallback_)
+        if (general_backend_)
         {
-            return fallback_->allgatherv(send_buf, send_count, recv_buf,
-                                         recv_counts, displacements, dtype);
+            return general_backend_->allgatherv(send_buf, send_count, recv_buf,
+                                                recv_counts, displacements, dtype);
         }
-        last_error_ = "No fallback backend for allgatherv";
+        last_error_ = "No general backend for allgatherv";
         return false;
     }
 
@@ -610,32 +812,390 @@ namespace llaminar2
                                          size_t recv_count, CollectiveDataType dtype,
                                          CollectiveOp op)
     {
-        if (fallback_)
+        if (general_backend_)
         {
-            return fallback_->reduceScatter(send_buf, recv_buf, recv_count, dtype, op);
+            return general_backend_->reduceScatter(send_buf, recv_buf, recv_count, dtype, op);
         }
-        last_error_ = "No fallback backend for reduceScatter";
+        last_error_ = "No general backend for reduceScatter";
         return false;
+    }
+
+    bool ShmemSpinBackend::gatherVariableFloatRecordsToRoot(
+        const float *local_records,
+        size_t local_record_count,
+        float *root_records,
+        size_t root_record_capacity,
+        size_t record_width_elements,
+        int root_rank,
+        size_t &gathered_record_count)
+    {
+        gathered_record_count = 0u;
+        if (abort_requested_.load(std::memory_order_acquire))
+        {
+            last_error_ = "ShmemSpinBackend abort has been requested";
+            return false;
+        }
+        if (!initialized_ || !arena_ || num_ranks_ <= 1 || root_rank < 0 ||
+            root_rank >= num_ranks_ || my_rank_ < 0 ||
+            my_rank_ >= num_ranks_ || record_width_elements == 0u ||
+            root_record_capacity == 0u ||
+            local_record_count > root_record_capacity ||
+            (local_record_count > 0u && !local_records) ||
+            (my_rank_ == root_rank && !root_records) ||
+            rooted_publication_element_counts_.size() !=
+                static_cast<size_t>(num_ranks_) ||
+            rooted_publication_element_offsets_.size() !=
+                static_cast<size_t>(num_ranks_) ||
+            root_record_capacity >
+                std::numeric_limits<size_t>::max() / record_width_elements ||
+            local_record_count >
+                std::numeric_limits<size_t>::max() / record_width_elements)
+        {
+            last_error_ =
+                "invalid shared-memory rooted packed-record contract";
+            LOG_ERROR("ShmemSpinBackend::gatherVariableFloatRecordsToRoot - "
+                      << last_error_ << " domain=" << domain_id_
+                      << " rank=" << my_rank_ << "/" << num_ranks_
+                      << " root=" << root_rank
+                      << " local_records=" << local_record_count
+                      << " capacity=" << root_record_capacity
+                      << " record_width=" << record_width_elements);
+            return false;
+        }
+
+        const size_t local_elements =
+            local_record_count * record_width_elements;
+        auto *const my_slot = arena_->epoch_at(my_rank_);
+
+        /*
+         * The size publication is a transaction header. Every participant
+         * waits for every header before computing the common chunk count, so
+         * ranks with no local routes still execute exactly the same epoch DAG.
+         */
+        my_slot->payload_elements.store(
+            static_cast<uint64_t>(local_elements),
+            std::memory_order_relaxed);
+        ++my_epoch_;
+        my_slot->epoch.store(my_epoch_, std::memory_order_release);
+        for (int rank = 0; rank < num_ranks_; ++rank)
+        {
+            if (rank == my_rank_)
+                continue;
+            if (!waitForPeerEpoch(
+                    rank,
+                    my_epoch_,
+                    "publishing rooted packed-record sizes",
+                    local_elements))
+            {
+                return false;
+            }
+        }
+
+        size_t total_elements = 0u;
+        size_t maximum_participant_elements = 0u;
+        for (int rank = 0; rank < num_ranks_; ++rank)
+        {
+            const uint64_t rank_elements_u64 =
+                arena_->epoch_at(rank)->payload_elements.load(
+                    std::memory_order_relaxed);
+            if (rank_elements_u64 >
+                static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+            {
+                last_error_ =
+                    "rooted packed-record element count exceeds size_t";
+                LOG_ERROR("ShmemSpinBackend::gatherVariableFloatRecordsToRoot - "
+                          << last_error_ << " source=" << rank);
+                abort();
+                return false;
+            }
+            const size_t rank_elements =
+                static_cast<size_t>(rank_elements_u64);
+            if (rank_elements % record_width_elements != 0u ||
+                rank_elements >
+                    root_record_capacity * record_width_elements -
+                        total_elements)
+            {
+                last_error_ =
+                    "rooted packed-record sizes are malformed or exceed capacity";
+                LOG_ERROR("ShmemSpinBackend::gatherVariableFloatRecordsToRoot - "
+                          << last_error_ << " source=" << rank
+                          << " source_elements=" << rank_elements
+                          << " accumulated_elements=" << total_elements
+                          << " capacity_elements="
+                          << root_record_capacity * record_width_elements);
+                abort();
+                return false;
+            }
+            rooted_publication_element_counts_[static_cast<size_t>(rank)] =
+                rank_elements;
+            total_elements += rank_elements;
+            maximum_participant_elements =
+                std::max(maximum_participant_elements, rank_elements);
+        }
+
+        /*
+         * Close the transaction-header lifetime before any participant may
+         * return or publish the next header. The first epoch above proves that
+         * every count is available; this second epoch proves that every rank
+         * has consumed every count. Both edges are required because the count
+         * field is a single persistent slot rather than an epoch-indexed ring.
+         *
+         * This is especially important for an all-empty transaction. Such a
+         * transaction has no payload chunk whose ready/consumed handshake could
+         * otherwise delay slot reuse. Without this explicit consumed edge, a
+         * fast participant can publish transaction N+1 while a slower root is
+         * still reading transaction N and the root can observe a stale/future
+         * count under an epoch that it has already acquired.
+         */
+        ++my_epoch_;
+        my_slot->epoch.store(my_epoch_, std::memory_order_release);
+        for (int rank = 0; rank < num_ranks_; ++rank)
+        {
+            if (rank == my_rank_)
+                continue;
+            if (!waitForPeerEpoch(
+                    rank,
+                    my_epoch_,
+                    "retiring rooted packed-record size headers",
+                    total_elements))
+            {
+                return false;
+            }
+        }
+
+        /* Root's contribution is always the first packed block. */
+        size_t next_offset =
+            rooted_publication_element_counts_[
+                static_cast<size_t>(root_rank)];
+        rooted_publication_element_offsets_[static_cast<size_t>(root_rank)] = 0u;
+        for (int rank = 0; rank < num_ranks_; ++rank)
+        {
+            if (rank == root_rank)
+                continue;
+            rooted_publication_element_offsets_[static_cast<size_t>(rank)] =
+                next_offset;
+            next_offset +=
+                rooted_publication_element_counts_[static_cast<size_t>(rank)];
+        }
+        if (next_offset != total_elements)
+        {
+            last_error_ = "rooted packed-record offset construction diverged";
+            LOG_ERROR("ShmemSpinBackend::gatherVariableFloatRecordsToRoot - "
+                      << last_error_ << " offsets=" << next_offset
+                      << " elements=" << total_elements);
+            abort();
+            return false;
+        }
+
+        if (my_rank_ == root_rank && local_elements > 0u &&
+            local_records != root_records)
+        {
+            std::memmove(
+                root_records,
+                local_records,
+                local_elements * sizeof(float));
+        }
+
+        for (size_t chunk_offset = 0u;
+             chunk_offset < maximum_participant_elements;
+             chunk_offset += ShmemSpinArena::CHUNK_CAPACITY)
+        {
+            const size_t my_chunk_elements =
+                chunk_offset < local_elements
+                    ? std::min(
+                          ShmemSpinArena::CHUNK_CAPACITY,
+                          local_elements - chunk_offset)
+                    : 0u;
+            if (my_rank_ != root_rank && my_chunk_elements > 0u)
+            {
+                std::memcpy(
+                    arena_->buffer_at(my_rank_),
+                    local_records + chunk_offset,
+                    my_chunk_elements * sizeof(float));
+            }
+
+            ++my_epoch_;
+            my_slot->epoch.store(my_epoch_, std::memory_order_release);
+            if (my_rank_ == root_rank)
+            {
+                for (int rank = 0; rank < num_ranks_; ++rank)
+                {
+                    if (rank == root_rank)
+                        continue;
+                    if (!waitForPeerEpoch(
+                            rank,
+                            my_epoch_,
+                            "waiting for a packed-record chunk",
+                            total_elements))
+                    {
+                        return false;
+                    }
+                }
+
+                for (int rank = 0; rank < num_ranks_; ++rank)
+                {
+                    if (rank == root_rank)
+                        continue;
+                    const size_t rank_elements =
+                        rooted_publication_element_counts_[
+                            static_cast<size_t>(rank)];
+                    const size_t rank_chunk_elements =
+                        chunk_offset < rank_elements
+                            ? std::min(
+                                  ShmemSpinArena::CHUNK_CAPACITY,
+                                  rank_elements - chunk_offset)
+                            : 0u;
+                    if (rank_chunk_elements == 0u)
+                        continue;
+                    std::memcpy(
+                        root_records +
+                            rooted_publication_element_offsets_[
+                                static_cast<size_t>(rank)] +
+                            chunk_offset,
+                        arena_->buffer_at(rank),
+                        rank_chunk_elements * sizeof(float));
+                }
+
+                // Release every peer to reuse its sole staging buffer.
+                ++my_epoch_;
+                my_slot->epoch.store(my_epoch_, std::memory_order_release);
+            }
+            else
+            {
+                const uint64_t consumed_epoch = my_epoch_ + 1u;
+                if (!waitForPeerEpoch(
+                        root_rank,
+                        consumed_epoch,
+                        "waiting for root to consume a packed-record chunk",
+                        my_chunk_elements))
+                {
+                    return false;
+                }
+                ++my_epoch_;
+                my_slot->epoch.store(my_epoch_, std::memory_order_release);
+            }
+        }
+
+        /*
+         * Root waits for the final peer acknowledgement so successful return
+         * means the complete transaction, not merely root's local copy, is done.
+         */
+        if (my_rank_ == root_rank && maximum_participant_elements > 0u)
+        {
+            for (int rank = 0; rank < num_ranks_; ++rank)
+            {
+                if (rank == root_rank)
+                    continue;
+                if (!waitForPeerEpoch(
+                        rank,
+                        my_epoch_,
+                        "completing rooted packed-record publication",
+                        total_elements))
+                {
+                    return false;
+                }
+            }
+        }
+
+        if (my_rank_ == root_rank)
+            gathered_record_count = total_elements / record_width_elements;
+        return true;
     }
 
     bool ShmemSpinBackend::broadcast(void *buffer, size_t count,
                                      CollectiveDataType dtype, int root_rank)
     {
-        if (fallback_)
+        if (abort_requested_.load(std::memory_order_acquire))
         {
-            return fallback_->broadcast(buffer, count, dtype, root_rank);
+            last_error_ = "ShmemSpinBackend abort has been requested";
+            return false;
         }
-        last_error_ = "No fallback backend for broadcast";
-        return false;
+        const size_t element_size = collectiveElementSize(dtype);
+        if (!initialized_ || !arena_ || root_rank < 0 ||
+            root_rank >= num_ranks_ || my_rank_ < 0 ||
+            my_rank_ >= num_ranks_ || element_size == 0u ||
+            (count > 0u && !buffer) ||
+            count > std::numeric_limits<size_t>::max() / element_size)
+        {
+            last_error_ = "invalid native shared-memory broadcast contract";
+            LOG_ERROR("ShmemSpinBackend::broadcast - " << last_error_
+                      << " domain=" << domain_id_
+                      << " rank=" << my_rank_ << "/" << num_ranks_
+                      << " root=" << root_rank << " count=" << count
+                      << " element_size=" << element_size);
+            return false;
+        }
+        if (count == 0u || num_ranks_ == 1)
+            return true;
+
+        constexpr size_t kArenaBytes =
+            ShmemSpinArena::CHUNK_CAPACITY * sizeof(float);
+        const size_t chunk_capacity_elements = kArenaBytes / element_size;
+        auto *const payload = static_cast<std::byte *>(buffer);
+        auto *const root_staging = reinterpret_cast<std::byte *>(
+            arena_->buffer_at(root_rank));
+        auto *const my_slot = arena_->epoch_at(my_rank_);
+
+        for (size_t chunk_offset = 0u; chunk_offset < count;)
+        {
+            const size_t chunk_elements = std::min(
+                chunk_capacity_elements,
+                count - chunk_offset);
+            const size_t chunk_bytes = chunk_elements * element_size;
+            const size_t byte_offset = chunk_offset * element_size;
+            const uint64_t transaction_epoch = my_epoch_ + 1u;
+
+            if (my_rank_ == root_rank)
+            {
+                std::memcpy(
+                    root_staging,
+                    payload + byte_offset,
+                    chunk_bytes);
+                ++my_epoch_;
+                my_slot->epoch.store(my_epoch_, std::memory_order_release);
+                for (int rank = 0; rank < num_ranks_; ++rank)
+                {
+                    if (rank == root_rank)
+                        continue;
+                    if (!waitForPeerEpoch(
+                            rank,
+                            transaction_epoch,
+                            "waiting for shared-memory broadcast consumption",
+                            chunk_elements))
+                    {
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                if (!waitForPeerEpoch(
+                        root_rank,
+                        transaction_epoch,
+                        "waiting for shared-memory broadcast publication",
+                        chunk_elements))
+                {
+                    return false;
+                }
+                std::memcpy(
+                    payload + byte_offset,
+                    root_staging,
+                    chunk_bytes);
+                ++my_epoch_;
+                my_slot->epoch.store(my_epoch_, std::memory_order_release);
+            }
+            chunk_offset += chunk_elements;
+        }
+        return true;
     }
 
     bool ShmemSpinBackend::synchronize()
     {
-        if (fallback_)
+        if (general_backend_)
         {
-            return fallback_->synchronize();
+            return general_backend_->synchronize();
         }
-        // Without fallback, use epoch-based N-way barrier
+        // Without a general backend, use the native epoch-based N-way barrier.
         if (!arena_)
         {
             return false;

@@ -15,6 +15,7 @@
 #include "../../../tensors/BlockStructures.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <vector>
 #include <cmath>
@@ -72,6 +73,40 @@ namespace llaminar2
         return total_elements >= MIN_ELEMENTS_FOR_PARALLEL;
     }
 
+    /**
+     * @brief Record one economical runtime-M RMSNorm invocation.
+     *
+     * RMSNorm has no cross-row arithmetic dependency, so its production grouped
+     * implementation accepts every positive runtime row count in one API call.
+     * Small verifier groups walk cache-resident rows on the caller thread, while
+     * larger groups distribute complete rows through one OpenMP workshare. The
+     * counter deliberately omits M=1 serial witnesses so integration tests can
+     * prove that an M>=2 request entered the grouped implementation exactly once.
+     */
+    inline void record_grouped_rmsnorm_call(const char *input_format,
+                                            const char *output_format,
+                                            int rows,
+                                            int cols)
+    {
+        if (rows < 2)
+            return;
+
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_rmsnorm_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            "cpu",
+            {{"input_format", input_format},
+             {"output_format", output_format},
+             {"verifier_rows", std::to_string(rows)},
+             {"hidden_dim", std::to_string(cols)},
+             {"row_schedule", want_parallel(rows, static_cast<size_t>(cols))
+                                  ? "openmp_rows"
+                                  : "cache_serial_rows"},
+             {"invocation_policy", "single_grouped_call"}});
+    }
+
     inline void rmsnorm_fused_row_best(
         const float *input,
         const float *gamma,
@@ -123,6 +158,7 @@ namespace llaminar2
             static_cast<size_t>(cols),
             epsilon);
 
+        record_grouped_rmsnorm_call("fp32", "fp32", rows, cols);
         return true;
     }
 
@@ -281,6 +317,7 @@ namespace llaminar2
             }
         }
 
+        record_grouped_rmsnorm_call("bf16", "bf16", rows, cols);
         return true;
     }
 
@@ -445,6 +482,7 @@ namespace llaminar2
             }
         }
 
+        record_grouped_rmsnorm_call("fp16", "fp16", rows, cols);
         return true;
     }
 
@@ -568,6 +606,7 @@ namespace llaminar2
             static_cast<size_t>(rows), blocks_per_row,
             epsilon, opts);
 
+        record_grouped_rmsnorm_call("q8_1", "q8_1", rows, cols);
         return true;
 #else
         const bool use_parallel = want_parallel(rows, ucols);
@@ -622,6 +661,7 @@ namespace llaminar2
             }
         }
 
+        record_grouped_rmsnorm_call("q8_1", "q8_1", rows, cols);
         return true;
 #endif
     }
@@ -795,6 +835,7 @@ namespace llaminar2
             static_cast<size_t>(rows), ucols,
             epsilon, opts);
 
+        record_grouped_rmsnorm_call("q16_1", "fp32", rows, cols);
         return true;
     }
 

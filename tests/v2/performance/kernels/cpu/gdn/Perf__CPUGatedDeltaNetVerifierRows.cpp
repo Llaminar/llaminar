@@ -1,32 +1,35 @@
 /**
  * @file Perf__CPUGatedDeltaNetVerifierRows.cpp
- * @brief Synthetic CPU GDN verifier-row microbenchmark for Phase 9.8.
+ * @brief Production-shaped CPU GDN grouped-verifier economy benchmark.
  *
- * The dense Qwen3.6 verifier replay is the production proof, but it is too
- * heavy for kernel iteration.  This benchmark isolates the Gated Delta Net
- * recurrence contract that MTP all-position publication depends on:
+ * This harness compares one grouped merged-QKV verifier transaction with the
+ * exact production M=1 merged-QKV recurrence repeated in serial row order.  It
+ * includes direct post-row snapshot materialization because it is required by
+ * MTP state commitment. The optimized verifier writes recurrence results into
+ * those slots directly, so no speculative clone or post-row copy is permitted.
+ * Vector construction, input generation, capacity growth, and state reset stay
+ * outside canonical timing samples.
  *
- * - grouped verifier rows must publish the same post-row states as explicit
- *   serial decode;
- * - M=2,3,4 must all be covered because those are the draft depths used by the
- *   dynamic depth controller;
- * - numerical checks use cosine, relative L2, symmetric KL, and max absolute
- *   error so an optimization cannot hide behind a single loose metric.
+ * Correctness is a byte contract.  Every grouped output row and every published
+ * recurrence-state snapshot must match the corresponding production M=1 row.
+ * The default inventory contains M=1 as a control, every supported MTP verifier
+ * row count, and the canonical extended runtime-M probes.
  */
 
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <iostream>
 #include <limits>
-#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -35,314 +38,417 @@ using namespace llaminar2;
 
 namespace
 {
-    struct VectorMetrics
-    {
-        double cosine = 0.0;
-        double relative_l2 = 0.0;
-        double symmetric_kl = 0.0;
-        double max_abs = 0.0;
-    };
-
+    /** @brief Timing and geometry evidence emitted for one runtime-M case. */
     struct BenchmarkResult
     {
         int rows = 0;
+        int n_k_heads = 0;
         int n_heads = 0;
         int d_k = 0;
         int d_v = 0;
         double grouped_ms = 0.0;
         double serial_ms = 0.0;
         double speedup = 0.0;
-        VectorMetrics output_metrics;
-        VectorMetrics state_metrics;
     };
 
+    /** @brief Parse one strictly positive integer environment override. */
     int envInt(const char *name, int fallback)
     {
         const char *raw = std::getenv(name);
         if (!raw || !*raw)
             return fallback;
+
         char *end = nullptr;
         const long parsed = std::strtol(raw, &end, 10);
-        if (end == raw || parsed <= 0)
+        if (end == raw || *end != '\0' || parsed <= 0 ||
+            parsed > std::numeric_limits<int>::max())
+        {
             return fallback;
+        }
         return static_cast<int>(parsed);
     }
 
+    /** @brief Parse one strictly positive floating-point environment override. */
     double envDouble(const char *name, double fallback)
     {
         const char *raw = std::getenv(name);
         if (!raw || !*raw)
             return fallback;
+
         char *end = nullptr;
         const double parsed = std::strtod(raw, &end);
-        if (end == raw || parsed <= 0.0)
+        if (end == raw || *end != '\0' || parsed <= 0.0)
             return fallback;
         return parsed;
     }
 
+    /**
+     * @brief Select runtime-M cases without imposing an artificial upper bound.
+     *
+     * An explicit comma-separated override is useful for profiler runs.  The
+     * ordinary benchmark uses the shared complete verifier inventory, preceded
+     * by M=1 so the serial boundary remains visible.
+     */
     std::vector<int> envRows()
     {
         const char *raw = std::getenv("LLAMINAR_CPU_GDN_VERIFIER_M");
         if (!raw || !*raw)
-            return {2, 3, 4};
+        {
+            std::vector<int> rows = {1};
+            rows.insert(
+                rows.end(),
+                test::kGroupedVerifierRuntimeRows.begin(),
+                test::kGroupedVerifierRuntimeRows.end());
+            return rows;
+        }
 
         std::vector<int> rows;
-        std::stringstream ss(raw);
+        std::stringstream stream(raw);
         std::string token;
-        while (std::getline(ss, token, ','))
+        while (std::getline(stream, token, ','))
         {
-            const int value = std::atoi(token.c_str());
-            if (value >= 1 && value <= 4)
-                rows.push_back(value);
+            char *end = nullptr;
+            const long parsed = std::strtol(token.c_str(), &end, 10);
+            if (end != token.c_str() && *end == '\0' && parsed > 0 &&
+                parsed <= std::numeric_limits<int>::max())
+            {
+                rows.push_back(static_cast<int>(parsed));
+            }
         }
+
         if (rows.empty())
-            rows = {2, 3, 4};
+            rows = {1, 2, 3, 4, 8, 15, 16};
         std::sort(rows.begin(), rows.end());
         rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
         return rows;
     }
 
     /**
-     * @brief Symmetric KL after softmax-normalizing arbitrary vectors.
-     *
-     * GDN recurrence states are signed, so KL is undefined on the raw values.
-     * We softmax both vectors and compare the resulting distributions.  This is
-     * intentionally diagnostic rather than a replacement for cosine/L2.
+     * @brief Report the first FP32 mismatch after an exact byte comparison.
      */
-    double symmetricSoftmaxKL(const float *a, const float *b, size_t count)
+    void expectByteExact(
+        const float *actual,
+        const float *expected,
+        size_t count,
+        const std::string &context)
     {
-        if (count == 0)
-            return 0.0;
-        const float max_a = *std::max_element(a, a + count);
-        const float max_b = *std::max_element(b, b + count);
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+            return;
 
-        long double sum_a = 0.0;
-        long double sum_b = 0.0;
-        for (size_t i = 0; i < count; ++i)
+        for (size_t index = 0; index < count; ++index)
         {
-            sum_a += std::exp(static_cast<long double>(a[i] - max_a));
-            sum_b += std::exp(static_cast<long double>(b[i] - max_b));
+            if (std::memcmp(actual + index, expected + index, sizeof(float)) != 0)
+            {
+                uint32_t actual_bits = 0;
+                uint32_t expected_bits = 0;
+                std::memcpy(&actual_bits, actual + index, sizeof(actual_bits));
+                std::memcpy(&expected_bits, expected + index, sizeof(expected_bits));
+                ADD_FAILURE() << context << " first mismatch at element " << index
+                              << " actual=" << actual[index]
+                              << " expected=" << expected[index]
+                              << " actual_bits=" << actual_bits
+                              << " expected_bits=" << expected_bits;
+                return;
+            }
         }
-
-        constexpr long double eps = 1e-30L;
-        long double kl_ab = 0.0;
-        long double kl_ba = 0.0;
-        for (size_t i = 0; i < count; ++i)
-        {
-            const long double pa =
-                std::exp(static_cast<long double>(a[i] - max_a)) / sum_a;
-            const long double pb =
-                std::exp(static_cast<long double>(b[i] - max_b)) / sum_b;
-            kl_ab += pa * std::log((pa + eps) / (pb + eps));
-            kl_ba += pb * std::log((pb + eps) / (pa + eps));
-        }
-        return static_cast<double>(0.5L * (kl_ab + kl_ba));
     }
 
-    VectorMetrics computeMetrics(const float *a, const float *b, size_t count)
+    /**
+     * @brief Own all persistent buffers and kernels for one measured geometry.
+     *
+     * The object is constructed before warmup and never changes capacity during
+     * a timing sample.  Q/K/V use the same merged row layout consumed by the real
+     * Qwen GDN recurrence stage.  Separate kernel instances prevent scratch or
+     * speculative workspace from leaking between grouped and serial samples.
+     */
+    class GDNVerifierCase
     {
-        VectorMetrics metrics;
-        long double dot = 0.0;
-        long double norm_a = 0.0;
-        long double norm_b = 0.0;
-        long double diff2 = 0.0;
-
-        for (size_t i = 0; i < count; ++i)
+    public:
+        GDNVerifierCase(
+            int rows,
+            int n_k_heads,
+            int n_heads,
+            int d_k,
+            int d_v)
+            : rows_(rows),
+              n_k_heads_(n_k_heads),
+              n_heads_(n_heads),
+              d_k_(d_k),
+              d_v_(d_v),
+              q_src_dim_(n_k_heads * d_k),
+              k_src_dim_(n_k_heads * d_k),
+              value_dim_(n_heads * d_v),
+              qkv_stride_(q_src_dim_ + k_src_dim_ + value_dim_),
+              state_floats_(n_heads * d_k * d_v),
+              merged_qkv_(static_cast<size_t>(rows) * qkv_stride_),
+              alpha_(static_cast<size_t>(rows) * n_heads),
+              beta_(static_cast<size_t>(rows) * n_heads),
+              a_log_(n_heads),
+              dt_bias_(n_heads),
+              initial_state_(state_floats_),
+              grouped_live_state_(state_floats_),
+              serial_state_(state_floats_),
+              grouped_output_(static_cast<size_t>(rows) * value_dim_),
+              serial_output_(static_cast<size_t>(rows) * value_dim_),
+              grouped_snapshots_(static_cast<size_t>(rows) * state_floats_),
+              serial_snapshots_(static_cast<size_t>(rows) * state_floats_)
         {
-            const long double av = a[i];
-            const long double bv = b[i];
-            const long double d = av - bv;
-            dot += av * bv;
-            norm_a += av * av;
-            norm_b += bv * bv;
-            diff2 += d * d;
-            metrics.max_abs =
-                std::max(metrics.max_abs, static_cast<double>(std::abs(d)));
+            fillInputs();
+            resetGrouped();
+            resetSerial();
         }
 
-        constexpr long double eps = 1e-30L;
-        metrics.cosine =
-            static_cast<double>(dot / (std::sqrt(norm_a * norm_b) + eps));
-        metrics.relative_l2 =
-            static_cast<double>(std::sqrt(diff2) / (std::sqrt(norm_b) + eps));
-        metrics.symmetric_kl = symmetricSoftmaxKL(a, b, count);
-        return metrics;
-    }
-
-    void fillSyntheticInputs(
-        std::vector<float> &q,
-        std::vector<float> &k,
-        std::vector<float> &v,
-        std::vector<float> &alpha,
-        std::vector<float> &beta,
-        std::vector<float> &a_log,
-        std::vector<float> &dt_bias,
-        std::vector<float> &initial_state)
-    {
-        for (size_t i = 0; i < q.size(); ++i)
+        /** @brief Restore the grouped live-state source outside measured time. */
+        void resetGrouped()
         {
-            q[i] = 0.002f * static_cast<float>(static_cast<int>(i % 29) - 14);
-            k[i] = 0.0015f * static_cast<float>(static_cast<int>(i % 31) - 15);
+            std::memcpy(
+                grouped_live_state_.data(),
+                initial_state_.data(),
+                static_cast<size_t>(state_floats_) * sizeof(float));
         }
-        for (size_t i = 0; i < v.size(); ++i)
-            v[i] = 0.001f * static_cast<float>(static_cast<int>(i % 23) - 11);
-        for (size_t i = 0; i < alpha.size(); ++i)
-        {
-            alpha[i] = -0.2f + 0.004f * static_cast<float>(i % 37);
-            beta[i] = 0.1f - 0.003f * static_cast<float>(i % 41);
-        }
-        for (size_t h = 0; h < a_log.size(); ++h)
-        {
-            a_log[h] = -0.35f - 0.002f * static_cast<float>(h);
-            dt_bias[h] = 0.01f * static_cast<float>(static_cast<int>(h % 7) - 3);
-        }
-        for (size_t i = 0; i < initial_state.size(); ++i)
-            initial_state[i] =
-                0.0001f * static_cast<float>(static_cast<int>(i % 43) - 21);
-    }
 
-    bool runGrouped(
-        int rows,
-        int n_heads,
-        int d_k,
-        int d_v,
-        const std::vector<float> &q,
-        const std::vector<float> &k,
-        const std::vector<float> &v,
-        const std::vector<float> &alpha,
-        const std::vector<float> &beta,
-        const std::vector<float> &a_log,
-        const std::vector<float> &dt_bias,
-        const std::vector<float> &initial_state,
-        std::vector<float> *output,
-        std::vector<float> *capture)
-    {
-        const int state_floats = n_heads * d_k * d_v;
-        const int v_stride = n_heads * d_v;
-
-        CPUGatedDeltaNet kernel;
-        std::vector<float> state = initial_state;
-        output->assign(static_cast<size_t>(rows) * v_stride, 0.0f);
-        capture->assign(static_cast<size_t>(rows) * state_floats, 0.0f);
+        /** @brief Restore serial production state outside measured time. */
+        void resetSerial()
+        {
+            std::memcpy(
+                serial_state_.data(),
+                initial_state_.data(),
+                static_cast<size_t>(state_floats_) * sizeof(float));
+        }
 
         /**
-         * Measure the grouped recurrence kernel ceiling, not caller-side
-         * speculative-state preparation.  The production transaction still has
-         * to make live state safe before verification, but the serial oracle
-         * below also starts from a private state copy.  Calling the explicit
-         * snapshot API keeps the comparison fair: one prepared state in, exact
-         * M=2..4 verifier rows and post-row snapshots out.
+         * @brief Run one grouped production-ABI verifier transaction.
+         *
+         * Each immutable post-row snapshot is the direct recurrence destination;
+         * no live-to-work clone or post-row copy belongs in this path.
          */
-        return kernel.chunkForwardWithStateSnapshots(
-            q.data(),
-            k.data(),
-            v.data(),
-            alpha.data(),
-            beta.data(),
-            a_log.data(),
-            dt_bias.data(),
-            output->data(),
-            state.data(),
-            rows,
-            n_heads,
-            d_k,
-            d_v,
-            /*chunk_size=*/64,
-            /*use_qk_l2norm=*/true,
-            capture->data(),
-            state_floats,
-            rows);
-    }
-
-    bool runSerial(
-        int rows,
-        int n_heads,
-        int d_k,
-        int d_v,
-        const std::vector<float> &q,
-        const std::vector<float> &k,
-        const std::vector<float> &v,
-        const std::vector<float> &alpha,
-        const std::vector<float> &beta,
-        const std::vector<float> &a_log,
-        const std::vector<float> &dt_bias,
-        const std::vector<float> &initial_state,
-        std::vector<float> *output,
-        std::vector<float> *capture)
-    {
-        const int state_floats = n_heads * d_k * d_v;
-        const int qk_stride = n_heads * d_k;
-        const int v_stride = n_heads * d_v;
-
-        CPUGatedDeltaNet kernel;
-        std::vector<float> state = initial_state;
-        output->assign(static_cast<size_t>(rows) * v_stride, 0.0f);
-        capture->assign(static_cast<size_t>(rows) * state_floats, 0.0f);
-
-        for (int t = 0; t < rows; ++t)
+        bool runGrouped()
         {
-            if (!kernel.recurrent_step(
-                    q.data() + static_cast<size_t>(t) * qk_stride,
-                    k.data() + static_cast<size_t>(t) * qk_stride,
-                    v.data() + static_cast<size_t>(t) * v_stride,
-                    alpha.data() + static_cast<size_t>(t) * n_heads,
-                    beta.data() + static_cast<size_t>(t) * n_heads,
-                    a_log.data(),
-                    dt_bias.data(),
-                    output->data() + static_cast<size_t>(t) * v_stride,
-                    state.data(),
-                    n_heads,
-                    d_k,
-                    d_v,
-                    /*use_qk_l2norm=*/true))
-            {
-                return false;
-            }
-            std::memcpy(capture->data() + static_cast<size_t>(t) * state_floats,
-                        state.data(),
-                        static_cast<size_t>(state_floats) * sizeof(float));
+            return grouped_kernel_.chunkForwardMergedQKVWithStateSnapshots(
+                merged_qkv_.data(),
+                qkv_stride_,
+                alpha_.data(),
+                beta_.data(),
+                a_log_.data(),
+                dt_bias_.data(),
+                grouped_output_.data(),
+                grouped_live_state_.data(),
+                rows_,
+                n_k_heads_,
+                n_heads_,
+                d_k_,
+                d_v_,
+                /*global_v_head_offset=*/0,
+                /*chunk_size=*/64,
+                /*use_qk_l2norm=*/true,
+                grouped_snapshots_.data(),
+                state_floats_,
+                rows_);
         }
-        return true;
-    }
 
-    double timeOneMs(const std::function<void()> &fn)
+        /**
+         * @brief Run the actual production M=1 merged-QKV path for every row.
+         *
+         * @param publish_snapshots Whether to copy each post-row state for the
+         *        correctness oracle. Canonical timing disables these diagnostic
+         *        copies because ordinary serial decode does not publish them.
+         */
+        bool runSerial(bool publish_snapshots)
+        {
+            for (int row = 0; row < rows_; ++row)
+            {
+                if (!serial_kernel_.chunkForwardMergedQKV(
+                        merged_qkv_.data() + static_cast<size_t>(row) * qkv_stride_,
+                        qkv_stride_,
+                        alpha_.data() + static_cast<size_t>(row) * n_heads_,
+                        beta_.data() + static_cast<size_t>(row) * n_heads_,
+                        a_log_.data(),
+                        dt_bias_.data(),
+                        serial_output_.data() + static_cast<size_t>(row) * value_dim_,
+                        serial_state_.data(),
+                        /*seq_len=*/1,
+                        n_k_heads_,
+                        n_heads_,
+                        d_k_,
+                        d_v_,
+                        /*global_v_head_offset=*/0,
+                        /*chunk_size=*/64,
+                        /*use_qk_l2norm=*/true))
+                {
+                    return false;
+                }
+
+                if (publish_snapshots)
+                {
+                    std::memcpy(
+                        serial_snapshots_.data() +
+                            static_cast<size_t>(row) * state_floats_,
+                        serial_state_.data(),
+                        static_cast<size_t>(state_floats_) * sizeof(float));
+                }
+            }
+            return true;
+        }
+
+        /** @brief Prove grouped output, snapshots, and live-state isolation. */
+        void verifyByteEquality()
+        {
+            resetGrouped();
+            resetSerial();
+            ASSERT_TRUE(runGrouped());
+            ASSERT_TRUE(runSerial(/*publish_snapshots=*/true));
+
+            const std::string prefix =
+                "CPU GDN merged verifier M=" + std::to_string(rows_);
+            expectByteExact(
+                grouped_output_.data(),
+                serial_output_.data(),
+                grouped_output_.size(),
+                prefix + " output");
+            expectByteExact(
+                grouped_snapshots_.data(),
+                serial_snapshots_.data(),
+                grouped_snapshots_.size(),
+                prefix + " state snapshots");
+            expectByteExact(
+                grouped_live_state_.data(),
+                initial_state_.data(),
+                initial_state_.size(),
+                prefix + " live-state isolation");
+        }
+
+        int rows() const { return rows_; }
+
+    private:
+        /** @brief Fill deterministic finite values spanning every source region. */
+        void fillInputs()
+        {
+            for (int row = 0; row < rows_; ++row)
+            {
+                float *source =
+                    merged_qkv_.data() + static_cast<size_t>(row) * qkv_stride_;
+                for (int index = 0; index < q_src_dim_; ++index)
+                {
+                    source[index] =
+                        0.002f * static_cast<float>((row * 17 + index) % 29 - 14);
+                }
+                for (int index = 0; index < k_src_dim_; ++index)
+                {
+                    source[q_src_dim_ + index] =
+                        0.0015f * static_cast<float>((row * 19 + index) % 31 - 15);
+                }
+                for (int index = 0; index < value_dim_; ++index)
+                {
+                    source[q_src_dim_ + k_src_dim_ + index] =
+                        0.001f * static_cast<float>((row * 23 + index) % 23 - 11);
+                }
+            }
+
+            for (size_t index = 0; index < alpha_.size(); ++index)
+            {
+                alpha_[index] =
+                    -0.2f + 0.004f * static_cast<float>(index % 37);
+                beta_[index] =
+                    0.1f - 0.003f * static_cast<float>(index % 41);
+            }
+            for (int head = 0; head < n_heads_; ++head)
+            {
+                a_log_[static_cast<size_t>(head)] =
+                    -0.35f - 0.002f * static_cast<float>(head);
+                dt_bias_[static_cast<size_t>(head)] =
+                    0.01f * static_cast<float>(head % 7 - 3);
+            }
+            for (int index = 0; index < state_floats_; ++index)
+            {
+                initial_state_[static_cast<size_t>(index)] =
+                    0.0001f * static_cast<float>(index % 43 - 21);
+            }
+        }
+
+        int rows_ = 0;
+        int n_k_heads_ = 0;
+        int n_heads_ = 0;
+        int d_k_ = 0;
+        int d_v_ = 0;
+        int q_src_dim_ = 0;
+        int k_src_dim_ = 0;
+        int value_dim_ = 0;
+        int qkv_stride_ = 0;
+        int state_floats_ = 0;
+
+        std::vector<float> merged_qkv_;
+        std::vector<float> alpha_;
+        std::vector<float> beta_;
+        std::vector<float> a_log_;
+        std::vector<float> dt_bias_;
+        std::vector<float> initial_state_;
+        std::vector<float> grouped_live_state_;
+        std::vector<float> serial_state_;
+        std::vector<float> grouped_output_;
+        std::vector<float> serial_output_;
+        std::vector<float> grouped_snapshots_;
+        std::vector<float> serial_snapshots_;
+        CPUGatedDeltaNet grouped_kernel_;
+        CPUGatedDeltaNet serial_kernel_;
+    };
+
+    /** @brief Measure one invocation after untimed state preparation. */
+    double timeOneMs(
+        const std::function<void()> &prepare,
+        const std::function<bool()> &invoke)
     {
+        prepare();
         const auto start = std::chrono::steady_clock::now();
-        fn();
+        const bool ok = invoke();
         const auto end = std::chrono::steady_clock::now();
+        EXPECT_TRUE(ok);
         return std::chrono::duration<double, std::milli>(end - start).count();
     }
 
     /**
-     * @brief Measure grouped and serial paths with balanced ordering.
+     * @brief Alternate grouped and serial order and retain each best stable run.
      *
-     * The M=2 verifier-row GDN recurrence is intentionally tiny.  Measuring all
-     * grouped iterations first and all serial iterations second lets the second
-     * path inherit warmer instruction/data caches and occasionally flips a real
-     * small win into a false loss.  This helper alternates the order on each
-     * sample and records the best stable sample for each path, which is the
-     * usual microbenchmark signal for kernel ceiling work.
+     * Alternation prevents one path from systematically inheriting hotter code
+     * or data.  Best-of-N estimates the kernel ceiling and is intentionally not
+     * an end-to-end latency percentile.
      */
     void timePairedBestMs(
-        const std::function<void()> &grouped,
-        const std::function<void()> &serial,
-        int iters,
+        GDNVerifierCase *benchmark_case,
+        int iterations,
         double *grouped_ms,
         double *serial_ms)
     {
         double best_grouped = std::numeric_limits<double>::infinity();
         double best_serial = std::numeric_limits<double>::infinity();
-        for (int i = 0; i < iters; ++i)
+
+        const auto measure_grouped = [&]()
         {
-            if ((i & 1) == 0)
+            best_grouped = std::min(
+                best_grouped,
+                timeOneMs(
+                    [&]() { benchmark_case->resetGrouped(); },
+                    [&]() { return benchmark_case->runGrouped(); }));
+        };
+        const auto measure_serial = [&]()
+        {
+            best_serial = std::min(
+                best_serial,
+                timeOneMs(
+                    [&]() { benchmark_case->resetSerial(); },
+                    [&]() { return benchmark_case->runSerial(false); }));
+        };
+
+        for (int iteration = 0; iteration < iterations; ++iteration)
+        {
+            if ((iteration & 1) == 0)
             {
-                best_grouped = std::min(best_grouped, timeOneMs(grouped));
-                best_serial = std::min(best_serial, timeOneMs(serial));
+                measure_grouped();
+                measure_serial();
             }
             else
             {
-                best_serial = std::min(best_serial, timeOneMs(serial));
-                best_grouped = std::min(best_grouped, timeOneMs(grouped));
+                measure_serial();
+                measure_grouped();
             }
         }
 
@@ -350,70 +456,46 @@ namespace
         *serial_ms = best_serial;
     }
 
-    BenchmarkResult runCase(int rows, int n_heads, int d_k, int d_v)
+    /** @brief Run correctness, warmup, and measurement for one runtime M. */
+    BenchmarkResult runCase(
+        int rows,
+        int n_k_heads,
+        int n_heads,
+        int d_k,
+        int d_v)
     {
-        const int max_rows = 4;
-        const int state_floats = n_heads * d_k * d_v;
-        const int qk_stride = n_heads * d_k;
-        const int v_stride = n_heads * d_v;
-        const int warmups = envInt("LLAMINAR_CPU_GDN_VERIFIER_WARMUP", 2);
-        const int iters = envInt("LLAMINAR_CPU_GDN_VERIFIER_ITERS", 10);
+        const int warmups = envInt("LLAMINAR_CPU_GDN_VERIFIER_WARMUP", 3);
+        const int iterations = envInt("LLAMINAR_CPU_GDN_VERIFIER_ITERS", 12);
+        GDNVerifierCase benchmark_case(rows, n_k_heads, n_heads, d_k, d_v);
 
-        std::vector<float> q(static_cast<size_t>(max_rows) * qk_stride);
-        std::vector<float> k(q.size());
-        std::vector<float> v(static_cast<size_t>(max_rows) * v_stride);
-        std::vector<float> alpha(static_cast<size_t>(max_rows) * n_heads);
-        std::vector<float> beta(static_cast<size_t>(max_rows) * n_heads);
-        std::vector<float> a_log(n_heads);
-        std::vector<float> dt_bias(n_heads);
-        std::vector<float> initial_state(state_floats);
-        fillSyntheticInputs(q, k, v, alpha, beta, a_log, dt_bias, initial_state);
-
-        std::vector<float> grouped_output;
-        std::vector<float> grouped_capture;
-        std::vector<float> serial_output;
-        std::vector<float> serial_capture;
-
-        auto grouped = [&]()
+        benchmark_case.verifyByteEquality();
+        for (int warmup = 0; warmup < warmups; ++warmup)
         {
-            ASSERT_TRUE(runGrouped(
-                rows, n_heads, d_k, d_v, q, k, v, alpha, beta,
-                a_log, dt_bias, initial_state,
-                &grouped_output, &grouped_capture));
-        };
-        auto serial = [&]()
-        {
-            ASSERT_TRUE(runSerial(
-                rows, n_heads, d_k, d_v, q, k, v, alpha, beta,
-                a_log, dt_bias, initial_state,
-                &serial_output, &serial_capture));
-        };
-
-        for (int i = 0; i < warmups; ++i)
-        {
-            grouped();
-            serial();
+            benchmark_case.resetGrouped();
+            EXPECT_TRUE(benchmark_case.runGrouped());
+            benchmark_case.resetSerial();
+            EXPECT_TRUE(benchmark_case.runSerial(false));
         }
 
         BenchmarkResult result;
         result.rows = rows;
+        result.n_k_heads = n_k_heads;
         result.n_heads = n_heads;
         result.d_k = d_k;
         result.d_v = d_v;
-        timePairedBestMs(grouped, serial, iters, &result.grouped_ms, &result.serial_ms);
+        timePairedBestMs(
+            &benchmark_case,
+            iterations,
+            &result.grouped_ms,
+            &result.serial_ms);
         result.speedup = result.serial_ms / std::max(result.grouped_ms, 1e-9);
-        result.output_metrics = computeMetrics(
-            grouped_output.data(),
-            serial_output.data(),
-            static_cast<size_t>(rows) * v_stride);
-        result.state_metrics = computeMetrics(
-            grouped_capture.data(),
-            serial_capture.data(),
-            static_cast<size_t>(rows) * state_floats);
+
+        benchmark_case.verifyByteEquality();
         return result;
     }
 
-    void appendCsv(const std::vector<BenchmarkResult> &results)
+    /** @brief Persist concise additive evidence when a CSV path is requested. */
+    void writeCsv(const std::vector<BenchmarkResult> &results)
     {
         const char *path = std::getenv("LLAMINAR_CPU_GDN_VERIFIER_CSV");
         if (!path || !*path)
@@ -423,93 +505,61 @@ namespace
         ASSERT_NE(file, nullptr) << "failed to open " << path;
         std::fprintf(
             file,
-            "backend,phase,rows,n_heads,d_k,d_v,grouped_ms,serial_ms,speedup,"
-            "output_cosine,output_relative_l2,output_symmetric_kl,output_max_abs,"
-            "state_cosine,state_relative_l2,state_symmetric_kl,state_max_abs\n");
-        for (const BenchmarkResult &r : results)
+            "backend,phase,rows,n_k_heads,n_heads,d_k,d_v,grouped_ms,"
+            "serial_ms,speedup,byte_exact\n");
+        for (const BenchmarkResult &result : results)
         {
             std::fprintf(
                 file,
-                "cpu,gdn_verifier_rows,%d,%d,%d,%d,%.9f,%.9f,%.9f,"
-                "%.12f,%.12g,%.12g,%.12g,%.12f,%.12g,%.12g,%.12g\n",
-                r.rows,
-                r.n_heads,
-                r.d_k,
-                r.d_v,
-                r.grouped_ms,
-                r.serial_ms,
-                r.speedup,
-                r.output_metrics.cosine,
-                r.output_metrics.relative_l2,
-                r.output_metrics.symmetric_kl,
-                r.output_metrics.max_abs,
-                r.state_metrics.cosine,
-                r.state_metrics.relative_l2,
-                r.state_metrics.symmetric_kl,
-                r.state_metrics.max_abs);
+                "cpu,gdn_verifier_rows,%d,%d,%d,%d,%d,%.9f,%.9f,%.9f,1\n",
+                result.rows,
+                result.n_k_heads,
+                result.n_heads,
+                result.d_k,
+                result.d_v,
+                result.grouped_ms,
+                result.serial_ms,
+                result.speedup);
         }
         std::fclose(file);
     }
+} // namespace
 
-    void expectTightMetrics(const BenchmarkResult &r)
-    {
-        const double min_speedup =
-            envDouble("LLAMINAR_CPU_GDN_VERIFIER_MIN_SPEEDUP", 1.0);
-
-        EXPECT_GE(r.output_metrics.cosine, 0.999999999)
-            << "rows=" << r.rows;
-        EXPECT_LE(r.output_metrics.relative_l2, 1e-7)
-            << "rows=" << r.rows;
-        EXPECT_LE(r.output_metrics.symmetric_kl, 1e-12)
-            << "rows=" << r.rows;
-        EXPECT_LE(r.output_metrics.max_abs, 1e-7)
-            << "rows=" << r.rows;
-
-        EXPECT_GE(r.state_metrics.cosine, 0.999999999)
-            << "rows=" << r.rows;
-        EXPECT_LE(r.state_metrics.relative_l2, 1e-7)
-            << "rows=" << r.rows;
-        EXPECT_LE(r.state_metrics.symmetric_kl, 1e-12)
-            << "rows=" << r.rows;
-        EXPECT_LE(r.state_metrics.max_abs, 1e-7)
-            << "rows=" << r.rows;
-
-        EXPECT_GT(r.speedup, min_speedup)
-            << "rows=" << r.rows
-            << " grouped_ms=" << r.grouped_ms
-            << " serial_ms=" << r.serial_ms
-            << " min_speedup=" << min_speedup;
-    }
-}
-
-TEST(Perf__CPUGatedDeltaNetVerifierRows, M234_GroupedVsSerial_Synthetic)
+TEST(Perf__CPUGatedDeltaNetVerifierRows, RuntimeM_GroupedVsSerial_ProductionMergedQKV)
 {
-    const int n_heads = envInt("LLAMINAR_CPU_GDN_VERIFIER_HEADS", 32);
+    const int n_heads = envInt("LLAMINAR_CPU_GDN_VERIFIER_HEADS", 16);
+    const int n_k_heads =
+        envInt("LLAMINAR_CPU_GDN_VERIFIER_K_HEADS", n_heads);
     const int d_k = envInt("LLAMINAR_CPU_GDN_VERIFIER_DK", 128);
     const int d_v = envInt("LLAMINAR_CPU_GDN_VERIFIER_DV", 128);
+    const double min_speedup =
+        envDouble("LLAMINAR_CPU_GDN_VERIFIER_MIN_SPEEDUP", 1.0);
 
     std::vector<BenchmarkResult> results;
-    for (int rows : envRows())
+    for (const int rows : envRows())
     {
-        BenchmarkResult result = runCase(rows, n_heads, d_k, d_v);
+        BenchmarkResult result =
+            runCase(rows, n_k_heads, n_heads, d_k, d_v);
         results.push_back(result);
 
         std::cerr << "[CPU GDN verifier rows] M=" << result.rows
-                  << " heads=" << result.n_heads
+                  << " k_heads=" << result.n_k_heads
+                  << " v_heads=" << result.n_heads
                   << " d_k=" << result.d_k
                   << " d_v=" << result.d_v
                   << " grouped_ms=" << result.grouped_ms
                   << " serial_ms=" << result.serial_ms
                   << " speedup=" << result.speedup
-                  << " output_cos=" << result.output_metrics.cosine
-                  << " output_l2=" << result.output_metrics.relative_l2
-                  << " output_skl=" << result.output_metrics.symmetric_kl
-                  << " state_cos=" << result.state_metrics.cosine
-                  << " state_l2=" << result.state_metrics.relative_l2
-                  << " state_skl=" << result.state_metrics.symmetric_kl
-                  << "\n";
+                  << " byte_exact=true\n";
 
-        expectTightMetrics(result);
+        if (rows > 1)
+        {
+            EXPECT_GT(result.speedup, min_speedup)
+                << "M=" << rows
+                << " grouped_ms=" << result.grouped_ms
+                << " serial_ms=" << result.serial_ms
+                << " min_speedup=" << min_speedup;
+        }
     }
-    appendCsv(results);
+    writeCsv(results);
 }

@@ -13,11 +13,9 @@
  *
  *   Dispatch Functions (extern "C"):
  *     - rocmQuantGemm_setDevice()              : HIP device selection
- *     - rocmQuantGemm_uploadWeights()          : Weight upload H2D
- *     - rocmQuantGemm_ensureWorkBuffers()      : Work buffer management
  *     - rocmQuantGemm_applyScaling()           : INT32 → FP32 scaling epilogue
  *     - rocmQuantGemm_biasAdd()                : In-place bias addition
- *     - rocmQuantGemm_alloc*(), copy*(), free* : Memory management utilities
+ *     - rocmQuantGemm_alloc*(), free* : Setup-owned packed-weight storage
  *
  * Backend-specific GEMM implementations live in separate files:
  *   - ROCmQuantisedGemmKernel_INT8_VNNI.hip : INT8 VNNI prefill kernels (gfx906)
@@ -32,9 +30,12 @@
 #include <cfloat>
 #include <cmath>
 #include <chrono>
+#include <stdexcept>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../utils/DebugEnv.h"
+#include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 
 // ============================================================================
 // Apply Scales Kernel (for two-kernel approach)
@@ -338,9 +339,10 @@ __global__ void quantizeActivationsQ8_blockwise_kernel(
     }
     __syncthreads();
 
-    float max_abs = s_absmax;
-    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float max_abs = s_absmax;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(max_abs);
+    const float inv_scale = 1.0f / scale;
 
     // Step 2: Write scale for this block
     if (tid == 0)
@@ -351,8 +353,8 @@ __global__ void quantizeActivationsQ8_blockwise_kernel(
     // Step 3: Quantize elements in this block
     if (tid < block_len)
     {
-        int q = static_cast<int>(rintf(src[tid] * inv_scale));
-        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            src[tid], inv_scale);
         dst[tid] = static_cast<int8_t>(q);
     }
 }
@@ -433,8 +435,9 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
     local_max = __shfl(local_max, source_lane_in_wave);
 
-    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
+    const float inv_scale = 1.0f / scale;
 
     // Step 2: Write scale
     if (sub_tid == 0)
@@ -445,8 +448,8 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     // Step 3: Quantize
     if (sub_tid < block_len)
     {
-        int q = static_cast<int>(rintf(val * inv_scale));
-        q = max(-127, min(127, q));
+        const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            val, inv_scale);
         dst[sub_tid] = static_cast<int8_t>(q);
     }
 }
@@ -499,14 +502,15 @@ void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
     const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
     local_max = __shfl(local_max, source_lane_in_wave);
 
-    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
+    const float inv_scale = 1.0f / scale;
 
     int q = 0;
     if (sub_tid < block_len)
     {
-        q = static_cast<int>(rintf(val * inv_scale));
-        q = max(-127, min(127, q));
+        q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            val, inv_scale);
         dst[sub_tid] = static_cast<int8_t>(q);
     }
 
@@ -583,7 +587,8 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
     for (int b = tid; b < blocks_per_row; b += WG_SIZE)
     {
         const float max_abs = s_block_max[b];
-        const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::rocm::decode_equivalent::q8Scale(max_abs);
         const float inv_scale = 1.0f / scale;
 
         row_scales[b] = scale;
@@ -602,10 +607,10 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
             for (int k4 = k_start; k4 < vec_end; k4 += 4)
             {
                 const float4 v = *reinterpret_cast<const float4 *>(row_in + k4);
-                int q0 = max(-127, min(127, static_cast<int>(rintf(v.x * inv_scale))));
-                int q1 = max(-127, min(127, static_cast<int>(rintf(v.y * inv_scale))));
-                int q2 = max(-127, min(127, static_cast<int>(rintf(v.z * inv_scale))));
-                int q3 = max(-127, min(127, static_cast<int>(rintf(v.w * inv_scale))));
+                const int q0 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.x, inv_scale);
+                const int q1 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.y, inv_scale);
+                const int q2 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.z, inv_scale);
+                const int q3 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.w, inv_scale);
                 const uint32_t packed =
                     static_cast<uint32_t>(static_cast<uint8_t>(q0)) |
                     (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
@@ -618,7 +623,8 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
         {
             for (int k = k_start; k < k_end; ++k)
             {
-                int q = max(-127, min(127, static_cast<int>(rintf(row_in[k] * inv_scale))));
+                const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+                    row_in[k], inv_scale);
                 row_out[k] = static_cast<int8_t>(q);
             }
         }
@@ -677,8 +683,9 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
     }
     local_max = __shfl(local_max, 0);
 
-    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
+    const float inv_scale = 1.0f / scale;
 
     if (tid == 0)
     {
@@ -687,7 +694,9 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
 
     if (tid < block_len)
     {
-        int q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
+        const int q =
+            llaminar2::rocm::decode_equivalent::quantizeQ8(
+                val, inv_scale);
         dst[tid] = static_cast<int8_t>(q);
     }
 }
@@ -743,13 +752,15 @@ void quantizeActivationsQ8_blockwise_v4_with_sums_kernel(
     }
     local_max = __shfl(local_max, 0);
 
-    const float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
     const float inv_scale = 1.0f / scale;
 
     int q = 0;
     if (tid < block_len)
     {
-        q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
+        q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            val, inv_scale);
         dst[tid] = static_cast<int8_t>(q);
     }
 
@@ -946,8 +957,9 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
     // Write scales to global memory
     for (int b = tid; b < blocks_per_row; b += WG_SIZE)
     {
-        float max_abs = s_block_max[b];
-        float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        const float max_abs = s_block_max[b];
+        const float scale =
+            llaminar2::rocm::decode_equivalent::q8Scale(max_abs);
         row_scales[b] = scale;
         // Overwrite s_block_max with inv_scale for pass 2
         s_block_max[b] = 1.0f / scale;
@@ -963,10 +975,10 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
         const int b = k / QUANT_BLOCK;
         const float inv_scale = s_block_max[b];
 
-        int q0 = max(-127, min(127, static_cast<int>(rintf(v.x * inv_scale))));
-        int q1 = max(-127, min(127, static_cast<int>(rintf(v.y * inv_scale))));
-        int q2 = max(-127, min(127, static_cast<int>(rintf(v.z * inv_scale))));
-        int q3 = max(-127, min(127, static_cast<int>(rintf(v.w * inv_scale))));
+        const int q0 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.x, inv_scale);
+        const int q1 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.y, inv_scale);
+        const int q2 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.z, inv_scale);
+        const int q3 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.w, inv_scale);
 
         const uint32_t packed =
             static_cast<uint32_t>(static_cast<uint8_t>(q0)) |
@@ -981,7 +993,8 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
     {
         const int b = k / QUANT_BLOCK;
         const float inv_scale = s_block_max[b];
-        int q = max(-127, min(127, static_cast<int>(rintf(row_in[k] * inv_scale))));
+        const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            row_in[k], inv_scale);
         row_out[k] = static_cast<int8_t>(q);
     }
 }
@@ -1008,167 +1021,21 @@ extern "C"
         return true;
     }
 
-    // -------------------------------------------------------------------------
-    // Weight upload (Phase 1)
-    // -------------------------------------------------------------------------
-
-    bool rocmQuantGemm_uploadWeights(
-        const int8_t *h_weights_int8,
-        const float *h_scales_B,
-        int8_t **d_weights_int8,
-        float **d_scales_B,
-        int K, int N,
-        int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        // Allocate device memory for weights
-        size_t weight_bytes = static_cast<size_t>(K) * N * sizeof(int8_t);
-        hipError_t err = hipMalloc(d_weights_int8, weight_bytes);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMalloc weights failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        // CRITICAL: Verify hipMalloc actually allocated memory
-        if (*d_weights_int8 == nullptr)
-        {
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] CRITICAL: hipMalloc returned success but pointer is NULL! "
-                    "(bytes=%zu K=%d N=%d device=%d)\n",
-                    weight_bytes, K, N, rocm_device_id);
-            return false;
-        }
-
-        // Allocate device memory for scales
-        size_t scale_bytes = static_cast<size_t>(N) * sizeof(float);
-        err = hipMalloc(d_scales_B, scale_bytes);
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_weights_int8);
-            *d_weights_int8 = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMalloc scales failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-
-        // Copy weights H2D
-        err = hipMemcpy(*d_weights_int8, h_weights_int8, weight_bytes, hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_weights_int8);
-            (void)hipFree(*d_scales_B);
-            *d_weights_int8 = nullptr;
-            *d_scales_B = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy weights failed: %s "
-                    "(src=%p dst=%p bytes=%zu K=%d N=%d device=%d)\n",
-                    hipGetErrorString(err), (void*)h_weights_int8, (void*)*d_weights_int8,
-                    weight_bytes, K, N, rocm_device_id);
-            return false;
-        }
-
-        // Copy scales H2D
-        err = hipMemcpy(*d_scales_B, h_scales_B, scale_bytes, hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_weights_int8);
-            (void)hipFree(*d_scales_B);
-            *d_weights_int8 = nullptr;
-            *d_scales_B = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy scales failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-
-        return true;
-    }
-
-    // -------------------------------------------------------------------------
-    // Work buffer allocation (Phase 2)
-    // -------------------------------------------------------------------------
-
-    bool rocmQuantGemm_ensureWorkBuffers(
-        int8_t **d_A_int8,
-        float **d_scales_A,
-        int32_t **d_C_int32,
-        int *work_buffer_M,
-        int M, int K, int N,
-        int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        // Only reallocate if M increased
-        if (M <= *work_buffer_M)
-        {
-            return true;
-        }
-
-        // Free existing buffers
-        if (*d_A_int8) {
-            (void)hipFree(*d_A_int8);
-        }
-        if (*d_scales_A) {
-            (void)hipFree(*d_scales_A);
-        }
-        if (*d_C_int32) {
-            (void)hipFree(*d_C_int32);
-        }
-
-        *d_A_int8 = nullptr;
-        *d_scales_A = nullptr;
-        *d_C_int32 = nullptr;
-
-        // Allocate new buffers
-        hipError_t err = hipMalloc(d_A_int8, static_cast<size_t>(M) * K * sizeof(int8_t));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc A_int8 failed: %s\n", hipGetErrorString(err));
-            return false;
-        }
-
-        err = hipMalloc(d_scales_A, static_cast<size_t>(M) * sizeof(float));
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_A_int8);
-            *d_A_int8 = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc scales_A failed: %s\n", hipGetErrorString(err));
-            return false;
-        }
-
-        err = hipMalloc(d_C_int32, static_cast<size_t>(M) * N * sizeof(int32_t));
-        if (err != hipSuccess)
-        {
-            (void)hipFree(*d_A_int8);
-            (void)hipFree(*d_scales_A);
-            *d_A_int8 = nullptr;
-            *d_scales_A = nullptr;
-            fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc C_int32 failed: %s\n", hipGetErrorString(err));
-            return false;
-        }
-
-        *work_buffer_M = M;
-        return true;
-    }
-
     // =========================================================================
     // INT8 ALLOCATION HELPER
     // =========================================================================
     
     bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id)
     {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        *d_ptr = nullptr;
+        if (count == 0)
+            return true;
+        auto *backend = llaminar2::getROCmBackend();
+        if (!backend)
             return false;
-
-        hipError_t err = hipMalloc(d_ptr, count * sizeof(int8_t));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_allocInt8] hipMalloc failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
+        *d_ptr = static_cast<int8_t *>(
+            backend->allocate(count * sizeof(int8_t), rocm_device_id));
+        return *d_ptr != nullptr;
     }
 
     // =========================================================================
@@ -1375,98 +1242,26 @@ extern "C"
 
     void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id)
     {
-        if (d_ptr)
-        {
-            // Set device before freeing - required by HIP/CUDA
-            hipError_t set_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(rocm_device_id));
-            if (set_err == hipErrorDeinitialized || set_err == hipErrorNoDevice)
-            {
-                // HIP runtime is shutting down, skip cleanup
-                // This is normal during static destruction at program exit
-                return;
-            }
-            hipError_t err = hipFree(d_ptr);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                // Only log actual errors, not shutdown-related ones
-                fprintf(stderr, "WARNING: hipFree failed: %s\n", hipGetErrorString(err));
-            }
-        }
+        if (!d_ptr)
+            return;
+        auto *backend = llaminar2::getROCmBackend();
+        if (!backend)
+            throw std::runtime_error(
+                "[ROCmQuantGemm] ROCm backend unavailable while releasing packed weights");
+        backend->free(d_ptr, rocm_device_id);
     }
 
     bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id)
     {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        *d_ptr = nullptr;
+        if (count == 0)
+            return true;
+        auto *backend = llaminar2::getROCmBackend();
+        if (!backend)
             return false;
-
-        hipError_t err = hipMalloc(d_ptr, count * sizeof(float));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_allocFloat] hipMalloc failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_allocInt32(int32_t **d_ptr, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMalloc(d_ptr, count * sizeof(int32_t));
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_allocInt32] hipMalloc failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMemcpy(d_dst, h_src, count * sizeof(float), hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_copyHostToDevice] hipMemcpy failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMemcpy(h_dst, d_src, count * sizeof(float), hipMemcpyDeviceToHost);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_copyDeviceToHost] hipMemcpy failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
-    }
-
-    bool rocmQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int rocm_device_id)
-    {
-        if (!rocmQuantGemm_setDevice(rocm_device_id))
-            return false;
-
-        hipError_t err = hipMemcpy(h_dst, d_src, count * sizeof(int32_t), hipMemcpyDeviceToHost);
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmQuantGemm_copyInt32DeviceToHost] hipMemcpy failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-        return true;
+        *d_ptr = static_cast<float *>(
+            backend->allocate(count * sizeof(float), rocm_device_id));
+        return *d_ptr != nullptr;
     }
 
     // =========================================================================

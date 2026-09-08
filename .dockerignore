@@ -14,13 +14,18 @@ venv/
 # layer (see Dockerfile). Excluding it from the build context avoids
 # uploading the host's local checkout (which can include a multi-GB
 # build/ dir after a dev build) on every `docker build`.
-external/onednn/
+external/*
+!external/vendor/
+!external/vendor/**
+flash_rebar/
 
 # Core dumps & profiling artefacts
 core
 core.*
 gpucore
 gpucore.*
+vgcore
+vgcore.*
 *.cubin
 *.nsys-rep
 *.ncu-rep
@@ -28,6 +33,11 @@ gpucore.*
 
 # Test / benchmark outputs
 results.*
+benchmark_results/
+parity-results/
+*_snapshots/
+*_captures/
+pytorch_qwen2_test/
 gemm_tuning_results.csv
 gemv_tile_occupancy*.csv
 rocm_worker*.csv

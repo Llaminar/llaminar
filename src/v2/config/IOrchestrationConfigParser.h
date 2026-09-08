@@ -65,11 +65,11 @@ namespace llaminar2
          *   --backend <type>            Default collective backend (auto, nccl, rccl, etc.)
          *   --config <path>             Path to YAML configuration file
          *
-         *   MoE expert overlay uses named domains as the canonical hardware
-         *   inventory. Use --moe-expert-overlay-continuation for activation /
-         *   logits ownership and --moe-expert-overlay-base-domain for dense /
-         *   non-expert model placement (defaults to continuation). Do not
-         *   combine explicit overlay placements with --device/-d.
+         *   MoE routed-expert placement uses named domains as the canonical
+         *   hardware inventory. Use --moe-routed-expert-continuation-domain
+         *   for activation/logit ownership and
+         *   --moe-routed-expert-base-model-domain for dense/non-expert model
+         *   placement. Do not combine explicit placement with --device/-d.
          *
          * @param argc Argument count
          * @param argv Argument values
@@ -85,7 +85,7 @@ namespace llaminar2
          * ```yaml
          * orchestration:
          *   tp_degree: 2
-         *   tp_scope: local
+         *   tp_scope: rank_local
          *   domains:
          *     - name: gpu_tp
          *       devices: [cuda:0, cuda:1]
@@ -96,15 +96,16 @@ namespace llaminar2
          *       domain: gpu_tp
          *       layers: [0, 13]
          *
-         * moe_expert_parallel:
+         * moe_routed_expert_placement:
          *   enabled: true
-         *   execution_kind: tiered
+         *   topology: tiered-overlay
          *   continuation_domain: rocm_hot
          *   base_model_domain: rocm_hot
          *   shared_expert_domain: rocm_hot
+         *   domains:
+         *     - "rocm_hot=0:rocm:0,0:rocm:1;scope=rank_local;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident"
          *   routed_tiers:
          *     - "hot@rocm_hot;priority=0"
-         *     - "cold@cpu_cold;priority=1;fallback=true"
          * ```
          *
          * @param path Path to YAML file

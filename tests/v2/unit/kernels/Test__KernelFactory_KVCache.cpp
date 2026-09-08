@@ -10,8 +10,13 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include "kernels/KernelFactory.h"
+#include "kernels/HybridKVCacheConfig.h"
+#include "kernels/IHybridKVCache.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include "planning/KVCacheMemoryEstimator.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
 #include "execution/config/RuntimeConfig.h"
@@ -374,6 +379,213 @@ namespace llaminar2::test
         ASSERT_NE(cache, nullptr);
         EXPECT_EQ(cache->precision(), ActivationPrecision::FP32);
         EXPECT_EQ(cache->n_layers(), 4);
+    }
+
+    /**
+     * @brief Every supported CPU codec uses the same exact KVCache owner edge.
+     *
+     * The concrete tensor types have different packed geometry, but accounting
+     * belongs to the typed factory transaction rather than to format-specific
+     * constructors. Each iteration proves claim-before-construction, retained
+     * cache ownership, and release after the final payload allocation dies.
+     */
+    TEST_F(Test__KernelFactory_KVCache,
+           CanonicalAuthorityClaimsAllSupportedCPUStorageFormats)
+    {
+        const std::array precisions{
+            ActivationPrecision::FP32,
+            ActivationPrecision::BF16,
+            ActivationPrecision::FP16,
+            ActivationPrecision::Q8_1,
+            ActivationPrecision::Q16_1,
+            ActivationPrecision::TQ4,
+            ActivationPrecision::TQ8,
+        };
+
+        for (const ActivationPrecision precision : precisions)
+        {
+            SCOPED_TRACE(activationPrecisionToString(precision));
+            KVCacheConfig config;
+            config.precision = precision;
+            config.device = DeviceId::cpu();
+            config.num_layers = 2;
+            config.batch_size = 1;
+            config.max_seq_len = 16;
+            config.n_kv_heads = 2;
+            config.head_dim = 64;
+            config.mpi_ctx = &getTestMPIContext();
+            const size_t expected_bytes = config.estimateBytes();
+            ASSERT_GT(expected_bytes, 0u);
+
+            PhysicalMemoryBOMBuilder bom({
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 1u << 30u,
+                .admission_available_bytes = 1u << 30u,
+            });
+            bom.add(PhysicalMemoryOwner::KVCache, expected_bytes);
+            PhysicalMemoryPlanBuilder plan_builder;
+            plan_builder.add(bom.build());
+            auto certificate = std::make_shared<
+                const PhysicalMemoryPlanAdmissionCertificate>(
+                plan_builder.build());
+            auto authority = std::make_shared<PhysicalMemoryAuthority>(
+                certificate,
+                /*world_rank=*/0);
+            config.physical_memory_authority = authority;
+
+            {
+                auto cache = KernelFactory::createKVCache(config);
+                ASSERT_NE(cache, nullptr);
+                EXPECT_TRUE(cache->hasPhysicalMemoryLease());
+                EXPECT_EQ(
+                    authority->claimedBytes(
+                        DeviceId::cpu(),
+                        PhysicalMemoryOwner::KVCache,
+                        PhysicalMemoryMaterializationKind::NewAllocation),
+                    expected_bytes);
+            }
+
+            EXPECT_EQ(
+                authority->claimedBytes(
+                    DeviceId::cpu(),
+                    PhysicalMemoryOwner::KVCache,
+                    PhysicalMemoryMaterializationKind::NewAllocation),
+                0u);
+        }
+    }
+
+    /** @brief Hybrid admission prices only concrete full-attention KV layers. */
+    TEST_F(Test__KernelFactory_KVCache,
+           HybridEstimateExcludesRecurrentOnlyLayers)
+    {
+        HybridKVCacheConfig hybrid;
+        hybrid.layer_types = {
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+        };
+
+        KVCacheConfig config;
+        config.precision = ActivationPrecision::FP16;
+        config.device = DeviceId::cpu();
+        config.num_layers = 4;
+        config.batch_size = 2;
+        config.max_seq_len = 32;
+        config.n_kv_heads = 2;
+        config.head_dim = 64;
+        config.hybrid_config = &hybrid;
+
+        EXPECT_EQ(
+            config.estimateBytes(),
+            KVCacheMemoryEstimator::estimate(
+                /*n_layers=*/1,
+                config.batch_size,
+                config.max_seq_len,
+                config.n_kv_heads,
+                config.head_dim,
+                "fp16",
+                config.device));
+    }
+
+    /**
+     * @brief CPU hybrid construction claims KV and recurrent owners exactly.
+     *
+     * This is the real factory transaction rather than a geometry-only test:
+     * both allocations must be claimed before construction, retained by their
+     * respective cache bases, and returned only after the concrete cache dies.
+     */
+    TEST_F(Test__KernelFactory_KVCache,
+           CPUHybridCacheClaimsAndReleasesBothPhysicalOwners)
+    {
+        HybridKVCacheConfig hybrid;
+        hybrid.layer_types = {
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+        };
+        hybrid.gdn_conv_kernel_size = 3;
+        hybrid.gdn_state_size = 2;
+        hybrid.gdn_inner_size = 8;
+        hybrid.gdn_group_count = 2;
+        hybrid.gdn_time_step_rank = 4;
+        hybrid.n_heads = 4;
+
+        KVCacheConfig config;
+        config.precision = ActivationPrecision::FP32;
+        config.device = DeviceId::cpu();
+        config.num_layers = 3;
+        config.batch_size = 1;
+        config.max_seq_len = 16;
+        config.n_kv_heads = 2;
+        config.head_dim = 4;
+        config.mpi_ctx = &getTestMPIContext();
+        config.hybrid_config = &hybrid;
+
+        const size_t kv_bytes = config.estimateBytes();
+        const size_t recurrent_bytes =
+            hybrid.gdnStateGeometry().localPayloadBytes(
+                hybrid.countGDNLayers());
+        ASSERT_GT(kv_bytes, 0u);
+        ASSERT_GT(recurrent_bytes, 0u);
+
+        PhysicalMemoryBOMBuilder bom({
+            .world_rank = 0,
+            .device = DeviceId::cpu(),
+            .total_bytes = 1u << 30u,
+            .admission_available_bytes = 1u << 30u,
+        });
+        bom.add(PhysicalMemoryOwner::KVCache, kv_bytes)
+            .add(
+                PhysicalMemoryOwner::RecurrentLiveState,
+                recurrent_bytes);
+        PhysicalMemoryPlanBuilder plan_builder;
+        plan_builder.add(bom.build());
+        auto certificate = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            plan_builder.build());
+        auto authority = std::make_shared<PhysicalMemoryAuthority>(
+            certificate,
+            /*world_rank=*/0);
+        config.physical_memory_authority = authority;
+
+        {
+            auto cache = KernelFactory::createKVCache(config);
+            ASSERT_NE(cache, nullptr);
+            auto *hybrid_cache =
+                dynamic_cast<IHybridKVCache *>(cache.get());
+            ASSERT_NE(hybrid_cache, nullptr);
+            EXPECT_TRUE(cache->hasPhysicalMemoryLease());
+            EXPECT_TRUE(
+                hybrid_cache->hasRecurrentLiveMemoryLease());
+            EXPECT_EQ(hybrid_cache->gdnMemoryBytes(), recurrent_bytes);
+            EXPECT_EQ(
+                authority->claimedBytes(
+                    DeviceId::cpu(),
+                    PhysicalMemoryOwner::KVCache,
+                    PhysicalMemoryMaterializationKind::NewAllocation),
+                kv_bytes);
+            EXPECT_EQ(
+                authority->claimedBytes(
+                    DeviceId::cpu(),
+                    PhysicalMemoryOwner::RecurrentLiveState,
+                    PhysicalMemoryMaterializationKind::NewAllocation),
+                recurrent_bytes);
+        }
+
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::KVCache,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
+        EXPECT_EQ(
+            authority->claimedBytes(
+                DeviceId::cpu(),
+                PhysicalMemoryOwner::RecurrentLiveState,
+                PhysicalMemoryMaterializationKind::NewAllocation),
+            0u);
     }
 
     // =============================================================================

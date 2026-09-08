@@ -6,32 +6,37 @@
  *   - N_TILE: 64 vs 128
  *   - M_TILE: {16, 32, 64}
  *   - MIN_BLOCKS: {1 (bare launch_bounds), 2 (default 2-wave)}
- *   - UNROLL_G: {0 (no hint), 2, 4 (default)}
+ *   - UNROLL_G: {0 (no hint), 1, 2, 4 (default)} for both launch-bound regimes
  *   - Auto dispatch (current heuristic baseline)
  *
  * Shapes tested: Qwen2.5/Qwen3.6 dense and MoE-style production shapes.
  * M values: MTP small rows plus the canonical graph-prefill bucket policy.
  *
- * Output: per-shape best variant table with correctness gate (cosine > 0.9990).
+ * Output: per-shape best variant table. Every candidate must be byte-identical
+ * to the production exact-M Auto route before its timing can win.
  *
  * @note Requires ROCm device. Run with build_v2_release for representative timing.
  */
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
@@ -41,11 +46,13 @@
 #include "utils/Logger.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/ScopedGPUStream.h"
+#include "../native_vnni_dispatch/GPUTrainerVerification.h"
+#include "../native_vnni_dispatch/NativeVNNIShapeManifest.h"
 #include "fort.hpp"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
-#include "GpuVerification.h"
 #endif
 
 using namespace llaminar2;
@@ -54,59 +61,15 @@ using namespace llaminar2::test;
 
 namespace
 {
-#ifdef HAVE_ROCM
-    using gpu_verify::destroyAllHipBLAS;
-    using gpu_verify::gpuCosineSimilarity;
-    using gpu_verify::gpuReferenceFP32Gemm;
-    using gpu_verify::GpuWeightsCache;
-#endif
-
     // =========================================================================
     // Constants
     // =========================================================================
 
     constexpr int WARMUP_RUNS = 5;
     constexpr int BENCH_RUNS = 20;
-    constexpr float COSINE_SIM_GATE = 0.9990f;
 
     // =========================================================================
-    // Scoped environment override
-    // =========================================================================
-
-    class ScopedEnvOverride
-    {
-    public:
-        ScopedEnvOverride(const char *name, const std::string &value)
-            : name_(name)
-        {
-            const char *existing = std::getenv(name_);
-            had_original_ = (existing != nullptr);
-            if (had_original_)
-                original_value_ = existing;
-            ::setenv(name_, value.c_str(), 1);
-            mutableDebugEnv().rocm.reload();
-        }
-
-        ~ScopedEnvOverride()
-        {
-            if (had_original_)
-                ::setenv(name_, original_value_.c_str(), 1);
-            else
-                ::unsetenv(name_);
-            mutableDebugEnv().rocm.reload();
-        }
-
-        ScopedEnvOverride(const ScopedEnvOverride &) = delete;
-        ScopedEnvOverride &operator=(const ScopedEnvOverride &) = delete;
-
-    private:
-        const char *name_;
-        bool had_original_ = false;
-        std::string original_value_;
-    };
-
-    // =========================================================================
-    // Shape definitions (Qwen2.5 0.5B / 3B / 7B)
+    // Canonical exact-overlay shape inventory
     // =========================================================================
 
     struct GEMMShape
@@ -117,42 +80,35 @@ namespace
         int K;
     };
 
-    static const std::vector<GEMMShape> GEMM_SHAPES = {
-        // Qwen3.5/Qwen3.6 MoE expert FFN shapes.
-        {"35BMoE_Expert_GateUp", "MoE", 512, 2048},
-        {"35BMoE_Expert_Down", "MoE", 2048, 512},
-        // Qwen2.5-0.5B (hidden=896, intermediate=4864)
-        {"0.5B_AttnQKV", "Attention", 2688, 896},
-        {"0.5B_AttnOut", "Attention", 896, 896},
-        {"0.5B_FFN_Up", "FFN_Up", 4864, 896},
-        {"0.5B_FFN_Dn", "FFN_Down", 896, 4864},
-        {"0.5B_LM_Head", "LM_Head", 151936, 896},
-        // Qwen2.5-3B (hidden=2048, intermediate=11008)
-        {"3B_AttnQKV", "Attention", 6144, 2048},
-        {"3B_AttnOut", "Attention", 2048, 2048},
-        {"3B_FFN_Up", "FFN_Up", 11008, 2048},
-        {"3B_FFN_Dn", "FFN_Down", 2048, 11008},
-        {"3B_LM_Head", "LM_Head", 151936, 2048},
-        // Qwen2.5-7B (hidden=3584, intermediate=18944)
-        {"7B_AttnQKV", "Attention", 10752, 3584},
-        {"7B_AttnOut", "Attention", 3584, 3584},
-        {"7B_FFN_Up", "FFN_Up", 18944, 3584},
-        {"7B_FFN_Dn", "FFN_Down", 3584, 18944},
-        {"7B_LM_Head", "LM_Head", 151936, 3584},
-        // Qwen3.6 27B dense / hybrid GDN production shapes.
-        {"Qwen36_Attn_Q", "Attention", 5120, 5120},
-        {"Qwen36_Attn_KV", "Attention", 1024, 5120},
-        {"Qwen36_Attn_Wo", "Attention", 5120, 5120},
-        {"Qwen36_FFN_GateUp", "FFN_Up", 17408, 5120},
-        {"Qwen36_FFN_DownProjection", "FFN_Down", 5120, 17408},
-        {"Qwen36_GDN_InnerProjection", "GDN", 10240, 5120},
-        {"Qwen36_GDN_ZProjection", "GDN", 6144, 5120},
-        {"Qwen36_GDN_TimeProjection", "GDN", 1024, 5120},
-        {"Qwen36_GDN_OutputProjection", "GDN", 5120, 6144},
-        {"Qwen36_LM_Head", "LM_Head", 248320, 5120},
-    };
+    /**
+     * @brief Resolve every production exact-overlay geometry from the same
+     * manifest consumed by CPU, CUDA, and the Python matrix planner.
+     *
+     * The refresh transaction passes the ordinary-prefill subset explicitly.
+     * Keeping the complete production inventory here allows those filters to
+     * resolve every released geometry without maintaining a second ROCm-only
+     * model table that can drift out of date.
+     */
+    static const std::vector<GEMMShape> GEMM_SHAPES = []
+    {
+        std::vector<GEMMShape> result;
+        for (const auto &shape :
+             llaminar2::test::native_vnni_dispatch::nativeVnniShapeManifest())
+        {
+            if (shape.role != "production" || !shape.exact_overlay)
+                continue;
+            result.push_back(
+                {shape.name, shape.aspect_bucket, shape.N, shape.K});
+        }
+        if (result.empty())
+            throw std::runtime_error(
+                "ROCm NativeVNNI manifest has no production exact overlays");
+        return result;
+    }();
 
-    static const std::vector<int> M_VALUES = defaultNativeVNNIDispatchTrainingRows();
+    // Decode and grouped verifier depths have dedicated common-trainer
+    // transactions. This legacy harness is restricted to ordinary prefill.
+    static const std::vector<int> M_VALUES = defaultPrefillGraphBucketSizes();
 
     struct FormatSpec
     {
@@ -165,6 +121,8 @@ namespace
          { return TestTensorFactory::createQ4_0Random({N, K}); }},
         {"IQ4_NL", [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        {"IQ4_XS", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ4_XSRandom({N, K}); }},
         {"Q4_1", [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_1Random({N, K}); }},
         {"Q4_K", [](size_t N, size_t K)
@@ -195,6 +153,12 @@ namespace
          { return TestTensorFactory::createIQ1_SRandom({N, K}); }},
         {"IQ1_M", [](size_t N, size_t K)
          { return TestTensorFactory::createIQ1_MRandom({N, K}); }},
+        {"Q8_0", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_0Random({N, K}); }},
+        {"Q8_1", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_1Random({N, K}); }},
+        {"Q8_K", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_KRandom({N, K}); }},
     };
 
     static std::string toLower(std::string value)
@@ -280,6 +244,45 @@ namespace
         return *info;
     }
 
+    TEST(NativeVNNISweepOffline, ShapeAndFormatInventoriesAreCanonical)
+    {
+        const std::set<std::string> expected_formats = {
+            "Q4_0", "IQ4_NL", "IQ4_XS", "Q4_1", "Q4_K", "Q5_0", "Q5_1",
+            "Q5_K", "Q6_K", "Q3_K", "Q2_K", "IQ3_S", "IQ3_XXS", "IQ2_S",
+            "IQ2_XS", "IQ2_XXS", "IQ1_S", "IQ1_M", "Q8_0", "Q8_1", "Q8_K"};
+        std::set<std::string> observed_formats;
+        for (const auto &format : NVNNI_FORMATS)
+        {
+            auto weights = format.create(/*N=*/2, /*K=*/256);
+            ASSERT_NE(weights, nullptr) << format.name;
+            (void)requireNativeVnniInfo(weights.get(), format.name);
+            EXPECT_TRUE(observed_formats.insert(format.name).second)
+                << "duplicate ROCm NativeVNNI source format " << format.name;
+        }
+        EXPECT_EQ(observed_formats, expected_formats);
+
+        std::set<std::tuple<std::string, int, int>> expected_shapes;
+        for (const auto &shape :
+             llaminar2::test::native_vnni_dispatch::nativeVnniShapeManifest())
+        {
+            if (shape.role == "production" && shape.exact_overlay)
+                expected_shapes.emplace(shape.name, shape.N, shape.K);
+        }
+        std::set<std::tuple<std::string, int, int>> observed_shapes;
+        for (const auto &shape : GEMM_SHAPES)
+            EXPECT_TRUE(
+                observed_shapes.emplace(shape.name, shape.N, shape.K).second)
+                << "duplicate ROCm NativeVNNI exact geometry " << shape.name;
+        EXPECT_EQ(observed_shapes, expected_shapes);
+
+        EXPECT_EQ(M_VALUES, llaminar2::defaultPrefillGraphBucketSizes());
+        EXPECT_EQ(std::count(M_VALUES.begin(), M_VALUES.end(), 1), 0);
+        for (int m = 2; m <= llaminar2::kDefaultNativeVNNIVerifierRowCapacity;
+             ++m)
+            EXPECT_EQ(std::count(M_VALUES.begin(), M_VALUES.end(), m), 0)
+                << "M=" << m << " belongs to grouped verifier training";
+    }
+
     // =========================================================================
     // Variant definitions
     // =========================================================================
@@ -291,6 +294,7 @@ namespace
         int mt;         // -1=auto, 16/32/64
         int min_blocks; // -1=auto, 1=bare, 2=2-wave, 3=3-wave
         int unroll;     // -1=auto, 0/1/2/4
+        int full_tiles = 0; // -1=auto, 0=checked edges, 1=proven full tiles
     };
 
     static const std::vector<VariantConfig> NVNNI_VARIANTS = {
@@ -311,14 +315,101 @@ namespace
         {"N64/MT64/MB1/U1", 64, 64, 1, 1},
         {"N64/MT64/MB1/U2", 64, 64, 1, 2},
         {"N64/MT64/MB1/U4", 64, 64, 1, 4},
+        // The two-wave family is the production Q6_K contender. Exposing its
+        // unroll dimension is essential: launch bounds and loop unrolling
+        // jointly determine gfx906 VGPR allocation and scratch spills.
+        {"N64/MT64/MB2/U0", 64, 64, 2, 0},
+        {"N64/MT64/MB2/U1", 64, 64, 2, 1},
+        {"N64/MT64/MB2/U2", 64, 64, 2, 2},
+        {"N64/MT64/MB2/U4", 64, 64, 2, 4},
         // UNROLL_G sweep on N128/MT32/MB1
         {"N128/MT32/MB1/U0", 128, 32, 1, 0},
         {"N128/MT32/MB1/U1", 128, 32, 1, 1},
         {"N128/MT32/MB1/U2", 128, 32, 1, 2},
         {"N128/MT32/MB1/U4", 128, 32, 1, 4},
+        {"N128/MT32/MB2/U0", 128, 32, 2, 0},
+        {"N128/MT32/MB2/U1", 128, 32, 2, 1},
+        {"N128/MT32/MB2/U2", 128, 32, 2, 2},
+        {"N128/MT32/MB2/U4", 128, 32, 2, 4},
         // Auto dispatch (current heuristic)
-        {"Auto", -1, -1, -1, -1},
+        {"Auto", -1, -1, -1, -1, -1},
     };
+
+    /**
+     * @brief Return the extra spill-gated Q6_K full-tile candidate family.
+     *
+     * Q6_K owns the dominant Qwen 3.6 prefill time and every released model
+     * geometry is divisible by both candidate column tiles. M16 and M32 cover
+     * the occupancy transition across the complete captured-bucket inventory;
+     * M64 is deliberately absent because prior gfx906 ISA inspection proved
+     * that its dual-scale accumulator shape spills.
+     */
+    static std::vector<VariantConfig> q6FullTileVariants()
+    {
+        std::vector<VariantConfig> result;
+        for (const int n_tile : {64, 128})
+        {
+            for (const int m_tile : {16, 32})
+            {
+                for (const int min_blocks : {1, 2})
+                {
+                    for (const int unroll : {0, 1, 2, 4})
+                    {
+                        result.push_back(VariantConfig{
+                            .name =
+                                "N" + std::to_string(n_tile) +
+                                "/MT" + std::to_string(m_tile) +
+                                "/MB" + std::to_string(min_blocks) +
+                                "/U" + std::to_string(unroll) +
+                                "/FULL",
+                            .force_n = n_tile,
+                            .mt = m_tile,
+                            .min_blocks = min_blocks,
+                            .unroll = unroll,
+                            .full_tiles = 1,
+                        });
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /** Return the exact candidate inventory launchable for one source format. */
+    static std::vector<VariantConfig> trainerVariantsForFormat(
+        const std::string &format_name)
+    {
+        std::vector<VariantConfig> result;
+        result.reserve(NVNNI_VARIANTS.size() + 32);
+        const auto auto_iterator = std::find_if(
+            NVNNI_VARIANTS.begin(),
+            NVNNI_VARIANTS.end(),
+            [](const VariantConfig &variant)
+            { return variant.name == "Auto"; });
+        for (auto iterator = NVNNI_VARIANTS.begin();
+             iterator != auto_iterator; ++iterator)
+        {
+            const bool q6_checked_spill =
+                format_name == "Q6_K" &&
+                iterator->full_tiles == 0 &&
+                iterator->min_blocks == 2 &&
+                ((iterator->force_n == 64 && iterator->mt == 64) ||
+                 (iterator->force_n == 128 && iterator->mt == 32));
+            if (!q6_checked_spill)
+                result.push_back(*iterator);
+        }
+        if (format_name == "Q6_K")
+        {
+            auto full = q6FullTileVariants();
+            result.insert(
+                result.end(),
+                std::make_move_iterator(full.begin()),
+                std::make_move_iterator(full.end()));
+        }
+        if (auto_iterator != NVNNI_VARIANTS.end())
+            result.push_back(*auto_iterator);
+        return result;
+    }
 
     // =========================================================================
     // Benchmark result
@@ -336,7 +427,511 @@ namespace
         double gflops = 0.0;
         float cosine_sim = 0.0f;
         bool correctness_pass = false;
+        size_t byte_mismatches_vs_auto = 0;
+        size_t first_byte_mismatch_vs_auto =
+            std::numeric_limits<size_t>::max();
+        int observed_n_tile = 0;
+        int observed_m_tile = 0;
+        int observed_min_blocks = 0;
+        int observed_unroll = 0;
+        bool observed_full_tiles = false;
+        int registers_per_thread = 0;
+        size_t local_memory_bytes_per_thread = 0;
+        size_t static_shared_memory_bytes = 0;
+        int max_threads_per_block = 0;
+        int max_active_blocks_per_sm = 0;
     };
+
+#ifdef HAVE_ROCM
+    extern "C" bool rocmNativeVNNIPrefill_getLastLaunchSelection(
+        uint8_t *codebook_id,
+        int *n_tile,
+        int *m_tile,
+        int *min_blocks,
+        int *unroll,
+        bool *full_tiles);
+    extern "C" bool rocmNativeVNNIPrefill_getLastLaunchResources(
+        int *registers_per_thread,
+        size_t *local_memory_bytes_per_thread,
+        size_t *static_shared_memory_bytes,
+        int *max_threads_per_block,
+        int *max_active_blocks_per_sm);
+#endif
+
+#ifdef HAVE_ROCM
+    /**
+     * @brief Typed, process-local NativeVNNI candidate override for the trainer.
+     *
+     * The production launcher reads its tuning controls from the typed
+     * `DebugEnv` snapshot. Rewriting environment variables and reparsing the
+     * complete ROCm configuration for every launch made the old trainer both
+     * noisy and needlessly expensive. This scope changes only the five launch
+     * fields owned by the NativeVNNI tournament and restores them on teardown.
+     * The turnkey collector gives every physical GPU its own process, so these
+     * process-local controls cannot race another candidate lane.
+     */
+    class ScopedROCmNativeVNNITrainerOverride
+    {
+    public:
+        ScopedROCmNativeVNNITrainerOverride()
+        {
+            const auto &config = debugEnv().rocm;
+            saved_mt_ = config.nvnni_mt;
+            saved_unroll_ = config.nvnni_unroll;
+            saved_min_blocks_ = config.nvnni_min_blocks;
+            saved_force_n64_ = config.nvnni_force_n64;
+            saved_force_n128_ = config.nvnni_force_n128;
+            saved_full_tiles_ = config.nvnni_full_tiles;
+        }
+
+        ~ScopedROCmNativeVNNITrainerOverride()
+        {
+            auto &config = mutableDebugEnv().rocm;
+            config.nvnni_mt = saved_mt_;
+            config.nvnni_unroll = saved_unroll_;
+            config.nvnni_min_blocks = saved_min_blocks_;
+            config.nvnni_force_n64 = saved_force_n64_;
+            config.nvnni_force_n128 = saved_force_n128_;
+            config.nvnni_full_tiles = saved_full_tiles_;
+        }
+
+        ScopedROCmNativeVNNITrainerOverride(
+            const ScopedROCmNativeVNNITrainerOverride &) = delete;
+        ScopedROCmNativeVNNITrainerOverride &operator=(
+            const ScopedROCmNativeVNNITrainerOverride &) = delete;
+
+        /** Select one exact compile-time candidate for subsequent launches. */
+        void apply(const VariantConfig &variant)
+        {
+            auto &config = mutableDebugEnv().rocm;
+            config.nvnni_mt = variant.mt;
+            config.nvnni_unroll = variant.unroll;
+            config.nvnni_min_blocks = variant.min_blocks;
+            config.nvnni_force_n64 = variant.force_n == 64;
+            config.nvnni_force_n128 = variant.force_n == 128;
+            config.nvnni_full_tiles = variant.full_tiles;
+        }
+
+    private:
+        int saved_mt_ = -1;
+        int saved_unroll_ = -1;
+        int saved_min_blocks_ = -1;
+        bool saved_force_n64_ = false;
+        bool saved_force_n128_ = false;
+        int saved_full_tiles_ = -1;
+    };
+
+    /** @brief Move-only ownership for one HIP timing event. */
+    class ScopedROCmTimingEvent
+    {
+    public:
+        ScopedROCmTimingEvent()
+        {
+            const hipError_t error =
+                hipEventCreateWithFlags(&event_, hipEventDefault);
+            if (error != hipSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("failed to create HIP timing event: ") +
+                    hipGetErrorString(error));
+            }
+        }
+
+        ~ScopedROCmTimingEvent()
+        {
+            if (event_)
+                (void)hipEventDestroy(event_);
+        }
+
+        ScopedROCmTimingEvent(const ScopedROCmTimingEvent &) = delete;
+        ScopedROCmTimingEvent &operator=(const ScopedROCmTimingEvent &) = delete;
+
+        ScopedROCmTimingEvent(ScopedROCmTimingEvent &&other) noexcept
+            : event_(other.event_)
+        {
+            other.event_ = nullptr;
+        }
+
+        ScopedROCmTimingEvent &operator=(ScopedROCmTimingEvent &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (event_)
+                    (void)hipEventDestroy(event_);
+                event_ = other.event_;
+                other.event_ = nullptr;
+            }
+            return *this;
+        }
+
+        [[nodiscard]] hipEvent_t get() const noexcept { return event_; }
+
+    private:
+        hipEvent_t event_ = nullptr;
+    };
+
+    /**
+     * @brief Persistent device state for one ROCm shape/M tournament.
+     *
+     * Construction performs weight packing/upload, tensor allocation, input
+     * publication, workspace planning, event creation, and the exact-M Auto
+     * oracle launch exactly once. `measure()` then contains only warmup and
+     * timed production kernel launches on one explicit non-default stream.
+     * `certify()` compares every output byte on that producer stream and
+     * downloads only the mismatch count and first mismatch offset.
+     *
+     * Candidate geometry changes do not change any captured pointer or arena
+     * binding. The workspace is the union of every candidate requirement for
+     * this cell, making dynamic allocation or rebinding during measurement
+     * structurally unnecessary.
+     */
+    class PreparedROCmSweepExecution
+    {
+    public:
+        PreparedROCmSweepExecution(
+            const GEMMShape &shape,
+            int m,
+            TensorBase *weights,
+            const std::vector<VariantConfig> &variants,
+            int maximum_bench_runs)
+            : shape_(shape), m_(m)
+        {
+            if (!weights || m_ <= 0 || shape_.N <= 0 || shape_.K <= 0 ||
+                maximum_bench_runs <= 0)
+            {
+                throw std::invalid_argument(
+                    "invalid ROCm NativeVNNI tournament geometry");
+            }
+            requireHip(hipSetDevice(kDeviceOrdinal), "select device");
+            expected_codebook_ =
+                requireNativeVnniInfo(weights, "ROCm tournament source weights")
+                    .codebook_id;
+            if (!packWeightsToROCm(weights, packed_))
+                throw std::runtime_error(
+                    "failed to pack persistent ROCm NativeVNNI weights");
+
+            kernel_ = std::make_unique<ROCmQuantisedGemmKernel>(
+                &packed_, kDeviceOrdinal);
+            stream_owner_ = std::make_unique<ScopedGPUStream>(
+                DeviceId::rocm(kDeviceOrdinal));
+            stream_ = static_cast<hipStream_t>(stream_owner_->get());
+            kernel_->setGPUStream(static_cast<void *>(stream_));
+
+            WorkspaceRequirements requirements;
+            for (const auto &variant : variants)
+            {
+                override_.apply(variant);
+                requirements.merge(kernel_->getWorkspaceRequirements(
+                    m_, shape_.N, shape_.K));
+            }
+            override_.apply(autoVariant());
+            requirements.merge(kernel_->getWorkspaceRequirements(
+                m_, shape_.N, shape_.K));
+
+            const size_t required = requirements.total_bytes_with_alignment();
+            const size_t budget = std::max(
+                required + required / 10,
+                size_t{64} * 1024 * 1024);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                DeviceId::rocm(kDeviceOrdinal), budget);
+            if (!workspace_->allocate(requirements))
+                throw std::runtime_error(
+                    "failed to allocate persistent ROCm sweep workspace");
+            kernel_->bindWorkspace(workspace_.get());
+
+            input_ = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(m_), static_cast<size_t>(shape_.K)},
+                -0.25f,
+                0.25f,
+                7);
+            output_ = TestTensorFactory::createFP32(
+                {static_cast<size_t>(m_), static_cast<size_t>(shape_.N)});
+            oracle_output_ = TestTensorFactory::createFP32(
+                {static_cast<size_t>(m_), static_cast<size_t>(shape_.N)});
+            comparison_state_ = TestTensorFactory::createFP32({4});
+            if (!input_ || !output_ || !oracle_output_ || !comparison_state_)
+                throw std::runtime_error(
+                    "failed to construct persistent ROCm sweep tensors");
+
+            const DeviceId device = DeviceId::rocm(kDeviceOrdinal);
+            if (!input_->ensureOnDevice(device, stream_) ||
+                !output_->allocateOnDevice(device, stream_) ||
+                !oracle_output_->allocateOnDevice(device, stream_) ||
+                !comparison_state_->allocateOnDevice(device, stream_))
+            {
+                throw std::runtime_error(
+                    "failed to bind persistent ROCm sweep tensors");
+            }
+
+            start_events_.reserve(static_cast<size_t>(maximum_bench_runs));
+            stop_events_.reserve(static_cast<size_t>(maximum_bench_runs));
+            for (int index = 0; index < maximum_bench_runs; ++index)
+            {
+                start_events_.emplace_back();
+                stop_events_.emplace_back();
+            }
+            times_us_.resize(static_cast<size_t>(maximum_bench_runs));
+
+            buildExactMPrefillOracle();
+        }
+
+        ~PreparedROCmSweepExecution()
+        {
+            if (stream_)
+                (void)hipStreamSynchronize(stream_);
+            if (kernel_)
+                kernel_->clearGPUStreamBinding();
+            if (kernel_)
+                kernel_->unbindWorkspace();
+        }
+
+        PreparedROCmSweepExecution(const PreparedROCmSweepExecution &) = delete;
+        PreparedROCmSweepExecution &operator=(
+            const PreparedROCmSweepExecution &) = delete;
+
+        /**
+         * @brief Time one candidate without allocation or per-launch blocking.
+         *
+         * Every event pair is enqueued first. Waiting on the final stop event
+         * drains the ordered stream once, after which all individual elapsed
+         * intervals are available. This preserves per-launch samples without
+         * the old host round trip after every kernel invocation.
+         */
+        BenchResult measure(
+            const VariantConfig &variant,
+            int warmup_runs,
+            int bench_runs)
+        {
+            if (warmup_runs <= 0 || bench_runs <= 0 ||
+                static_cast<size_t>(bench_runs) > start_events_.size())
+            {
+                throw std::invalid_argument(
+                    "invalid ROCm NativeVNNI timing repetition count");
+            }
+
+            override_.apply(variant);
+            BenchResult result;
+            result.variant_name = variant.name;
+            result.shape_name = shape_.name;
+            result.category = shape_.category;
+            result.M = m_;
+            result.N = shape_.N;
+            result.K = shape_.K;
+
+            // Resolve immutable compiler resources before the timing batch.
+            // This single untimed launch also proves the requested template is
+            // launchable for the exact cell geometry. A spilling candidate is
+            // rejected here and never contributes a benchmark observation.
+            launch(output_.get());
+            checkStream("candidate resource probe");
+            uint8_t observed_codebook = 0;
+            if (!rocmNativeVNNIPrefill_getLastLaunchSelection(
+                    &observed_codebook,
+                    &result.observed_n_tile,
+                    &result.observed_m_tile,
+                    &result.observed_min_blocks,
+                    &result.observed_unroll,
+                    &result.observed_full_tiles) ||
+                observed_codebook != expected_codebook_ ||
+                !rocmNativeVNNIPrefill_getLastLaunchResources(
+                    &result.registers_per_thread,
+                    &result.local_memory_bytes_per_thread,
+                    &result.static_shared_memory_bytes,
+                    &result.max_threads_per_block,
+                    &result.max_active_blocks_per_sm))
+            {
+                throw std::runtime_error(
+                    "ROCm NativeVNNI trainer could not inspect its launch");
+            }
+            if (result.local_memory_bytes_per_thread != 0)
+            {
+                throw std::runtime_error(
+                    "ROCm NativeVNNI candidate spills local memory: " +
+                    variant.name + " bytes_per_thread=" +
+                    std::to_string(result.local_memory_bytes_per_thread));
+            }
+
+            for (int iteration = 0; iteration < warmup_runs; ++iteration)
+                launch(output_.get());
+            checkStream("candidate warmup");
+
+            for (int iteration = 0; iteration < bench_runs; ++iteration)
+            {
+                const size_t index = static_cast<size_t>(iteration);
+                requireHip(
+                    hipEventRecord(start_events_[index].get(), stream_),
+                    "record candidate start event");
+                launch(output_.get());
+                requireHip(
+                    hipEventRecord(stop_events_[index].get(), stream_),
+                    "record candidate stop event");
+            }
+            requireHip(
+                hipEventSynchronize(
+                    stop_events_[static_cast<size_t>(bench_runs - 1)].get()),
+                "wait for candidate event batch");
+
+            for (int iteration = 0; iteration < bench_runs; ++iteration)
+            {
+                float elapsed_ms = 0.0f;
+                requireHip(
+                    hipEventElapsedTime(
+                        &elapsed_ms,
+                        start_events_[static_cast<size_t>(iteration)].get(),
+                        stop_events_[static_cast<size_t>(iteration)].get()),
+                    "read candidate elapsed time");
+                times_us_[static_cast<size_t>(iteration)] =
+                    static_cast<double>(elapsed_ms) * 1000.0;
+            }
+
+            result.min_us = *std::min_element(
+                times_us_.begin(),
+                times_us_.begin() + bench_runs);
+            result.mean_us = std::accumulate(
+                                 times_us_.begin(),
+                                 times_us_.begin() + bench_runs,
+                                 0.0) /
+                             static_cast<double>(bench_runs);
+            double squared_error = 0.0;
+            for (int iteration = 0; iteration < bench_runs; ++iteration)
+            {
+                const double sample = times_us_[static_cast<size_t>(iteration)];
+                const double difference = sample - result.mean_us;
+                squared_error += difference * difference;
+            }
+            result.stddev_us = std::sqrt(
+                squared_error / static_cast<double>(bench_runs));
+            const double flops =
+                2.0 * static_cast<double>(m_) * shape_.N * shape_.K;
+            result.gflops = flops / (result.min_us * 1.0e-6) / 1.0e9;
+
+            const auto certificate = certify();
+            result.byte_mismatches_vs_auto =
+                static_cast<size_t>(certificate[0]);
+            result.first_byte_mismatch_vs_auto =
+                static_cast<size_t>(certificate[1]);
+            result.correctness_pass = certificate[0] == 0;
+            result.cosine_sim = result.correctness_pass ? 1.0f : 0.0f;
+            last_timing_sample_count_ = static_cast<size_t>(bench_runs);
+            return result;
+        }
+
+        /**
+         * @brief Return the native HIP-event samples from the last candidate.
+         *
+         * The view aliases persistent tournament storage and is consumed
+         * before another candidate launch. Keeping this allocation-free makes
+         * the sidecar faithful to the same event batch used by the aggregate.
+         */
+        [[nodiscard]] std::span<const double> timingSamples() const noexcept
+        {
+            return std::span<const double>(
+                times_us_.data(), last_timing_sample_count_);
+        }
+
+    private:
+        static constexpr int kDeviceOrdinal = 0;
+
+        /** Return the production exact-M route used as the byte oracle. */
+        static const VariantConfig &autoVariant()
+        {
+            const auto iterator = std::find_if(
+                NVNNI_VARIANTS.begin(),
+                NVNNI_VARIANTS.end(),
+                [](const VariantConfig &variant)
+                { return variant.name == "Auto"; });
+            if (iterator == NVNNI_VARIANTS.end())
+                throw std::logic_error(
+                    "ROCm NativeVNNI candidate inventory has no Auto route");
+            return *iterator;
+        }
+
+        static void requireHip(hipError_t error, const char *operation)
+        {
+            if (error != hipSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("ROCm NativeVNNI sweep failed to ") +
+                    operation + ": " + hipGetErrorString(error));
+            }
+        }
+
+        void launch(FP32Tensor *destination)
+        {
+            if (!kernel_->multiply_tensor(
+                    input_.get(),
+                    destination,
+                    m_,
+                    shape_.N,
+                    shape_.K))
+            {
+                throw std::runtime_error(
+                    "ROCm NativeVNNI production launch failed");
+            }
+        }
+
+        void checkStream(const char *operation)
+        {
+            requireHip(hipStreamSynchronize(stream_), operation);
+        }
+
+        void buildExactMPrefillOracle()
+        {
+            override_.apply(autoVariant());
+            launch(oracle_output_.get());
+            checkStream("construct exact-M Auto oracle");
+        }
+
+        std::array<uint64_t, 2> certify()
+        {
+            auto *comparison_words = reinterpret_cast<uint64_t *>(
+                comparison_state_->gpu_data_ptr());
+            if (!llaminar2::test::enqueueROCmFP32ByteComparison(
+                    reinterpret_cast<const float *>(output_->gpu_data_ptr()),
+                    reinterpret_cast<const float *>(
+                        oracle_output_->gpu_data_ptr()),
+                    static_cast<size_t>(m_) *
+                        static_cast<size_t>(shape_.N),
+                    comparison_words,
+                    comparison_words + 1,
+                    stream_))
+            {
+                throw std::runtime_error(
+                    "ROCm NativeVNNI full-buffer byte comparison failed");
+            }
+
+            std::array<uint64_t, 2> certificate{};
+            requireHip(
+                hipMemcpyAsync(
+                    certificate.data(),
+                    comparison_words,
+                    sizeof(certificate),
+                    hipMemcpyDeviceToHost,
+                    stream_),
+                "download byte-certificate counters");
+            checkStream("complete byte certificate");
+            return certificate;
+        }
+
+        const GEMMShape &shape_;
+        int m_ = 0;
+        uint8_t expected_codebook_ = 0;
+        ScopedROCmNativeVNNITrainerOverride override_;
+        std::unique_ptr<ScopedGPUStream> stream_owner_;
+        hipStream_t stream_ = nullptr;
+        ROCmPackedWeights packed_;
+        std::unique_ptr<ROCmQuantisedGemmKernel> kernel_;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
+        std::unique_ptr<FP32Tensor> input_;
+        std::unique_ptr<FP32Tensor> output_;
+        std::unique_ptr<FP32Tensor> oracle_output_;
+        std::unique_ptr<FP32Tensor> comparison_state_;
+        std::vector<ScopedROCmTimingEvent> start_events_;
+        std::vector<ScopedROCmTimingEvent> stop_events_;
+        std::vector<double> times_us_;
+        size_t last_timing_sample_count_ = 0;
+    };
+#endif
 
     // =========================================================================
     // Test fixture
@@ -365,152 +960,8 @@ namespace
 #endif
         }
 
-        void TearDown() override
-        {
-#ifdef HAVE_ROCM
-            destroyAllHipBLAS();
-#endif
-        }
-
         bool has_device_ = false;
         std::string device_name_;
-
-#ifdef HAVE_ROCM
-
-        BenchResult benchmarkVariant(const VariantConfig &variant,
-                                     const GEMMShape &shape, int M,
-                                     TensorBase *weights,
-                                     const GpuWeightsCache &gpu_weights)
-        {
-            BenchResult result;
-            result.variant_name = variant.name;
-            result.shape_name = shape.name;
-            result.category = shape.category;
-            result.M = M;
-            result.N = shape.N;
-            result.K = shape.K;
-
-            if (!weights)
-                return result;
-
-            // Set environment overrides for this variant
-            ScopedEnvOverride force_n64("LLAMINAR_ROCM_NVNNI_FORCE_N64",
-                                        variant.force_n == 64 ? "1" : "0");
-            ScopedEnvOverride force_n128("LLAMINAR_ROCM_NVNNI_FORCE_N128",
-                                         variant.force_n == 128 ? "1" : "0");
-            ScopedEnvOverride mt_env("LLAMINAR_ROCM_NVNNI_MT",
-                                     std::to_string(variant.mt));
-            ScopedEnvOverride mb_env("LLAMINAR_ROCM_NVNNI_MIN_BLOCKS",
-                                     std::to_string(variant.min_blocks));
-            ScopedEnvOverride ug_env("LLAMINAR_ROCM_NVNNI_UNROLL",
-                                     std::to_string(variant.unroll));
-
-            ROCmPackedWeights packed;
-            if (!packWeightsToROCm(weights, packed))
-                return result;
-
-            ROCmQuantisedGemmKernel kernel(&packed, 0);
-            auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
-            const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
-            auto workspace = std::make_unique<DeviceWorkspaceManager>(
-                DeviceId::rocm(0), budget);
-            if (!workspace->allocate(reqs))
-                return result;
-            kernel.bindWorkspace(workspace.get());
-
-            auto input = TestTensorFactory::createFP32Random(
-                {static_cast<size_t>(M), static_cast<size_t>(shape.K)});
-            auto output = TestTensorFactory::createFP32(
-                {static_cast<size_t>(M), static_cast<size_t>(shape.N)});
-            if (!input->ensureOnDevice(DeviceId::rocm(0)))
-            {
-                kernel.unbindWorkspace();
-                return result;
-            }
-            if (!output->allocateOnDevice(DeviceId::rocm(0)))
-            {
-                kernel.unbindWorkspace();
-                return result;
-            }
-
-            // Correctness: compare against hipBLAS FP32 reference
-            {
-                kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-                (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-
-                if (gpu_weights.d_weights)
-                {
-                    auto *in_fp32 = dynamic_cast<FP32Tensor *>(input.get());
-                    const float *d_input = reinterpret_cast<const float *>(in_fp32->gpu_data_ptr());
-                    if (d_input)
-                    {
-                        const size_t out_elems = static_cast<size_t>(M) * shape.N;
-                        float *d_ref = nullptr;
-                        if (hipMalloc(&d_ref, out_elems * sizeof(float)) == hipSuccess)
-                        {
-                            if (gpuReferenceFP32Gemm(d_input, gpu_weights.d_weights,
-                                                     d_ref, M, shape.N, shape.K, 0))
-                            {
-                                (void)hipDeviceSynchronize();
-                                const float *d_out = reinterpret_cast<const float *>(
-                                    dynamic_cast<FP32Tensor *>(output.get())->gpu_data_ptr());
-                                result.cosine_sim = gpuCosineSimilarity(d_out, d_ref, out_elems, 0);
-                                result.correctness_pass = (result.cosine_sim >= COSINE_SIM_GATE);
-                            }
-                            (void)hipFree(d_ref);
-                        }
-                    }
-                }
-            }
-
-            // Warmup
-            for (int i = 0; i < WARMUP_RUNS; ++i)
-                kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-            (void)hipDeviceSynchronize();
-
-            // Timed runs using HIP events
-            hipEvent_t start = nullptr, stop = nullptr;
-            (void)hipEventCreate(&start);
-            (void)hipEventCreate(&stop);
-
-            std::vector<double> times_us;
-            times_us.reserve(BENCH_RUNS);
-
-            for (int i = 0; i < BENCH_RUNS; ++i)
-            {
-                (void)hipDeviceSynchronize();
-                (void)hipEventRecord(start);
-                kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-                (void)hipEventRecord(stop);
-                (void)hipEventSynchronize(stop);
-
-                float ms = 0.0f;
-                (void)hipEventElapsedTime(&ms, start, stop);
-                times_us.push_back(static_cast<double>(ms) * 1000.0);
-            }
-
-            (void)hipEventDestroy(start);
-            (void)hipEventDestroy(stop);
-
-            std::sort(times_us.begin(), times_us.end());
-
-            result.min_us = times_us.front();
-            result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) /
-                             static_cast<double>(times_us.size());
-            double sq_sum = 0.0;
-            for (double t : times_us)
-                sq_sum += (t - result.mean_us) * (t - result.mean_us);
-            result.stddev_us = std::sqrt(sq_sum / static_cast<double>(times_us.size()));
-
-            double flops = 2.0 * M * static_cast<double>(shape.N) * shape.K;
-            result.gflops = flops / (result.min_us * 1e-6) / 1e9;
-
-            kernel.unbindWorkspace();
-            return result;
-        }
-
-#endif
     };
 
     // =========================================================================
@@ -531,8 +982,8 @@ namespace
                 GEMM_SHAPES.size(), M_VALUES.size(), NVNNI_VARIANTS.size());
         fprintf(stderr, "[Native-VNNI Q4_0 Sweep] %d warmup + %d timed runs each\n",
                 WARMUP_RUNS, BENCH_RUNS);
-        fprintf(stderr, "[Native-VNNI Q4_0 Sweep] Correctness gate: cosine >= %.4f\n\n",
-                COSINE_SIM_GATE);
+        fprintf(stderr,
+                "[Native-VNNI Q4_0 Sweep] Correctness gate: full output byte equality vs Auto\n\n");
 
         const size_t num_shapes = GEMM_SHAPES.size();
         const size_t num_m = M_VALUES.size();
@@ -551,30 +1002,35 @@ namespace
             auto q4_weights = TestTensorFactory::createQ4_0Random(
                 {static_cast<size_t>(shape.N), static_cast<size_t>(shape.K)});
 
-            GpuWeightsCache gpu_weights;
-            if (q4_weights)
-            {
-                const float *w_fp32 = q4_weights->data();
-                if (w_fp32)
-                    gpu_weights.upload(w_fp32, shape.N, shape.K, 0);
-            }
-
             for (size_t mi = 0; mi < num_m; ++mi)
             {
                 int M = M_VALUES[mi];
+                PreparedROCmSweepExecution execution(
+                    shape,
+                    M,
+                    q4_weights.get(),
+                    NVNNI_VARIANTS,
+                    BENCH_RUNS);
 
                 for (size_t vi = 0; vi < num_variants; ++vi)
                 {
                     const auto &variant = NVNNI_VARIANTS[vi];
-                    auto r = benchmarkVariant(variant, shape, M,
-                                              q4_weights.get(), gpu_weights);
+                    auto r = execution.measure(
+                        variant,
+                        WARMUP_RUNS,
+                        BENCH_RUNS);
                     results[si * num_m * num_variants + mi * num_variants + vi] = std::move(r);
                     ++completed;
 
                     const auto &res = results[si * num_m * num_variants + mi * num_variants + vi];
-                    fprintf(stderr, "  %s %s M=%d: %.0f μs (cos=%.4f) [%d/%d]\n",
+                    EXPECT_EQ(res.byte_mismatches_vs_auto, 0u)
+                        << shape.name << " M=" << M
+                        << " candidate=" << variant.name
+                        << " first_byte_mismatch="
+                        << res.first_byte_mismatch_vs_auto;
+                    fprintf(stderr, "  %s %s M=%d: %.0f μs (byte_mismatches=%zu) [%d/%d]\n",
                             variant.name.c_str(), shape.name.c_str(), M,
-                            res.min_us, res.cosine_sim,
+                            res.min_us, res.byte_mismatches_vs_auto,
                             completed, total_benchmarks);
                 }
             }
@@ -704,9 +1160,19 @@ namespace
         const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_VARIANTS");
         const std::vector<int> m_values = getEnvCsvInts(
             "LLAMINAR_ROCM_NVNNI_SWEEP_M",
-            defaultNativeVNNIDispatchTrainingRows());
+            defaultPrefillGraphBucketSizes());
+        const int warmup_runs = std::max(
+            1,
+            getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_WARMUP")
+                .value_or(WARMUP_RUNS));
+        const int bench_runs = std::max(
+            1,
+            getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_BENCH")
+                .value_or(BENCH_RUNS));
         const int max_cases = std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_MAX_CASES").value_or(1));
         const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_SWEEP_CSV");
+        const std::string timing_csv_path =
+            getEnvString("LLAMINAR_ROCM_NVNNI_SWEEP_TIMING_CSV");
 
         std::FILE *csv = nullptr;
         if (!csv_path.empty())
@@ -714,7 +1180,20 @@ namespace
             csv = std::fopen(csv_path.c_str(), "w");
             ASSERT_NE(csv, nullptr) << "Failed to open ROCm NativeVNNI sweep CSV: " << csv_path;
             std::fprintf(csv,
-                         "backend,phase,format,codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,is_best\n");
+                         "backend,phase,format,codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,byte_mismatches_vs_auto,first_byte_mismatch_vs_auto,is_best,observed_n_tile,observed_m_tile,observed_min_blocks,observed_unroll,observed_full_tiles,registers_per_thread,local_memory_bytes_per_thread,static_shared_memory_bytes,max_threads_per_block,max_active_blocks_per_sm\n");
+        }
+
+        std::FILE *timing_csv = nullptr;
+        if (!timing_csv_path.empty())
+        {
+            timing_csv = std::fopen(timing_csv_path.c_str(), "w");
+            ASSERT_NE(timing_csv, nullptr)
+                << "Failed to open ROCm NativeVNNI timing CSV: "
+                << timing_csv_path;
+            std::fprintf(
+                timing_csv,
+                "backend,phase,format,codebook,shape,m,n,k,variant,"
+                "sample_index,timed_replays,latency_us,latency_us_hex\n");
         }
 
         int executed_cases = 0;
@@ -724,6 +1203,18 @@ namespace
         {
             if (!shouldRunName(format_filters, format.name))
                 continue;
+
+            const std::vector<VariantConfig> launchable_variants =
+                trainerVariantsForFormat(format.name);
+            std::vector<VariantConfig> selected_variants;
+            std::copy_if(
+                launchable_variants.begin(),
+                launchable_variants.end(),
+                std::back_inserter(selected_variants),
+                [&variant_filters](const VariantConfig &variant)
+                { return shouldRunName(variant_filters, variant.name); });
+            ASSERT_FALSE(selected_variants.empty())
+                << "No ROCm NativeVNNI variants selected for " << format.name;
 
             for (const auto &shape : GEMM_SHAPES)
             {
@@ -735,26 +1226,52 @@ namespace
                 auto weights = format.create(static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
                 const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), format.name).codebook_id;
 
-                GpuWeightsCache gpu_weights;
-                if (weights)
-                {
-                    const float *w_fp32 = weights->data();
-                    if (w_fp32)
-                        gpu_weights.upload(w_fp32, shape.N, shape.K, 0);
-                }
-
                 for (const int M : m_values)
                 {
                     if (executed_cases >= max_cases)
                         break;
 
+                    PreparedROCmSweepExecution execution(
+                        shape,
+                        M,
+                        weights.get(),
+                        selected_variants,
+                        bench_runs);
+
                     std::vector<BenchResult> rows;
-                    rows.reserve(NVNNI_VARIANTS.size());
-                    for (const auto &variant : NVNNI_VARIANTS)
+                    rows.reserve(selected_variants.size());
+                    for (const auto &variant : selected_variants)
                     {
-                        if (!shouldRunName(variant_filters, variant.name))
-                            continue;
-                        auto r = benchmarkVariant(variant, shape, M, weights.get(), gpu_weights);
+                        auto r = execution.measure(
+                            variant,
+                            warmup_runs,
+                            bench_runs);
+                        EXPECT_EQ(r.byte_mismatches_vs_auto, 0u)
+                            << format.name << ' ' << shape.name << " M=" << M
+                            << " candidate=" << variant.name
+                            << " first_byte_mismatch="
+                            << r.first_byte_mismatch_vs_auto;
+                        r.correctness_pass =
+                            r.correctness_pass &&
+                            r.byte_mismatches_vs_auto == 0;
+                        if (timing_csv)
+                        {
+                            const auto samples = execution.timingSamples();
+                            for (size_t sample_index = 0;
+                                 sample_index < samples.size(); ++sample_index)
+                            {
+                                const double latency_us = samples[sample_index];
+                                std::fprintf(
+                                    timing_csv,
+                                    "rocm,prefill,%s,%u,%s,%d,%d,%d,%s,"
+                                    "%zu,1,%.9f,%a\n",
+                                    format.name.c_str(),
+                                    static_cast<unsigned>(codebook_id),
+                                    shape.name.c_str(), M, shape.N, shape.K,
+                                    variant.name.c_str(), sample_index,
+                                    latency_us, latency_us);
+                            }
+                        }
                         rows.push_back(std::move(r));
                     }
                     ASSERT_FALSE(rows.empty()) << "No ROCm NativeVNNI variants selected.";
@@ -775,7 +1292,7 @@ namespace
                         if (csv)
                         {
                             std::fprintf(csv,
-                                         "rocm,prefill,%s,%u,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%d\n",
+                                         "rocm,prefill,%s,%u,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%zu,%zu,%d,%d,%d,%d,%d,%d,%d,%zu,%zu,%d,%d\n",
                                          format.name.c_str(),
                                          static_cast<unsigned>(codebook_id),
                                          shape.name.c_str(),
@@ -790,22 +1307,36 @@ namespace
                                          r.gflops,
                                          r.cosine_sim,
                                          r.correctness_pass ? 1 : 0,
-                                         is_best);
+                                         r.byte_mismatches_vs_auto,
+                                         r.first_byte_mismatch_vs_auto,
+                                         is_best,
+                                         r.observed_n_tile,
+                                         r.observed_m_tile,
+                                         r.observed_min_blocks,
+                                         r.observed_unroll,
+                                         r.observed_full_tiles ? 1 : 0,
+                                         r.registers_per_thread,
+                                         r.local_memory_bytes_per_thread,
+                                         r.static_shared_memory_bytes,
+                                         r.max_threads_per_block,
+                                         r.max_active_blocks_per_sm);
                             ++executed_rows;
                         }
                     }
                     if (csv)
                         std::fflush(csv);
+                    if (timing_csv)
+                        std::fflush(timing_csv);
 
                     std::fprintf(stderr,
-                                 "[ROCmNativeVNNI][TRAINER][BEST] format=%s codebook=%u shape=%s M=%d variant=%s time_us=%.3f cosine=%.6f\n",
+                                 "[ROCmNativeVNNI][TRAINER][BEST] format=%s codebook=%u shape=%s M=%d variant=%s time_us=%.3f byte_mismatches=%zu\n",
                                  format.name.c_str(),
                                  static_cast<unsigned>(codebook_id),
                                  shape.name.c_str(),
                                  M,
                                  best_it->variant_name.c_str(),
                                  best_it->min_us,
-                                 best_it->cosine_sim);
+                                 best_it->byte_mismatches_vs_auto);
 
                     ++executed_cases;
                 }
@@ -817,6 +1348,8 @@ namespace
             std::fclose(csv);
             ASSERT_GT(executed_rows, 0) << "ROCm NativeVNNI trainer CSV had no rows.";
         }
+        if (timing_csv)
+            ASSERT_EQ(std::fclose(timing_csv), 0);
         ASSERT_GT(executed_cases, 0) << "No ROCm NativeVNNI trainer cases selected.";
 #endif
     }

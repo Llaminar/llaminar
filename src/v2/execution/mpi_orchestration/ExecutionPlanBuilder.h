@@ -40,10 +40,13 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices; ///< Devices in domain
         std::vector<float> weights;               ///< Work distribution
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
+        ExecutionDomainScope scope = ExecutionDomainScope::AUTO;
 
-        // Rank mappings (computed during resolution)
-        std::vector<int> ranks;           ///< MPI ranks in this domain
-        std::map<int, int> rank_to_index; ///< Rank -> index within domain
+        // Rank mappings (computed during resolution). device_ranks is aligned
+        // with devices; ranks is the sorted unique collective membership.
+        std::vector<int> device_ranks;     ///< Exact owner rank per device
+        std::vector<int> ranks;            ///< MPI ranks in this domain
+        std::map<int, int> rank_to_index;  ///< Rank -> index within domain
     };
 
     /**
@@ -135,11 +138,16 @@ namespace llaminar2
             const ClusterInventory &cluster_inventory);
 
         /**
-         * @brief Find which rank owns a device
+         * @brief Find an inventory owner, honoring an explicitly declared rank.
+         * @param device Resolved physical participant address.
+         * @param cluster_inventory Canonical gathered hardware inventory.
+         * @param required_rank Exact declared owner, or -1 for inventory discovery.
+         * @return Matching rank or -1 when the required physical participant is absent.
          */
         int findRankForDevice(
             const GlobalDeviceAddress &device,
-            const ClusterInventory &cluster_inventory);
+            const ClusterInventory &cluster_inventory,
+            int required_rank = -1);
 
         // =====================================================================
         // PP Stage Resolution

@@ -4,10 +4,9 @@
  *
  * Tests:
  *   1. Device context preservation after GPU transfer
- *   2. P2P transfer data integrity (if multi-GPU available)
- *   3. Host-staged fallback correctness
- *   4. Transfer with asymmetric weights (mins array present)
- *   5. Zero-size array handling (emins_bytes=0)
+ *   2. Same-backend transfer data integrity
+ *   3. Transfer with asymmetric weights (mins array present)
+ *   4. Zero-size array handling (emins_bytes=0)
  *
  * Requires: HAVE_ROCM or HAVE_CUDA and at least 1 GPU.
  * Multi-GPU tests are skipped if only 1 device is available.
@@ -85,23 +84,28 @@ TEST_F(Test__GPUExpertTransferIntegration, DeviceContextPreserved_SingleGPU)
     src_ptrs.d_vnni = d_src;
     dst_ptrs.d_vnni = d_dst;
 
-    // Transfer (self-device — always P2P since same device)
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    // Transfer on an explicit non-default stream.
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(0),
-        test_bytes, 0, 0, 0, nullptr);
+        test_bytes, 0, 0, 0, stream);
     EXPECT_TRUE(ok);
 
     // Verify device is still 0
     int current_device = -1;
     ASSERT_EQ(hipGetDevice(&current_device), hipSuccess);
     EXPECT_EQ(current_device, 0) << "Device context must be preserved after transfer";
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     // Verify data integrity
     std::vector<uint8_t> host_result(test_bytes);
     ASSERT_EQ(hipMemcpy(host_result.data(), d_dst, test_bytes, hipMemcpyDeviceToHost), hipSuccess);
     EXPECT_EQ(host_pattern, host_result) << "Transferred data must match source";
 
+    hipStreamDestroy(stream);
     hipFree(d_src);
     hipFree(d_dst);
 }
@@ -137,6 +141,8 @@ TEST_F(Test__GPUExpertTransferIntegration, DeviceContextPreserved_MultiGPU)
     hipSetDevice(1);
     ASSERT_EQ(hipMalloc(&d_dst_vnni, vnni_bytes), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_dst_scales, scales_bytes), hipSuccess);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
     // Switch back to device 0 (caller's context)
     hipSetDevice(0);
@@ -150,7 +156,7 @@ TEST_F(Test__GPUExpertTransferIntegration, DeviceContextPreserved_MultiGPU)
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(1),
-        vnni_bytes, scales_bytes, 0, 0, nullptr);
+        vnni_bytes, scales_bytes, 0, 0, stream);
     EXPECT_TRUE(ok);
 
     // Verify caller's device context is preserved (should be 0)
@@ -158,6 +164,7 @@ TEST_F(Test__GPUExpertTransferIntegration, DeviceContextPreserved_MultiGPU)
     ASSERT_EQ(hipGetDevice(&current_device), hipSuccess);
     EXPECT_EQ(current_device, 0)
         << "Device context must be restored to caller's original device (0) after cross-device transfer";
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     // Verify data integrity on destination
     hipSetDevice(1);
@@ -174,6 +181,7 @@ TEST_F(Test__GPUExpertTransferIntegration, DeviceContextPreserved_MultiGPU)
     hipFree(d_src_vnni);
     hipFree(d_src_scales);
     hipSetDevice(1);
+    hipStreamDestroy(stream);
     hipFree(d_dst_vnni);
     hipFree(d_dst_scales);
 }
@@ -193,16 +201,20 @@ TEST_F(Test__GPUExpertTransferIntegration, ZeroSizeArraysHandled)
     src_ptrs.d_vnni = d_src;
     dst_ptrs.d_vnni = d_dst;
 
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(0),
-        vnni_bytes, 0, 0, 0, nullptr);
+        vnni_bytes, 0, 0, 0, stream);
     EXPECT_TRUE(ok);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     std::vector<uint8_t> result(vnni_bytes);
     ASSERT_EQ(hipMemcpy(result.data(), d_dst, vnni_bytes, hipMemcpyDeviceToHost), hipSuccess);
     EXPECT_EQ(pattern, result);
 
+    hipStreamDestroy(stream);
     hipFree(d_src);
     hipFree(d_dst);
 }
@@ -213,19 +225,8 @@ TEST_F(Test__GPUExpertTransferIntegration, NonROCmDeviceRejected)
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::cuda(0), DeviceId::rocm(0),
-        1024, 0, 0, 0, nullptr);
+        1024, 0, 0, 0, reinterpret_cast<void *>(0x1));
     EXPECT_FALSE(ok) << "Mixed device types must be rejected";
 }
 
-TEST_F(Test__GPUExpertTransferIntegration, PeerAccessQuery)
-{
-    // canAccessPeer(0, 0) should always return true (same device)
-    EXPECT_TRUE(GPUExpertTransfer::canAccessPeer(0, 0));
-
-    if (gpu_count_ >= 2) {
-        // P2P between different devices may or may not work — just verify no crash
-        bool can = GPUExpertTransfer::canAccessPeer(0, 1);
-        (void)can; // Result depends on hardware topology
-    }
-}
 #endif // HAVE_ROCM

@@ -15,10 +15,12 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 
 #include "../../../../mocks/MockBackend.h"
+#include "../../../../mocks/MockWorkerGPUContext.h"
 
 #include <cstring>
 #include <memory>
@@ -48,7 +50,15 @@ public:
 
     // ---- Inject fake state for testing ----
 
-    void injectCompletionEvent(void *event) { device_completion_event_ = event; }
+    void injectCompletionEvent(void *event)
+    {
+        device_completion_event_ = event;
+        completion_event_protection_ = event
+                                           ? CompletionEventProtection::DeviceValue
+                                           : CompletionEventProtection::None;
+        if (!event)
+            event_device_.reset();
+    }
     void injectGpuDevice(DeviceId device) { gpu_device_ = device; }
     void injectDeviceValid(bool valid)
     {
@@ -95,6 +105,11 @@ public:
 class Test__CoherenceProtocol : public ::testing::Test
 {
 protected:
+    static void SetUpTestSuite()
+    {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
+    }
+
     static constexpr size_t kRows = 4;
     static constexpr size_t kCols = 8;
     static constexpr size_t kElements = kRows * kCols;
@@ -127,6 +142,8 @@ protected:
     /// Safe cleanup: free mock allocation and null out gpu_data_ptr before destruction
     void cleanupTensor(CoherenceProtocolTensor *tensor)
     {
+        if (tensor->getCompletionEvent())
+            TransferEngine::publishSynchronized(tensor);
         void *gpu_ptr = tensor->getGpuDataPtr();
         if (gpu_ptr && mock_backend_.isAllocated(gpu_ptr))
         {
@@ -247,20 +264,23 @@ TEST_F(Test__CoherenceProtocol, DataAccessor_TriggersD2HWhenDeviceDirty)
         gpu_mem[i] = 42.0f + static_cast<float>(i);
     }
 
-    // Mark as device-dirty (flags only, to test the no-event sync path)
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    // Publish the producer completion with the authoritative state.
+    TransferEngine::publishDeviceWrite(
+        tensor,
+        device_,
+        reinterpret_cast<void *>(0x5055424C));
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
 
     mock_backend_.resetAll();
 
-    // Access data() — should trigger ensureOnHost → sync + D2H
+    // Access data() — should trigger an event wait followed by D2H.
     const float *result = tensor->data();
     ASSERT_NE(result, nullptr);
 
-    // Verify sync happened (full sync since no event)
-    EXPECT_GE(mock_backend_.getSyncCount(), 1u);
+    EXPECT_GE(mock_backend_.getEventWaitCount(), 1u);
+    EXPECT_EQ(mock_backend_.getSyncCount(), 0u);
 
     // Verify D2H transfer happened
     EXPECT_GE(mock_backend_.getD2HCount(), 1u);
@@ -397,12 +417,13 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_CreatesAndRecordsEvent)
     ASSERT_TRUE(tensor->ensureOnDevice(device_));
     mock_backend_.resetAll();
 
-    // Pre-condition: may or may not have an event from ensureOnDevice
-    // Clear it so we test fresh event creation
-    tensor->injectCompletionEvent(nullptr);
+    // Retire the setup upload generation through the production lifecycle so
+    // the following publication must allocate its own device-value event.
+    TransferEngine::publishSynchronized(tensor);
+    mock_backend_.resetAll();
 
     void *fake_stream = reinterpret_cast<void *>(0xBEEF);
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, fake_stream);
+    TransferEngine::publishCurrentDeviceWrite(tensor, fake_stream);
 
     // Verify event was created
     EXPECT_GE(mock_backend_.getEventCreateCount(), 1u);
@@ -426,17 +447,22 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_ReusesExistingEvent)
     ASSERT_TRUE(tensor->ensureOnDevice(device_));
     mock_backend_.resetAll();
 
-    // First call: creates event + records
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    // The upload already owns one event. A device write re-records that exact
+    // handle and preserves its still-live host-source protection.
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        reinterpret_cast<void *>(0x5055424C));
     size_t creates_after_first = mock_backend_.getEventCreateCount();
     size_t records_after_first = mock_backend_.getEventRecordCount();
     void *event_after_first = tensor->getCompletionEvent();
 
-    EXPECT_GE(creates_after_first, 1u);
+    EXPECT_EQ(creates_after_first, 0u);
     EXPECT_GE(records_after_first, 1u);
 
     // Second call: should reuse existing event, only record again
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        reinterpret_cast<void *>(0x5055424C));
     EXPECT_EQ(mock_backend_.getEventCreateCount(), creates_after_first); // No new create
     EXPECT_GT(mock_backend_.getEventRecordCount(), records_after_first); // New record
     EXPECT_EQ(tensor->getCompletionEvent(), event_after_first);         // Same event
@@ -457,7 +483,9 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_EventUsedForSyncOnReadback)
     }
 
     // Mark dirty with event
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        reinterpret_cast<void *>(0x5055424C));
 
     mock_backend_.resetAll();
 
@@ -511,7 +539,10 @@ TEST_F(Test__CoherenceProtocol, FullStateMachineCycle_HostDeviceDirtyReadback)
     {
         gpu_mem[i] = 77.0f;
     }
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishDeviceWrite(
+        tensor,
+        device_,
+        reinterpret_cast<void *>(0x5055424C));
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
@@ -523,8 +554,9 @@ TEST_F(Test__CoherenceProtocol, FullStateMachineCycle_HostDeviceDirtyReadback)
     const float *host_data = tensor->data();
     ASSERT_NE(host_data, nullptr);
 
-    // Should have synced and transferred
-    EXPECT_GE(mock_backend_.getSyncCount(), 1u); // Full sync (no event)
+    // The host observes the producer event; no full-device barrier is needed.
+    EXPECT_GE(mock_backend_.getEventWaitCount(), 1u);
+    EXPECT_EQ(mock_backend_.getSyncCount(), 0u);
     EXPECT_GE(mock_backend_.getD2HCount(), 1u);
 
     // Both should now be valid
@@ -574,7 +606,7 @@ TEST_F(Test__CoherenceProtocol, FullCycle_WithEventSync)
     }
 
     // Mark dirty WITH event (full path)
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, reinterpret_cast<void *>(0xCAFE));
+    TransferEngine::publishCurrentDeviceWrite(tensor, reinterpret_cast<void *>(0xCAFE));
 
     EXPECT_TRUE(tensor->getDeviceValid());
     EXPECT_FALSE(tensor->getHostValid());
@@ -635,11 +667,21 @@ public:
 class Test__CoherenceProtocolFailure : public ::testing::Test
 {
 protected:
+    static void SetUpTestSuite()
+    {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
+    }
+
     static constexpr size_t kRows = 4;
     static constexpr size_t kCols = 8;
 
     DeviceId device_ = DeviceId::rocm(0);
     FailingMockBackend mock_backend_;
+
+    void SetUp() override
+    {
+        mock_backend_.setMockDeviceType(DeviceType::ROCm);
+    }
 
     std::unique_ptr<CoherenceProtocolTensor> createTensor()
     {
@@ -657,6 +699,8 @@ protected:
 
     void cleanupTensor(CoherenceProtocolTensor *tensor)
     {
+        if (tensor->getCompletionEvent())
+            TransferEngine::publishSynchronized(tensor);
         void *gpu_ptr = tensor->getGpuDataPtr();
         if (gpu_ptr && mock_backend_.isAllocated(gpu_ptr))
         {
@@ -706,7 +750,9 @@ TEST_F(Test__CoherenceProtocolFailure, D2HFailure_EnsureOnHostReturnsFalse)
     gpu_mem[0] = 999.0f;
 
     // Mark dirty so ensureOnHost will attempt D2H
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        reinterpret_cast<void *>(0x5055424C));
 
     // Now make D2H fail
     mock_backend_.fail_d2h = true;

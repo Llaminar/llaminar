@@ -26,9 +26,13 @@
 #include "WeightPlan.h"
 #include "WeightPlacementMap.h"
 #include "WeightManagerConfig.h"
+#include "PreparedWeightAdmission.h"
+#include "PreparedDeviceAllocationLedger.h"
+#include "MmapReclaimLifecycle.h"
 #include "../execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
+#include "../config/GDNHeadAssignment.h"
 #include "../execution/local_execution/graph/GraphSchema.h"
 #include "IWeightManager.h"
 #include "../utils/MPIContext.h"
@@ -40,10 +44,12 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
+#include <vector>
 
 namespace llaminar2
 {
     class ExpertWeightPayloadProvider;
+    class PhysicalMemoryAuthority;
 
     // WeightDistributionStrategy and ShardingMode are now in WeightTypes.h
     // (included transitively via WeightManagerConfig.h → WeightTypes.h)
@@ -84,6 +90,15 @@ namespace llaminar2
                       std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
                       WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
                       WeightPrecision weight_precision = WeightPrecision::NATIVE);
+
+        /**
+         * @brief Join any submitted mapping reclaim before loader state is destroyed.
+         *
+         * The owned worker borrows this manager and its loader, so teardown owns
+         * an explicit completion edge rather than relying on member destruction
+         * order alone.
+         */
+        ~WeightManager() override;
 
         /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
@@ -151,18 +166,33 @@ namespace llaminar2
             DeviceId device,
             bool include_expert_jobs = true);
 
-        /// Prepare routed experts assigned to overlay tiers. Accelerator tiers use
-        /// the GPU load pipeline; CPU fallback tiers are eagerly packed into CPU
-        /// expert GEMM engines and inserted into ExpertGemmRegistry.
+        /**
+         * @brief Prepare the overlay experts owned by one graph participant.
+         *
+         * Accelerator preparation consumes only the exact frozen bindings owned
+         * by @p target_device.  It never scans another participant's requests and
+         * never substitutes mutable process-wide cache tensors for a missing
+         * frozen binding.  CPU participants likewise prepare only their explicit
+         * device-scoped requests.  This keeps LocalTP graph construction
+         * participant-local and prevents duplicate cross-device repack work.
+         *
+         * @param runtime_plan Declarative rank/domain overlay policy.
+         * @param target_device Device owned by the calling graph participant.
+         * @param frozen_weights Immutable graph bindings for that participant;
+         *        mandatory when the scoped plan contains accelerator requests.
+         * @param execution_plan Optional rank filter applied before device scope.
+         * @param admission Whether to create exact prepared engines or adopt a
+         *        complete set certified by the model-context reuse lifecycle.
+         *        Certified adoption never falls back to source materialization.
+         * @return true after all scoped requests have been prepared.
+         */
         bool prepareMoEExpertOverlayWeights(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
+            DeviceId target_device,
             const FrozenModelWeightSet *frozen_weights = nullptr,
-            const MoEExpertOverlayExecutionPlan *execution_plan = nullptr);
-
-        const MoEExpertOverlayPreparationDiagnostics &moeExpertOverlayPreparationDiagnostics() const
-        {
-            return moe_overlay_preparation_diagnostics_;
-        }
+            const MoEExpertOverlayExecutionPlan *execution_plan = nullptr,
+            PreparedWeightAdmission admission =
+                PreparedWeightAdmission::AllocateCompleteSet);
 
         /**
          * @brief Prepare weights for a single device, filtered to a layer range
@@ -211,10 +241,13 @@ namespace llaminar2
          *                          packing and upload. Set false for nested
          *                          TP-in-PP setups where a later PP stage on
          *                          a different device still needs host copies.
+         * @param include_expert_jobs If false, routed MoE expert jobs are not
+         *                            packed by this broad finalize pass.
          * @return true on success
          */
         bool finalizeForDevices(const std::vector<DeviceId> &devices,
-                                bool release_host_data = true) override;
+                                bool release_host_data = true,
+                                bool include_expert_jobs = true) override;
 
         // =========================================================================
         // Weight Packing and Preloading (folded from WeightPreloader)
@@ -254,7 +287,10 @@ namespace llaminar2
             std::function<bool(const std::string &)> layer_filter = nullptr,
             const FrozenModelWeightSet *frozen_weights = nullptr,
             bool include_expert_jobs = true,
-            const MoEExpertOverlayPreparationPlan *overlay_preparation_plan = nullptr);
+            const MoEExpertOverlayPreparationPlan *overlay_preparation_plan = nullptr,
+            std::optional<size_t> staging_budget_bytes_override = std::nullopt,
+            PhysicalMemoryOwner persistent_owner =
+                PhysicalMemoryOwner::PrimaryModelWeights);
 
         /**
          * @brief Upload all non-GEMM weights to GPU
@@ -283,6 +319,9 @@ namespace llaminar2
          * Called after the first forward pass completes. Unlike releaseAllHostWeightData()
          * which retains host-resident tensors because they haven't been uploaded yet,
          * this method releases them because the GPU kernels have now created their own copies.
+         * This method deliberately does not reclaim mmap pages: borrowed views
+         * are retired by the asynchronous scheduleMmapReclaim() operation before
+         * the shared mapping may be advised.
          *
          * @return Number of tensors whose host data was released
          */
@@ -300,14 +339,27 @@ namespace llaminar2
         size_t releaseMoEExpertHostWeightData();
 
         /**
-         * @brief Advise the OS to reclaim mmap physical pages.
+         * @brief Submit exactly-once mmap reclaim to the prestarted worker.
          *
-         * Delegates to the loader's adviseMmapDontneed(). Safe to call
-         * after all GEMM engines have packed their weight data.
+         * Submission is non-blocking and performs no allocator, device-runtime,
+         * or madvise work on the inference authority thread. The worker retires
+         * remaining mmap host registrations before applying the loader's typed
+         * backing-storage policy.
          *
-         * @return Total bytes advised
+         * @return Typed submission outcome.
          */
-        size_t adviseMmapDontneed() override;
+        MmapReclaimLifecycle::Submission scheduleMmapReclaim() override;
+
+        /**
+         * @brief Wait for reclaim before an allocation that depends on its RAM.
+         *
+         * This is an admission/teardown boundary, never an inference hot-path
+         * operation.
+         *
+         * @return Terminal state and total bytes actually advised.
+         */
+        MmapReclaimLifecycle::Completion
+        awaitMmapReclaimBeforeHostAllocation() override;
 
         /**
          * @brief Get statistics about preloaded weights
@@ -381,6 +433,13 @@ namespace llaminar2
             {
                 tp_config_ = config.tp_config;
             }
+
+            if (!config.routed_expert_assignment.valid())
+            {
+                throw std::invalid_argument(
+                    "WeightManager routed-expert assignment has invalid participant coordinates");
+            }
+            routed_expert_assignment_ = config.routed_expert_assignment;
 
             // Preprocessor
             if (config.preprocessor)
@@ -787,6 +846,51 @@ namespace llaminar2
         void setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store);
 
         /**
+         * @brief Install the sole admitted CPU/GPU allocation authority.
+         *
+         * Orchestration performs this transition after topology-wide memory
+         * admission and before any graph or prepared-weight allocation. The
+         * authority is immutable by identity for the remaining model-context
+         * lifetime; replacing it would split live allocation accounting.
+         *
+         * @param authority Rank-bound authority shared by every setup worker.
+         * @throws std::invalid_argument for null input.
+         * @throws std::logic_error when a different authority is already live.
+         */
+        void installPhysicalMemoryAuthority(
+            std::shared_ptr<PhysicalMemoryAuthority> authority);
+
+        /** @return The installed allocation authority, or null before admission. */
+        [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority>
+        physicalMemoryAuthority() const;
+
+        /**
+         * @brief Count model-owned prepared records for one exact device.
+         *
+         * Dense GEMMs, embeddings, and explicit slabs live in
+         * PreparedWeightStore; routed ExpertOverlay GEMMs live in the
+         * model-owned ExpertGemmRegistry. This is the single existence query
+         * used by reuse certification and memory admission. It is not a byte
+         * estimate because scoped expert aliases may share one allocation.
+         */
+        [[nodiscard]] size_t preparedRecordCountForDevice(
+            DeviceId device) const;
+
+        /**
+         * @brief Return exact model-owned GPU weight bytes still live at seal.
+         * @param device Exact GPU backend and ordinal.
+         * @return Checked sum of live persistent weight pools and embeddings.
+         *
+         * Pool entries retain only weak ownership, so runner-only Dynamic
+         * shadow allocations disappear before this query. Model-owned kernels
+         * keep their original pool owner alive; prepared embeddings expose
+         * their independent allocation through PreparedWeightStore. This is an
+         * ownership query, never an allocator free-memory estimate.
+         */
+        [[nodiscard]] size_t retainedPreparedDeviceBytes(
+            DeviceId device) const;
+
+        /**
          * @brief Get the current lifecycle state (derived from gates)
          */
         WeightLifecycleState lifecycleState() const { return lifecycle_gates_.currentState(); }
@@ -868,6 +972,102 @@ namespace llaminar2
          */
         static ShardingMode toShardingMode(WeightShardingMode mode);
 
+        /**
+         * @brief Identity of one immutable model-prepared FP32 override.
+         *
+         * A canonical source can be bound under different semantic roles and
+         * to different devices and logical slices.  All three facts affect the
+         * representation and its eventual device residency, so none may be
+         * inferred from tensor shape or omitted from cache identity.
+         */
+        struct ModelPreparedFp32OverrideKey
+        {
+            std::string canonical_name; ///< Stable model weight identity.
+            WeightRole role = WeightRole::Other; ///< Graph semantic role.
+            DeviceId target_device = DeviceId::invalid(); ///< Exact consumer.
+            WeightSliceSpec slice; ///< Exact logical source interval represented.
+
+            /** @return true when all representation-defining fields match. */
+            bool operator==(const ModelPreparedFp32OverrideKey &other) const
+            {
+                return canonical_name == other.canonical_name &&
+                       role == other.role &&
+                       target_device == other.target_device &&
+                       slice.source_rows == other.slice.source_rows &&
+                       slice.source_cols == other.slice.source_cols &&
+                       slice.row_start == other.slice.row_start &&
+                       slice.row_count == other.slice.row_count &&
+                       slice.col_start == other.slice.col_start &&
+                       slice.col_count == other.slice.col_count &&
+                       slice.expert_start == other.slice.expert_start &&
+                       slice.expert_count == other.slice.expert_count &&
+                       slice.expert_ids == other.slice.expert_ids &&
+                       slice.inner_is_presliced == other.slice.inner_is_presliced;
+            }
+        };
+
+        /** @brief Hashes the complete prepared-override identity. */
+        struct ModelPreparedFp32OverrideKeyHash
+        {
+            /**
+             * @param key Complete override identity.
+             * @return Stable process-local hash suitable for unordered lookup.
+             */
+            size_t operator()(const ModelPreparedFp32OverrideKey &key) const noexcept
+            {
+                size_t hash = std::hash<std::string>{}(key.canonical_name);
+                hash ^= std::hash<int>{}(static_cast<int>(key.role)) +
+                        0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+                hash ^= std::hash<DeviceId>{}(key.target_device) +
+                        0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+                const auto mix = [&hash](size_t value)
+                {
+                    hash ^= std::hash<size_t>{}(value) +
+                            0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+                };
+                mix(key.slice.source_rows);
+                mix(key.slice.source_cols);
+                mix(key.slice.row_start);
+                mix(key.slice.row_count);
+                mix(key.slice.col_start);
+                mix(key.slice.col_count);
+                mix(key.slice.expert_start);
+                mix(key.slice.expert_count);
+                mix(key.slice.expert_ids.size());
+                for (const int expert_id : key.slice.expert_ids)
+                    mix(static_cast<size_t>(expert_id));
+                mix(key.slice.inner_is_presliced ? 1u : 0u);
+                return hash;
+            }
+        };
+
+        /**
+         * @brief Acquire a model-owned FP32 representation for special graph roles.
+         *
+         * The returned object is cached for the lifetime of this WeightManager,
+         * not the lifetime of a FrozenModelWeightSet or graph runner.  This is
+         * required because raw GGUF bytes may be released after the first runner
+         * is prepared while a later campaign cell reuses the same ModelContext.
+         *
+         * @param name Canonical model weight name.
+         * @param role Semantic graph role selected by the weight plan.
+         * @param source Loaded source tensor.
+         * @param target_device Exact consuming device.
+         * @param logical_slice Exact source interval represented by @p source.
+         * @param logical_derivation Sharding/alias derivation that produced the
+         *        logical value; scalar conversion does not replace this fact.
+         * @return Shared immutable FP32 tensor, or nullptr when no override applies.
+         * @throws std::runtime_error when an uncached override is requested after
+         *         its source bytes have already been released.
+         */
+        std::shared_ptr<TensorBase> createModelPreparedFp32Override(
+            const std::string &name,
+            WeightRole role,
+            const TensorBase *source,
+            DeviceId target_device,
+            const WeightSliceSpec &logical_slice,
+            WeightDerivationKind logical_derivation);
+
         IModelLoader &loader_;                                                      ///< Model loader (GGUF, mock, etc.)
         std::shared_ptr<IMPIContext> mpi_ctx_;                                      ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
@@ -875,12 +1075,25 @@ namespace llaminar2
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
         WeightPrecision weight_precision_;                                          ///< How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> cache_;        ///< Weight cache
+        /**
+         * Immutable derived values whose lifetime is the complete model context.
+         *
+         * These deliberately do not participate in host-weight release sweeps:
+         * they are small canonical graph inputs needed to rematerialize runners
+         * after the corresponding raw source bytes have been reclaimed.
+         */
+        std::unordered_map<
+            ModelPreparedFp32OverrideKey,
+            std::shared_ptr<TensorBase>,
+            ModelPreparedFp32OverrideKeyHash>
+            model_prepared_fp32_overrides_;
         mutable std::mutex cache_mutex_;                                            ///< Protects cache_ and decode_cache_ access
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
         mutable std::mutex sharding_mode_cache_mutex_;                              ///< Protects sharding_mode_cache_ (separate from cache_mutex_ to avoid deadlock — getShardingMode may be called while cache_mutex_ is held)
         WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
         bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
         WeightPreprocessor weight_preprocessor_;                                    ///< Optional per-weight transform before packing
+        RoutedExpertWeightAssignment routed_expert_assignment_;                     ///< Static owner policy shared with graph construction
 
         // =========================================================================
         // Model head dimensions for FusedQKV sub-block computation
@@ -918,6 +1131,69 @@ namespace llaminar2
             const std::shared_ptr<TensorBase> &clone,
             DeviceId device);
         WeightSliceSpec fullSliceSpec(const TensorBase &tensor) const;
+
+        /**
+         * @brief Resolve the exact ordered routed-expert IDs for one owner.
+         *
+         * Expert slices with different owner policies can have identical tensor
+         * shapes. Cache identity therefore cannot be inferred from dimensions;
+         * it must be derived from the same layer-aware ownership policy used by
+         * graph construction and physical GGUF loading.
+         *
+         * @param name Canonical three-dimensional routed-expert weight name.
+         * @param participant_index Static owner index requesting the weight.
+         * @param participant_count Number of static whole-expert owners.
+         * @param layer_idx Explicit layer index, or a negative value to derive it
+         *        from @p name.
+         * @return Sorted global expert IDs in packed source-tensor order.
+         * @throws std::runtime_error when the tensor geometry or layer identity
+         *         cannot establish an unambiguous ownership set.
+         */
+        std::vector<int> expectedRoutedExpertIds(
+            const std::string &name,
+            int participant_index,
+            int participant_count,
+            int layer_idx) const;
+
+        /**
+         * @brief Identify an exact full source that may precede TP slicing.
+         *
+         * Model-context construction can cache a complete immutable routed
+         * tensor before the final TP topology is installed. Such a source is
+         * not a stale expert slice: its typed source/clone derivation, canonical
+         * name, and complete GGUF geometry make it an unambiguous input from
+         * which the configured expert selection must subsequently be loaded.
+         *
+         * @param name Canonical routed-expert weight name.
+         * @param tensor Candidate cached tensor.
+         * @return true only for an unsliced full source or full device clone.
+         */
+        bool isCachedFullRoutedExpertSource(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor) const;
+
+        /**
+         * @brief Prove that a cached expert tensor has the requested identity.
+         *
+         * A cache hit is accepted only when registry metadata identifies an
+         * explicit expert slice with the exact global expert-ID sequence and a
+         * packed tensor shape consistent with that sequence. Missing or stale
+         * metadata is fatal; callers must never erase and silently reconstruct
+         * an ambiguously identified expert tensor. A separately typed complete
+         * source recognized by isCachedFullRoutedExpertSource() is a lifecycle
+         * input rather than a candidate slice and is handled before this check.
+         *
+         * @param name Canonical routed-expert weight name.
+         * @param tensor Candidate cached tensor.
+         * @param expected_expert_ids Exact IDs requested by the active policy.
+         * @param cache_key Human-readable cache key for diagnostics.
+         * @throws std::runtime_error when any cache identity invariant fails.
+         */
+        void validateCachedRoutedExpertSlice(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor,
+            const std::vector<int> &expected_expert_ids,
+            const std::string &cache_key) const;
 
         // =========================================================================
         // Layer range for Pipeline Parallelism (LAYER_PARTITIONED strategy)
@@ -963,7 +1239,30 @@ namespace llaminar2
             DeviceId device,
             std::function<bool(const std::string &)> layer_filter,
             const FrozenModelWeightSet *frozen_weights = nullptr,
-            bool include_expert_jobs = true);
+            bool include_expert_jobs = true,
+            PhysicalMemoryOwner persistent_owner =
+                PhysicalMemoryOwner::PrimaryModelWeights);
+
+        /**
+         * @brief Upload exact non-GEMM tensors owned by a frozen binding set.
+         *
+         * Frozen graph bindings may own freshly materialized replicated slices
+         * or derived tensors that are intentionally absent from the broad
+         * loader cache. This binding-driven pass uploads those exact objects
+         * before execution so graph stages never repair missing residency.
+         *
+         * @param target_device GPU targeted by the frozen bindings.
+         * @param frozen_weights Immutable bindings used by the graph.
+         * @param layer_filter Optional canonical-name filter.
+         * @param include_expert_jobs Retained for preparation-policy symmetry;
+         *        routed expert tensors remain owned by the expert pipeline.
+         */
+        bool uploadFrozenNonGemmWeights(
+            DeviceId target_device,
+            const FrozenModelWeightSet &frozen_weights,
+            const std::function<bool(const std::string &)> &layer_filter,
+            bool include_expert_jobs,
+            PhysicalMemoryOwner persistent_owner);
 
         // =========================================================================
         // Per-device tensor cache for multi-device scenarios (LOCAL TP)
@@ -984,6 +1283,25 @@ namespace llaminar2
             const std::string &name,
             const std::shared_ptr<TensorBase> &original,
             DeviceId target_device);
+
+        /**
+         * @brief Return whether a replicated GPU weight is only a host-side
+         *        source for a later device-owned preparation step.
+         *
+         * Quantized GEMM weights, mirrored floating-point GEMM weights, token
+         * embeddings, and complete MoE expert tensors are not consumed through
+         * a raw per-device TensorBase allocation. Their owning GPU subsystem
+         * repacks or slices the immutable model bytes into its own device
+         * storage. Replicating the host tensor per GPU therefore adds no useful
+         * residency; for large 3D expert tensors it can copy the complete model
+         * once per participant before loading even begins.
+         *
+         * @param name Canonical GGUF tensor name.
+         * @return true when every GPU participant may share the immutable host
+         *         tensor while constructing independent device-owned state.
+         */
+        [[nodiscard]] bool isReplicatedGpuPreparationSource(
+            const std::string &name) const;
 
         // =========================================================================
         // Proportional slicing helpers (used when tp_config_ is set)
@@ -1170,6 +1488,101 @@ namespace llaminar2
             const DeviceShardingAssignment &assignment,
             const std::vector<size_t> &dimensions);
 
+        /**
+         * @brief Resolve economical modulo-linked GDN ownership for one TP participant.
+         *
+         * The attention-head partition is used only as a backend-independent
+         * proportional partition space. The returned assignment owns a true
+         * Q/K shard and every V head whose @c global_v % global_k falls inside
+         * that shard.
+         */
+        GDNHeadAssignment gdnHeadAssignmentFor(
+            const DeviceShardingAssignment &assignment) const;
+
+        /**
+         * @brief Resolve economical modulo-linked ownership for equal-rank TP.
+         *
+         * This is the global-MPI companion to @ref gdnHeadAssignmentFor. Both
+         * entry points produce the same typed ownership object, so rank-local
+         * and LocalTP loading cannot drift into different GDN layouts.
+         */
+        GDNHeadAssignment gdnHeadAssignmentForEqualRank(
+            int rank,
+            int world_size) const;
+
+        /**
+         * @brief Return the logical element width of a GDN value head.
+         *
+         * @return One for per-head scalar projections, @c gdn_d_state for
+         *         value-channel projections, or zero when @p name/@p total_size
+         *         is not an exact GDN value-head tensor.
+         */
+        int gdnValueElementsPerHead(
+            const std::string &name,
+            size_t total_size) const;
+
+        /**
+         * @brief Load and concatenate non-contiguous source row intervals.
+         *
+         * Every interval is read directly in native format and concatenated in
+         * the supplied order. This preserves source quantization bytes while
+         * constructing a participant-local semantic order (including linked
+         * GDN heads and independently sliced fused Q/K/V blocks) once during
+         * model loading.
+         */
+        std::shared_ptr<TensorBase> loadNativeRowSpanConcat(
+            const std::string &name,
+            DeviceId device,
+            const std::vector<GDNHeadSpan> &spans,
+            size_t source_cols);
+
+        /**
+         * @brief Load and row-wise concatenate non-contiguous source columns.
+         *
+         * This is the input-parallel companion to
+         * @ref loadNativeRowSpanConcat. Quantized intervals must be naturally
+         * block aligned; an unrepresentable geometry fails explicitly.
+         */
+        std::shared_ptr<TensorBase> loadNativeColumnSpanConcat(
+            const std::string &name,
+            DeviceId device,
+            const std::vector<GDNHeadSpan> &spans,
+            size_t source_rows);
+
+        /**
+         * @brief Load a TP GDN fused [Q|K|V] tensor in linked local order.
+         *
+         * The returned native payload is backend-neutral preparation input.
+         * CUDA, ROCm, and CPU therefore consume exactly the same semantic head
+         * assignment before their respective prepared-weight stores take
+         * ownership of the bytes.
+         */
+        std::shared_ptr<TensorBase> loadGDNFusedQKVColumnParallel(
+            const std::string &name,
+            DeviceId device,
+            const GDNHeadAssignment &head_assignment,
+            int rank,
+            int world_size,
+            const std::vector<size_t> &dimensions);
+
+        /** @brief Load a value-associated row-sharded GDN tensor. */
+        std::shared_ptr<TensorBase> loadGDNValueRows(
+            const std::string &name,
+            DeviceId device,
+            const GDNHeadAssignment &head_assignment,
+            int rank,
+            int world_size,
+            const std::vector<size_t> &dimensions);
+
+        /** @brief Load a value-associated input-sharded GDN tensor. */
+        std::shared_ptr<TensorBase> loadGDNValueColumns(
+            const std::string &name,
+            DeviceId device,
+            const GDNHeadAssignment &head_assignment,
+            int rank,
+            int world_size,
+            const std::vector<size_t> &dimensions);
+
     public:
         /**
          * @brief Slice a specific column range from tensor
@@ -1230,8 +1643,14 @@ namespace llaminar2
 
         ExpertGemmRegistry expert_gemm_registry_;
         std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
-        MoEExpertOverlayPreparationDiagnostics moe_overlay_preparation_diagnostics_;
+        /** Serializes the one-time admission-to-materialization publication. */
+        mutable std::mutex physical_memory_authority_mutex_;
+        /** Sole CPU/GPU allocation authority shared by all preparation lanes. */
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
         uint64_t next_pipeline_prepared_binding_id_ = (1ULL << 48);
+
+        /** Exact weak ownership of every finalized GPU weight pool. */
+        PreparedDeviceAllocationLedger prepared_device_allocations_;
 
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility
@@ -1268,6 +1687,22 @@ namespace llaminar2
         void evaluateReclaimEligibility(const std::string &name, bool is_gemm);
         bool tryReleaseReclaimHostRawData(const std::string &name);
         static const char *weightPrepStateName(WeightPrepState state);
+
+        /**
+         * @brief Execute the complete reclaim sequence on the lifecycle worker.
+         *
+         * Snapshots all surviving mapped tensors under the cache mutex, then
+         * retires their accelerator host registrations before asking the loader
+         * to advise its durable mappings. The snapshot owns tensor lifetimes
+         * after the mutex is released, so inference never waits on the expensive
+         * device-runtime or page-table operations.
+         *
+         * @return Number of durable mapping bytes advised by the loader.
+         */
+        size_t performMmapReclaim();
+
+        /** Sole exactly-once authority for asynchronous model-mapping reclaim. */
+        MmapReclaimLifecycle mmap_reclaim_lifecycle_;
     };
 
 } // namespace llaminar2

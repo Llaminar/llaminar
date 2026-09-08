@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "planning/ModelMemoryProfile.h"
 #include "loaders/ModelLoader.h"
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,24 @@ using namespace llaminar2;
 
 namespace
 {
+
+    /**
+     * @brief Store one unsigned GGUF metadata scalar in the test model.
+     * @param model Model receiving the metadata entry.
+     * @param key Fully qualified GGUF metadata key.
+     * @param value Unsigned value encoded with the GGUF UINT32 wire type.
+     */
+    void setUInt32Metadata(
+        GGUFModel &model,
+        const std::string &key,
+        uint32_t value)
+    {
+        GGUFValue metadata;
+        metadata.type = GGUFValueType::UINT32;
+        metadata.data.resize(sizeof(value));
+        std::memcpy(metadata.data.data(), &value, sizeof(value));
+        model.metadata[key] = std::move(metadata);
+    }
 
     // Helper: create a minimal GGUFModel resembling Qwen2.5-0.5B (2 layers only)
     // block_count is set to 2 to match the actual tensor count.
@@ -204,6 +223,78 @@ TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsArchitecture)
     EXPECT_EQ(profile.max_seq_len, 32768);
 }
 
+TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsExactMoEGeometry)
+{
+    auto model = createTestModel();
+    model.architecture = "qwen35moe";
+    setUInt32Metadata(model, "qwen35moe.expert_count", 256);
+    setUInt32Metadata(model, "qwen35moe.expert_used_count", 8);
+    setUInt32Metadata(
+        model,
+        "qwen35moe.expert_feed_forward_length",
+        512);
+    setUInt32Metadata(
+        model,
+        "qwen35moe.expert_shared_feed_forward_length",
+        768);
+
+    const auto profile = ModelMemoryProfile::fromGGUF(model);
+
+    EXPECT_EQ(profile.expert_count, 256);
+    EXPECT_EQ(profile.expert_used_count, 8);
+    EXPECT_EQ(profile.expert_feed_forward_length, 512);
+    EXPECT_EQ(profile.expert_shared_feed_forward_length, 768);
+}
+
+/**
+ * @brief A routed parent's outer expert axis must never masquerade as GEMM K.
+ */
+TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsLogicalMatrixKFrom3DExpertParent)
+{
+    GGUFModel model;
+    model.architecture = "qwen35moe";
+    model.block_count = 1;
+    setUInt32Metadata(model, "qwen35moe.expert_count", 256);
+
+    GGUFTensorInfo gate;
+    gate.name = "blk.0.ffn_gate_exps.weight";
+    // ModelLoader intentionally retains GGUF's [K, N, experts] order for 3-D
+    // parents so expert slicing can operate on the outer axis.
+    gate.dimensions = {3072, 1024, 256};
+    gate.type = GGUFTensorType::Q8_K;
+    gate.size_bytes = 1;
+    model.tensors.push_back(gate);
+
+    const auto profile = ModelMemoryProfile::fromGGUF(model);
+    ASSERT_EQ(profile.tensors.size(), 1u);
+    EXPECT_EQ(profile.tensors.front().elements,
+              3072ULL * 1024ULL * 256ULL);
+    EXPECT_EQ(profile.tensors.front().K, 3072u);
+
+    const auto serialized = profile.serialize();
+    const auto restored = ModelMemoryProfile::deserialize(
+        serialized.data(), serialized.size());
+    ASSERT_EQ(restored.tensors.size(), 1u);
+    EXPECT_EQ(restored.tensors.front().K, 3072u);
+}
+
+/** @brief Reject malformed routed parents before any memory decision is made. */
+TEST(Test__ModelMemoryProfile, FromGGUF_RejectsMismatchedExpertAxis)
+{
+    GGUFModel model;
+    model.architecture = "qwen35moe";
+    setUInt32Metadata(model, "qwen35moe.expert_count", 256);
+
+    GGUFTensorInfo gate;
+    gate.name = "blk.0.ffn_gate_exps.weight";
+    gate.dimensions = {3072, 1024, 255};
+    gate.type = GGUFTensorType::Q8_K;
+    gate.size_bytes = 1;
+    model.tensors.push_back(gate);
+
+    EXPECT_THROW(ModelMemoryProfile::fromGGUF(model), std::invalid_argument);
+}
+
 TEST(Test__ModelMemoryProfile, FromGGUF_SumsTensorBytes)
 {
     auto model = createTestModel();
@@ -339,6 +430,17 @@ TEST(Test__ModelMemoryProfile, FromGGUF_PreservesSupportedQuantTypeNames)
 TEST(Test__ModelMemoryProfile, SerializeDeserialize_RoundTrip_ScalarFields)
 {
     auto model = createTestModel();
+    model.architecture = "qwen35moe";
+    setUInt32Metadata(model, "qwen35moe.expert_count", 256);
+    setUInt32Metadata(model, "qwen35moe.expert_used_count", 8);
+    setUInt32Metadata(
+        model,
+        "qwen35moe.expert_feed_forward_length",
+        512);
+    setUInt32Metadata(
+        model,
+        "qwen35moe.expert_shared_feed_forward_length",
+        512);
     auto original = ModelMemoryProfile::fromGGUF(model);
 
     auto buf = original.serialize();
@@ -355,6 +457,27 @@ TEST(Test__ModelMemoryProfile, SerializeDeserialize_RoundTrip_ScalarFields)
     EXPECT_EQ(restored.head_dim, original.head_dim);
     EXPECT_EQ(restored.vocab_size, original.vocab_size);
     EXPECT_EQ(restored.max_seq_len, original.max_seq_len);
+    EXPECT_EQ(restored.expert_count, original.expert_count);
+    EXPECT_EQ(restored.expert_used_count, original.expert_used_count);
+    EXPECT_EQ(
+        restored.expert_feed_forward_length,
+        original.expert_feed_forward_length);
+    EXPECT_EQ(
+        restored.expert_shared_feed_forward_length,
+        original.expert_shared_feed_forward_length);
+    EXPECT_EQ(restored.mtp_layer_count, original.mtp_layer_count);
+    EXPECT_EQ(
+        restored.full_attention_interval,
+        original.full_attention_interval);
+    EXPECT_EQ(
+        restored.gdn_conv_kernel_size,
+        original.gdn_conv_kernel_size);
+    EXPECT_EQ(restored.gdn_state_size, original.gdn_state_size);
+    EXPECT_EQ(restored.gdn_inner_size, original.gdn_inner_size);
+    EXPECT_EQ(restored.gdn_group_count, original.gdn_group_count);
+    EXPECT_EQ(
+        restored.gdn_time_step_rank,
+        original.gdn_time_step_rank);
     EXPECT_EQ(restored.total_native_bytes, original.total_native_bytes);
 }
 
@@ -435,5 +558,22 @@ TEST(Test__ModelMemoryProfile, Deserialize_TruncatedBuffer_Throws)
     // Truncate to 10 bytes — should throw on deserialization
     EXPECT_THROW(
         ModelMemoryProfile::deserialize(buf.data(), 10),
+        std::runtime_error);
+}
+
+TEST(Test__ModelMemoryProfile, Deserialize_RejectsUnknownWireVersion)
+{
+    auto original = ModelMemoryProfile::fromGGUF(createTestModel());
+    auto buffer = original.serialize();
+    ASSERT_GE(buffer.size(), 2 * sizeof(uint32_t));
+
+    const uint32_t unknown_version = 0xFFFFFFFFU;
+    std::memcpy(
+        buffer.data() + sizeof(uint32_t),
+        &unknown_version,
+        sizeof(unknown_version));
+
+    EXPECT_THROW(
+        ModelMemoryProfile::deserialize(buffer.data(), buffer.size()),
         std::runtime_error);
 }

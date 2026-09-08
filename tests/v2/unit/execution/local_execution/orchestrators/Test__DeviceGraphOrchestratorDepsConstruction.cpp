@@ -18,17 +18,22 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "config/PipelineConfig.h"
 #include "config/TensorParallelConfig.h"
 #include "backends/DeviceId.h"
 #include "utils/DebugEnv.h"
+#include "../../../../mocks/MockLocalTPContext.h"
+#include "../../../../mocks/MockMPIContext.h"
+#include "../../../../mocks/MockMPITopology.h"
 #include "../../../../mocks/MockModelContext.h"
 #include "../../../../mocks/MockComputeStage.h"
 
@@ -51,7 +56,10 @@ namespace
                     entry.old_value = old_value;
                 }
                 entries_.push_back(entry);
-                ::setenv(name, value, 1);
+                if (value)
+                    ::setenv(name, value, 1);
+                else
+                    ::unsetenv(name);
             }
             mutableDebugEnv().reload();
         }
@@ -168,6 +176,28 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, NullModelCtx_Throws)
     EXPECT_THROW(DeviceGraphOrchestrator(std::move(deps)), std::invalid_argument);
 }
 
+/**
+ * @brief One graph cannot consume two distributed-rank authorities.
+ *
+ * The concrete MPI context supplies collectives and rank identity for ordinary
+ * production global TP, while IMPITopology is the injectable interface used by
+ * topology-driven construction. Accepting both would make executor rank and
+ * collective ownership dependent on caller ordering.
+ */
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction,
+       ConcreteMPIAndInjectedTopologyAreMutuallyExclusive)
+{
+    auto deps = minimalDeps();
+    deps.mpi_ctx =
+        std::make_shared<llaminar2::test::MockMPIContext>(0, 2);
+    deps.topology =
+        llaminar2::test::MockMPITopology::createSimple(0, 2);
+
+    EXPECT_THROW(
+        DeviceGraphOrchestrator(std::move(deps)),
+        std::invalid_argument);
+}
+
 // =============================================================================
 // Polymorphic IGraphBuilder Usage (MockGraphBuilder)
 // =============================================================================
@@ -196,12 +226,173 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, MockGraphBuilder_ConfigAcc
     EXPECT_EQ(cfg.head_dim, 64);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DoesNotGraphCaptureCollectivesByDefault)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_RejectsEagerHomogeneousGpuCollectives)
 {
     ScopedEnvVars env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "0"},
     });
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    const IForwardExecutionHost &host = dgo;
+
+    EXPECT_THROW(
+        host.buildDecodeCapturePolicy(
+            true,
+            &gpu_ctx),
+        std::runtime_error);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalancePayloadSidebandDefaultsOff)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND", nullptr},
+    });
+
+    EXPECT_FALSE(debugEnv().moe_rebalance.device_rebalance_payload_sideband)
+        << "Bulk expert payload sidebands must not be attached to every decode-token graph replay by default.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalancePayloadSidebandEnvStillParsesButSelectorRejects)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND", "1"},
+    });
+
+    EXPECT_TRUE(debugEnv().moe_rebalance.device_rebalance_payload_sideband);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLayerWaveDefaultsToBoundedEarlySweep)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE", nullptr},
+    });
+
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_layer_wave_count, 4)
+        << "The graph-side controller should inspect several early layers per maintenance wave "
+           "without defaulting to a full-model policy pass.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLayerWaveEnvOverridesDefault)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE", "7"},
+    });
+
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_layer_wave_count, 7);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpreadFloorDefaultsToDynamic)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", nullptr},
+    });
+
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement, 0)
+        << "Default Dynamic should use the shared Dynamic admission floor "
+           "max(2, window/16), not an extra GPU-only candidate floor.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor,
+              static_cast<int>(moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor))
+        << "The relative spread gate is enabled by default to keep transfer-backed GPU "
+           "maintenance economical.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 256)
+        << "The wave-level value gate should reject low-value hot-cache transfer churn by default.";
+    EXPECT_EQ(
+        debugEnv().moe_rebalance
+            .device_rebalance_min_foreign_rows_per_critical_path_payload_slot,
+        0)
+        << "The useful-work gate should be available for sweeps without changing existing policy by default.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 128)
+        << "Steady-state hot-replica transfer waves should require measured realized router benefit by default.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille, 100)
+        << "Transfer-backed waves should leave the domain close enough to balanced to amortize maintenance cost.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_no_work_backoff_periods, 1)
+        << "Empty maintenance replays should back off by default until zero-bucket graph bodies exist.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpreadFloorEnvOverridesDefault)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", "96"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", "12"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "192"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT", "768"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "384"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE", "75"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", "3"},
+    });
+
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement, 96);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor, 12);
+    EXPECT_TRUE(debugEnv().presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"));
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 192);
+    EXPECT_EQ(
+        debugEnv().moe_rebalance
+            .device_rebalance_min_foreign_rows_per_critical_path_payload_slot,
+        768);
+    EXPECT_TRUE(debugEnv().presence.has(
+        "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT"));
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 384);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille, 75);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_no_work_backoff_periods, 3);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesCollectivesByDefaultForHomogeneousCudaLocalTP)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", nullptr},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", nullptr},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_TRUE(policy.allow_cached_graph_replay)
+        << "Homogeneous CUDA LocalTP collective decode must remain graph-replay eligible by default.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesCollectivesByDefaultForHomogeneousRocmLocalTP)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", nullptr},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", nullptr},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::RCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
 
     auto deps = minimalDeps();
     DeviceGraphOrchestrator dgo(std::move(deps));
@@ -210,13 +401,309 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DoesNo
 
     const auto policy = host.buildDecodeCapturePolicy(
         true,
-        &gpu_ctx,
-        0);
+        &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_TRUE(policy.allow_cached_graph_replay)
+        << "Homogeneous ROCm LocalTP collective decode should graph-capture through participant-local RCCL enqueue.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturedCollectivesTakePrecedenceOverSegmentedOptIn)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled)
+        << "Segmented replay is an explicit compatibility lane, not the primary LocalTP graph path.";
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesDenseDecodeReplicatedWithCollectiveOptIn)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    cfg.dense_tp_enabled = true;
+    cfg.dense_tp_decode_replicated = true;
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_TRUE(policy.allow_cached_graph_replay)
+        << "Phase-split dense decode builds a decode-only graph with replicated dense bindings; "
+           "homogeneous LocalTP captured collectives remain the gating contract.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesCollectivesForOptInHomogeneousCudaLocalTP)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesCollectivesForOptInHomogeneousRocmLocalTP)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::RCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_AdmitsTopologyDrivenSegmentationForMixedLocalTP)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_TRUE(policy.heterogeneous_segmented_enabled);
     EXPECT_FALSE(policy.collectives_graph_capturable);
-    EXPECT_FALSE(policy.allow_segmented_capture);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+    EXPECT_EQ(
+        policy.graph_replay_plan_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_AdmitsExpertOverlayBoundaryWithoutNamedCollective)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    auto placement = std::make_shared<MoERoutedExpertPlacementPlan>();
+    placement->enabled = true;
+    RoutedExpertDomain hot;
+    hot.name = "cuda_hot";
+    hot.scope = ExecutionDomainScope::RANK_LOCAL;
+    hot.backend = CollectiveBackendType::NCCL;
+    hot.participants = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+    RoutedExpertDomain cold;
+    cold.name = "cpu_cold";
+    cold.scope = ExecutionDomainScope::NODE_LOCAL;
+    cold.backend = CollectiveBackendType::HOST;
+    cold.participants = {
+        GlobalDeviceAddress::cpu(0),
+        GlobalDeviceAddress::cpu(1)};
+    placement->domains = {hot, cold};
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    cfg.moe.routed_expert_plan = placement;
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    ASSERT_EQ(std::as_const(dgo).graphBuilder(), mock_builder_.get());
+    const auto &installed_config = std::as_const(dgo).graphBuilder()->config();
+    ASSERT_EQ(installed_config.moe.routed_expert_plan, placement);
+    ASSERT_EQ(installed_config.moe.routed_expert_plan->domains.size(), 2u);
+    ASSERT_EQ(
+        installed_config.moe.routed_expert_plan->domains[0].participants.size(),
+        2u);
+    ASSERT_EQ(
+        installed_config.moe.routed_expert_plan->domains[1].participants.size(),
+        2u);
+    EXPECT_EQ(
+        installed_config.moe.routed_expert_plan->domains[0]
+            .participants[0]
+            .device_type,
+        DeviceType::CUDA);
+    EXPECT_EQ(
+        installed_config.moe.routed_expert_plan->domains[1]
+            .participants[0]
+            .device_type,
+        DeviceType::CPU);
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        false,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.heterogeneous_segmented_enabled);
+    EXPECT_FALSE(policy.collectives_graph_capturable);
+    EXPECT_EQ(
+        policy.graph_replay_plan_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesHomogeneousContinuationCollectivesAcrossExpertOverlayBoundary)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({
+        GlobalDeviceAddress::cuda(0, 0, "worker-a"),
+        GlobalDeviceAddress::cuda(1, 0, "worker-a")});
+
+    auto placement = std::make_shared<MoERoutedExpertPlacementPlan>();
+    placement->enabled = true;
+    RoutedExpertDomain continuation;
+    continuation.name = "priority_0";
+    continuation.scope = ExecutionDomainScope::RANK_LOCAL;
+    continuation.backend = CollectiveBackendType::NCCL;
+    continuation.participants = {
+        GlobalDeviceAddress::cuda(0, 0, "worker-a"),
+        GlobalDeviceAddress::cuda(1, 0, "worker-a")};
+    RoutedExpertDomain remote;
+    remote.name = "priority_1";
+    remote.scope = ExecutionDomainScope::RANK_LOCAL;
+    remote.backend = CollectiveBackendType::RCCL;
+    remote.participants = {
+        GlobalDeviceAddress::rocm(0, 1, "worker-a"),
+        GlobalDeviceAddress::rocm(1, 1, "worker-a")};
+    placement->domains = {continuation, remote};
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    cfg.moe.routed_expert_plan = placement;
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        /*has_collective_nodes=*/true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.heterogeneous_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable)
+        << "A remote ExpertOverlay domain must not eject homogeneous continuation NCCL stages from capture.";
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+    EXPECT_EQ(
+        policy.graph_replay_plan_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, ExecutorAccessible)

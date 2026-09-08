@@ -13,6 +13,7 @@
 #pragma once
 
 #include "DecodeExpertHistogram.h"
+#include "MoELayeredExpertOwnership.h"
 #include "SocketAwareRebalancer.h"
 
 #include <chrono>
@@ -24,26 +25,48 @@
 namespace llaminar2
 {
 
-    /// Describes which experts are replicated across sockets.
-    /// Both sockets have GEMM engines for replicated experts;
-    /// per-token dynamic dispatch decides which socket computes each one.
+    /// Describes resident hot-expert replicas in a routed-expert domain.
+    ///
+    /// Base ownership is a complete per-layer table: exactly one participant
+    /// owns every `(layer, expert)` pair. Hot replicas are additional resident
+    /// copies and are likewise scoped by layer and participant. The aggregate
+    /// `replicated_in_any_layer` vector is a derived diagnostic index only; it
+    /// never participates in dispatch or ownership decisions.
     struct ExpertReplicaSet
     {
-        std::string domain_id;          ///< ExpertParallel domain this replica set belongs to.
-        std::vector<bool> is_replicated; ///< [num_experts] true if on both sockets
-        std::vector<int> owner_socket;   ///< [num_experts] primary owner socket
-        int num_replicated = 0;          ///< Count of replicated experts
-        int num_sockets = 0;             ///< Cached socket count (computed once from owner_socket)
+        std::string domain_id; ///< Routed-expert domain this replica set belongs to.
+        MoELayeredExpertOwnership base_ownership;
+        std::vector<bool> replicated_in_any_layer; ///< Derived `[expert]` diagnostic index.
+        int num_replicated = 0; ///< Count of layer/expert/participant replica slots.
+
+        /// [layer][expert][participant] true when participant has a non-owner
+        /// resident replica for that layer/expert. Owner residency is implicit
+        /// through base_ownership and must not be represented here.
+        std::vector<std::vector<std::vector<bool>>> replica_participants_by_layer;
 
         /// Pre-built prefill mask: expert_mask[e] && ownership check baked in.
         /// When non-empty, prefill path uses this single-lookup mask instead of
-        /// the multi-branch is_replicated + owner_socket check per expert.
+        /// repeated replica and owner lookups per expert.
         /// Built once per socket at rebalance time.
         std::vector<bool> prefill_mask; ///< [expert_id] for this socket
 
         /// Build prefill mask from expert_mask + ownership for a specific socket.
-        /// Call after rebalance when masks and owner_socket are finalized.
-        void buildPrefillMask(int my_socket_id, const std::vector<bool> &expert_mask);
+        /// Call after masks and layered base ownership are finalized.
+        void buildPrefillMask(
+            int my_socket_id,
+            const std::vector<bool> &expert_mask,
+            int layer_idx = -1);
+
+        bool hasLayerReplicaPlacement() const;
+        int participantCount() const { return base_ownership.participantCount(); }
+        int ownerParticipant(int layer_idx, int expert_id) const
+        {
+            return base_ownership.owner(layer_idx, expert_id);
+        }
+        bool hasReplicaOnParticipant(int layer_idx, int expert_id, int participant_id) const;
+        bool isReplicatedForLayer(int layer_idx, int expert_id) const;
+        void setReplicaOnParticipant(int layer_idx, int expert_id, int participant_id, bool enabled = true);
+        void rebuildAggregateReplicaFlags();
 
         /// Compare replica placement only. Socket-specific prefill_mask is ignored.
         bool sameReplicaPlacement(const ExpertReplicaSet &other) const;
@@ -70,7 +93,8 @@ namespace llaminar2
             int top_k,
             int my_socket_id,
             const std::vector<bool> &expert_mask,
-            bool *compute_here) const;
+            bool *compute_here,
+            int layer_idx = -1) const;
     };
 
 } // namespace llaminar2 (forward decl block)
@@ -113,11 +137,12 @@ namespace llaminar2
             int num_experts = 0;
             int top_k = 0;
             int window_size = 256;
+            int token_boundary_layer_idx = -1;       ///< Routed layer that advances decode-token windows
             int max_window_size = 4096;                ///< Cap for adaptive growth (0 = no adaptive growth)
             float window_growth_factor = 1.5f;         ///< Multiply window_size by this after each rebalance
-            int max_replicas = 0;                      ///< Max experts to replicate per socket (0 = disabled)
-            std::vector<DeviceId> sockets;             ///< e.g. {cpu:0, cpu:1}
-            std::vector<int> initial_expert_to_socket; ///< [num_experts]
+            int max_replicas = 0;                      ///< Max replica slots per participant (0 = disabled)
+            std::vector<DeviceId> sockets;             ///< Domain participants, e.g. {cpu:0, cpu:1}
+            MoELayeredExpertOwnership initial_ownership; ///< [layer][expert] -> participant
             SocketRebalanceConfig rebalance_config;
         };
 
@@ -132,23 +157,20 @@ namespace llaminar2
         /// Check rebalance readiness with an explicit Phase 8 rollout reason.
         MoERebalanceDecision rebalanceDecision() const;
 
-        /// Propose and apply rebalance (swap-based, global placement).
-        /// Returns the new expert_to_socket mapping.
-        /// Returns empty vector if no rebalancing was done.
-        /// The caller is responsible for updating MoEExpertComputeStage local_expert_start/count.
-        std::vector<int> rebalance();
+        /**
+         * @brief Propose, validate, and install one layered ownership update.
+         *
+         * The returned entries identify only layer/expert owners that changed.
+         * An empty result means no candidate met both the per-layer planner
+         * policy and the aggregate non-regression contract.
+         */
+        std::vector<MoELayeredExpertOwnershipChange> rebalance();
 
-        /// Compute optimal per-layer partition using LPT (Longest Processing Time First).
-        /// Each layer gets its own independently-optimized expert assignment.
-        /// This is more effective than swap-based rebalancing because layer routing
-        /// patterns differ — an expert popular in layer 5 may be rare in layer 20.
-        void rebalanceLPT();
-
-        /// Get current global expert-to-socket mapping (used by swap-based rebalance)
-        const std::vector<int> &currentPlacement() const { return current_placement_; }
-
-        /// Domain/participant vocabulary alias for new ExpertParallel call sites.
-        const std::vector<int> &currentParticipantPlacement() const { return current_placement_; }
+        /// Complete authoritative `(layer, expert) -> participant` ownership.
+        const MoELayeredExpertOwnership &currentOwnership() const
+        {
+            return current_ownership_;
+        }
 
         /// Number of participants in this rebalance domain.
         int participantCount() const { return static_cast<int>(config_.sockets.size()); }
@@ -174,23 +196,37 @@ namespace llaminar2
         /// Get routed experts selected per token
         int topK() const { return config_.top_k; }
 
-        /// Get max hot expert replicas per socket/rank.
+        /// Get max hot expert replica slots per participant/rank.
         int maxReplicasPerSocket() const { return config_.max_replicas; }
+
+        /// Get the ownership-swap rebalancer policy configured for this domain.
+        const SocketRebalanceConfig &rebalanceConfig() const { return config_.rebalance_config; }
+
+        /// Load-spread stats scored before the most recent rebalance policy decision.
+        const ExpertLoadImbalanceStats &lastImbalanceBefore() const { return last_imbalance_before_; }
+
+        /// Load-spread stats scored after the most recent rebalance policy decision.
+        const ExpertLoadImbalanceStats &lastImbalanceAfter() const { return last_imbalance_after_; }
+
+        /// Mean normalized spread reduction from the last policy decision.
+        double lastAverageSpreadImprovement() const
+        {
+            if (!last_imbalance_before_.valid || !last_imbalance_after_.valid)
+                return 0.0;
+            return last_imbalance_before_.average_spread - last_imbalance_after_.average_spread;
+        }
 
         /// Get total rebalances performed
         int totalRebalances() const { return total_rebalances_; }
 
-        /// Get total swaps performed across all rebalances
-        int totalSwaps() const { return total_swaps_; }
+        /// Get total capacity-preserving ownership swap pairs installed.
+        int totalSwapPairs() const { return total_swap_pairs_; }
+
+        /// Get total layer/expert owner entries changed across all updates.
+        int totalOwnershipChanges() const { return total_ownership_changes_; }
 
         /// Get the domain placement epoch used by prefix and graph-cache keys.
         uint64_t placementEpoch() const { return placement_epoch_; }
-
-        /// Get duration of last rebalanceLPT() call in milliseconds
-        double lastRebalanceDurationMs() const { return last_rebalance_duration_ms_; }
-
-        /// Get number of experts moved in last rebalanceLPT() call
-        int lastExpertsMoved() const { return last_experts_moved_; }
 
         /// Get duration of last applyExpertMasks (VNNI prep) in milliseconds
         double lastPrepDurationMs() const { return last_prep_duration_ms_; }
@@ -205,18 +241,17 @@ namespace llaminar2
         /// Log current histogram summary (for OBSERVE mode)
         void logHistogramSummary() const;
 
-        /// Get a structured profiling summary string for LLAMINAR_PROFILING output.
+        /// Get the legacy human-readable profiling summary.
         /// Includes: histogram stats, rebalance timing, expert movement counts.
         std::string getProfilingSummary() const;
 
-        /// Compute per-layer expert masks for a given socket/rank.
+        /// Compute per-layer expert masks for a given participant/rank.
         /// Returns a vector of num_layers expert masks (each size num_experts).
         /// expert_mask[layer][expert] == true means this rank computes that expert.
-        /// After rebalanceLPT(), uses per-layer placement. Otherwise uses global placement.
         /// When replicas are active, the mask includes both owned and replicated experts.
         std::vector<std::vector<bool>> computeExpertMasks(int socket_id) const;
 
-        /// Domain/participant vocabulary alias for new ExpertParallel call sites.
+        /// Domain/participant vocabulary alias for routed-expert call sites.
         std::vector<std::vector<bool>> computeExpertMasksForParticipant(int participant_id) const
         {
             return computeExpertMasks(participant_id);
@@ -225,15 +260,14 @@ namespace llaminar2
         /// Compute expert masks for all sockets with a bounded GPU routed-expert cache.
         /// The hottest experts per layer are placed on GPU sockets up to
         /// gpu_cache_experts_per_layer; all remaining experts are placed on CPU sockets.
-        /// If the topology does not contain both GPU and CPU sockets, falls back to
-        /// computeExpertMasks() for each socket.
+        /// If the bounded heterogeneous-cache policy is not applicable, the
+        /// authoritative installed ownership/replica masks are returned unchanged.
         std::vector<std::vector<std::vector<bool>>> computeGpuCacheExpertMasks(
             int gpu_cache_experts_per_layer) const;
 
-        /// Propose experts to replicate across sockets based on histogram data.
-        /// Identifies the top-N hottest experts on each socket and proposes
-        /// replicating them on the other socket. max_replicas_per_socket controls
-        /// how many experts each socket gets as replicas.
+        /// Propose layer/expert replica slots based on histogram data.
+        /// For each participant, chooses hot layer/expert slots owned by other
+        /// participants, up to max_replicas_per_socket slots for that target.
         /// Returns empty set if no replicas are beneficial.
         ExpertReplicaSet proposeReplicas(int max_replicas_per_socket);
 
@@ -249,37 +283,31 @@ namespace llaminar2
         /// Whether expert replication is active.
         bool hasReplicas() const { return current_replicas_.num_replicated > 0; }
 
-        /// Update replica set owner_socket to match current placement.
-        /// Must be called after rebalance() if replicas are active,
-        /// since rebalance swaps change which socket owns each expert.
-        void syncReplicaPlacement()
-        {
-            if (current_replicas_.num_replicated > 0)
-                current_replicas_.owner_socket = current_placement_;
-        }
-
     private:
         MoERebalanceMode requested_mode_ = MoERebalanceMode::OFF;
         Config config_;
         std::unique_ptr<DecodeExpertHistogram> histogram_;
         std::unique_ptr<SocketAwareRebalancer> rebalancer_;
-        std::vector<int> current_placement_;                ///< Global placement (swap-based)
-        std::vector<std::vector<int>> per_layer_placement_; ///< Per-layer placement (LPT-based)
-        bool use_per_layer_placement_ = false;              ///< True after rebalanceLPT()
+        MoELayeredExpertOwnership current_ownership_;
         int total_rebalances_ = 0;
-        int total_swaps_ = 0;
-        double last_rebalance_duration_ms_ = 0.0;
-        int last_experts_moved_ = 0;
+        int total_swap_pairs_ = 0;
+        int total_ownership_changes_ = 0;
         double last_prep_duration_ms_ = 0.0;
         uint64_t placement_epoch_ = 0;
-        float last_avg_imbalance_before_ = 0.0f;
-        float last_avg_imbalance_after_ = 0.0f;
-        float last_worst_imbalance_before_ = 0.0f;
-        int last_worst_layer_before_ = 0;
+        ExpertLoadImbalanceStats last_imbalance_before_;
+        ExpertLoadImbalanceStats last_imbalance_after_;
         int current_window_size_ = 0;       ///< Tracks effective window size for adaptive growth
         ExpertReplicaSet current_replicas_; ///< Active replica set
 
         void growWindowIfAdaptive();
     };
+
+    /// Pick the controller that should own graph-side routed expert telemetry
+    /// and runtime rebalance decisions when multiple domains are present.
+    MoERebalanceController *selectActiveMoERebalanceController(
+        const std::vector<MoERebalanceController *> &controllers);
+
+    MoERebalanceController *selectActiveMoERebalanceController(
+        const std::vector<std::unique_ptr<MoERebalanceController>> &controllers);
 
 } // namespace llaminar2

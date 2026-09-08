@@ -2,6 +2,579 @@
 
 ## Objective
 
+### Dynamic-depth economy (CUDA and ROCm)
+
+September 8 follow-on: the user requested promotion to card-aware production
+defaults. Single-device and homogeneous continuation plans now select typed
+RTX3090/MI50 profiles, with automatic versus explicit threshold intent retained
+through request admission and MPI. Fresh verification passes **639 Unit + 115
+preflight + twelve parity cells + 106 CSV artifacts** in **600.305 seconds**.
+Clean automatic-default Release decode is **68.091 CUDA / 41.103 ROCm tok/s**,
+with all five token arrays unchanged per backend. Normal inference retires
+cleanly; a separate pre-existing dry-run retention-seal error is recorded for
+follow-up, not called green. See the
+[hardware-defaults handoff](../2026-09/2026-09-08-mtp-hardware-defaults.md).
+
+September 8 accepted handoff: CUDA dynamic capacity 15 is **68.166 tok/s**, or
+**97.39%** of its best fixed depth (depth 2, 69.991 tok/s; full 1–15 inventory).
+ROCm dynamic is **41.013 tok/s**, or **92.77%** of the best tested fixed depth
+(depth 2, 44.208 tok/s; depths 1–9 completed). The user accepted these results
+and stopped the slower deeper ROCm sweep: depth 10 was interrupted, not failed,
+and 11–15 were not measured in this final sweep. ROCm uses the explicit
+`--mtp-depth-demote-zero-accept 0.45` override; CUDA uses the existing defaults.
+At that earlier tuning checkpoint no global policy default had changed; the
+automatic-profile follow-on above supersedes the manual override. Both retain
+dynamic bounds 1–15 and initial
+depth 2, with real depth updates and identical per-backend output IDs across
+all five measured requests in every completed case. The final gate passes
+**638 Unit + 115 preflight + twelve Qwen3.8 cells + 106 CSV artifacts** in
+**613.462 seconds**. This closes the accepted dynamic-depth tuning goal, not
+the full production/E2E campaign or the deferred external-baseline prefill gap.
+See the [reproduction and evidence handoff](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
+The following entries preserve the investigation chronology.
+
+September 8 implementation follow-up and refreshed baselines are in the
+[device-row-range investigation](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
+Raw CUDA grouped and ROCm single/fused/mixed-decoder row admission is
+implemented. All 638 Unit tests, the focused all-format regressions and twenty
+repetitions per backend pass; the rebuilt 115-registration preflight passes.
+Subsequent ROCm mixed-decoder register-lifetime cleanup passes focused checks.
+The count now reaches public projection/SwiGLU adapters, including native
+FP16/BF16/FP32 fixed-order kernels, and Qwen FFN/QKV/GDN/output/identity-LM-head
+stage parameters. New adapter/capture tests pass 64 CUDA and 106 ROCm cases.
+Full gates are rebuilding for this interface revision. Physical-width
+quantization, non-prefix row layouts and unchanged general BLAS work are not
+claimed to be count-admitted. The per-backend 90% real-model proof is pending.
+
+The September 7 user direction is to finish the current MTP-off decode slice,
+then tune dynamic-depth MTP on **CUDA and ROCm independently** until delivered
+decode throughput is at least **90% of that backend's best fixed MTP depth**
+on the existing Qwen3.8-27B comparison prompt. This is a new follow-on acceptance
+criterion, not a result already measured at that point. It became the active goal; the
+remaining MTP-off prefill gap is deferred. "Fixed" describes speculative depth, not MoE
+expert-residency policy.
+
+Latest September 8 WIP checkpoint: CUDA ordinary decode retains its lead at
+46.485 tok/s versus a refreshed pinned llama.cpp 45.757. The additive packed-
+prefill installation improves approximately 3–4% in two control/candidate
+brackets, ending at 1186.524 tok/s versus the external 1204.301 confirmation.
+It adds no persistent memory and does not alter the dynamic-width design below.
+All 147 all-format exact-shape cells and 45 isolated spill checks pass; full
+Unit is 638/638, preflight is 112/112, and all twelve affected model cells pass
+with 106 validated CSV artifacts in 581.568 seconds:
+`/tmp/qwen38-staged-prefill-proof.{json,log}`. This certifies the affected slice,
+not the entire production campaign or the dynamic economy target. Fixed-depth/dynamic measurements must be
+refreshed after the attention change before any 90% certification.
+
+- Reuse the exact 512-token prompt, GGUF, FP32 activations, KV precision,
+  context capacity, sampling policy/seed and 256-output request from the
+  [phase investigation](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md).
+  Keep topology and any expert-placement policy unchanged within each bracket.
+  Do not add VRAM beyond an explicitly approved scope.
+- Establish healthy fixed-depth 1/2/3 baselines first, then measure every fixed
+  depth through dynamic's supported ceiling (currently 15) before calling one
+  the best. The final user-directed stop limits ROCm's accepted comparison to
+  the best **tested** depth (1–9); CUDA completed 1–15. Reconfirm the winner and dynamic in interleaved, warmed Release
+  measurements; record all repeats and the common emitted-token denominator.
+  Startup/capture cost is separate, but controller exploration during the
+  measured request remains in its decode time. Do not discard a slow prefix
+  or carry hidden training state between otherwise fresh requests.
+- Require `dynamic_decode_tok_s / best_fixed_decode_tok_s >= 0.90` on **each**
+  backend, using the same after-prefill timing definition and repeated-run
+  statistic. One vendor's improvement cannot compensate for the other's miss.
+  Compare emitted/accepted response tokens, never attempted draft throughput.
+- Diagnose depth trajectory, proposed/accepted drafts, tokens per transaction,
+  draft and verifier work, state publication, and scheduler/ticket overhead in
+  separate profiled runs. Preserve the device-owned decision authority and
+  retained capture semantics; no fixed-depth substitution for dynamic mode.
+- Retain strict serial/grouped byte equivalence and real-model numerical/CSV
+  proof, including reset, prefix restore, stochastic sampling and capacity
+  through depth 15. Run focused regressions, full Unit, ProductionParityPreflight
+  and affected canonical model cells before accepting a change. Performance
+  measurements remain outside the functional preflight gate.
+
+The first matched measurements, before restoring deterministic attention's
+parallel KV splits, confirm the reported regression. Five warmed Release
+repeats, exact 512-token prompt, 256 outputs,
+greedy sampling, FP32 activations, FP16 KV and profiling disabled give:
+
+| Backend | Fixed depth 2 | Dynamic, ceiling 15 | Dynamic / fixed 2 |
+|---|---:|---:|---:|
+| CUDA RTX3090 | 67.226 tok/s | 23.950 tok/s | 35.6% |
+| ROCm MI50 | 38.418 tok/s | 13.990 tok/s | 36.4% |
+
+Tokens are identical between fixed and dynamic within each backend and across
+all repeats. CUDA also matches the current ordinary-decode output. CUDA and
+ROCm output IDs differ from each other; neither is the other's byte oracle.
+Dynamic starts at 2 and demotes once to 1 per request on both backends. It
+performs only about 5% more verifier transactions than fixed 2, with slightly
+higher draft acceptance, so extra transactions do not explain the slowdown.
+
+A CUDA **diagnostic only** reduces the dynamic ceiling from 15 to 2. It gives
+**65.367 tok/s (97.2% of fixed 2)** with identical output IDs and identical
+depth-window, update, accepted/rejected, draft and verifier counters to the
+ceiling-15 run. This establishes a large capacity-dependent execution tax
+without changing the actual adaptive decisions. It is not an accepted solution:
+the final dynamic policy must retain capacity through depth 15. The matching
+ROCm diagnostic gives **37.176 tok/s (96.8% of fixed 2)**, again with identical
+outputs and adaptive counters to its ceiling-15 run. The complete fixed-depth
+inventory is also pending;
+depth 2 is a healthy comparator, not yet the certified best fixed depth.
+Receipts: `/tmp/qwen38-dynamic90-{cuda,rocm}-{fixed2,dynamic}.{json,log}` and
+`/tmp/qwen38-dynamic90-{cuda,rocm}-envelope2-diagnostic.{json,log}`.
+
+September 8 device-counted projection implementation now passes the complete
+affected gate: **638 Unit, 115 preflight integrations, twelve Qwen3.8 CUDA/ROCm
+cells, and 106 validated CSV artifacts** in 596.888 seconds. Clean Release
+fixed-2/dynamic-15 is **69.842/56.839 CUDA** and **45.319/34.135 ROCm tok/s**.
+This is a 2.337x/2.691x dynamic improvement over the immediate baseline, with
+identical output IDs across all five repeats. It is still only 81.38%/75.32% of
+fixed 2; the >=90% goal and complete fixed-depth search are not certified.
+
+Controlled same-decision capacity pairs retain an execution-width cost. The
+CUDA FFN probe identifies a concrete component: capacity-selected row reuse 16
+has 80 registers and about 41% achieved occupancy; reuse 8 has 40 registers and
+about 82%, with zero measured spills in both. Release timing wins at both
+three and sixteen live rows. The shared exact refresh now includes 1,050
+byte-checked observations across every format and five live occupancies;
+offline occupancy participates in worst-surface selection, not runtime host
+dispatch. The installed 32-key delta retains the entire M1/Auto programs and
+44,000 other exact keys. Clean CUDA fixed-2/dynamic-15 is now
+**69.991/68.166 tok/s**, or **97.39%** of fixed 2, with unchanged tokens and
+controller counters. The rebuilt affected gate passes **638 Unit + 115
+preflight + twelve cells + 106 validated CSV artifacts** in 594.741 seconds:
+`/tmp/qwen38-counted-policy-proof.{json,log}`. No controller threshold
+change is installed. CUDA's complete fixed-depth 1–15 sweep now passes, with
+depth 2 fastest, so its dynamic result meets the target against the **best**
+fixed depth. ROCm tuning and its fixed-depth inventory remain open. Isolated
+ROCm probes rule out GDN recurrence as the dominant capacity penalty and expose
+excess inactive fused-projection workgroups. The bounded fused-row candidate
+now has zero spills across all 72 specializations and passes 128 focused
+captured-format checks. Clean default-policy ROCm dynamic improves to 36.073
+tok/s, but fixed-2 drops to 44.277 and the performance target remains open.
+Controller-threshold screening identifies early zero-accept demotion as a
+separate cost; screening results are not accepted defaults or clean final
+measurements. The rebuilt aggregate gate passes **638 Unit + 115 preflight +
+twelve Qwen3.8 cells + 106 validated CSV artifacts** in **613.462 seconds**
+(`/tmp/qwen38-rocm-grid-v21-proof.{json,log}`). The quiet controller confirmation
+subsequently passed; the accepted handoff above records the final measurements
+and the user-directed ROCm inventory limit. See the
+[bounded implementation/evidence record](../2026-09/2026-09-08-dynamic-mtp-device-row-range.md).
+
+The original MTP-off external-baseline goal remains open. Prefill sweeps and
+generic fitting stay stopped; retained exact overlays and installed Auto for
+unseen shapes remain the agreed dispatch policy.
+
+The initial fixed-depth neighborhood is now measured with five clean Release
+repeats per depth, profiling disabled and normal bootstrap. Every output token
+matches depth 2 within its backend:
+
+| Fixed depth | CUDA RTX3090 tok/s | ROCm MI50 tok/s |
+|---|---:|---:|
+| 1 | 64.193 | 33.436 |
+| 2 | 67.226 | 38.418 |
+| 3 | 65.640 | 38.041 |
+
+Depth 2 leads this neighborhood; depths 4 through 15 and an interleaved final
+bracket remain required before calling it the overall best. Receipts extend
+`/tmp/qwen38-dynamic90-{cuda,rocm}-fixed{1,2,3}.{json,log}`.
+
+September 8 captured-event attribution now localizes the capacity tax on ROCm:
+
+| Same dynamic decisions, different admitted capacity | Ceiling 2 | Ceiling 15 |
+|---|---:|---:|
+| Physical verifier rows | 3 | 16 |
+| Measured verifier replays | 121 | 121 |
+| Total verifier GPU time | 6,232.270 ms | 17,534.912 ms |
+| Mean verifier replay | 51.506 ms | 144.917 ms |
+| Whole measured decode loop | 6,869.387 ms | 18,213.693 ms |
+
+Both runs produce the baseline's exact 256 output IDs and the same 201 draft
+steps, 135 accepted drafts, 48 rejections and one demotion. The verifier's
+11,302.642-ms increase accounts for **99.6%** of the 11,344.306-ms loop
+increase in this diagnostic pair. These are asynchronous GPU-event timings
+around retained full graphs under normal MPI bootstrap, not per-kernel
+attribution or canonical timing labels. Full-sidecar mean GPU time is stable
+at 2.612/2.625 ms. The ceiling-15 chain count contains thirteen additional
+materialization launches, so its aggregate must not be interpreted as thirteen
+extra device-controller drafts. No controller threshold should be tuned to
+compensate for a verifier execution-width tax.
+
+Receipts: `/tmp/qwen38-sep8-dynamic{2,15}-rocm-events.{json,log}` and
+`/tmp/qwen38-sep8-dynamic{2,15}-rocm-event-bench.json`. A preceding rocprofv3
+whole-graph attempt crashed in replay and produced no trace. Its direct
+`--no-mpi-bootstrap` control completes but differs from the normal-bootstrap
+token sequence after output 206; it is not admitted as matched numerical or
+performance evidence. Both normal-bootstrap event runs reproduce the baseline
+and reclaim the canonical ledger to zero. Preserve the failed profiling log
+separately; do not disable retained capture to make the profiler work.
+
+The remaining kernel-level attribution must distinguish inactive projection
+work, reduction/attention work and row-sized publication. The GEMM interface
+currently receives a host-fixed integer M, not the active device row count,
+so masking state publication alone cannot remove that projection work.
+`materializeMTPDeviceGenerationLoopGraph()` captures its verifier and
+publication tail at the admitted maximum depth plus one for both CUDA and
+host-ticket ROCm. The active-row controller masks unused rows while the sidecar
+sequence follows the selected depth. Profile whether a shallow dynamic
+transaction therefore executes materially more matrix/reducer/attention work
+than its fixed-depth equivalent before changing thresholds. Also distinguish
+the GPU integer-window controller from the CPU generated-policy controller;
+CPU policy-table tuning does not automatically change GPU decisions. Preserve
+one typed graph family, device-owned selection, stable maximum-capacity arena
+bindings and the existing memory footprint when removing this execution tax;
+do not change the ceiling or substitute fixed mode to meet the target.
+
+The current/target distinction is capacity versus execution geometry, not a
+new lifecycle controller. The target below is **not implemented yet**:
+
+```mermaid
+flowchart LR
+    subgraph Current
+        C[Retained depth capacity 15] --> W[Verifier width 16]
+        D[Device selects depth 1 or 2] --> S[One or two sidecar drafts]
+        S --> W
+        D --> M[Mask inactive rows]
+        M --> W
+        W --> P[Publish accepted state]
+    end
+    subgraph Target
+        A[Retained capacity 15] --> B[Stable maximum-capacity arena]
+        Q[Device selects logical depth] --> G[Select retained execution width]
+        B --> G
+        G --> T[Matching preparation, verifier and publication]
+        T --> N[Device commits outcome and next depth]
+    end
+```
+
+Next isolate the excess verifier work in captured kernel attribution, then use
+typed geometry and the existing captured-family ownership to remove it. CUDA
+selection stays in its native parent; HIP selection stays in the authenticated
+retained-transaction ticket contract. No host state shadow, row replay, runtime
+recapture or silent depth cap is acceptable. Preserve the ceiling-15 memory
+baseline: both backends prepare 17,380,802,560 weight bytes; reusable workspace
+is 3,387,957,252 bytes on CUDA and 3,903,954,948 on ROCm. Validate driver-visible
+graph memory as well as arena bytes; unchanged tensor BOM alone cannot prove
+that additional native graph executables cost no memory.
+
+The September 8 API audit makes the first prototype boundary explicit.
+`ITensorGemm::multiply_tensor` and the fused projection stages currently carry
+host-fixed M only; they do not bind `ActiveVerifierRowCount`. A device-owned
+logical work extent must be distinct from immutable physical row capacity and
+layout stride. For example, CUDA's grouped K-part producer indexes its arena as
+`(split * M + row) * N`: replacing that M with the active count would change
+partial addresses underneath its captured reducer. Keep this stride frozen and
+use the device count only for work/publication admission. The active count's
+pointer, generation and exact producer ordering belong to the graph binding;
+there must be no host download, global mode toggle or parallel count authority.
+
+Prefer a bounded prototype of active-row-aware physical tiles in the existing
+retained graph before adding more graph executables. It must skip inactive
+operand/weight arithmetic, not merely mask the final write, and must measure
+the remaining register/occupancy cost of the admitted tile. Cover activation
+preparation, plain/fused projections, ordered reducers and floating formats
+through their shared typed interfaces. A useful focused gate changes logical
+rows repeatedly (shallow -> maximum -> shallow, including odd tails) in one
+captured graph, poisons inactive scratch, and compares all live output bytes
+against serial rows without recapture or allocation. Measure the shallow case
+against the corresponding fixed-depth graph before promoting the interface;
+if tile resource pressure still loses the 90% target, evaluate a bounded native
+graph family only with explicit driver-memory evidence. This is a prototype
+plan, not an implemented or certified dynamic-depth optimization.
+
+### Latest completed checkpoint
+
+September 8 floating-prefill checkpoint: the public CUDA projection bridge
+now consumes the already byte-proven shared-operand kernel for economical
+large batches in FP32/FP16/BF16. The full affected gate passes **638 Unit,
+112 preflight, twelve Qwen3.8 CUDA/ROCm cells and 106 CSVs** in 576.680 seconds:
+`/tmp/qwen38-tiny-shared-proof.{json,log}`. A new functional test proves actual
+captured production selection and exact output, not just a test-only candidate.
+The clean bracket supports approximately 2.3% prefill improvement with unchanged
+decode and memory; the fresh external prefill comparison still leads. Dynamic
+execution width and the ordinary generation-loop binding remain open.
+
+September 8 parallel-attention checkpoint: deterministic capture no longer
+forces one split on either vendor, and the HIP device selector no longer has
+a separate deterministic-only serial branch. Both 288-case format/width/M
+sweeps prove parallel captured geometry and serial/grouped bytes; ROCm's two
+consolidated request-cache tests also pass twenty repeats. Their registration
+repairs the missing ROCm context/grouped/request attention preflight coverage.
+The expanded gate passes 638 Unit registrations, 112 preflight integrations,
+and all twelve Qwen3.8 CUDA/ROCm cells, with 106 CSV artifacts in 574.176 seconds:
+`/tmp/qwen38-parallel-deterministic-proof.{json,log}`. Two older real-Qwen2
+attention fixture failures remain outside preflight: their PP model contexts
+lack the required PhysicalMemoryAuthority before inference starts.
+
+Clean Release CUDA MTP-off decode rises **43.977 -> 46.576 tok/s** (+5.91%),
+with unchanged 17,091,788,800 prepared-weight and 2,435,227,652 workspace bytes.
+This exceeds pinned llama.cpp's 45.689 decode result; prefill remains below
+the external target at 1126.644 tok/s. ROCm MTP-off now measures 30.804 tok/s.
+Five repeats agree on tokens for each backend. The changed attention fold is
+not old/new byte-identical (CUDA first greedy difference at output 231), so
+fresh model CSV certification was required and now passes. Dynamic-width selection is
+still pending; refresh its fixed-depth comparison after this shared improvement.
+
+September 8 startup-policy correction passed the full affected gate: 638 Unit
+registrations, 109 preflight integrations, and twelve CUDA/ROCm Qwen3.8 model
+cells, with 106 validated CSV artifacts (491.887 seconds). This is not a rerun
+of the entire multi-model production matrix.
+Early logging/splash had frozen `DebugEnv` before `--deterministic` exported
+its value, so direct profiler launches and MPI-launched children could execute
+different kernel policies. CLI publication now refreshes the canonical cold
+snapshot. The reproducing Unit passes twenty repeats; all 181 parser tests
+pass. Corrected direct CUDA MTP-off and ROCm dynamic-15 requests now reproduce
+their normal-bootstrap token sequences exactly. This is not a throughput
+optimization or the dynamic-width fix.
+
+The authenticated CUDA trace changes the next ordinary-decode priority:
+attention takes 1.956 ms/token versus pinned llama.cpp's 0.245 ms. Both vendor
+attention launchers force one KV split under deterministic mode; the previous
+unmatched trace used a parallel envelope. Prove ordered split-parallel
+deterministic execution before tuning the adaptive controller. The full gate
+receipt is `/tmp/qwen38-deterministic-startup-proof.{json,log}`; current
+attribution is in the September 7 phase investigation's September 8 correction.
+
+September 7 23:40 UTC: the attention partial-publication cleanup removes the
+final-linked FP16 stack spill (2,808 measured local-spill requests to zero).
+Its model throughput is neutral within noise at **1123.878 / 43.977 tok/s**.
+The fresh gate passes **638 Unit, 109 preflight, twelve CUDA/ROCm Qwen3.8
+cells and 106 CSVs** in 489.473 seconds. The new empty-prefix regression is
+in preflight; the microbenchmark stays outside it. All MTP cells retain their
+native-parent/ticket certificates, while both off cells still lack complete
+generation-loop certification. See the phase investigation for the rejected
+head-width experiment, final-image resource evidence and exact receipts.
+
+Latest checkpoint, September 7 22:28 UTC: ordinary publication now commits the
+response and borrowed live position/next-condition rows through one shared
+CUDA/ROCm transition. Focused captured tests exercise twenty reset/replay rounds,
+including aliased sampler storage and forward-only continuation. The fresh gate
+passes **638 Unit, 108 preflight, twelve CUDA/ROCm Qwen3.8 cells and 106 CSVs**
+in 827.206 seconds including the Unit rebuild. This is controller groundwork,
+not a new throughput result: the public ordinary model loop remains host-driven.
+The next binding must reuse the already-reserved sampling/logical-state storage
+and the existing captured-parent machinery; do not add sidecar capacity or a
+second executable owner. The latest retained Release result is
+**1117.762 prefill / 43.930 decode tok/s**, still below pinned llama.cpp's
+**1152.615 / 45.689**. Current evidence, the publication Mermaid map, and the
+remaining ownership boundaries are in the
+[September 7 phase investigation](../2026-09/2026-09-07-cuda-mtp-off-phase-comparison.md).
+Earlier checkpoint numbers below are historical.
+
+The active goal is now **MTP-off** Qwen3.8-27B prefill and decode on one
+RTX 3090, against the same pinned llama.cpp model/prompt/precision baseline.
+Keep the existing MTP correctness proof while addressing ordinary inference
+latency; do not use more speculative depth to hide a kernel gap. The current
+partition-boundary optimization and its all-format resource/economy checks
+are recorded in the
+[MTP-off tuning receipt](../2026-09/2026-09-06-cuda-qwen38-mtp-off-tuning.md).
+The September 7 retained-source slice is green (Unit 634, preflight 96, six
+CUDA Qwen3.8 cells, 53 CSV artifacts) at **1075.182 / 42.475 tok/s**, versus
+llama.cpp **1175.520 / 45.664**. Unprofitable fusion/unpack experiments were
+removed; the active performance goal is open. Next generalize the existing
+device generation authority to ordinary decode without adding a host shadow,
+sidecar dependency or VRAM growth. Current MTP-off tests prove mathematical
+parity and captured forwards, but not the complete device-owned generation
+loop required by the architecture. The receipt maps that lifecycle gap and
+the exact reset, prefix, sampling and terminal-budget proof obligations.
+
+The first ordinary-generation slice implements explicit policy and shared
+response publication on CUDA/ROCm without changing persistent storage size.
+All **635 Unit tests, 96 preflight tests and six CUDA Qwen3.8 cells are green**
+with 53 validated CSV artifacts (397.622 seconds protected wall time). Focused
+captured CUDA/ROCm reset tests pass; both publication kernels have zero spills
+in isolated profiler evidence. The public model path is not redirected until sampling,
+device-input forward, terminal state and reset/prefix ownership are composed
+into the complete retained parent. This foundation is not a throughput win or
+a completed ordinary-generation certificate.
+
+The following composition slice adds a captured CUDA entry prologue ahead of
+the native loop predicate and consolidates terminal validation behind the
+complete immutable admission. Focused tests prove budget-one/EOS cannot run an
+extra forward, and every CUDA/ROCm publication replay now authenticates through
+the shared terminal contract. The refreshed canonical gate passes **635 Unit,
+96 preflight and all six CUDA Qwen3.8 cells**, with 53 CSV artifacts in
+**379.455 seconds**. The first attempt stopped on a stale source-policy
+call-count assertion, replaced by explicit prologue/body lowering and ordering
+checks; no model cell ran in that failed prerequisite pass. Production ordinary
+forward/sampler composition and executable-owner accounting are still pending,
+and the MTP-off CSV still reports no complete generation-loop certificate.
+
+Previous CUDA Qwen3.8 performance slice: retain the gated byte-exact small-projection
+prefill improvement, then attribute the remaining fixed-MTP3 decode latency
+and the different acceptance/transaction counts against llama.cpp. Do not change weights,
+activation precision, or depth to meet the target. The first sample is
+957.651 tok/s prefill and 63.701 tok/s decode; final-source confirmation gives
+948.547/63.507 tok/s, with no new workspace. Unit 633/633, preflight 94/94 and
+the 1,076-case captured floating oracle pass. The fresh external baseline is
+981.901/70.600 tok/s; this goal is not complete. Detailed evidence and
+next actions live in the
+[September tuning receipt](../2026-09/2026-09-06-cuda-qwen38-tiny-projection-tuning.md).
+The fresh canonical Qwen3.8 CUDA matrix passes all six MTP policies and 53 CSV
+artifacts after the complete Unit/preflight gate. MTP3 first/terminal draft-head
+cosines are 0.999910/0.999922. The exact 512-token benchmark prompt separately
+produces all 256 serial-equivalent output IDs with MTP3 across three repeats;
+serial decode is 42.587 tok/s, so MTP3 already supplies a 49.12% speedup. Keep
+the arithmetic unchanged and resume production-node attribution; differing
+upstream acceptance alone is not evidence of an MTP defect.
+The older lifecycle work below is historical context, not the current blocker.
+
+September 6, 13:40 UTC: the following CUDA2/CPU2 cell exposes an auxiliary
+branch attachment restriction during prefill setup. Its GPU children form one
+retained parent around CPU tickets, not host-segmented inference. One typed
+attachment now decorates that final parent or a directly captured body in
+place, replacing paired recording calls/events/thread flags. Model-free
+CUDA/ROCm ordering and CPU-ticket tests pass, as do all 22 transfer tests,
+87 engine tests and three new CPU-only DAG tests. The new lifecycle is in a
+twenty-round fresh-process stress gate. At 13:51 all twenty rounds pass (520
+test executions), Unit is 633/633 (68.15 s), preflight is 93/93 (220.83 s), and
+Release is rebuilt. CUDA2/CPU2 passes all eight long-context checks, clean
+shutdown and zero residual VRAM, but its 740281-record artifact processing hits
+the 600-second cell watchdog. All validators pass offline. One-pass collection
+and validation preserves byte-identical evidence while reducing isolated
+post-processing from 18.929 s to 10.819 s; 106 focused tests and Unit 633/633
+pass. The fresh online CPU-tier retry passes 43/43 checks, all eight long checks
+and 740078 evidence records in 597.234 s, with clean logs/shutdown and no GPU
+memory residue. Its 2.766-second watchdog margin still needs improvement before
+the full repeat campaign. Ornith 1.5 LocalTP 2xCUDA passes 43/43 checks in
+109.319 s, including all eight long checks and 34439 evidence records, with
+clean shutdown and zero residual VRAM. Qwen3.6 MoE NodeTP 2xCPU passes 43/43
+in 572.911 s, all eight long checks and 877663 evidence records, with clean
+shutdown and no GPU use. Ornith NodeTP 2xCPU also passes 43/43 in 572.858 s,
+all eight long checks and 838794 records, with clean shutdown and no GPU use.
+Four fresh cells pass. The remaining nine now run sequentially, starting with
+122B ROCm2/CPU2; that first cell passes 43/43 in 552.792 s with all eight long
+checks, 700812 evidence records, clean shutdown/logs and full VRAM release.
+ROCm4/CPU2 then passes 43/43 in 512.371 s with 558140 records, and Qwen3.6
+MoE CUDA1 passes 43/43 in 55.196 s with 7692 records. Both pass all eight long
+checks, clean shutdown/logs and exact VRAM return. Seven of thirteen are now
+fresh green. Qwen3.8 dense CUDA1 then passes 43/43 in 158.479 s, with all eight
+long checks, 5757 records, clean shutdown/logs and exact VRAM return. Eight of
+thirteen are fresh green; mixed 122B CUDA2/ROCm4 runs next. The complete
+aggregate and its repeat gate are still pending.
+
+Post-green sequence update: before the twenty full-suite repetitions, run a
+Release A/B against then-current upstream llama.cpp for Qwen3.6 MoE 35B and
+Qwen3.8 dense 27B on CUDA1 and ROCm1, fixed MTP depth three, with identical
+prompt/context/token/sampling inputs. Llaminar must beat both prefill and decode
+in all four comparable model/backend cells before stability stress resumes.
+
+Mixed 122B CUDA2/ROCm4 passes 43/43 in 389.070 s with all eight long checks,
+107654 records, clean shutdown/logs, exact VRAM return and no recurrence of the
+long transfer warnings. Nine of thirteen are fresh green; Ornith RCCL ROCm2
+runs next.
+
+Ornith RCCL ROCm2 passes 43/43 in 159.072 s with all eight long checks, 52878
+records, clean shutdown/logs and exact VRAM return. Ten of thirteen are fresh
+green; Qwen3.6 MoE ROCm1 runs next.
+Earlier mixed-topology green evidence below predates the graph refactor.
+
+September 6, 12:46 UTC: current E2E work is the hosted verifier's missing
+maintenance authority. The mixed 122B CUDA2/ROCm4 retry clears readiness and two
+needles, then depth 14 passes an empty factory to a graph captured with the
+transfer epoch. A device-free engine regression reproduces the exact cache
+rejection. Retained replay now obtains its policy from the same
+`IForwardExecutionHost` as materialization, without reconstructing ForwardInput
+or weakening cache identity. The 200-retained-replay regression and complete
+87-test engine binary pass. Release and all Unit/preflight targets rebuilt;
+Unit is 633/633 and preflight 93/93. The exact E2E retry passes 43/43 checks
+and all eight long-context checks in 394.907 s, with clean logs/shutdown and
+zero residual VRAM. Rank-zero evidence proves 19 committed movement
+transactions/170 edges/3.209 GB; remote endpoint p95 drops from 26.870 s to
+410.561 ms. Full topology refresh and stronger CPU-quantized transfer proof
+remain open; this is not a full-suite or inference-throughput certificate.
+The separate capture-thread fix is gated by Unit 633/633, preflight
+93/93, and 20 symmetric fresh-process repetitions. Current receipts and the
+simplified lifecycle map are in the September E2E handoff.
+
+Current September 6 slice: the stronger HTTP certificate now requires actual
+MTP-bearing prefix restores, accepted drafts, adaptive windows, and typed
+physical-movement obligations. Qwen3.6 single CUDA exposes a response-framing
+bug: the second thinking delimiter terminates generation before the answer
+when reasoning continues after forced budget closure. The HTTP/SSE mock
+reproduces before the fix. The parser fix and both event-ordering fixes are
+gated: Unit 633/633, preflight 92/92, and twenty symmetric GPU process
+repetitions. Short arithmetic now requires natural EOS. The remaining
+arithmetic-B loop occurs with MTP off and in the independent CPU/FP32 reference.
+Model schemas dropped Qwen's leading paragraph boundary from the forced-thinking
+continuation. Restoring only those bytes changes the reference from looping to
+`14` plus EOS. The shared schema policy fix passes Unit 633/633, preflight
+92/92, and twenty full canonical CUDA E2E repetitions, each 43/43 checks in
+54.49–55.60 s. The fresh aggregate passes both CUDA single-device cells, then
+the mixed 122B CUDA2/ROCm4 cell aborts during near-boundary prefill: transaction
+36 times out preparing physical transfers after all earlier behavioral checks
+pass. Fatal-only per-projection diagnostics are building; this new root cause
+is not established. No diagnostic synchronization or parser early-stop hides a
+runtime defect. The September handoff owns current receipts.
+
+Historical previous next step: gate the sealed-command retention fix, then retry the exact
+mixed122B E2E cell. A diagnostic run found empty transaction 16 erased by
+snapshot 17 before the remote worker acquired it. Retain the command through
+the existing next-snapshot fan-in; publish phase intent separately, without a
+new barrier or acknowledgement. CPU regression and twenty captured replays per
+CUDA/ROCm authority pass; full gates are rebuilding. This does not yet close the
+separate prefix/archive preparation stall or certify another E2E cell.
+
+2026-09-05 current E2E slice: resumed-parent NCCL capture is fixed and installed
+as a pinned, reproducible dependency. Its production-coordinator regression
+passes 20/20; Unit passes 632/632 and preflight 90/90, with no measured aggregate
+collective replay regression. Exact 122B CUDA2+CPU2 now clears graph preparation
+and shared-prefix checks, then rejects a stale expert epoch during forced-token
+SSE decode. A KV-only sidecar wrongly acquires an ambient expert reader before
+main graph-sequence admission. Separating maintenance event observation from
+typed expert ownership passes CUDA/HIP 20/20 each, Unit 632/632, and preflight
+90/90. Exact E2E now passes SSE and all four needle/JSON checks but times out
+at 600 seconds during structured generation; no stale epoch recurs through
+epoch 127. Next: attribute throughput and command-local DMA warning latency.
+Command-local diagnostic timing now passes Unit 633/633 and preflight 90/90.
+CPU sampling identifies OpenMP waits and ordered NativeVNNI expert projections;
+their critical-path contribution is not yet isolated. No kernel speedup is
+claimed. 122B ROCm4+CPU2 now passes all eight full behavioral checks, including
+2048 generated tokens and 7595/8192 context. Its certificate remains red:
+the harness's file-size RAM heuristic, empty shutdown POST framing, and
+rank-zero-only PerfStats export are wrong for the rank-1 GPU authority.
+Authority-based memory evidence, all-rank collection and strict clean shutdown
+are implemented; 71 focused harness regressions, Unit 633/633 and preflight
+90/90 pass. The unchanged ROCm4+CPU2 retry clears readiness but fails its first
+MTP answer: shifted-KV catch-up refreshes verifier terminal hidden using the
+unpopulated prefill request-length owner. The lifecycle audit identifies two
+intermediate refreshes before the existing accepted-state terminal publication;
+both are now removed in favor of typed scratch retirement. The initial append
+API no longer accepts prefill geometry; accepted publication owns the final row.
+New unit/source guards and symmetric captured two-stream CUDA/HIP regressions
+pass (20/20 per GPU backend), both builds pass, Unit is 633/633 (68.51 s), and
+preflight is 90/90 (190.47 s). Exact ROCm4/CPU2 passes all behavior and clean
+teardown in 514.54 s but its original receipt rejects retained-parent and mapped
+activation-collective evidence. Both validator omissions are corrected, with
+77 focused regressions and successful revalidation of all 550186 saved records.
+A fresh ROCm4/CPU2 receipt now passes in 523.24 s: all eight long checks,
+39/39 harness assertions, 555186 validated all-rank records, clean shutdown,
+and zero post-teardown VRAM delta. No original red receipt was relabeled.
+ROCm2/CPU2 also passes all 39 assertions/eight long checks in 597.62 s, with
+705832 validated records and clean teardown. Its 2.38 s watchdog margin remains
+an economy risk. Four other historical E2E cells need refresh; this is not
+a full certificate. See the
+dated September certification handoff for receipts and lifecycle maps.
+
+The CUDA admission follow-up now has a real-device memory certificate:
+128 retained 64-kernel graphs use 80 MiB cold / 0 MiB warm on CUDA and 256 MiB
+per lifetime on ROCm. Both focused certificates and both full affected graph
+suites pass. The typed bounded-helper inventory and capture-time native-shape
+guard are now implemented through canonical admission. Depth-15/request-one
+retains 82 bounded helpers and 25 general auxiliaries (107 unchanged owners),
+reducing CUDA admission by 1640 MiB per runner with no ROCm byte change. Both
+builds and four focused graph suites pass. Full Unit passes 633/633 and
+preflight 90/90. Exact dense CUDA E2E is green in 151.16 s, with all 39
+assertions/eight long checks, 2048 generated tokens, clean shutdown and no
+residual VRAM. Seven of nine cells have successful receipts; older cells still
+need shared-change refresh. CUDA2/ROCm4 122B reproduces the existing prefix
+archive/preparation stall in 282.98 s, with ROCm prepared at 28 and CUDA at 27.
+The first long needle passes; the CUDA host thread then blocks in KV gather
+submission. A separate CUDA debugger attachment fails internally and crashes
+the diagnostic target without device-kernel evidence. No production change is
+justified from that invalid diagnostic; reduce archive/controller ordering in
+a model-free fixture next.
+
 Port a vLLM-style MTP/speculative decoding architecture into Llaminar for
 Qwen3.6 dense and MoE models on CUDA, ROCm, and CPU. SingleDevice is the first
 acceptance target. Multi-device TP/PP/ExpertParallel follows only after the
@@ -12,6 +585,222 @@ This replaces the old search for verifier-row shortcuts. The target is a clean
 accepted-count state machine: draft state lives in speculative slots, target
 verification produces accepted counts and output tokens, and only accepted
 state slots are published to live model state.
+
+Related proposer work: the
+[`QWEN36_DFLASH_ACCELERATION_PROJECT_PLAN.md`](../2026-07/QWEN36_DFLASH_ACCELERATION_PROJECT_PLAN.md)
+uses this accepted-count verifier/publication transaction for a parallel
+block-diffusion drafter. DFlash is not a second verifier path; the shared MTP
+transaction is generalized behind proposer-neutral interfaces before DFlash is
+connected.
+
+2026-09-05 E2E identity audit: homogeneous CPU NodeTP executes an ordered host
+MTP program without a heterogeneous follower coordinator. Sparse sidecar
+operations must therefore receive a host-owner invocation ID, not constant
+zero, a token position that speculation may revisit, or a counter private to
+each retained graph variant. The new sequence is shared by full/chained/
+correction sidecars and is not rewound by request reset. GPU device epochs and
+heterogeneous coordinator IDs are unchanged. The real CPU sidecar runner
+regression and expanded real-MPI sidecar/verifier ring test each passed 20/20
+repeats; the rebuilt full Unit gate passed 632/632 and preflight passed 89/89.
+The CPU E2E retry cleared that defect and passed its first 5,232-token needle,
+then exposed invalid grouped-policy selection. A focused test reproduced a
+separate cache collision: eight-bit M identity aliases 258 prefill rows with
+two verifier rows. Full-width typed cache identity passes 20 repeats, CPU
+all-format grouped-verifier integration, refreshed Unit 632/632 and preflight
+89/89. The unchanged CPU2 Release E2E cell passes 40/40 in 572.2 s, including
+all long-context checks and 2,048 generated tokens. Other cells remain open.
+See the [current handoff](../2026-09/2026-09-05-model-parity-e2e-certification.md).
+
+2026-08-24 update: the mixed-vendor 122B depth-1 prefix-restored campaign
+localized a shifted-KV correction failure to an unnecessary terminal-hidden
+reselection. `PREFIX_TERMINAL_HIDDEN` is a stable arena mailbox read by the MTP
+sidecar, but the correction path tried to rebuild it afterward from transient
+host-visible forward geometry. `MTPTerminalHiddenPublication` now records the
+typed producer and monotonic generation; correction takes an immutable read
+lease, and cold graph construction rejects any dense, MoE, or ExpertOverlay
+sidecar stage that writes the mailbox. The focused
+`V2_Unit_{DeviceGraphOrchestrator,MTPGraphConstruction,GpuWorkspaceAllocationPolicy}`
+gate passes. Exact CUDA2/ROCm4 real-weight re-certification is pending; see the
+terminal-hidden lifecycle chart in
+`../2026-08/EXPERT_OVERLAY_TIER_MIGRATION_DESIGN.md`.
+
+2026-08-24 update 2: a depth-2 to depth-3 same-process campaign then exposed a
+separate model-context reuse defect while the second runner materialized
+`SharedExpertInputGate`. The lifecycle audit found that a helper described its
+FP32 result as model-owned while only the first runner's `FrozenModelWeightSet`
+actually retained it. Once device preparation released the raw BF16 source and
+that runner retired, the next cell tried to convert a null raw pointer. The
+repair removes that false ownership edge: `WeightManager` is now the sole
+authority for immutable model-prepared FP32 overrides, keyed by canonical
+weight, semantic role, and exact target device. Runner bindings only acquire a
+shared lease. No reuse flags, restoration callbacks, or runner-to-runner handoff
+remain.
+
+The rejected lifecycle had two independently expiring owners:
+
+```mermaid
+flowchart LR
+    MC[ModelContext / WeightManager] --> RAW[Raw BF16 or codebook source]
+    RAW --> CONVERT[Runner A converts to FP32]
+    CONVERT --> FA[Frozen bindings A own override]
+    FA --> PREP[Prepare runner A]
+    PREP --> RELEASE[Release raw source bytes]
+    FA --> RETIRE[Retire runner A]
+    RETIRE --> LOST[Override destroyed]
+    RELEASE --> B[Runner B materializes]
+    LOST --> B
+    B --> NULL[Convert released source]
+    NULL --> CRASH[Invalid lifecycle state]
+```
+
+The accepted lifecycle has one model-scoped authority and only cheap runner
+leases:
+
+```mermaid
+stateDiagram-v2
+    [*] --> SourceAvailable: ModelContext created
+    SourceAvailable --> OverridePublished: first typed materialization
+    OverridePublished --> RunnerAReady: runner A acquires lease
+    RunnerAReady --> SourceReleased: preparation proves raw bytes releasable
+    SourceReleased --> RunnerARetired: mutable graph/arena/streams retire
+    RunnerARetired --> RunnerBReady: runner B acquires same cached override
+    RunnerBReady --> ContextRetired: ModelContext reuse contract retires
+    ContextRetired --> [*]: source and override cache retire together
+```
+
+The cache-miss publication and raw-source release share `cache_mutex_`, making
+the transition atomic. A cache miss after source release is a fatal diagnostic;
+it never dereferences null storage or invents a fallback. The focused
+`V2_Unit_WeightPlan` regression destroys runner-A bindings, releases the source,
+and rematerializes byte-identically through the same model-owned object for
+FP16, BF16, and every quantized format in the canonical codebook registry.
+The same-process 122B depth-transition repair is now integration-proven. The
+CUDA2/ROCm4 Static/Ordinal campaign passes MTP off, depths 1/2/3/15, and dynamic
+depth in 184.558 seconds through one retained model context, with mandatory
+prefix restore and strict checkpoint/CSV evidence. The broader Dynamic and
+random-order ExpertOverlay cells remain the aggregate gate.
+
+2026-08-24 update 3: process-campaign reuse now separates retained MTP model
+capacity from active request execution. Every MTP-capable matrix cell retains
+the same routed predictor weights, 16-row verifier envelope, mapped follower
+families, transaction slots, and memory/placement BOM. The off cell selects
+only the main graph; enabled cells select buckets inside that retained envelope.
+Initial ExpertOverlay residency no longer depends on which active graph was
+visited first: one rank-synchronized finalization resolves every participant
+and retained layer from the model-owned prepared-engine registry before
+maintenance composition. See the complete Mermaid lifecycle and rationale in
+`../2026-08/EXPERT_OVERLAY_TIER_MIGRATION_DESIGN.md` under “Retained MTP
+capacity and initial-bank finalization lifecycle re-audit.”
+
+2026-07-06 update: CUDA2 ExpertOverlay Dynamic + prefix-cache + MTP long-context
+parity now passes after prefix restore without a model-runtime snapshot destroys
+depth-0 MTP sidecar graph caches instead of preserving graph objects whose MoE
+runtime tables were intentionally reset. The focused regression is
+`PrefixRestoreWithoutModelRuntimeInvalidatesMTPSidecarGraphs`; E2E evidence is
+`PrefixCacheMTPRestore_CUDA2TPDynamicPhaseSplit` passing in `288.7s` with
+`mtp.sidecar_graph_invalidations`, fresh sidecar cache misses, grouped
+publication, and initialized MoE runtime decode predicates on both CUDA
+participants. Remaining debt: the lane is too slow and still emits compact
+rebalance missing-source diagnostics under the movement-friendly Dynamic policy.
+
+2026-07-08 update: LocalTP grouped GPU MTP shifted-KV publication no longer
+materializes compact verifier outcomes on the host before publication. CUDA and
+ROCm expose `enqueuePrepareSpeculativeShiftedKVTokens()`, a fixed-shape
+device-resident token-prep kernel that reads compact accepted-count metadata
+and output tokens on the sidecar stream. `DeviceGraphOrchestrator` now commits
+the initial shifted row from the verifier-base terminal-hidden checkpoint plus
+resident compact output token zero, then commits the shifted suffix through
+`commitMTPShiftedRowsFromDeviceOutcome()`. The rank runner fans both operations
+to every mirrored LocalTP child outcome. Greedy and stochastic grouped
+publication now order as device initial-row prep, device suffix prep, device
+accepted-state publication, then response-only host materialization. Focused
+gates passed:
+`V2_Unit_{PrefixMTPConfig,RankOrchestrator,PrefillDecodeTransition,MTPGraphConstruction}`
+and the MTP unit gate covering `V2_Unit_MTP*`.
+
+2026-07-08 update 2: GPU all-position MTP verification now also refuses the
+old host `MTPSpecStepPlanBatch` publisher. CUDA/ROCm all-position greedy and
+stochastic paths require resident compact outcome reduction plus
+`publishAcceptedMTPSpecStateBatchFromDeviceOutcome()`; CPU retains the host plan
+publisher only for host-owned execution. The regression
+`GreedyGPUAllPositionWithoutResidentPublicationFailsBeforeHostPublish` proves a
+GPU runner cannot reach row-indexed verifier setup, all-position sampling, or
+state publication without resident publication support. Focused MTP unit gate
+passed.
+
+2026-07-08 update 3: The focused Qwen3.6 verifier-forward operation matrix now
+requires byte-identical grouped verifier logits against serial decode for
+CPU/CUDA/ROCm dense and MoE M1-M4. Tightening the real-model grouped verifier
+gate exposed that full-forward/partial-forward/unified-PP graphs were still
+building ordinary M>1 LM-head all-position projections, even though the
+standalone decode-equivalent LM-head kernels were already proven. `QwenGraphBase`
+now routes every compact MTP verifier LM-head construction through the shared
+decode-equivalent grouped prefill decision, and the focused suite asserts the
+`mtp.lm_head_grouped_decode_equivalent_verifier_prefill_rows` counter for
+multi-row verifier buckets. Evidence: direct CUDA and ROCm M1/M2 repro cells
+passed, then the full operation matrix passed `24/24` in `1053.3s`.
+
+2026-07-08 update 4: The cross-backend grouped verifier sweep now treats every
+grouped production path as a hard requirement rather than a capability fallback.
+CUDA and ROCm broad GEMM harnesses were repaired to exercise the production
+decode-equivalent wrappers/scopes for MTP verifier rows, including graph-captured
+ROCm fused gate/up and GDN projection groups. CUDA cached prepared kernels now
+declare M=1..4 GEMV KPAR scratch even when first planned for large prefill, so
+prefill/decode phase reuse cannot lose the canonical decode arena. The broad
+gate passed `19/19`:
+`GroupedVerifierRows_{CPU,CUDA,ROCm}_{AllFormats,...}`, CUDA GEMM parity, CPU
+NativeVNNI GEMV, and ROCm quantized small-M.
+
+2026-07-09 update: CPU NativeVNNI fused grouped verifier rows now share the
+caller-thread K-parallel partial-sum arena across the OpenMP team instead of
+addressing each worker's empty `thread_local` arena. The regression
+`MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows` forces
+`LLAMINAR_CPU_VNNI_K_TILES=4`, sweeps every CPU NativeVNNI format, and requires
+byte equality against serial decode plus the fused grouped verifier counter. It
+is part of `V2_Integration_GroupedVerifierRows_CPU_AllFormats`. The canonical
+precommit/CI grouped verifier gate now runs `^V2_Integration_GroupedVerifierRows_`
+ after unit tests; local, tracked, and installed hooks are aligned, and the exact
+gate passed `16/16` across CPU/CUDA/ROCm.
+
+2026-07-10 update: The intermittent ROCm Qwen3.6 MoE M=2 verifier failure was a
+real router-to-expert Q8 publication bug. The router hidden quantizer used
+`value / scale`, while ordinary NativeVNNI M=1 expert decode computes one
+reciprocal per block and multiplies by it. Those FP32 expressions differ at
+half-way rounding boundaries, so router-owned Q8 rows could differ by one int8
+byte from serial decode. ROCm router-hidden M=1 and grouped M=2..4 publication
+now use the serial reciprocal-multiply order; router gate-weight caching retains
+its established arithmetic. The graph also declares the hidden dependency from
+shared-expert FFN to MoE routing, preventing stale router publication under a
+different topological order. The backend-neutral layer-31 activation fixture
+drives the production router -> routed experts -> shared expert chain through
+eager and graph-captured execution for every format. CUDA required no arithmetic
+change because its MoE quantizers already share one expression, but its sweep
+now proves the same full transaction and reuse counters. Evidence: 20 fresh
+ROCm M=2 model processes passed; CPU/CUDA/ROCm MoE operation equivalence passed
+M=1..4; and the complete discovered
+`^V2_Integration_GroupedVerifierRows_` matrix passed `43/43` in `306.44s`
+(13 CPU, 13 CUDA, 17 ROCm).
+
+2026-07-11 update: Grouped verifier depth is now a runtime capacity contract,
+not an M=2..4 architecture. Graph/schema tests reserve 31 target-query rows,
+and the canonical kernel inventory proves every grouped M=2..16 plus M=31;
+M=1 remains the independent production serial-decode oracle and M=31 is a
+deeper sentinel, not a maximum. CPU NativeVNNI composes arbitrary M from
+bounded two-row AVX2 or up-to-four-row AVX512 physical tiles. Both the direct
+grouped projection and fused multi-projection long-K scheduler share decoded
+weights across each tile and reduce K partials through one runtime-ISA-selected,
+in-order FP32 reducer. The fused route publishes its physical tile and K-part
+policy through PerfStats, so byte equality cannot hide independent one-row work.
+
+The promotion-grade CPU trainer now executes that fused production bundle twice
+in every format/M cell. AVX2-build/AVX2-runtime, AVX512-build/forced-AVX2, and
+AVX512-build/AVX512 all passed the complete format and M=2..16/M31 long-K sweep
+with zero serial or repeat byte mismatches. The focused CPU integration gate
+passed in `89.74s`; the rebuilt unit gate passed `536/536`; and the complete
+discovered grouped-verifier gate passed `50/50` CTest entries in `565.28s`
+(`49` substantive lanes: 13 CPU, 16 CUDA, 20 ROCm). A fresh Release configure
+also exposed and fixed an unconditional property assignment to an omitted ROCm
+integration test, so performance-only build trees configure cleanly again.
 
 ## Why vLLM Is Fast
 
@@ -1232,9 +2021,9 @@ Exit gate:
 - CPU/CUDA/ROCm sampler parity passes on synthetic and Qwen3.6 real-logit-style
   fixtures for greedy, top-k/top-p, temperature, residual sampling, and seeded
   RNG.
-- Dense stochastic MTP no longer emits the retired
-  `decode_equivalent_stochastic_verifier_runs` counter in accepted lanes; parity
-  and prefix-cache MTP probes assert the all-position publication path instead.
+- Dense stochastic MTP now uses grouped decode-equivalent stochastic verifier
+  counters in accepted lanes; parity and prefix-cache MTP probes assert grouped
+  publication or the stronger all-position publication path explicitly.
 - Bounded stochastic dense benchmarks are speed-positive on each backend at
   least one fixed/dynamic lane, with ROCm d2/d3 documented as
   acceptance-limited rather than contract failures.
@@ -1945,6 +2734,28 @@ Status:
   participants as hard failures. Focused gates:
   `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, and the
   bounded Phase 8 unit cluster.
+- LocalTP greedy grouped publication no longer falls back to row replay while
+  waiting for a single cross-device device mailbox. `RankOrchestrator` now
+  stages verifier device-token rows on every child, runs the verifier forward
+  through a rank-owned child-pointer bundle, reduces sharded all-position
+  logits into the shared compact `SamplingMath` outcome, builds the canonical
+  device-outcome transaction plan, and fans accepted-state publication out
+  through each child's grouped decode-equivalent publisher. The path deliberately
+  does not call child direct device-resident publishers or serial replay. The
+  grouped child publisher now records the resident logical-state mailbox from
+  the accepted step plan, and Rank aggregates those child mailboxes into a
+  domain handle that fans out next-step resident sidecar prelaunch. Focused gate:
+  `V2_Unit_RankOrchestrator|V2_Unit_PrefillDecodeTransition|V2_Unit_MTPVerifierPolicy`.
+- 2026-07-08 GPU LocalTP resident MTP publication now requires mirrored
+  full-vocab child verifier heads. Greedy and stochastic mirrored children build
+  their own compact resident outcomes and publish those handles directly; the
+  rank no longer uploads or stages compact outcome metadata into child runners.
+  `IInferenceRunner::stageMTPSpecOutcomeForDeviceResidentPublication()` and its
+  DeviceGraphOrchestrator implementation were removed. Non-mirrored GPU LocalTP
+  hard-fails before publication rather than taking rank-owned compact metadata
+  as a fallback. Focused gates passed:
+  `V2_Unit_RankOrchestrator`, `V2_Unit_PrefillDecodeTransition`, the MTP unit
+  cluster, and full `V2_Unit_` `517/517`.
 - Request-batch admission now has a first-class scheduler contract.
   `MTPSpecRequestBatchScheduler` groups pending requests in stable order,
   admits only matching mode/topology/vocab shapes, preserves variable verifier
@@ -2775,6 +3586,12 @@ must stay decode-equivalent, but the hot path should no longer pay row-serial
 replay, full all-position LM-head, or host transfer/sync costs where a compact
 backend-resident path can produce the same state and logits.
 
+NativeVNNI small-M retuning and promotion in this phase is governed by the
+[Cross-Backend Batch-Invariant NativeVNNI Learned Dispatch Policy](../2026-07/NATIVE_VNNI_BATCH_INVARIANT_LEARNED_DISPATCH_POLICY.md):
+verifier candidates require serial-M1 byte equality, and the exact frozen
+generic policy requires maximum sealed worst-surface performance regret of at
+most 3% with no post-certification refit.
+
 Scope:
 
 - CPU, CUDA, and ROCm dense verifier rows M=1/2/3/4.
@@ -2794,9 +3611,10 @@ Why this phase exists:
 - Phase 9.7 intentionally proved correctness first. It allowed row-serial
   decode-equivalent replay and host bridges while the row contract was still
   being validated.
-- Current MoE publication code still has a decode-equivalent row replay route
-  for multi-row verifier prefill. That is the right fail-closed correctness
-  posture, but it is not an economical production implementation.
+- Current MoE verifier publication no longer accepts row replay as a production
+  route for multi-row verifier prefill. Routed and shared expert verifier rows
+  must execute through decode-equivalent grouped implementations, with row-copy
+  helpers reserved for diagnostics/oracles only.
 - GPU verifier/sampling work has already moved toward resident outcomes, but
   the remaining D2H/H2D and stream-sync boundaries still show up in perfstats
   and ROCm stage timing. The hot path needs to decide, publish, and continue
@@ -2874,11 +3692,12 @@ Implementation plan:
      projections, LM-head, MoE routing, routed experts, shared experts,
      sampling, and accepted-state publication. A helper that loops over M
      ordinary one-token stage executions is a correctness oracle only; it must
-     stay labelled `serial_decode_equivalent_fallback` and cannot satisfy
-     Phase 9.8 performance acceptance.
+     remain outside production capability reporting and cannot satisfy Phase
+     9.8 performance acceptance.
    - MoE: replace promoted uses of `executeDecodeEquivalentVerifierPrefill`
      row replay with grouped decode-equivalent routed+shared prefill for
-     M=2/3/4. Serial replay remains available only as a guarded fallback.
+     M=2/3/4. Serial replay remains available only as an offline diagnostic
+     oracle and must not be called by production verifier execution.
    - CUDA: tune grouped verifier prefill with explicit stream capture, reusable
      descriptor tables/workspace, row-indexed LM-head, and tile/dispatch choices
      trained or measured for the actual Qwen3.5/3.6 verifier buckets.
@@ -2889,11 +3708,11 @@ Implementation plan:
      strict distribution proof and enough instrumentation to identify row
      grouping, LM-head, sampler, and publication cost separately.
    - Trained M=2/3/4 kernels are part of this phase, not a follow-up.  The
-     row-wise M=1 verifier path is the correctness fallback contract; Phase 9.8
-     is not performance-complete until CPU, CUDA, and ROCm have generated or
-     trained dispatch tables for verifier-shaped GEMV/GEMM buckets and the
-     promoted kernels are wired into dense, GDN, LM-head, routed MoE, and shared
-     expert verifier paths where applicable.
+     row-wise M=1 verifier path is a diagnostic correctness oracle only;
+     Phase 9.8 is not performance-complete until CPU, CUDA, and ROCm have
+     generated or trained dispatch tables for verifier-shaped GEMV/GEMM buckets
+     and the promoted kernels are wired into dense, GDN, LM-head, routed MoE,
+     and shared expert verifier paths where applicable.
    - The generated-kernel pipeline must be turnkey: perf sweeps emit CSV for
      verifier aspect/work buckets and codebooks, the trainer emits checked-in
      C++ `.inc` dispatch tables, and backend code consumes those tables without
@@ -2909,7 +3728,7 @@ Implementation plan:
      explicit non-null streams, consume declared workspace, and avoid raw
      cuda/hip allocations.  CPU kernels must follow the existing scalar/AVX2/
      AVX512 runtime-dispatch pattern where vectorized paths are introduced.
-   - Promotion requires a focused perf win over the serial fallback for the same
+   - Promotion requires a focused perf win over the serial oracle for the same
      row count/backend/model/sampling lane and no full-model regression versus
      the current guarded path.
 
@@ -2931,10 +3750,11 @@ Implementation plan:
 
 6. Cleanup and reconciliation
    - Reconcile the Phase 10 documentation/status rows with the code capability
-     flags so "grouped verifier green" cannot mean "serial fallback is correct".
-   - Rename comments and metrics where needed to separate
-     `serial_decode_equivalent_fallback` from
-     `grouped_decode_equivalent_verifier`.
+     flags so "grouped verifier green" cannot mean "serial oracle is a
+     production lane".
+   - Rename comments and metrics where needed so production surfaces advertise
+     only `grouped_decode_equivalent_verifier`; serial row replay remains an
+     offline diagnostic/oracle implementation detail.
    - Delete or demote retired experimental all-position verifier paths only
      after the grouped path has passed correctness and perf gates on CPU, CUDA,
      and ROCm.
@@ -2961,14 +3781,14 @@ Implementation plan:
    - Dedicated LocalTP and GlobalTP integration tests must prove strict
      cosine, relative L2, symmetric KL/KLD, sampled-token, accepted-count, and
      published-continuation equivalence before any sharded verifier lane is
-     promoted out of the serial fallback.
+     promoted out of the unaccepted verifier lane.
 
 Focused correctness gate:
 
 ```bash
 cmake --build build_v2_integration --parallel
 ctest --test-dir build_v2_integration \
-  -R '^(V2_Integration_Parity_Qwen36.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*MainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported|V2_Integration_GPUSamplingKernels|V2_Integration_CUDAMoEKernel|V2_Integration_ROCmMoEKernel)$' \
+  -R '^(V2_Integration_Parity_Qwen36.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*VerifierRows(DecodeEquivalent|GroupedDecodeEquivalent)M[1-4]|V2_Integration_Parity_Qwen36MoE_.*MainVerifierUsesGroupedDecodeEquivalentPublication|V2_Integration_GPUSamplingKernels|V2_Integration_CUDAMoEKernel|V2_Integration_ROCmMoEKernel)$' \
   --output-on-failure --parallel
 ```
 
@@ -3020,7 +3840,7 @@ Exit criteria:
   excluding explicit final response materialization.
 - LocalTP and GlobalTP/NodeLocalTP have explicit sharded compact verifier
   reducers for greedy and stochastic, or their Phase 9.8 dashboard rows remain
-  unaccepted and fail-closed behind the labelled serial fallback.
+  unaccepted and fail-closed without a production row-replay fallback.
 - CPU uses the same compact verifier metadata contract as GPU and avoids full
   all-position LM-head work for promoted verifier rows.
 - Dense grouped/batched verifier M=2/3/4 passes strict cosine, relative L2, and
@@ -3031,10 +3851,10 @@ Exit criteria:
   supported Q/K/IQ codebooks, pass serial M=1 numerical equivalence in focused
   integration tests, and are wired into production only after dense/MoE grouped
   verifier parity passes strict cosine, relative L2, and symmetric KL/KLD.
-- Grouped paths are faster than serial fallback in focused verifier harnesses
+- Grouped paths are faster than the serial oracle in focused verifier harnesses
   and do not regress same-run full-model MTP benchmark rows. Lanes that fail
-  either condition remain on fail-closed serial fallback and are not eligible
-  for Phase 10 default enablement.
+  either condition remain unaccepted and are not eligible for Phase 10 default
+  enablement.
 - Dashboard rows include same-run baseline, verifier time, condition-token time,
   publication time, sampler/outcome time, graph replay time, grouped-path status,
   and host-bridge status for every backend/model/sampling lane.
@@ -3043,17 +3863,11 @@ Current status:
 
 - [x] Phase added to close the gap between Phase 9.7 correctness proofs and
   Phase 10 speed/default-readiness evidence.
-- [x] Verifier-economy capability contract added in
-  `MTPDecodeCatchup`/`IInferenceRunner`, with `DeviceGraphOrchestrator` and
-  `RankOrchestrator` reporting correct serial fallback separately from
-  grouped/promoted verifier support. Focused unit coverage proves
-  `RankOrchestrator` clamps to the weakest participant and current
-  SingleDevice lanes are not accidentally marked economical.
-- [x] Verifier-economy capability printed in perfstats/matrix rows. MTP decode
-  emits tagged dense/MoE `verifier_economy_capability` counters, and
-  `summarize_mtp_perfstats.py`/`run_mtp_iteration_benchmark_matrix.sh` expose
-  compact `verifier_economy_dense` and `verifier_economy_moe` columns for
-  dashboard refreshes.
+- [x] Verifier-economy capability advertising retired. Grouped verifier paths
+  are now a hard production contract: they must be serial-row-equivalent and
+  economical rather than reporting an optional capability. Runtime perfstats
+  keep measured timings and counters only; dedicated `Perf__` suites own the
+  economy proof.
 - [x] GPU request-batched stochastic depth-1 sidecar tokens can now publish
   directly into device draft slots. `OrchestrationRunner` skips the legacy
   draft-token H2D staging for this lane, while the compatibility host shadow is
@@ -3476,8 +4290,8 @@ Current status:
   state. `OrchestrationRunner` direct-publication callsites also reject the
   contract before backend publication. Focused gate passed:
   `V2_Unit_(MTPSpecStateContract|MTPVerifierForwardExecutor)` plus the CUDA/ROCm
-  Qwen3.6 MoE replay guards
-  `Qwen36MoE(CUDA|ROCm)SingleDevicePrefixMTPParity.MainVerifierUsesDecodeEquivalentReplayWhenPublicationUnsupported`.
+  Qwen3.6 MoE grouped-publication guards
+  `Qwen36MoE(CUDA|ROCm)SingleDevicePrefixMTPParity.MainVerifierUsesGroupedDecodeEquivalentPublication`.
 - [x] CUDA/ROCm MoE d1 Prefix+MTP parity is green on the shared
   decode-equivalent publication contract. A CUDA regression had allowed
   host-visible positions to advance past shifted sidecar KV because direct
@@ -3639,16 +4453,22 @@ Current status:
   open until benchmark evidence proves the promoted lane is economical for
   repetition/DRY requests.
 - [ ] Full MTP benchmark matrix refreshed with perfstats and GPU stage timing.
-- [x] Phase 10 status reconciled so correctness-only serial fallback cannot be
-  mistaken for performant grouped verifier acceptance. `MTPVerifierEconomyLane`
-  keeps serial fallback, grouped outcome, and direct publication as separate
-  contracts; DGO and RankOrchestrator tests assert grouped MoE outcome evidence
-  is not economical while publication is pending. CPU MoE replay units now
-  cover M=2/3/4 with cosine, relative L2, symmetric KL, and max-absolute checks
-  so this correctness lane is strict but still labelled non-economical.
+- [x] Phase 10 status reconciled so correctness-only serial oracles cannot be
+  mistaken for performant grouped verifier acceptance. Grouped verifier
+  publication is invoked directly and fails on concrete structural/plan errors;
+  row replay remains diagnostic-only. CPU MoE grouped units now cover M=2/3/4
+  with cosine, relative L2, symmetric KL, and max-absolute checks, while the
+  grouped decode-equivalence sweeps enforce bitwise gates.
 - [ ] LocalTP sharded compact verifier reducers implemented and proven for
   greedy/stochastic dense lanes with strict distribution and continuation
-  equivalence.
+  equivalence.  2026-07-07: RankOrchestrator now has a focused host-visible
+  greedy cross-shard compact verifier reducer for LocalTP all-position rows.
+  It reduces child-local argmax rows through the existing explicit-stream
+  `LogitsLocalInfo` path, summarizes accepted prefix/ready-token metadata with
+  shared `SamplingMath`, publishes accepted rows through grouped child
+  publishers, records child resident mailboxes, and has unit coverage for
+  accept, reject, and aggregate-mailbox prelaunch cases. Stochastic
+  probability/top-p reduction is still unimplemented.
 - [ ] GlobalTP/NodeLocalTP sharded compact verifier reducers implemented and
   proven for greedy/stochastic dense lanes with strict distribution and
   continuation equivalence.
@@ -3866,6 +4686,22 @@ Current status:
   Focused gate:
   `V2_Unit_PrefillDecodeTransition` and
   `V2_Unit_GpuWorkspaceAllocationPolicy`.
+- Request-batched greedy GPU MTP now follows the same direct resident
+  publication contract: the verifier input is a device-token matrix, grouped
+  all-position rows are reduced into `DeviceSpeculativeOutcomeHandle`, and
+  `publishAcceptedMTPSpecStateBatchFromDeviceOutcome()` runs before any host
+  response bridge. A follow-up tightened the continuation token source: after
+  a resident publication, row zero of the next grouped verifier is copied from
+  `DeviceResidentLogicalSequenceStateHandle::next_condition_tokens_device`
+  on the verifier stream instead of re-uploading the per-request host shadow.
+  The initial post-prefill step remains explicit because no prior resident
+  mailbox exists. Focused regression:
+  `RequestBatchedGreedyVerifierUsesResidentConditionTokensAfterPublication`.
+- Request-batched stochastic GPU MTP now uses the same resident verifier-token
+  matrix boundary. The verifier forward hard-disables batched host tokens, and
+  the stochastic summary reads row zero from the prepared device matrix so
+  mirrored LocalTP children consume child-local resident rows. Focused
+  regression: `RequestBatchedStochasticContinuationPublishesDeviceOutcomes`.
 - A follow-up code dive confirmed why DGO cannot safely advertise the new
   capability yet: `MTPSpecStatePublisher`, `GDNRecurrenceStage`, and
   `ShortConv1dStage` still restore verifier state from a host integer row, and
@@ -4127,8 +4963,10 @@ Current status:
   `commitMTPShiftedRowFromDeviceResidentLogicalState()`, which validates the
   mailbox owner/epoch, waits on its readiness event on an explicit stream, reads
   `NEXT_CONDITION_TOKENS` on device, and appends the shifted MTP row without
-  using the host-materialized compact token. Multi-participant TP remains a hard
-  fail until a domain-wide logical mailbox exists. Focused gate passed:
+  using the host-materialized compact token. Multi-participant LocalTP greedy
+  now owns a rank aggregate mailbox whose child handles are dispatched back to
+  every participant; stochastic TP mailbox use remains tied to the pending
+  sharded stochastic reducer. Focused gate passed:
   `V2_Unit_PrefillDecodeTransition`,
   `V2_Unit_GpuWorkspaceAllocationPolicy`, exact Qwen3.6 CUDA/ROCm SingleDevice
   stochastic Prefix+MTP parity, and the bounded CUDA/ROCm MoE stochastic sweep
@@ -4789,6 +5627,82 @@ Current status:
 - No default-enable proposal is allowed until the active dashboard matrix has
   same-run parity and benchmark evidence for the exact backend/model/sampling
   lanes under consideration.
+
+- GPU request-batched stochastic continuation no longer reconstructs mutable
+  RNG positions on the host. Each request resolves one immutable non-zero seed
+  at admission (including one-time entropy resolution for API seed zero), while
+  CUDA/ROCm compact and processed verifiers read the current target position
+  directly from `DeviceResidentLogicalSequenceStateHandle`. Accept, residual,
+  inverse-recovery, and lazy bonus draws all use that same ordered mailbox
+  scalar. The resident descriptor carries `inverse_sample_first_logical_position
+  = -1`, leaves host threshold arrays untouched, and records
+  `stochastic_request_batch_resident_position_threshold_rows` so served runs
+  prove the route. Focused real-GPU tests graph-capture scalar-position and
+  resident-position launches and require byte equality for tokens, acceptance,
+  probabilities, thresholds, and both compact/processed bonus samples on CUDA
+  and ROCm. Validation: transition `125/125`, GPU ownership policy `96/96`,
+  explicit CUDA and ROCm sampling suites, full Integration build `935/935`, and
+  the then-current canonical grouped verifier `43/43` substantive lanes.
+- GPU recurrent graph lifetime is now byte-proven rather than guarded by a
+  reset-all policy. CUDA and ROCm GDN/short-conv regressions capture the ordinary
+  M=1 decode graph once, run grouped M=2/3/4 verifier state, publish every
+  accepted row by device index, detach verifier bindings, and replay without
+  recapture. Continuation output and complete live recurrent state match serial
+  M=1 decode byte-for-byte. `DeviceGraphOrchestrator` now applies the typed
+  correction-boundary policy: stable single-token decode and all-position
+  verifier captures remain warm, while live-state-versioned multi-row ordinary
+  decode resets. Validation passed the focused policy/orchestration suite
+  `9/9` and canonical grouped verifier gate `47/47` substantive cells (`48/48`
+  including the fixture).
+- LocalTP request-batched prefill now remains resident through its first sampled
+  decode token. Compact row-indexed prefill selects the mirrored full-vocabulary
+  head on every child, `RankOrchestrator` samples all child-resident logits in
+  parallel, and each child publishes its own logical-state mailbox. The host
+  compares only tiny response token shadows; it neither gathers logits nor owns
+  the sampled continuation. CUDA2 and ROCm2 greedy/stochastic unequal-length
+  regressions passed in `45.77 s` and `63.18 s` respectively and require the
+  mirrored-head, resident sampling, grouped GDN/short-conv commit, and rank
+  fan-out counters. CPU request batches now publish captured recurrent terminal
+  rows from host-owned lengths, while GPU publication ignores stale host shadows
+  and consumes resident lengths only. ForwardExecutionEngine obtains worker
+  streams/graphs through its host, so GPU-shaped unit tests use a hardware-free
+  worker instead of initializing a physical backend. Validation: focused `9/9`,
+  full unit `518/518`, CUDA2/ROCm2 production cells `2/2`. Current architecture
+  estimate after that slice was LocalTP 95%, ExpertParallel 80%. Remaining ownership work is the
+  complete captured collective/remote-participant lifecycle and equivalent
+  mirrored-head request-batch proof across ExpertParallel modes.
+- ROCm request-cache decode now has the same fully device-owned grouped
+  contract as CUDA. One captured metadata kernel derives every request/query
+  row from contiguous cache-owned counts; one phase grid and one reduction grid
+  cover the complete request batch. The existing MI50 FP32/FP16/Q8_1 decode
+  body is parameterized by shared-verifier versus independent-request cache
+  ownership, and inactive split/wavefront planes reproduce each row's ordinary
+  scalar split and TPB policy byte-for-byte. BF16 uses one flat device
+  conversion before the grouped FP32 body. The old ROCm verifier compute-row
+  loop is removed. A captured unequal-history regression uses lengths 512/93
+  to exercise 4-split/256-thread and 2-split/128-thread rows in one graph and
+  sweeps FP32, FP16, BF16, and Q8_1. Validation: all ROCm attention `54/54`,
+  canonical ROCm grouped verifier `19/19`, exact ROCm2 resident request-batch
+  model green twice (`66.4 s`, `66.2 s`), full build, and unit `528/528`.
+  Current architecture estimate: LocalTP 97%, ExpertParallel 80%; LocalTP's
+  remaining work is legacy host-parameter retirement plus performance/full-tier
+  E2E acceptance, while mirrored-head EP request batching remains unproven.
+- CUDA and ROCm attention parameter publication is now fully stream/device
+  owned. CUDA's fixed host arrays, ROCm's pinned `hipHostMalloc` lifecycle, all
+  parameter H2D copies, and the associated host-valid state are deleted.
+  Explicit geometry is written by tiny graph-capturable CUDA/HIP kernels;
+  production cache replay continues to derive geometry from the live device
+  count. Changing streams or workspaces invalidates the recorded parameter
+  state, preventing an unordered writer from being reused. A source-policy unit
+  forbids either backend from reintroducing host mirrors or parameter H2D
+  transfers. Symmetric captured replay regressions update KV length after graph
+  instantiation and match direct same-backend decode byte-for-byte. Validation:
+  source contract `3/3`, CUDA attention `46/46`, ROCm attention `54/54`, CUDA2
+  resident request batch `54.32 s`, and ROCm2 resident request batch `70.37 s`.
+  Current architecture estimate: LocalTP 98%, ExpertParallel 80%; the remaining
+  LocalTP work is full-tier E2E/performance acceptance and captured collective
+  lifecycle, while ExpertParallel still needs mirrored-head request batching
+  and matched remote-participant graphs.
 
 ## Iteration Gates
 

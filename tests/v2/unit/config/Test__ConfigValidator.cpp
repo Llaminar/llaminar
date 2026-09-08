@@ -135,31 +135,31 @@ TEST(Test__ConfigValidator, DefaultConfig_NoErrors)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_DefaultExpertParallel_NoErrors)
+TEST(Test__ConfigValidator, MoE_DefaultApportionedRoutedCompute_NoErrors)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::ExpertParallel;
+    cfg.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_ReplicatedExperts_NoErrors)
+TEST(Test__ConfigValidator, MoE_ReplicatedRoutedCompute_NoErrors)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::Replicated;
+    cfg.routed_expert_compute_policy = RoutedExpertComputePolicy::Replicated;
 
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_TensorParallelExperts_NotImplemented)
+TEST(Test__ConfigValidator, MoE_RoutedExpertTensorSharding_NotImplemented)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::TensorParallel;
+    cfg.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
 
-    EXPECT_TRUE(ruleFiresFor(v, "moe-tensor-parallel-experts-not-implemented", cfg));
+    EXPECT_TRUE(ruleFiresFor(v, "moe-routed-tensor-sharding-not-implemented", cfg));
 }
 
 TEST(Test__ConfigValidator, StandardValidator_HasRules)
@@ -317,7 +317,7 @@ TEST(Test__ConfigValidator, MutualExclusion_Device_SimpleTP)
     EXPECT_TRUE(ruleFiresFor(v, "device-simple-tp-conflict", cfg));
 }
 
-TEST(Test__ConfigValidator, NodeLocalTPAutoPickWithoutDeviceIsValid)
+TEST(Test__ConfigValidator, NodeTPAutoPickWithoutDeviceIsValid)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
@@ -329,7 +329,7 @@ TEST(Test__ConfigValidator, NodeLocalTPAutoPickWithoutDeviceIsValid)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, NodeLocalTPWithExplicitCPUDeviceMapIsValid)
+TEST(Test__ConfigValidator, NodeTPWithExplicitCPUDeviceMapIsValid)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
@@ -560,7 +560,7 @@ TEST(Test__ConfigValidator, Consistency_TPScopeLocal_WithTPDevices_OK)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.tp_scope = TPScope::LOCAL;
+    cfg.tp_scope = TPScope::RANK_LOCAL;
     cfg.tp_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
 
     EXPECT_FALSE(ruleFiresFor(v, "tp-scope-global-tp-devices-conflict", cfg));
@@ -584,6 +584,70 @@ TEST(Test__ConfigValidator, Consistency_SimpleTP_WithTopology)
     cfg.topology_string = "PP(TP(cuda:0,cuda:1))";
 
     EXPECT_TRUE(ruleFiresFor(v, "simple-tp-with-topology", cfg));
+}
+
+// ============================================================================
+// Benchmark Input Tests
+// ============================================================================
+
+TEST(Test__ConfigValidator, BenchmarkPromptSourcesAreMutuallyExclusive)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.prompt = "inline";
+    config.benchmark_prompt_file_path = "/tmp/prompt.txt";
+
+    EXPECT_TRUE(ruleFiresFor(validator, "benchmark-prompt-source-mutex", config));
+}
+
+TEST(Test__ConfigValidator, BenchmarkPromptFileRequiresBenchmarkMode)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_prompt_file_path = "/tmp/prompt.txt";
+
+    EXPECT_TRUE(ruleFiresFor(
+        validator,
+        "benchmark-prompt-file-requires-benchmark",
+        config));
+}
+
+TEST(Test__ConfigValidator, ExplicitEmptyBenchmarkPromptFails)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.prompt_was_explicitly_provided = true;
+
+    EXPECT_TRUE(ruleFiresFor(validator, "benchmark-inline-prompt-nonempty", config));
+}
+
+TEST(Test__ConfigValidator, ExplicitEmptyBenchmarkPromptFilePathFails)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.benchmark_prompt_file_was_provided = true;
+
+    EXPECT_TRUE(ruleFiresFor(
+        validator,
+        "benchmark-prompt-file-path-nonempty",
+        config));
+}
+
+TEST(Test__ConfigValidator, OneNonEmptyBenchmarkPromptSourceIsValid)
+{
+    auto validator = ConfigValidator::createStandard();
+    auto config = makeClean();
+    config.benchmark_mode = true;
+    config.benchmark_prompt_file_path = "/tmp/prompt.txt";
+
+    EXPECT_FALSE(ruleFiresFor(validator, "benchmark-prompt-source-mutex", config));
+    EXPECT_FALSE(ruleFiresFor(
+        validator,
+        "benchmark-prompt-file-requires-benchmark",
+        config));
 }
 
 // ============================================================================
@@ -706,32 +770,32 @@ TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleD
 {
     OrchestrationConfig cfg;
     cfg.device_for_this_rank = GlobalDeviceAddress::cuda(0);
-    cfg.moe_expert_parallel_plan = std::make_shared<MoEExpertParallelPlan>();
-    cfg.moe_expert_parallel_plan->enabled = true;
-    cfg.moe_expert_parallel_plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
-    cfg.moe_expert_parallel_plan->continuation_domain = "cuda_fast";
-    cfg.moe_expert_parallel_plan->shared_expert_domain = "cuda_fast";
-    cfg.moe_expert_parallel_plan->domains = {
-        ExpertComputeDomain{
+    cfg.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    cfg.moe_routed_expert_plan->enabled = true;
+    cfg.moe_routed_expert_plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+    cfg.moe_routed_expert_plan->continuation_domain = "cuda_fast";
+    cfg.moe_routed_expert_plan->shared_expert_domain = "cuda_fast";
+    cfg.moe_routed_expert_plan->domains = {
+        RoutedExpertDomain{
             .name = "cuda_fast",
-            .kind = ExpertDomainKind::SingleDevice,
+            .scope = ExecutionDomainScope::SINGLE,
             .backend = CollectiveBackendType::AUTO,
             .participants = {GlobalDeviceAddress::cuda(0)},
             .owner_rank = 0,
-            .compute_kind = ExpertDomainComputeKind::ReplicatedExperts,
+            .routed_compute_policy = RoutedExpertComputePolicy::Apportioned,
         },
-        ExpertComputeDomain{
+        RoutedExpertDomain{
             .name = "cpu_cold",
-            .kind = ExpertDomainKind::NodeLocalTP,
+            .scope = ExecutionDomainScope::NODE_LOCAL,
             .backend = CollectiveBackendType::UPI,
             .participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
             .world_ranks = {0, 1},
-            .compute_kind = ExpertDomainComputeKind::TensorParallelExperts,
+            .routed_compute_policy = RoutedExpertComputePolicy::TensorSharded,
         },
     };
-    cfg.moe_expert_parallel_plan->routed_tiers = {
-        ExpertRoutedTier{.name = "fast", .domain = "cuda_fast", .priority = 0},
-        ExpertRoutedTier{.name = "cold", .domain = "cpu_cold", .priority = 1, .fallback = true},
+    cfg.moe_routed_expert_plan->routed_tiers = {
+        RoutedExpertTier{.name = "fast", .domain = "cuda_fast", .priority = 0},
+        RoutedExpertTier{.name = "cold", .domain = "cpu_cold", .priority = 1, .fallback = true},
     };
 
     const auto errors = cfg.validate();
@@ -739,7 +803,7 @@ TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleD
     bool found_overlay_conflict = false;
     for (const auto &error : errors)
     {
-        if (error.find("Conflicting options: --device/-d cuda:0 and --moe-expert-overlay-continuation cuda_fast") != std::string::npos)
+        if (error.find("Conflicting options: --device/-d cuda:0 and --moe-routed-expert-continuation-domain cuda_fast") != std::string::npos)
         {
             found_overlay_conflict = true;
             break;

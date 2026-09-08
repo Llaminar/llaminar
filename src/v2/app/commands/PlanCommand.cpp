@@ -39,7 +39,6 @@ namespace llaminar2
             std::string kv_precision = "fp16";
             int max_seq_len = 0; // 0 = use model default
             int batch_size = 1;
-            int headroom_mb = 128;
             // MPI bootstrap control
             bool no_mpi_bootstrap = false;
             std::string hostfile;
@@ -96,13 +95,6 @@ namespace llaminar2
                 .value_label = "<type>",
                 .description = "KV cache precision: fp16, fp32, q8_1, auto",
                 .setter = setters::assignString(&PlanConfig::kv_precision),
-            });
-            spec.add({
-                .long_name = "--headroom",
-                .category = "Strategy",
-                .value_label = "<mb>",
-                .description = "Reserved headroom per device in MB (default: 128)",
-                .setter = setters::parseInt(&PlanConfig::headroom_mb, "headroom"),
             });
             spec.add({
                 .short_name = "-o",
@@ -168,15 +160,15 @@ namespace llaminar2
             if (plan.devices.size() == 1)
             {
                 const auto &d = plan.devices[0];
-                yaml << "device: " << d.device.to_string() << "\n";
+                yaml << "device: " << d.device().to_string() << "\n";
                 yaml << "memory:\n"
-                     << "  weights_mb: " << mb(d.weight_bytes) << "\n"
-                     << "  kv_cache_mb: " << mb(d.kv_cache_bytes) << "\n"
-                     << "  activations_mb: " << mb(d.activation_bytes) << "\n"
-                     << "  workspace_mb: " << mb(d.workspace_bytes) << "\n"
+                     << "  weights_mb: " << mb(d.weight_bytes()) << "\n"
+                     << "  kv_cache_mb: " << mb(d.kv_cache_bytes()) << "\n"
+                     << "  activations_mb: " << mb(d.activation_bytes()) << "\n"
+                     << "  workspace_mb: " << mb(d.workspace_bytes()) << "\n"
                      << "  total_mb: " << mb(d.total_bytes()) << "\n"
-                     << "  device_free_mb: " << mb(d.device_free_bytes) << "\n"
-                     << "  headroom_mb: " << mb(d.remaining()) << "\n";
+                     << "  device_free_mb: " << mb(d.device_free_bytes()) << "\n"
+                     << "  unallocated_mb: " << mb(d.remaining()) << "\n";
             }
             else
             {
@@ -184,13 +176,13 @@ namespace llaminar2
                 for (size_t i = 0; i < plan.devices.size(); ++i)
                 {
                     const auto &d = plan.devices[i];
-                    yaml << "  - id: " << d.device.to_string() << "\n"
-                         << "    weights_mb: " << mb(d.weight_bytes) << "\n"
-                         << "    kv_cache_mb: " << mb(d.kv_cache_bytes) << "\n"
-                         << "    activations_mb: " << mb(d.activation_bytes) << "\n"
-                         << "    workspace_mb: " << mb(d.workspace_bytes) << "\n"
+                    yaml << "  - id: " << d.device().to_string() << "\n"
+                         << "    weights_mb: " << mb(d.weight_bytes()) << "\n"
+                         << "    kv_cache_mb: " << mb(d.kv_cache_bytes()) << "\n"
+                         << "    activations_mb: " << mb(d.activation_bytes()) << "\n"
+                         << "    workspace_mb: " << mb(d.workspace_bytes()) << "\n"
                          << "    total_mb: " << mb(d.total_bytes()) << "\n"
-                         << "    device_free_mb: " << mb(d.device_free_bytes) << "\n";
+                         << "    device_free_mb: " << mb(d.device_free_bytes()) << "\n";
                 }
             }
 
@@ -206,12 +198,12 @@ namespace llaminar2
             dc.device = device;
             dc.device_total_bytes = gpu.memory_bytes;
             dc.device_free_bytes = gpu.free_memory_bytes;
+            dc.device_compute_units = gpu.compute_units;
             dc.first_layer = 0;
             dc.last_layer = profile.n_layers - 1;
             dc.batch_size = cfg.batch_size;
             dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
             dc.kv_precision = cfg.kv_precision;
-            dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
             return dc;
         }
 
@@ -229,6 +221,7 @@ namespace llaminar2
                 dc.device = DeviceId(gpus[i].type, gpus[i].local_device_id);
                 dc.device_total_bytes = gpus[i].memory_bytes;
                 dc.device_free_bytes = gpus[i].free_memory_bytes;
+                dc.device_compute_units = gpus[i].compute_units;
                 dc.shard_index = i;
                 dc.total_shards = actual_tp;
                 dc.first_layer = 0;
@@ -236,7 +229,6 @@ namespace llaminar2
                 dc.batch_size = cfg.batch_size;
                 dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
                 dc.kv_precision = cfg.kv_precision;
-                dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
                 configs.push_back(dc);
             }
             return configs;
@@ -260,12 +252,12 @@ namespace llaminar2
                 dc.device = DeviceId(gpus[i].type, gpus[i].local_device_id);
                 dc.device_total_bytes = gpus[i].memory_bytes;
                 dc.device_free_bytes = gpus[i].free_memory_bytes;
+                dc.device_compute_units = gpus[i].compute_units;
                 dc.first_layer = layer_offset;
                 dc.last_layer = layer_offset + stage_layers - 1;
                 dc.batch_size = cfg.batch_size;
                 dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
                 dc.kv_precision = cfg.kv_precision;
-                dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
                 configs.push_back(dc);
                 layer_offset += stage_layers;
             }
@@ -275,18 +267,20 @@ namespace llaminar2
         /// Build DevicePlanConfig for CPU-only.
         DevicePlanConfig buildCPUConfig(
             const PlanConfig &cfg, const ModelMemoryProfile &profile,
-            size_t cpu_memory_bytes)
+            size_t cpu_total_bytes,
+            size_t cpu_available_bytes,
+            int cpu_worker_count)
         {
             DevicePlanConfig dc;
             dc.device = DeviceId::cpu();
-            dc.device_total_bytes = cpu_memory_bytes;
-            dc.device_free_bytes = cpu_memory_bytes;
+            dc.device_total_bytes = cpu_total_bytes;
+            dc.device_free_bytes = cpu_available_bytes;
+            dc.device_compute_units = cpu_worker_count;
             dc.first_layer = 0;
             dc.last_layer = profile.n_layers - 1;
             dc.batch_size = cfg.batch_size;
             dc.max_seq_len = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
             dc.kv_precision = cfg.kv_precision;
-            dc.headroom_bytes = static_cast<size_t>(cfg.headroom_mb) * 1024ULL * 1024;
             return dc;
         }
 
@@ -402,15 +396,31 @@ namespace llaminar2
 
         // --- Step 2: Collect available GPUs from inventory ---
         std::vector<DeviceInfo> gpus;
-        size_t cpu_memory = 0;
+        PhysicalMemoryResource host_memory;
+        int host_worker_count = 0;
         if (!session.inventory.ranks.empty())
         {
-            gpus = session.inventory.ranks[0].gpus;
-            cpu_memory = session.inventory.ranks[0].cpu_memory_bytes;
-            if (cpu_memory == 0)
+            const auto &rank = session.inventory.ranks[0];
+            gpus = rank.gpus;
+            host_memory = PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = rank.cpu.memory_bytes,
+                .admission_available_bytes =
+                    rank.cpu.free_memory_bytes,
+            };
+            host_worker_count = rank.cpu_cores;
+        }
+        if (!host_memory.valid() ||
+            host_memory.admission_available_bytes == 0 ||
+            host_worker_count <= 0)
+        {
+            if (session.is_output_rank)
             {
-                cpu_memory = 64ULL * 1024 * 1024 * 1024; // fallback: 64 GB
+                std::cerr
+                    << "Error: canonical rank-0 host memory/physical-worker observation is unavailable; planning cannot invent CPU capacity or execution parallelism.\n";
             }
+            return 1;
         }
 
         // --- Step 3: Build and evaluate strategies ---
@@ -448,7 +458,13 @@ namespace llaminar2
             }
 
             candidates.push_back({"cpu-only",
-                                  {buildCPUConfig(cfg, profile, cpu_memory)}});
+                                  {buildCPUConfig(
+                                      cfg,
+                                      profile,
+                                      host_memory.total_bytes,
+                                      host_memory
+                                          .admission_available_bytes,
+                                      host_worker_count)}});
         }
         else if (cfg.strategy == "single-gpu")
         {
@@ -501,7 +517,30 @@ namespace llaminar2
         else if (cfg.strategy == "cpu-only")
         {
             candidates.push_back({"cpu-only",
-                                  {buildCPUConfig(cfg, profile, cpu_memory)}});
+                                  {buildCPUConfig(
+                                      cfg,
+                                      profile,
+                                      host_memory.total_bytes,
+                                      host_memory
+                                          .admission_available_bytes,
+                                      host_worker_count)}});
+        }
+
+        /*
+         * `plan` describes the same production defaults as server startup.
+         * Prefix restore is enabled and its RAM tier is charged once to the
+         * exact host allocator; GPU candidates additionally charge their
+         * archive staging and device-hot tier through MemoryPlanner.
+         */
+        for (auto &candidate : candidates)
+        {
+            for (auto &device_config : candidate.configs)
+            {
+                device_config.world_rank = 0;
+                device_config.prefix_cache = PrefixCacheRuntimeConfig{};
+                if (device_config.device.is_gpu())
+                    device_config.associated_host_memory = host_memory;
+            }
         }
 
         // Evaluate each candidate

@@ -10,11 +10,14 @@
  */
 
 #include "HostBackend.h"
+#include "../../tensors/FP16Utils.h"
+#include "../../utils/BFloat16.h"
 #include "../../utils/Logger.h"
 #include "../../backends/GPUDeviceContextPool.h"
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <exception>
 
 // Forward declare the copy functions that are implemented in runtime-specific files
 namespace llaminar2
@@ -25,15 +28,15 @@ namespace llaminar2
 #ifdef HAVE_CUDA
         bool cudaCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes, void *stream);
         bool cudaCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes, void *stream);
-        bool cudaHostRegisterBuffer(void *ptr, size_t size);
-        void cudaHostUnregisterBuffer(void *ptr);
+        bool cudaHostRegisterBuffer(void *ptr, size_t size, int device_ordinal);
+        bool cudaHostUnregisterBuffer(void *ptr, int device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
         bool hipCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes, void *stream);
         bool hipCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes, void *stream);
-        bool hipHostRegisterBuffer(void *ptr, size_t size);
-        void hipHostUnregisterBuffer(void *ptr);
+        bool hipHostRegisterBuffer(void *ptr, size_t size, int device_ordinal);
+        bool hipHostUnregisterBuffer(void *ptr, int device_ordinal);
 #endif
 
     } // namespace host_backend_detail
@@ -52,6 +55,13 @@ namespace llaminar2
         LOG_DEBUG("HostBackend: Created");
     }
 
+    /**
+     * @brief Retire every runtime registration before freeing staging storage.
+     *
+     * CUDA and HIP retain page mappings independently of the C++ allocation.
+     * Freeing a buffer after an unregister failure lets a future allocation
+     * reuse pages still exposed to device DMA, so retirement failure is fatal.
+     */
     HostBackend::~HostBackend()
     {
         if (initialized_)
@@ -64,11 +74,25 @@ namespace llaminar2
         {
 #ifdef HAVE_CUDA
             if (staging_registered_cuda_)
-                host_backend_detail::cudaHostUnregisterBuffer(staging_buffer_);
+            {
+                if (!host_backend_detail::cudaHostUnregisterBuffer(
+                        staging_buffer_, cuda_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister CUDA staging buffer");
+                    std::terminate();
+                }
+            }
 #endif
 #ifdef HAVE_ROCM
             if (staging_registered_rocm_)
-                host_backend_detail::hipHostUnregisterBuffer(staging_buffer_);
+            {
+                if (!host_backend_detail::hipHostUnregisterBuffer(
+                        staging_buffer_, rocm_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister ROCm staging buffer");
+                    std::terminate();
+                }
+            }
 #endif
             std::free(staging_buffer_);
             staging_buffer_ = nullptr;
@@ -817,14 +841,24 @@ namespace llaminar2
 #ifdef HAVE_CUDA
             if (staging_registered_cuda_)
             {
-                host_backend_detail::cudaHostUnregisterBuffer(staging_buffer_);
+                if (!host_backend_detail::cudaHostUnregisterBuffer(
+                        staging_buffer_, cuda_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister superseded CUDA staging buffer");
+                    return false;
+                }
                 staging_registered_cuda_ = false;
             }
 #endif
 #ifdef HAVE_ROCM
             if (staging_registered_rocm_)
             {
-                host_backend_detail::hipHostUnregisterBuffer(staging_buffer_);
+                if (!host_backend_detail::hipHostUnregisterBuffer(
+                        staging_buffer_, rocm_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister superseded ROCm staging buffer");
+                    return false;
+                }
                 staging_registered_rocm_ = false;
             }
 #endif
@@ -849,7 +883,8 @@ namespace llaminar2
 #ifdef HAVE_CUDA
         if (has_cuda_)
         {
-            if (!host_backend_detail::cudaHostRegisterBuffer(staging_buffer_, alloc_size))
+            if (!host_backend_detail::cudaHostRegisterBuffer(
+                    staging_buffer_, alloc_size, cuda_device_.gpu_ordinal()))
             {
                 LOG_WARN("HostBackend: cudaHostRegister failed");
             }
@@ -862,7 +897,8 @@ namespace llaminar2
 #ifdef HAVE_ROCM
         if (has_rocm_)
         {
-            if (!host_backend_detail::hipHostRegisterBuffer(staging_buffer_, alloc_size))
+            if (!host_backend_detail::hipHostRegisterBuffer(
+                    staging_buffer_, alloc_size, rocm_device_.gpu_ordinal()))
             {
                 LOG_WARN("HostBackend: hipHostRegister failed");
             }
@@ -1025,50 +1061,13 @@ namespace llaminar2
             const uint16_t *src_h = static_cast<const uint16_t *>(src);
             uint16_t *dst_h = static_cast<uint16_t *>(dst);
 
-            // Helper lambdas for FP16 conversion (IEEE 754 half-precision)
-            auto fp16_to_fp32 = [](uint16_t h) -> float
-            {
-                uint32_t sign = (h >> 15) & 0x1;
-                uint32_t exp = (h >> 10) & 0x1F;
-                uint32_t mant = h & 0x3FF;
-
-                if (exp == 0)
-                {
-                    if (mant == 0)
-                        return sign ? -0.0f : 0.0f;
-                    // Denormalized
-                    while (!(mant & 0x400))
-                    {
-                        mant <<= 1;
-                        exp--;
-                    }
-                    exp++;
-                    mant &= ~0x400;
-                }
-                else if (exp == 31)
-                {
-                    uint32_t result = (sign << 31) | 0x7F800000 | (mant << 13);
-                    return *reinterpret_cast<float *>(&result);
-                }
-
-                uint32_t result = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-                return *reinterpret_cast<float *>(&result);
-            };
-
-            auto fp32_to_fp16 = [](float f) -> uint16_t
-            {
-                uint32_t x = *reinterpret_cast<uint32_t *>(&f);
-                uint32_t sign = (x >> 31) & 0x1;
-                int32_t exp = ((x >> 23) & 0xFF) - 127 + 15;
-                uint32_t mant = (x >> 13) & 0x3FF;
-
-                if (exp <= 0)
-                    return static_cast<uint16_t>(sign << 15);
-                if (exp >= 31)
-                    return static_cast<uint16_t>((sign << 15) | 0x7C00);
-
-                return static_cast<uint16_t>((sign << 15) | (exp << 10) | mant);
-            };
+            /*
+             * Use the same IEEE conversion functions as tensor materialization
+             * and snapshot comparison.  The retired local converter truncated
+             * normal values and flushed every half subnormal, so mixed-vendor
+             * collectives could disagree with homogeneous GPU reduction before
+             * the parity comparator ever saw the result.
+             */
 
             switch (op)
             {
@@ -1113,17 +1112,18 @@ namespace llaminar2
             const uint16_t *src_bf = static_cast<const uint16_t *>(src);
             uint16_t *dst_bf = static_cast<uint16_t *>(dst);
 
-            // BF16 is just the upper 16 bits of FP32
+            // Keep conversion identical to BF16Tensor: lossless expansion and
+            // round-to-nearest-even contraction after each fixed-order step.
             auto bf16_to_fp32 = [](uint16_t bf) -> float
             {
-                uint32_t x = static_cast<uint32_t>(bf) << 16;
-                return *reinterpret_cast<float *>(&x);
+                bfloat16 value;
+                value.data = bf;
+                return value.to_float();
             };
 
             auto fp32_to_bf16 = [](float f) -> uint16_t
             {
-                uint32_t x = *reinterpret_cast<uint32_t *>(&f);
-                return static_cast<uint16_t>(x >> 16);
+                return bfloat16::from_float(f).data;
             };
 
             switch (op)

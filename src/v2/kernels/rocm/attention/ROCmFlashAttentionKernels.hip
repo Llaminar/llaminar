@@ -14,6 +14,8 @@
  *   - Explicit wavefront reductions via DPP
  *   - NO WMMA/Matrix Cores - pure VALU implementation
  * - Flash Decoding: Split-K parallelism for single-token decode
+ *   - Ordinary and grouped rows share the same ordered parallel reduction,
+ *     including deterministic mode; there is no serial-only policy branch.
  *
  * MI50 Optimization Strategy:
  *   1. Maximize LDS utilization (64KB per CU)
@@ -27,9 +29,10 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include <hipblas/hipblas.h>
+#include <hip/hip_bfloat16.h>
 #include <cstdint>
 #include "../../attention/AttentionDeviceParams.h"
+#include "ROCmFlashAttentionLaunchPolicy.h"
 #include "../../../tensors/BlockStructures.h"
 #include <cmath>
 #include <cfloat>
@@ -37,9 +40,6 @@
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
-#include <mutex>
-#include <unordered_map>
-#include <vector>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
@@ -59,6 +59,10 @@ namespace
     // Maximum VGPRs per wavefront (for occupancy tuning)
     constexpr int MAX_VGPRS_PER_WAVEFRONT = 256;
 
+    /// Maximum compact verifier rows represented by DEVICE_PARAMS.
+    constexpr int MAX_DYNAMIC_ATTENTION_PARAM_ROWS =
+        llaminar2::attention::kMaxGroupedVerifierAttentionRows;
+
     // =========================================================================
     // KV Cache Type Tags for Template Dispatch
     // =========================================================================
@@ -67,21 +71,26 @@ namespace
     // directly in their native storage format.
     //   FP32: K/V are float*    (4 bytes/element) — baseline
     //   FP16: K/V are __half*   (2 bytes/element) — 2× BW savings + fdot2
+    //   BF16: K/V are hip_bfloat16* (2 bytes/element) — native FP32 conversion
     //   Q8_1: K/V are Q8_1Block* (36 bytes/32 elements) — ~3.5× BW savings
-    enum class KVTypeTag { FP32, FP16, Q8_1 };
+    enum class KVTypeTag { FP32, FP16, BF16, Q8_1 };
 
     /**
      * @brief Derive graph-captured attention params from live KV cache count.
      *
      * This tiny helper runs in graph order immediately before attention, after
-     * KV append has advanced the device-owned cache count. It avoids the old
-     * host-built `AttentionDeviceParams` upload for resident MTP replay.
+     * KV append has advanced the device-owned cache count. The resulting
+     * `AttentionDeviceParams` block remains device-owned through MTP replay.
      */
     __global__ void hip_derive_attention_params_from_cached_tokens_kernel(
         llaminar2::attention::AttentionDeviceParams *__restrict__ out,
         const int *__restrict__ post_append_cached_tokens,
         int seq_len,
-        int query_rows)
+        int query_rows,
+        int kv_stride,
+        const int *__restrict__ active_query_rows_device,
+        const int *__restrict__ ring_head_device,
+        int ring_capacity)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || !post_append_cached_tokens || row >= query_rows)
@@ -89,14 +98,336 @@ namespace
 
         const int raw_kv_len = *post_append_cached_tokens;
         const int kv_len = raw_kv_len > 1 ? raw_kv_len : 1;
-        const int logical_seq_len = seq_len > 1 ? seq_len : 1;
-        const int base_position_raw = kv_len - logical_seq_len;
+        const int launch_seq_len = seq_len > 1 ? seq_len : 1;
+        const int raw_logical_seq_len = active_query_rows_device
+                                            ? *active_query_rows_device
+                                            : launch_seq_len;
+        const int logical_seq_len =
+            raw_logical_seq_len > 1
+                ? (raw_logical_seq_len < launch_seq_len
+                       ? raw_logical_seq_len
+                       : launch_seq_len)
+                : 1;
+        int ring_row_origin = 0;
+        if (ring_head_device && ring_capacity > 0)
+        {
+            ring_row_origin = (*ring_head_device - kv_len) % ring_capacity;
+            if (ring_row_origin < 0)
+                ring_row_origin += ring_capacity;
+        }
+
+        /*
+         * Ordinary prefill and M=1 decode share one parameter record across the
+         * launch.  The attention kernel owns per-query causal masking, so this
+         * record exposes the full resident KV span and identifies only the first
+         * query's absolute position.  Multiple records instead denote grouped
+         * verifier rows and intentionally shorten the visible prefix per row.
+         */
+        if (query_rows == 1)
+        {
+            out[0].kv_len = kv_len;
+            out[0].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
+            const int base_position = kv_len - logical_seq_len;
+            out[0].position_offset = base_position > 0 ? base_position : 0;
+            out[0].mask_stride = kv_len;
+            out[0].ring_row_origin = ring_row_origin;
+            out[0].ring_row_capacity = ring_head_device ? ring_capacity : 0;
+            return;
+        }
+
+        const int grouped_logical_seq_len =
+            logical_seq_len < query_rows ? logical_seq_len : query_rows;
+        if (row >= grouped_logical_seq_len)
+        {
+            out[row].kv_len = 1;
+            out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
+            out[row].position_offset = 0;
+            out[row].mask_stride = 1;
+            out[row].ring_row_origin = ring_row_origin;
+            out[row].ring_row_capacity = ring_head_device ? ring_capacity : 0;
+            return;
+        }
+        const int base_position_raw = kv_len - grouped_logical_seq_len;
         const int base_position = base_position_raw > 0 ? base_position_raw : 0;
+        const int row_kv_len_raw =
+            kv_len - (grouped_logical_seq_len - 1 - row);
+        const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
+        out[row].kv_len = row_kv_len;
+        out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
+        out[row].position_offset = base_position + row;
+        out[row].mask_stride = kv_len;
+        out[row].ring_row_origin = ring_row_origin;
+        out[row].ring_row_capacity = ring_head_device ? ring_capacity : 0;
+    }
+
+    /**
+     * @brief Materialize explicit attention geometry directly in device memory.
+     *
+     * This is the stream-owned counterpart to the device-count path above for
+     * eager tests and callers that already possess fixed launch geometry.  A
+     * tiny HIP kernel writes the canonical parameter records, so capture never
+     * depends on a pinned host allocation or an H2D parameter transfer.
+     *
+     * Earlier verifier rows expose successively shorter KV prefixes, matching
+     * independent serial decode calls byte for byte.  Absolute positions still
+     * advance from @p position_offset and all rows share the full KV mask
+     * stride supplied by @p kv_len.
+     */
+    __global__ void hip_write_attention_params_from_geometry_kernel(
+        llaminar2::attention::AttentionDeviceParams *__restrict__ out,
+        int kv_len,
+        int kv_stride,
+        int position_offset,
+        int query_rows)
+    {
+        const int row = static_cast<int>(threadIdx.x);
+        if (!out || row >= query_rows)
+            return;
+
         const int row_kv_len_raw = kv_len - (query_rows - 1 - row);
         const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
         out[row].kv_len = row_kv_len;
-        out[row].position_offset = base_position + row;
+        out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
+        out[row].position_offset = position_offset + row;
         out[row].mask_stride = kv_len;
+        out[row].ring_row_origin = 0;
+        out[row].ring_row_capacity = 0;
+    }
+
+    /**
+     * @brief Derive request-major attention metadata from canonical device counts.
+     *
+     * The resident request cache exposes one post-append token count per
+     * request.  A request may contribute several compact verifier rows, so an
+     * earlier row must see a shorter prefix than the final row.  Flattening the
+     * request/query coordinates here keeps that visibility rule entirely on
+     * the execution stream and makes the operation legal inside HIP graph
+     * capture and replay.
+     *
+     * @param out Device workspace containing one parameter record per flat row.
+     * @param post_append_cached_tokens Contiguous cache-owned request counts.
+     * @param request_count Number of independent request cache banks.
+     * @param query_rows Number of consecutive decode rows owned by each request.
+     */
+    __global__ void hip_derive_attention_params_from_request_counts_kernel(
+        llaminar2::attention::AttentionDeviceParams *__restrict__ out,
+        const int *__restrict__ post_append_cached_tokens,
+        int request_count,
+        int query_rows,
+        int kv_stride)
+    {
+        const int flat_row = static_cast<int>(threadIdx.x);
+        const int total_rows = request_count * query_rows;
+        if (!out || !post_append_cached_tokens || flat_row >= total_rows)
+            return;
+
+        const int request = flat_row / query_rows;
+        const int query_row = flat_row - request * query_rows;
+        const int raw_post_append_kv_len = post_append_cached_tokens[request];
+        const int post_append_kv_len =
+            raw_post_append_kv_len > 1 ? raw_post_append_kv_len : 1;
+        const int base_position_raw = post_append_kv_len - query_rows;
+        const int base_position = base_position_raw > 0 ? base_position_raw : 0;
+        const int row_kv_len_raw =
+            post_append_kv_len - (query_rows - 1 - query_row);
+        const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
+
+        out[flat_row].kv_len = row_kv_len;
+        out[flat_row].kv_stride =
+            kv_stride > post_append_kv_len ? kv_stride : post_append_kv_len;
+        out[flat_row].position_offset = base_position + query_row;
+        out[flat_row].mask_stride = post_append_kv_len;
+        out[flat_row].ring_row_origin = 0;
+        out[flat_row].ring_row_capacity = 0;
+    }
+
+    // Hardware exponential helper is defined beside the decode implementation
+    // and forward-declared here for the context reducer above prefill utilities.
+    __device__ __forceinline__ float fast_expf(float x);
+
+    /**
+     * @brief Merge two scaled online-softmax terms with one fixed instruction order.
+     *
+     * gfx906 LLVM can otherwise choose a fused multiply-add in one kernel
+     * specialization and two rounded operations in another. Calling this same
+     * explicit primitive from direct FA2 and the context reducer makes physical
+     * scheduling irrelevant to both output and denominator bytes.
+     */
+    __device__ __forceinline__ float merge_fa2_scaled_terms(
+        float previous,
+        float previous_scale,
+        float partition,
+        float partition_scale)
+    {
+        const float scaled_previous = previous * previous_scale;
+        return fmaf(partition, partition_scale, scaled_previous);
+    }
+
+    /**
+     * @brief Merge canonical ROCm FA2 context summaries in ascending K/V order.
+     *
+     * Phase one publishes an unnormalized `(m, l, O)` tuple for every logical
+     * 256-key interval. Each lane below owns disjoint output dimensions and
+     * traverses every live interval in the same ascending order. Dimension
+     * striping changes occupancy only: there are no atomics, cross-workgroup
+     * reductions, allocations, transfers, or stream synchronizations.
+     *
+     * The graph grid is fixed by the captured query geometry. Live partition
+     * count comes directly from the device-owned attention parameter record,
+     * so stale summary bytes above a shorter replay can never participate.
+     *
+     * @tparam DIMENSION_WAVEFRONTS Number of independent 64-dimension stripes
+     *         assigned to one query-row/head reduction.
+     */
+    template <int DIMENSION_WAVEFRONTS>
+    __global__ __launch_bounds__(256, 2)
+    void flash_attention_2_context_reduce_mi50_kernel(
+        const float *__restrict__ O_partial,
+        const float *__restrict__ m_partial,
+        const float *__restrict__ l_partial,
+        float *__restrict__ O,
+        int batch_size,
+        int seq_len,
+        int n_heads,
+        int head_dim,
+        int max_context_partitions,
+        int device_direct_partition_limit,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__
+            device_params)
+    {
+        constexpr int wavefronts_per_block =
+            256 / WAVEFRONT_SIZE;
+        static_assert(
+            DIMENSION_WAVEFRONTS == 1 ||
+                DIMENSION_WAVEFRONTS == 2 ||
+                DIMENSION_WAVEFRONTS == 4,
+            "MI50 FA2 reducer supports one, two, or four dimension wavefronts");
+        static_assert(
+            wavefronts_per_block % DIMENSION_WAVEFRONTS == 0,
+            "Reducer dimension stripes must divide the physical workgroup");
+        constexpr int rows_per_block =
+            wavefronts_per_block / DIMENSION_WAVEFRONTS;
+
+        const int live_kv_len = device_params->kv_len;
+        const int live_partitions = min(
+            max_context_partitions,
+            max(
+                1,
+                (live_kv_len +
+                 llaminar2::rocm::fa2_policy::
+                     kROCmFA2CanonicalContextPartitionKeys -
+                 1) /
+                    llaminar2::rocm::fa2_policy::
+                        kROCmFA2CanonicalContextPartitionKeys));
+        if (live_partitions <= device_direct_partition_limit)
+            return;
+
+        const int wavefront = threadIdx.x / WAVEFRONT_SIZE;
+        const int lane = threadIdx.x % WAVEFRONT_SIZE;
+        const int row_in_block = wavefront / DIMENSION_WAVEFRONTS;
+        const int dimension_wavefront =
+            wavefront % DIMENSION_WAVEFRONTS;
+        const int logical_row_blocks =
+            (seq_len + rows_per_block - 1) / rows_per_block;
+        const int blocks_per_batch = n_heads * logical_row_blocks;
+        const int logical_blocks = batch_size * blocks_per_batch;
+
+        /*
+         * Grid width is an economy choice embedded at capture time. Each
+         * physical workgroup strides disjoint logical row/head tasks, making
+         * the grid persistent without introducing an atomic work queue. The
+         * arithmetic performed for one output element is therefore identical
+         * for every physical block count.
+         */
+        for (int logical_block = static_cast<int>(blockIdx.x);
+             logical_block < logical_blocks;
+             logical_block += static_cast<int>(gridDim.x))
+        {
+            const int batch = logical_block / blocks_per_batch;
+            const int batch_block = logical_block % blocks_per_batch;
+            const int head = batch_block / logical_row_blocks;
+            const int row_block = batch_block % logical_row_blocks;
+            const int query_row =
+                row_block * rows_per_block + row_in_block;
+            if (query_row >= seq_len)
+                continue;
+
+            const size_t scalar_base =
+                ((static_cast<size_t>(batch) * seq_len + query_row) *
+                     n_heads +
+                 head) *
+                max_context_partitions;
+            float *O_row =
+                O +
+                ((static_cast<size_t>(batch) * seq_len + query_row) *
+                     n_heads +
+                 head) *
+                    static_cast<size_t>(head_dim);
+
+            for (int dimension =
+                     dimension_wavefront * WAVEFRONT_SIZE + lane;
+                 dimension < head_dim;
+                 dimension += DIMENSION_WAVEFRONTS * WAVEFRONT_SIZE)
+            {
+                float merged_m = -FLT_MAX;
+                float merged_l = 0.0f;
+                float merged_output = 0.0f;
+
+                for (int partition = 0;
+                     partition < live_partitions;
+                     ++partition)
+                {
+                    const size_t summary_index =
+                        scalar_base + static_cast<size_t>(partition);
+                    const float partition_l = l_partial[summary_index];
+                    if (!(partition_l > 0.0f))
+                        continue;
+
+                    const float partition_m = m_partial[summary_index];
+                    const float partition_output =
+                        O_partial[
+                            summary_index * static_cast<size_t>(head_dim) +
+                            dimension];
+                    if (!(merged_l > 0.0f))
+                    {
+                        merged_m = partition_m;
+                        merged_l = partition_l;
+                        merged_output = partition_output;
+                        continue;
+                    }
+
+                    const float next_m = fmaxf(merged_m, partition_m);
+                    const float previous_scale =
+                        fast_expf(merged_m - next_m);
+                    const float partition_scale =
+                        fast_expf(partition_m - next_m);
+                    merged_output = merge_fa2_scaled_terms(
+                        merged_output,
+                        previous_scale,
+                        partition_output,
+                        partition_scale);
+                    merged_l = merge_fa2_scaled_terms(
+                        merged_l,
+                        previous_scale,
+                        partition_l,
+                        partition_scale);
+                    merged_m = next_m;
+                }
+
+                /*
+                 * Preserve the direct schedule's exact normalization
+                 * expression. A source-level division can select a different
+                 * gfx906 rounding sequence from `reciprocal then multiply`,
+                 * even though both are numerically close.
+                 */
+                const float inverse_l =
+                    merged_l > 0.0f ? 1.0f / merged_l : 0.0f;
+                O_row[dimension] =
+                    merged_l > 0.0f
+                        ? merged_output * inverse_l
+                        : 0.0f;
+            }
+        }
     }
 
     // =========================================================================
@@ -150,377 +481,10 @@ namespace
     // Flash Decoding Configuration for MI50
     // =========================================================================
 
-    // Number of splits for Flash Decoding
-    // More splits = more parallelism but more reduction overhead
-    constexpr int FD_DEFAULT_NUM_SPLITS = 8;
-
-    // Threads per block for decode kernel
-    constexpr int FD_THREADS_PER_BLOCK = 256;
-
     // Max splits supported by reduction kernel shared-memory staging
     constexpr int FD_MAX_SPLITS_SUPPORTED = 32;
 
     constexpr int FD_TARGET_ELEMS_PER_SPLIT = 16384;
-    constexpr int FD_MIN_SPLITS = 1;
-    constexpr int FD_AUTOTUNE_MAX_TRIALS = 6;
-
-    inline int clampInt(int v, int lo, int hi)
-    {
-        return (v < lo) ? lo : ((v > hi) ? hi : v);
-    }
-
-    inline int roundUpPow2Clamped(int value, int max_allowed)
-    {
-        int p = 1;
-        while (p < value && p < max_allowed)
-        {
-            p <<= 1;
-        }
-        return clampInt(p, 1, max_allowed);
-    }
-
-    inline int chooseDecodeThreadsPerBlock(int head_dim, int kv_len, int effective_num_splits)
-    {
-        // Generic heuristic using work-per-split and split aspect.
-        const int safe_head_dim = std::max(head_dim, 1);
-        const int safe_splits = std::max(effective_num_splits, 1);
-        const int rows_per_split = std::max(1, kv_len / safe_splits);
-        const int64_t elems_per_split =
-            (static_cast<int64_t>(kv_len) * safe_head_dim) / safe_splits;
-
-        // Small per-split work or very short split rows favor lower TPB.
-        if ((rows_per_split <= 64 && elems_per_split <= 16384) ||
-            (rows_per_split <= 48 && elems_per_split <= 32768))
-        {
-            return 128;
-        }
-
-        return 256;
-    }
-
-    inline int chooseDecodeSplitsAuto(int kv_len, int head_dim, int max_allowed,
-                                      int n_heads = 0, int num_cus = 0)
-    {
-        const int safe_head_dim = std::max(head_dim, 1);
-        const int64_t total_elements = static_cast<int64_t>(kv_len) * safe_head_dim;
-
-        // Target work-per-split (elements), architecture-agnostic default.
-        const int target_elements_per_split = clampInt(
-            FD_TARGET_ELEMS_PER_SPLIT,
-            1024,
-            1 << 20);
-
-        int base_splits = static_cast<int>((total_elements + target_elements_per_split - 1) /
-                                           target_elements_per_split);
-        base_splits = std::max(base_splits, 1);
-
-        // Aspect-ratio adjustment: deeper KV relative to head_dim benefits from more splits.
-        // Uses ratio kv_len/head_dim (not hard-coded model dimensions).
-        if (kv_len >= safe_head_dim * 8)
-        {
-            base_splits = (base_splits * 3 + 1) / 2; // ~1.5x
-        }
-        else if (kv_len <= safe_head_dim * 2)
-        {
-            base_splits = std::max(1, (base_splits + 1) / 2);
-        }
-
-        // Don't over-split beyond useful row granularity.
-        base_splits = std::min(base_splits, std::max(kv_len, 1));
-
-        // Prefer power-of-two split counts for predictable reduction behavior.
-        int auto_splits = roundUpPow2Clamped(base_splits, max_allowed);
-
-        // CU-aware occupancy floor: when n_heads * splits is too low to fill
-        // the GPU, increase splits to target ~75% CU occupancy.  This is
-        // critical for TP configurations where per-rank head count drops.
-        if (n_heads > 0 && num_cus > 0)
-        {
-            const int target_blocks = (num_cus * 3) / 4; // 75% occupancy
-            if (n_heads * auto_splits < target_blocks)
-            {
-                int occ_splits = (target_blocks + n_heads - 1) / n_heads;
-                occ_splits = roundUpPow2Clamped(occ_splits, max_allowed);
-                auto_splits = std::max(auto_splits, occ_splits);
-            }
-        }
-
-        const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
-        auto_splits = clampInt(auto_splits, min_splits, max_allowed);
-        return auto_splits;
-    }
-
-    inline int chooseEffectiveDecodeSplits(int kv_len, int head_dim, int requested_num_splits,
-                                           int n_heads = 0, int num_cus = 0)
-    {
-        const int workspace_limit = (requested_num_splits > 0)
-            ? requested_num_splits
-            : FD_MAX_SPLITS_SUPPORTED;
-        const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
-
-        const int auto_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed, n_heads, num_cus);
-        return std::max(1, std::min(auto_splits, max_allowed));
-    }
-
-    struct DecodeLaunchConfig
-    {
-        int splits = FD_DEFAULT_NUM_SPLITS;
-        int tpb = FD_THREADS_PER_BLOCK;
-    };
-
-    struct DecodeAutotuneSelection
-    {
-        DecodeLaunchConfig config{};
-        bool should_time = false;
-        uint32_t key = 0;
-        int candidate_index = -1;
-    };
-
-    struct DecodeAutotuneState
-    {
-        std::vector<DecodeLaunchConfig> candidates;
-        int max_trials = 0;
-        int next_trial = 0;
-        bool has_best = false;
-        DecodeLaunchConfig best{};
-        float best_ms = std::numeric_limits<float>::infinity();
-    };
-
-    inline int ilog2Floor(int value)
-    {
-        int v = std::max(value, 1);
-        int lg = 0;
-        while (v > 1)
-        {
-            v >>= 1;
-            lg++;
-        }
-        return lg;
-    }
-
-    inline int bucketAspectRatio(int kv_len, int head_dim)
-    {
-        const int safe_hd = std::max(head_dim, 1);
-        const float ratio = static_cast<float>(kv_len) / static_cast<float>(safe_hd);
-        if (ratio <= 1.0f)
-            return 0;
-        if (ratio <= 2.0f)
-            return 1;
-        if (ratio <= 4.0f)
-            return 2;
-        if (ratio <= 8.0f)
-            return 3;
-        if (ratio <= 16.0f)
-            return 4;
-        if (ratio <= 32.0f)
-            return 5;
-        return 6;
-    }
-
-    inline uint32_t makeDecodeAutotuneKey(int kv_len, int head_dim, int max_allowed_splits,
-                                          int n_heads = 0)
-    {
-        const int64_t total_elements = static_cast<int64_t>(std::max(kv_len, 1)) * std::max(head_dim, 1);
-        const int elem_bucket = clampInt(ilog2Floor(static_cast<int>(std::min<int64_t>(total_elements, INT32_MAX))), 0, 31);
-        const int aspect_bucket = bucketAspectRatio(kv_len, head_dim); // 0..6
-        const int hd_bucket = clampInt(ilog2Floor(std::max(head_dim, 1)), 0, 15);
-        const int split_cap_bucket = clampInt(ilog2Floor(std::max(max_allowed_splits, 1)), 0, 15);
-        const int heads_bucket = clampInt(ilog2Floor(std::max(n_heads, 1)), 0, 15);
-
-        return static_cast<uint32_t>(
-            (elem_bucket & 0x1F) |
-            ((aspect_bucket & 0x07) << 5) |
-            ((hd_bucket & 0x0F) << 8) |
-            ((split_cap_bucket & 0x0F) << 12) |
-            ((heads_bucket & 0x0F) << 16));
-    }
-
-    inline void addSplitCandidate(std::vector<int> &splits, int value, int max_allowed)
-    {
-        int clamped = clampInt(value, 1, max_allowed);
-        clamped = roundUpPow2Clamped(clamped, max_allowed);
-        if (std::find(splits.begin(), splits.end(), clamped) == splits.end())
-        {
-            splits.push_back(clamped);
-        }
-    }
-
-    inline std::vector<DecodeLaunchConfig> buildDecodeAutotuneCandidates(int kv_len, int head_dim, int max_allowed,
-                                                                         int n_heads = 0, int num_cus = 0)
-    {
-        const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
-
-        const int base_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed, n_heads, num_cus);
-
-        std::vector<int> split_candidates;
-        split_candidates.reserve(12);
-        addSplitCandidate(split_candidates, min_splits, max_allowed);
-        addSplitCandidate(split_candidates, base_splits / 2, max_allowed);
-        addSplitCandidate(split_candidates, base_splits, max_allowed);
-        addSplitCandidate(split_candidates, base_splits * 2, max_allowed);
-        addSplitCandidate(split_candidates, 1, max_allowed);
-        addSplitCandidate(split_candidates, max_allowed, max_allowed);
-
-        // Occupancy-aware candidates: when the base heuristic has already been
-        // bumped by the CU floor, also explore splits that hit 50% and 100%
-        // occupancy so the autotuner can bracket the sweet spot.
-        if (n_heads > 0 && num_cus > 0)
-        {
-            for (int pct : {50, 100})
-            {
-                int target = (num_cus * pct) / 100;
-                int s = (target + n_heads - 1) / n_heads;
-                addSplitCandidate(split_candidates, s, max_allowed);
-            }
-        }
-
-        std::sort(split_candidates.begin(), split_candidates.end());
-
-        const int preferred_tpb = chooseDecodeThreadsPerBlock(head_dim, kv_len, base_splits);
-        int alt_tpb = (preferred_tpb == 128) ? 256 : 128;
-
-        std::vector<DecodeLaunchConfig> candidates;
-        candidates.reserve(split_candidates.size() * 2 + 2);
-
-        auto addCandidate = [&](int splits, int tpb)
-        {
-            DecodeLaunchConfig cfg{splits, tpb};
-            auto it = std::find_if(candidates.begin(), candidates.end(), [&](const DecodeLaunchConfig &existing)
-                                   { return existing.splits == cfg.splits && existing.tpb == cfg.tpb; });
-            if (it == candidates.end())
-            {
-                candidates.push_back(cfg);
-            }
-        };
-
-        addCandidate(base_splits, preferred_tpb);
-        addCandidate(base_splits, alt_tpb);
-
-        for (int s : split_candidates)
-        {
-            addCandidate(s, preferred_tpb);
-            addCandidate(s, alt_tpb);
-        }
-
-        return candidates;
-    }
-
-    inline std::unordered_map<uint32_t, DecodeAutotuneState> &decodeAutotuneMap()
-    {
-        static std::unordered_map<uint32_t, DecodeAutotuneState> states;
-        return states;
-    }
-
-    inline std::mutex &decodeAutotuneMutex()
-    {
-        static std::mutex lock;
-        return lock;
-    }
-
-    inline DecodeAutotuneSelection chooseDecodeLaunchConfig(int kv_len, int head_dim, int requested_num_splits,
-                                                             int n_heads = 0, int num_cus = 0)
-    {
-        DecodeAutotuneSelection selection;
-
-        const int heuristic_splits = chooseEffectiveDecodeSplits(kv_len, head_dim, requested_num_splits, n_heads, num_cus);
-        const int heuristic_tpb = chooseDecodeThreadsPerBlock(head_dim, kv_len, heuristic_splits);
-        selection.config = {heuristic_splits, heuristic_tpb};
-
-        const int workspace_limit = (requested_num_splits > 0)
-            ? requested_num_splits
-            : FD_MAX_SPLITS_SUPPORTED;
-        const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
-
-        const auto &rocm_env = llaminar2::debugEnv().rocm;
-        if (rocm_env.fa_decode_num_splits_present)
-        {
-            const int forced_splits = rocm_env.fa_decode_num_splits
-                ? clampInt(*rocm_env.fa_decode_num_splits, 1, max_allowed)
-                : heuristic_splits;
-            const int forced_tpb = rocm_env.fa_decode_tpb
-                ? clampInt(*rocm_env.fa_decode_tpb, 64, 256)
-                : chooseDecodeThreadsPerBlock(head_dim, kv_len, forced_splits);
-            selection.config = {forced_splits, forced_tpb};
-            return selection;
-        }
-
-        if (llaminar2::debugEnv().gemm.deterministic)
-        {
-            // Deterministic parity runs require a stable launch policy across
-            // fresh runners.  The autotuner is performance state, not model
-            // state, so rotating through trial TPB values can make two identical
-            // requests execute different kernels in one process.
-            return selection;
-        }
-
-        const uint32_t key = makeDecodeAutotuneKey(kv_len, head_dim, max_allowed, n_heads);
-
-        std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
-        auto &states = decodeAutotuneMap();
-        auto &state = states[key];
-
-        if (state.candidates.empty())
-        {
-            state.candidates = buildDecodeAutotuneCandidates(kv_len, head_dim, max_allowed, n_heads, num_cus);
-            const int max_trials_env = clampInt(FD_AUTOTUNE_MAX_TRIALS, 1, 24);
-            state.max_trials = std::min<int>(max_trials_env, static_cast<int>(state.candidates.size()));
-            state.next_trial = 0;
-            state.has_best = false;
-            state.best_ms = std::numeric_limits<float>::infinity();
-            state.best = selection.config;
-        }
-
-        selection.key = key;
-
-        if (state.next_trial < state.max_trials)
-        {
-            selection.config = state.candidates[state.next_trial];
-            selection.should_time = true;
-            selection.candidate_index = state.next_trial;
-            state.next_trial++;
-            return selection;
-        }
-
-        if (state.has_best)
-        {
-            selection.config = state.best;
-        }
-        else
-        {
-            selection.config = state.best;
-        }
-
-        return selection;
-    }
-
-    inline void recordDecodeAutotuneResult(uint32_t key, int candidate_index, float elapsed_ms)
-    {
-        if (!(elapsed_ms > 0.0f))
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
-        auto &states = decodeAutotuneMap();
-        auto it = states.find(key);
-        if (it == states.end())
-        {
-            return;
-        }
-
-        auto &state = it->second;
-        if (candidate_index < 0 || candidate_index >= static_cast<int>(state.candidates.size()))
-        {
-            return;
-        }
-
-        if (!state.has_best || elapsed_ms < state.best_ms)
-        {
-            state.has_best = true;
-            state.best_ms = elapsed_ms;
-            state.best = state.candidates[candidate_index];
-        }
-    }
 
     // =========================================================================
     // Device Property Caching
@@ -690,15 +654,106 @@ namespace
     };
 
     /**
+     * @brief Load one logical KV element and convert it to the FP16 LDS format.
+     *
+     * The prefill kernel keeps K and V in their native cache representation
+     * while they reside in HBM.  Conversion happens only as the live tile is
+     * staged into LDS, preserving the bandwidth advantage of FP16 and Q8_1
+     * caches without allocating a graph-unstable full-cache conversion buffer.
+     *
+     * @tparam KV_TYPE Physical cache representation selected at kernel launch.
+     * @param source Beginning of the request-major native cache allocation.
+     * @param logical_element Dense FP32-equivalent element index.  Q8_1 rows
+     *        are block aligned because every supported head dimension is a
+     *        multiple of the 32-element Q8_1 block width.
+     * @return The requested value rounded to the FP16 arithmetic format used
+     *         by the MI50 dot-product pipeline.
+     */
+    template <KVTypeTag KV_TYPE>
+    __device__ __forceinline__ __half load_fa2_kv_element_as_half(
+        const void *__restrict__ source,
+        size_t logical_element)
+    {
+        if constexpr (KV_TYPE == KVTypeTag::FP32)
+        {
+            return float_to_half(static_cast<const float *>(source)[logical_element]);
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::FP16)
+        {
+            return static_cast<const __half *>(source)[logical_element];
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::BF16)
+        {
+            return float_to_half(
+                static_cast<float>(
+                    static_cast<const hip_bfloat16 *>(source)[logical_element]));
+        }
+        else
+        {
+            constexpr size_t ELEMENTS_PER_BLOCK = llaminar2::Q8_1Block::BLOCK_SIZE;
+            const auto *blocks = static_cast<const llaminar2::Q8_1Block *>(source);
+            const auto &block = blocks[logical_element / ELEMENTS_PER_BLOCK];
+            const int element_in_block =
+                static_cast<int>(logical_element % ELEMENTS_PER_BLOCK);
+            const float scale = __half2float(
+                *reinterpret_cast<const __half *>(&block.d));
+            return float_to_half(scale * static_cast<float>(block.qs[element_in_block]));
+        }
+    }
+
+    /**
+     * @brief Load two adjacent KV values in the packed format consumed by fdot2.
+     *
+     * FP32 and FP16 caches retain vectorized global-memory reads.  Q8_1 uses
+     * two scalar block lookups because its scale metadata is shared by 32
+     * values; the resulting pair is still packed before entering LDS.
+     */
+    template <KVTypeTag KV_TYPE>
+    __device__ __forceinline__ __half2 load_fa2_kv_pair_as_half2(
+        const void *__restrict__ source,
+        size_t logical_element)
+    {
+        if constexpr (KV_TYPE == KVTypeTag::FP32)
+        {
+            const float2 values = *reinterpret_cast<const float2 *>(
+                static_cast<const float *>(source) + logical_element);
+            return __float22half2_rn(values);
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::FP16)
+        {
+            return *reinterpret_cast<const __half2 *>(
+                static_cast<const __half *>(source) + logical_element);
+        }
+        else if constexpr (KV_TYPE == KVTypeTag::BF16)
+        {
+            return __halves2half2(
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element),
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element + 1));
+        }
+        else
+        {
+            return __halves2half2(
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element),
+                load_fa2_kv_element_as_half<KV_TYPE>(source, logical_element + 1));
+        }
+    }
+
+    /**
      * @brief Flash Attention 2 prefill kernel for MI50
      *
      * Uses vectorized FP16 VALU operations for Q@K^T computation.
      * No WMMA/Matrix Cores - pure ALU implementation optimized for Vega.
      */
-    __global__ __launch_bounds__(256, 4) void flash_attention_2_mi50_kernel(
+    template <KVTypeTag KV_TYPE,
+              int THREADS_PER_ROW,
+              int STATIC_HEAD_DIM = 0,
+              int STATIC_TILE_Q = 0,
+              int STATIC_TILE_KV = 0,
+              bool WRITE_CONTEXT_PARTIAL = false>
+    __global__ __launch_bounds__(256, 2) void flash_attention_2_mi50_kernel(
         const float *__restrict__ Q,
-        const float *__restrict__ K,
-        const float *__restrict__ V,
+        const void *__restrict__ K,
+        const void *__restrict__ V,
         float *__restrict__ O,
         int batch_size,
         int seq_len,
@@ -715,28 +770,116 @@ namespace
         int tile_q,
         int tile_kv,
         int head_start,
-        int gqa_n_rep)
+        int gqa_n_rep,
+        float *__restrict__ O_partial = nullptr,
+        float *__restrict__ m_partial = nullptr,
+        float *__restrict__ l_partial = nullptr,
+        int context_partition_size = 0,
+        int max_context_partitions = 0,
+        int context_partition_slots = 0,
+        int device_direct_partition_limit = 0)
     {
+        const int kernel_head_dim =
+            STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM : head_dim;
+        const int kernel_tile_q =
+            STATIC_TILE_Q > 0 ? STATIC_TILE_Q : tile_q;
+        const int kernel_tile_kv =
+            STATIC_TILE_KV > 0 ? STATIC_TILE_KV : tile_kv;
+
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
         int position_offset_runtime = position_offset;
         int mask_stride = kv_len;
+        int ring_row_origin = 0;
+        int ring_row_capacity = 0;
 
         if (device_params)
         {
             kv_len_runtime = device_params->kv_len;
+            kv_stride = device_params->kv_stride;
             position_offset_runtime = device_params->position_offset;
             mask_stride = device_params->mask_stride;
+            ring_row_origin = device_params->ring_row_origin;
+            ring_row_capacity = device_params->ring_row_capacity;
         }
 
-        // Block/thread indexing
-        const int batch_idx = blockIdx.z;
-        const int head_idx = blockIdx.x;
-        const int q_tile_idx = blockIdx.y;
+        const int logical_query_tiles =
+            (seq_len + kernel_tile_q - 1) / kernel_tile_q;
+        const int phase_blocks_per_slot =
+            batch_size * logical_query_tiles * n_heads;
+        int graph_live_context_partitions = 1;
+        int active_context_partition_slots = 1;
+        if constexpr (WRITE_CONTEXT_PARTIAL)
+        {
+            graph_live_context_partitions = min(
+                max_context_partitions,
+                max(
+                    1,
+                    (kv_len_runtime + context_partition_size - 1) /
+                        context_partition_size));
+            if (graph_live_context_partitions <=
+                device_direct_partition_limit)
+            {
+                return;
+            }
+            active_context_partition_slots = min(
+                context_partition_slots,
+                graph_live_context_partitions);
+        }
+        else if (device_direct_partition_limit > 0)
+        {
+            const int live_context_partitions = max(
+                1,
+                (kv_len_runtime +
+                 llaminar2::rocm::fa2_policy::
+                     kROCmFA2CanonicalContextPartitionKeys -
+                 1) /
+                    llaminar2::rocm::fa2_policy::
+                        kROCmFA2CanonicalContextPartitionKeys);
+            if (live_context_partitions > device_direct_partition_limit)
+                return;
+        }
+        const int logical_phase_blocks = WRITE_CONTEXT_PARTIAL
+                                             ? phase_blocks_per_slot *
+                                                   active_context_partition_slots
+                                             : 1;
+        const int first_logical_block = WRITE_CONTEXT_PARTIAL
+                                            ? static_cast<int>(blockIdx.x)
+                                            : 0;
+        const int logical_block_stride = WRITE_CONTEXT_PARTIAL
+                                             ? static_cast<int>(gridDim.x)
+                                             : 1;
         const int tid = threadIdx.x;
         const int threads_per_block = blockDim.x;
         const int wavefront_id = tid / WAVEFRONT_SIZE;
         const int lane_id = tid % WAVEFRONT_SIZE;
+
+        /*
+         * Context graphs expose a CU-sized physical grid. Every workgroup
+         * deterministically strides the larger logical space of partition
+         * slots, batches, query tiles, and heads. All threads in a workgroup
+         * execute the same task sequence, so the barriers in the tiled
+         * attention body remain valid and no atomic work queue is required.
+         */
+        for (int logical_block = first_logical_block;
+             logical_block < logical_phase_blocks;
+             logical_block += logical_block_stride)
+        {
+            int batch_idx = static_cast<int>(blockIdx.z);
+            int q_tile_idx = static_cast<int>(blockIdx.y);
+            int head_idx = static_cast<int>(blockIdx.x);
+            int context_partition_slot = 0;
+            if constexpr (WRITE_CONTEXT_PARTIAL)
+            {
+                context_partition_slot =
+                    logical_block / phase_blocks_per_slot;
+                int participant_block =
+                    logical_block % phase_blocks_per_slot;
+                head_idx = participant_block % n_heads;
+                participant_block /= n_heads;
+                q_tile_idx = participant_block % logical_query_tiles;
+                batch_idx = participant_block / logical_query_tiles;
+            }
 
         // GQA mapping: multiple Q heads can share one KV head
         // When gqa_n_rep > 0, KV heads are REPLICATED (each device has all KV heads),
@@ -748,30 +891,57 @@ namespace
             : head_idx / effective_gqa_ratio;
 
         // Q row range for this block
-        const int q_block_start = q_tile_idx * tile_q;
+        const int q_block_start = q_tile_idx * kernel_tile_q;
         if (q_block_start >= seq_len)
-            return;
-        const int q_tile_rows = min(tile_q, seq_len - q_block_start);
+        {
+            if constexpr (WRITE_CONTEXT_PARTIAL)
+                continue;
+            else
+                return;
+        }
+        const int q_tile_rows = min(kernel_tile_q, seq_len - q_block_start);
+
+        /*
+         * Context execution launches a bounded persistent partition grid. Each
+         * physical slot strides over logical partitions, while summary storage
+         * is indexed by the logical partition number. The reducer can therefore
+         * traverse one fixed ascending arithmetic order regardless of the
+         * physical slot count selected by the capture-time policy.
+         */
+        int first_context_partition = 0;
+        int context_partition_stride = 1;
+        int live_context_partitions = 1;
+        if constexpr (WRITE_CONTEXT_PARTIAL)
+        {
+            live_context_partitions = graph_live_context_partitions;
+            first_context_partition = context_partition_slot;
+            context_partition_stride = context_partition_slots;
+            if (first_context_partition >= live_context_partitions ||
+                context_partition_stride <= 0)
+            {
+                continue;
+            }
+        }
 
         // Compute LDS layout
         FA2LDSLayout lds_layout;
-        lds_layout.compute(head_dim, tile_q, tile_kv);
+        lds_layout.compute(kernel_head_dim, kernel_tile_q, kernel_tile_kv);
 
         // LDS allocation
         extern __shared__ char smem[];
 
         __half *Q_tile = reinterpret_cast<__half *>(smem);
-        __half *KV_buffers = Q_tile + tile_q * lds_layout.q_stride;
-        float *scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * tile_kv * lds_layout.kv_stride);
+        __half *KV_buffers = Q_tile + kernel_tile_q * lds_layout.q_stride;
+        float *scores = reinterpret_cast<float *>(KV_buffers + FA2_NUM_STAGES * 2 * kernel_tile_kv * lds_layout.kv_stride);
 
         // Helper lambdas for double-buffered K/V access
         auto get_K_tile = [&](int stage) -> __half *
         {
-            return KV_buffers + stage * 2 * tile_kv * lds_layout.kv_stride;
+            return KV_buffers + stage * 2 * kernel_tile_kv * lds_layout.kv_stride;
         };
         auto get_V_tile = [&](int stage) -> __half *
         {
-            return KV_buffers + (stage * 2 + 1) * tile_kv * lds_layout.kv_stride;
+            return KV_buffers + (stage * 2 + 1) * kernel_tile_kv * lds_layout.kv_stride;
         };
 
         // =====================================================================
@@ -783,37 +953,47 @@ namespace
 
         // Use 4 threads per Q row so all 256 threads participate when tile_q=64.
         // Each thread owns a disjoint subset of output dims for that row.
-        constexpr int THREADS_PER_ROW = 4;
         const int local_q_row = tid / THREADS_PER_ROW;
         const int row_lane = tid % THREADS_PER_ROW;
         const bool thread_has_row = (local_q_row < q_tile_rows);
 
-        // This tiled kernel runs only for head_dim < 64 (rocBLAS handles >= 64).
-        // THREADS_PER_ROW=4 => max ceil(head_dim/4) = 16 dims per thread.
-        float O_acc[32];
+        /*
+         * Size static Qwen instantiations from their exact head dimension so
+         * LLVM never reserves a 256-wide accumulator for HD64/HD128. Generic
+         * uncommon dimensions retain the maximum bound and runtime predicate.
+         * Four lanes cooperate through HD128 and sixteen lanes above it; each
+         * thread therefore owns only the output values that can be live for its
+         * compiled geometry, keeping the array in VGPRs instead of scratch.
+         */
+        constexpr int COMPILED_HEAD_DIM =
+            STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM : 256;
+        constexpr int OUTPUTS_PER_THREAD =
+            (COMPILED_HEAD_DIM + THREADS_PER_ROW - 1) /
+            THREADS_PER_ROW;
+        float O_acc[OUTPUTS_PER_THREAD];
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
+        float merged_m = -FLT_MAX;
+        float merged_l = 0.0f;
 
-        if (thread_has_row)
+        #pragma unroll
+        for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
         {
-            int d_local = 0;
-            for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
-            {
-                O_acc[d_local++] = 0.0f;
-            }
+            O_acc[d_local] = 0.0f;
         }
 
         // Batch/head pointers
-        const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
-        const float *K_batch = K + batch_idx * kv_stride * n_kv_heads * head_dim;
-        const float *V_batch = V + batch_idx * kv_stride * n_kv_heads * head_dim;
+        const float *Q_batch = Q + batch_idx * seq_len * n_heads * kernel_head_dim;
+        const size_t request_element_offset =
+            static_cast<size_t>(batch_idx) * static_cast<size_t>(kv_stride) *
+            static_cast<size_t>(n_kv_heads) * static_cast<size_t>(kernel_head_dim);
 
         // =====================================================================
         // Load Q tile into LDS (done once per block)
         // =====================================================================
-        if ((head_dim & 1) == 0)
+        if ((kernel_head_dim & 1) == 0)
         {
-            const int head_dim_vec2 = head_dim / 2;
+            const int head_dim_vec2 = kernel_head_dim / 2;
             for (int i = tid; i < q_tile_rows * head_dim_vec2; i += threads_per_block)
             {
                 int local_row = i / head_dim_vec2;
@@ -822,68 +1002,122 @@ namespace
                 int global_row = q_block_start + local_row;
 
                 const float2 qv = *reinterpret_cast<const float2 *>(
-                    Q_batch + global_row * n_heads * head_dim + head_idx * head_dim + d);
+                    Q_batch + global_row * n_heads * kernel_head_dim + head_idx * kernel_head_dim + d);
                 reinterpret_cast<__half2 *>(Q_tile + local_row * lds_layout.q_stride + d)[0] = __float22half2_rn(qv);
             }
         }
         else
         {
-            for (int i = tid; i < q_tile_rows * head_dim; i += threads_per_block)
+            for (int i = tid; i < q_tile_rows * kernel_head_dim; i += threads_per_block)
             {
-                int local_row = i / head_dim;
-                int d = i % head_dim;
+                int local_row = i / kernel_head_dim;
+                int d = i % kernel_head_dim;
                 int global_row = q_block_start + local_row;
-                float val = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
+                float val = Q_batch[global_row * n_heads * kernel_head_dim + head_idx * kernel_head_dim + d];
                 Q_tile[local_row * lds_layout.q_stride + d] = float_to_half(val);
             }
         }
         __syncthreads();
 
-        const int num_kv_tiles = (kv_len_runtime + tile_kv - 1) / tile_kv;
-
-        // =====================================================================
-        // Prologue: Load first KV tile
-        // =====================================================================
+        for (int context_partition = first_context_partition;
+             context_partition < live_context_partitions;
+             context_partition += context_partition_stride)
         {
-            const int kv_start = 0;
-            const int kv_end = min(tile_kv, kv_len_runtime);
+            /*
+             * A persistent physical slot may own several logical partitions.
+             * Reset only its private online-softmax tuple between them; Q stays
+             * resident in LDS and the graph launches no additional work.
+             */
+            if (thread_has_row)
+            {
+                #pragma unroll
+                for (int d_local = 0;
+                     d_local < OUTPUTS_PER_THREAD;
+                     ++d_local)
+                {
+                    O_acc[d_local] = 0.0f;
+                }
+                m_i = -FLT_MAX;
+                l_i = 0.0f;
+            }
+
+            const int kv_partition_begin = WRITE_CONTEXT_PARTIAL
+                                               ? context_partition *
+                                                     context_partition_size
+                                               : 0;
+            const int kv_partition_end = WRITE_CONTEXT_PARTIAL
+                                             ? min(
+                                                   kv_partition_begin +
+                                                       context_partition_size,
+                                                   kv_len_runtime)
+                                             : kv_len_runtime;
+            const int partition_kv_len =
+                max(0, kv_partition_end - kv_partition_begin);
+            const int num_kv_tiles =
+                (partition_kv_len + kernel_tile_kv - 1) /
+                kernel_tile_kv;
+
+            // =================================================================
+            // Prologue: Load the first K/V tile in this arithmetic partition.
+            // =================================================================
+            {
+            const int kv_start = kv_partition_begin;
+            const int kv_end = min(
+                kv_start + kernel_tile_kv,
+                kv_partition_end);
             const int actual_len = kv_end - kv_start;
 
             __half *K_dst = get_K_tile(0);
             __half *V_dst = get_V_tile(0);
 
-            if ((head_dim & 1) == 0)
+            if ((kernel_head_dim & 1) == 0)
             {
-                const int head_dim_vec2 = head_dim / 2;
+                const int head_dim_vec2 = kernel_head_dim / 2;
                 for (int i = tid; i < actual_len * head_dim_vec2; i += threads_per_block)
                 {
                     int local_row = i / head_dim_vec2;
                     int d2 = i % head_dim_vec2;
                     int d = d2 * 2;
-                    int global_row = kv_start + local_row;
+                    const int logical_row = kv_start + local_row;
+                    const int global_row = ring_row_capacity > 0
+                                               ? (ring_row_origin + logical_row) %
+                                                     ring_row_capacity
+                                               : logical_row;
+                    const size_t element =
+                        request_element_offset +
+                        (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                            static_cast<size_t>(kernel_head_dim) +
+                        static_cast<size_t>(d);
 
-                    const float2 kv = *reinterpret_cast<const float2 *>(
-                        K_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-                    const float2 vv = *reinterpret_cast<const float2 *>(
-                        V_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-
-                    reinterpret_cast<__half2 *>(K_dst + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(kv);
-                    reinterpret_cast<__half2 *>(V_dst + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(vv);
+                    reinterpret_cast<__half2 *>(
+                        K_dst + local_row * lds_layout.kv_stride + d)[0] =
+                        load_fa2_kv_pair_as_half2<KV_TYPE>(K, element);
+                    reinterpret_cast<__half2 *>(
+                        V_dst + local_row * lds_layout.kv_stride + d)[0] =
+                        load_fa2_kv_pair_as_half2<KV_TYPE>(V, element);
                 }
             }
             else
             {
-                for (int i = tid; i < actual_len * head_dim; i += threads_per_block)
+                for (int i = tid; i < actual_len * kernel_head_dim; i += threads_per_block)
                 {
-                    int local_row = i / head_dim;
-                    int d = i % head_dim;
-                    int global_row = kv_start + local_row;
+                    int local_row = i / kernel_head_dim;
+                    int d = i % kernel_head_dim;
+                    const int logical_row = kv_start + local_row;
+                    const int global_row = ring_row_capacity > 0
+                                               ? (ring_row_origin + logical_row) %
+                                                     ring_row_capacity
+                                               : logical_row;
+                    const size_t element =
+                        request_element_offset +
+                        (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                            static_cast<size_t>(kernel_head_dim) +
+                        static_cast<size_t>(d);
 
-                    float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                    float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-
-                    K_dst[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
-                    V_dst[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                    K_dst[local_row * lds_layout.kv_stride + d] =
+                        load_fa2_kv_element_as_half<KV_TYPE>(K, element);
+                    V_dst[local_row * lds_layout.kv_stride + d] =
+                        load_fa2_kv_element_as_half<KV_TYPE>(V, element);
                 }
             }
         }
@@ -897,14 +1131,17 @@ namespace
             const int current_stage = kv_tile_iter % FA2_NUM_STAGES;
             const int next_stage = (kv_tile_iter + 1) % FA2_NUM_STAGES;
 
-            const int kv_start = kv_tile_iter * tile_kv;
-            const int kv_end = min(kv_start + tile_kv, kv_len_runtime);
+            const int kv_start =
+                kv_partition_begin + kv_tile_iter * kernel_tile_kv;
+            const int kv_end = min(
+                kv_start + kernel_tile_kv,
+                kv_partition_end);
             const int actual_kv_len = kv_end - kv_start;
 
-            // Early exit for causal (all positions masked)
-            if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset_runtime)
+            // Every later tile is also masked for the complete query block.
+            if (causal && kv_start > (q_block_start + kernel_tile_q - 1) + position_offset_runtime)
             {
-                continue;
+                break;
             }
 
             __half *K_tile = get_K_tile(current_stage);
@@ -915,46 +1152,66 @@ namespace
             // =================================================================
             if (kv_tile_iter + 1 < num_kv_tiles)
             {
-                const int next_kv_start = (kv_tile_iter + 1) * tile_kv;
-                const int next_kv_end = min(next_kv_start + tile_kv, kv_len_runtime);
+                const int next_kv_start =
+                    kv_partition_begin +
+                    (kv_tile_iter + 1) * kernel_tile_kv;
+                const int next_kv_end = min(
+                    next_kv_start + kernel_tile_kv,
+                    kv_partition_end);
                 const int next_len = next_kv_end - next_kv_start;
 
                 __half *K_next = get_K_tile(next_stage);
                 __half *V_next = get_V_tile(next_stage);
 
                 // Cooperative load by all threads
-                if ((head_dim & 1) == 0)
+                if ((kernel_head_dim & 1) == 0)
                 {
-                    const int head_dim_vec2 = head_dim / 2;
+                    const int head_dim_vec2 = kernel_head_dim / 2;
                     for (int i = tid; i < next_len * head_dim_vec2; i += threads_per_block)
                     {
                         int local_row = i / head_dim_vec2;
                         int d2 = i % head_dim_vec2;
                         int d = d2 * 2;
-                        int global_row = next_kv_start + local_row;
+                        const int logical_row = next_kv_start + local_row;
+                        const int global_row = ring_row_capacity > 0
+                                                   ? (ring_row_origin + logical_row) %
+                                                         ring_row_capacity
+                                                   : logical_row;
+                        const size_t element =
+                            request_element_offset +
+                            (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                                static_cast<size_t>(kernel_head_dim) +
+                            static_cast<size_t>(d);
 
-                        const float2 kv = *reinterpret_cast<const float2 *>(
-                            K_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-                        const float2 vv = *reinterpret_cast<const float2 *>(
-                            V_batch + global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d);
-
-                        reinterpret_cast<__half2 *>(K_next + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(kv);
-                        reinterpret_cast<__half2 *>(V_next + local_row * lds_layout.kv_stride + d)[0] = __float22half2_rn(vv);
+                        reinterpret_cast<__half2 *>(
+                            K_next + local_row * lds_layout.kv_stride + d)[0] =
+                            load_fa2_kv_pair_as_half2<KV_TYPE>(K, element);
+                        reinterpret_cast<__half2 *>(
+                            V_next + local_row * lds_layout.kv_stride + d)[0] =
+                            load_fa2_kv_pair_as_half2<KV_TYPE>(V, element);
                     }
                 }
                 else
                 {
-                    for (int i = tid; i < next_len * head_dim; i += threads_per_block)
+                    for (int i = tid; i < next_len * kernel_head_dim; i += threads_per_block)
                     {
-                        int local_row = i / head_dim;
-                        int d = i % head_dim;
-                        int global_row = next_kv_start + local_row;
+                        int local_row = i / kernel_head_dim;
+                        int d = i % kernel_head_dim;
+                        const int logical_row = next_kv_start + local_row;
+                        const int global_row = ring_row_capacity > 0
+                                                   ? (ring_row_origin + logical_row) %
+                                                         ring_row_capacity
+                                                   : logical_row;
+                        const size_t element =
+                            request_element_offset +
+                            (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
+                                static_cast<size_t>(kernel_head_dim) +
+                            static_cast<size_t>(d);
 
-                        float k_val = K_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-                        float v_val = V_batch[global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d];
-
-                        K_next[local_row * lds_layout.kv_stride + d] = float_to_half(k_val);
-                        V_next[local_row * lds_layout.kv_stride + d] = float_to_half(v_val);
+                        K_next[local_row * lds_layout.kv_stride + d] =
+                            load_fa2_kv_element_as_half<KV_TYPE>(K, element);
+                        V_next[local_row * lds_layout.kv_stride + d] =
+                            load_fa2_kv_element_as_half<KV_TYPE>(V, element);
                     }
                 }
             }
@@ -983,9 +1240,9 @@ namespace
                 // Each instruction: d.f32 = a.f16x2 · b.f16x2 + c.f32
                 // Replaces 4× fp16→fp32 convert + 2× FP32 FMA per half2 pair
                 // with a single hardware dot-product instruction.
-                if ((head_dim & 1) == 0)
+                if ((kernel_head_dim & 1) == 0)
                 {
-                    const int head_dim_vec2 = head_dim / 2;
+                    const int head_dim_vec2 = kernel_head_dim / 2;
                     const __half2 *Q_ptr2 = reinterpret_cast<const __half2 *>(Q_ptr);
                     const __half2 *K_ptr2 = reinterpret_cast<const __half2 *>(K_ptr);
 
@@ -1011,7 +1268,7 @@ namespace
                 }
                 else
                 {
-                    for (int d = 0; d < head_dim; d++)
+                    for (int d = 0; d < kernel_head_dim; d++)
                     {
                         score += half_to_float(Q_ptr[d]) * half_to_float(K_ptr[d]);
                     }
@@ -1106,10 +1363,12 @@ namespace
                 float scale_old = fast_expf(m_i - m_i_new);
 
                 // Rescale previous accumulators
-                int d_local = 0;
-                for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
+                #pragma unroll
+                for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
                 {
-                    O_acc[d_local++] *= scale_old;
+                    const int d = row_lane + d_local * THREADS_PER_ROW;
+                    if (d < kernel_head_dim)
+                        O_acc[d_local] *= scale_old;
                 }
                 l_i *= scale_old;
 
@@ -1124,10 +1383,12 @@ namespace
                         l_ij += p;
 
                         const __half *V_row = V_tile + j * lds_layout.kv_stride;
-                        int d_local = 0;
-                        for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
+                        #pragma unroll
+                        for (int d_local = 0; d_local < OUTPUTS_PER_THREAD; ++d_local)
                         {
-                            O_acc[d_local++] += p * half_to_float(V_row[d]);
+                            const int d = row_lane + d_local * THREADS_PER_ROW;
+                            if (d < kernel_head_dim)
+                                O_acc[d_local] += p * half_to_float(V_row[d]);
                         }
                     }
                 }
@@ -1136,25 +1397,177 @@ namespace
                 m_i = m_i_new;
             }
 
+            constexpr int canonical_partition_keys =
+                llaminar2::rocm::fa2_policy::
+                    kROCmFA2CanonicalContextPartitionKeys;
+            const int maximum_visible_key =
+                q_block_start + kernel_tile_q - 1 +
+                position_offset_runtime;
+            const bool next_tile_is_causally_empty =
+                causal && kv_end > maximum_visible_key;
+
+            if constexpr (!WRITE_CONTEXT_PARTIAL)
+            {
+                const bool closes_canonical_partition =
+                    kv_end % canonical_partition_keys == 0;
+                const bool closes_scan =
+                    kv_tile_iter + 1 == num_kv_tiles ||
+                    next_tile_is_causally_empty;
+                if ((closes_canonical_partition || closes_scan) &&
+                    thread_has_row)
+                {
+                    const int global_q_row =
+                        q_block_start + local_q_row;
+                    float *O_row =
+                        O +
+                        ((static_cast<size_t>(batch_idx) * seq_len +
+                          global_q_row) *
+                             n_heads +
+                         head_idx) *
+                            static_cast<size_t>(kernel_head_dim);
+
+                    if (l_i > 0.0f)
+                    {
+                        if (!(merged_l > 0.0f))
+                        {
+                            merged_m = m_i;
+                            merged_l = l_i;
+                            #pragma unroll
+                            for (int d_local = 0;
+                                 d_local < OUTPUTS_PER_THREAD;
+                                 ++d_local)
+                            {
+                                const int d =
+                                    row_lane +
+                                    d_local * THREADS_PER_ROW;
+                                if (d < kernel_head_dim)
+                                    O_row[d] = O_acc[d_local];
+                            }
+                        }
+                        else
+                        {
+                            const float next_m =
+                                fmaxf(merged_m, m_i);
+                            const float previous_scale =
+                                fast_expf(merged_m - next_m);
+                            const float partition_scale =
+                                fast_expf(m_i - next_m);
+                            #pragma unroll
+                            for (int d_local = 0;
+                                 d_local < OUTPUTS_PER_THREAD;
+                                 ++d_local)
+                            {
+                                const int d =
+                                    row_lane +
+                                    d_local * THREADS_PER_ROW;
+                                if (d < kernel_head_dim)
+                                {
+                                    O_row[d] = merge_fa2_scaled_terms(
+                                        O_row[d],
+                                        previous_scale,
+                                        O_acc[d_local],
+                                        partition_scale);
+                                }
+                            }
+                            merged_l = merge_fa2_scaled_terms(
+                                merged_l,
+                                previous_scale,
+                                l_i,
+                                partition_scale);
+                            merged_m = next_m;
+                        }
+                    }
+
+                    if (!closes_scan)
+                    {
+                        #pragma unroll
+                        for (int d_local = 0;
+                             d_local < OUTPUTS_PER_THREAD;
+                             ++d_local)
+                        {
+                            O_acc[d_local] = 0.0f;
+                        }
+                        m_i = -FLT_MAX;
+                        l_i = 0.0f;
+                    }
+                }
+            }
+
             __syncthreads();
+            if (next_tile_is_causally_empty)
+                break;
         }
 
         // =====================================================================
-        // Write final output
+        // Publish one canonical summary or the final normalized output.
         // =====================================================================
-        float *O_batch = O + batch_idx * seq_len * n_heads * head_dim;
-
         if (thread_has_row)
         {
-            int global_q_row = q_block_start + local_q_row;
-            float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+            const int global_q_row = q_block_start + local_q_row;
+            float *O_row =
+                O +
+                ((static_cast<size_t>(batch_idx) * seq_len +
+                  global_q_row) *
+                     n_heads +
+                 head_idx) *
+                    static_cast<size_t>(kernel_head_dim);
 
-            float *O_row = O_batch + global_q_row * n_heads * head_dim + head_idx * head_dim;
-            int d_local = 0;
-            for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
+            if constexpr (WRITE_CONTEXT_PARTIAL)
             {
-                O_row[d] = O_acc[d_local++] * inv_l;
+                const size_t summary_index =
+                    ((static_cast<size_t>(batch_idx) * seq_len +
+                      global_q_row) *
+                         n_heads +
+                     head_idx) *
+                        max_context_partitions +
+                    context_partition;
+                float *O_summary =
+                    O_partial +
+                    summary_index * static_cast<size_t>(kernel_head_dim);
+                #pragma unroll
+                for (int d_local = 0;
+                     d_local < OUTPUTS_PER_THREAD;
+                     ++d_local)
+                {
+                    const int d =
+                        row_lane + d_local * THREADS_PER_ROW;
+                    if (d < kernel_head_dim)
+                        O_summary[d] = O_acc[d_local];
+                }
+                if (row_lane == 0)
+                {
+                    m_partial[summary_index] = m_i;
+                    l_partial[summary_index] = l_i;
+                }
             }
+            else
+            {
+                const float inverse_l =
+                    merged_l > 0.0f ? 1.0f / merged_l : 0.0f;
+                #pragma unroll
+                for (int d_local = 0;
+                     d_local < OUTPUTS_PER_THREAD;
+                     ++d_local)
+                {
+                    const int d =
+                        row_lane + d_local * THREADS_PER_ROW;
+                    if (d < kernel_head_dim)
+                    {
+                        O_row[d] = merged_l > 0.0f
+                                       ? O_row[d] * inverse_l
+                                       : 0.0f;
+                    }
+                }
+            }
+        }
+
+        if constexpr (WRITE_CONTEXT_PARTIAL)
+        {
+            // Every thread must finish consuming LDS before this persistent
+            // slot advances and reuses it for the next logical partition.
+            __syncthreads();
+        }
+        }
         }
     }
 
@@ -1199,6 +1612,177 @@ namespace
     }
 
     /**
+     * @brief Physical cache ownership represented by one decode grid row.
+     *
+     * The arithmetic body is shared across all policies.  Only parameter-row
+     * selection and the K/V bank base differ, which is essential for proving
+     * grouped execution byte-identical to the ordinary scalar decode kernel.
+     */
+    enum class FlashDecodeRowMode
+    {
+        OrdinaryBatch,      ///< One physical K/V bank per ordinary batch row.
+        SharedKVVerifier,   ///< Every verifier row reads one shared cache bank.
+        IndependentRequest ///< Flat rows map to fixed-stride request cache banks.
+    };
+
+    /**
+     * @brief Scalar-equivalent launch policy for one grouped decode row.
+     */
+    struct FlashDecodeRowConfig
+    {
+        int splits;
+        int threads_per_block;
+    };
+
+    /**
+     * @brief Clamp an integer without relying on host-only standard-library code.
+     */
+    __device__ __forceinline__ int deviceClampInt(int value, int lo, int hi)
+    {
+        return value < lo ? lo : (value > hi ? hi : value);
+    }
+
+    /**
+     * @brief Round upward to a power of two, bounded by a row's split cap.
+     */
+    __device__ __forceinline__ int deviceRoundUpPow2Clamped(
+        int value,
+        int max_allowed)
+    {
+        int result = 1;
+        while (result < value && result < max_allowed)
+            result <<= 1;
+        return deviceClampInt(result, 1, max_allowed);
+    }
+
+    /**
+     * @brief Reproduce the production scalar ROCm decode policy on device.
+     *
+     * Grouped rows can own unequal live KV lengths even though graph capture
+     * requires one fixed grid and block shape. The phase kernel launches the
+     * maximum physical geometry, then only the
+     * split and wavefront prefix selected from the live device-owned KV length
+     * participates. Consequently ordinary M=1 and grouped verifier rows retain
+     * the same KV partition, wavefront merge order, and reduction order while
+     * one graph executable spans every short- and long-sequence regime.
+     */
+    __device__ __forceinline__ FlashDecodeRowConfig selectDecodeRowConfig(
+        int kv_len,
+        int head_dim,
+        int n_heads,
+        int num_cus,
+        int max_launch_splits,
+        bool forced_splits_present,
+        int forced_splits,
+        bool forced_tpb_present,
+        int forced_tpb)
+    {
+        /*
+         * These regimes are offline-tuned launch policy, not online
+         * autotuning. The 256-thread physical workgroup is immutable in the
+         * graph. Only the active split prefix changes from device-owned
+         * sequence metadata:
+         *
+         *   - eight splits amortize phase/reduction overhead at short context;
+         *   - sixteen splits fill gfx906 for ordinary Qwen3.6 head counts;
+         *   - a LocalTP shard with at most eight query heads needs 32 splits
+         *     from 1K onward to expose the same block-level parallelism;
+         *   - ordinary 16-head execution crosses to 32 splits at 8K.
+         *
+         * The byte-equivalence sweep compares grouped rows against independent
+         * M=1 calls across every boundary, so changing prefix size cannot
+         * silently change grouped verifier arithmetic.
+         */
+        int requested_cap = 8;
+        if (kv_len >= 8192)
+            requested_cap = 32;
+        else if (n_heads <= 8 && kv_len >= 1024)
+            requested_cap = 32;
+        else if (kv_len >= 256)
+            requested_cap = 16;
+
+        const int max_allowed = deviceClampInt(
+            deviceClampInt(
+                requested_cap < max_launch_splits
+                    ? requested_cap
+                    : max_launch_splits,
+                1,
+                kv_len > 0 ? kv_len : 1),
+            1,
+            FD_MAX_SPLITS_SUPPORTED);
+        const int safe_head_dim = head_dim > 0 ? head_dim : 1;
+        const int64_t total_elements =
+            static_cast<int64_t>(kv_len) * static_cast<int64_t>(safe_head_dim);
+        int base_splits = static_cast<int>(
+            (total_elements + FD_TARGET_ELEMS_PER_SPLIT - 1) /
+            FD_TARGET_ELEMS_PER_SPLIT);
+        if (base_splits < 1)
+            base_splits = 1;
+
+        if (kv_len >= safe_head_dim * 8)
+            base_splits = (base_splits * 3 + 1) / 2;
+        else if (kv_len <= safe_head_dim * 2)
+            base_splits = (base_splits + 1) / 2 > 1
+                              ? (base_splits + 1) / 2
+                              : 1;
+
+        if (base_splits > kv_len)
+            base_splits = kv_len > 0 ? kv_len : 1;
+        int row_splits =
+            deviceRoundUpPow2Clamped(base_splits, max_allowed);
+
+        if (n_heads > 0 && num_cus > 0)
+        {
+            /*
+             * The 36-VGPR FP16 specialization sustains seven resident
+             * workgroups per CU. Filling that envelope is especially
+             * important for LocalTP shards whose reduced head count would
+             * otherwise leave most CUs idle at long context.
+             */
+            constexpr int target_resident_blocks_per_cu = 7;
+            const int target_blocks =
+                num_cus * target_resident_blocks_per_cu;
+            if (n_heads * row_splits < target_blocks)
+            {
+                const int occupancy_splits =
+                    (target_blocks + n_heads - 1) / n_heads;
+                const int rounded_occupancy_splits =
+                    deviceRoundUpPow2Clamped(occupancy_splits, max_allowed);
+                if (rounded_occupancy_splits > row_splits)
+                    row_splits = rounded_occupancy_splits;
+            }
+        }
+        row_splits = deviceClampInt(row_splits, 1, max_allowed);
+        if (forced_splits_present)
+        {
+            /*
+             * Offline profiling must be able to compare every split count
+             * admitted by the immutable capture envelope, including counts
+             * above the production heuristic for this live KV length.
+             */
+            row_splits = deviceClampInt(
+                forced_splits,
+                1,
+                deviceClampInt(
+                    max_launch_splits,
+                    1,
+                    FD_MAX_SPLITS_SUPPORTED));
+        }
+
+        /*
+         * Offline A/B measurements showed that deactivating two wavefronts
+         * roughly doubled short-context latency and remained slower at every
+         * tested Qwen3.6 sequence length. Keep the logical workgroup identical
+         * to the captured 256-thread workgroup in production.
+         */
+        int row_threads = 256;
+        if (forced_tpb_present)
+            row_threads = deviceClampInt(forced_tpb, 64, 256);
+
+        return FlashDecodeRowConfig{row_splits, row_threads};
+    }
+
+    /**
      * @brief Flash Decoding kernel for single-query decode on MI50
      *        v3: wavefront-cooperative KV processing + exp2f intrinsic
      */
@@ -1218,37 +1802,92 @@ namespace
         int num_splits,
         float softmax_scale,
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        FlashDecodeRowMode row_mode,
+        int query_rows_per_request,
+        int num_cus,
+        bool forced_splits_present,
+        int forced_splits,
+        bool forced_tpb_present,
+        int forced_tpb,
         int head_start = 0,
         int gqa_n_rep = 0)
     {
+        /*
+         * Ownership is runtime metadata, not a template axis. Keeping one
+         * compiled kernel per physical KV format guarantees that ordinary M=1
+         * and grouped verifier rows execute the same arithmetic instruction
+         * stream. The mode affects addresses only.
+         */
+        const bool row_local_params =
+            row_mode != FlashDecodeRowMode::OrdinaryBatch;
+        const bool shared_kv =
+            row_mode == FlashDecodeRowMode::SharedKVVerifier;
+
         int kv_len_runtime = kv_len;
         int kv_batch_stride = kv_len;
+        int ring_row_origin = 0;
+        int ring_row_capacity = 0;
         if (device_params)
         {
-            kv_len_runtime = device_params->kv_len;
+            const int param_row = row_local_params ? blockIdx.z : 0;
+            kv_len_runtime = device_params[param_row].kv_len;
+            kv_batch_stride = device_params[param_row].kv_stride;
+            ring_row_origin = device_params[param_row].ring_row_origin;
+            ring_row_capacity = device_params[param_row].ring_row_capacity;
         }
 
         const int head_idx = blockIdx.x;
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
 
+        FlashDecodeRowConfig row_config{
+            num_splits,
+            static_cast<int>(blockDim.x)};
+        row_config = selectDecodeRowConfig(
+            kv_len_runtime,
+            head_dim,
+            n_heads,
+            num_cus,
+            num_splits,
+            forced_splits_present,
+            forced_splits,
+            forced_tpb_present,
+            forced_tpb);
+        const int row_num_splits = row_config.splits;
+        const int logical_threads = row_config.threads_per_block;
+
+        /*
+         * Every thread in the physical 256-thread block still reaches both
+         * barriers.  Only the scalar-selected prefix performs arithmetic.  In
+         * particular, a row whose ordinary decode uses 128 threads executes
+         * with exactly two active wavefronts and merges those two wavefronts in
+         * the same order even when another row in this grid needs four.
+         */
+        const int tid = threadIdx.x;
+        const bool active_thread = tid < logical_threads;
+        const int wavefront_id = tid / WAVEFRONT_SIZE;
+        const int lane_id = tid % WAVEFRONT_SIZE;
+        const int num_wavefronts =
+            logical_threads / WAVEFRONT_SIZE > 0
+                ? logical_threads / WAVEFRONT_SIZE
+                : 1;
+
         const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
         const int kv_head_idx = (gqa_n_rep > 0)
             ? (head_start + head_idx) / effective_gqa_ratio
             : head_idx / effective_gqa_ratio;
 
-        // Split range
-        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
+        /* Surplus split planes are outside this row's scalar launch shape. */
+        if (split_idx >= row_num_splits)
+            return;
+
+        // Split range: identical integer partitioning to scalar M=1 decode.
+        const int split_size =
+            (kv_len_runtime + row_num_splits - 1) / row_num_splits;
         const int kv_start = split_idx * split_size;
         const int kv_end = min(kv_start + split_size, kv_len_runtime);
 
         const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
-
-        const int tid = threadIdx.x;
-        const int num_threads = blockDim.x;
-        const int wavefront_id = tid / WAVEFRONT_SIZE;
-        const int lane_id = tid % WAVEFRONT_SIZE;
-        const int num_wavefronts = num_threads / WAVEFRONT_SIZE;
 
         // Handle empty splits
         if (kv_start >= kv_len_runtime)
@@ -1258,7 +1897,9 @@ namespace
                 m_partial[partial_idx] = -FLT_MAX;
                 l_partial[partial_idx] = 0.0f;
             }
-            for (int d = tid * 2; d + 1 < head_dim; d += num_threads * 2)
+            for (int d = tid * 2;
+                 active_thread && d + 1 < head_dim;
+                 d += logical_threads * 2)
             {
                 const int base = (batch_idx * n_heads + head_idx) * head_dim;
                 const int idx0 = (base + d + 0) * num_splits + split_idx;
@@ -1266,7 +1907,9 @@ namespace
                 O_partial[idx0] = 0.0f;
                 O_partial[idx1] = 0.0f;
             }
-            for (int d = (head_dim & ~1) + tid; d < head_dim; d += num_threads)
+            for (int d = (head_dim & ~1) + tid;
+                 active_thread && d < head_dim;
+                 d += logical_threads)
             {
                 const int base = (batch_idx * n_heads + head_idx) * head_dim;
                 const int idx = (base + d) * num_splits + split_idx;
@@ -1277,7 +1920,8 @@ namespace
 
         // Load Q into LDS (all threads cooperate)
         // FP16 KV path: store Q as half in LDS (convert once, use many times)
-        // FP32/Q8_1 paths: store Q as float in LDS (matching their dot product type)
+        // FP32/BF16/Q8_1 paths store Q as float in LDS so BF16 and Q8_1
+        // dequantization retains the scalar FP32 decode arithmetic contract.
         extern __shared__ char smem[];
         [[maybe_unused]] float *Q_shared = nullptr;
         [[maybe_unused]] __half *Q_shared_h = nullptr;
@@ -1289,7 +1933,9 @@ namespace
             // Store Q as FP16 in LDS — eliminates per-KV-position FP32→FP16 conversion
             // Halves LDS bandwidth for Q reads (4B → 2B per element per lane)
             Q_shared_h = reinterpret_cast<__half *>(smem);
-            for (int d = tid; d < head_dim; d += num_threads)
+            for (int d = tid;
+                 active_thread && d < head_dim;
+                 d += logical_threads)
             {
                 Q_shared_h[d] = __float2half(Q_ptr[d]);
             }
@@ -1297,12 +1943,16 @@ namespace
         else
         {
             Q_shared = reinterpret_cast<float *>(smem);
-            for (int d = tid * 2; d + 1 < head_dim; d += num_threads * 2)
+            for (int d = tid * 2;
+                 active_thread && d + 1 < head_dim;
+                 d += logical_threads * 2)
             {
                 const float2 qv = reinterpret_cast<const float2 *>(Q_ptr + d)[0];
                 reinterpret_cast<float2 *>(Q_shared + d)[0] = qv;
             }
-            for (int d = (head_dim & ~1) + tid; d < head_dim; d += num_threads)
+            for (int d = (head_dim & ~1) + tid;
+                 active_thread && d < head_dim;
+                 d += logical_threads)
             {
                 Q_shared[d] = Q_ptr[d];
             }
@@ -1332,19 +1982,36 @@ namespace
         [[maybe_unused]] const int q8_bph = head_dim / Q8_BS;    // blocks per head
         [[maybe_unused]] const int q8_bpr = n_kv_heads * q8_bph; // blocks per KV row
 
+        int cache_batch_idx = batch_idx;
+        if (shared_kv)
+        {
+            cache_batch_idx = 0;
+        }
+        else if (row_mode == FlashDecodeRowMode::IndependentRequest)
+        {
+            cache_batch_idx =
+                batch_idx / (query_rows_per_request > 0
+                                 ? query_rows_per_request
+                                 : 1);
+        }
+
         size_t row_byte_stride;
         size_t base_byte_off;
         if constexpr (KV_TYPE == KVTypeTag::Q8_1) {
             row_byte_stride = static_cast<size_t>(q8_bpr) * sizeof(llaminar2::Q8_1Block);
-            base_byte_off = static_cast<size_t>(batch_idx) * kv_batch_stride * row_byte_stride
+            base_byte_off = static_cast<size_t>(cache_batch_idx) * kv_batch_stride * row_byte_stride
                           + static_cast<size_t>(kv_head_idx) * q8_bph * sizeof(llaminar2::Q8_1Block);
         } else if constexpr (KV_TYPE == KVTypeTag::FP16) {
             row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(__half);
-            base_byte_off = static_cast<size_t>(batch_idx) * kv_batch_stride * row_byte_stride
+            base_byte_off = static_cast<size_t>(cache_batch_idx) * kv_batch_stride * row_byte_stride
                           + static_cast<size_t>(kv_head_offset_elems) * sizeof(__half);
+        } else if constexpr (KV_TYPE == KVTypeTag::BF16) {
+            row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(hip_bfloat16);
+            base_byte_off = static_cast<size_t>(cache_batch_idx) * kv_batch_stride * row_byte_stride
+                          + static_cast<size_t>(kv_head_offset_elems) * sizeof(hip_bfloat16);
         } else {
             row_byte_stride = static_cast<size_t>(kv_row_stride_elems) * sizeof(float);
-            base_byte_off = static_cast<size_t>(batch_idx) * kv_batch_stride * row_byte_stride
+            base_byte_off = static_cast<size_t>(cache_batch_idx) * kv_batch_stride * row_byte_stride
                           + static_cast<size_t>(kv_head_offset_elems) * sizeof(float);
         }
         const char *K_base = reinterpret_cast<const char*>(K_cache) + base_byte_off;
@@ -1357,9 +2024,16 @@ namespace
         // Within each position, all 64 lanes cooperate on loads and dot product.
         // K/V loads are fully coalesced (adjacent lanes → adjacent addresses).
         // =====================================================================
-        for (int kv_pos = kv_start + wavefront_id; kv_pos < kv_end; kv_pos += num_wavefronts)
+        for (int kv_pos = kv_start + wavefront_id;
+             active_thread && kv_pos < kv_end;
+             kv_pos += num_wavefronts)
         {
-            const char *K_pos = K_base + kv_pos * row_byte_stride;
+            const int physical_kv_pos = ring_row_capacity > 0
+                                            ? (ring_row_origin + kv_pos) %
+                                                  ring_row_capacity
+                                            : kv_pos;
+            const char *K_pos =
+                K_base + physical_kv_pos * row_byte_stride;
 
             // Type-dispatched K load + dot product
             // FP16: half bandwidth, fdot2 for vectorized path (Q→FP16 on the fly)
@@ -1398,6 +2072,16 @@ namespace
                     const int bo = d % Q8_BS;
                     const float ks = __half2float(*reinterpret_cast<const __half*>(&Kq[bi].d));
                     partial_dot += Q_shared[d] * (static_cast<float>(Kq[bi].qs[bo]) * ks);
+                }
+            }
+            else if constexpr (KV_TYPE == KVTypeTag::BF16)
+            {
+                const auto *K_bf16 =
+                    reinterpret_cast<const hip_bfloat16 *>(K_pos);
+                for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE)
+                {
+                    partial_dot +=
+                        Q_shared[d] * static_cast<float>(K_bf16[d]);
                 }
             }
             else
@@ -1439,7 +2123,8 @@ namespace
 
             // Type-dispatched V load + O accumulation
             // Each lane updates only its own output dims (head_dim/64 per lane)
-            const char *V_pos = V_base + kv_pos * row_byte_stride;
+            const char *V_pos =
+                V_base + physical_kv_pos * row_byte_stride;
             int o_idx = 0;
             if constexpr (KV_TYPE == KVTypeTag::FP16)
             {
@@ -1458,6 +2143,19 @@ namespace
                     const int bo = d % Q8_BS;
                     const float vs = __half2float(*reinterpret_cast<const __half*>(&Vq[bi].d));
                     O_lane[o_idx] = O_lane[o_idx] * scale_old + p * (static_cast<float>(Vq[bi].qs[bo]) * vs);
+                }
+            }
+            else if constexpr (KV_TYPE == KVTypeTag::BF16)
+            {
+                const auto *V_bf16 =
+                    reinterpret_cast<const hip_bfloat16 *>(V_pos);
+                for (int d = lane_id;
+                     d < head_dim;
+                     d += WAVEFRONT_SIZE, ++o_idx)
+                {
+                    O_lane[o_idx] =
+                        O_lane[o_idx] * scale_old +
+                        p * static_cast<float>(V_bf16[d]);
                 }
             }
             else
@@ -1486,18 +2184,18 @@ namespace
         __shared__ float block_O[4 * 256]; // 4 wavefronts × max head_dim
 
         // Write this wavefront's results to LDS
-        if (lane_id == 0)
+        if (active_thread && lane_id == 0)
         {
             block_m[wavefront_id] = m_local;
             block_l[wavefront_id] = l_local;
         }
-        if (head_dim == 128)
+        if (active_thread && head_dim == 128)
         {
             const int base = wavefront_id * 128;
             block_O[base + lane_id] = O_lane[0];
             block_O[base + lane_id + WAVEFRONT_SIZE] = O_lane[1];
         }
-        else
+        else if (active_thread)
         {
             int o_idx = 0;
             for (int d = lane_id; d < head_dim; d += WAVEFRONT_SIZE, o_idx++)
@@ -1538,7 +2236,7 @@ namespace
         __syncthreads(); // All threads hit this — wf_scales now visible
 
         // Parallel output write — wavefront 0 lanes each handle their output dims
-        if (wavefront_id == 0)
+        if (active_thread && wavefront_id == 0)
         {
             const int base = (batch_idx * n_heads + head_idx) * head_dim;
 
@@ -1604,30 +2302,53 @@ namespace
         float *__restrict__ O,
         int n_heads,
         int head_dim,
-        int num_splits)
+        int num_splits,
+        int kv_len,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        FlashDecodeRowMode row_mode,
+        int num_cus,
+        bool forced_splits_present,
+        int forced_splits,
+        bool forced_tpb_present,
+        int forced_tpb)
     {
         const int head_idx = blockIdx.x;
         const int batch_idx = blockIdx.y;
+        const int output_tile = blockIdx.z;
+        const int output_tiles = gridDim.z;
 
         const int tid = threadIdx.x;
+        const int param_row =
+            row_mode != FlashDecodeRowMode::OrdinaryBatch ? batch_idx : 0;
+        const int row_kv_len =
+            device_params ? device_params[param_row].kv_len : kv_len;
+        const int row_num_splits =
+            selectDecodeRowConfig(
+                row_kv_len,
+                head_dim,
+                n_heads,
+                num_cus,
+                num_splits,
+                forced_splits_present,
+                forced_splits,
+                forced_tpb_present,
+                forced_tpb)
+                .splits;
         const int base_idx = (batch_idx * n_heads + head_idx) * num_splits;
 
         // Find global max and compute scales
-        __shared__ float global_m;
         __shared__ float global_l;
         __shared__ float split_scales[32]; // Support up to 32 splits
 
         if (tid == 0)
         {
             float m_max = -FLT_MAX;
-            for (int s = 0; s < num_splits; s++)
+            for (int s = 0; s < row_num_splits; s++)
             {
                 m_max = fmaxf(m_max, m_partial[base_idx + s]);
             }
-            global_m = m_max;
-
             float l_sum = 0.0f;
-            for (int s = 0; s < num_splits; s++)
+            for (int s = 0; s < row_num_splits; s++)
             {
                 float scale = expf(m_partial[base_idx + s] - m_max);
                 split_scales[s] = scale;
@@ -1640,15 +2361,28 @@ namespace
         float inv_l = (global_l > 0.0f) ? (1.0f / global_l) : 0.0f;
         float *O_out = O + (batch_idx * n_heads + head_idx) * head_dim;
         const int head_base = (batch_idx * n_heads + head_idx) * head_dim;
+        const int output_begin =
+            (head_dim * output_tile) / output_tiles;
+        const int output_end =
+            (head_dim * (output_tile + 1)) / output_tiles;
+        const int vectorized_elements =
+            (output_end - output_begin) & ~1;
 
-        // Combine partial outputs
-        for (int d = tid * 2; d + 1 < head_dim; d += blockDim.x * 2)
+        /*
+         * One wave owns each output tile. The scalar softmax merge is
+         * intentionally repeated by each tile, while every output component
+         * accumulates split partials in the original ascending order.
+         */
+        for (int offset = tid * 2;
+             offset + 1 < vectorized_elements;
+             offset += blockDim.x * 2)
         {
+            const int d = output_begin + offset;
             float O_sum0 = 0.0f;
             float O_sum1 = 0.0f;
             const int split_base0 = (head_base + d + 0) * num_splits;
             const int split_base1 = (head_base + d + 1) * num_splits;
-            for (int s = 0; s < num_splits; s++)
+            for (int s = 0; s < row_num_splits; s++)
             {
                 const float scale = split_scales[s];
                 O_sum0 += scale * O_partial[split_base0 + s];
@@ -1657,11 +2391,13 @@ namespace
             reinterpret_cast<float2 *>(O_out + d)[0] = make_float2(O_sum0 * inv_l, O_sum1 * inv_l);
         }
 
-        for (int d = (head_dim & ~1) + tid; d < head_dim; d += blockDim.x)
+        for (int d = output_begin + vectorized_elements + tid;
+             d < output_end;
+             d += blockDim.x)
         {
             float O_sum = 0.0f;
             const int split_base = (head_base + d) * num_splits;
-            for (int s = 0; s < num_splits; s++)
+            for (int s = 0; s < row_num_splits; s++)
             {
                 O_sum += split_scales[s] * O_partial[split_base + s];
             }
@@ -1670,6 +2406,361 @@ namespace
     }
 
 } // anonymous namespace
+
+// =============================================================================
+// Device-resident prefill launch template
+// =============================================================================
+
+/**
+ * @brief Launch the native-format ROCm prefill kernel with stable graph shape.
+ *
+ * Tile selection depends only on the immutable head dimension and MI50 LDS
+ * capacity.  In particular, neither the live KV length nor the current cache
+ * fill level changes the grid or shared-memory allocation.  A captured graph
+ * can therefore replay after later cache appends: the kernel reads the new
+ * logical length and fixed physical request stride from @p device_params.
+ *
+ * The cache remains compressed in HBM for FP16 and Q8_1.  Only each live K/V
+ * tile is converted to the half-precision LDS representation used by gfx906
+ * `v_dot2_f32_f16`, avoiding full-cache conversion buffers and host-sized GEMM
+ * launches.
+ *
+ * @tparam KV_TYPE Physical representation of the resident K/V cache.
+ * @return Zero after a valid launch, or -1 when geometry is unsupported or
+ *         HIP reports a launch error.
+ */
+template <KVTypeTag KV_TYPE, bool WRITE_CONTEXT_PARTIAL = false>
+static int launch_device_resident_prefill(
+    const float *Q,
+    const void *K,
+    const void *V,
+    float *O,
+    int batch_size,
+    int seq_len,
+    int kv_len,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    bool causal,
+    int window_size,
+    int position_offset,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
+    const float *mask,
+    hipStream_t hip_stream,
+    int head_start,
+    int gqa_n_rep,
+    float *O_partial = nullptr,
+    float *m_partial = nullptr,
+    float *l_partial = nullptr,
+    int context_partition_size = 0,
+    int max_context_partitions = 0,
+    int context_partition_slots = 0,
+    int context_phase_block_slots = 0,
+    int device_direct_partition_limit = 0,
+    int reducer_dimension_wavefronts = 0,
+    int reducer_block_slots = 0)
+{
+    if (!Q || !K || !V || !O || !hip_stream ||
+        batch_size <= 0 || seq_len <= 0 ||
+        kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_dim <= 0 || head_dim > 256)
+    {
+        printf("[launch_device_resident_prefill] Invalid pointers or geometry\n");
+        return -1;
+    }
+    const bool valid_head_mapping =
+        gqa_n_rep > 0
+            ? head_start >= 0 &&
+                  static_cast<long long>(head_start) + n_heads <=
+                      static_cast<long long>(n_kv_heads) * gqa_n_rep
+            : n_heads % n_kv_heads == 0;
+    if (!valid_head_mapping)
+    {
+        printf("[launch_device_resident_prefill] Invalid local or replicated GQA head mapping\n");
+        return -1;
+    }
+    if constexpr (KV_TYPE == KVTypeTag::Q8_1)
+    {
+        if (head_dim % static_cast<int>(llaminar2::Q8_1Block::BLOCK_SIZE) != 0)
+        {
+            printf("[launch_device_resident_prefill] Q8_1 head_dim must be a multiple of 32\n");
+            return -1;
+        }
+    }
+
+    if constexpr (WRITE_CONTEXT_PARTIAL)
+    {
+        const int expected_partitions =
+            (kv_len +
+             llaminar2::rocm::fa2_policy::
+                 kROCmFA2CanonicalContextPartitionKeys -
+             1) /
+            llaminar2::rocm::fa2_policy::
+                kROCmFA2CanonicalContextPartitionKeys;
+        if (!O_partial || !m_partial || !l_partial || !device_params ||
+            context_partition_size !=
+                llaminar2::rocm::fa2_policy::
+                    kROCmFA2CanonicalContextPartitionKeys ||
+            max_context_partitions != expected_partitions ||
+            context_partition_slots <= 0 ||
+            context_partition_slots > max_context_partitions ||
+            context_phase_block_slots <= 0 ||
+            device_direct_partition_limit <= 0 ||
+            device_direct_partition_limit > max_context_partitions ||
+            (reducer_dimension_wavefronts != 1 &&
+             reducer_dimension_wavefronts != 2 &&
+             reducer_dimension_wavefronts != 4))
+        {
+            printf("[launch_device_resident_prefill] Invalid context transaction geometry\n");
+            return -1;
+        }
+        constexpr int wavefronts_per_block =
+            llaminar2::rocm::fa2_policy::kROCmFA2ThreadsPerBlock /
+            llaminar2::rocm::fa2_policy::kROCmFA2WavefrontSize;
+        const int rows_per_block =
+            wavefronts_per_block / reducer_dimension_wavefronts;
+        const long long logical_reducer_blocks =
+            static_cast<long long>(batch_size) * n_heads *
+            ((static_cast<long long>(seq_len) + rows_per_block - 1) /
+             rows_per_block);
+        if (logical_reducer_blocks <= 0 ||
+            logical_reducer_blocks > std::numeric_limits<int>::max() ||
+            reducer_block_slots <= 0 ||
+            reducer_block_slots > logical_reducer_blocks)
+        {
+            printf("[launch_device_resident_prefill] Invalid persistent reducer grid\n");
+            return -1;
+        }
+    }
+
+    const auto tile_plan =
+        llaminar2::rocm::fa2_policy::selectROCmFA2Tile(
+            head_dim,
+            LDS_SIZE_BYTES);
+    if (!tile_plan.valid)
+    {
+        printf("[launch_device_resident_prefill] No LDS tile fits head_dim=%d\n", head_dim);
+        return -1;
+    }
+    const int tile_q = tile_plan.query_rows;
+    const int tile_kv = tile_plan.kv_rows;
+    const int threads_per_row = tile_plan.threads_per_row;
+    FA2LDSLayout lds_layout{};
+    lds_layout.compute(head_dim, tile_q, tile_kv);
+    if (static_cast<size_t>(lds_layout.total_size) != tile_plan.lds_bytes)
+    {
+        printf("[launch_device_resident_prefill] Policy/kernel LDS layout mismatch\n");
+        return -1;
+    }
+
+    const float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
+    if constexpr (WRITE_CONTEXT_PARTIAL)
+    {
+        /*
+         * Capture the exact direct schedule before the partition transaction.
+         * Its kernel reads the same device-owned live length and returns before
+         * touching output when that length exceeds the immutable direct span.
+         * The following phase and reducer apply the opposite predicate. This
+         * three-node transaction gives HIP conditional execution without host
+         * dispatch, graph recapture, atomics, or a merged high-register kernel.
+         */
+        const int direct_status =
+            launch_device_resident_prefill<KV_TYPE, false>(
+                Q, K, V, O,
+                batch_size, seq_len, kv_len,
+                n_heads, n_kv_heads, head_dim,
+                causal, window_size, position_offset,
+                device_params, mask,
+                hip_stream,
+                head_start, gqa_n_rep,
+                nullptr, nullptr, nullptr,
+                0,
+                max_context_partitions,
+                0,
+                0,
+                device_direct_partition_limit,
+                0,
+                0);
+        if (direct_status != 0)
+        {
+            printf("[launch_device_resident_prefill] Guarded direct launch failed\n");
+            return -1;
+        }
+
+        const long long logical_phase_blocks =
+            static_cast<long long>(batch_size) * n_heads * num_q_tiles *
+            context_partition_slots;
+        if (logical_phase_blocks <= 0 ||
+            logical_phase_blocks > std::numeric_limits<int>::max() ||
+            context_phase_block_slots > logical_phase_blocks)
+        {
+            printf("[launch_device_resident_prefill] Invalid persistent context phase grid\n");
+            return -1;
+        }
+    }
+    const dim3 grid(
+        WRITE_CONTEXT_PARTIAL
+            ? context_phase_block_slots
+            : n_heads,
+        WRITE_CONTEXT_PARTIAL ? 1 : num_q_tiles,
+        WRITE_CONTEXT_PARTIAL ? 1 : batch_size);
+    const dim3 block(
+        llaminar2::rocm::fa2_policy::kROCmFA2ThreadsPerBlock);
+
+    // Discard an error left by an earlier asynchronous operation before the
+    // launch, then report only the status produced by this kernel.
+    (void)hipGetLastError();
+    if (head_dim == 64 && tile_q == 64 && tile_kv == 64)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 4, 64, 64, 64, WRITE_CONTEXT_PARTIAL>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
+    }
+    else if (head_dim == 128 && tile_q == 64 && tile_kv == 32)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 4, 128, 64, 32, WRITE_CONTEXT_PARTIAL>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
+    }
+    else if (threads_per_row == 4)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 4, 0, 0, 0, WRITE_CONTEXT_PARTIAL>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
+    }
+    else if (head_dim == 256 && tile_q == 16 && tile_kv == 16)
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 16, 256, 16, 16, WRITE_CONTEXT_PARTIAL>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<
+                KV_TYPE, 16, 0, 0, 0, WRITE_CONTEXT_PARTIAL>),
+            grid, block, lds_layout.total_size, hip_stream,
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            softmax_scale, causal, window_size, position_offset,
+            device_params, mask,
+            tile_q, tile_kv,
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit);
+    }
+
+    hipError_t error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        printf("[launch_device_resident_prefill] Kernel launch failed: %s\n",
+               hipGetErrorString(error));
+        return -1;
+    }
+
+    if constexpr (WRITE_CONTEXT_PARTIAL)
+    {
+        const dim3 reducer_grid(reducer_block_slots);
+        if (reducer_dimension_wavefronts == 1)
+        {
+            hipLaunchKernelGGL(
+                (flash_attention_2_context_reduce_mi50_kernel<1>),
+                reducer_grid, block, 0, hip_stream,
+                O_partial, m_partial, l_partial, O,
+                batch_size, seq_len, n_heads, head_dim,
+                max_context_partitions,
+                device_direct_partition_limit,
+                device_params);
+        }
+        else if (reducer_dimension_wavefronts == 2)
+        {
+            hipLaunchKernelGGL(
+                (flash_attention_2_context_reduce_mi50_kernel<2>),
+                reducer_grid, block, 0, hip_stream,
+                O_partial, m_partial, l_partial, O,
+                batch_size, seq_len, n_heads, head_dim,
+                max_context_partitions,
+                device_direct_partition_limit,
+                device_params);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                (flash_attention_2_context_reduce_mi50_kernel<4>),
+                reducer_grid, block, 0, hip_stream,
+                O_partial, m_partial, l_partial, O,
+                batch_size, seq_len, n_heads, head_dim,
+                max_context_partitions,
+                device_direct_partition_limit,
+                device_params);
+        }
+        error = hipGetLastError();
+        if (error != hipSuccess)
+        {
+            printf("[launch_device_resident_prefill] Context reducer launch failed: %s\n",
+                   hipGetErrorString(error));
+            return -1;
+        }
+    }
+    return 0;
+}
 
 // =============================================================================
 // Flash Decoding launch template (outside extern "C" — templates need C++ linkage)
@@ -1689,49 +2780,42 @@ static int launch_decode(
     hipStream_t hip_stream,
     int head_start = 0, int gqa_n_rep = 0)
 {
-    if (head_dim <= 0 || head_dim > 256)
+    if (!Q || !K_cache || !V_cache || !O || !O_partial || !m_partial ||
+        !l_partial || !hip_stream || batch_size <= 0 || kv_len <= 0 ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+        head_dim > 256 || num_splits <= 0 ||
+        num_splits > FD_MAX_SPLITS_SUPPORTED)
     {
-        printf("[launch_decode] Error: head_dim=%d must be in [1, 256]\n", head_dim);
+        printf("[launch_decode] Invalid stable decode geometry: "
+               "batch=%d kv_len=%d heads=%d kv_heads=%d head_dim=%d "
+               "split_envelope=%d stream=%p\n",
+               batch_size,
+               kv_len,
+               n_heads,
+               n_kv_heads,
+               head_dim,
+               num_splits,
+               static_cast<void *>(hip_stream));
         return -1;
     }
 
-    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const float softmax_scale =
+        1.0f / sqrtf(static_cast<float>(head_dim));
 
     int current_device = 0;
     (void)hipGetDevice(&current_device);
     const int num_cus = getDeviceConfig(current_device).num_cus;
-
-    const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits, n_heads, num_cus);
-    const int effective_num_splits = tuned.config.splits;
-    const int decode_threads_per_block = tuned.config.tpb;
-
-    // Autotuning MUST be disabled during HIP stream capture.
-    // hipEventCreate/Synchronize/Destroy are forbidden during capture and
-    // will invalidate the capture graph.
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    if (hip_stream)
-        (void)hipStreamIsCapturing(hip_stream, &capture_status);
-    const bool is_capturing = (capture_status == hipStreamCaptureStatusActive);
-
-    hipEvent_t tune_start = nullptr;
-    hipEvent_t tune_stop = nullptr;
-    const bool measure_tuning = tuned.should_time && !is_capturing;
-    if (measure_tuning)
-    {
-        if (hipEventCreate(&tune_start) == hipSuccess && hipEventCreate(&tune_stop) == hipSuccess)
-        {
-            (void)hipEventRecord(tune_start, hip_stream);
-        }
-        else
-        {
-            if (tune_start)
-                (void)hipEventDestroy(tune_start);
-            if (tune_stop)
-                (void)hipEventDestroy(tune_stop);
-            tune_start = nullptr;
-            tune_stop = nullptr;
-        }
-    }
+    const auto &rocm_env = llaminar2::debugEnv().rocm;
+    const bool forced_splits_present =
+        rocm_env.fa_decode_num_splits_present &&
+        rocm_env.fa_decode_num_splits.has_value();
+    const int forced_splits =
+        forced_splits_present ? *rocm_env.fa_decode_num_splits : 0;
+    const bool forced_tpb_present =
+        rocm_env.fa_decode_num_splits_present &&
+        rocm_env.fa_decode_tpb.has_value();
+    const int forced_tpb =
+        forced_tpb_present ? *rocm_env.fa_decode_tpb : 0;
 
     // Split-K kernel (type-dispatched via template)
     // FP16 path stores Q as half in shared memory (halves LDS usage + bandwidth)
@@ -1741,42 +2825,43 @@ static int launch_decode(
     } else {
         smem_size = head_dim * sizeof(float);
     }
-    dim3 grid_split(n_heads, effective_num_splits, batch_size);
-    dim3 block_split(decode_threads_per_block);
+    const dim3 grid_split(n_heads, num_splits, batch_size);
+    constexpr int physical_threads = 256;
 
     hipLaunchKernelGGL(
         (flash_decoding_mi50_kernel<KV_TYPE>),
-        grid_split, block_split, smem_size, hip_stream,
+        grid_split, dim3(physical_threads), smem_size, hip_stream,
         Q, K_cache, V_cache,
         O_partial, m_partial, l_partial,
         kv_len, n_heads, n_kv_heads, head_dim,
-        effective_num_splits, softmax_scale, device_params,
+        num_splits, softmax_scale, device_params,
+        FlashDecodeRowMode::OrdinaryBatch,
+        /*query_rows_per_request=*/1,
+        num_cus,
+        forced_splits_present,
+        forced_splits,
+        forced_tpb_present,
+        forced_tpb,
         head_start, gqa_n_rep);
 
     // Reduction kernel (unchanged — operates on FP32 partials only)
-    dim3 grid_reduce(n_heads, batch_size);
-    dim3 block_reduce(256);
+    const int output_tiles = head_dim >= 256 ? 2 : 1;
+    dim3 grid_reduce(n_heads, batch_size, output_tiles);
+    dim3 block_reduce(64);
 
     hipLaunchKernelGGL(
         flash_decoding_reduce_mi50_kernel,
         grid_reduce, block_reduce, 0, hip_stream,
         O_partial, m_partial, l_partial, O,
-        n_heads, head_dim, effective_num_splits);
-
-    if (tune_start && tune_stop)
-    {
-        (void)hipEventRecord(tune_stop, hip_stream);
-        if (hipEventSynchronize(tune_stop) == hipSuccess)
-        {
-            float elapsed_ms = 0.0f;
-            if (hipEventElapsedTime(&elapsed_ms, tune_start, tune_stop) == hipSuccess)
-            {
-                recordDecodeAutotuneResult(tuned.key, tuned.candidate_index, elapsed_ms);
-            }
-        }
-        (void)hipEventDestroy(tune_start);
-        (void)hipEventDestroy(tune_stop);
-    }
+        n_heads, head_dim, num_splits,
+        kv_len,
+        device_params,
+        FlashDecodeRowMode::OrdinaryBatch,
+        num_cus,
+        forced_splits_present,
+        forced_splits,
+        forced_tpb_present,
+        forced_tpb);
 
     (void)hipGetLastError();  // Clear stale errors
     hipError_t err = hipGetLastError();
@@ -1789,602 +2874,164 @@ static int launch_decode(
     return 0;
 }
 
-// =============================================================================
-// rocBLAS-based Prefill Attention (Two-pass GEMM + Causal Softmax)
-// =============================================================================
-// Strategy: use rocBLAS (Tensile) tiled GEMMs for QK^T and PV, connected by a
-// custom causal softmax kernel. This gives 24-32× better data reuse per tile
-// compared to streaming K/V from HBM per query position.
-//
-// Per head:
-//   1) S = (1/√d) * Q_h @ K_{kh}^T    [seq × kv_len]  via hipBLAS SGEMM
-//   2) P = causal_softmax(S)            [seq × kv_len]  custom HIP kernel
-//   3) O_h = P @ V_{kh}                [seq × hdim]    via hipBLAS SGEMM
-//
-// Memory layout (all row-major, interleaved heads):
-//   Q[batch, seq, n_heads * head_dim]   — Q_h at offset h*head_dim, stride n_heads*head_dim
-//   K[batch, kv,  n_kv_heads * head_dim]
-//   V[batch, kv,  n_kv_heads * head_dim]
-//   O[batch, seq, n_heads * head_dim]
-// =============================================================================
-
 /**
- * @brief Row-wise causal softmax (2-pass): P[i,j] = softmax(S[i, 0..i+pos_off])
+ * @brief Launch one economical decode phase and reduction for grouped rows.
  *
- * Optimizations vs the original 3-pass kernel:
- *   - softmax_scale is folded into the QK^T GEMM alpha, so scores arrive pre-scaled
- *   - Pass 1 is read-only (find max), eliminating seq×kv_len global writes
- *   - Pass 2 fuses exp+sum and normalize: each thread holds exp values in registers,
- *     reduces the sum, then writes final normalized values — 1 read + 1 write total
+ * Unlike an ordinary batch, grouped verifier rows may share one K/V bank and
+ * grouped request rows may map several query rows to each independent bank.
+ * Device-resident metadata supplies every row's logical KV length.  The phase
+ * grid uses the longest row's split cap and a 256-thread physical block, while
+ * the kernel activates only the split and wavefront prefix selected by the
+ * ordinary scalar ROCm policy for that row.  This preserves byte identity
+ * without host count reads or one launch pair per row.
  *
- * Memory traffic: 2 reads + 1 write per element (was 3 reads + 3 writes).
- *
- * Each block processes one row. 256 threads (4 wavefronts) cooperate.
- * Register budget: MAX_ELEMS_PER_THREAD × 4 bytes. For kv_len ≤ 8192 with 256
- * threads, that's ≤ 32 registers per thread — well within gfx906's 256 VGPRs.
+ * Explicit fixed split/TPB overrides remain available for offline profiling.
+ * Production never rotates candidates online; the device-owned row policy is
+ * deterministic for a given geometry and live KV length.
  */
-__global__ __launch_bounds__(256, 4)
-void causal_softmax_inplace_kernel(
-    float* __restrict__ S,
-    int total_rows,
-    int seq_len,
-    int kv_len,
-    int position_offset,
-    const float* __restrict__ mask,
-    int mask_stride)
-{
-    const int row = blockIdx.x;
-    if (row >= total_rows) return;
-
-    float* row_data = S + static_cast<size_t>(row) * kv_len;
-    const int seq_pos = row % seq_len;
-    const int last_valid = seq_pos + position_offset;
-    constexpr int WARP_SIZE = 64;
-    const int warp_id = threadIdx.x / WARP_SIZE;
-    const int lane_id = threadIdx.x % WARP_SIZE;
-
-    // Pass 1: Find row max (read-only — scores are pre-scaled by GEMM alpha)
-    float local_max = -FLT_MAX;
-    for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
-        if (j <= last_valid && mask_val > -1.0e20f) {
-            local_max = fmaxf(local_max, row_data[j] + mask_val);
-        }
-    }
-
-    // Wavefront-level max reduce
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
-
-    __shared__ float shared_max[4];
-    if (lane_id == 0) shared_max[warp_id] = local_max;
-    __syncthreads();
-
-    float row_max;
-    if (threadIdx.x < 4) {
-        row_max = shared_max[threadIdx.x];
-        for (int offset = 2; offset > 0; offset >>= 1)
-            row_max = fmaxf(row_max, __shfl_xor(row_max, offset));
-        shared_max[0] = row_max;
-    }
-    __syncthreads();
-    row_max = shared_max[0];
-
-    // Pass 2: Fused exp + sum + normalize
-    // Each thread computes exp values into a register array, reduces the sum,
-    // then writes normalized values — one read + one write per element.
-    constexpr int MAX_ELEMS_PER_THREAD = 32;  // Supports kv_len ≤ 8192 @ 256 threads
-    constexpr float LOG2E = 1.4426950408889634f;
-    float local_exp[MAX_ELEMS_PER_THREAD];
-    float local_sum = 0.0f;
-
-    const int elems_per_thread = (kv_len + blockDim.x - 1) / blockDim.x;
-
-    // Sub-pass 2a: compute exp values into registers, accumulate sum
-    for (int i = 0; i < elems_per_thread; i++) {
-        int j = threadIdx.x + i * blockDim.x;
-        float val = 0.0f;
-        if (j < kv_len) {
-            const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
-            if (j <= last_valid && mask_val > -1.0e20f) {
-                val = exp2f((row_data[j] + mask_val - row_max) * LOG2E);
-            }
-        }
-        local_exp[i] = val;
-        local_sum += val;
-    }
-
-    // Wavefront-level sum reduce
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        local_sum += __shfl_xor(local_sum, offset);
-
-    __shared__ float shared_sum[4];
-    if (lane_id == 0) shared_sum[warp_id] = local_sum;
-    __syncthreads();
-
-    float row_sum;
-    if (threadIdx.x < 4) {
-        row_sum = shared_sum[threadIdx.x];
-        for (int offset = 2; offset > 0; offset >>= 1)
-            row_sum += __shfl_xor(row_sum, offset);
-        shared_sum[0] = row_sum;
-    }
-    __syncthreads();
-    row_sum = shared_sum[0];
-
-    // Sub-pass 2b: normalize and write
-    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-    for (int i = 0; i < elems_per_thread; i++) {
-        int j = threadIdx.x + i * blockDim.x;
-        if (j < kv_len) {
-            row_data[j] = local_exp[i] * inv_sum;
-        }
-    }
-}
-
-namespace {
-
-// Cached hipBLAS handles (one per device, created on first use)
-static hipblasHandle_t get_cached_rocblas_handle(int device_id) {
-    static std::mutex mtx;
-    static std::unordered_map<int, hipblasHandle_t> handles;
-
-    std::lock_guard<std::mutex> lock(mtx);
-    auto it = handles.find(device_id);
-    if (it != handles.end()) return it->second;
-
-    hipblasHandle_t h = nullptr;
-    hipblasStatus_t status = hipblasCreate(&h);
-    if (status != HIPBLAS_STATUS_SUCCESS) {
-        printf("[rocblas_prefill] Failed to create hipBLAS handle for device %d\n", device_id);
-        return nullptr;
-    }
-    // Disable atomic reductions inside rocBLAS/Tensile GEMM kernels.
-    // Atomic accumulation produces nondeterministic floating-point reduction
-    // order across runs, which causes parity tests to drift ~14x in KL
-    // divergence and occasionally fail tight thresholds. The deterministic
-    // (non-atomic) Tensile paths are selected instead; perf impact is minor
-    // on gfx906 since SGEMM there is compute-bound, not reduction-bound.
-    hipblasSetAtomicsMode(h, HIPBLAS_ATOMICS_NOT_ALLOWED);
-    handles[device_id] = h;
-    return h;
-}
-
-// ─── Multi-stream infrastructure for GQA group pipelining ───
-// Each stream gets its own hipBLAS handle and scores buffer so that
-// consecutive GQA groups can overlap QK^T / softmax / PV across streams.
-constexpr int NUM_PREFILL_STREAMS = 2;
-
-struct PrefillStreamCtx {
-    hipStream_t stream = nullptr;
-    hipblasHandle_t handle = nullptr;
-    float* scores_buf = nullptr;
-    size_t scores_cap = 0;
-    hipEvent_t completion_event = nullptr;  // Signals when this stream's work is done
-};
-
-// Per-device input readiness event: recorded on the caller's stream so pool
-// streams can wait for Q/K/V data to be fully written before reading.
-struct PrefillPoolState {
-    std::array<PrefillStreamCtx, NUM_PREFILL_STREAMS> streams;
-    hipEvent_t input_ready = nullptr;  // Recorded on caller's stream before dispatch
-};
-
-static std::mutex s_stream_mtx;
-static std::unordered_map<int, PrefillPoolState> s_stream_pools;
-
-static PrefillPoolState& get_stream_pool(int device_id) {
-    std::lock_guard<std::mutex> lock(s_stream_mtx);
-    auto it = s_stream_pools.find(device_id);
-    if (it != s_stream_pools.end()) return it->second;
-
-    // Ensure streams/handles are created on the correct device for multi-GPU TP
-    (void)hipSetDevice(device_id);
-
-    auto& state = s_stream_pools[device_id];
-    for (int i = 0; i < NUM_PREFILL_STREAMS; i++) {
-        (void)hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
-        hipblasCreate(&state.streams[i].handle);
-        hipblasSetStream(state.streams[i].handle, state.streams[i].stream);
-        // Disable atomic reductions inside rocBLAS/Tensile GEMM kernels for
-        // deterministic output (see get_cached_rocblas_handle for rationale).
-        hipblasSetAtomicsMode(state.streams[i].handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
-        (void)hipEventCreateWithFlags(&state.streams[i].completion_event, hipEventDisableTiming);
-    }
-    (void)hipEventCreateWithFlags(&state.input_ready, hipEventDisableTiming);
-    return state;
-}
-
-static float* ensure_scores_buffer(PrefillStreamCtx& ctx, size_t required_bytes) {
-    if (required_bytes > ctx.scores_cap) {
-        if (ctx.scores_buf) (void)hipFree(ctx.scores_buf);
-        hipError_t err = hipMalloc(&ctx.scores_buf, required_bytes);
-        if (err != hipSuccess) {
-            ctx.scores_buf = nullptr;
-            ctx.scores_cap = 0;
-            return nullptr;
-        }
-        ctx.scores_cap = required_bytes;
-    }
-    return ctx.scores_buf;
-}
-
-/**
- * @brief rocBLAS two-pass prefill attention (FP32 KV)
- *
- * Optimizations over the initial implementation:
- *   - softmax_scale folded into QK^T GEMM alpha (eliminates per-element multiply)
- *   - Multi-stream pipelining: 2 HIP streams overlap consecutive GQA groups
- *     (group N's PV overlaps with group N+1's QK^T)
- *   - Per-stream scores buffers (no contention, independent lifetimes)
- *   - PV GEMM uses OP_T for V to hit Tensile's optimized (OP_T, OP_N) path
- *   - 2-pass softmax: fused exp+sum+normalize eliminates one full R/W pass
- *
- * Uses hipblasSgemmStridedBatched to process all Q heads within each GQA group
- * in a single GEMM call (one QK^T batch + one PV batch per KV head).
- * For Qwen 7B (28h, 4kv): 8 GEMMs + 4 softmax = 12 launches across 2 streams.
- */
-static int rocblas_prefill_impl(
-    const float *Q, const float *K, const float *V, float *O,
-    int batch_size, int seq_len, int kv_len,
-    int n_heads, int n_kv_heads, int head_dim,
-    float softmax_scale, bool causal, int position_offset,
+template <KVTypeTag KV_TYPE, FlashDecodeRowMode ROW_MODE>
+static int launch_grouped_decode(
+    const float *Q,
+    const void *K_cache,
+    const void *V_cache,
+    float *O,
+    float *O_partial,
+    float *m_partial,
+    float *l_partial,
+    int row_count,
+    int query_rows_per_request,
+    int max_kv_len,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_num_splits,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
     hipStream_t hip_stream,
-    const float *mask = nullptr,
-    int mask_stride = 0,
-    int head_start = 0, int gqa_n_rep = 0)
+    int head_start,
+    int gqa_n_rep)
 {
-    int device_id = 0;
-    (void)hipGetDevice(&device_id);
+    static_assert(
+        ROW_MODE != FlashDecodeRowMode::OrdinaryBatch,
+        "Grouped launcher requires a row-local cache ownership policy");
 
-    auto& pool_state = get_stream_pool(device_id);
-    auto& pool = pool_state.streams;
-
-    // ─── Input fence: pool streams must wait for caller's stream ───
-    // Q/K/V data is written by upstream stages (QKV projection, RoPE, KV append)
-    // on hip_stream. Pool streams use hipStreamNonBlocking, which does NOT
-    // implicitly sync with the caller's stream. Without this fence, pool
-    // streams can read stale Q/K/V data from prior pipeline iterations.
-    (void)hipEventRecord(pool_state.input_ready, hip_stream);
-    for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-        (void)hipStreamWaitEvent(pool[s].stream, pool_state.input_ready, 0);
+    if (!Q || !K_cache || !V_cache || !O || !O_partial || !m_partial ||
+        !l_partial || !device_params || !hip_stream || row_count < 2 ||
+        row_count >
+            llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
+        query_rows_per_request <= 0 || max_kv_len <= 0 ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 ||
+        max_num_splits <= 0 || max_num_splits > FD_MAX_SPLITS_SUPPORTED)
+    {
+        printf("[launch_grouped_decode] Invalid grouped decode contract: "
+               "rows=%d query_rows=%d max_kv_len=%d heads=%d kv_heads=%d "
+               "head_dim=%d max_splits=%d stream=%p\n",
+               row_count,
+               query_rows_per_request,
+               max_kv_len,
+               n_heads,
+               n_kv_heads,
+               head_dim,
+               max_num_splits,
+               static_cast<void *>(hip_stream));
+        return -1;
     }
 
-    const int gqa_ratio = n_heads / n_kv_heads;
-    // Effective GQA repetition: use global ratio when provided (TP replicated KV)
-    const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : gqa_ratio;
+    const auto &rocm_env = llaminar2::debugEnv().rocm;
+    const bool forced_splits_present =
+        rocm_env.fa_decode_num_splits_present &&
+        rocm_env.fa_decode_num_splits.has_value();
+    const int forced_splits =
+        forced_splits_present ? *rocm_env.fa_decode_num_splits : 0;
+    const bool forced_tpb_present =
+        rocm_env.fa_decode_num_splits_present &&
+        rocm_env.fa_decode_tpb.has_value();
+    const int forced_tpb =
+        forced_tpb_present ? *rocm_env.fa_decode_tpb : 0;
 
-    // Per-stream scores buffer: sized for max local Q heads in any single KV group
-    const size_t scores_per_head = static_cast<size_t>(seq_len) * kv_len;
-    // When using global GQA mapping, a single KV head may serve up to n_heads local Q heads
-    const int max_group_size = (gqa_n_rep > 0) ? n_heads : gqa_ratio;
-    const size_t scores_per_group = static_cast<size_t>(max_group_size) * scores_per_head;
-    const size_t scores_bytes = scores_per_group * sizeof(float);
+    int current_device = 0;
+    (void)hipGetDevice(&current_device);
+    const int num_cus = getDeviceConfig(current_device).num_cus;
+    const float softmax_scale =
+        1.0f / sqrtf(static_cast<float>(head_dim));
+    const size_t smem_size =
+        KV_TYPE == KVTypeTag::FP16
+            ? static_cast<size_t>(head_dim) * sizeof(__half)
+            : static_cast<size_t>(head_dim) * sizeof(float);
 
-    // Ensure all stream buffers are large enough
-    for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-        if (!ensure_scores_buffer(pool[s], scores_bytes)) return -1;
+    /* Clear a pre-existing asynchronous launch error before attributing one. */
+    (void)hipGetLastError();
+
+    const dim3 split_grid(n_heads, max_num_splits, row_count);
+    constexpr int physical_threads = 256;
+    hipLaunchKernelGGL(
+        (flash_decoding_mi50_kernel<KV_TYPE>),
+        split_grid,
+        dim3(physical_threads),
+        smem_size,
+        hip_stream,
+        Q,
+        K_cache,
+        V_cache,
+        O_partial,
+        m_partial,
+        l_partial,
+        max_kv_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_num_splits,
+        softmax_scale,
+        device_params,
+        ROW_MODE,
+        query_rows_per_request,
+        num_cus,
+        forced_splits_present,
+        forced_splits,
+        forced_tpb_present,
+        forced_tpb,
+        head_start,
+        gqa_n_rep);
+    hipError_t error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        printf("[launch_grouped_decode] Decode phase launch failed: %s\n",
+               hipGetErrorString(error));
+        return -1;
     }
 
-    const float alpha_one = 1.0f;
-    const float beta_zero = 0.0f;
-
-    // Leading dimensions (row strides for interleaved head layout)
-    const int lda_q = n_heads * head_dim;
-    const int lda_k = n_kv_heads * head_dim;
-    const int lda_v = n_kv_heads * head_dim;
-    const int lda_o = n_heads * head_dim;
-
-    // QK^T strides (within a GQA group)
-    const long long strideB_qkt = head_dim;             // Q: consecutive heads
-    const long long strideA_qkt = 0;                    // K: shared across group
-    const long long strideC_qkt = static_cast<long long>(scores_per_head);
-
-    // PV strides — O^T = V^T @ P^T with OP_T on V
-    // V is row-major with stride lda_v; transposing gives column-major access
-    const long long strideA_pv = 0;                     // V: shared across group
-    const long long strideB_pv = static_cast<long long>(scores_per_head);
-    const long long strideC_pv = head_dim;              // O: interleaved heads
-
-    int pos_off = causal ? position_offset : (kv_len - 1);
-    if (mask && mask_stride <= 0) {
-        mask_stride = kv_len;
-    }
-
-    for (int b = 0; b < batch_size; b++) {
-        const float* Q_batch = Q + static_cast<size_t>(b) * seq_len * lda_q;
-        const float* K_batch = K + static_cast<size_t>(b) * kv_len * lda_k;
-        const float* V_batch = V + static_cast<size_t>(b) * kv_len * lda_v;
-        float* O_batch = O + static_cast<size_t>(b) * seq_len * lda_o;
-        const float* mask_batch = mask ? mask + static_cast<size_t>(b) * seq_len * mask_stride : nullptr;
-
-        for (int kh = 0; kh < n_kv_heads; kh++) {
-            // TP-aware GQA mapping: compute which LOCAL Q heads map to this KV head
-            // Global Q heads [kh * effective_gqa, (kh+1) * effective_gqa) use KV head kh
-            // Local Q heads are [0, n_heads) corresponding to global [head_start, head_start + n_heads)
-            int local_first, local_last;
-            if (gqa_n_rep > 0) {
-                int global_q_first = kh * effective_gqa;
-                int global_q_last = (kh + 1) * effective_gqa - 1;
-                local_first = max(0, global_q_first - head_start);
-                local_last = min(n_heads - 1, global_q_last - head_start);
-            } else {
-                // Standard (non-TP) path: uniform gqa_ratio heads per KV head
-                local_first = kh * gqa_ratio;
-                local_last = local_first + gqa_ratio - 1;
-            }
-            if (local_first > local_last) continue;  // No local Q heads for this KV head
-            const int local_group_size = local_last - local_first + 1;
-
-            const int stream_idx = kh % NUM_PREFILL_STREAMS;
-            auto& ctx = pool[stream_idx];
-
-            const float* Q_group = Q_batch + local_first * head_dim;
-            const float* K_kh = K_batch + kh * head_dim;
-            const float* V_kh = V_batch + kh * head_dim;
-            float* O_group = O_batch + local_first * head_dim;
-
-            // ─── Pass 1: S = softmax_scale * Q @ K^T  (scale baked into alpha) ───
-            hipblasStatus_t status = hipblasSgemmStridedBatched(
-                ctx.handle,
-                HIPBLAS_OP_T, HIPBLAS_OP_N,
-                kv_len, seq_len, head_dim,
-                &softmax_scale,                              // α = 1/√d (#4)
-                K_kh, lda_k, strideA_qkt,
-                Q_group, lda_q, strideB_qkt,
-                &beta_zero,
-                ctx.scores_buf, kv_len, strideC_qkt,
-                local_group_size);
-            if (status != HIPBLAS_STATUS_SUCCESS) {
-                printf("[rocblas_prefill] QK^T GEMM failed: %d (kv_head %d)\n", (int)status, kh);
-                return -1;
-            }
-
-            // ─── Pass 2: causal softmax (no scale — already applied) ───
-            dim3 grid_sm(local_group_size * seq_len);
-            dim3 block_sm(256);
-            hipLaunchKernelGGL(
-                causal_softmax_inplace_kernel,
-                grid_sm, block_sm, 0, ctx.stream,
-                ctx.scores_buf, local_group_size * seq_len, seq_len, kv_len, pos_off,
-                mask_batch, mask_stride);
-
-            // ─── Pass 3: O = P @ V ───
-            status = hipblasSgemmStridedBatched(
-                ctx.handle,
-                HIPBLAS_OP_N, HIPBLAS_OP_N,
-                head_dim, seq_len, kv_len,
-                &alpha_one,
-                V_kh, lda_v, strideA_pv,
-                ctx.scores_buf, kv_len, strideB_pv,
-                &beta_zero,
-                O_group, lda_o, strideC_pv,
-                local_group_size);
-            if (status != HIPBLAS_STATUS_SUCCESS) {
-                printf("[rocblas_prefill] PV GEMM failed: %d (kv_head %d)\n", (int)status, kh);
-                return -1;
-            }
-        }
-
-        // ─── Output fence: rejoin pool streams to caller's stream ───
-        // Event fence: makes hip_stream aware of pool completion so
-        // subsequent GPU work on hip_stream waits for attention output.
-        // No CPU-side sync needed — all downstream stages operate on hip_stream
-        // which will wait for the events before proceeding.
-        for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-            (void)hipEventRecord(pool[s].completion_event, pool[s].stream);
-            (void)hipStreamWaitEvent(hip_stream, pool[s].completion_event, 0);
-        }
+    const int output_tiles = head_dim >= 256 ? 2 : 1;
+    const dim3 reduce_grid(n_heads, row_count, output_tiles);
+    hipLaunchKernelGGL(
+        flash_decoding_reduce_mi50_kernel,
+        reduce_grid,
+        dim3(64),
+        0,
+        hip_stream,
+        O_partial,
+        m_partial,
+        l_partial,
+        O,
+        n_heads,
+        head_dim,
+        max_num_splits,
+        max_kv_len,
+        device_params,
+        ROW_MODE,
+        num_cus,
+        forced_splits_present,
+        forced_splits,
+        forced_tpb_present,
+        forced_tpb);
+    error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        printf("[launch_grouped_decode] Reduction launch failed: %s\n",
+               hipGetErrorString(error));
+        return -1;
     }
 
     return 0;
 }
-
-// =============================================================================
-// FP16/Q8_1 KV Dequantization Kernels + rocBLAS Wrapper
-// =============================================================================
-// Strategy: dequantize K/V to a temporary FP32 buffer, then reuse the FP32
-// rocblas_prefill_impl. This avoids per-position HBM streaming and leverages
-// rocBLAS Tensile GEMM tiles for optimal throughput on gfx906.
-//
-// The dequant + SGEMM path trades a small dequant kernel launch for dramatically
-// better GEMM data reuse. On MI50 (no matrix cores), FP32 SGEMM is already the
-// optimal compute path, so pre-dequanting to FP32 has zero compute penalty.
-// =============================================================================
-
-/**
- * @brief Dequantize interleaved FP16 KV to FP32
- *
- * Layout: [kv_len, n_kv_heads * head_dim] — one element per thread.
- * Each FP16 value is converted in-place to FP32 in the output buffer,
- * preserving the interleaved head layout for rocBLAS.
- */
-__global__ void dequant_fp16_to_fp32_kernel(
-    const half* __restrict__ src,
-    float* __restrict__ dst,
-    int total_elements)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        dst[idx] = __half2float(src[idx]);
-    }
-}
-
-/**
- * @brief Dequantize interleaved Q8_1 KV to FP32
- *
- * Layout: K/V are stored as Q8_1Blocks in interleaved head layout:
- *   [kv_len, n_kv_heads, blocks_per_head] where blocks_per_head = head_dim / 32
- *
- * Each thread processes one Q8_1Block (32 elements): scale × int8 → float.
- * Output is written to the matching position in FP32 interleaved layout.
- */
-__global__ void dequant_q8_1_to_fp32_kernel(
-    const llaminar2::Q8_1Block* __restrict__ src,
-    float* __restrict__ dst,
-    int total_blocks,
-    int n_kv_heads,
-    int head_dim)
-{
-    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (block_idx >= total_blocks) return;
-
-    constexpr int BLOCK_SIZE = 32;  // Q8_1Block::BLOCK_SIZE
-    const int blocks_per_head = head_dim / BLOCK_SIZE;
-
-    // Decode block position in [kv_pos, kv_head, block_within_head]
-    const int blocks_per_row = n_kv_heads * blocks_per_head;
-    const int kv_pos = block_idx / blocks_per_row;
-    const int rem = block_idx % blocks_per_row;
-    const int kv_head = rem / blocks_per_head;
-    const int blk = rem % blocks_per_head;
-
-    const auto& block = src[block_idx];
-    // FP16 scale → FP32
-    float scale = __half2float(*reinterpret_cast<const half*>(&block.d));
-
-    // Output offset in FP32 interleaved layout: [kv_pos, kv_head * head_dim + blk * 32]
-    int dst_base = kv_pos * (n_kv_heads * head_dim) + kv_head * head_dim + blk * BLOCK_SIZE;
-
-    #pragma unroll
-    for (int i = 0; i < BLOCK_SIZE; i++) {
-        dst[dst_base + i] = scale * static_cast<float>(block.qs[i]);
-    }
-}
-
-// Cached dequant buffer (grow-only, per-device, for FP16/Q8_1 → FP32 KV)
-struct DequantBuf {
-    float* ptr = nullptr;
-    size_t cap = 0;
-};
-static std::mutex s_dequant_mtx;
-static std::unordered_map<int, DequantBuf> s_dequant_bufs;
-
-static float* get_dequant_buffer(int device_id, size_t required_bytes) {
-    std::lock_guard<std::mutex> lock(s_dequant_mtx);
-    auto& buf = s_dequant_bufs[device_id];
-    if (required_bytes > buf.cap) {
-        // Ensure allocation targets the correct device for multi-GPU TP
-        (void)hipSetDevice(device_id);
-        if (buf.ptr) (void)hipFree(buf.ptr);
-        hipError_t err = hipMalloc(&buf.ptr, required_bytes);
-        if (err != hipSuccess) {
-            printf("[rocblas_prefill] hipMalloc failed for dequant buffer (%zu bytes)\n", required_bytes);
-            buf.ptr = nullptr;
-            buf.cap = 0;
-            return nullptr;
-        }
-        buf.cap = required_bytes;
-    }
-    return buf.ptr;
-}
-
-/**
- * @brief rocBLAS prefill with FP16 KV cache
- *
- * Dequantizes K/V from FP16 to FP32 in a shared buffer, then delegates
- * to rocblas_prefill_impl. Single dequant buffer holds both K and V
- * sequentially: [K_fp32 | V_fp32].
- */
-static int rocblas_prefill_fp16_impl(
-    const float *Q, const void *K_fp16, const void *V_fp16, float *O,
-    int batch_size, int seq_len, int kv_len,
-    int n_heads, int n_kv_heads, int head_dim,
-    float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream,
-    const float *mask = nullptr,
-    int mask_stride = 0,
-    int head_start = 0, int gqa_n_rep = 0)
-{
-    int device_id = 0;
-    (void)hipGetDevice(&device_id);
-
-    // Dequant buffer: space for both K and V as FP32
-    const size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
-    const size_t dequant_bytes = 2 * kv_elements * sizeof(float);  // K + V
-    float* dequant_buf = get_dequant_buffer(device_id, dequant_bytes);
-    if (!dequant_buf) return -1;
-
-    float* K_fp32 = dequant_buf;
-    float* V_fp32 = dequant_buf + kv_elements;
-
-    // Launch dequant kernels (can overlap on same stream since K and V are independent outputs)
-    constexpr int DEQUANT_BLOCK = 256;
-    int dequant_grid = (kv_elements + DEQUANT_BLOCK - 1) / DEQUANT_BLOCK;
-
-    hipLaunchKernelGGL(dequant_fp16_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const half*>(K_fp16), K_fp32, static_cast<int>(kv_elements));
-
-    hipLaunchKernelGGL(dequant_fp16_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const half*>(V_fp16), V_fp32, static_cast<int>(kv_elements));
-
-    // Delegate to FP32 rocBLAS path
-    return rocblas_prefill_impl(
-        Q, K_fp32, V_fp32, O,
-        batch_size, seq_len, kv_len,
-        n_heads, n_kv_heads, head_dim,
-        softmax_scale, causal, position_offset,
-        hip_stream,
-        mask, mask_stride,
-        head_start, gqa_n_rep);
-}
-
-/**
- * @brief rocBLAS prefill with Q8_1 KV cache
- *
- * Dequantizes K/V from Q8_1Block to FP32, then delegates to rocblas_prefill_impl.
- */
-static int rocblas_prefill_q8_1_impl(
-    const float *Q, const void *K_q8, const void *V_q8, float *O,
-    int batch_size, int seq_len, int kv_len,
-    int n_heads, int n_kv_heads, int head_dim,
-    float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream,
-    const float *mask = nullptr,
-    int mask_stride = 0,
-    int head_start = 0, int gqa_n_rep = 0)
-{
-    int device_id = 0;
-    (void)hipGetDevice(&device_id);
-
-    const size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
-    const size_t dequant_bytes = 2 * kv_elements * sizeof(float);
-    float* dequant_buf = get_dequant_buffer(device_id, dequant_bytes);
-    if (!dequant_buf) return -1;
-
-    float* K_fp32 = dequant_buf;
-    float* V_fp32 = dequant_buf + kv_elements;
-
-    // Total Q8_1 blocks for one K or V tensor
-    const int blocks_per_head = head_dim / 32;
-    const int total_blocks = kv_len * n_kv_heads * blocks_per_head;
-
-    constexpr int DEQUANT_BLOCK = 256;
-    int dequant_grid = (total_blocks + DEQUANT_BLOCK - 1) / DEQUANT_BLOCK;
-
-    hipLaunchKernelGGL(dequant_q8_1_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const llaminar2::Q8_1Block*>(K_q8), K_fp32,
-        total_blocks, n_kv_heads, head_dim);
-
-    hipLaunchKernelGGL(dequant_q8_1_to_fp32_kernel,
-        dim3(dequant_grid), dim3(DEQUANT_BLOCK), 0, hip_stream,
-        static_cast<const llaminar2::Q8_1Block*>(V_q8), V_fp32,
-        total_blocks, n_kv_heads, head_dim);
-
-    return rocblas_prefill_impl(
-        Q, K_fp32, V_fp32, O,
-        batch_size, seq_len, kv_len,
-        n_heads, n_kv_heads, head_dim,
-        softmax_scale, causal, position_offset,
-        hip_stream,
-        mask, mask_stride,
-        head_start, gqa_n_rep);
-}
-
-} // anonymous namespace
 
 // =============================================================================
 // Extern "C" Wrapper Functions
@@ -2407,120 +3054,14 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep)
     {
-        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-
-        // Input validation
-        if (head_dim <= 0 || head_dim > 256)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Error: head_dim=%d must be in [1, 256]\n", head_dim);
-            return -1;
-        }
-        if (n_heads % n_kv_heads != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Error: n_heads must be divisible by n_kv_heads\n");
-            return -1;
-        }
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // rocBLAS two-pass prefill: uses Tensile-optimized GEMM tiles for QK^T and PV.
-        if (head_dim >= 64) {
-            return rocblas_prefill_impl(
-                Q, K, V, O,
-                batch_size, seq_len, kv_len,
-                n_heads, n_kv_heads, head_dim,
-                softmax_scale, causal, position_offset,
-                hip_stream, mask, kv_len, head_start, gqa_n_rep);
-        }
-
-        // Fall through to existing tiled kernel for head_dim < 64
-
-        // Adaptively select tile sizes based on LDS constraints.
-        // Prefer larger tile area, then larger tile_q (better Q reuse / fewer blocks).
-        int tile_q = FA2_TILE_Q;
-        int tile_kv = FA2_TILE_KV;
-        FA2LDSLayout lds_layout;
-
-        struct TileCandidate
-        {
-            int q;
-            int kv;
-        };
-
-        // Keep candidates conservative and power-of-two for predictable behavior.
-        // NOTE: 64x32 is intentionally included; for head_dim=128 it often fits
-        // where 64x64 does not, and is usually better than dropping to 32x32.
-        constexpr TileCandidate candidates[] = {
-            {64, 64},
-            {64, 32},
-            {32, 64},
-            {32, 32},
-            {16, 32},
-        };
-
-        int best_q = -1;
-        int best_kv = -1;
-        int best_area = -1;
-        FA2LDSLayout best_layout{};
-
-        for (const auto &c : candidates)
-        {
-            FA2LDSLayout cand_layout;
-            cand_layout.compute(head_dim, c.q, c.kv);
-            if (cand_layout.total_size > LDS_SIZE_BYTES)
-                continue;
-
-            const int area = c.q * c.kv;
-            const bool better =
-                (area > best_area) ||
-                (area == best_area && c.q > best_q);
-
-            if (better)
-            {
-                best_q = c.q;
-                best_kv = c.kv;
-                best_area = area;
-                best_layout = cand_layout;
-            }
-        }
-
-        if (best_area < 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Error: Cannot fit head_dim=%d in LDS with supported tiles\n",
-                   head_dim);
-            return -1;
-        }
-
-        tile_q = best_q;
-        tile_kv = best_kv;
-        lds_layout = best_layout;
-
-        // Grid configuration
-        const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
-        dim3 grid(n_heads, num_q_tiles, batch_size);
-        dim3 block(FA2_THREADS_PER_BLOCK);
-
-        // Launch kernel
-        hipLaunchKernelGGL(
-            flash_attention_2_mi50_kernel,
-            grid, block, lds_layout.total_size, hip_stream,
+        return launch_device_resident_prefill<KVTypeTag::FP32>(
             Q, K, V, O,
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
-            softmax_scale, causal, window_size, position_offset,
+            causal, window_size, position_offset,
             device_params, mask,
-            tile_q, tile_kv,
+            static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
-
-        (void)hipGetLastError();  // Clear stale errors
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            printf("[hipFlashAttn_prefill_fa2] Kernel launch failed: %s\n", hipGetErrorString(err));
-            return -1;
-        }
-
-        return 0;
     }
 
     /**
@@ -2543,34 +3084,40 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep)
     {
-        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-
-        if (head_dim <= 0 || head_dim > 256)
-        {
-            printf("[hipFlashAttn_prefill_fa2_fp16] Error: head_dim=%d must be in [1, 256]\n", head_dim);
-            return -1;
-        }
-        if (n_heads % n_kv_heads != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2_fp16] Error: n_heads must be divisible by n_kv_heads\n");
-            return -1;
-        }
-        if (head_dim < 64)
-        {
-            printf("[hipFlashAttn_prefill_fa2_fp16] Error: FP16 KV requires head_dim >= 64 (got %d)\n", head_dim);
-            return -1;
-        }
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // rocBLAS path: dequant FP16→FP32 then Tensile SGEMM
-        return rocblas_prefill_fp16_impl(
+        return launch_device_resident_prefill<KVTypeTag::FP16>(
             Q, K, V, O,
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
-            softmax_scale, causal, position_offset,
-            hip_stream,
-            mask, kv_len,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch device-resident prefill over a native BF16 KV cache.
+     *
+     * BF16 values remain two-byte resident data through HBM and are converted
+     * only while the current tile enters LDS.  This avoids the packed FP32
+     * shadow whose request stride could not follow a growing captured cache.
+     */
+    int hipFlashAttn_prefill_fa2_bf16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<KVTypeTag::BF16>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
     }
 
@@ -2593,40 +3140,176 @@ extern "C"
         void *stream,
         int head_start, int gqa_n_rep)
     {
-        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-
-        if (head_dim <= 0 || head_dim > 256)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim=%d must be in [1, 256]\n", head_dim);
-            return -1;
-        }
-        if (n_heads % n_kv_heads != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: n_heads must be divisible by n_kv_heads\n");
-            return -1;
-        }
-        if (head_dim < 64)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: Q8_1 KV requires head_dim >= 64 (got %d)\n", head_dim);
-            return -1;
-        }
-        if (head_dim % 32 != 0)
-        {
-            printf("[hipFlashAttn_prefill_fa2_q8_1] Error: head_dim must be multiple of 32 for Q8_1 (got %d)\n", head_dim);
-            return -1;
-        }
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // rocBLAS path: dequant Q8_1→FP32 then Tensile SGEMM
-        return rocblas_prefill_q8_1_impl(
+        return launch_device_resident_prefill<KVTypeTag::Q8_1>(
             Q, K, V, O,
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
-            softmax_scale, causal, position_offset,
-            hip_stream,
-            mask, kv_len,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch captured context-parallel FA2 over an FP32 K/V cache.
+     *
+     * The guarded direct kernel, guarded phase, and guarded reducer are
+     * submitted to the same explicit stream and therefore captured as one
+     * ordered, device-owned transaction.
+     */
+    int hipFlashAttn_prefill_fa2_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::FP32,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
+    }
+
+    /** @brief Launch captured context-parallel FA2 over native FP16 K/V. */
+    int hipFlashAttn_prefill_fa2_fp16_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::FP16,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
+    }
+
+    /** @brief Launch captured context-parallel FA2 over native BF16 K/V. */
+    int hipFlashAttn_prefill_fa2_bf16_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::BF16,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
+    }
+
+    /** @brief Launch captured context-parallel FA2 over native Q8_1 K/V. */
+    int hipFlashAttn_prefill_fa2_q8_1_context_parallel(
+        const float *Q, const void *K, const void *V, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int seq_len, int kv_capacity,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int context_phase_block_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_wavefronts,
+        int reducer_block_slots,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_device_resident_prefill<
+            KVTypeTag::Q8_1,
+            true>(
+            Q, K, V, O,
+            batch_size, seq_len, kv_capacity,
+            n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset,
+            device_params, mask,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep,
+            O_partial, m_partial, l_partial,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            context_phase_block_slots,
+            device_direct_partition_limit,
+            reducer_dimension_wavefronts,
+            reducer_block_slots);
     }
 
     /**
@@ -2675,6 +3358,27 @@ extern "C"
     }
 
     /**
+     * @brief Launch ordinary split-K decode with native BF16 K/V reads.
+     */
+    int hipFlashAttn_decode_bf16(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_decode<KVTypeTag::BF16>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            batch_size, kv_len, n_heads, n_kv_heads, head_dim,
+            num_splits, device_params, static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
      * @brief Launch Flash Decoding kernel for MI50 (Q8_1 KV cache — inline dequant)
      *
      * K_cache/V_cache point to Q8_1Block data. Each block covers 32 elements.
@@ -2704,6 +3408,226 @@ extern "C"
     }
 
     /**
+     * @brief Launch shared-cache verifier rows through one grouped FP32 decode.
+     */
+    int hipFlashAttn_decode_fp32_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::FP32,
+            FlashDecodeRowMode::SharedKVVerifier>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            verifier_rows,
+            /*query_rows_per_request=*/1,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch shared-cache verifier rows through one grouped FP16 decode.
+     */
+    int hipFlashAttn_decode_fp16_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::FP16,
+            FlashDecodeRowMode::SharedKVVerifier>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            verifier_rows,
+            /*query_rows_per_request=*/1,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch shared-cache verifier rows with native BF16 K/V reads.
+     */
+    int hipFlashAttn_decode_bf16_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::BF16,
+            FlashDecodeRowMode::SharedKVVerifier>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            verifier_rows,
+            /*query_rows_per_request=*/1,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch shared-cache verifier rows through one grouped Q8_1 decode.
+     */
+    int hipFlashAttn_decode_q8_1_grouped_verifier_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int verifier_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        if (head_dim % 32 != 0)
+            return -1;
+        return launch_grouped_decode<
+            KVTypeTag::Q8_1,
+            FlashDecodeRowMode::SharedKVVerifier>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            verifier_rows,
+            /*query_rows_per_request=*/1,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch independent FP32 request banks through one grouped decode.
+     */
+    int hipFlashAttn_decode_fp32_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::FP32,
+            FlashDecodeRowMode::IndependentRequest>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            request_count * query_rows,
+            query_rows,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch independent FP16 request banks through one grouped decode.
+     */
+    int hipFlashAttn_decode_fp16_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::FP16,
+            FlashDecodeRowMode::IndependentRequest>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            request_count * query_rows,
+            query_rows,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch independent request banks with native BF16 K/V reads.
+     */
+    int hipFlashAttn_decode_bf16_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        return launch_grouped_decode<
+            KVTypeTag::BF16,
+            FlashDecodeRowMode::IndependentRequest>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            request_count * query_rows,
+            query_rows,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Launch independent Q8_1 request banks through one grouped decode.
+     */
+    int hipFlashAttn_decode_q8_1_grouped_request_rows(
+        const float *Q, const void *K_cache, const void *V_cache, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int request_count, int query_rows, int max_kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int max_num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int head_start, int gqa_n_rep)
+    {
+        if (head_dim % 32 != 0)
+            return -1;
+        return launch_grouped_decode<
+            KVTypeTag::Q8_1,
+            FlashDecodeRowMode::IndependentRequest>(
+            Q, K_cache, V_cache, O,
+            O_partial, m_partial, l_partial,
+            request_count * query_rows,
+            query_rows,
+            max_kv_len,
+            n_heads, n_kv_heads, head_dim,
+            max_num_splits, device_params,
+            static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
+    }
+
+    /**
      * @brief Derive AttentionDeviceParams from device-owned KV cache count.
      */
     int hipFlashAttn_prepare_device_params_from_count(
@@ -2711,10 +3635,17 @@ extern "C"
         const int *post_append_cached_tokens,
         int seq_len,
         int query_rows,
+        int kv_stride,
+        const int *active_query_rows_device,
+        const int *ring_head_device,
+        int ring_capacity,
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
-            query_rows <= 0 || !stream)
+            query_rows <= 0 || kv_stride <= 0 ||
+            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream ||
+            ((ring_head_device == nullptr) != (ring_capacity == 0)) ||
+            (ring_capacity > 0 && ring_capacity != kv_stride))
         {
             return -1;
         }
@@ -2724,7 +3655,11 @@ extern "C"
                            static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
                            post_append_cached_tokens,
                            seq_len,
-                           query_rows);
+                           query_rows,
+                           kv_stride,
+                           active_query_rows_device,
+                           ring_head_device,
+                           ring_capacity);
         const hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
@@ -2736,46 +3671,87 @@ extern "C"
     }
 
     /**
-     * @brief Allocate workspace for Flash Decoding
+     * @brief Write explicit decode geometry to the device-owned param block.
      */
-    int hipFlashAttn_allocWorkspace(
-        void **partial_output, void **partial_m, void **partial_l,
-        int batch_size, int n_heads, int head_dim, int num_splits)
+    int hipFlashAttn_prepare_device_params_from_geometry(
+        void *device_params,
+        int kv_len,
+        int kv_stride,
+        int position_offset,
+        int query_rows,
+        void *stream)
     {
-        size_t num_partials = static_cast<size_t>(batch_size) * n_heads * num_splits;
-
-        size_t output_size = num_partials * head_dim * sizeof(float);
-        size_t m_size = num_partials * sizeof(float);
-        size_t l_size = num_partials * sizeof(float);
-
-        if (hipMalloc(partial_output, output_size) != hipSuccess)
-            return -1;
-        if (hipMalloc(partial_m, m_size) != hipSuccess)
+        if (!device_params || kv_len <= 0 || kv_stride < kv_len ||
+            position_offset < 0 ||
+            query_rows <= 0 ||
+            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
         {
-            (void)hipFree(*partial_output);
-            return -1;
-        }
-        if (hipMalloc(partial_l, l_size) != hipSuccess)
-        {
-            (void)hipFree(*partial_output);
-            (void)hipFree(*partial_m);
             return -1;
         }
 
+        hipLaunchKernelGGL(
+            hip_write_attention_params_from_geometry_kernel,
+            dim3(1),
+            dim3(query_rows),
+            0,
+            static_cast<hipStream_t>(stream),
+            static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
+            kv_len,
+            kv_stride,
+            position_offset,
+            query_rows);
+        const hipError_t error = hipGetLastError();
+        if (error != hipSuccess)
+        {
+            printf("[hipFlashAttn_prepare_device_params_from_geometry] "
+                   "Kernel launch failed: %s\n",
+                   hipGetErrorString(error));
+            return -1;
+        }
         return 0;
     }
 
     /**
-     * @brief Free workspace for Flash Decoding
+     * @brief Derive grouped request-row params from contiguous device counts.
      */
-    void hipFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l)
+    int hipFlashAttn_prepare_device_params_from_request_counts(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int request_count,
+        int query_rows,
+        int kv_stride,
+        void *stream)
     {
-        if (partial_output)
-            (void)hipFree(partial_output);
-        if (partial_m)
-            (void)hipFree(partial_m);
-        if (partial_l)
-            (void)hipFree(partial_l);
+        const int total_rows = request_count * query_rows;
+        if (!device_params || !post_append_cached_tokens || request_count < 2 ||
+            query_rows <= 0 ||
+            total_rows >
+                llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
+            kv_stride <= 0 || !stream)
+        {
+            return -1;
+        }
+
+        hipLaunchKernelGGL(
+            hip_derive_attention_params_from_request_counts_kernel,
+            dim3(1),
+            dim3(total_rows),
+            0,
+            static_cast<hipStream_t>(stream),
+            static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
+            post_append_cached_tokens,
+            request_count,
+            query_rows,
+            kv_stride);
+        const hipError_t error = hipGetLastError();
+        if (error != hipSuccess)
+        {
+            printf("[hipFlashAttn_prepare_device_params_from_request_counts] "
+                   "Kernel launch failed: %s\n",
+                   hipGetErrorString(error));
+            return -1;
+        }
+        return 0;
     }
 
     /**

@@ -1,3 +1,14 @@
+/**
+ * @file MTPVerifierForwardExecutor.cpp
+ * @brief Typed admission and execution for grouped MTP verifier forwards.
+ *
+ * Verifier shape alone cannot identify graph semantics: a short continuation
+ * can be prefill, ordinary decode, or grouped verification. This implementation
+ * admits host and device token plans through explicit runner entrypoints so the
+ * graph receives the grouped-verifier role and publishes the exact recurrent
+ * state required by accepted-prefix commitment.
+ */
+
 #include "MTPVerifierForwardExecutor.h"
 
 #include "../local_execution/orchestrators/IInferenceRunner.h"
@@ -36,7 +47,9 @@ namespace llaminar2
         }
 
         const bool batched = graph_plan.request_count > 1;
-        if (batched && !options.allow_batched_host_forward)
+        if (batched &&
+            !options.allow_batched_host_forward &&
+            options.device_token_ids == nullptr)
         {
             return verifierForwardFailure(
                 std::move(graph_plan),
@@ -56,7 +69,8 @@ namespace llaminar2
                                    result.graph_plan.token_batches,
                                    options.device_token_ids,
                                    result.graph_plan.padded_seq_len)
-                             : runner.forward_batch(result.graph_plan.token_batches);
+                             : runner.forwardGroupedMTPVerifierWithHostTokenIds(
+                                   result.graph_plan.token_batches);
         }
         else
         {
@@ -70,13 +84,12 @@ namespace llaminar2
              * runner-owned device buffer.
              */
             forward_ok = options.device_token_ids
-                             ? runner.forwardWithDeviceTokenIds(
+                             ? runner.forwardGroupedMTPVerifierWithDeviceTokenIds(
                                    plan.verifier_input_tokens.data(),
                                    options.device_token_ids,
                                    seq_len)
-                             : runner.forward(
-                                   plan.verifier_input_tokens.data(),
-                                   seq_len);
+                             : runner.forwardGroupedMTPVerifierWithHostTokenIds(
+                                   result.graph_plan.token_batches);
         }
 
         if (!forward_ok)
@@ -226,23 +239,13 @@ namespace llaminar2
         }
 
         result.transaction_plan =
-            request.publication_contract ==
-                    MTPSpecTransactionPublicationContract::
-                        DecodeEquivalentReplayPublicationRequired
-                ? buildMTPSpecTransactionBatchPlanFromGreedyCatchupsForReplayPublication(
-                      request.shape,
-                      request.request_ids,
-                      request.vocab_size,
-                      request.requests,
-                      result.catchup.results,
-                      request.base_cached_tokens)
-                : buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
-                      request.shape,
-                      request.request_ids,
-                      request.vocab_size,
-                      request.requests,
-                      result.catchup.results,
-                      request.base_cached_tokens);
+            buildMTPSpecTransactionBatchPlanFromGreedyCatchups(
+                request.shape,
+                request.request_ids,
+                request.vocab_size,
+                request.requests,
+                result.catchup.results,
+                request.base_cached_tokens);
         if (!result.transaction_plan.ok)
         {
             return fail(std::string("MTP greedy verifier transaction plan failed: ") +
@@ -256,8 +259,7 @@ namespace llaminar2
     MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
         IInferenceRunner &runner,
         const MTPSpecRequestBatch &scheduled_batch,
-        MTPVerifierForwardExecutionOptions forward_options,
-        MTPSpecTransactionPublicationContract publication_contract)
+        MTPVerifierForwardExecutionOptions forward_options)
     {
         MTPGreedyVerifierBatchTransactionResult result;
 
@@ -307,7 +309,6 @@ namespace llaminar2
         request.requests = scheduled_batch.greedy_requests;
         request.base_cached_tokens = scheduled_batch.base_cached_tokens;
         request.forward_options = forward_options;
-        request.publication_contract = publication_contract;
         return executeMTPGreedyVerifierBatchTransaction(runner, request);
     }
 
@@ -316,8 +317,7 @@ namespace llaminar2
         IInferenceRunner &runner,
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
-        MTPVerifierForwardExecutionOptions forward_options,
-        MTPSpecTransactionPublicationContract publication_contract)
+        MTPVerifierForwardExecutionOptions forward_options)
     {
         MTPOwnedGreedyVerifierBatchTransactionResult result;
 
@@ -335,8 +335,7 @@ namespace llaminar2
             executeMTPGreedyVerifierScheduledBatchTransaction(
                 runner,
                 result.scheduled_batch,
-                forward_options,
-                publication_contract);
+                forward_options);
 
         if (!result.transaction.ok)
         {
@@ -375,8 +374,7 @@ namespace llaminar2
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
         MTPGreedyVerifierBatchPublicationFn publish,
-        MTPVerifierForwardExecutionOptions forward_options,
-        MTPSpecTransactionPublicationContract publication_contract)
+        MTPVerifierForwardExecutionOptions forward_options)
     {
         MTPOwnedGreedyVerifierBatchTransactionResult result;
 
@@ -402,8 +400,7 @@ namespace llaminar2
             executeMTPGreedyVerifierScheduledBatchTransaction(
                 runner,
                 result.scheduled_batch,
-                forward_options,
-                publication_contract);
+                forward_options);
 
         if (!result.transaction.ok)
         {
@@ -413,29 +410,6 @@ namespace llaminar2
             result.error =
                 std::string("owned MTP verifier transaction failed: ") +
                 result.transaction.error;
-            if (!result.released)
-            {
-                result.error += "; release failed: ";
-                result.error += release_error;
-            }
-            return result;
-        }
-
-        if (result.transaction.transaction_plan
-                .requiresDecodeEquivalentReplayPublication())
-        {
-            std::string release_error;
-            result.released = owner.releaseInFlightBatch(&release_error);
-            result.ok = false;
-            result.error =
-                "owned MTP greedy transaction requires decode-equivalent replay publication";
-            const std::string &reason =
-                result.transaction.transaction_plan.publication_contract_reason;
-            if (!reason.empty())
-            {
-                result.error += ": ";
-                result.error += reason;
-            }
             if (!result.released)
             {
                 result.error += "; release failed: ";
@@ -483,8 +457,7 @@ namespace llaminar2
 
     MTPDeviceOutcomeBatchTransactionResult executeMTPDeviceOutcomeScheduledBatchTransaction(
         const MTPSpecRequestBatch &scheduled_batch,
-        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes,
-        MTPSpecTransactionPublicationContract publication_contract)
+        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes)
     {
         MTPDeviceOutcomeBatchTransactionResult result;
         result.scheduled_batch = scheduled_batch;
@@ -520,23 +493,13 @@ namespace llaminar2
             return fail("scheduled MTP outcome batch result vector mismatch");
 
         result.transaction_plan =
-            publication_contract ==
-                    MTPSpecTransactionPublicationContract::
-                        DecodeEquivalentReplayPublicationRequired
-                ? buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomesForReplayPublication(
-                      scheduled_batch.shape,
-                      scheduled_batch.request_ids,
-                      scheduled_batch.vocab_size,
-                      scheduled_batch.greedy_requests,
-                      result.device_outcomes,
-                      scheduled_batch.base_cached_tokens)
-                : buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
-                      scheduled_batch.shape,
-                      scheduled_batch.request_ids,
-                      scheduled_batch.vocab_size,
-                      scheduled_batch.greedy_requests,
-                      result.device_outcomes,
-                      scheduled_batch.base_cached_tokens);
+            buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+                scheduled_batch.shape,
+                scheduled_batch.request_ids,
+                scheduled_batch.vocab_size,
+                scheduled_batch.greedy_requests,
+                result.device_outcomes,
+                scheduled_batch.base_cached_tokens);
         if (!result.transaction_plan.ok)
         {
             return fail(
@@ -553,8 +516,7 @@ namespace llaminar2
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
         MTPDeviceOutcomeBatchProducerFn produce,
-        MTPGreedyVerifierBatchPublicationFn publish,
-        MTPSpecTransactionPublicationContract publication_contract)
+        MTPGreedyVerifierBatchPublicationFn publish)
     {
         MTPOwnedDeviceOutcomeBatchTransactionResult result;
 
@@ -610,8 +572,7 @@ namespace llaminar2
         MTPDeviceOutcomeBatchTransactionResult planned =
             executeMTPDeviceOutcomeScheduledBatchTransaction(
                 result.scheduled_batch,
-                result.device_outcomes,
-                publication_contract);
+                result.device_outcomes);
         result.transaction_plan = planned.transaction_plan;
         if (!planned.ok)
         {
@@ -621,32 +582,6 @@ namespace llaminar2
             result.error =
                 std::string("owned MTP outcome transaction failed: ") +
                 planned.error;
-            if (!result.released)
-            {
-                result.error += "; release failed: ";
-                result.error += release_error;
-            }
-            return result;
-        }
-
-        /*
-         * Grouped outcome proof is not the same as safe live-state
-         * publication.  A replay-required plan must be routed to a future
-         * replay/publication helper, never through this direct publisher.
-         */
-        if (result.transaction_plan.requiresDecodeEquivalentReplayPublication())
-        {
-            std::string release_error;
-            result.released = owner.releaseInFlightBatch(&release_error);
-            result.ok = false;
-            result.error =
-                "owned MTP outcome transaction requires decode-equivalent replay publication";
-            if (!result.transaction_plan.publication_contract_reason.empty())
-            {
-                result.error += ": ";
-                result.error +=
-                    result.transaction_plan.publication_contract_reason;
-            }
             if (!result.released)
             {
                 result.error += "; release failed: ";

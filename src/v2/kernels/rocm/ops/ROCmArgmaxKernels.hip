@@ -20,16 +20,21 @@
 #include <climits>
 #include <cstdio>
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../common/SamplingMath.h"
+#include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
 
 // ── Argmax multi-block reduction tuning ─────────────────────────────────────
-// Threads per block for both reduction passes. Must be a power of two because
-// the in-block tree reduction halves the active range each step.
+// Threads per block for both reduction passes. Every production geometry is a
+// power-of-two multiple of the target wave size, allowing the deterministic
+// shuffle reduction below to avoid repeated workgroup-wide barriers.
 constexpr int ARGMAX_REDUCE_THREADS = 256;
 constexpr int ARGMAX_FINALIZE_THREADS = 256;
-// Target elements processed per thread in pass 1. Chosen so each thread reads a
-// handful of elements (good memory coalescing) while still spreading the vocab
-// across enough blocks to occupy most CUs. 8 → ~74 blocks for a 152K vocab.
-constexpr int ARGMAX_ELEMS_PER_THREAD = 8;
+// Target elements processed per thread in pass 1.  The production Qwen 3.6
+// vocabulary has 248,320 columns, so four elements per thread launches 243
+// blocks at the 256-thread geometry.  Repeated full-matrix Perf__ sweeps on an
+// MI50 selected this geometry while preserving the serial lower-token tie
+// break exactly.
+constexpr int ARGMAX_ELEMS_PER_THREAD = 4;
 
 __device__ __forceinline__ bool rocm_argmax_better(float candidate_value,
                                                    int candidate_index,
@@ -38,6 +43,70 @@ __device__ __forceinline__ bool rocm_argmax_better(float candidate_value,
 {
     return candidate_value > current_value ||
            (candidate_value == current_value && candidate_index < current_index);
+}
+
+/**
+ * @brief Value/index pair carrying serial argmax tie-breaking semantics.
+ */
+struct ROCmArgmaxPair
+{
+    float value;
+    int index;
+};
+
+/**
+ * @brief Reduce one complete AMD wave with deterministic token-id ties.
+ */
+__device__ __forceinline__ ROCmArgmaxPair rocm_argmax_wave_reduce(
+    ROCmArgmaxPair pair)
+{
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        const ROCmArgmaxPair candidate{
+            __shfl_down(pair.value, offset),
+            __shfl_down(pair.index, offset)};
+        if (rocm_argmax_better(
+                candidate.value,
+                candidate.index,
+                pair.value,
+                pair.index))
+        {
+            pair = candidate;
+        }
+    }
+    return pair;
+}
+
+/**
+ * @brief Reduce one workgroup with one barrier and one final wave.
+ */
+__device__ __forceinline__ ROCmArgmaxPair rocm_argmax_block_reduce(
+    ROCmArgmaxPair pair,
+    float *wave_values,
+    int *wave_indices)
+{
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int wave = static_cast<int>(threadIdx.x) / warpSize;
+    const int wave_count = static_cast<int>(blockDim.x) / warpSize;
+
+    pair = rocm_argmax_wave_reduce(pair);
+    if (lane == 0)
+    {
+        wave_values[wave] = pair.value;
+        wave_indices[wave] = pair.index;
+    }
+    __syncthreads();
+
+    if (wave == 0)
+    {
+        pair = lane < wave_count
+                   ? ROCmArgmaxPair{
+                         wave_values[lane],
+                         wave_indices[lane]}
+                   : ROCmArgmaxPair{-FLT_MAX, INT_MAX};
+        pair = rocm_argmax_wave_reduce(pair);
+    }
+    return pair;
 }
 
 // ============================================================================
@@ -173,8 +242,10 @@ __global__ void rocm_argmax_partial_f32_batched_rows_kernel(
     int row_partial_capacity)
 {
     extern __shared__ char shared_mem[];
-    float *smax = reinterpret_cast<float *>(shared_mem);
-    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+    const int wave_count = static_cast<int>(blockDim.x) / warpSize;
+    float *wave_values = reinterpret_cast<float *>(shared_mem);
+    int *wave_indices = reinterpret_cast<int *>(
+        shared_mem + wave_count * sizeof(float));
 
     const int row = blockIdx.y;
     if (row >= rows)
@@ -197,32 +268,491 @@ __global__ void rocm_argmax_partial_f32_batched_rows_kernel(
         }
     }
 
+    const ROCmArgmaxPair block_max = rocm_argmax_block_reduce(
+        ROCmArgmaxPair{local_max, local_idx},
+        wave_values,
+        wave_indices);
+
+    if (tid == 0)
+    {
+        const int offset = row * row_partial_capacity + blockIdx.x;
+        partial_vals[offset] = block_max.value;
+        partial_idxs[offset] = block_max.index;
+    }
+}
+
+/**
+ * @brief HIP grouped verifier argmax with serial-row penalty semantics.
+ *
+ * The persistent histogram owns prior emitted tokens.  Verifier input tokens
+ * up to the current row complete that row's speculative branch history, so one
+ * grouped launch observes exactly the same counts as serial decode.
+ */
+__global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
+    const float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device,
+    float *__restrict__ partial_vals,
+    int *__restrict__ partial_idxs,
+    int row_partial_capacity)
+{
+    extern __shared__ char shared_mem[];
+    float *smax = reinterpret_cast<float *>(shared_mem);
+    int *sidx = reinterpret_cast<int *>(
+        shared_mem + blockDim.x * sizeof(float));
+
+    const int row = blockIdx.y;
+    const int active_rows = *active_rows_device;
+    if (active_rows <= 0 || active_rows > rows || row >= active_rows)
+        return;
+
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + tid;
+    const int grid_stride = blockDim.x * gridDim.x;
+    const float *row_data =
+        data + static_cast<size_t>(row) * static_cast<size_t>(row_stride);
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    const int prefix_begin =
+        request_policy.first_token_already_in_history != 0 ? 1 : 0;
+
+    float local_max = -FLT_MAX;
+    int local_idx = INT_MAX;
+    for (int token = gid; token < cols; token += grid_stride)
+    {
+        float value = row_data[token];
+        if (request_policy.enabled != 0)
+        {
+            int count = generated_token_counts[token];
+            for (int history_index = prefix_begin;
+                 history_index <= row;
+                 ++history_index)
+            {
+                count += verifier_input_tokens[history_index] == token ? 1 : 0;
+            }
+
+            if (count > 0)
+            {
+                float penalty = 0.0f;
+                if (request_policy.presence_penalty != 0.0f)
+                    penalty += request_policy.presence_penalty;
+                if (request_policy.frequency_penalty != 0.0f)
+                {
+                    const float frequency_component =
+                        request_policy.frequency_penalty *
+                        static_cast<float>(count);
+                    penalty += frequency_component;
+                }
+                value -= penalty;
+            }
+        }
+        if (rocm_argmax_better(value, token, local_max, local_idx))
+        {
+            local_max = value;
+            local_idx = token;
+        }
+    }
+
     smax[tid] = local_max;
     sidx[tid] = local_idx;
     __syncthreads();
 
     for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
     {
-        if (tid < stride)
+        if (tid < stride &&
+            rocm_argmax_better(
+                smax[tid + stride],
+                sidx[tid + stride],
+                smax[tid],
+                sidx[tid]))
         {
-            if (rocm_argmax_better(smax[tid + stride], sidx[tid + stride],
-                                   smax[tid], sidx[tid]))
-            {
-                smax[tid] = smax[tid + stride];
-                sidx[tid] = sidx[tid + stride];
-            }
+            smax[tid] = smax[tid + stride];
+            sidx[tid] = sidx[tid + stride];
         }
         __syncthreads();
     }
 
     if (tid == 0)
     {
-        const int offset = row * row_partial_capacity + blockIdx.x;
+        const int offset =
+            row * row_partial_capacity + static_cast<int>(blockIdx.x);
         partial_vals[offset] = smax[0];
         partial_idxs[offset] = sidx[0];
     }
 }
 
+/**
+ * @brief Publish request policy into graph-stable device storage.
+ */
+__global__ void rocm_configure_mtp_greedy_penalty_policy_kernel(
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ controls,
+    float presence_penalty,
+    float frequency_penalty,
+    int first_token_already_in_history)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    controls->presence_penalty = presence_penalty;
+    controls->frequency_penalty = frequency_penalty;
+    controls->first_token_already_in_history =
+        first_token_already_in_history != 0 ? 1 : 0;
+    controls->enabled =
+        presence_penalty != 0.0f || frequency_penalty != 0.0f ? 1 : 0;
+}
+
+/**
+ * @brief Apply durable-history penalties without a verifier prefix.
+ *
+ * This M=1 specialization gives adjacent work-items adjacent vocabulary
+ * entries and excludes every verifier-only branch. Ordinary serial decode
+ * therefore retains a compact VGPR/SGPR footprint and low launch latency.
+ */
+__global__ void rocm_apply_mtp_durable_penalties_f32_rows_kernel(
+    float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device)
+{
+    const int active_rows = active_rows_device ? *active_rows_device : rows;
+    if (active_rows <= 0 || active_rows > rows)
+        return;
+
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    for (int token = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+         token < cols;
+         token += static_cast<int>(blockDim.x * gridDim.x))
+    {
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        for (int row = 0; row < active_rows; ++row)
+        {
+            data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)] -= penalty;
+        }
+    }
+}
+
+/**
+ * @brief Apply device-owned serial-decode penalties to verifier logit rows.
+ *
+ * Adjacent work-items own adjacent vocabulary entries, preserving coalesced
+ * accesses on AMD wavefronts. Tokens named anywhere in the verifier branch are
+ * left to sparse row owners in workgroup zero. Every other token has one
+ * durable count shared by all rows, allowing this pass to scan the short
+ * branch once per vocabulary token instead of once per row.
+ *
+ * The two-kernel ownership split removes O(rows^2 * vocabulary) redundant
+ * comparisons while retaining one captured launch. Dense and sparse owners
+ * touch disjoint token addresses, requiring no grid-wide barrier, atomics,
+ * temporary buffers, transfers, or synchronization points.
+ */
+__global__ void rocm_apply_mtp_verifier_penalties_f32_rows_kernel(
+    float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device)
+{
+    const int active_rows = active_rows_device ? *active_rows_device : rows;
+    if (active_rows <= 0 || active_rows > rows)
+        return;
+
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    const int prefix_begin =
+        request_policy.first_token_already_in_history != 0 ? 1 : 0;
+
+    // Verifier launches reserve workgroup zero for sparse branch-token rows.
+    // The sparse workgroup runs concurrently with dense workgroups and exits;
+    // dense workgroups skip every address the sparse owner can modify.
+    if (blockIdx.x == 0)
+    {
+        for (int row = static_cast<int>(threadIdx.x);
+             row < active_rows;
+             row += static_cast<int>(blockDim.x))
+        {
+            for (int candidate_index = prefix_begin;
+                 candidate_index < active_rows;
+                 ++candidate_index)
+            {
+                const int token = verifier_input_tokens[candidate_index];
+                if (token < 0 || token >= cols)
+                    continue;
+
+                bool already_processed = false;
+                for (int earlier = prefix_begin;
+                     earlier < candidate_index;
+                     ++earlier)
+                {
+                    already_processed |=
+                        verifier_input_tokens[earlier] == token;
+                }
+                if (already_processed)
+                    continue;
+
+                int count = generated_token_counts[token];
+                for (int visible = prefix_begin; visible <= row; ++visible)
+                    count += verifier_input_tokens[visible] == token ? 1 : 0;
+                if (count <= 0)
+                    continue;
+
+                float penalty = 0.0f;
+                if (request_policy.presence_penalty != 0.0f)
+                    penalty += request_policy.presence_penalty;
+                if (request_policy.frequency_penalty != 0.0f)
+                {
+                    penalty += request_policy.frequency_penalty *
+                               static_cast<float>(count);
+                }
+                data[static_cast<size_t>(row) *
+                         static_cast<size_t>(row_stride) +
+                     static_cast<size_t>(token)] -= penalty;
+            }
+        }
+        return;
+    }
+
+    const int dense_block = static_cast<int>(blockIdx.x) - 1;
+    const int dense_blocks = static_cast<int>(gridDim.x) - 1;
+    for (int token = dense_block * static_cast<int>(blockDim.x) +
+                     static_cast<int>(threadIdx.x);
+         token < cols;
+         token += static_cast<int>(blockDim.x) * dense_blocks)
+    {
+        bool verifier_branch_token = false;
+        for (int history_index = prefix_begin;
+             history_index < active_rows;
+             ++history_index)
+        {
+            verifier_branch_token |=
+                verifier_input_tokens[history_index] == token;
+        }
+        if (verifier_branch_token)
+            continue;
+
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        for (int row = 0; row < active_rows; ++row)
+        {
+            data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)] -= penalty;
+        }
+    }
+
+}
+
+/** @brief Resolve one token from persistent condition and draft branch rows. */
+__device__ __forceinline__ int rocm_mtp_branch_token_at(
+    int branch_index,
+    int include_first_condition,
+    const int *__restrict__ first_condition_token,
+    const int *__restrict__ prior_draft_tokens)
+{
+    if (include_first_condition != 0 && branch_index == 0)
+        return first_condition_token[0];
+    return prior_draft_tokens[
+        branch_index - (include_first_condition != 0 ? 1 : 0)];
+}
+
+/**
+ * @brief Apply one proposal row's durable and speculative branch penalties.
+ *
+ * Sparse branch tokens belong to block zero; dense durable-only tokens belong
+ * to every later block.  This disjoint ownership preserves serial arithmetic
+ * without atomics, scratch, or a grid-wide synchronization point.
+ */
+__global__ void rocm_apply_mtp_branch_penalties_f32_row_kernel(
+    float *__restrict__ data,
+    int cols,
+    const int *__restrict__ first_condition_token,
+    const int *__restrict__ prior_draft_tokens,
+    int prior_draft_count,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy)
+{
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    const int include_first_condition =
+        request_policy.first_token_already_in_history == 0 ? 1 : 0;
+    const int branch_count = include_first_condition + prior_draft_count;
+
+    if (blockIdx.x == 0)
+    {
+        for (int branch_index = static_cast<int>(threadIdx.x);
+             branch_index < branch_count;
+             branch_index += static_cast<int>(blockDim.x))
+        {
+            const int token = rocm_mtp_branch_token_at(
+                branch_index,
+                include_first_condition,
+                first_condition_token,
+                prior_draft_tokens);
+            if (token < 0 || token >= cols)
+                continue;
+
+            bool already_processed = false;
+            for (int earlier = 0; earlier < branch_index; ++earlier)
+            {
+                already_processed |=
+                    rocm_mtp_branch_token_at(
+                        earlier,
+                        include_first_condition,
+                        first_condition_token,
+                        prior_draft_tokens) == token;
+            }
+            if (already_processed)
+                continue;
+
+            int count = generated_token_counts[token];
+            for (int visible = 0; visible < branch_count; ++visible)
+            {
+                count += rocm_mtp_branch_token_at(
+                             visible,
+                             include_first_condition,
+                             first_condition_token,
+                             prior_draft_tokens) == token
+                             ? 1
+                             : 0;
+            }
+            if (count <= 0)
+                continue;
+
+            float penalty = 0.0f;
+            if (request_policy.presence_penalty != 0.0f)
+                penalty += request_policy.presence_penalty;
+            if (request_policy.frequency_penalty != 0.0f)
+            {
+                penalty += request_policy.frequency_penalty *
+                           static_cast<float>(count);
+            }
+            data[token] -= penalty;
+        }
+        return;
+    }
+
+    const int dense_block = static_cast<int>(blockIdx.x) - 1;
+    const int dense_blocks = static_cast<int>(gridDim.x) - 1;
+    for (int token = dense_block * static_cast<int>(blockDim.x) +
+                     static_cast<int>(threadIdx.x);
+         token < cols;
+         token += dense_blocks * static_cast<int>(blockDim.x))
+    {
+        bool branch_owned = false;
+        for (int branch_index = 0;
+             branch_index < branch_count;
+             ++branch_index)
+        {
+            branch_owned |=
+                rocm_mtp_branch_token_at(
+                    branch_index,
+                    include_first_condition,
+                    first_condition_token,
+                    prior_draft_tokens) == token;
+        }
+        if (branch_owned)
+            continue;
+
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        data[token] -= penalty;
+    }
+}
+
+/**
+ * @brief Advance the mirrored generated-token histogram after publication.
+ */
+__global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
+    const int *__restrict__ output_tokens,
+    const int *__restrict__ output_meta,
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ accepted_state_counts,
+    const int *__restrict__ stopped_flags,
+    int output_token_capacity,
+    int vocab_size,
+    int *__restrict__ generated_token_counts)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (output_meta[llaminar2::sampling_math::kSpecBatchMetaOk] == 0)
+        return;
+
+    if (policy->enabled == 0)
+    {
+        policy->first_token_already_in_history = 0;
+        return;
+    }
+
+    int output_count =
+        output_meta[llaminar2::sampling_math::kSpecBatchMetaOutputCount];
+    if (output_count < 0)
+        output_count = 0;
+    if (output_count > output_token_capacity)
+        output_count = output_token_capacity;
+    const int accepted_state_count = accepted_state_counts[0];
+    if (accepted_state_count < 0 || accepted_state_count > output_count)
+        return;
+    const int begin =
+        policy->first_token_already_in_history != 0 ? 1 : 0;
+    for (int i = begin; i < output_count; ++i)
+    {
+        const int token = output_tokens[i];
+        if (token >= 0 && token < vocab_size)
+            ++generated_token_counts[token];
+    }
+
+    policy->first_token_already_in_history =
+        stopped_flags[0] == 0 && output_count > accepted_state_count ? 1 : 0;
+}
+
+template <bool PUBLISH_MTP_CHAIN, bool DEVICE_ACTIVE_ROWS = false>
 __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     const float *__restrict__ partial_vals,
     const int *__restrict__ partial_idxs,
@@ -230,13 +760,28 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     int row_partial_capacity,
     float *__restrict__ out_values,
     int *__restrict__ out_indices,
-    int output_stride)
+    int output_stride,
+    int *__restrict__ chain_condition_tokens,
+    int *__restrict__ chain_position_ids,
+    int chain_position_increment,
+    const int *__restrict__ active_rows_device)
 {
     extern __shared__ char shared_mem[];
-    float *smax = reinterpret_cast<float *>(shared_mem);
-    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+    const int wave_count = static_cast<int>(blockDim.x) / warpSize;
+    float *wave_values = reinterpret_cast<float *>(shared_mem);
+    int *wave_indices = reinterpret_cast<int *>(
+        shared_mem + wave_count * sizeof(float));
 
     const int row = blockIdx.x;
+    if constexpr (DEVICE_ACTIVE_ROWS)
+    {
+        const int active_rows = *active_rows_device;
+        if (active_rows <= 0 || active_rows > static_cast<int>(gridDim.x) ||
+            row >= active_rows)
+        {
+            return;
+        }
+    }
     const int tid = threadIdx.x;
     const int base = row * row_partial_capacity;
 
@@ -253,30 +798,166 @@ __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
         }
     }
 
-    smax[tid] = local_max;
-    sidx[tid] = local_idx;
-    __syncthreads();
-
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
-    {
-        if (tid < stride)
-        {
-            if (rocm_argmax_better(smax[tid + stride], sidx[tid + stride],
-                                   smax[tid], sidx[tid]))
-            {
-                smax[tid] = smax[tid + stride];
-                sidx[tid] = sidx[tid + stride];
-            }
-        }
-        __syncthreads();
-    }
+    const ROCmArgmaxPair block_max = rocm_argmax_block_reduce(
+        ROCmArgmaxPair{local_max, local_idx},
+        wave_values,
+        wave_indices);
 
     if (tid == 0)
     {
         const int out_row = row * output_stride;
-        out_values[out_row] = smax[0];
-        out_indices[out_row] = sidx[0];
+        out_values[out_row] = block_max.value;
+        out_indices[out_row] = block_max.index;
+        if constexpr (PUBLISH_MTP_CHAIN)
+        {
+            chain_condition_tokens[row] = block_max.index;
+            chain_position_ids[row] += chain_position_increment;
+        }
     }
+}
+
+/**
+ * @brief Validate a workgroup width accepted by the wave reducer.
+ *
+ * Production gfx906 devices execute wave64.  Requiring a multiple of 64 also
+ * remains valid on a future wave32 target, while shared-memory sizing below is
+ * conservatively based on 32-lane waves.
+ */
+static bool validROCmArgmaxThreadCount(int threads)
+{
+    return threads >= 64 && threads <= 1024 &&
+           (threads & (threads - 1)) == 0 &&
+           threads % 64 == 0;
+}
+
+/**
+ * @brief Launch one explicit HIP two-pass argmax geometry.
+ *
+ * The production entry point and Perf__ sweep share this exact launcher.  The
+ * benchmark can therefore select a stable winner without creating a separate
+ * implementation or a runtime autotuning branch in inference.
+ */
+static bool launchROCmArgmaxF32BatchedRowsGeometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment)
+{
+    const bool publish_mtp_chain =
+        chain_condition_tokens != nullptr || chain_position_ids != nullptr ||
+        chain_position_increment != 0;
+    if (rows <= 0 || cols <= 0 || row_stride < cols ||
+        !data || !out_values || !out_indices ||
+        !partial_vals || !partial_idxs || partial_capacity < rows ||
+        !stream || output_stride <= 0 || elements_per_thread <= 0 ||
+        !validROCmArgmaxThreadCount(reduce_threads) ||
+        !validROCmArgmaxThreadCount(finalize_threads) ||
+        (publish_mtp_chain &&
+         (!chain_condition_tokens || !chain_position_ids ||
+          chain_position_increment <= 0)))
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    const int row_partial_capacity = partial_capacity / rows;
+    if (row_partial_capacity < 1)
+        return false;
+
+    const long per_block =
+        static_cast<long>(reduce_threads) * elements_per_thread;
+    long blocks = (static_cast<long>(cols) + per_block - 1) / per_block;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > row_partial_capacity)
+        blocks = row_partial_capacity;
+    const int num_blocks = static_cast<int>(blocks);
+
+    const size_t partial_shared_bytes =
+        static_cast<size_t>(reduce_threads / 32) *
+        (sizeof(float) + sizeof(int));
+    hipLaunchKernelGGL(
+        rocm_argmax_partial_f32_batched_rows_kernel,
+        dim3(num_blocks, rows),
+        dim3(reduce_threads),
+        partial_shared_bytes,
+        s,
+        data,
+        rows,
+        cols,
+        row_stride,
+        partial_vals,
+        partial_idxs,
+        row_partial_capacity);
+
+    const size_t finalize_shared_bytes =
+        static_cast<size_t>(finalize_threads / 32) *
+        (sizeof(float) + sizeof(int));
+    if (publish_mtp_chain)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_argmax_finalize_f32_batched_rows_kernel<true>),
+            dim3(rows),
+            dim3(finalize_threads),
+            finalize_shared_bytes,
+            s,
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride,
+            chain_condition_tokens,
+            chain_position_ids,
+            chain_position_increment,
+            nullptr);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_argmax_finalize_f32_batched_rows_kernel<false>),
+            dim3(rows),
+            dim3(finalize_threads),
+            finalize_shared_bytes,
+            s,
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride,
+            nullptr,
+            nullptr,
+            0,
+            nullptr);
+    }
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm Argmax FP32 batched rows launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -361,7 +1042,7 @@ bool rocmOps_argmax_f32(
         partial_vals, partial_idxs, num_blocks, out_value, out_index);
 
     (void)hipGetLastError();  // Clear stale errors
-    hipError_t err = hipGetLastError();
+    const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Argmax FP32 (multi-block) launch failed: %s\n",
@@ -385,50 +1066,438 @@ bool rocmOps_argmax_f32_batched_rows(
     void *stream,
     int output_stride)
 {
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        ARGMAX_REDUCE_THREADS,
+        ARGMAX_ELEMS_PER_THREAD,
+        ARGMAX_FINALIZE_THREADS,
+        nullptr,
+        nullptr,
+        0);
+}
+
+bool rocmOps_argmax_f32_batched_rows_publish_mtp_chain(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride)
+{
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        ARGMAX_REDUCE_THREADS,
+        ARGMAX_ELEMS_PER_THREAD,
+        ARGMAX_FINALIZE_THREADS,
+        chain_condition_tokens,
+        chain_position_ids,
+        chain_position_increment);
+}
+
+/**
+ * @brief Perf__ entry point for explicit HIP argmax launch geometry.
+ */
+bool rocmOps_argmax_f32_batched_rows_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads)
+{
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        reduce_threads,
+        elements_per_thread,
+        finalize_threads,
+        nullptr,
+        nullptr,
+        0);
+}
+
+/**
+ * @brief Perf__ entry point for producer-owned MTP-chain publication.
+ *
+ * This invokes the exact production template specialization while exposing only
+ * launch geometry to the performance harness. Inference remains bound to one
+ * stable capture-time geometry and never autotunes on the hot path.
+ */
+bool rocmOps_argmax_f32_batched_rows_publish_mtp_chain_geometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads)
+{
+    return launchROCmArgmaxF32BatchedRowsGeometry(
+        data,
+        rows,
+        cols,
+        row_stride,
+        out_values,
+        out_indices,
+        partial_vals,
+        partial_idxs,
+        partial_capacity,
+        device_idx,
+        stream,
+        output_stride,
+        reduce_threads,
+        elements_per_thread,
+        finalize_threads,
+        chain_condition_tokens,
+        chain_position_ids,
+        chain_position_increment);
+}
+
+bool rocmOps_configure_mtp_greedy_penalty_policy(
+    llaminar2::MTPGreedyPenaltyPolicy *controls,
+    float presence_penalty,
+    float frequency_penalty,
+    bool first_token_already_in_history,
+    int device_idx,
+    void *stream)
+{
+    if (!controls || !stream)
+        return false;
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_configure_mtp_greedy_penalty_policy_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        static_cast<hipStream_t>(stream),
+        controls,
+        presence_penalty,
+        frequency_penalty,
+        first_token_already_in_history ? 1 : 0);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MTP greedy penalty policy launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *verifier_input_tokens,
+    const int *generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    const int *active_rows,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride)
+{
     if (rows <= 0 || cols <= 0 || row_stride < cols ||
-        !data || !out_values || !out_indices ||
+        !data || !verifier_input_tokens || !generated_token_counts ||
+        !policy || !active_rows || !out_values || !out_indices ||
         !partial_vals || !partial_idxs || partial_capacity < rows ||
-        output_stride <= 0)
+        !stream || output_stride <= 0)
     {
         return false;
     }
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipStream_t s = static_cast<hipStream_t>(stream);
-
     const int row_partial_capacity = partial_capacity / rows;
     if (row_partial_capacity < 1)
         return false;
 
     const int threads = ARGMAX_REDUCE_THREADS;
-    const long per_block = static_cast<long>(threads) * ARGMAX_ELEMS_PER_THREAD;
-    long blocks = (static_cast<long>(cols) + per_block - 1) / per_block;
+    const long per_block =
+        static_cast<long>(threads) * ARGMAX_ELEMS_PER_THREAD;
+    long blocks =
+        (static_cast<long>(cols) + per_block - 1) / per_block;
     if (blocks < 1)
         blocks = 1;
     if (blocks > row_partial_capacity)
         blocks = row_partial_capacity;
     const int num_blocks = static_cast<int>(blocks);
-
-    const size_t smem1 = threads * (sizeof(float) + sizeof(int));
+    const size_t shared_bytes =
+        static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
     hipLaunchKernelGGL(
-        rocm_argmax_partial_f32_batched_rows_kernel,
-        dim3(num_blocks, rows), dim3(threads), smem1, s,
-        data, rows, cols, row_stride, partial_vals, partial_idxs,
+        rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel,
+        dim3(num_blocks, rows),
+        dim3(threads),
+        shared_bytes,
+        static_cast<hipStream_t>(stream),
+        data,
+        rows,
+        cols,
+        row_stride,
+        verifier_input_tokens,
+        generated_token_counts,
+        policy,
+        active_rows,
+        partial_vals,
+        partial_idxs,
         row_partial_capacity);
-
-    const int fthreads = ARGMAX_FINALIZE_THREADS;
-    const size_t smem2 = fthreads * (sizeof(float) + sizeof(int));
     hipLaunchKernelGGL(
-        rocm_argmax_finalize_f32_batched_rows_kernel,
-        dim3(rows), dim3(fthreads), smem2, s,
-        partial_vals, partial_idxs, num_blocks, row_partial_capacity,
-        out_values, out_indices, output_stride);
+        HIP_KERNEL_NAME(
+            rocm_argmax_finalize_f32_batched_rows_kernel<false, true>),
+        dim3(rows),
+        dim3(ARGMAX_FINALIZE_THREADS),
+        static_cast<size_t>(ARGMAX_FINALIZE_THREADS) *
+            (sizeof(float) + sizeof(int)),
+        static_cast<hipStream_t>(stream),
+        partial_vals,
+        partial_idxs,
+        num_blocks,
+        row_partial_capacity,
+        out_values,
+        out_indices,
+        output_stride,
+        nullptr,
+        nullptr,
+        0,
+        active_rows);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MTP penalty-aware batched argmax launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
 
+bool rocmOps_apply_mtp_penalties_f32_rows(
+    float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *verifier_input_tokens,
+    const int *generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    const int *active_rows,
+    int device_idx,
+    void *stream)
+{
+    if (!data || rows <= 0 || cols <= 0 || row_stride < cols ||
+        !generated_token_counts || !policy || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int blocks = (cols + threads - 1) / threads;
+    blocks = blocks > 1024 ? 1024 : blocks;
+    if (verifier_input_tokens)
+    {
+        hipLaunchKernelGGL(
+            rocm_apply_mtp_verifier_penalties_f32_rows_kernel,
+            dim3(blocks + 1),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            data,
+            rows,
+            cols,
+            row_stride,
+            verifier_input_tokens,
+            generated_token_counts,
+            policy,
+            active_rows);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            rocm_apply_mtp_durable_penalties_f32_rows_kernel,
+            dim3(blocks),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            data,
+            rows,
+            cols,
+            row_stride,
+            generated_token_counts,
+            policy,
+            active_rows);
+    }
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "ROCm Argmax FP32 batched rows launch failed: %s\n",
-                hipGetErrorString(err));
+        fprintf(
+            stderr,
+            "ROCm MTP penalty row transform launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
+bool rocmOps_apply_mtp_branch_penalties_f32_row(
+    float *data,
+    int cols,
+    const int *first_condition_token,
+    const int *prior_draft_tokens,
+    int prior_draft_count,
+    const int *generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *policy,
+    int device_idx,
+    void *stream)
+{
+    if (!data || cols <= 0 || !first_condition_token ||
+        prior_draft_count < 0 ||
+        (prior_draft_count > 0 && !prior_draft_tokens) ||
+        !generated_token_counts || !policy || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int dense_blocks = (cols + threads - 1) / threads;
+    dense_blocks = dense_blocks > 1024 ? 1024 : dense_blocks;
+    hipLaunchKernelGGL(
+        rocm_apply_mtp_branch_penalties_f32_row_kernel,
+        dim3(dense_blocks + 1),
+        dim3(threads),
+        0,
+        static_cast<hipStream_t>(stream),
+        data,
+        cols,
+        first_condition_token,
+        prior_draft_tokens,
+        prior_draft_count,
+        generated_token_counts,
+        policy);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MTP branch penalty row transform launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_commit_mtp_greedy_penalty_history(
+    const int *output_tokens,
+    const int *output_meta,
+    llaminar2::MTPGreedyPenaltyPolicy *policy,
+    const int *accepted_state_counts,
+    const int *stopped_flags,
+    int output_token_capacity,
+    int vocab_size,
+    int *generated_token_counts,
+    int device_idx,
+    void *stream)
+{
+    if (!output_tokens || !output_meta || !policy ||
+        !accepted_state_counts || !stopped_flags ||
+        output_token_capacity <= 0 || vocab_size <= 0 ||
+        !generated_token_counts || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_commit_mtp_greedy_penalty_history_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        static_cast<hipStream_t>(stream),
+        output_tokens,
+        output_meta,
+        policy,
+        accepted_state_counts,
+        stopped_flags,
+        output_token_capacity,
+        vocab_size,
+        generated_token_counts);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MTP greedy penalty history commit launch failed: %s\n",
+            hipGetErrorString(err));
         return false;
     }
     return true;

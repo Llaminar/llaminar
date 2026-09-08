@@ -16,7 +16,7 @@
 
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 
 #include <algorithm>
 #include <memory>
@@ -37,50 +37,50 @@ namespace llaminar2::test
         // Domain helpers (same style as unit tests)
         // -------------------------------------------------------------------------
 
-        ExpertComputeDomain cudaDomain(const std::string &name)
+        RoutedExpertDomain cudaDomain(const std::string &name)
         {
-            ExpertComputeDomain d;
+            RoutedExpertDomain d;
             d.name = name;
-            d.kind = ExpertDomainKind::SingleDevice;
+            d.scope = ExecutionDomainScope::SINGLE;
             d.backend = CollectiveBackendType::NCCL;
             d.participants = {GlobalDeviceAddress::cuda(0, 0)};
             d.owner_rank = 0;
-            d.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            d.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return d;
         }
 
-        ExpertComputeDomain rocmDomain(const std::string &name)
+        RoutedExpertDomain rocmDomain(const std::string &name)
         {
-            ExpertComputeDomain d;
+            RoutedExpertDomain d;
             d.name = name;
-            d.kind = ExpertDomainKind::LocalTP;
+            d.scope = ExecutionDomainScope::RANK_LOCAL;
             d.backend = CollectiveBackendType::RCCL;
             d.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(0, 1)};
             d.owner_rank = 0;
-            d.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            d.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return d;
         }
 
-        ExpertComputeDomain cpuDomain(const std::string &name)
+        RoutedExpertDomain cpuDomain(const std::string &name)
         {
-            ExpertComputeDomain d;
+            RoutedExpertDomain d;
             d.name = name;
-            d.kind = ExpertDomainKind::SingleDevice;
+            d.scope = ExecutionDomainScope::SINGLE;
             d.backend = CollectiveBackendType::MPI;
             d.participants = {GlobalDeviceAddress::cpu(0)};
             d.owner_rank = 0;
-            d.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            d.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return d;
         }
 
-        ExpertRoutedTier tier(
+        RoutedExpertTier tier(
             const std::string &name,
             const std::string &domain,
             int priority,
             int max_experts_per_layer,
             bool fallback = false)
         {
-            ExpertRoutedTier t;
+            RoutedExpertTier t;
             t.name = name;
             t.domain = domain;
             t.priority = priority;
@@ -89,9 +89,9 @@ namespace llaminar2::test
             return t;
         }
 
-        MoEExpertModelMetadata metadata()
+        MoERoutedExpertModelMetadata metadata()
         {
-            MoEExpertModelMetadata m;
+            MoERoutedExpertModelMetadata m;
             m.num_layers = kLayers;
             m.num_experts = kExperts;
             m.d_model = kDModel;
@@ -145,12 +145,12 @@ namespace llaminar2::test
     TEST(Test__MoEGraphNative_RebalancedOwnerMap_MVP, AllGPU_CompleteOwnerMap_NoFallback)
     {
         // cuda_hot (8 slots, priority 0) + rocm_warm (8 slots, priority 1) = 16 == kExperts.
-        MoEExpertParallelPlan plan;
+        MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
-        plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan.continuation_domain = "cuda_hot";
         plan.shared_expert_domain = "cuda_hot";
-        plan.residency_policy = ExpertResidencyPolicy::RoutedTierRebalanced;
+        plan.residency_policy = RoutedExpertResidencyPolicy::RoutedTierRebalanced;
         plan.domains = {cudaDomain("cuda_hot"), rocmDomain("rocm_warm")};
         plan.routed_tiers = {
             tier("cuda_hot_tier", "cuda_hot", 0, 8),
@@ -158,13 +158,13 @@ namespace llaminar2::test
         };
 
         auto hist = makeAscendingHistogram();
-        MoEExpertParallelPlannerOptions opts;
+        MoERoutedExpertPlacementPlannerOptions opts;
         opts.decode_histogram = hist.get();
 
-        const auto result = MoEExpertParallelPlanner::plan(plan, metadata(), opts);
+        const auto result = MoERoutedExpertPlacementPlanner::plan(plan, metadata(), opts);
 
         // Plan validates cleanly.
-        EXPECT_TRUE(validateMoEExpertParallelPlan(
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(
                         result.planned_plan,
                         {.layer_count = kLayers, .routed_expert_count = kExperts})
                         .ok());
@@ -221,12 +221,12 @@ namespace llaminar2::test
     TEST(Test__MoEGraphNative_RebalancedOwnerMap_MVP, MixedGpuCpu_TierDiagnostics_Complete)
     {
         // cuda_hot (4) + rocm_warm (4) = 8 GPU; remaining 8 -> cpu_cold (fallback).
-        MoEExpertParallelPlan plan;
+        MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
-        plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan.continuation_domain = "cuda_hot";
         plan.shared_expert_domain = "cuda_hot";
-        plan.residency_policy = ExpertResidencyPolicy::RoutedTierRebalanced;
+        plan.residency_policy = RoutedExpertResidencyPolicy::RoutedTierRebalanced;
         plan.domains = {cudaDomain("cuda_hot"), rocmDomain("rocm_warm"), cpuDomain("cpu_cold")};
         plan.routed_tiers = {
             tier("cuda_hot_tier", "cuda_hot", 0, 4),
@@ -235,12 +235,12 @@ namespace llaminar2::test
         };
 
         auto hist = makeAscendingHistogram();
-        MoEExpertParallelPlannerOptions opts;
+        MoERoutedExpertPlacementPlannerOptions opts;
         opts.decode_histogram = hist.get();
 
-        const auto result = MoEExpertParallelPlanner::plan(plan, metadata(), opts);
+        const auto result = MoERoutedExpertPlacementPlanner::plan(plan, metadata(), opts);
 
-        EXPECT_TRUE(validateMoEExpertParallelPlan(
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(
                         result.planned_plan,
                         {.layer_count = kLayers, .routed_expert_count = kExperts})
                         .ok());

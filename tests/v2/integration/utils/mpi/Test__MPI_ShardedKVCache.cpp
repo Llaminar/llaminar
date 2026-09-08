@@ -222,7 +222,8 @@ namespace llaminar2
             EXPECT_EQ(cache->get_cached_tokens(0, 0), 2);
 
             // Clear on this rank only (no communication)
-            cache->clear();
+            ASSERT_TRUE(cache->resetRequestState(
+                IKVCache::StateResetContext::testReinitialization(nullptr)));
 
             // Verify cleared
             for (int layer = 0; layer < kNumLayers; ++layer)

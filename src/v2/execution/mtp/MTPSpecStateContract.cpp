@@ -1,3 +1,12 @@
+/**
+ * @file MTPSpecStateContract.cpp
+ * @brief Validates grouped MTP metadata and constructs atomic publication plans.
+ *
+ * All validation happens before a backend mutates KV, recurrent, terminal, or
+ * logical-position state.  The resulting plans preserve exact CPU verifier-row
+ * identity and can be clamped across participants without inventing a second
+ * authority for any live value.
+ */
 #include "MTPSpecStateContract.h"
 
 #include <algorithm>
@@ -51,6 +60,20 @@ namespace llaminar2
             const MTPSpecStepPlan &lhs,
             const MTPSpecStepPlan &rhs)
         {
+            const auto same_verifier_identity = [&]()
+            {
+                if (lhs.verifier_input_identity.has_value() !=
+                    rhs.verifier_input_identity.has_value())
+                {
+                    return false;
+                }
+                if (!lhs.verifier_input_identity)
+                    return true;
+                return lhs.verifier_input_identity->draft_depth ==
+                           rhs.verifier_input_identity->draft_depth &&
+                       lhs.verifier_input_identity->verifier_input_tokens ==
+                           rhs.verifier_input_identity->verifier_input_tokens;
+            };
             return lhs.request_id == rhs.request_id &&
                    lhs.draft_count == rhs.draft_count &&
                    lhs.target_rows == rhs.target_rows &&
@@ -58,7 +81,8 @@ namespace llaminar2
                    lhs.committed_output_count == rhs.committed_output_count &&
                    lhs.valid_sampled_count == rhs.valid_sampled_count &&
                    lhs.next_condition_token == rhs.next_condition_token &&
-                   lhs.stopped == rhs.stopped;
+                   lhs.stopped == rhs.stopped &&
+                   same_verifier_identity();
         }
 
         void clearSpeculativeSuffixState(MTPSpecStepPlan &step)
@@ -120,6 +144,9 @@ namespace llaminar2
             !hasSize(batch.bonus_ready_token_rows, requests) ||
             !hasSize(batch.bonus_ready_token_indices, requests) ||
             !hasSize(batch.bonus_ready_state_slot_indices, requests) ||
+            !hasSize(
+                batch.draft_tokens,
+                requests * shape.max_draft_tokens) ||
             !hasSize(publication_plan.base_cached_tokens, requests) ||
             !hasSize(publication_plan.target_cached_tokens, requests) ||
             !hasSize(publication_plan.accepted_state_counts, requests) ||
@@ -275,6 +302,17 @@ namespace llaminar2
             step.bonus_ready_state_slot_index = bonus_slot;
             step.next_condition_token =
                 batch.next_condition_tokens[static_cast<size_t>(i)];
+            const int draft_offset = i * shape.max_draft_tokens;
+            MTPSpecVerifierInputIdentity verifier_identity;
+            verifier_identity.draft_depth = draft_count - 1;
+            verifier_identity.verifier_input_tokens.assign(
+                batch.draft_tokens.begin() + draft_offset,
+                batch.draft_tokens.begin() + draft_offset + draft_count);
+            if (verifier_identity.valid())
+            {
+                step.verifier_input_identity =
+                    std::move(verifier_identity);
+            }
             step.all_drafts_accepted = all_drafts_accepted;
             step.stopped = stopped;
             result.steps.push_back(step);
@@ -353,7 +391,7 @@ namespace llaminar2
         result.ok = true;
         result.common_accepted_count = common_accepted;
         result.all_participants_direct = all_direct;
-        result.requires_common_fallback_replay = !all_direct;
+        result.clamped_participant_suffix = !all_direct;
         result.clamped_steps.reserve(participant_steps.size());
 
         for (const MTPSpecStepPlan &input_step : participant_steps)
@@ -366,9 +404,9 @@ namespace llaminar2
                 /*
                  * A participant that ran further than the common prefix may
                  * have verifier-row state the rest of the domain cannot use.
-                 * Clamp the publishable state and force the topology owner to
-                 * replay from the common prefix instead of pretending the
-                 * participant-local suffix is globally valid.
+                 * Clamp the publishable state to the shared prefix and clear the
+                 * participant-local suffix so grouped publication advances every
+                 * participant to the same serial-decode boundary.
                  */
                 step.accepted_count = common_accepted;
                 step.target_cached_tokens =
@@ -378,7 +416,7 @@ namespace llaminar2
                         ? common_accepted - 1
                         : kMTPSpecDecodeInvalidToken;
             }
-            if (result.requires_common_fallback_replay || common_accepted == 0)
+            if (result.clamped_participant_suffix || common_accepted == 0)
             {
                 if (common_accepted == 0)
                 {

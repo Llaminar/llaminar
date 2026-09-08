@@ -2,8 +2,9 @@
  * @file CUDAEmbeddingKernelT.h
  * @brief CUDA implementation of embedding lookup kernel
  *
- * Handles embedding table lookup on GPU. The embedding table is
- * uploaded to GPU memory and rows are looked up based on token IDs.
+ * Handles embedding table lookup from device-owned weights. Quantized tables
+ * must be prepared and uploaded before execution; FP32 tables must already be
+ * resident on the target CUDA device.
  *
  * Supports FP32 embedding tables with FP32 output.
  *
@@ -24,8 +25,6 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
-#include <unordered_map>
-#include <mutex>
 #include <stdexcept>
 
 namespace llaminar2
@@ -64,10 +63,11 @@ namespace llaminar2
         void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
         IWorkerGPUContext *deviceContext() const { return device_ctx_; }
         bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-        void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+        void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
         // GPU stream for graph capture support
-        void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+        void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+        void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
         void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle) override
         {
             prepared_embedding_handle_ = handle;
@@ -189,17 +189,14 @@ namespace llaminar2
         /**
          * @brief Get workspace requirements for embedding lookup
          *
-         * Returns buffers needed for embedding:
-         * - embed_token_ids [max_seq_len]: INT32 token IDs on GPU
-         * - embed_table_temp [vocab_size × d_model]: FP32 temp buffer for non-GPU embed tables
+         * Returns the stable INT32 token-ID buffer used by prefill and by graph
+         * replay when a device sampler has not supplied token IDs directly.
+         * Embedding weights are persistent model state and never workspace.
          *
          * @param m Maximum sequence length (num_tokens)
          * @param n Not used (pass 0)
-         * @param k d_model dimension (embedding dimension)
+         * @param k Unused (embedding weights are prepared separately)
          * @return WorkspaceRequirements describing all needed buffers
-         *
-         * @note For embed_table_temp, vocab_size is estimated as 151936 (Qwen2 vocab).
-         *       Actual vocab size may be smaller; the buffer will be sufficient.
          */
         WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const override;
@@ -224,30 +221,6 @@ namespace llaminar2
          */
         DeviceWorkspaceManager *getWorkspace() const override;
 
-        /**
-         * @brief Clear the cached embedding table pointer for this workspace
-         *
-         * Call this if the model changes or the workspace is reset.
-         * The next apply_tensor() call will re-upload the embedding table.
-         */
-        void clearEmbeddingCache()
-        {
-            if (workspace_)
-            {
-                std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                s_workspace_embed_cache_.erase(workspace_);
-            }
-        }
-
-        /**
-         * @brief Static method to clear ALL embedding caches (for model unload)
-         */
-        static void clearGlobalEmbeddingCache()
-        {
-            std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-            s_workspace_embed_cache_.clear();
-        }
-
     private:
         int device_idx_ = 0;
         IWorkerGPUContext *device_ctx_ = nullptr;
@@ -256,16 +229,6 @@ namespace llaminar2
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
-
-        // Embedding table caching state (STATIC MAP - per-workspace cache)
-        // This is critical for performance: kernel instances are recreated every forward pass
-        // due to graph rebuild, but the embedding table in GPU workspace is persistent.
-        // Using static ensures we don't re-upload 500+ MB every decode step.
-        // KEY FIX: Use per-workspace cache to support LOCAL TP with multiple devices.
-        // Each device has its own workspace, so we cache separately per workspace.
-        // THREAD SAFETY: Protected by s_embed_cache_mutex_ for LocalTP multi-device access.
-        static inline std::mutex s_embed_cache_mutex_;
-        static inline std::unordered_map<DeviceWorkspaceManager *, const TensorBase *> s_workspace_embed_cache_;
 
         int *h_token_ids_ = nullptr;
         int max_token_ids_ = 0;

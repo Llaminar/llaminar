@@ -6,7 +6,7 @@
  * 1. MoERoutingStage produces routing_indices and routing_weights
  * 2. MoEExpertComputeStage consumes routing results + expert weights → combined output
  *
- * Tests prefill (multi-token), decode (single-token), expert-parallel partial output,
+ * Tests prefill, decode, expert-ID-apportioned partial output,
  * and normalized weight flow.
  */
 
@@ -36,6 +36,16 @@ class MoERoutingToComputeTest : public ::testing::Test
 {
 protected:
     std::unique_ptr<MockDeviceContext> cpu_ctx_;
+    /**
+     * @brief Graph-local owner shared by routing and expert compute.
+     *
+     * Production graphs use one owner for the ordered routed pipeline so the
+     * CPU router can publish its canonical Q8_1 hidden rows directly to the
+     * expert projection stage.  Keeping the same ownership contract in this
+     * fixture prevents the test from accidentally exercising two disconnected
+     * kernels that cannot exchange publication state.
+     */
+    std::shared_ptr<MoERoutedPipelineKernelOwner> routed_pipeline_kernel_owner_;
 
     // Dimensions must be multiples of 256 for Q4_K block size
     static constexpr int D_MODEL = 256;
@@ -46,6 +56,8 @@ protected:
     void SetUp() override
     {
         cpu_ctx_ = std::make_unique<MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
+        routed_pipeline_kernel_owner_ =
+            std::make_shared<MoERoutedPipelineKernelOwner>();
     }
 
     /// Create a 3D Q4_K expert tensor in GGUF layout [cols, rows, num_experts]
@@ -95,6 +107,8 @@ protected:
         params.top_k = top_k;
         params.norm_topk_prob = norm_topk_prob;
         params.layer_idx = 0;
+        params.routed_pipeline_kernel_owner =
+            routed_pipeline_kernel_owner_;
 
         MoERoutingStage stage(params);
         return stage.execute(cpu_ctx_.get());
@@ -125,6 +139,8 @@ protected:
         params.expert_intermediate = intermediate;
         params.local_expert_start = local_expert_start;
         params.local_expert_count = local_expert_count;
+        params.routed_pipeline_kernel_owner =
+            routed_pipeline_kernel_owner_;
 
         if (!MoEExpertComputeStage::extractExpertViews(params))
             return false;
@@ -149,7 +165,7 @@ protected:
         EXPECT_TRUE(any_nonzero) << label << ": output is all zeros";
     }
 
-    /// Check no NaN/Inf (but allow all-zeros for EP partial output)
+    /// Check no NaN/Inf, while allowing an all-zero local routed partial.
     void verifyNoNaN(const float *data, int count, const std::string &label)
     {
         for (int i = 0; i < count; ++i)
@@ -278,7 +294,7 @@ TEST_F(MoERoutingToComputeTest, EPPartialOutput)
                            routing_indices.get(), routing_weights.get(),
                            seq_len, D_MODEL, NUM_EXPERTS, TOP_K));
 
-    // === Stage 2: Expert compute with EP (only experts 2,3) ===
+    // === Stage 2: expert-ID-apportioned compute (only experts 2 and 3) ===
     ASSERT_TRUE(runExpertCompute(input.get(), routing_indices.get(), routing_weights.get(),
                                  gate_exps.get(), up_exps.get(), down_exps.get(),
                                  output.get(), seq_len, D_MODEL, NUM_EXPERTS, TOP_K, INTERMEDIATE,
@@ -288,7 +304,7 @@ TEST_F(MoERoutingToComputeTest, EPPartialOutput)
     // But it must not contain NaN/Inf.
     verifyNoNaN(output->data(), seq_len * D_MODEL, "EPPartialOutput");
 
-    // Verify allowsZeroOutput() returns true for EP configuration
+    // A participant with no selected local expert rows may produce zero output.
     MoEExpertComputeStage::Params ep_params;
     ep_params.device_id = DeviceId::cpu();
     ep_params.local_expert_count = local_expert_count;

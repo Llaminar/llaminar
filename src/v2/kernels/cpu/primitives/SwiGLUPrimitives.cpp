@@ -5,9 +5,11 @@
  */
 
 #include "SwiGLUPrimitives.h"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
 #include <cmath>
 #include <omp.h>
 #include <algorithm>
+#include <stdexcept>
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/OpenMPUtils.h"
 
@@ -208,6 +210,266 @@ namespace llaminar2::primitives
     }
 #endif
 
+#if defined(__GNUC__) && !defined(__clang__)
+    /** Keep the explicit device arithmetic edges distinct in SIMD code. */
+#define LLAMINAR_EXACT_SWIGLU_SIMD                                                \
+    __attribute__((optimize("fp-contract=off", "no-associative-math")))
+#else
+#define LLAMINAR_EXACT_SWIGLU_SIMD
+#endif
+
+#if defined(__AVX2__)
+    /**
+     * @brief Evaluate the device exponential contract in eight independent lanes.
+     *
+     * Every intrinsic corresponds to one operation in
+     * device_swiglu_contract::expNonPositive().  In particular the range
+     * reduction uses two fixed FMAs and every Horner edge is a distinct FMA;
+     * the compiler may not contract or reassociate the surrounding operations.
+     */
+    LLAMINAR_EXACT_SWIGLU_SIMD
+    static inline __m256 exact_exp_non_positive_avx2(__m256 x)
+    {
+        const __m256 zero = _mm256_setzero_ps();
+        const __m256 one = _mm256_set1_ps(1.0f);
+        const __m256 nan_mask = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
+        const __m256 nonnegative_mask =
+            _mm256_cmp_ps(x, zero, _CMP_GE_OQ);
+        const __m256 underflow_mask = _mm256_cmp_ps(
+            x, _mm256_set1_ps(-87.0f), _CMP_LE_OQ);
+
+        const __m256 scaled = _mm256_mul_ps(
+            x, _mm256_set1_ps(0x1.715476p+0f));
+        const __m256 rounding_offset = _mm256_blendv_ps(
+            _mm256_set1_ps(-0.5f),
+            _mm256_set1_ps(0.5f),
+            _mm256_cmp_ps(scaled, zero, _CMP_GE_OQ));
+        const __m256 adjusted = _mm256_add_ps(scaled, rounding_offset);
+        const __m256i exponent = _mm256_cvttps_epi32(adjusted);
+        const __m256 exponent_fp32 = _mm256_cvtepi32_ps(exponent);
+        __m256 remainder = _mm256_fnmadd_ps(
+            exponent_fp32,
+            _mm256_set1_ps(0x1.62e400p-1f),
+            x);
+        remainder = _mm256_fnmadd_ps(
+            exponent_fp32,
+            _mm256_set1_ps(0x1.7f7d1cp-20f),
+            remainder);
+
+        __m256 polynomial = _mm256_set1_ps(0x1.a01a02p-16f);
+        polynomial = _mm256_fmadd_ps(
+            polynomial, remainder, _mm256_set1_ps(0x1.a01a02p-13f));
+        polynomial = _mm256_fmadd_ps(
+            polynomial, remainder, _mm256_set1_ps(0x1.6c16c2p-10f));
+        polynomial = _mm256_fmadd_ps(
+            polynomial, remainder, _mm256_set1_ps(0x1.111112p-7f));
+        polynomial = _mm256_fmadd_ps(
+            polynomial, remainder, _mm256_set1_ps(0x1.555556p-5f));
+        polynomial = _mm256_fmadd_ps(
+            polynomial, remainder, _mm256_set1_ps(0x1.555556p-3f));
+        polynomial = _mm256_fmadd_ps(
+            polynomial, remainder, _mm256_set1_ps(0x1.000000p-1f));
+        polynomial = _mm256_fmadd_ps(polynomial, remainder, one);
+        polynomial = _mm256_fmadd_ps(polynomial, remainder, one);
+
+        const __m256i exponent_bits = _mm256_slli_epi32(
+            _mm256_add_epi32(exponent, _mm256_set1_epi32(127)), 23);
+        __m256 result = _mm256_mul_ps(
+            polynomial, _mm256_castsi256_ps(exponent_bits));
+        result = _mm256_blendv_ps(result, zero, underflow_mask);
+        result = _mm256_blendv_ps(result, one, nonnegative_mask);
+        return _mm256_blendv_ps(result, x, nan_mask);
+    }
+
+    /**
+     * @brief Execute eight exact device SwiGLU programs in parallel.
+     * @param gate Gate-projection words.
+     * @param up Up-projection words.
+     * @return Eight byte-equivalent CPU/CUDA/ROCm SwiGLU results.
+     */
+    LLAMINAR_EXACT_SWIGLU_SIMD
+    static inline __m256 exact_swiglu_avx2(__m256 gate, __m256 up)
+    {
+        const __m256 zero = _mm256_setzero_ps();
+        const __m256 positive =
+            _mm256_cmp_ps(gate, zero, _CMP_GE_OQ);
+        const __m256 exponential_input = _mm256_blendv_ps(
+            gate,
+            _mm256_sub_ps(zero, gate),
+            positive);
+        const __m256 exponential =
+            exact_exp_non_positive_avx2(exponential_input);
+        const __m256 denominator =
+            _mm256_add_ps(_mm256_set1_ps(1.0f), exponential);
+        __m256 reciprocal = _mm256_set1_ps(0.75f);
+        for (int iteration = 0; iteration < 5; ++iteration)
+        {
+            const __m256 product = _mm256_mul_ps(denominator, reciprocal);
+            const __m256 correction =
+                _mm256_sub_ps(_mm256_set1_ps(2.0f), product);
+            reciprocal = _mm256_mul_ps(reciprocal, correction);
+        }
+        const __m256 sigmoid = _mm256_blendv_ps(
+            _mm256_mul_ps(exponential, reciprocal), reciprocal, positive);
+        return _mm256_mul_ps(_mm256_mul_ps(gate, sigmoid), up);
+    }
+
+    /**
+     * @brief AVX2 implementation of the placement-invariant SwiGLU program.
+     */
+    static void compute_swiglu_gpu_aligned_expert_avx2(
+        const float *gate,
+        const float *up,
+        float *output,
+        int size)
+    {
+        int element = 0;
+        for (; element + 8 <= size; element += 8)
+        {
+            _mm256_storeu_ps(
+                output + element,
+                exact_swiglu_avx2(
+                    _mm256_loadu_ps(gate + element),
+                    _mm256_loadu_ps(up + element)));
+        }
+        for (; element < size; ++element)
+        {
+            output[element] = device_swiglu_contract::swigluValue(
+                gate[element], up[element]);
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Evaluate the device exponential contract in sixteen lanes.
+     * @see exact_exp_non_positive_avx2
+     */
+    LLAMINAR_EXACT_SWIGLU_SIMD
+    static inline __m512 exact_exp_non_positive_avx512(__m512 x)
+    {
+        const __m512 zero = _mm512_setzero_ps();
+        const __m512 one = _mm512_set1_ps(1.0f);
+        const __mmask16 nan_mask = _mm512_cmp_ps_mask(x, x, _CMP_UNORD_Q);
+        const __mmask16 nonnegative_mask =
+            _mm512_cmp_ps_mask(x, zero, _CMP_GE_OQ);
+        const __mmask16 underflow_mask = _mm512_cmp_ps_mask(
+            x, _mm512_set1_ps(-87.0f), _CMP_LE_OQ);
+
+        const __m512 scaled = _mm512_mul_ps(
+            x, _mm512_set1_ps(0x1.715476p+0f));
+        const __mmask16 scaled_nonnegative =
+            _mm512_cmp_ps_mask(scaled, zero, _CMP_GE_OQ);
+        const __m512 rounding_offset = _mm512_mask_blend_ps(
+            scaled_nonnegative,
+            _mm512_set1_ps(-0.5f),
+            _mm512_set1_ps(0.5f));
+        const __m512 adjusted = _mm512_add_ps(scaled, rounding_offset);
+        const __m512i exponent = _mm512_cvttps_epi32(adjusted);
+        const __m512 exponent_fp32 = _mm512_cvtepi32_ps(exponent);
+        __m512 remainder = _mm512_fnmadd_ps(
+            exponent_fp32,
+            _mm512_set1_ps(0x1.62e400p-1f),
+            x);
+        remainder = _mm512_fnmadd_ps(
+            exponent_fp32,
+            _mm512_set1_ps(0x1.7f7d1cp-20f),
+            remainder);
+
+        __m512 polynomial = _mm512_set1_ps(0x1.a01a02p-16f);
+        polynomial = _mm512_fmadd_ps(
+            polynomial, remainder, _mm512_set1_ps(0x1.a01a02p-13f));
+        polynomial = _mm512_fmadd_ps(
+            polynomial, remainder, _mm512_set1_ps(0x1.6c16c2p-10f));
+        polynomial = _mm512_fmadd_ps(
+            polynomial, remainder, _mm512_set1_ps(0x1.111112p-7f));
+        polynomial = _mm512_fmadd_ps(
+            polynomial, remainder, _mm512_set1_ps(0x1.555556p-5f));
+        polynomial = _mm512_fmadd_ps(
+            polynomial, remainder, _mm512_set1_ps(0x1.555556p-3f));
+        polynomial = _mm512_fmadd_ps(
+            polynomial, remainder, _mm512_set1_ps(0x1.000000p-1f));
+        polynomial = _mm512_fmadd_ps(polynomial, remainder, one);
+        polynomial = _mm512_fmadd_ps(polynomial, remainder, one);
+
+        const __m512i exponent_bits = _mm512_slli_epi32(
+            _mm512_add_epi32(exponent, _mm512_set1_epi32(127)), 23);
+        __m512 result = _mm512_mul_ps(
+            polynomial, _mm512_castsi512_ps(exponent_bits));
+        result = _mm512_mask_mov_ps(result, underflow_mask, zero);
+        result = _mm512_mask_mov_ps(result, nonnegative_mask, one);
+        return _mm512_mask_mov_ps(result, nan_mask, x);
+    }
+
+    /**
+     * @brief Execute sixteen exact device SwiGLU programs in parallel.
+     * @param gate Gate-projection words.
+     * @param up Up-projection words.
+     * @return Sixteen byte-equivalent CPU/CUDA/ROCm SwiGLU results.
+     */
+    LLAMINAR_EXACT_SWIGLU_SIMD
+    static inline __m512 exact_swiglu_avx512(__m512 gate, __m512 up)
+    {
+        const __m512 zero = _mm512_setzero_ps();
+        const __mmask16 positive =
+            _mm512_cmp_ps_mask(gate, zero, _CMP_GE_OQ);
+        const __m512 exponential_input = _mm512_mask_blend_ps(
+            positive, gate, _mm512_sub_ps(zero, gate));
+        const __m512 exponential =
+            exact_exp_non_positive_avx512(exponential_input);
+        const __m512 denominator =
+            _mm512_add_ps(_mm512_set1_ps(1.0f), exponential);
+        __m512 reciprocal = _mm512_set1_ps(0.75f);
+        for (int iteration = 0; iteration < 5; ++iteration)
+        {
+            const __m512 product = _mm512_mul_ps(denominator, reciprocal);
+            const __m512 correction =
+                _mm512_sub_ps(_mm512_set1_ps(2.0f), product);
+            reciprocal = _mm512_mul_ps(reciprocal, correction);
+        }
+        const __m512 sigmoid = _mm512_mask_blend_ps(
+            positive,
+            _mm512_mul_ps(exponential, reciprocal),
+            reciprocal);
+        return _mm512_mul_ps(_mm512_mul_ps(gate, sigmoid), up);
+    }
+
+    /**
+     * @brief AVX-512 implementation of the placement-invariant SwiGLU program.
+     */
+    static void compute_swiglu_gpu_aligned_expert_avx512(
+        const float *gate,
+        const float *up,
+        float *output,
+        int size)
+    {
+        int element = 0;
+        for (; element + 16 <= size; element += 16)
+        {
+            _mm512_storeu_ps(
+                output + element,
+                exact_swiglu_avx512(
+                    _mm512_loadu_ps(gate + element),
+                    _mm512_loadu_ps(up + element)));
+        }
+#if defined(__AVX2__)
+        compute_swiglu_gpu_aligned_expert_avx2(
+            gate + element,
+            up + element,
+            output + element,
+            size - element);
+#else
+        for (; element < size; ++element)
+        {
+            output[element] = device_swiglu_contract::swigluValue(
+                gate[element], up[element]);
+        }
+#endif
+    }
+#endif
+
+#undef LLAMINAR_EXACT_SWIGLU_SIMD
+
 // Stubs for portability when ISA unavailable at compile time
 #if !defined(__AVX2__)
     static void compute_swiglu_avx2(const float *gate, const float *up, float *output, int size)
@@ -221,6 +483,42 @@ namespace llaminar2::primitives
         compute_swiglu_avx2(gate, up, output, size);
     }
 #endif
+
+    /**
+     * @brief Dispatch the exact expert program through the canonical CPU ISA.
+     *
+     * Runtime dispatch is deliberate even in an AVX-512 compilation unit: an
+     * AVX2-only deployment and `LLAMINAR_ISA_LEVEL=avx2` certification must
+     * execute the independently implemented eight-lane program.
+     */
+    static void compute_swiglu_gpu_aligned_expert_selected(
+        const float *gate,
+        const float *up,
+        float *output,
+        int size)
+    {
+#if defined(__AVX512F__)
+        if (activeISALevel() >= ISALevel::AVX512)
+        {
+            compute_swiglu_gpu_aligned_expert_avx512(
+                gate, up, output, size);
+            return;
+        }
+#endif
+#if defined(__AVX2__)
+        if (activeISALevel() >= ISALevel::AVX2)
+        {
+            compute_swiglu_gpu_aligned_expert_avx2(
+                gate, up, output, size);
+            return;
+        }
+#endif
+        for (int element = 0; element < size; ++element)
+        {
+            output[element] = device_swiglu_contract::swigluValue(
+                gate[element], up[element]);
+        }
+    }
 
     void compute_swiglu(const float *gate, const float *up, float *output, int size)
     {
@@ -265,6 +563,49 @@ namespace llaminar2::primitives
             float *o_ptr = output + i;
             ISA_DISPATCH_VOID(compute_swiglu, g_ptr, u_ptr, o_ptr, current_chunk);
         }
+    }
+
+    void compute_swiglu_gpu_aligned_expert_serial(
+        const float *gate,
+        const float *up,
+        float *output,
+        int size)
+    {
+        if (!gate || !up || !output || size < 0)
+            throw std::invalid_argument(
+                "GPU-aligned expert SwiGLU received an invalid buffer or size");
+        compute_swiglu_gpu_aligned_expert_selected(
+            gate, up, output, size);
+    }
+
+    void compute_swiglu_gpu_aligned_expert(
+        const float *gate,
+        const float *up,
+        float *output,
+        int size)
+    {
+        if (!gate || !up || !output || size < 0)
+            throw std::invalid_argument(
+                "GPU-aligned expert SwiGLU received an invalid buffer or size");
+        constexpr int kElementsPerTask = 256;
+        const int task_count =
+            (size + kElementsPerTask - 1) / kElementsPerTask;
+        auto work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int task = 0; task < task_count; ++task)
+            {
+                const int first = task * kElementsPerTask;
+                const int count = std::min(
+                    kElementsPerTask, size - first);
+                compute_swiglu_gpu_aligned_expert_selected(
+                    gate + first,
+                    up + first,
+                    output + first,
+                    count);
+            }
+        };
+        OMP_WORKSHARE_REGION(work);
     }
 
     void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)

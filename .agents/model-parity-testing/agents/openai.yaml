@@ -1,0 +1,4 @@
+interface:
+  display_name: "Model Parity Testing"
+  short_description: "Run and diagnose production model parity campaigns"
+  default_prompt: "Use $model-parity-testing to run the production parity matrix and diagnose any numerical failures."

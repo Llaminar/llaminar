@@ -154,7 +154,6 @@ namespace llaminar2::test
         outer_config.activation_precision = ActivationPrecision::FP32;
         outer_config.kv_cache_scale_k = 1.0f;
         outer_config.kv_cache_scale_v = 1.0f;
-        outer_config.use_mapped_memory = true;
 
         // TP domain stage configuration
         PPStageConfig stage0;
@@ -179,7 +178,6 @@ namespace llaminar2::test
         nested_config.activation_precision = outer_config.activation_precision;
         nested_config.kv_cache_scale_k = outer_config.kv_cache_scale_k;
         nested_config.kv_cache_scale_v = outer_config.kv_cache_scale_v;
-        nested_config.use_mapped_memory = outer_config.use_mapped_memory;
 
         // Verify nested config has correct TP settings
         EXPECT_EQ(nested_config.mode, ParallelismMode::TP);
@@ -203,7 +201,6 @@ namespace llaminar2::test
         EXPECT_EQ(nested_config.activation_precision, ActivationPrecision::FP32);
         EXPECT_FLOAT_EQ(nested_config.kv_cache_scale_k, 1.0f);
         EXPECT_FLOAT_EQ(nested_config.kv_cache_scale_v, 1.0f);
-        EXPECT_TRUE(nested_config.use_mapped_memory);
 
         // Verify nested config is valid for TP mode
         EXPECT_TRUE(nested_config.validate());

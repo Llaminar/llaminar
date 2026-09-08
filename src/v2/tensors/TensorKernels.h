@@ -10,18 +10,33 @@
 
 #pragma once
 
+#include "../backends/ExplicitGPUStream.h"
 #include "../utils/MPIContext.h"
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../kernels/IPackedWeights.h"
+#include "../kernels/GDNDeviceStateBinding.h"
+#include "../kernels/attention/AttentionExecutionPolicy.h"
+#include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "../kernels/common/DeviceRowRange.h"
+#include "NativeVnniFormatInfo.h"
+#include "TensorType.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
 {
+    namespace cpu::native_vnni
+    {
+        struct CPUNativeVNNIPackedWeights;
+    }
+
     // Forward declarations
     class ITensor; // Device-agnostic tensor interface
     class TensorBase;
@@ -30,27 +45,43 @@ namespace llaminar2
     class IDeviceContext; // For kernel execute() interface
 
     /**
-     * @brief Device-readable native-VNNI matrix descriptor.
+     * @brief Immutable contiguous FP16/BF16/FP32 weight view exported by GEMM.
      *
-     * This intentionally carries only raw device pointers and compact format
-     * metadata so MoE grouped kernels can select expert weights by descriptor
-     * without depending on backend-specific GEMM classes.
+     * ExpertOverlay uses this descriptor to move the exact live mathematical
+     * weights without manufacturing a tensor mirror. The engine lifetime owns
+     * `data`; callers must retain the exporting engine until all asynchronous
+     * reads complete.
      */
-    struct DeviceNativeVNNIMatrixDesc
+    struct ContiguousFloatingPointWeightDescriptor
     {
-        const uint8_t *payload = nullptr;
-        const void *scales = nullptr;
-        const void *mins = nullptr;
-        const void *emins = nullptr;
+        const void *data = nullptr;
+        TensorType type = TensorType::FP32;
         int n = 0;
         int k = 0;
-        uint32_t blocks_per_row = 0;
-        uint8_t codebook_id = 0;
-        uint8_t reserved[3] = {0, 0, 0};
+        std::size_t bytes = 0;
 
-        bool valid() const
+        /** @return Whether pointer, precision, geometry, and byte size agree. */
+        [[nodiscard]] bool valid() const noexcept
         {
-            return payload && scales && n > 0 && k > 0 && blocks_per_row > 0;
+            std::size_t element_bytes = 0;
+            switch (type)
+            {
+            case TensorType::FP16:
+            case TensorType::BF16:
+                element_bytes = sizeof(std::uint16_t);
+                break;
+            case TensorType::FP32:
+                element_bytes = sizeof(float);
+                break;
+            default:
+                return false;
+            }
+            if (!data || n <= 0 || k <= 0)
+                return false;
+            const auto elements = static_cast<std::size_t>(n) *
+                                  static_cast<std::size_t>(k);
+            return elements <= SIZE_MAX / element_bytes &&
+                   bytes == elements * element_bytes;
         }
     };
 
@@ -293,17 +324,43 @@ namespace llaminar2
         virtual bool supports_device(int device_idx) const = 0;
 
         /**
-         * @brief Set the GPU stream for kernel dispatch (GPU graph capture support)
+         * @brief Validate and bind the stream used by subsequent GPU dispatches.
          *
-         * When non-null, GPU kernels dispatch work on this stream instead of the
-         * default stream. This is required for GPU graph capture — all kernels must
-         * dispatch to the capture stream for nodes to be recorded in the graph.
+         * This non-virtual gateway is the only raw-handle entry point. It converts
+         * the nullable ABI representation into ExplicitGPUStream before any kernel
+         * implementation can observe it, so a null CUDA or HIP stream fails
+         * immediately instead of becoming an implicit default-stream request.
          *
-         * CPU kernels ignore this (default no-op).
+         * CPU kernels accept the validated binding and ignore it through the
+         * default bindGPUStream() implementation.
          *
-         * @param stream Opaque stream pointer (hipStream_t or cudaStream_t cast to void*)
+         * @param stream Non-null cudaStream_t or hipStream_t cast to void*.
+         * @throws std::invalid_argument when @p stream is null.
          */
-        virtual void setGPUStream(void *stream) { (void)stream; }
+        void setGPUStream(void *stream)
+        {
+            bindGPUStream(ExplicitGPUStream{stream});
+        }
+
+        /**
+         * @brief Install a stream that has already crossed the non-null boundary.
+         *
+         * Kernel implementations override this method rather than setGPUStream().
+         * This ensures implementations cannot accidentally reinterpret null as a
+         * default stream or as lifecycle teardown.
+         *
+         * @param stream Validated non-null GPU stream binding.
+         */
+        virtual void bindGPUStream(ExplicitGPUStream stream) { (void)stream; }
+
+        /**
+         * @brief Explicitly remove a borrowed GPU stream binding.
+         *
+         * Teardown is intentionally a different operation from stream
+         * assignment so null can never masquerade as an execution stream.
+         * CPU kernels retain the default no-op implementation.
+         */
+        virtual void clearGPUStreamBinding() {}
 
         // =====================================================================
         // Session Lifecycle (kernel state that depends on input data, not weights)
@@ -358,13 +415,97 @@ namespace llaminar2
          * kernel mode override return a token from
          * beginVerifierDecodeEquivalentScope(); callers keep it alive while
          * running verifier row work and then let destruction restore the
-         * previous backend mode.  CPU and backends without such a mode may
-         * return nullptr.
+         * previous backend mode. Row geometry is immutable recording metadata:
+         * it borrows the controller's device count, never reads that count on
+         * the host, and is copied into each captured kernel's arguments. Nested
+         * adapter scopes inherit it; an explicit geometry replaces it only for
+         * that scope. Destruction restores the enclosing capture transaction.
          */
         struct VerifierKernelModeScope
         {
-            virtual ~VerifierKernelModeScope() = default;
+            /** @brief Bind optional physical/live geometry for this recording scope. */
+            explicit VerifierKernelModeScope(
+                std::optional<DeviceRowRange> rows = std::nullopt)
+                : previous_rows_(current_rows_)
+            {
+                if (rows)
+                    current_rows_ = rows;
+            }
+
+            /** @brief Restore metadata even when a nested launch throws. */
+            virtual ~VerifierKernelModeScope() { current_rows_ = previous_rows_; }
+
+            VerifierKernelModeScope(const VerifierKernelModeScope &) = delete;
+            VerifierKernelModeScope &operator=(const VerifierKernelModeScope &) = delete;
+
+            /**
+             * @brief Resolve borrowed launch metadata without reading device state.
+             * @param physical_rows Matrix width used by this launch and its scratch.
+             * @return The enclosing geometry, or null for fully active work.
+             * @throws std::logic_error If a caller tries to reuse another matrix's extent.
+             *
+             * This is host recording context, not a live execution-state mirror.
+             * GPU bridges copy the descriptor by value before this scope ends.
+             */
+            [[nodiscard]] static const DeviceRowRange *rowsFor(int physical_rows)
+            {
+                if (current_rows_ && current_rows_->physicalRows() != physical_rows)
+                    throw std::logic_error("Verifier launch row geometry disagrees with physical matrix");
+                return current_rows_ ? &*current_rows_ : nullptr;
+            }
+
+        private:
+            std::optional<DeviceRowRange> previous_rows_; ///< Enclosing recording metadata.
+            inline static thread_local std::optional<DeviceRowRange> current_rows_;
         };
+
+        /**
+         * @brief RAII token for replicated-output arithmetic equivalence.
+         *
+         * A replicated projection may launch a full output matrix even though
+         * the serial reference graph computes that matrix as column shards.
+         * Generated GEMM/GEMV policy is allowed to depend on output width, so
+         * those two ownership layouts can otherwise select different K-split
+         * reduction trees and produce different FP32 bytes.  Keeping this token
+         * alive tells a backend to launch the actual output width while choosing
+         * arithmetic geometry from the declared serial partition width.
+         */
+        struct OutputPartitionEquivalenceScope
+        {
+            virtual ~OutputPartitionEquivalenceScope() = default;
+        };
+
+        /**
+         * @brief Require a full-output projection to match serial shard arithmetic.
+         *
+         * @param actual_output_columns Number of columns physically produced by
+         *        this invocation.
+         * @param serial_partition_columns Number of columns produced by one
+         *        regular partition of the serial reference graph. The final
+         *        typed partition may contain fewer columns.
+         * @return A scope token that must outlive every affected kernel launch.
+         *
+         * The default implementation accepts only the identity case. Backends
+         * must opt in explicitly when the two widths differ; silently ignoring
+         * the contract would reintroduce topology-dependent logits.
+         */
+        virtual std::unique_ptr<OutputPartitionEquivalenceScope>
+        beginOutputPartitionEquivalenceScope(
+            int actual_output_columns,
+            int serial_partition_columns)
+        {
+            if (actual_output_columns <= 0 || serial_partition_columns <= 0)
+            {
+                throw std::invalid_argument(
+                    "Output-partition equivalence requires positive column counts");
+            }
+            if (actual_output_columns != serial_partition_columns)
+            {
+                throw std::logic_error(
+                    "This GEMM backend does not implement replicated-output serial-partition equivalence");
+            }
+            return nullptr;
+        }
 
         /**
          * @brief Enter a verifier dispatch mode that preserves rowwise decode equivalence.
@@ -375,9 +516,10 @@ namespace llaminar2
          * whether CUDA, ROCm, or CPU implements the mode with generated policy
          * switches, deterministic reductions, or no-op scalar code.
          */
-        virtual std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope()
+        virtual std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope(
+            std::optional<DeviceRowRange> rows = std::nullopt)
         {
-            return nullptr;
+            return std::make_unique<VerifierKernelModeScope>(rows);
         }
 
         /**
@@ -510,7 +652,7 @@ namespace llaminar2
         /**
          * @brief Grouped verifier-row SwiGLU + down projection.
          *
-         * The MTP verifier publishes accepted rows from a compact M=2..4 graph,
+         * The MTP verifier publishes accepted rows from a runtime-M grouped graph,
          * but the published row must be numerically equivalent to serial decode.
          * Implementations that override this method must compute all verifier
          * rows through a grouped/concurrent path while preserving the M=1 decode
@@ -520,7 +662,8 @@ namespace llaminar2
          * @param gate Gate projection rows [m, k].
          * @param up Up projection rows [m, k].
          * @param output Down projection output [m, n].
-         * @param m Verifier row count. Production MTP uses 2..4.
+         * @param m Verifier row count. Every supported value greater than one
+         *        must use the grouped implementation; callers may not replay rows.
          * @param n Output width.
          * @param k Intermediate width.
          */
@@ -545,13 +688,37 @@ namespace llaminar2
         }
 
         /**
-         * @brief Check if this kernel supports optimized fused multi-projection
+         * @brief Check if this kernel implements fused multi-projection
          *
-         * @return true if multiply_fused_tensor() has optimized implementation beyond sequential GEMMs
+         * Returning true is a production contract: multiply_fused_tensor() must
+         * execute the complete bundle without reconstructing it as a sequence of
+         * polymorphic multiply_tensor() calls.
+         *
+         * @return true only when the first-class fused implementation exists.
          */
         virtual bool supports_fused_projection() const
         {
-            return false; // Default: no optimized fusion, uses sequential fallback
+            return false;
+        }
+
+        /**
+         * @brief Provision persistent backend resources for fused projection capture.
+         *
+         * Fused projection implementations may use auxiliary streams, events,
+         * descriptor tables, or other model-lifetime launch resources. Graph
+         * capture cannot create those resources lazily from multiply_fused_tensor(),
+         * so the owning compute stage calls this method from its typed
+         * prepareGraphLaunch() lifecycle before beginCapture(). Implementations
+         * must not execute model arithmetic or synchronize the device here.
+         *
+         * @param projection_count Maximum projection fan-out represented by the
+         *        upcoming fused launch.
+         * @return true when the fused launch is capture-ready.
+         */
+        virtual bool prepareFusedProjectionGraphCapture(
+            size_t projection_count)
+        {
+            return projection_count > 0;
         }
 
         /**
@@ -585,6 +752,87 @@ namespace llaminar2
         {
             out = {};
             return false;
+        }
+
+        /**
+         * @brief Export unambiguous source provenance for prepared VNNI weights.
+         *
+         * The device descriptor carries the canonical execution codebook. This
+         * second identity preserves distinctions such as Q4_1 versus Q4_K and
+         * Q8_0 versus normalized Q8_1/Q8_K for cross-tier migration.
+         * Unsupported or provenance-free engines return false and clear @p out.
+         */
+        virtual bool exportNativeVNNISourceIdentity(
+            NativeVnniSourceIdentity &out) const
+        {
+            out = {};
+            return false;
+        }
+
+        /**
+         * @brief Borrow immutable CPU NativeVNNI execution bytes for migration.
+         *
+         * CPU prepared kernels override this to expose their single authoritative
+         * packed representation. The returned object remains owned by the engine
+         * and is valid only while the caller retains that engine's shared lifetime.
+         * GPU and non-NativeVNNI engines return null.
+         */
+        virtual const cpu::native_vnni::CPUNativeVNNIPackedWeights *
+        exportCPUNativeVNNIPackedWeights() const
+        {
+            return nullptr;
+        }
+
+        /**
+         * @brief Borrow the mutable final CPU NativeVNNI byte range for a
+         * retired ExpertOverlay physical slot.
+         *
+         * This is an infrastructure-only mutation boundary. The caller must
+         * own the slot through the ExpertOverlay residency fabric and may
+         * write the returned range only after the old residency epoch's ticket
+         * barrier has drained. Ordinary kernels, stages, and coherence callers
+         * must use @ref exportCPUNativeVNNIPackedWeights instead.
+         *
+         * @return Engine-owned final execution bytes, or an empty span when
+         *         the prepared engine cannot participate in slot recycling.
+         */
+        virtual std::span<std::uint8_t>
+        exportRetiredCPUNativeVNNIStorage() noexcept
+        {
+            return {};
+        }
+
+        /**
+         * @brief Borrow an immutable contiguous floating-point weight matrix.
+         *
+         * CPU and GPU floating GEMM engines override this with their exact live
+         * FP16, BF16, or FP32 execution allocation. Quantized engines return
+         * false and clear @p out. Retaining the engine pins the returned bytes.
+         *
+         * @param out Receives pointer, precision, geometry, and exact byte size.
+         * @return True only when the engine executes from contiguous float data.
+         */
+        virtual bool exportContiguousFloatingPointWeights(
+            ContiguousFloatingPointWeightDescriptor &out) const
+        {
+            out = {};
+            return false;
+        }
+
+        /**
+         * @brief Borrow mutable bytes from a retired CPU floating-point slot.
+         *
+         * This is the floating analogue of
+         * @ref exportRetiredCPUNativeVNNIStorage. Only the ExpertOverlay
+         * physical residency fabric may write the range, after the old epoch's
+         * inference-ticket barrier has drained.
+         *
+         * @return Engine-owned row-major bytes, or an empty span otherwise.
+         */
+        virtual std::span<std::uint8_t>
+        exportRetiredCPUFloatingPointStorage() noexcept
+        {
+            return {};
         }
 
         // =====================================================================
@@ -621,11 +869,11 @@ namespace llaminar2
          *
          * **Device Handling**:
          * - Input tensor: ensureOnDevice() called if needed
-         * - Output tensors: ensureOnDevice() called, transitionTo(DEVICE_AUTHORITATIVE) after write
+         * - Output tensors: allocated on device, then published through TransferEngine after write
          * - Weight tensors: managed by the kernel (already packed/uploaded)
          *
-         * **For CPU execution**: Falls back to host pointers transparently
-         * **For GPU execution**: Uses device pointers, no manual sync needed by caller
+         * **For CPU execution**: Uses the backend's grouped/fused host implementation.
+         * **For GPU execution**: Uses device pointers, no manual sync needed by caller.
          *
          * @param input Input tensor [m, k] (FP32)
          * @param projections Vector of tensor projection descriptors
@@ -634,7 +882,8 @@ namespace llaminar2
          * @param mpi_ctx MPI context for distributed execution
          * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
-         * @return true on success, false on error
+         * @return true on success. False means the required production contract
+         *         is unavailable or failed and must be treated as fatal by the stage.
          */
         virtual bool multiply_fused_tensor(
             const TensorBase *input,
@@ -643,40 +892,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             DeviceWorkspaceManager *workspace = nullptr)
         {
-            // Default implementation: call multiply_tensor() for each projection
-            for (const auto &proj : projections)
-            {
-                if (!proj.kernel || !proj.output)
-                {
-                    return false; // Invalid projection
-                }
-
-                // Use tensor-aware multiply - kernel handles device placement
-                // Note: Must pass transpose_B explicitly before alpha/beta to match signature:
-                //   multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace)
-                bool success = proj.kernel->multiply_tensor(
-                    input, proj.output,
-                    m, proj.n, k,
-                    true,      // transpose_B (weights are [K,N] stored as [N,K] transposed)
-                    1.0f,      // alpha
-                    0.0f,      // beta
-                    proj.bias, // bias tensor (may be nullptr)
-                    mpi_ctx,
-                    -1, // device_idx (use default)
-                    workspace);
-
-                if (!success)
-                {
-                    return false;
-                }
-            }
-            return true;
+            (void)input;
+            (void)projections;
+            (void)m;
+            (void)k;
+            (void)mpi_ctx;
+            (void)workspace;
+            return false;
         }
 
         /**
          * @brief Grouped verifier-row projection with serial decode row math.
          *
-         * MTP verifier graphs often evaluate M=2..4 candidate rows together.
+         * MTP verifier graphs evaluate a runtime number of candidate rows together.
          * A normal GEMM kernel may legally change accumulation order across
          * rows, K tiles, or projection groups, but verifier rows that publish
          * recurrent/KV state need the same per-row numerical contract as M=1
@@ -1393,6 +1621,21 @@ namespace llaminar2
          */
         virtual size_t packedWeightBytes() const { return 0; }
 
+        /**
+         * @brief Report whether the source weight tensor may release its bytes.
+         *
+         * Returning true is a strong lifetime guarantee: every subsequent
+         * execution must use engine-owned or independently retained prepared
+         * storage and must never dereference the TensorBase supplied during
+         * construction. The conservative default is false.
+         *
+         * Graph builders and weight services use this capability before
+         * retiring large raw MoE slabs. It prevents floating-point GEMM engines,
+         * which intentionally retain a tensor view, from being mistaken for
+         * self-contained packed NativeVNNI engines.
+         */
+        virtual bool canReleaseSourceWeightTensor() const { return false; }
+
         // =============================================================================
         // Weight Dimension Accessors (for Tensor Parallelism)
         // =============================================================================
@@ -1543,6 +1786,11 @@ namespace llaminar2
          * @param head_start First query head to compute (0-indexed, default 0)
          * @param local_n_heads Number of query heads to compute (-1 = all)
          * @param local_n_kv_heads Number of KV heads for this slice (-1 = all)
+         * @param execution_policy Capture-stable physical prefill policy. The
+         *        backend must either implement the requested axis exactly or
+         *        reject it; silently substituting another path is forbidden.
+         * @param kv_logical_view Logical-to-physical row mapping when K/V are
+         *        direct ring-cache tensors. The default denotes contiguous K/V.
          * @return true on success, false on failure or unsupported type combination
          *
          * @note Default returns false. Subclasses should override with type-aware dispatch.
@@ -1582,13 +1830,15 @@ namespace llaminar2
             int head_start = 0,        ///< First query head (TP slice start)
             int local_n_heads = -1,    ///< Number of query heads (-1 = all)
             int local_n_kv_heads = -1, ///< Number of KV heads (-1 = all)
-            int gqa_n_rep = 0)         ///< Global GQA repetition factor (0 = auto from n_heads/n_kv_heads)
+            int gqa_n_rep = 0,         ///< Global GQA repetition factor (0 = auto from n_heads/n_kv_heads)
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView &kv_logical_view = {})
             = 0;
 
         /**
          * @brief Compute MTP verifier rows through a grouped decode-equivalent path.
          *
-         * The verifier input contains M compact rows (currently production M=2..4)
+         * The verifier input contains M compact rows (production M=2..15)
          * appended after an existing prefix in the KV cache. The implementation
          * must compute every row as if serial decode had processed rows
          * `[0, M)` one at a time, including causal visibility:
@@ -1600,7 +1850,7 @@ namespace llaminar2
          * This is a performance contract, not merely a correctness contract.
          * Implementations must not hide M ordinary one-token `compute_tensor()`
          * calls behind this method. Unsupported backends should return false so
-         * stages can fail closed instead of silently taking a serial fallback.
+         * stages can fail closed instead of silently taking a serial oracle path.
          */
         virtual bool compute_verifier_rows_decode_equivalent(
             const ITensor *Q,
@@ -1617,7 +1867,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            const attention::AttentionKVLogicalView &kv_logical_view = {},
+            const attention::AttentionExecutionPolicy &execution_policy = {})
         {
             (void)Q;
             (void)K;
@@ -1634,16 +1886,157 @@ namespace llaminar2
             (void)device_idx;
             (void)head_start;
             (void)gqa_n_rep;
+            (void)kv_logical_view;
+            (void)execution_policy;
             return false;
         }
 
         /**
-         * @brief Update attention device params stored in pinned host memory for graph replay
+         * @brief Compute independent request-batched decode rows from per-request KV views.
          *
-         * Graph-captured attention reads AttentionDeviceParams from device memory.
-         * Implementations update that device buffer before beginCapture()/graph
-         * replay on the explicit stage stream; captured stage bodies must not
-         * record H2D nodes.
+         * A request batch does not share one contiguous KV history: request
+         * `r` owns `K_by_request[r]`, `V_by_request[r]`, and `kv_lens[r]`.
+         * Implementations must consume the whole descriptor set through one
+         * grouped API and preserve each request's ordinary serial-decode math.
+         * Calling `compute_tensor()` once per request at the stage layer is not
+         * a valid implementation because it turns the production graph into a
+         * row-replay loop and repeatedly crosses the polymorphic dispatch path.
+         *
+         * CPU implementations may share their internal tiled decode primitive
+         * across requests. GPU backends use their resident, fixed-stride cache
+         * views and do not currently need this host descriptor contract.
+         *
+         * @param Q Row-major query tensor `[request_count * query_rows, q_dim]`.
+         * @param K_by_request One logical K history tensor per request.
+         * @param V_by_request One logical V history tensor per request.
+         * @param kv_lens Logical KV row count for each request tensor.
+         * @param kv_logical_views Per-request mapping from logical history rows
+         *        to each persistent native ring tensor. This array is mandatory:
+         *        callers use an all-zero element for a compact tensor rather
+         *        than omitting ownership information.
+         * @param output Row-major output tensor matching @p Q.
+         * @return true only when the grouped implementation executed.
+         */
+        virtual bool compute_request_batch_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *const *K_by_request,
+            const ITensor *const *V_by_request,
+            const int *kv_lens,
+            ITensor *output,
+            int request_count,
+            int query_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0,
+            const attention::AttentionExecutionPolicy &execution_policy = {},
+            const attention::AttentionKVLogicalView *kv_logical_views = nullptr)
+        {
+            (void)Q;
+            (void)K_by_request;
+            (void)V_by_request;
+            (void)kv_lens;
+            (void)output;
+            (void)request_count;
+            (void)query_rows;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)head_start;
+            (void)gqa_n_rep;
+            (void)execution_policy;
+            (void)kv_logical_views;
+            return false;
+        }
+
+        /**
+         * @brief Compute independent GPU request rows from one fixed-stride KV view.
+         *
+         * GPU ring caches own independent allocations and live sequence counts for
+         * every request.  Before attention, the cache gather stage materializes
+         * those allocations as one device-resident tensor with layout
+         * `[request_count, max_kv_len, kv_width]`.  This method is the matching
+         * grouped attention contract: each request reads only the prefix named by
+         * its canonical device count while the backend launches one grouped phase
+         * grid and one grouped reduction grid.
+         *
+         * `query_rows` permits a compact verifier span for every request.  The
+         * device count is the post-append count for that request, so row `q` sees
+         * `post_append_count - (query_rows - 1 - q)` cache positions.  This is the
+         * same visibility sequence produced by serial one-token decode.
+         *
+         * This is a production economy contract.  Implementations must not copy
+         * counts to the host, launch one attention operation per request, or call
+         * the scalar `compute_tensor()` entry point in a loop.  Unsupported
+         * backends return false and the graph fails closed.
+         *
+         * @param Q FP32 query rows in request-major order.
+         * @param K Fixed-stride device K view produced by the GPU KV cache.
+         * @param V Fixed-stride device V view produced by the GPU KV cache.
+         * @param post_append_cached_tokens_device Contiguous device counts for
+         *        the request range, one INT32 value per request.
+         * @param output FP32 output rows matching @p Q.
+         * @param request_count Number of independent request cache banks.
+         * @param query_rows Number of consecutive decode rows per request.
+         * @param max_kv_len Physical row stride of each gathered request bank.
+         * @return true only when the grouped device implementation executed.
+         */
+        virtual bool compute_device_request_batch_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            const int *post_append_cached_tokens_device,
+            ITensor *output,
+            int request_count,
+            int query_rows,
+            int max_kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)post_append_cached_tokens_device;
+            (void)output;
+            (void)request_count;
+            (void)query_rows;
+            (void)max_kv_len;
+            (void)n_heads;
+            (void)n_kv_heads;
+            (void)head_dim;
+            (void)causal;
+            (void)window_size;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)head_start;
+            (void)gqa_n_rep;
+            return false;
+        }
+
+        /**
+         * @brief Establish explicit attention geometry for the next execution.
+         *
+         * Graph-captured GPU attention reads AttentionDeviceParams exclusively
+         * from device memory. GPU implementations therefore enqueue a tiny
+         * stream-ordered device writer; they must not maintain a host mirror or
+         * record H2D parameter nodes. CPU implementations may retain ordinary
+         * scalar control state because they do not own a device replay graph.
          *
          * @param kv_len Number of cached tokens (including tokens to be appended this step)
          * @param position_offset Position offset for the current decode step
@@ -1663,15 +2056,20 @@ namespace llaminar2
         /**
          * @brief Prepare device-side attention params before graph capture/replay.
          *
-         * Backends with graph-captured attention should update any device-resident
-         * scalar params on the explicit execution stream before beginCapture() or
-         * graph launch. The default preserves existing backends by updating their
-         * host-side params and reporting success.
+         * Backends with graph-captured attention update their device-resident
+         * scalar params on the explicit execution stream before capture or graph
+         * launch. The default delegates to the scalar setter for non-GPU
+         * implementations; graph-capable GPU backends override this contract.
          */
         virtual bool prepareDynamicAttnParams(
-            int kv_len, int position_offset, int query_rows, void *stream)
+            int kv_len,
+            int position_offset,
+            int query_rows,
+            void *stream,
+            int kv_stride = -1)
         {
             (void)stream;
+            (void)kv_stride;
             setDynamicAttnParams(kv_len, position_offset, query_rows);
             return true;
         }
@@ -1692,17 +2090,42 @@ namespace llaminar2
          * @param seq_len Logical query row count for this attention stage.
          * @param query_rows Number of row-local dynamic attention params needed.
          * @param stream Explicit non-null backend stream.
+         * @param kv_stride Stable positive physical request-major K/V row
+         *        capacity. This value is mandatory because the live count is a
+         *        device pointer and cannot safely determine host launch shape.
+         * @param active_query_rows_device Optional device INT32 logical width.
+         *        When non-null, @p seq_len and @p query_rows remain immutable
+         *        physical launch geometry while this scalar determines which
+         *        leading rows may observe and publish serial-equivalent state.
+         * @param prefill_capture Immutable physical prefill geometry and policy.
+         *        CUDA uses this before the parameter producer to establish native
+         *        device-controlled graph branching. An empty value is valid for
+         *        decode/grouped calls that do not construct a prefill graph.
+         * @param device_ring_head Optional device-owned next-write position for
+         *        a direct physical ring view. Null names contiguous K/V.
+         * @param ring_capacity Positive ring modulus when @p device_ring_head
+         *        is supplied; zero is required for contiguous K/V.
          */
         virtual bool prepareDynamicAttnParamsFromDeviceSequenceState(
             const int *post_append_cached_tokens_device,
             int seq_len,
             int query_rows,
-            void *stream)
+            void *stream,
+            int kv_stride,
+            const int *active_query_rows_device = nullptr,
+            const attention::AttentionPrefillCaptureGeometry &prefill_capture = {},
+            const int *device_ring_head = nullptr,
+            int ring_capacity = 0)
         {
             (void)post_append_cached_tokens_device;
             (void)seq_len;
             (void)query_rows;
             (void)stream;
+            (void)kv_stride;
+            (void)active_query_rows_device;
+            (void)prefill_capture;
+            (void)device_ring_head;
+            (void)ring_capacity;
             return false;
         }
     };
@@ -2142,6 +2565,19 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Provision persistent resources for the two-projection capture.
+         *
+         * Adapters backed by ITensorGemm kernels forward this to both child
+         * kernels. CPU implementations may retain the default validation-only
+         * behavior because they do not own GPU graph resources.
+         */
+        virtual bool prepareFusedProjectionGraphCapture(
+            size_t projection_count)
+        {
+            return projection_count == 2;
+        }
+
+        /**
          * @brief Execute fused Gate/Up GEMM with tensor inputs/outputs
          *
          * @param input Input activations tensor [m, k]
@@ -2298,6 +2734,29 @@ namespace llaminar2
     class ITensorRoPE : public ITensorKernel
     {
     public:
+        /**
+         * @brief Prepare immutable RoPE state before GPU graph capture.
+         *
+         * GPU implementations publish the exact `(rotary_dim, rope_theta)`
+         * inverse-frequency table on their bound explicit stream and adopt its
+         * readiness event. The operation is setup-only: captured execution must
+         * consume the resulting device pointer without registry access,
+         * allocation, transfer, or lazy initialization. CPU implementations do
+         * not need a device publication and therefore use this no-op default.
+         *
+         * @param rotary_dim Number of head elements rotated by RoPE.
+         * @param rope_theta Positive finite RoPE frequency base.
+         * @return True when the exact invariant state is ready for capture.
+         */
+        virtual bool prepareInvariantDeviceState(
+            int rotary_dim,
+            float rope_theta)
+        {
+            (void)rotary_dim;
+            (void)rope_theta;
+            return true;
+        }
+
         /**
          * @brief Apply RoPE to Q8_1 input, output to FP32 (Hybrid mode)
          *
@@ -2846,9 +3305,11 @@ namespace llaminar2
         /**
          * @brief Provide a model-owned prepared embedding handle for execution.
          *
-         * Graph-built model paths resolve this through PreparedWeightStore.
-         * Implementations may keep using their legacy lookup/fallback path when
-         * no handle is provided (for direct kernel tests and non-model callers).
+         * Graph-built GPU paths resolve quantized embedding weights through
+         * PreparedWeightStore before graph construction. GPU implementations
+         * must reject a missing or mismatched handle instead of repacking host
+         * weights in the execution path. FP32 tables may execute directly when
+         * the source tensor is already resident on the target device.
          */
         virtual void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle)
         {
@@ -3065,17 +3526,29 @@ namespace llaminar2
     public:
         virtual ~ITensorShortConvolution() = default;
 
-        /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
-        virtual void setGPUStream(void *stream) { (void)stream; }
-
-        /// Allocate GPU state buffer (no-op for CPU implementations)
-        virtual void allocateGPUState(int state_size) { (void)state_size; }
-
-        /// Allocate GPU scratch used by graph/stage execution (no-op for CPU implementations)
-        virtual bool allocateGPUScratch(int scratch_size)
+        /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
+        void setGPUStream(void *stream)
         {
-            (void)scratch_size;
-            return true;
+            bindGPUStream(ExplicitGPUStream{stream});
+        }
+
+        /// Bind a validated non-null GPU stream (no-op for CPU implementations).
+        virtual void bindGPUStream(ExplicitGPUStream stream) { (void)stream; }
+
+        /// Explicitly remove a borrowed GPU stream binding.
+        virtual void clearGPUStreamBinding() {}
+
+        /**
+         * @brief Bind cache-owned persistent GPU state before execution.
+         *
+         * GPU implementations must reject malformed or late bindings. CPU
+         * implementations are never asked to bind device state and retain the
+         * default false result.
+         */
+        virtual bool bindDeviceState(const GDNDeviceStateBinding &binding)
+        {
+            (void)binding;
+            return false;
         }
 
         /**
@@ -3083,7 +3556,8 @@ namespace llaminar2
          *
          * GPU implementations use this shared workspace instead of allocating
          * one persistent scratch buffer per layer. Passing nullptr unbinds the
-         * shared buffer and restores the implementation's fallback behavior.
+         * shared buffer. GPU execution fails when required scratch is absent or
+         * undersized; implementations may not allocate replacement storage.
          *
          * @param scratch Device pointer to [max_seq_len * channels] floats.
          * @param scratch_size Number of float elements available in scratch.
@@ -3154,6 +3628,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore host-selected snapshot rows into CPU request state.
+         *
+         * Implementations copy each non-negative flat snapshot row into the
+         * corresponding request-owned live-state slot. Request zero also
+         * refreshes @p dst_state, preserving the public host-state ABI.
+         */
+        virtual bool restoreVerifierStateCaptureRows(
+            float *dst_state,
+            const int *host_row_indices,
+            int request_count,
+            void *stream)
+        {
+            (void)dst_state;
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Restore a captured verifier-row conv state by device row index.
          *
          * GPU MTP publication uses compact device metadata to choose the
@@ -3204,18 +3698,48 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Publish one captured terminal conv state per padded request.
+         *
+         * @p device_request_seq_lens stores real rows per request, not flat
+         * snapshot indices. The backend computes
+         * `request * request_row_width + real_length - 1` on device and copies
+         * all request states in one grouped launch.
+         */
+        virtual bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream)
+        {
+            (void)dst_states;
+            (void)device_request_seq_lens;
+            (void)request_count;
+            (void)request_row_width;
+            (void)stream;
+            return false;
+        }
+
         /// Return true when padded prefill can commit state using a dynamic real length.
         virtual bool supportsPaddedPrefillRealLength() const { return false; }
 
-        /// Reset GPU state to zero (no-op for CPU implementations)
-        virtual void resetGPUState() {}
+        /// Reset bound GPU state on the exact producer stream.
+        virtual bool resetGPUState(void *stream)
+        {
+            (void)stream;
+            return true;
+        }
 
-        /// Size of implementation-owned recurrent state, if exportable.
+        /// Size of the immutable primary persistent conv-state bank.
         virtual size_t stateBytes() const { return 0; }
 
-        /// Export implementation-owned state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before consuming the exported payload.
+        /// Largest resident conv-state bank, if multiple live banks are held.
+        virtual size_t largestStateBytes() const { return stateBytes(); }
+
+        /// Export the immutable primary persistent state. Multi-geometry GPU
+        /// callers must use exportStateForSize() so graph construction never
+        /// depends on mutable selected-bank host state.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
         {
             (void)dst_host;
@@ -3224,15 +3748,32 @@ namespace llaminar2
             return stateBytes() == 0;
         }
 
-        /// Import implementation-owned state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before using the imported state.
+        virtual bool exportStateForSize(int state_size, void *dst_host, void *dst_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return exportState(dst_host, dst_device, stream);
+        }
+
+        /// Import the immutable primary implementation-owned state.
+        /// Multi-geometry GPU callers must use importStateForSize().
         virtual bool importState(const void *src_host, const void *src_device, void *stream)
         {
             (void)src_host;
             (void)src_device;
             (void)stream;
             return stateBytes() == 0;
+        }
+
+        virtual bool importStateForSize(int state_size, const void *src_host, const void *src_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return importState(src_host, src_device, stream);
         }
 
         /**
@@ -3367,6 +3908,71 @@ namespace llaminar2
             (void)apply_silu;
             return false;
         }
+
+        /**
+         * @brief Native CPU request-batched forward with host-owned real lengths.
+         *
+         * CPU serving already owns immutable request lengths in ordinary host
+         * memory.  A conforming implementation must process the flattened
+         * request matrix as grouped work, preserve one live state slot per
+         * request, and zero padded rows.  Calling `forward()` once per request
+         * is not a grouped implementation.
+         */
+        virtual bool forwardBatchedRequestsWithHostSeqLens(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int request_count, int request_seq_len,
+            int channels, int kernel_size,
+            const int *host_request_seq_lens,
+            bool apply_silu = true)
+        {
+            (void)input;
+            (void)weight;
+            (void)bias;
+            (void)output;
+            (void)conv_state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)channels;
+            (void)kernel_size;
+            (void)host_request_seq_lens;
+            (void)apply_silu;
+            return false;
+        }
+
+        /**
+         * @brief Native request-batched forward with device-owned real lengths.
+         *
+         * This is the production variable-length GPU entry point. The backend
+         * must launch the request matrix as grouped work, read one real length
+         * per request from @p device_request_seq_lens, zero padded output rows,
+         * and commit each request's live state at its own terminal real row.
+         * Implementations must not copy lengths to the host or replay requests
+         * through the scalar `forward()` API.
+         */
+        virtual bool forwardBatchedRequestsWithDeviceSeqLens(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int request_count, int request_seq_len,
+            int channels, int kernel_size,
+            const int *device_request_seq_lens,
+            bool apply_silu = true)
+        {
+            (void)input;
+            (void)weight;
+            (void)bias;
+            (void)output;
+            (void)conv_state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)channels;
+            (void)kernel_size;
+            (void)device_request_seq_lens;
+            (void)apply_silu;
+            return false;
+        }
     };
 
     /**
@@ -3391,21 +3997,43 @@ namespace llaminar2
     public:
         virtual ~ITensorGatedDeltaNet() = default;
 
-        /// Set the GPU stream for kernel dispatch (no-op for CPU implementations)
-        virtual void setGPUStream(void *stream) { (void)stream; }
+        /// Validate a raw CUDA/HIP stream before forwarding it to the implementation.
+        void setGPUStream(void *stream)
+        {
+            bindGPUStream(ExplicitGPUStream{stream});
+        }
 
-        /// Allocate GPU state buffer (no-op for CPU implementations)
-        virtual void allocateGPUState(int state_size) { (void)state_size; }
+        /// Bind a validated non-null GPU stream (no-op for CPU implementations).
+        virtual void bindGPUStream(ExplicitGPUStream stream) { (void)stream; }
 
-        /// Reset GPU state to zero (no-op for CPU implementations)
-        virtual void resetGPUState() {}
+        /// Explicitly remove a borrowed GPU stream binding.
+        virtual void clearGPUStreamBinding() {}
 
-        /// Size of implementation-owned recurrent state, if exportable.
+        /**
+         * @brief Bind cache-owned persistent GPU state before execution.
+         */
+        virtual bool bindDeviceState(const GDNDeviceStateBinding &binding)
+        {
+            (void)binding;
+            return false;
+        }
+
+        /// Reset bound GPU state on the exact producer stream.
+        virtual bool resetGPUState(void *stream)
+        {
+            (void)stream;
+            return true;
+        }
+
+        /// Size of the immutable primary persistent recurrence-state bank.
         virtual size_t stateBytes() const { return 0; }
 
-        /// Export implementation-owned state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before consuming the exported payload.
+        /// Largest resident recurrence-state bank, if multiple live banks are held.
+        virtual size_t largestStateBytes() const { return stateBytes(); }
+
+        /// Export the immutable primary persistent state. Multi-geometry GPU
+        /// callers must use exportStateForSize() so graph construction never
+        /// depends on mutable selected-bank host state.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
         {
             (void)dst_host;
@@ -3414,15 +4042,32 @@ namespace llaminar2
             return stateBytes() == 0;
         }
 
-        /// Import implementation-owned state. When stream is non-null, GPU
-        /// implementations may enqueue async copies; callers must synchronize
-        /// the stream before using the imported state.
+        virtual bool exportStateForSize(int state_size, void *dst_host, void *dst_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return exportState(dst_host, dst_device, stream);
+        }
+
+        /// Import the immutable primary implementation-owned state.
+        /// Multi-geometry GPU callers must use importStateForSize().
         virtual bool importState(const void *src_host, const void *src_device, void *stream)
         {
             (void)src_host;
             (void)src_device;
             (void)stream;
             return stateBytes() == 0;
+        }
+
+        virtual bool importStateForSize(int state_size, const void *src_host, const void *src_device, void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            if (stateBytes() != static_cast<size_t>(state_size) * sizeof(float))
+                return false;
+            return importState(src_host, src_device, stream);
         }
 
         /// Check if GPU state is allocated with the required size.
@@ -3491,6 +4136,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore host-selected recurrence snapshots by request.
+         *
+         * This is the CPU counterpart of device-indexed grouped publication;
+         * it updates request-owned live-state slots directly and never replays
+         * a scalar recurrence row.
+         */
+        virtual bool restoreVerifierStateCaptureRows(
+            float *dst_state,
+            const int *host_row_indices,
+            int request_count,
+            void *stream)
+        {
+            (void)dst_state;
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Restore a captured verifier-row recurrence state by device row index.
          *
          * This is the device-resident companion to restoreVerifierStateCaptureRow().
@@ -3541,15 +4206,41 @@ namespace llaminar2
         }
 
         /**
-         * @brief Deinterleave merged QKV buffer on device (GPU-only)
+         * @brief Publish one captured terminal recurrence state per request.
+         *
+         * Real request lengths remain device-resident. The backend derives flat
+         * terminal snapshot rows and copies the complete request state bank in
+         * one launch, without host-visible row indices.
+         */
+        virtual bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream)
+        {
+            (void)dst_states;
+            (void)device_request_seq_lens;
+            (void)request_count;
+            (void)request_row_width;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Transform merged QKV rows in caller-owned device workspace.
          *
          * Splits a merged [seq_len, q_dim + k_dim + v_dim] device buffer into
          * separate contiguous Q, K, V device arrays. Handles Qwen GDN modular
          * Q/K tiling:
          *   k_head_for_v_head_j = (j + global_v_head_offset) % n_k_heads
          *
-         * GPU implementations allocate persistent grow-only scratch internally.
-         * CPU implementations return false (deinterleave done on host by stage).
+         * This operation is invoked only for GPU paths that require separate
+         * contiguous matrices for a downstream recurrence variant. Scratch is
+         * bound by the graph workspace before capture; implementations must
+         * never allocate private storage from this method. A false result is a
+         * fatal execution error, not permission for a host or allocation-based
+         * alternate path.
          *
          * @param d_merged_qkv  Device pointer to merged QKV buffer
          * @param d_q           [out] Device pointer to deinterleaved Q [seq_len, n_v_heads * d_k]
@@ -3561,7 +4252,7 @@ namespace llaminar2
          * @param d_k           Key/query head dimension
          * @param d_v           Value head dimension
          * @param global_v_head_offset  TP modular repeat offset
-         * @return true if device deinterleave succeeded, false for CPU fallback
+         * @return true after the device transform completes successfully.
          */
         virtual bool deinterleave_qkv_device(
             const float *d_merged_qkv,
@@ -3585,9 +4276,9 @@ namespace llaminar2
         /**
          * @brief Bind caller-owned scratch for merged-QKV deinterleaving.
          *
-         * GPU implementations use this workspace instead of keeping a private
-         * grow-only deinterleave buffer per GDN layer. Passing nullptr unbinds
-         * the shared buffer and restores the implementation's fallback behavior.
+         * GPU implementations use this workspace instead of keeping private
+         * deinterleave storage per GDN layer. Passing nullptr explicitly
+         * unbinds the buffer; any later operation that requires it must fail.
          *
          * @param scratch Device pointer to the deinterleave scratch buffer.
          * @param scratch_size Number of float elements available in scratch.
@@ -3630,11 +4321,63 @@ namespace llaminar2
             int chunk_size, bool use_qk_l2norm) = 0;
 
         /**
+         * @brief Execute ordinary decode or prefill directly from merged QKV rows.
+         *
+         * The source layout is one row per token:
+         *
+         *   [Q(n_k_heads*d_k) | K(n_k_heads*d_k) | V(n_heads*d_v)]
+         *
+         * For local value head @p h, Q and K are selected from
+         * `(h + global_v_head_offset) mod n_k_heads`; V remains indexed by the
+         * local head. Implementations own any backend-specific layout handling.
+         * CPU kernels consume the row strides directly, while GPU kernels may
+         * launch their graph-captured device transform before recurrence. The
+         * caller must never materialize a host-side Q/K/V copy as an alternate
+         * path.
+         *
+         * This operation is mandatory for every backend. It covers ordinary
+         * live-state execution; verifier snapshots, request-batched state banks,
+         * and graph-replay effective-length scalars retain their explicit APIs.
+         *
+         * @param merged_qkv First merged source row.
+         * @param qkv_stride Source-row stride in FP32 elements.
+         * @param alpha Per-row/per-local-head gate projection.
+         * @param beta_raw Per-row/per-local-head raw beta projection.
+         * @param A_log Per-local-head learned gate scale.
+         * @param dt_bias Per-local-head learned time-step bias.
+         * @param output Contiguous `[seq_len, n_heads*d_v]` output.
+         * @param state Live recurrence state, updated in place on CPU. GPU
+         *        implementations resolve their bound persistent state owner.
+         * @param seq_len Number of real rows to advance.
+         * @param n_k_heads Number of Q/K heads encoded in each source row.
+         * @param n_heads Number of participant-local V/output heads.
+         * @param d_k Q/K width and recurrence-state row count.
+         * @param d_v V/output width.
+         * @param global_v_head_offset Global first V-head index for modular Q/K
+         *        selection under tensor parallelism.
+         * @param chunk_size Backend scheduling hint; arithmetic remains fixed.
+         * @param use_qk_l2norm Whether to normalize Q/K before recurrence.
+         * @return true after exact recurrence completion; false is a fatal
+         *         execution error, never a request to use another path.
+         */
+        virtual bool chunkForwardMergedQKV(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, int chunk_size,
+            bool use_qk_l2norm) = 0;
+
+        /**
          * @brief Chunk prefill with recurrence-state snapshots after each row.
          *
          * Snapshot rows are laid out as:
          *   state_snapshots[row * snapshot_stride_floats + state_index]
          * where state_index spans [n_heads, d_k, d_v].
+         * CPU implementations publish the terminal snapshot back to @p state.
+         * A backend may materialize snapshots directly during recurrence, but it
+         * must preserve serial-row arithmetic and may not replay rows afterward.
          */
         virtual bool chunkForwardWithStateSnapshots(
             const float *Q, const float *K, const float *V,
@@ -3674,20 +4417,18 @@ namespace llaminar2
          *
          *   [Q(n_k_heads*d_k) | K(n_k_heads*d_k) | V(n_heads*d_v)]
          *
-         * The generic stage path can deinterleave that tensor into separate
-         * contiguous Q/K/V matrices before calling chunkForwardWithStateSnapshots(),
-         * but all-position MTP verifier chunks are tiny (M=2..4), so the copy can
-         * dominate CPU replay time.  Implementations that can read this merged
-         * layout directly should override this method and publish the same
-         * post-row snapshots as serial recurrent_step().
+         * All-position MTP verifier chunks are latency-sensitive, so backends
+         * serving a merged verifier graph consume this layout directly and
+         * publish the same post-row snapshots as serial recurrent_step(). The
+         * supplied live @p state remains unchanged until the accepted snapshot
+         * is explicitly published by the transaction owner.
          *
          * The Q/K head for local V-head h is:
          *
          *   qk_head = (h + global_v_head_offset) mod n_k_heads
          *
-         * Returning false means the implementation has no direct merged-QKV
-         * verifier path; callers may use their explicit deinterleave path when
-         * that behavior is intended.
+         * Returning false is a fatal contract violation for a graph that chose
+         * this layout; callers must not reconstruct rows through another path.
          */
         virtual bool chunkForwardMergedQKVWithStateSnapshots(
             const float *merged_qkv, int qkv_stride,
@@ -3808,6 +4549,124 @@ namespace llaminar2
             (void)d_v;
             (void)chunk_size;
             (void)use_qk_l2norm;
+            return false;
+        }
+
+        /**
+         * @brief Native CPU request-batched recurrence with host real lengths.
+         *
+         * The backend must own one recurrence state per request and schedule
+         * independent `(request, head)` work in one grouped region while each
+         * head preserves serial timestep order.  Padded rows are inert and
+         * produce zero output.
+         */
+        virtual bool chunkForwardBatchedRequestsWithHostSeqLens(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *host_request_seq_lens)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
+            (void)host_request_seq_lens;
+            return false;
+        }
+
+        /**
+         * @brief Grouped CPU recurrence directly over merged Q/K/V rows.
+         *
+         * Qwen GDN stores each row as
+         * `[Q(n_k_heads*d_k), K(n_k_heads*d_k), V(n_heads*d_v)]`.
+         * This contract combines request isolation with the modular Q/K head
+         * mapping so production CPU batching does not first materialize three
+         * temporary tensors.
+         */
+        virtual bool chunkForwardBatchedMergedQKVWithHostSeqLens(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, bool use_qk_l2norm,
+            const int *host_request_seq_lens)
+        {
+            (void)merged_qkv;
+            (void)qkv_stride;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)n_k_heads;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)global_v_head_offset;
+            (void)use_qk_l2norm;
+            (void)host_request_seq_lens;
+            return false;
+        }
+
+        /**
+         * @brief Native request-batched recurrence with device-owned real lengths.
+         *
+         * The grouped backend reads @p device_request_seq_lens directly, keeps
+         * every request on its own recurrent-state slot, emits zeroes for padded
+         * rows, and commits state after the last real row. A host request loop or
+         * scalar-row replay is not a conforming production implementation.
+         */
+        virtual bool chunkForwardBatchedRequestsWithDeviceSeqLens(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *device_request_seq_lens)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)request_count;
+            (void)request_seq_len;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
+            (void)device_request_seq_lens;
             return false;
         }
 

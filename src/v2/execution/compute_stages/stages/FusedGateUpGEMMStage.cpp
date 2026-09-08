@@ -1,24 +1,24 @@
-/**
- * @file FusedGateUpGEMMStage.cpp
+/** @file FusedGateUpGEMMStage.cpp
  * @brief Implementation of FusedGateUpGEMMStage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #include "FusedGateUpGEMMStage.h"
-#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../loaders/PreparedWeightStore.h"
 
 #include <algorithm>
+#include <array>
 
 namespace llaminar2
 {
-
     // =============================================================================
     // FusedGateUpGEMMStage Implementation
     // =============================================================================
@@ -26,6 +26,57 @@ namespace llaminar2
     FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    void FusedGateUpGEMMStage::clearCachedKernelStream()
+    {
+        if (cached_kernel_)
+            cached_kernel_->clearGPUStreamBinding();
+    }
+
+    void FusedGateUpGEMMStage::resetSessionState()
+    {
+        IComputeStage::resetSessionState();
+        clearCachedKernelStream();
+    }
+
+    void FusedGateUpGEMMStage::resetSessionStatePreservingCapturedReplay()
+    {
+        IComputeStage::resetSessionStatePreservingCapturedReplay();
+        clearCachedKernelStream();
+    }
+
+    void FusedGateUpGEMMStage::resetSessionStatePreservingLazyInitialization()
+    {
+        resetSessionStatePreservingCapturedReplay();
+    }
+
+    bool FusedGateUpGEMMStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Graph launch preparation requires "
+                      "the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+
+        ITensorFusedGateUpGemm *kernel = resolvePreparedKernel(
+            "FusedGateUpGEMMStage::prepareGraphLaunch");
+        if (!kernel)
+            return false;
+        bindStageStream(kernel);
+        if (!kernel->prepareFusedProjectionGraphCapture(2))
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to provision persistent "
+                      "gate/up projection resources before graph capture"
+                      << " device=" << params_.device_id.toString());
+            return false;
+        }
+        return true;
     }
 
     bool FusedGateUpGEMMStage::validatePreparedWeights(std::string *error) const
@@ -75,7 +126,7 @@ namespace llaminar2
     {
         ScopedGemmContext gemm_ctx(GemmContext::FFN);
 
-        LOG_DEBUG("[FusedGateUpGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
+        LOG_TRACE("[FusedGateUpGEMMStage] Execute: m=" << params_.m << " k=" << params_.k
                                                        << " n_gate=" << params_.n_gate << " n_up=" << params_.n_up);
 
         if (!ctx)
@@ -171,7 +222,7 @@ namespace llaminar2
             LOG_ERROR("[FusedGateUpGEMMStage] Failed to get fused Gate/Up kernel");
             return false;
         }
-        fused_kernel->setGPUStream(gpuStream());
+        bindStageStream(fused_kernel);
 
         if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
         {
@@ -212,7 +263,7 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[FusedGateUpGEMMStage] Complete");
+        LOG_TRACE("[FusedGateUpGEMMStage] Complete");
         return true;
     }
 
@@ -227,13 +278,6 @@ namespace llaminar2
             return false;
         (void)ctx;
         (void)kernel;
-        if (params_.m > 4)
-        {
-            LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent verifier prefill is only supported "
-                      << "for tiny MTP verifier batches, got m=" << params_.m);
-            return false;
-        }
-
         const bool is_gpu = params_.device_id.is_gpu();
         void *stream = gpuStream();
         if (is_gpu && !stream)
@@ -259,12 +303,13 @@ namespace llaminar2
                       << " up=" << static_cast<const void *>(up_gemm));
             return false;
         }
-        gate_gemm->setGPUStream(gpuStream());
-        up_gemm->setGPUStream(gpuStream());
+        bindStageStream(gate_gemm);
+        bindStageStream(up_gemm);
 
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {gate_gemm, output_gate, params_.n_gate, params_.bias_gate, "gate"},
             {up_gemm, output_up, params_.n_up, params_.bias_up, "up"}};
+        auto verifier_rows = gate_gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         const bool success = gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
             input,
             projections,
@@ -277,10 +322,9 @@ namespace llaminar2
         {
             if (is_gpu)
             {
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    output_gate, params_.device_id, stream);
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    output_up, params_.device_id, stream);
+                const StageGPUExecution gpu = gpuExecution();
+                gpu.publish(output_gate);
+                gpu.publish(output_up);
             }
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -466,6 +510,16 @@ namespace llaminar2
 
         mergeFrom(params_.prepared_ref_gate.value(), params_.n_gate);
         mergeFrom(params_.prepared_ref_up.value(), params_.n_up);
+        const std::array<int, 2> fused_columns = {
+            params_.n_gate > 0 ? params_.n_gate : n,
+            params_.n_up > 0 ? params_.n_up : n};
+        if (auto *anchor = dynamic_cast<IWorkspaceConsumer *>(
+                params_.prepared_store->gemmKernel(
+                    params_.prepared_ref_gate.value())))
+        {
+            anchor->appendFusedProjectionWorkspaceRequirements(
+                combined, workspace_m, fused_columns, workspace_k);
+        }
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
             combined, params_.device_id, workspace_m, /*projection_count=*/2);
         return combined;
@@ -481,11 +535,17 @@ namespace llaminar2
             .addInput(*params_.input_buffer_id)
             .addOutput(*params_.output_gate_buffer_id)
             .addOutput(*params_.output_up_buffer_id);
-        // Model weights are not arena-managed
+        // Gate/up kernels consume store-owned prepared representations.
         if (params_.w_gate)
-            contract.addWeight(const_cast<ITensor *>(params_.w_gate));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_gate),
+                params_.prepared_store,
+                params_.prepared_ref_gate.value_or(PreparedWeightRef{}));
         if (params_.w_up)
-            contract.addWeight(const_cast<ITensor *>(params_.w_up));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_up),
+                params_.prepared_store,
+                params_.prepared_ref_up.value_or(PreparedWeightRef{}));
         if (params_.bias_gate)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_gate)));
         if (params_.bias_up)

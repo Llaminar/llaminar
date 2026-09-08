@@ -29,6 +29,7 @@ MoE-specific GGUF tensors:
 
 import copy
 import re
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -36,8 +37,93 @@ import torch
 import torch.nn.functional as F
 
 from .base import HuggingFaceReferenceModel
+from .mtp_sidecar_reference import (
+    mtp_sidecar_replay_depth,
+    save_mtp_snapshot_atomic,
+)
 from .pipeline_stages import PipelineStage
 from .registry import ModelRegistry
+
+
+def production_router_distribution(router_output) -> torch.Tensor:
+    """Return the full post-softmax distribution published by production.
+
+    Hugging Face names the first tuple member ``router_logits`` even though the
+    module has already applied softmax. Keeping this validation in one helper
+    prevents main-model and recursive-MTP hooks from drifting back to a
+    reconstructed raw projection that no captured backend publishes.
+    """
+
+    if not isinstance(router_output, tuple) or len(router_output) < 3:
+        raise RuntimeError(
+            "Qwen3.5 MoE router did not return probabilities, weights, and indices"
+        )
+    return router_output[0]
+
+
+def materialize_route_contributions(
+    experts,
+    hidden_states: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Reproduce Hugging Face's weighted output for every selected route.
+
+    Hugging Face's public experts result is the sum over the top-k routes. A
+    summed row cannot isolate one moved expert when quantized and FP32 routers
+    exchange an unrelated, low-weight boundary expert. This reference-only
+    recorder evaluates the same expert equations and preserves each route in
+    ``[token, slot, hidden]`` order. It never participates in inference; its
+    sole purpose is to provide an unambiguous numerical parity oracle.
+    """
+
+    if hidden_states.ndim != 2:
+        raise RuntimeError("Qwen3.5 MoE expert input must be a rank-2 tensor")
+    if (
+        selected_experts.ndim != 2
+        or routing_weights.shape != selected_experts.shape
+    ):
+        raise RuntimeError(
+            "Qwen3.5 MoE route IDs and weights must share rank-2 geometry"
+        )
+    if selected_experts.shape[0] != hidden_states.shape[0]:
+        raise RuntimeError(
+            "Qwen3.5 MoE route rows must match the flattened expert input"
+        )
+
+    route_contributions = hidden_states.new_zeros(
+        (
+            hidden_states.shape[0],
+            selected_experts.shape[1],
+            hidden_states.shape[1],
+        )
+    )
+    for encoded_expert in torch.unique(selected_experts):
+        expert_idx = int(encoded_expert.item())
+        if expert_idx < 0 or expert_idx >= int(experts.num_experts):
+            raise RuntimeError(
+                f"Qwen3.5 MoE route names invalid expert {expert_idx}"
+            )
+        positions = torch.nonzero(
+            selected_experts == expert_idx, as_tuple=False
+        )
+        token_indices = positions[:, 0]
+        route_slots = positions[:, 1]
+        current_state = hidden_states[token_indices]
+        gate, up = F.linear(
+            current_state, experts.gate_up_proj[expert_idx]
+        ).chunk(2, dim=-1)
+        expert_output = F.linear(
+            experts.act_fn(gate) * up,
+            experts.down_proj[expert_idx],
+        )
+        weighted_output = expert_output * routing_weights[
+            token_indices, route_slots, None
+        ]
+        route_contributions[token_indices, route_slots] = weighted_output.to(
+            route_contributions.dtype
+        )
+    return route_contributions
 
 
 class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
@@ -149,52 +235,280 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
     # ------------------------------------------------------------------
 
     def _load_from_gguf(self, gguf_path: str, torch_dtype=None, **kwargs) -> None:
-        """Load GGUF with MoE expert gate+up fusion into gate_up_proj."""
-        import warnings
+        """Stream GGUF tensors directly into the final Hugging Face model.
+
+        A 122B checkpoint expands to roughly 488 GB in FP32. Materializing a
+        second state dictionary beside the model exceeds host memory and makes
+        split-model parity impossible. The bounded loader publishes ordinary
+        parameters and each half of the fused expert tensor directly into its
+        final allocation; the trailing MTP decoder is loaded into its own
+        layer by the same transaction.
+        """
         from .loaders import GGUFLoader
+        from .loaders.gguf_parser import GGUFParser
         from transformers.initialization import no_init_weights
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeDecoderLayer,
+            Qwen3_5MoeForCausalLM,
+        )
 
         print(f"Loading GGUF file: {gguf_path}")
         loader = GGUFLoader(gguf_path, verbose=self.verbose)
-        config_dict, state_dict = loader.load(
-            as_transformers_config=False,
-            as_torch=True,
-            show_progress=self.verbose,
-        )
+        parser = GGUFParser(gguf_path)
+        parser.parse()
+        try:
+            config_dict = loader.load_config(
+                parser=parser, as_transformers_config=False
+            )
+            sidecar_reference_pack = kwargs.get("mtp_sidecar_reference_pack")
+            self._mtp_sidecar_reference_pack = (
+                Path(sidecar_reference_pack)
+                if sidecar_reference_pack is not None
+                else None
+            )
+            with no_init_weights():
+                self.hf_config = self._build_hf_config(config_dict)
+                if torch_dtype:
+                    self.hf_config.torch_dtype = torch_dtype
+                if self._mtp_sidecar_reference_pack is None:
+                    self.hf_model = Qwen3_5MoeForCausalLM(self.hf_config)
+                else:
+                    # An additive branch oracle consumes the authenticated
+                    # main-model trajectory already stored in the canonical
+                    # Hugging Face pack. It owns only graph-external MTP state:
+                    # embeddings, LM head, rotary state, and one sidecar layer.
+                    # Retaining 48 unused FP32 main layers would add roughly
+                    # 450 GiB and defeat campaign-level context amortization.
+                    shell_config = copy.deepcopy(self.hf_config)
+                    shell_config.num_hidden_layers = 0
+                    shell_config.layer_types = []
+                    self.hf_model = Qwen3_5MoeForCausalLM(shell_config)
+                    # The top-level Transformers model resolves its concrete
+                    # expert implementation during construction. Propagate
+                    # that typed choice to the original full-depth config used
+                    # by the standalone sidecar layer so both canonical and
+                    # additive contexts execute the same HF expert kernel.
+                    self.hf_config._experts_implementation = (
+                        shell_config._experts_implementation
+                    )
 
-        # Fuse expert gate+up tensors: GGUF has separate gate_proj and up_proj,
-        # HF expects a single gate_up_proj = cat(gate, up, dim=1)
-        state_dict = self._fuse_expert_gate_up(state_dict)
-        self._capture_mtp_sidecar_state(state_dict)
+            nextn_sources = sorted(
+                {
+                    int(match.group(1))
+                    for tensor in parser.tensors
+                    if (
+                        match := re.fullmatch(
+                            r"blk\.(\d+)\.nextn\.eh_proj\.weight",
+                            tensor.name,
+                        )
+                    )
+                }
+            )
+            if len(nextn_sources) > 1:
+                raise RuntimeError(
+                    f"Multiple MTP source layers are unsupported: {nextn_sources}"
+                )
+            self._mtp_sidecar_source_layer = (
+                nextn_sources[0] if nextn_sources else None
+            )
+            self._mtp_sidecar_state = {}
+            self._mtp_sidecar_layer = None
 
-        # Fix shared_expert_gate shape: GGUF stores as [hidden_size] (1D),
-        # HF nn.Linear(hidden_size, 1) expects [1, hidden_size] (2D)
-        for key in list(state_dict.keys()):
-            if 'shared_expert_gate.weight' in key and state_dict[key].dim() == 1:
-                state_dict[key] = state_dict[key].unsqueeze(0)
+            sidecar_parameters = {}
+            sidecar_loaded = set()
+            sidecar_expert_halves = {}
+            if self._mtp_sidecar_source_layer is not None:
+                sidecar_config = copy.deepcopy(self.hf_config)
+                sidecar_config.num_hidden_layers = 1
+                sidecar_config.layer_types = ["full_attention"]
+                with no_init_weights():
+                    self._mtp_sidecar_layer = Qwen3_5MoeDecoderLayer(
+                        sidecar_config, 0
+                    )
+                self._mtp_sidecar_layer._llaminar_mtp_config = sidecar_config
+                sidecar_parameters = dict(
+                    self._mtp_sidecar_layer.named_parameters()
+                )
 
-        with no_init_weights():
-            self.hf_config, self.hf_model = self._create_model_from_gguf_config(
-                config_dict, torch_dtype
+            main_parameters = dict(self.hf_model.named_parameters())
+            main_loaded = set()
+            main_expert_halves = {}
+            unexpected = []
+            source_layer_prefix = (
+                f"model.layers.{self._mtp_sidecar_source_layer}."
+                if self._mtp_sidecar_source_layer is not None
+                else None
+            )
+            raw_nextn_prefix = (
+                f"blk.{self._mtp_sidecar_source_layer}.nextn."
+                if self._mtp_sidecar_source_layer is not None
+                else None
             )
 
-        print(f"Loading {len(state_dict)} tensors into model...")
-        missing, unexpected = self.hf_model.load_state_dict(state_dict, strict=False)
+            def include_sidecar_tensor(mapped_name: str) -> bool:
+                """Select tensors owned by the additive sidecar context."""
 
-        if "lm_head.weight" in missing or missing == ["lm_head.weight"]:
-            print("Tying lm_head.weight to model.embed_tokens.weight (weight sharing)")
-            self.hf_model.lm_head.weight = self.hf_model.model.embed_tokens.weight
+                if self._mtp_sidecar_reference_pack is None:
+                    return True
+                return (
+                    mapped_name in main_parameters
+                    or (
+                        raw_nextn_prefix is not None
+                        and mapped_name.startswith(raw_nextn_prefix)
+                    )
+                    or (
+                        source_layer_prefix is not None
+                        and mapped_name.startswith(source_layer_prefix)
+                    )
+                )
 
-        if missing and missing != ["lm_head.weight"]:
-            warnings.warn(f"Missing keys when loading GGUF: {missing}")
-        if unexpected:
-            warnings.warn(f"Unexpected keys when loading GGUF: {unexpected}")
+            for mapped_name, tensor in loader.iter_state_dict(
+                parser=parser,
+                as_torch=True,
+                show_progress=self.verbose,
+                max_in_flight=8,
+                include_mapped_name=include_sidecar_tensor,
+            ):
+                if raw_nextn_prefix and mapped_name.startswith(raw_nextn_prefix):
+                    self._mtp_sidecar_state[mapped_name] = tensor.detach()
+                    continue
+                if source_layer_prefix and mapped_name.startswith(
+                    source_layer_prefix
+                ):
+                    sidecar_name = mapped_name[len(source_layer_prefix):]
+                    if not self._copy_streamed_parameter(
+                        sidecar_name,
+                        tensor,
+                        sidecar_parameters,
+                        sidecar_loaded,
+                        sidecar_expert_halves,
+                    ):
+                        unexpected.append(mapped_name)
+                    continue
+                if not self._copy_streamed_parameter(
+                    mapped_name,
+                    tensor,
+                    main_parameters,
+                    main_loaded,
+                    main_expert_halves,
+                ):
+                    if mapped_name not in {
+                        "rope_freqs.weight",
+                        "rope.freqs",
+                        "pos_embd.weight",
+                    }:
+                        unexpected.append(mapped_name)
 
-        self.hf_model = self.hf_model.to(self.device)
-        self.hf_model.eval()
+            main_missing = set(main_parameters) - main_loaded
+            if main_missing == {"lm_head.weight"} and (
+                "model.embed_tokens.weight" in main_loaded
+            ):
+                print("Tying lm_head.weight to model.embed_tokens.weight")
+                self.hf_model.lm_head.weight = (
+                    self.hf_model.model.embed_tokens.weight
+                )
+                main_missing.clear()
+            if main_missing:
+                raise RuntimeError(
+                    "Streamed GGUF model is missing parameters: "
+                    f"{sorted(main_missing)}"
+                )
+
+            sidecar_missing = set(sidecar_parameters) - sidecar_loaded
+            if sidecar_missing:
+                raise RuntimeError(
+                    "Streamed GGUF MTP layer is missing parameters: "
+                    f"{sorted(sidecar_missing)}"
+                )
+            if unexpected:
+                raise RuntimeError(
+                    "Streamed GGUF contains unexpected tensors: "
+                    f"{sorted(unexpected)}"
+                )
+            if self._mtp_sidecar_source_layer is not None:
+                for suffix in (
+                    "eh_proj.weight",
+                    "enorm.weight",
+                    "hnorm.weight",
+                    "shared_head_norm.weight",
+                ):
+                    self._mtp_tensor(suffix)
+
+            self.hf_model = self.hf_model.to(self.device).eval()
+            if self._mtp_sidecar_layer is not None:
+                self._mtp_sidecar_layer = (
+                    self._mtp_sidecar_layer.to(self.device).eval()
+                )
+        finally:
+            parser.close()
 
         self._resolve_tokenizer(gguf_path)
         print("✓ GGUF MoE model loaded successfully")
+
+    @staticmethod
+    def _copy_streamed_parameter(
+        name: str,
+        tensor: torch.Tensor,
+        parameters: dict[str, torch.nn.Parameter],
+        loaded: set[str],
+        expert_halves: dict[str, set[str]],
+    ) -> bool:
+        """Copy one mapped tensor into its final parameter allocation.
+
+        GGUF stores expert gate and up projections independently while
+        Transformers owns one ``gate_up_proj`` parameter. Copying each source
+        into its exact slice avoids constructing a second fused 6+ GB tensor.
+        """
+        expert_match = re.fullmatch(
+            r"((?:.*\.)?mlp\.experts)\.(gate_proj|up_proj)\.weight",
+            name,
+        )
+        target_name = name
+        target_view = None
+        half_name = None
+        if expert_match:
+            target_name = f"{expert_match.group(1)}.gate_up_proj"
+            if target_name not in parameters or tensor.ndim != 3:
+                return False
+            target = parameters[target_name]
+            if target.shape[0] != tensor.shape[0] or target.shape[2] != tensor.shape[2]:
+                raise RuntimeError(
+                    f"Expert tensor shape mismatch for {name}: "
+                    f"source={tuple(tensor.shape)}, target={tuple(target.shape)}"
+                )
+            if target.shape[1] != tensor.shape[1] * 2:
+                raise RuntimeError(
+                    f"Expert fused width mismatch for {name}: "
+                    f"source={tuple(tensor.shape)}, target={tuple(target.shape)}"
+                )
+            half_name = expert_match.group(2)
+            offset = 0 if half_name == "gate_proj" else tensor.shape[1]
+            target_view = target[:, offset:offset + tensor.shape[1], :]
+        elif target_name not in parameters:
+            return False
+        else:
+            target_view = parameters[target_name]
+            if name.endswith("mlp.shared_expert_gate.weight") and tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+
+        if tuple(target_view.shape) != tuple(tensor.shape):
+            raise RuntimeError(
+                f"Parameter shape mismatch for {name}: "
+                f"source={tuple(tensor.shape)}, target={tuple(target_view.shape)}"
+            )
+        with torch.no_grad():
+            target_view.copy_(
+                tensor.to(device=target_view.device, dtype=target_view.dtype)
+            )
+
+        if half_name is None:
+            loaded.add(target_name)
+        else:
+            halves = expert_halves.setdefault(target_name, set())
+            halves.add(half_name)
+            if halves == {"gate_proj", "up_proj"}:
+                loaded.add(target_name)
+        return True
 
     def _capture_mtp_sidecar_state(self, state_dict: dict) -> None:
         """Keep only the trailing nextn tensors needed for MTP sidecar parity."""
@@ -241,6 +555,8 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         return tensor.detach().cpu().float().numpy()
 
     def _make_mtp_sidecar_layer(self):
+        if getattr(self, "_mtp_sidecar_layer", None) is not None:
+            return self._mtp_sidecar_layer
         if not getattr(self, "_mtp_sidecar_state", None):
             return None
 
@@ -274,18 +590,153 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             raise RuntimeError(f"Missing MTP sidecar tensor {key}")
         return self._mtp_sidecar_state[key].to(self.device)
 
+    def _load_mtp_reference_pack_trajectory(
+        self,
+        prompt: str,
+        decode_steps: int,
+    ) -> tuple[list[int], list[int], torch.Tensor]:
+        """Load the authenticated main-model trajectory for a branch oracle.
+
+        Additive MTP branches do not alter committed main-model execution. The
+        canonical Hugging Face pack therefore is the exact authority for the
+        prompt's final-layer hidden rows and committed greedy tokens. Reusing
+        those immutable FP32 artifacts lets one small sidecar context evaluate
+        every production-observed branch without loading the 48-layer main
+        model again.
+
+        Returns:
+            Prompt token IDs, committed decode tokens, and the prefill final-
+            layer residual tensor.
+        """
+
+        pack = getattr(self, "_mtp_sidecar_reference_pack", None)
+        if pack is None:
+            raise RuntimeError("No MTP sidecar reference pack was configured")
+        metadata_path = pack / "metadata.txt"
+        if not metadata_path.is_file():
+            raise RuntimeError(
+                f"MTP sidecar reference pack has no metadata: {metadata_path}"
+            )
+
+        metadata = {}
+        for line in metadata_path.read_text(encoding="utf-8").splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            metadata[key.strip()] = value.strip()
+
+        def require(key: str) -> str:
+            value = metadata.get(key)
+            if value is None or not value:
+                raise RuntimeError(
+                    f"MTP sidecar reference metadata is missing {key}"
+                )
+            return value
+
+        if require("reference_engine") != "pytorch":
+            raise RuntimeError("MTP sidecar branches require a PyTorch reference pack")
+        if require("reference_dtype") != "float32":
+            raise RuntimeError("MTP sidecar branches require an FP32 reference pack")
+        if int(require("n_layers")) != self.hf_config.num_hidden_layers:
+            raise RuntimeError(
+                "MTP sidecar reference layer count does not match the GGUF model"
+            )
+        if int(require("decode_steps")) != decode_steps:
+            raise RuntimeError(
+                "MTP sidecar reference decode length does not match the request"
+            )
+
+        token_ids = [int(token) for token in require("token_ids").split(",")]
+        encoded_ids = self.tokenizer(prompt, return_tensors="pt")[
+            "input_ids"
+        ][0].tolist()
+        if encoded_ids != token_ids:
+            raise RuntimeError(
+                "MTP sidecar reference prompt tokens do not match the request"
+            )
+
+        decode_tokens = [
+            int(token) for token in require("decode_tokens").split(",")
+        ]
+        if len(decode_tokens) != decode_steps + 1:
+            raise RuntimeError(
+                "MTP sidecar reference pack must contain the prefill token and "
+                "one successor token for every decode step"
+            )
+
+        last_main_layer = self.hf_config.num_hidden_layers - 1
+        hidden_path = pack / f"layer{last_main_layer}_FFN_RESIDUAL.npy"
+        last_hidden = self._load_mtp_reference_hidden(hidden_path)
+        if last_hidden.shape[:2] != (1, len(token_ids)):
+            raise RuntimeError(
+                f"Unexpected MTP prefill trajectory shape {tuple(last_hidden.shape)}"
+            )
+        return token_ids, decode_tokens, last_hidden
+
+    def _load_mtp_reference_hidden(self, path: Path) -> torch.Tensor:
+        """Load and validate one immutable FP32 hidden-state checkpoint."""
+
+        if not path.is_file():
+            raise RuntimeError(f"Missing MTP main-model trajectory tensor: {path}")
+        payload = np.load(path, allow_pickle=False)
+        if payload.dtype != np.float32 or payload.ndim != 3:
+            raise RuntimeError(
+                f"Invalid MTP trajectory tensor {path}: "
+                f"dtype={payload.dtype}, shape={payload.shape}"
+            )
+        if payload.shape[-1] != self.hf_config.hidden_size:
+            raise RuntimeError(
+                f"MTP trajectory hidden width does not match the model: {path}"
+            )
+        return torch.from_numpy(payload).to(self.device)
+
     def generate_mtp_sidecar_decode_snapshots(
         self,
         prompt: str,
         decode_steps: int,
         output_dir,
+        max_draft_depth: int = 3,
         verbose: bool = False,
+        draft_token_overrides: Optional[dict[int, list[int]]] = None,
+        reuse_canonical_main_trajectory: bool = False,
     ) -> int:
-        """Generate decode_stepN_MTP0_* snapshots for the Qwen3.6 nextn sidecar."""
+        """Generate recursive MTP0..MTPN checkpoints for the Qwen3.6 sidecar.
+
+        Each repeated predictor call consumes the previous call's shared-head-
+        normalized hidden state.  That tensor is both the LM-head input and the
+        hidden-state result published by the reference Qwen3.5 MTP module; the
+        pre-normalized decoder residual is an intermediate checkpoint only.
+
+        ``draft_token_overrides`` names production-selected recursive condition
+        tokens by decode step.  Entry zero is consumed by MTP1, entry one by
+        MTP2, and so on; MTP0 always consumes the main-model condition token.
+        Alternate snapshots include the consumed branch in their filename so
+        they can coexist with the canonical Hugging Face greedy branch.
+
+        ``reuse_canonical_main_trajectory`` explicitly authorizes canonical
+        MTP0..MTPN generation from an existing authenticated main-model pack.
+        The sidecar-only model context then consumes the immutable FP32 hidden
+        rows and committed token history in that pack.  Keeping this authority
+        explicit prevents an arbitrary directory from silently replacing a
+        complete-model reference run while allowing deeper predictor capacity
+        to be added without loading the complete 35B/122B model again.
+        """
         if not getattr(self, "_mtp_sidecar_state", None):
             return 0
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
+        if max_draft_depth < 1 or max_draft_depth > 15:
+            raise ValueError("max_draft_depth must be in [1, 15]")
+        draft_token_overrides = draft_token_overrides or {}
+        for step, tokens in draft_token_overrides.items():
+            if step < 0 or step >= decode_steps:
+                raise ValueError(
+                    f"MTP draft override step {step} is outside decode range"
+                )
+            if len(tokens) > max_draft_depth - 1 or any(token < 0 for token in tokens):
+                raise ValueError(
+                    f"MTP draft override step {step} has invalid recursive tokens"
+                )
 
         from pathlib import Path
         from transformers.cache_utils import DynamicCache
@@ -296,29 +747,51 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         last_main_layer = self.hf_config.num_hidden_layers - 1
         sidecar_layer = self._make_mtp_sidecar_layer()
         sidecar_cache = DynamicCache(config=sidecar_layer._llaminar_mtp_config)
+        reference_pack = getattr(self, "_mtp_sidecar_reference_pack", None)
+        if (
+            reference_pack is not None
+            and not draft_token_overrides
+            and not reuse_canonical_main_trajectory
+        ):
+            raise RuntimeError(
+                "A sidecar-only context may generate additive branch snapshots "
+                "only unless reuse_canonical_main_trajectory explicitly "
+                "authorizes an authenticated canonical trajectory"
+            )
 
         hnorm = self._mtp_tensor("hnorm.weight")
         enorm = self._mtp_tensor("enorm.weight")
         eh_proj = self._mtp_tensor("eh_proj.weight")
         shared_head_norm = self._mtp_tensor("shared_head_norm.weight")
 
-        encoding = self.tokenizer(prompt, return_tensors="pt")
-        token_ids = encoding["input_ids"][0].tolist()
+        if reference_pack is None:
+            encoding = self.tokenizer(prompt, return_tensors="pt")
+            token_ids = encoding["input_ids"][0].tolist()
+            result = self.forward(
+                token_ids,
+                clear_snapshots=True,
+                use_cache=True,
+                capture_stages=[PipelineStage.FFN_RESIDUAL],
+            )
+            main_cache = result["past_key_values"]
+            last_hidden = torch.from_numpy(
+                self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
+            ).to(self.device)
+            if last_hidden.dim() == 2:
+                last_hidden = last_hidden.unsqueeze(0)
+            committed_decode_tokens = None
+        else:
+            token_ids, committed_decode_tokens, last_hidden = (
+                self._load_mtp_reference_pack_trajectory(prompt, decode_steps)
+            )
+            main_cache = None
 
-        result = self.forward(
-            token_ids,
-            clear_snapshots=True,
-            use_cache=True,
-            capture_stages=[PipelineStage.FFN_RESIDUAL],
-        )
-        main_cache = result["past_key_values"]
-        last_hidden = torch.from_numpy(
-            self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
-        ).to(self.device)
-        if last_hidden.dim() == 2:
-            last_hidden = last_hidden.unsqueeze(0)
-
-        def project_sidecar_hidden(terminal_hidden: torch.Tensor, token_id: int) -> dict:
+        def project_sidecar_hidden(
+            terminal_hidden: torch.Tensor,
+            token_id: int,
+            depth_index: int,
+        ) -> dict:
+            prefix = f"MTP{depth_index}_"
             token = torch.tensor([[token_id]], device=self.device, dtype=torch.long)
             embedding = self.hf_model.model.embed_tokens(token)
             norm_hidden = self._rms_norm(
@@ -330,12 +803,12 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             concat = torch.cat([norm_embedding, norm_hidden], dim=-1)
             projected = F.linear(concat, eh_proj)
             return {
-                "MTP_TERMINAL_HIDDEN_ROW_SELECT": terminal_hidden,
-                "MTP0_EMBEDDING": embedding,
-                "MTP0_NORM_HIDDEN": norm_hidden,
-                "MTP0_NORM_EMBEDDING": norm_embedding,
-                "MTP0_CONCAT": concat,
-                "MTP0_FC": projected,
+                f"{prefix}TERMINAL_HIDDEN_ROW_SELECT": terminal_hidden,
+                f"{prefix}EMBEDDING": embedding,
+                f"{prefix}NORM_HIDDEN": norm_hidden,
+                f"{prefix}NORM_EMBEDDING": norm_embedding,
+                f"{prefix}CONCAT": concat,
+                f"{prefix}FC": projected,
             }
 
         def _capture_mtp(captures: dict, key: str, tensor: torch.Tensor) -> None:
@@ -351,70 +824,100 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                 return tensor.contiguous().reshape(tensor.shape[0], tensor.shape[1], -1)
             return tensor
 
-        def _install_sidecar_capture_hooks(captures: dict) -> list:
+        def _install_sidecar_capture_hooks(
+            captures: dict,
+            depth_index: int,
+        ) -> list:
             handles = []
             runtime = {}
+            prefix = f"MTP{depth_index}_"
+            key = lambda suffix: f"{prefix}{suffix}"
 
             handles.append(sidecar_layer.input_layernorm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_ATTENTION_NORM", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("ATTENTION_NORM"), out)))
 
             fa = sidecar_layer.self_attn
 
             def _q_proj(_mod, _inp, out):
-                _capture_mtp(captures, "MTP0_Q_PROJECTION", out)
+                _capture_mtp(captures, key("Q_PROJECTION"), out)
                 head_dim = getattr(fa, "head_dim", self.hf_config.head_dim)
                 q_gate = out.view(*out.shape[:-1], -1, head_dim * 2)
                 _, gate = torch.chunk(q_gate, 2, dim=-1)
                 runtime["fa_gate"] = gate.reshape(*out.shape[:-1], -1).detach()
-                _capture_mtp(captures, "MTP0_FA_GATE", runtime["fa_gate"])
+                _capture_mtp(captures, key("FA_GATE"), runtime["fa_gate"])
 
             handles.append(fa.q_proj.register_forward_hook(_q_proj))
             handles.append(fa.k_proj.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_K_PROJECTION", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("K_PROJECTION"), out)))
             handles.append(fa.v_proj.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_V_PROJECTION", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("V_PROJECTION"), out)))
             handles.append(fa.q_norm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_Q_NORM", _flatten_seq_head_tensor(out))))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("Q_NORM"), _flatten_seq_head_tensor(out))))
             handles.append(fa.k_norm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_K_NORM", _flatten_seq_head_tensor(out))))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("K_NORM"), _flatten_seq_head_tensor(out))))
 
             def _attention_context(_mod, inp):
                 h = inp[0] if isinstance(inp, tuple) else inp
-                _capture_mtp(captures, "MTP0_ATTENTION_CONTEXT_GATED", h)
+                _capture_mtp(captures, key("ATTENTION_CONTEXT_GATED"), h)
                 gate = runtime.get("fa_gate")
                 if gate is not None:
                     raw_context = h / torch.sigmoid(gate.to(device=h.device, dtype=h.dtype)).clamp_min(1e-12)
-                    _capture_mtp(captures, "MTP0_ATTENTION_CONTEXT", raw_context)
+                    _capture_mtp(captures, key("ATTENTION_CONTEXT"), raw_context)
 
             handles.append(fa.o_proj.register_forward_pre_hook(_attention_context))
 
             def _attention_output(_mod, _inp, out):
                 h = out[0] if isinstance(out, tuple) else out
-                _capture_mtp(captures, "MTP0_ATTENTION_OUTPUT", h)
+                _capture_mtp(captures, key("ATTENTION_OUTPUT"), h)
 
             handles.append(fa.register_forward_hook(_attention_output))
 
             handles.append(sidecar_layer.post_attention_layernorm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_FFN_NORM", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("FFN_NORM"), out)))
 
             moe_block = sidecar_layer.mlp
 
             def _router(_mod, _inp, out):
-                if isinstance(out, tuple) and len(out) >= 3:
-                    _capture_mtp(captures, "MTP0_MOE_ROUTER_OUTPUT", out[0])
-                    _capture_mtp(captures, "MTP0_MOE_ROUTING_WEIGHTS", out[1])
-                    _capture_mtp(captures, "MTP0_MOE_ROUTING_INDICES", out[2].float())
-                else:
-                    router_logits = out[0] if isinstance(out, tuple) else out
-                    _capture_mtp(captures, "MTP0_MOE_ROUTER_OUTPUT", router_logits)
+                # Qwen3_5MoeTopKRouter calls its first result `router_logits`,
+                # but the value is the full post-softmax expert distribution.
+                # Llaminar intentionally publishes that same live routing
+                # workspace under the historical MOE_ROUTER_OUTPUT key.  Keep
+                # the reference at the production boundary instead of
+                # reconstructing a pre-softmax tensor that the captured graph
+                # does not expose after routing has completed.
+                _capture_mtp(
+                    captures,
+                    key("MOE_ROUTER_OUTPUT"),
+                    production_router_distribution(out),
+                )
+                _capture_mtp(captures, key("MOE_ROUTING_WEIGHTS"), out[1])
+                _capture_mtp(captures, key("MOE_ROUTING_INDICES"), out[2].float())
 
             handles.append(moe_block.gate.register_forward_hook(_router))
-            handles.append(moe_block.experts.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_MOE_EXPERT_OUTPUT", out)))
+            def _mtp_experts(mod, inp, out):
+                _capture_mtp(captures, key("MOE_EXPERT_OUTPUT"), out)
+                if not isinstance(inp, tuple) or len(inp) != 3:
+                    raise RuntimeError(
+                        "Qwen3.5 MoE MTP experts did not receive complete route inputs"
+                    )
+                _capture_mtp(
+                    captures,
+                    key("MOE_ROUTE_CONTRIBUTIONS"),
+                    materialize_route_contributions(
+                        mod,
+                        inp[0],
+                        inp[1],
+                        inp[2],
+                    ),
+                )
+
+            handles.append(
+                moe_block.experts.register_forward_hook(_mtp_experts)
+            )
 
             def _shared_expert(_mod, _inp, out):
                 runtime["shared_expert_output"] = out.detach()
-                _capture_mtp(captures, "MTP0_MOE_SHARED_EXPERT_OUTPUT", out)
+                _capture_mtp(captures, key("MOE_SHARED_EXPERT_OUTPUT"), out)
 
             handles.append(moe_block.shared_expert.register_forward_hook(_shared_expert))
 
@@ -422,21 +925,21 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                 shared = runtime.get("shared_expert_output")
                 if shared is not None:
                     gated = shared.to(device=out.device, dtype=out.dtype) * torch.sigmoid(out)
-                    _capture_mtp(captures, "MTP0_MOE_SHARED_GATE_OUTPUT", gated)
+                    _capture_mtp(captures, key("MOE_SHARED_GATE_OUTPUT"), gated)
                 else:
-                    _capture_mtp(captures, "MTP0_MOE_SHARED_GATE_OUTPUT", out)
+                    _capture_mtp(captures, key("MOE_SHARED_GATE_OUTPUT"), out)
 
             handles.append(moe_block.shared_expert_gate.register_forward_hook(_shared_gate))
 
             def _moe_combined(_mod, _inp, out):
                 h = out[0] if isinstance(out, tuple) else out
-                _capture_mtp(captures, "MTP0_MOE_COMBINED_OUTPUT", h)
+                _capture_mtp(captures, key("MOE_COMBINED_OUTPUT"), h)
 
             handles.append(moe_block.register_forward_hook(_moe_combined))
 
             def _ffn_residual(_mod, _inp, out):
                 h = out[0] if isinstance(out, tuple) else out
-                _capture_mtp(captures, "MTP0_FFN_RESIDUAL", h)
+                _capture_mtp(captures, key("FFN_RESIDUAL"), h)
 
             handles.append(sidecar_layer.register_forward_hook(_ffn_residual))
             return handles
@@ -445,12 +948,17 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             projected: torch.Tensor,
             position: int,
             cache,
+            depth_index: int = 0,
             captures: Optional[dict] = None,
         ) -> tuple[torch.Tensor, object]:
             text_position_ids = torch.tensor([[position]], device=self.device, dtype=torch.long)
             rope_position_ids = text_position_ids[None, ...].expand(3, 1, 1)
             position_embeddings = self.hf_model.model.rotary_emb(projected, rope_position_ids)
-            handles = _install_sidecar_capture_hooks(captures) if captures is not None else []
+            handles = (
+                _install_sidecar_capture_hooks(captures, depth_index)
+                if captures is not None
+                else []
+            )
             try:
                 hidden = sidecar_layer(
                     projected,
@@ -469,61 +977,142 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             for row in range(len(token_ids) - 1):
                 pieces = project_sidecar_hidden(
                     last_hidden[:, row:row + 1, :],
-                    token_ids[row + 1])
+                    token_ids[row + 1],
+                    0)
                 _, sidecar_cache = sidecar_forward(
                     pieces["MTP0_FC"],
                     row + 1,
                     sidecar_cache)
 
-            next_token = int(result["logits"][0, -1, :].argmax())
+            next_token = (
+                int(result["logits"][0, -1, :].argmax())
+                if committed_decode_tokens is None
+                else committed_decode_tokens[0]
+            )
             total = 0
             for step in range(decode_steps):
-                pieces = project_sidecar_hidden(last_hidden[:, -1:, :], next_token)
-                sidecar_captures = {}
-                hidden, sidecar_cache = sidecar_forward(
-                    pieces["MTP0_FC"],
-                    len(token_ids) + step,
-                    sidecar_cache,
-                    sidecar_captures)
-                final_hidden = self._rms_norm(
-                    hidden,
-                    shared_head_norm,
-                    self.hf_config.rms_norm_eps,
-                    pre_rmsnorm_1p=True)
-                logits = self.hf_model.lm_head(final_hidden)
+                committed_cache_length = sidecar_cache.get_seq_length()
+                draft_hidden = last_hidden[:, -1:, :]
+                draft_condition_token = next_token
+                step_overrides = draft_token_overrides.get(step)
+                consumed_recursive_tokens = []
+                replay_depth = mtp_sidecar_replay_depth(
+                    step, max_draft_depth, draft_token_overrides)
+                for depth_index in range(replay_depth):
+                    if (
+                        depth_index > 0
+                        and step_overrides is not None
+                        and depth_index - 1 < len(step_overrides)
+                    ):
+                        draft_condition_token = step_overrides[depth_index - 1]
+                    if depth_index > 0:
+                        consumed_recursive_tokens.append(draft_condition_token)
+                    prefix = f"MTP{depth_index}_"
+                    pieces = project_sidecar_hidden(
+                        draft_hidden,
+                        draft_condition_token,
+                        depth_index)
+                    sidecar_captures = {}
+                    hidden, sidecar_cache = sidecar_forward(
+                        pieces[f"{prefix}FC"],
+                        len(token_ids) + step + depth_index,
+                        sidecar_cache,
+                        depth_index,
+                        sidecar_captures)
+                    final_hidden = self._rms_norm(
+                        hidden,
+                        shared_head_norm,
+                        self.hf_config.rms_norm_eps,
+                        pre_rmsnorm_1p=True)
+                    logits = self.hf_model.lm_head(final_hidden)
 
-                snapshots = {
-                    "MTP_TERMINAL_HIDDEN_ROW_SELECT": self._flatten_for_snapshot(pieces["MTP_TERMINAL_HIDDEN_ROW_SELECT"]),
-                    "MTP0_EMBEDDING": self._flatten_for_snapshot(pieces["MTP0_EMBEDDING"]),
-                    "MTP0_NORM_HIDDEN": self._flatten_for_snapshot(pieces["MTP0_NORM_HIDDEN"]),
-                    "MTP0_NORM_EMBEDDING": self._flatten_for_snapshot(pieces["MTP0_NORM_EMBEDDING"]),
-                    "MTP0_CONCAT": self._flatten_for_snapshot(pieces["MTP0_CONCAT"]),
-                    "MTP0_FC": self._flatten_for_snapshot(pieces["MTP0_FC"]),
-                    "MTP0_FFN_RESIDUAL": self._flatten_for_snapshot(hidden),
-                    "MTP0_FINAL_NORM": self._flatten_for_snapshot(final_hidden),
-                    "MTP0_LM_HEAD": self._flatten_for_snapshot(logits),
-                }
-                snapshots.update(sidecar_captures)
-                for key, payload in snapshots.items():
-                    np.save(output_dir / f"decode_step{step}_{key}.npy", payload)
-                    total += 1
-                    if verbose:
-                        print(f"  Saved decode_step{step}_{key}: shape={list(payload.shape)}")
+                    snapshots = {
+                        f"{prefix}TERMINAL_HIDDEN_ROW_SELECT": self._flatten_for_snapshot(
+                            pieces[f"{prefix}TERMINAL_HIDDEN_ROW_SELECT"]),
+                        f"{prefix}EMBEDDING": self._flatten_for_snapshot(
+                            pieces[f"{prefix}EMBEDDING"]),
+                        f"{prefix}NORM_HIDDEN": self._flatten_for_snapshot(
+                            pieces[f"{prefix}NORM_HIDDEN"]),
+                        f"{prefix}NORM_EMBEDDING": self._flatten_for_snapshot(
+                            pieces[f"{prefix}NORM_EMBEDDING"]),
+                        f"{prefix}CONCAT": self._flatten_for_snapshot(
+                            pieces[f"{prefix}CONCAT"]),
+                        f"{prefix}FC": self._flatten_for_snapshot(
+                            pieces[f"{prefix}FC"]),
+                        f"{prefix}FFN_RESIDUAL": self._flatten_for_snapshot(hidden),
+                        f"{prefix}FINAL_NORM": self._flatten_for_snapshot(final_hidden),
+                        f"{prefix}LM_HEAD": self._flatten_for_snapshot(logits),
+                    }
+                    if depth_index == 0:
+                        snapshots["MTP_TERMINAL_HIDDEN_ROW_SELECT"] = snapshots[
+                            "MTP0_TERMINAL_HIDDEN_ROW_SELECT"
+                        ]
+                    snapshots.update(sidecar_captures)
+                    branch_qualifier = ""
+                    if step_overrides is not None and depth_index > 0:
+                        branch_qualifier = "_BRANCH_" + "_".join(
+                            str(token) for token in consumed_recursive_tokens
+                        )
+                    persist_snapshot = (
+                        not draft_token_overrides
+                        or (step_overrides is not None and depth_index > 0)
+                    )
+                    for snapshot_key, payload in snapshots.items():
+                        if not persist_snapshot:
+                            continue
+                        snapshot_path = (
+                            output_dir
+                            / f"decode_step{step}{branch_qualifier}_{snapshot_key}.npy"
+                        )
+                        if draft_token_overrides:
+                            save_mtp_snapshot_atomic(snapshot_path, payload)
+                        else:
+                            np.save(snapshot_path, payload)
+                        total += 1
+                        if verbose:
+                            print(
+                                f"  Saved decode_step{step}_{snapshot_key}: "
+                                f"shape={list(payload.shape)}"
+                            )
 
-                result = self.forward(
-                    [next_token],
-                    clear_snapshots=True,
-                    past_key_values=main_cache,
-                    use_cache=True,
-                    capture_stages=[PipelineStage.FFN_RESIDUAL],
-                )
-                main_cache = result["past_key_values"]
-                last_hidden = torch.from_numpy(
-                    self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
-                ).to(self.device)
-                if last_hidden.dim() == 2:
-                    last_hidden = last_hidden.unsqueeze(0)
-                next_token = int(result["logits"][0, -1, :].argmax())
+                    draft_condition_token = int(logits[0, -1, :].argmax())
+                    draft_hidden = final_hidden
+
+                # Only the first sidecar row belongs to the next committed main
+                # position.  Deeper rows are speculative and must not leak into
+                # the reference cache used by the following main decode step.
+                sidecar_cache.crop(committed_cache_length + 1)
+
+                if committed_decode_tokens is None:
+                    result = self.forward(
+                        [next_token],
+                        clear_snapshots=True,
+                        past_key_values=main_cache,
+                        use_cache=True,
+                        capture_stages=[PipelineStage.FFN_RESIDUAL],
+                    )
+                    main_cache = result["past_key_values"]
+                    last_hidden = torch.from_numpy(
+                        self.snapshots[
+                            (PipelineStage.FFN_RESIDUAL, last_main_layer)
+                        ]
+                    ).to(self.device)
+                    if last_hidden.dim() == 2:
+                        last_hidden = last_hidden.unsqueeze(0)
+                    next_token = int(result["logits"][0, -1, :].argmax())
+                else:
+                    hidden_path = (
+                        reference_pack
+                        / f"decode_step{step}_layer{last_main_layer}_"
+                        "FFN_RESIDUAL.npy"
+                    )
+                    last_hidden = self._load_mtp_reference_hidden(hidden_path)
+                    if last_hidden.shape[:2] != (1, 1):
+                        raise RuntimeError(
+                            "MTP decode trajectory must contain exactly one row: "
+                            f"{hidden_path}"
+                        )
+                    next_token = committed_decode_tokens[step + 1]
 
         return total
 
@@ -824,19 +1413,22 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
 
             # Router output (gate) + routing indices and weights
             def _router(mod, inp, out, i=idx):
-                if isinstance(out, tuple) and len(out) >= 3:
-                    # gate returns (router_logits, routing_weights, selected_experts)
-                    if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
-                        self.capture_stage(PipelineStage.MOE_ROUTER_OUTPUT, out[0], i)
-                    if self._should_capture(PipelineStage.MOE_ROUTING_WEIGHTS):
-                        self.capture_stage(PipelineStage.MOE_ROUTING_WEIGHTS, out[1], i)
-                    if self._should_capture(PipelineStage.MOE_ROUTING_INDICES):
-                        # selected_experts is int64 — store as float for snapshot compat
-                        self.capture_stage(PipelineStage.MOE_ROUTING_INDICES, out[2].float(), i)
-                else:
-                    router_logits = out[0] if isinstance(out, tuple) else out
-                    if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
-                        self.capture_stage(PipelineStage.MOE_ROUTER_OUTPUT, router_logits, i)
+                # The first result is the complete post-softmax distribution.
+                # CUDA and ROCm retain that same full routing workspace through
+                # captured replay, so this is the only live cross-backend
+                # checkpoint boundary. Top-k weights and indices remain the
+                # second and third results respectively.
+                if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
+                    self.capture_stage(
+                        PipelineStage.MOE_ROUTER_OUTPUT,
+                        production_router_distribution(out),
+                        i,
+                    )
+                if self._should_capture(PipelineStage.MOE_ROUTING_WEIGHTS):
+                    self.capture_stage(PipelineStage.MOE_ROUTING_WEIGHTS, out[1], i)
+                if self._should_capture(PipelineStage.MOE_ROUTING_INDICES):
+                    # selected_experts is int64 — store as float for snapshot compat
+                    self.capture_stage(PipelineStage.MOE_ROUTING_INDICES, out[2].float(), i)
             self._hook_handles.append(
                 moe_block.gate.register_forward_hook(_router)
             )
@@ -845,6 +1437,21 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             def _experts(mod, inp, out, i=idx):
                 if self._should_capture(PipelineStage.MOE_EXPERT_OUTPUT):
                     self.capture_stage(PipelineStage.MOE_EXPERT_OUTPUT, out, i)
+                if self._should_capture(PipelineStage.MOE_ROUTE_CONTRIBUTIONS):
+                    if not isinstance(inp, tuple) or len(inp) != 3:
+                        raise RuntimeError(
+                            "Qwen3.5 MoE experts did not receive hidden rows, route IDs, and route weights"
+                        )
+                    self.capture_stage(
+                        PipelineStage.MOE_ROUTE_CONTRIBUTIONS,
+                        materialize_route_contributions(
+                            mod,
+                            inp[0],
+                            inp[1],
+                            inp[2],
+                        ),
+                        i,
+                    )
             self._hook_handles.append(
                 moe_block.experts.register_forward_hook(_experts)
             )

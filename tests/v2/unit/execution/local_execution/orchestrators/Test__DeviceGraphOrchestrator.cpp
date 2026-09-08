@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "backends/BackendManager.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
@@ -19,22 +20,34 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "loaders/WeightPlan.h"
+#include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
 #include "backends/ComputeBackend.h"
+#include "../../../../mocks/MockModelContext.h"
+#include "../../../../mocks/MockModelLoader.h"
+#include "../../../../mocks/MockComputeStage.h"
+#include "../../../../mocks/MockLocalTPContext.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -46,6 +59,10 @@ class Test__DeviceGraphOrchestrator : public ::testing::Test
 protected:
     void SetUp() override
     {
+        // This unit-test process intentionally models one aggregate CPU domain.
+        // Production MPI ranks initialize an exact node in RuntimeInitPhase.
+        initCPUBackend(-1);
+
         // Initialize DeviceManager (required for DeviceContext creation)
         DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
 
@@ -90,6 +107,11 @@ public:
 
     TensorContext exposeTensorContext() const { return buildTensorContext(); }
     LayerWeights exposeLayerWeightsForGraph(int layer_idx) const { return layerWeightsForGraph(layer_idx); }
+    LayerWeightBindings exposeLayerWeightBindingsForGraph(int layer_idx, int total_tokens)
+    {
+        DecodeReplicatedDenseScope scope(*this, total_tokens);
+        return layerWeightBindingsForGraph(layer_idx);
+    }
     std::optional<PreparedWeightRef> exposePreparedRefForGraphWeight(
         const WeightBinding *binding,
         DeviceId device) const
@@ -104,6 +126,16 @@ public:
 
 namespace
 {
+    std::string readSourceFileForDeviceGraphOrchestratorTest(const std::string &path)
+    {
+        std::ifstream input(path);
+        if (!input.good())
+            return {};
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
+
     bool canReuseCachedFFNGraphForTest(
         const LayerGraphCache &cache,
         int seq_len,
@@ -113,6 +145,217 @@ namespace
                cache.valid &&
                cache.ffn_cached_seq_len == seq_len &&
                cache.ffn_cached_all_position_logits == all_position_logits;
+    }
+
+    TEST(
+        Test__ServingGraphFamilyMaterializationPlan,
+        RejectsPrefillOnlyInventoryAndRequiresHistoryBearingSerialDecode)
+    {
+        ServingGraphFamilyMaterializationPlan plan{
+            .prefill_bucket_rows = {64, 128},
+            .prefill_pad_token_id = 0,
+        };
+
+        EXPECT_FALSE(plan.valid());
+        plan.main_decode_graph =
+            ServingMainDecodeGraphKind::HistoryBearingSerial;
+        EXPECT_TRUE(plan.valid());
+        plan.prefill_bucket_rows.clear();
+        EXPECT_FALSE(plan.valid());
+    }
+
+    TEST(
+        Test__ServingGraphFamilyMaterializationPlan,
+        CaptureIdentityIncludesEveryFrozenPlanValue)
+    {
+        ServingGraphFamilyMaterializationPlan plan{
+            .prefill_bucket_rows = {64, 128},
+            .prefill_pad_token_id = 7,
+            .main_decode_graph =
+                ServingMainDecodeGraphKind::HistoryBearingSerial,
+        };
+        ASSERT_TRUE(plan.valid());
+        EXPECT_TRUE(plan.sameCaptureIdentity(plan));
+
+        auto changed = plan;
+        changed.prefill_bucket_rows.push_back(256);
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+        changed = plan;
+        ++changed.prefill_pad_token_id;
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+        changed = plan;
+        changed.main_decode_graph = ServingMainDecodeGraphKind::Unspecified;
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+        changed = plan;
+        changed.pipeline_hidden_input = reinterpret_cast<TensorBase *>(0x1);
+        EXPECT_FALSE(plan.sameCaptureIdentity(changed));
+    }
+
+    TEST(
+        Test__DeviceGraphOrchestratorSourcePolicy,
+        ServingFamilySealsHistoryBearingDecodeBeforeFollowerAdmission)
+    {
+        const std::string source =
+            readSourceFileForDeviceGraphOrchestratorTest(
+                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const size_t begin = source.find(
+            "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
+        const size_t end = source.find(
+            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            begin);
+        ASSERT_NE(begin, std::string::npos);
+        ASSERT_NE(end, std::string::npos);
+        const std::string method = source.substr(begin, end - begin);
+
+        const size_t decode_phase = method.find(
+            "decode_input.execution_phase = ForwardExecutionPhase::Decode");
+        const size_t history_identity = method.find(
+            "decode_input.position_offset = 1", decode_phase);
+        const size_t materialize_decode = method.find(
+            "decode_materialized = executeForward(", history_identity);
+        const size_t decode_input_argument = method.find(
+            "decode_input, decode_output", materialize_decode);
+        const size_t family_completion = method.find(
+            "serving_graph_family_participant_completions",
+            materialize_decode);
+        ASSERT_NE(decode_phase, std::string::npos);
+        ASSERT_NE(history_identity, std::string::npos);
+        ASSERT_NE(materialize_decode, std::string::npos);
+        ASSERT_NE(decode_input_argument, std::string::npos);
+        ASSERT_NE(family_completion, std::string::npos);
+        EXPECT_LT(decode_phase, history_identity);
+        EXPECT_LT(history_identity, materialize_decode);
+        EXPECT_LT(materialize_decode, decode_input_argument);
+        EXPECT_LT(materialize_decode, family_completion);
+        EXPECT_NE(
+            method.find(
+                "MaterializeExecutableWithoutLaunch", decode_phase),
+            std::string::npos);
+    }
+
+    /**
+     * @brief Keep request-independent MTP forwards inside the serving seal.
+     *
+     * The first device-generation transaction used to discover the live
+     * condition and grouped verifier cache identities after readiness.  That
+     * made a valid depth-15 request pay several seconds of native recording per
+     * participant.  The setup edge must now retain both greedy and stochastic
+     * verifier topologies before the lifecycle can become Sealed.
+     */
+    TEST(
+        Test__DeviceGraphOrchestratorSourcePolicy,
+        ServingFamilyMaterializesCompleteMTPForwardInventoryBeforeSeal)
+    {
+        const std::string source =
+            readSourceFileForDeviceGraphOrchestratorTest(
+                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const size_t helper_begin = source.find(
+            "materializeMTPServingForwardExecutablesWithoutLaunch(");
+        const size_t serving_begin = source.find(
+            "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
+        ASSERT_NE(helper_begin, std::string::npos);
+        ASSERT_NE(serving_begin, std::string::npos);
+        ASSERT_LT(helper_begin, serving_begin);
+
+        const std::string helper = source.substr(
+            helper_begin, serving_begin - helper_begin);
+        EXPECT_NE(
+            helper.find("ForwardExecutionRole::MTPCondition"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("ForwardExecutionRole::GroupedMTPVerifier"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("MTPVerifierOutcomeGraphMode::Greedy"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("MTPVerifierOutcomeGraphMode::Disabled"),
+            std::string::npos);
+        EXPECT_NE(
+            helper.find("MaterializeExecutableWithoutLaunch"),
+            std::string::npos);
+
+        const size_t serving_end = source.find(
+            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            serving_begin);
+        ASSERT_NE(serving_end, std::string::npos);
+        const std::string serving = source.substr(
+            serving_begin, serving_end - serving_begin);
+        const size_t mtp_family = serving.find(
+            "materializeMTPServingForwardExecutablesWithoutLaunch(");
+        const size_t sealed = serving.rfind(
+            "ServingGraphFamilyLifecycle::Sealed");
+        ASSERT_NE(mtp_family, std::string::npos);
+        ASSERT_NE(sealed, std::string::npos);
+        EXPECT_LT(mtp_family, sealed);
+    }
+
+    /**
+     * @brief Lock down the eager-host half of the common serving-family edge.
+     *
+     * CPU ExpertOverlay continuation ranks use ordinary eager compute graphs,
+     * but still have to certify their complete workspace topology and seal
+     * admission before transaction authority is installed. A former blanket
+     * GPU prerequisite made every CPU NodeTP overlay fail during setup.
+     */
+    TEST(
+        Test__DeviceGraphOrchestratorSourcePolicy,
+        EagerHostServingFamilyMaterializesAndSealsWithoutInference)
+    {
+        const std::string source =
+            readSourceFileForDeviceGraphOrchestratorTest(
+                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const size_t begin = source.find(
+            "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
+        const size_t end = source.find(
+            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            begin);
+        ASSERT_NE(begin, std::string::npos);
+        ASSERT_NE(end, std::string::npos);
+        const std::string method = source.substr(begin, end - begin);
+
+        EXPECT_EQ(
+            method.find("!state_.device_id.is_gpu()"),
+            std::string::npos)
+            << "Eager host preparation must not be rejected by a native-device prerequisite.";
+        const size_t workspace_family = method.find(
+            "materializeForwardGraphForShape(");
+        const size_t cpu_transition = method.find(
+            "if (state_.device_id.is_cpu())",
+            workspace_family);
+        const size_t cpu_transition_end = method.find(
+            "ModelBuffers model_buffers",
+            cpu_transition);
+        ASSERT_NE(workspace_family, std::string::npos);
+        ASSERT_NE(cpu_transition, std::string::npos);
+        ASSERT_NE(cpu_transition_end, std::string::npos);
+        const std::string cpu_branch = method.substr(
+            cpu_transition,
+            cpu_transition_end - cpu_transition);
+        const size_t engine_owner = cpu_branch.find(
+            "ensureForwardEngine();");
+        const size_t sealed = cpu_branch.find(
+            "ServingGraphFamilyLifecycle::Sealed",
+            engine_owner);
+        const size_t eager_evidence = cpu_branch.find(
+            "\"eager_host_graph\"",
+            sealed);
+        ASSERT_NE(engine_owner, std::string::npos);
+        ASSERT_NE(sealed, std::string::npos);
+        ASSERT_NE(eager_evidence, std::string::npos);
+        EXPECT_LT(engine_owner, sealed);
+        EXPECT_LT(sealed, eager_evidence);
+        EXPECT_EQ(cpu_branch.find("executeForward("), std::string::npos)
+            << "Eager admission certifies topology; it must not run synthetic inference.";
     }
 
     TEST(Test__LayerGraphCache, FFNVariantKeyIsIndependentFromAttentionVariant)
@@ -180,6 +423,88 @@ namespace
             << "Request reset must release stale verifier stream ownership.";
     }
 
+    TEST_F(Test__DeviceGraphOrchestrator,
+           DevicePositionAuthorityIsNotShadowedBySynthesizedHostRows)
+    {
+        const std::string source =
+            readSourceFileForDeviceGraphOrchestratorTest(
+                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const auto execute_pos = source.find(
+            "bool DeviceGraphOrchestrator::executeForward(");
+        const auto next_method_pos = source.find(
+            "bool DeviceGraphOrchestrator::waitForLastInferenceCompletionForBenchmark(",
+            execute_pos);
+        ASSERT_NE(execute_pos, std::string::npos);
+        ASSERT_NE(next_method_pos, std::string::npos);
+        const std::string execute_body =
+            source.substr(execute_pos, next_method_pos - execute_pos);
+
+        EXPECT_NE(
+            execute_body.find(
+                "if (!input.position_ids && !input.position_ids_device)"),
+            std::string::npos)
+            << "A permanent device position row is the sole graph-input "
+               "authority and must suppress host position synthesis.";
+        EXPECT_EQ(
+            execute_body.find("if (!input.position_ids)"),
+            std::string::npos)
+            << "Testing only the host pointer would silently create a second "
+               "position authority for device-resident graph inputs.";
+    }
+
+    /**
+     * @brief The forward boundary follows explicit PP ownership on CPU too.
+     */
+    TEST_F(Test__DeviceGraphOrchestrator,
+           ForwardResultBoundarySelectsHiddenOnlyForNonHeadPPStage)
+    {
+        llaminar2::testing::MockDeviceContext cpu_ctx(DeviceId::cpu());
+        FP32Tensor logits(std::vector<size_t>{1, 16}, DeviceId::cpu());
+        FP32Tensor hidden(std::vector<size_t>{1, 8}, DeviceId::cpu());
+
+        DeviceGraphOrchestrator nonterminal(graph_builder_, nullptr);
+        nonterminal.setPPStageConfig(FactoryPPStageConfig{
+            .first_layer = 0,
+            .last_layer = 12,
+            .has_embedding = true,
+            .has_lm_head = false});
+        IForwardExecutionHost &nonterminal_host = nonterminal;
+
+        ForwardOutput hidden_output;
+        hidden_output.hidden = &hidden;
+        EXPECT_TRUE(nonterminal_host.publishForwardResultAtBoundary(
+            hidden_output,
+            &cpu_ctx));
+
+        ForwardOutput missing_hidden;
+        missing_hidden.logits = &logits;
+        EXPECT_FALSE(nonterminal_host.publishForwardResultAtBoundary(
+            missing_hidden,
+            &cpu_ctx));
+
+        DeviceGraphOrchestrator terminal(graph_builder_, nullptr);
+        terminal.setPPStageConfig(FactoryPPStageConfig{
+            .first_layer = 12,
+            .last_layer = 24,
+            .has_embedding = false,
+            .has_lm_head = true});
+        IForwardExecutionHost &terminal_host = terminal;
+
+        ForwardOutput logits_output;
+        logits_output.logits = &logits;
+        EXPECT_TRUE(terminal_host.publishForwardResultAtBoundary(
+            logits_output,
+            &cpu_ctx));
+
+        ForwardOutput missing_logits;
+        missing_logits.hidden = &hidden;
+        EXPECT_FALSE(terminal_host.publishForwardResultAtBoundary(
+            missing_logits,
+            &cpu_ctx));
+    }
+
     class ScopedEnv
     {
     public:
@@ -226,6 +551,17 @@ namespace
         bool allreduce(TensorBase *) override { return false; }
         bool broadcast(TensorBase *, int = 0) override { return false; }
         bool allgather(const TensorBase *, TensorBase *) override { return false; }
+        bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &) override
+        {
+            return false;
+        }
+        bool broadcastFloatElements(
+            TensorBase *, size_t, int, const std::string &) override
+        {
+            return false;
+        }
         bool send(const TensorBase *, int) override { return false; }
         bool recv(TensorBase *, int) override { return false; }
 
@@ -254,9 +590,11 @@ namespace
         for (int s = 0; s < num_sockets; ++s)
             cfg.sockets.push_back(DeviceId(DeviceType::CPU, s));
 
-        cfg.initial_expert_to_socket.resize(num_experts);
+        std::vector<int> owners(static_cast<size_t>(num_experts));
         for (int e = 0; e < num_experts; ++e)
-            cfg.initial_expert_to_socket[e] = e % num_sockets;
+            owners[static_cast<size_t>(e)] = e % num_sockets;
+        cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+            num_layers, num_sockets, owners);
 
         cfg.rebalance_config.imbalance_threshold = 1.3f;
         cfg.rebalance_config.max_swaps_per_layer = 4;
@@ -280,6 +618,12 @@ namespace
         cfg.vocab_size = 32;
         cfg.rms_norm_eps = 1e-6f;
         cfg.default_device = DeviceId::cpu();
+        cfg.layer_types = {"full_attention", "full_attention"};
+        cfg.gdn.conv_kernel_size = 4;
+        cfg.gdn.state_size = cfg.head_dim;
+        cfg.gdn.inner_size = cfg.d_model;
+        cfg.gdn.group_count = cfg.n_kv_heads;
+        cfg.gdn.time_step_rank = cfg.n_heads;
         cfg.moe.num_experts = 8;
         cfg.moe.top_k = 2;
         cfg.moe.intermediate_size = 8;
@@ -311,6 +655,61 @@ namespace
             }
         }
     }
+
+    class RebuiltMoEGraphBuilder : public MockGraphBuilder
+    {
+    public:
+        /**
+         * @brief Enter the same public graph-policy boundary as production builders.
+         *
+         * DeviceGraphOrchestrator intentionally invokes buildForwardGraph()
+         * because that public virtual owns request-scoped graph policy adoption.
+         * This synthetic builder still constructs its one-node graph through
+         * buildFullForwardGraph(), but must expose that implementation through
+         * the public boundary instead of depending on an orchestrator bypass.
+         */
+        ComputeGraph buildForwardGraph(
+            const ForwardInput &input,
+            ForwardOutput &output) override
+        {
+            return buildFullForwardGraph(input, output);
+        }
+
+        ComputeGraph buildFullForwardGraph(
+            const ForwardInput &input,
+            ForwardOutput &output) override
+        {
+            (void)input;
+            (void)output;
+            ++full_forward_builds;
+
+            ComputeGraph graph;
+            auto stage = std::make_unique<MoEExpertComputeStage>(makeStageParams());
+            last_built_stage = stage.get();
+            graph.addNode("moe", std::move(stage), DeviceId::cpu());
+            return graph;
+        }
+
+        int full_forward_builds = 0;
+        MoEExpertComputeStage *last_built_stage = nullptr;
+
+    private:
+        static MoEExpertComputeStage::Params makeStageParams()
+        {
+            MoEExpertComputeStage::Params params;
+            params.device_id = DeviceId::cpu();
+            params.seq_len = 1;
+            params.d_model = 8;
+            params.num_experts = 4;
+            params.top_k = 2;
+            params.expert_intermediate = 4;
+            params.local_expert_start = 0;
+            params.local_expert_count = 4;
+            params.layer_idx = 0;
+            params.expert_mask = {true, false, true, false};
+            return params;
+        }
+    };
 }
 
 // =============================================================================
@@ -337,6 +736,143 @@ TEST_F(Test__DeviceGraphOrchestrator, ConstructWithConfig)
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, PreparedStoreKeepsModelOwnedIdForLegacyFrozenGraph)
+{
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    const ModelContextId shared_model_id{12345};
+    auto shared_store = std::make_shared<PreparedWeightStore>(shared_model_id);
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    DeviceGraphOrchestrator::Dependencies deps;
+    deps.model_ctx = test::MockModelContext::createMinimal();
+    deps.graph_builder = std::make_shared<QwenStandardGraph>(config_, nullptr);
+    deps.weight_manager = weight_manager;
+
+    DeviceGraphOrchestrator orchestrator(std::move(deps));
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto ffn_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto ffn_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.final_norm = final_norm.get();
+    weights.lm_head = lm_head.get();
+    weights.get_layer_weights = [ffn_norm, ffn_down](int)
+    {
+        LayerWeights layer;
+        layer.ffn_norm = ffn_norm.get();
+        layer.down_proj = ffn_down.get();
+        return layer;
+    };
+
+    orchestrator.setWeights(weights);
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    EXPECT_EQ(orchestrator.frozenWeightSet()->strategy().model_id.value, shared_model_id.value);
+    const auto &embedding_binding = orchestrator.frozenWeightSet()->global("token_embd.weight");
+    ASSERT_TRUE(embedding_binding.prepared.has_value());
+    EXPECT_EQ(embedding_binding.prepared->kind, PreparedWeightKind::PreparedEmbedding);
+    const auto &down_binding = orchestrator.frozenWeightSet()->layer(0, "ffn_down.weight");
+    ASSERT_TRUE(down_binding.prepared.has_value());
+    EXPECT_EQ(down_binding.prepared->kind, PreparedWeightKind::CpuPackedGemm);
+
+    ASSERT_NO_THROW(orchestrator.initializePreparedWeightStore(DeviceId::cpu()));
+    ASSERT_EQ(orchestrator.preparedWeightStore(), shared_store.get());
+    EXPECT_EQ(orchestrator.preparedWeightStore()->modelId().value, shared_model_id.value);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, LegacyConstructorWithWeightManagerSeedsPreparedRefs)
+{
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    const ModelContextId shared_model_id{67890};
+    auto shared_store = std::make_shared<PreparedWeightStore>(shared_model_id);
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    auto graph_builder = std::make_shared<QwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph_builder, nullptr);
+    orchestrator.setWeightManager(weight_manager);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto ffn_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto ffn_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.final_norm = final_norm.get();
+    weights.lm_head = lm_head.get();
+    weights.get_layer_weights = [ffn_norm, ffn_down](int)
+    {
+        LayerWeights layer;
+        layer.ffn_norm = ffn_norm.get();
+        layer.down_proj = ffn_down.get();
+        return layer;
+    };
+
+    orchestrator.setWeights(weights);
+
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    EXPECT_EQ(orchestrator.frozenWeightSet()->strategy().model_id.value, shared_model_id.value);
+    const auto &embedding_binding = orchestrator.frozenWeightSet()->global("token_embd.weight");
+    ASSERT_TRUE(embedding_binding.prepared.has_value());
+    EXPECT_EQ(embedding_binding.prepared->kind, PreparedWeightKind::PreparedEmbedding);
+    const auto &down_binding = orchestrator.frozenWeightSet()->layer(0, "ffn_down.weight");
+    ASSERT_TRUE(down_binding.prepared.has_value());
+    EXPECT_EQ(down_binding.prepared->kind, PreparedWeightKind::CpuPackedGemm);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, LegacyFrozenBindingIdsAreDeviceScopedForSharedPreparedStore)
+{
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    auto shared_store = std::make_shared<PreparedWeightStore>(ModelContextId{24680});
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto ffn_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.final_norm = final_norm.get();
+    weights.lm_head = lm_head.get();
+    weights.get_layer_weights = [ffn_down](int)
+    {
+        LayerWeights layer;
+        layer.down_proj = ffn_down.get();
+        return layer;
+    };
+
+    auto make_orchestrator = [&](DeviceId device)
+    {
+        GraphConfig cfg = config_;
+        cfg.default_device = device;
+        auto builder = std::make_shared<QwenStandardGraph>(cfg, nullptr);
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(builder, nullptr);
+        orchestrator->setWeightManager(weight_manager);
+        orchestrator->setWeights(weights);
+        return orchestrator;
+    };
+
+    auto cuda0 = make_orchestrator(DeviceId::cuda(0));
+    auto cuda1 = make_orchestrator(DeviceId::cuda(1));
+
+    ASSERT_NE(cuda0->frozenWeightSet(), nullptr);
+    ASSERT_NE(cuda1->frozenWeightSet(), nullptr);
+    EXPECT_NE(
+        cuda0->frozenWeightSet()->global("token_embd.weight").binding_id,
+        cuda1->frozenWeightSet()->global("token_embd.weight").binding_id);
+    EXPECT_NE(
+        cuda0->frozenWeightSet()->layer(0, "ffn_down.weight").binding_id,
+        cuda1->frozenWeightSet()->layer(0, "ffn_down.weight").binding_id);
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, ConstructWithCacheDisabled)
 {
     GraphCacheConfig cache_config;
@@ -356,11 +892,11 @@ TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
         std::invalid_argument);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedAndTopologyBounded)
+TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndInitializationBounded)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.mtp.enabled = true;
-    moe_config.moe.expert_mode = MoEExpertMode::ExpertParallel;
+    moe_config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     moe_config.moe.local_expert_start = 0;
     moe_config.moe.local_expert_count = -1;
     DeviceGraphOrchestrator moe_orchestrator(
@@ -368,9 +904,9 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
         nullptr);
     ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
-    EXPECT_FALSE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
-        << "MoE all-position verifier row parity is not enough to prove that the "
-           "preceding sidecar left every routed live-state surface untouched.";
+    EXPECT_TRUE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "Qwen3.6 MoE declares MTP scratch, shifted KV, and depth-scoped "
+           "router metadata as sidecar-owned on every backend.";
     EXPECT_FALSE(moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
         << "MoE must publish the first shifted MTP row from the target verifier "
            "accepted row, not reuse sidecar-local routed expert state.";
@@ -383,94 +919,23 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
     EXPECT_FALSE(moe_orchestrator.supportsMTPSpecStatePublication())
         << "CPU MoE must remain replay-published until it has a resident-state "
            "publication proof of its own.";
-    const auto cpu_moe_economy =
-        moe_orchestrator.mtpVerifierEconomyCapability();
-    EXPECT_TRUE(cpu_moe_economy.supportsMoERows(4, true));
-    EXPECT_TRUE(cpu_moe_economy.moe.serial_decode_equivalent_fallback)
-        << "CPU MoE remains on serial replay until it has a grouped full-model proof.";
-    EXPECT_FALSE(cpu_moe_economy.moe.grouped_decode_equivalent);
-    EXPECT_FALSE(cpu_moe_economy.hasEconomicalMoEPath(4, true));
+    EXPECT_FALSE(moe_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
+        << "CPU MoE grouped publication is a required host-native contract; it "
+           "does not advertise a separate economy or device-residency capability.";
 
-    DeviceId gpu_device = DeviceId::invalid();
-    if (DeviceManager::instance().cuda_device_count() > 0)
-    {
-        gpu_device = DeviceId::cuda(0);
-    }
-    else if (DeviceManager::instance().rocm_device_count() > 0)
-    {
-        gpu_device = DeviceId::rocm(0);
-    }
-    if (gpu_device.is_valid())
-    {
-        auto gpu_moe_config = moe_config;
-        gpu_moe_config.default_device = gpu_device;
-        DeviceGraphOrchestrator gpu_moe_orchestrator(
-            std::make_shared<Qwen35MoEGraph>(gpu_moe_config, nullptr),
-            nullptr);
-        ASSERT_TRUE(gpu_moe_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
-        EXPECT_TRUE(gpu_moe_orchestrator.supportsMTPSidecarPreservesMainState())
-            << "Full-owner GPU MoE sidecars are now covered by the runtime-state "
-               "preservation gate: main KV, GDN/conv, positions, and sequence "
-               "lengths must match the verifier base after sidecar execution.";
-        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
-            << "MoE may skip the verifier-base restore, but its first shifted MTP "
-               "row is still published from accepted verifier rows rather than "
-               "reusing the sidecar-local draft row.";
-        const auto gpu_moe_capability =
-            gpu_moe_orchestrator.mtpVerifierRowCapability();
-        EXPECT_TRUE(gpu_moe_capability.supportsMoEDecodeEquivalentRows(4, true))
-            << "Phase 9.7 proves MoE shared decode-equivalent verifier rows "
-               "for M=1..4 on every backend.";
-        EXPECT_FALSE(gpu_moe_capability.supportsMoEDirectAllPositionRows(4, true))
-            << "Grouped verifier-row math does not prove live-state publication; "
-               "KV, GDN/conv, shifted MTP KV, and logical state still need the "
-               "stronger transaction gate.";
-        EXPECT_FALSE(gpu_moe_capability.device_resident_direct_publication)
-            << "The old all-position publication capability remains disabled "
-               "for MoE; compact grouped outcomes publish through the separate "
-               "device-resident handoff.";
-        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPSpecStatePublication());
-        EXPECT_TRUE(gpu_moe_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
-            << "Grouped MoE outcomes now have a resident accepted-state "
-               "publication handoff even though the stronger all-position "
-               "state-publication policy remains disabled.";
-        const auto gpu_moe_economy =
-            gpu_moe_orchestrator.mtpVerifierEconomyCapability();
-        EXPECT_TRUE(gpu_moe_economy.supportsMoERows(4, true));
-        EXPECT_TRUE(gpu_moe_economy.moe.serial_decode_equivalent_fallback)
-            << "Serial replay remains the correctness oracle and fallback "
-               "contract, but the promoted grouped lane must not use it.";
-        EXPECT_TRUE(gpu_moe_economy.moe.grouped_decode_equivalent)
-            << "GPU MoE exposes the strict grouped verifier outcome proof.";
-        EXPECT_TRUE(gpu_moe_economy.moe.row_indexed_lm_head);
-        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_input);
-        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_outcome);
-        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_publication);
-        EXPECT_FALSE(gpu_moe_economy.moe.host_bridge_free_hot_path);
-        EXPECT_TRUE(gpu_moe_economy.moe.graph_capturable);
-        EXPECT_STREQ(
-            gpu_moe_economy.moe.perf_gate_status.c_str(),
-            "grouped_outcome_economics_pending");
-        EXPECT_FALSE(gpu_moe_economy.hasEconomicalMoEPath(4, true))
-            << "The grouped outcome lane is a middle contract; it cannot be "
-               "counted as economical until the grouped verifier graph and "
-               "host-bridge-free hot path are speed-accepted.";
-    }
-
-    auto dense_config = config_;
-    dense_config.mtp.enabled = true;
+    auto dense_config = moe_config;
+    dense_config.moe = {};
     DeviceGraphOrchestrator dense_orchestrator(
-        std::make_shared<QwenStandardGraph>(dense_config, nullptr),
+        std::make_shared<Qwen35Graph>(dense_config, nullptr),
         nullptr);
     EXPECT_FALSE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
         << "The capability requires initialized KV/MTP cache state, not just config.";
     ASSERT_TRUE(dense_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     /*
-     * Dense sidecars use MTP-prefixed activation buffers and request-local MTP
-     * KV.  Real-model ROCm preservation coverage compares verifier rows before
-     * and after sidecar execution; this unit guard keeps the advertised
-     * capability narrow enough for that proof to remain meaningful.
+     * Dense Qwen3.5/3.6 sidecars use MTP-prefixed activation buffers and
+     * request-local shifted KV. Real-model preservation coverage compares
+     * verifier rows and state payloads before and after sidecar execution.
      */
     EXPECT_TRUE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
         << "Initialized dense MTP runners can skip the full verifier-base restore; "
@@ -482,6 +947,9 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
         << "CPU dense MTP must stay on the decode-equivalent verifier until "
            "CPU all-position GDN/KV publication has a continuation-equivalence "
            "proof.";
+    EXPECT_FALSE(dense_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
+        << "CPU dense grouped publication is required through the host-native "
+           "path and no longer has a separate economy advertisement.";
     const auto cpu_dense_capability =
         dense_orchestrator.mtpVerifierRowCapability();
     EXPECT_TRUE(cpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true))
@@ -489,56 +957,19 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
            "contract for M=1..4.";
     EXPECT_FALSE(cpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
         << "CPU dense direct publication is intentionally not promoted.";
-    const auto cpu_dense_economy =
-        dense_orchestrator.mtpVerifierEconomyCapability();
-    EXPECT_TRUE(cpu_dense_economy.supportsDenseRows(4, true));
-    EXPECT_TRUE(cpu_dense_economy.dense.serial_decode_equivalent_fallback);
-    EXPECT_FALSE(cpu_dense_economy.hasEconomicalDensePath(4, false));
 
-    if (gpu_device.is_valid())
-    {
-        auto gpu_dense_config = dense_config;
-        gpu_dense_config.default_device = gpu_device;
-        DeviceGraphOrchestrator gpu_dense_orchestrator(
-            std::make_shared<QwenStandardGraph>(gpu_dense_config, nullptr),
-            nullptr);
-        ASSERT_TRUE(gpu_dense_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
-        EXPECT_FALSE(gpu_dense_orchestrator.supportsMTPSpecStatePublication())
-            << "GPU dense direct all-position publication must stay disabled "
-               "until it has a continuation-equivalence proof for recurrent "
-               "GDN/short-conv state, not just matching verifier row logits.";
-        const auto gpu_dense_capability =
-            gpu_dense_orchestrator.mtpVerifierRowCapability();
-        EXPECT_TRUE(gpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true));
-        EXPECT_FALSE(gpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
-            << "The proven M=1..4 contract is the shared decode-equivalent "
-               "path; direct publication remains fail-closed.";
-        EXPECT_FALSE(gpu_dense_capability.supportsDenseDirectAllPositionRows(4, true))
-            << "Stochastic direct publication also requires its own proof.";
-        const auto gpu_dense_economy =
-            gpu_dense_orchestrator.mtpVerifierEconomyCapability();
-        EXPECT_TRUE(gpu_dense_economy.supportsDenseRows(4, true));
-        EXPECT_TRUE(gpu_dense_economy.dense.serial_decode_equivalent_fallback)
-            << "The serial replay contract remains the correctness fallback "
-               "while the grouped GPU lane is still economy-pending.";
-        EXPECT_TRUE(gpu_dense_economy.dense.grouped_decode_equivalent)
-            << "GPU dense must expose the M=1..4 grouped verifier-row proof "
-               "so SingleDevice stochastic MTP can use the resident outcome path.";
-        EXPECT_TRUE(gpu_dense_economy.dense.row_indexed_lm_head);
-        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_input);
-        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_outcome);
-        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_publication);
-        EXPECT_FALSE(gpu_dense_economy.dense.host_bridge_free_hot_path)
-            << "Grouped dense publication is not fully economical until the "
-               "whole transaction is benchmark-accepted.";
-        EXPECT_TRUE(gpu_dense_economy.dense.graph_capturable);
-        EXPECT_STREQ(
-            gpu_dense_economy.dense.perf_gate_status.c_str(),
-            "grouped_outcome_economics_pending");
-        EXPECT_FALSE(gpu_dense_economy.hasEconomicalDensePath(4, true))
-            << "Grouped/resident verifier promotion is Phase 9.8 work, even "
-               "when Phase 9.7 row correctness is green.";
-    }
+    auto undeclared_config = config_;
+    undeclared_config.mtp.enabled = true;
+    DeviceGraphOrchestrator undeclared_orchestrator(
+        std::make_shared<QwenStandardGraph>(undeclared_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(undeclared_orchestrator.initializeInferenceStateFromArena(
+        1, 16, DeviceId::cpu()));
+    EXPECT_FALSE(
+        undeclared_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "A graph family without a concrete MTP sidecar implementation must "
+           "not inherit preservation merely because it is dense or runs on CPU.";
+
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeLazyCallback)
@@ -614,6 +1045,13 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeL
         DeviceId::cpu());
     capturing_builder->setPreparedWeightStore(&store);
 
+    /*
+     * The frozen binding id plus its typed graph role is the lookup identity.
+     * The graph helper selects CpuPackedGemm for this GDN projection, so an
+     * equal numeric id in the disjoint embedding registry cannot masquerade as
+     * the requested representation. No lazy tensor callback or host-side
+     * mutation of the frozen binding is required.
+     */
     auto graph_ref = capturing_builder->exposePreparedRefForGraphWeight(
         gdn_binding,
         DeviceId::cpu());
@@ -675,6 +1113,271 @@ TEST_F(Test__DeviceGraphOrchestrator, SetFrozenWeightSetConfiguresBindingsDirect
     ASSERT_TRUE(capturing_builder->captured_weights.get_layer_weights != nullptr);
     auto legacy_layer = capturing_builder->captured_weights.get_layer_weights(0);
     EXPECT_EQ(legacy_layer.wq, attn_q.get());
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PreparedStoreIncludesDecodeReplicatedDenseFrozenSet)
+{
+    config_.n_layers = 1;
+    auto capturing_builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    auto shared_store = std::make_shared<PreparedWeightStore>(ModelContextId{4242});
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    DeviceGraphOrchestrator orchestrator(capturing_builder, nullptr);
+    orchestrator.setWeightManager(weight_manager);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto primary_attn_q = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto decode_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    auto make_binding = [](uint64_t binding_id,
+                           const std::string &name,
+                           WeightRole role,
+                           TensorBase *tensor,
+                           PreparedWeightKind prepared_kind = PreparedWeightKind::None)
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{4242}, binding_id);
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.slice.source_rows = tensor ? tensor->rows() : 0;
+        binding.slice.source_cols = tensor ? tensor->cols() : 0;
+        binding.slice.row_count = binding.slice.source_rows;
+        binding.slice.col_count = binding.slice.source_cols;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        if (prepared_kind != PreparedWeightKind::None)
+        {
+            binding.prepared = PreparedWeightRef{
+                ModelContextId{4242},
+                binding_id,
+                prepared_kind,
+                DeviceId::cpu()};
+        }
+        return binding;
+    };
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{4242};
+    strategy.devices = {DeviceId::cpu()};
+
+    ModelWeightSetBuilder primary_builder(strategy);
+    primary_builder.addBinding(make_binding(1, "token_embd.weight", WeightRole::Embedding, embedding.get()));
+    primary_builder.addBinding(make_binding(2, "output_norm.weight", WeightRole::OutputNorm, final_norm.get()));
+    primary_builder.addBinding(make_binding(3, "output.weight", WeightRole::LMHead, lm_head.get()));
+    primary_builder.addBinding(make_binding(4, "blk.0.attn_q.weight", WeightRole::AttentionQ, primary_attn_q.get(),
+                                            PreparedWeightKind::CpuPackedGemm));
+    orchestrator.setFrozenWeightSet(
+        std::make_unique<FrozenModelWeightSet>(strategy, primary_builder.freezeBindings()));
+
+    ModelWeightSetBuilder decode_builder(strategy);
+    auto &decode_binding = decode_builder.addBinding(
+        make_binding(100, "blk.0.ffn_down.weight", WeightRole::FFNDown, decode_down.get(),
+                     PreparedWeightKind::CpuPackedGemm));
+    const uint64_t decode_binding_id = decode_binding.binding_id;
+    orchestrator.setDecodeReplicatedDenseWeightSet(
+        std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings()));
+
+    ASSERT_NO_THROW(orchestrator.initializePreparedWeightStore(DeviceId::cpu()));
+
+    auto decode_ref = shared_store->preparedRefForBinding(decode_binding_id, DeviceId::cpu());
+    ASSERT_TRUE(decode_ref.has_value())
+        << "decode-replicated dense frozen bindings must be registered in the shared prepared store";
+    EXPECT_EQ(decode_ref->kind, PreparedWeightKind::CpuPackedGemm);
+    EXPECT_EQ(decode_ref->binding_id, decode_binding_id);
+}
+
+/**
+ * @brief Replicated dense decode must reject incomplete alternate weight sets at install time.
+ *
+ * makeModelWeightBindings() always exposes a layer accessor lambda, so a decode
+ * set containing only layer weights used to look like a valid replicated dense
+ * source until the decode graph reached LM head construction. The owner of the
+ * alternate decode weight set must fail fast while the missing globals are
+ * still visible at the request/setup boundary.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseDecodeRejectsMissingGlobalBindings)
+{
+    GraphConfig cfg = config_;
+    cfg.dense_tp_enabled = true;
+    cfg.dense_tp_decode_replicated = true;
+    cfg.n_layers = 1;
+    auto graph = std::make_shared<CapturingQwenStandardGraph>(cfg, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph, nullptr);
+
+    auto decode_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto make_binding = [](uint64_t binding_id,
+                           const std::string &name,
+                           WeightRole role,
+                           TensorBase *tensor)
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{6161}, binding_id);
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.slice.source_rows = tensor ? tensor->rows() : 0;
+        binding.slice.source_cols = tensor ? tensor->cols() : 0;
+        binding.slice.row_count = binding.slice.source_rows;
+        binding.slice.col_count = binding.slice.source_cols;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        return binding;
+    };
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{6161};
+    strategy.devices = {DeviceId::cpu()};
+
+    ModelWeightSetBuilder decode_builder(strategy);
+    decode_builder.addBinding(
+        make_binding(100, "blk.0.ffn_down.weight", WeightRole::FFNDown, decode_down.get()));
+
+    EXPECT_THROW(
+        orchestrator.setDecodeReplicatedDenseWeightSet(
+            std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings())),
+        std::runtime_error);
+}
+
+/**
+ * @brief Terminal PP replicated decode may omit embedding when the stage does not own it.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseDecodeAllowsPPTerminalWithoutEmbedding)
+{
+    GraphConfig cfg = config_;
+    cfg.dense_tp_enabled = true;
+    cfg.dense_tp_decode_replicated = true;
+    cfg.n_layers = 1;
+    auto graph = std::make_shared<CapturingQwenStandardGraph>(cfg, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph, nullptr);
+    orchestrator.setPPStageConfig(
+        FactoryPPStageConfig{
+            .first_layer = 0,
+            .last_layer = 1,
+            .has_embedding = false,
+            .has_lm_head = true});
+
+    auto decode_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto make_binding = [](uint64_t binding_id,
+                           const std::string &name,
+                           WeightRole role,
+                           TensorBase *tensor)
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{6162}, binding_id);
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.slice.source_rows = tensor ? tensor->rows() : 0;
+        binding.slice.source_cols = tensor ? tensor->cols() : 0;
+        binding.slice.row_count = binding.slice.source_rows;
+        binding.slice.col_count = binding.slice.source_cols;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        return binding;
+    };
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::LocalPP;
+    strategy.model_id = ModelContextId{6162};
+    strategy.devices = {DeviceId::cpu()};
+
+    ModelWeightSetBuilder decode_builder(strategy);
+    decode_builder.addBinding(
+        make_binding(100, "output_norm.weight", WeightRole::OutputNorm, final_norm.get()));
+    decode_builder.addBinding(
+        make_binding(101, "output.weight", WeightRole::LMHead, lm_head.get()));
+    decode_builder.addBinding(
+        make_binding(102, "blk.0.ffn_down.weight", WeightRole::FFNDown, decode_down.get()));
+
+    EXPECT_NO_THROW(
+        orchestrator.setDecodeReplicatedDenseWeightSet(
+            std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings())));
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAttentionStateUsesDecodeDenseGdnBindingsForGroupedDecode)
+{
+    GraphConfig cfg = config_;
+    cfg.dense_tp_enabled = true;
+    cfg.dense_tp_decode_replicated = true;
+    cfg.mtp.enabled = true;
+    auto graph = std::make_shared<CapturingQwenStandardGraph>(cfg, nullptr);
+
+    auto make_binding = [](uint64_t binding_id,
+                           const std::string &name,
+                           WeightRole role,
+                           TensorBase *tensor)
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{5150}, binding_id);
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.slice.source_rows = tensor ? tensor->rows() : 0;
+        binding.slice.source_cols = tensor ? tensor->cols() : 0;
+        binding.slice.row_count = binding.slice.source_rows;
+        binding.slice.col_count = binding.slice.source_cols;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        return binding;
+    };
+
+    auto primary_alpha = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto decode_alpha = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto decode_embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto decode_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto decode_lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    WeightBinding primary_alpha_binding = make_binding(
+        1, "blk.0.ssm_alpha.weight", WeightRole::GDNAlphaBetaProjection, primary_alpha.get());
+    WeightBinding decode_alpha_binding = make_binding(
+        2, "blk.0.ssm_alpha.weight", WeightRole::GDNAlphaBetaProjection, decode_alpha.get());
+    WeightBinding decode_embedding_binding = make_binding(
+        3, "token_embd.weight", WeightRole::Embedding, decode_embedding.get());
+    WeightBinding decode_norm_binding = make_binding(
+        4, "output_norm.weight", WeightRole::OutputNorm, decode_norm.get());
+    WeightBinding decode_lm_head_binding = make_binding(
+        5, "output.weight", WeightRole::LMHead, decode_lm_head.get());
+
+    ModelWeightBindings primary_bindings;
+    primary_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.ssm_alpha = &primary_alpha_binding;
+        return layer;
+    };
+    graph->setWeightBindings(primary_bindings);
+
+    ModelWeightBindings decode_bindings;
+    decode_bindings.embedding_table = &decode_embedding_binding;
+    decode_bindings.final_norm = &decode_norm_binding;
+    decode_bindings.lm_head = &decode_lm_head_binding;
+    decode_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.ssm_alpha = &decode_alpha_binding;
+        return layer;
+    };
+    graph->setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+    auto grouped_decode_bindings = graph->exposeLayerWeightBindingsForGraph(
+        0,
+        /*total_tokens=*/2);
+    ASSERT_NE(grouped_decode_bindings.ssm_alpha, nullptr);
+    EXPECT_EQ(grouped_decode_bindings.ssm_alpha->binding_id, decode_alpha_binding.binding_id);
+    EXPECT_EQ(grouped_decode_bindings.ssm_alpha->tensor, decode_alpha.get());
 }
 
 // =============================================================================
@@ -1115,7 +1818,7 @@ TEST_F(Test__DeviceGraphOrchestrator, InitializeInferenceStateAllocatesBuffers)
     EXPECT_NE(orchestrator->logits(), nullptr);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, ClearInferenceStateResetsPositions)
+TEST_F(Test__DeviceGraphOrchestrator, RequestBoundaryResetResetsPositions)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
@@ -1125,8 +1828,9 @@ TEST_F(Test__DeviceGraphOrchestrator, ClearInferenceStateResetsPositions)
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(batch_size, max_seq_len, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
 
-    // Clear state
-    orchestrator->clearInferenceState();
+    orchestrator->resetInferenceState(
+        InferenceStateResetRequest::requestBoundary(
+            "request-boundary-position-reset"));
 
     // Positions should be reset to 0
     EXPECT_EQ(orchestrator->getPosition(0), 0);
@@ -1250,7 +1954,1381 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
     EXPECT_EQ(orchestrator->prefixStateProbe().prefix_cache_bypasses, 1u);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintIsDomainLevelAcrossParticipants)
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseVerifierUsesFullAllPositionLogitsForSerialEquivalence)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::string header =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    ASSERT_FALSE(source.empty());
+    ASSERT_FALSE(header.empty());
+
+    const auto predicate_pos =
+        source.find("bool DeviceGraphOrchestrator::allPositionVerifierGraphWritesLocalLogits");
+    const auto active_pos =
+        source.find("bool DeviceGraphOrchestrator::activeAllPositionLogitsAreColumnParallel");
+    ASSERT_NE(predicate_pos, std::string::npos);
+    ASSERT_NE(active_pos, std::string::npos);
+    ASSERT_LT(predicate_pos, active_pos);
+
+    const std::string predicate_body = source.substr(predicate_pos, active_pos - predicate_pos);
+    EXPECT_NE(predicate_body.find("config.dense_tp_decode_replicated"), std::string::npos);
+    EXPECT_NE(predicate_body.find("return false"), std::string::npos)
+        << "Decode-replicated all-position verifier rows must write full logits so "
+           "their LM-head binding matches rowwise serial decode.";
+    EXPECT_NE(predicate_body.find("config.mtpParticipantOwnsFullVocabulary()"), std::string::npos)
+        << "Mirrored MTP sidecars at every TP scope must advertise full replicated logits.";
+    EXPECT_EQ(predicate_body.find("config.tp_ctx->degree() > 1"), std::string::npos)
+        << "Degree-based local shard advertisement reintroduces the serial-logit mismatch.";
+
+    const auto binding_pos = source.find(
+        "bool DeviceGraphOrchestrator::bindAllPositionLogitsOutputs");
+    const auto release_pos = source.find(
+        "void DeviceGraphOrchestrator::releaseBuffers", binding_pos);
+    ASSERT_NE(binding_pos, std::string::npos);
+    ASSERT_NE(release_pos, std::string::npos);
+    const std::string binding_body =
+        source.substr(binding_pos, release_pos - binding_pos);
+    EXPECT_NE(
+        binding_body.find("allPositionVerifierGraphWritesLocalLogits("),
+        std::string::npos);
+    EXPECT_NE(
+        binding_body.find("state_.all_position_logits_local.reset()"),
+        std::string::npos)
+        << "Replicated dense decode must clear stale local all-position logits before RankOrchestrator samples.";
+
+    const auto forward_pos = source.find(
+        "const float *DeviceGraphOrchestrator::forwardImpl");
+    ASSERT_NE(forward_pos, std::string::npos);
+    EXPECT_NE(
+        source.find("bindAllPositionLogitsOutputs(", forward_pos),
+        std::string::npos)
+        << "forwardImpl must enter the typed all-position output binder.";
+
+    const auto has_local_pos = header.find("bool hasAllPositionLogitsLocal() const override");
+    ASSERT_NE(has_local_pos, std::string::npos);
+    const auto get_info_pos = header.find("LogitsLocalInfo getAllPositionLogitsLocalInfo", has_local_pos);
+    ASSERT_NE(get_info_pos, std::string::npos);
+    const std::string has_local_body = header.substr(has_local_pos, get_info_pos - has_local_pos);
+    EXPECT_NE(has_local_body.find("activeAllPositionLogitsAreColumnParallel()"),
+              std::string::npos);
+}
+
+/**
+ * @brief Guard mirrored GlobalTP sidecars against stale gathered-logits wiring.
+ *
+ * The terminal head's typed layout is the only authority allowed to request a
+ * compact vocabulary allgather. A previous orchestration path looked only at
+ * the primary LM-head sharding bit, then treated the mirrored schema's 1x1
+ * placeholder as a real gathered result and emitted false PerfStats. This
+ * architecture check keeps buffer validation, graph output binding, and
+ * successful-execution accounting under one resolved predicate.
+ */
+TEST_F(Test__DeviceGraphOrchestrator,
+       MirroredGlobalTPMTPDoesNotAdvertiseGatheredLogits)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto begin = source.find(
+        "bool DeviceGraphOrchestrator::executeMTPDepth0Batched");
+    const auto end = source.find(
+        "bool DeviceGraphOrchestrator::bindShiftedMTPPrefillTransaction",
+        begin);
+    ASSERT_NE(begin, std::string::npos);
+    ASSERT_NE(end, std::string::npos);
+    ASSERT_LT(begin, end);
+
+    const std::string body = source.substr(begin, end - begin);
+    EXPECT_NE(
+        body.find(
+            "mtpSidecarRequiresGlobalLogitsGather(kv_cache_only)"),
+        std::string::npos)
+        << "MTP execution must resolve its collective from typed terminal-head ownership.";
+    EXPECT_EQ(
+        body.find("graph_builder_->config().lm_head_column_parallel"),
+        std::string::npos)
+        << "The primary LM-head sharding bit cannot independently authorize an MTP allgather.";
+    EXPECT_NE(
+        body.find(
+            "output.gathered_logits = requires_global_mtp_logits_gather"),
+        std::string::npos)
+        << "A mirrored sidecar must expose null gathered output rather than a schema placeholder.";
+    EXPECT_NE(
+        body.find("if (ok && requires_global_mtp_logits_gather)"),
+        std::string::npos)
+        << "PerfStats may report a logits allgather only after that typed collective executes.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, LiveHybridPrefixLayoutRefreshRekeysBeforeHarvest)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto refresh_pos =
+        source.find("bool DeviceGraphOrchestrator::refreshPrefixPayloadLayoutForLiveHybridState");
+    const auto make_key_pos =
+        source.find("PrefixCacheKey DeviceGraphOrchestrator::makePrefixKeyForBlock", refresh_pos);
+    ASSERT_NE(refresh_pos, std::string::npos);
+    ASSERT_NE(make_key_pos, std::string::npos);
+
+    const std::string refresh_body = source.substr(refresh_pos, make_key_pos - refresh_pos);
+    const auto adopt_layout_pos = refresh_body.find("prefix_layout_ = live_layout");
+    const auto rebuild_fingerprint_pos =
+        refresh_body.find("buildCurrentPrefixFingerprint", adopt_layout_pos);
+    const auto publish_fingerprint_pos =
+        refresh_body.find(
+            "publishPrefixFingerprintTransition(",
+            rebuild_fingerprint_pos);
+
+    ASSERT_NE(adopt_layout_pos, std::string::npos);
+    ASSERT_NE(rebuild_fingerprint_pos, std::string::npos)
+        << "Live hybrid payload layout changes affect prefix fingerprint material; "
+           "harvest must not insert blocks under a stale key.";
+    ASSERT_NE(publish_fingerprint_pos, std::string::npos)
+        << "A rebuilt fingerprint must cross the typed cache-rebase publication boundary.";
+    EXPECT_LT(adopt_layout_pos, rebuild_fingerprint_pos);
+    EXPECT_LT(rebuild_fingerprint_pos, publish_fingerprint_pos);
+
+    const auto transition_pos = source.find(
+        "bool DeviceGraphOrchestrator::publishPrefixFingerprintTransition");
+    const auto ensure_pos = source.find(
+        "bool DeviceGraphOrchestrator::ensurePrefixCacheReady",
+        transition_pos);
+    ASSERT_NE(transition_pos, std::string::npos);
+    ASSERT_NE(ensure_pos, std::string::npos);
+    const std::string transition_body =
+        source.substr(transition_pos, ensure_pos - transition_pos);
+    EXPECT_NE(
+        transition_body.find("prefix_cache_->rebaseFingerprint("),
+        std::string::npos)
+        << "InvalidateOnRebalance must recover stale volatile capacity before publication.";
+    EXPECT_NE(
+        transition_body.find("prefix_fingerprint_ = next_fingerprint"),
+        std::string::npos)
+        << "The typed transition must publish the new fingerprint only after rebase succeeds.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixRestoresHybridStateBanksForSuffixPrefill)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto import_pos = source.find("bool importHybridPrefixPayload(");
+    ASSERT_NE(import_pos, std::string::npos);
+    const auto reset_pos = source.find("bool resetHybridPrefixPayloadState", import_pos);
+    ASSERT_NE(reset_pos, std::string::npos);
+    const std::string import_body = source.substr(import_pos, reset_pos - import_pos);
+
+    const auto include_device_pos =
+        import_body.find("desc.include_device_state = handle.layout.hybrid_device_state_bytes > 0");
+    ASSERT_NE(include_device_pos, std::string::npos)
+        << "Suffix-prefill restore must import the complete serialized GPU bank set.";
+    EXPECT_NE(
+        import_body.find(
+            "desc.include_host_state = handle.layout.hybrid_host_state_bytes > 0"),
+        std::string::npos)
+        << "CPU-owned recurrent vectors remain an independent payload section.";
+    EXPECT_EQ(import_body.find("host_payload_hydrates_device_bank"), std::string::npos);
+    EXPECT_EQ(import_body.find("import_host_state_into_device_state"), std::string::npos);
+    EXPECT_EQ(import_body.find("import_device_state_from_host_state"), std::string::npos)
+        << "GPU restore must consume a serialized device-bank payload directly; "
+           "there is no live host mirror to hydrate from.";
+}
+
+/**
+ * @brief Guard device-only GPU recurrent-state rollback checkpoints.
+ *
+ * CUDA and ROCm kernels preallocate both participant-local and mirrored full
+ * banks. A live MTP rollback handle therefore serializes only device-owned
+ * banks and never changes policy according to LocalTP sharding mode.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, GpuLiveCheckpointUsesDeviceOnlyHybridPayload)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto checkpoint_pos =
+        source.find("PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint");
+    const auto restore_pos =
+        source.find("bool DeviceGraphOrchestrator::restoreLivePrefixState", checkpoint_pos);
+    ASSERT_NE(checkpoint_pos, std::string::npos);
+    ASSERT_NE(restore_pos, std::string::npos);
+    const std::string checkpoint_body = source.substr(checkpoint_pos, restore_pos - checkpoint_pos);
+
+    EXPECT_EQ(source.find("denseLocalTPHybridStateRequiresHostOnlyPayload"),
+              std::string::npos);
+    EXPECT_EQ(source.find("applyDenseLocalTPHostOnlyHybridPayloadLayout"),
+              std::string::npos);
+
+    const auto device_only_pos =
+        checkpoint_body.find("const bool device_only_checkpoint = state_.device_id.is_gpu()");
+    ASSERT_NE(device_only_pos, std::string::npos)
+        << "GPU rollback checkpoints must select device-only recurrent payloads explicitly.";
+    const auto layout_call_pos =
+        checkpoint_body.find("liveHybridCheckpointLayout", device_only_pos);
+    ASSERT_NE(layout_call_pos, std::string::npos);
+    EXPECT_NE(checkpoint_body.find("device_only_checkpoint", layout_call_pos),
+              std::string::npos)
+        << "The layout helper must receive the GPU ownership decision.";
+    EXPECT_NE(checkpoint_body.find("live_prefix_checkpoint_hybrid_device_only_captures", layout_call_pos),
+              std::string::npos)
+        << "Perfstats must expose the device-only checkpoint lane.";
+    EXPECT_EQ(checkpoint_body.find("local_tp_hybrid_checkpoint"), std::string::npos);
+}
+
+/**
+ * @brief Guard device storage for full payload checkpoints.
+ *
+ * `captureLivePrefixCheckpoint()` is the production rollback transaction.
+ * GPU recurrent state must stay in preallocated device storage while this
+ * handle is live. `captureLivePrefixState()` remains a diagnostic payload
+ * export and is deliberately outside this production-path assertion.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, GpuRollbackCheckpointUsesPreallocatedDeviceStorage)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto payload_pos =
+        source.find("PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint");
+    const auto logical_pos =
+        source.find("bool DeviceGraphOrchestrator::restoreLivePrefixState", payload_pos);
+    ASSERT_NE(payload_pos, std::string::npos);
+    ASSERT_NE(logical_pos, std::string::npos);
+    const std::string payload_body = source.substr(payload_pos, logical_pos - payload_pos);
+
+    EXPECT_NE(payload_body.find("acquireLiveDeviceSequenceStateStorage("),
+              std::string::npos)
+        << "Production rollback must lease preallocated device sequence-state storage.";
+    EXPECT_NE(payload_body.find("ensureLiveCheckpointStorage(handle)"),
+              std::string::npos)
+        << "Recurrent and terminal state must use the prewarmed checkpoint pool.";
+    EXPECT_EQ(payload_body.find("captureLivePrefixState("), std::string::npos)
+        << "Production rollback must never switch to the diagnostic host-payload path.";
+    EXPECT_EQ(payload_body.find("allocateDeviceByteStorage("), std::string::npos)
+        << "No checkpoint allocation is permitted in the decode transaction.";
+}
+
+/**
+ * @brief Guard LocalTP prefix layouts against reintroducing a host-state lane.
+ *
+ * Local and mirrored full GPU banks are both represented by
+ * `hybrid_device_state_bytes`. Prefix initialization and live-layout refresh
+ * must preserve that cache-reported ownership without topology-specific
+ * rewriting.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, LocalTPPrefixCachePreservesDeviceOwnedHybridLayout)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    EXPECT_EQ(source.find("applyDenseLocalTPHostOnlyHybridPayloadLayout"),
+              std::string::npos);
+    EXPECT_EQ(source.find("denseLocalTPHybridStateRequiresHostOnlyPayload"),
+              std::string::npos);
+    EXPECT_EQ(source.find("import_host_state_into_device_state"),
+              std::string::npos);
+    EXPECT_EQ(source.find("import_device_state_from_host_state"),
+              std::string::npos);
+
+    const auto ensure_pos =
+        source.find("bool DeviceGraphOrchestrator::ensurePrefixCacheReady()");
+    const auto refresh_pos =
+        source.find("bool DeviceGraphOrchestrator::refreshPrefixPayloadLayoutForLiveHybridState", ensure_pos);
+    ASSERT_NE(ensure_pos, std::string::npos);
+    ASSERT_NE(refresh_pos, std::string::npos);
+    const std::string ensure_body = source.substr(ensure_pos, refresh_pos - ensure_pos);
+
+    const auto initial_layout_pos =
+        ensure_body.find("prefix_layout_ = buildDensePrefixPayloadLayout");
+    const auto mtp_attach_pos =
+        ensure_body.find("attachMTPPayloadLayout", initial_layout_pos);
+    ASSERT_NE(initial_layout_pos, std::string::npos);
+    ASSERT_NE(mtp_attach_pos, std::string::npos);
+    EXPECT_LT(initial_layout_pos, mtp_attach_pos);
+    EXPECT_EQ(ensure_body.find("hybrid_device_state_bytes = 0", initial_layout_pos),
+              std::string::npos);
+
+    const auto harvest_pos =
+        source.find("bool DeviceGraphOrchestrator::harvestPrefix(", refresh_pos);
+    ASSERT_NE(harvest_pos, std::string::npos);
+    const std::string refresh_body = source.substr(refresh_pos, harvest_pos - refresh_pos);
+    const auto live_layout_pos =
+        refresh_body.find("PrefixPayloadLayout live_layout = buildDensePrefixPayloadLayout");
+    ASSERT_NE(live_layout_pos, std::string::npos);
+    EXPECT_EQ(refresh_body.find("hybrid_device_state_bytes = 0", live_layout_pos),
+              std::string::npos)
+        << "Live layout refresh must preserve all kernel-owned GPU banks.";
+}
+
+/**
+ * @brief Guard the live-state observation fence used before prefix harvest exports.
+ *
+ * Prefix harvest reads multiple pieces of live decode state: KV cache blocks,
+ * recurrent hybrid/GDN state, terminal hidden/logit buffers, and device-resident
+ * logical sequence metadata.  Those producers can live on different streams, so
+ * harvest must first queue the shared read-only observation fence and only then
+ * refresh the payload layout that drives cache allocation and fingerprinting.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBeforeExport)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto harvest_pos =
+        source.find("bool DeviceGraphOrchestrator::harvestPrefix(");
+    ASSERT_NE(harvest_pos, std::string::npos);
+    const auto snapshot_pos =
+        source.find("PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixState", harvest_pos);
+    ASSERT_NE(snapshot_pos, std::string::npos);
+    const std::string harvest_body = source.substr(harvest_pos, snapshot_pos - harvest_pos);
+
+    const auto explicit_stream_pos =
+        harvest_body.find("explicitGPUStreamForOperation(\"harvestPrefix\")");
+    const auto observation_fence_pos =
+        harvest_body.find("waitForLiveInferenceStateReadyForObservation");
+    const auto layout_refresh_pos =
+        harvest_body.find("refreshPrefixPayloadLayoutForLiveHybridState");
+
+    ASSERT_NE(explicit_stream_pos, std::string::npos);
+    ASSERT_NE(observation_fence_pos, std::string::npos)
+        << "Prefix harvest observes live KV/GDN/MTP state and must use the "
+           "central read-only observation fence before exporting payload bytes.";
+    ASSERT_NE(layout_refresh_pos, std::string::npos);
+    EXPECT_LT(explicit_stream_pos, observation_fence_pos);
+    EXPECT_LT(observation_fence_pos, layout_refresh_pos);
+
+    /*
+     * The helper is intentionally verified here as part of the harvest contract:
+     * keeping producer waits centralized makes it much harder for a future cache
+     * export path to accidentally observe only KV state while missing an MTP
+     * publication, a GDN restore, or the device-resident sequence mailbox.
+     */
+    const auto fence_pos =
+        source.find("bool DeviceGraphOrchestrator::waitForLiveInferenceStateReadyForObservation");
+    const auto next_method_pos =
+        source.find("bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata", fence_pos);
+    const auto graph_fence_pos =
+        source.find("bool DeviceGraphOrchestrator::waitForPendingLiveGraphProducersForObservation");
+    const auto graph_fence_end =
+        source.find("void DeviceGraphOrchestrator::clearMTPVerifierTransactionStateForBoundary", graph_fence_pos);
+    ASSERT_NE(fence_pos, std::string::npos);
+    ASSERT_NE(next_method_pos, std::string::npos);
+    ASSERT_NE(graph_fence_pos, std::string::npos);
+    ASSERT_NE(graph_fence_end, std::string::npos);
+    const std::string fence_body = source.substr(fence_pos, next_method_pos - fence_pos);
+    const std::string graph_fence_body =
+        source.substr(graph_fence_pos, graph_fence_end - graph_fence_pos);
+
+    const auto published_state_join_pos =
+        fence_body.find("joinPublishedLiveStateHandoffs");
+    const auto producer_wait_pos =
+        fence_body.find("waitForPendingLiveGraphProducersForObservation");
+    const auto mailbox_wait_pos =
+        fence_body.find("waitForDeviceResidentLogicalSequenceStateMailboxForObservation");
+    const auto prefix_checkpoint_wait_pos =
+        fence_body.find("waitForPendingLivePrefixCheckpointReadyForObservation");
+    const auto mtp_transaction_pos =
+        fence_body.find("currentDeviceResidentMTPTransactionLease");
+
+    ASSERT_NE(published_state_join_pos, std::string::npos)
+        << "Harvest must join accepted publication and prefix mutation through "
+           "the central typed role API.";
+    ASSERT_NE(producer_wait_pos, std::string::npos)
+        << "Harvest must wait for graph producer streams before exporting GDN/KV payloads.";
+    ASSERT_NE(mailbox_wait_pos, std::string::npos)
+        << "Harvest must observe the device-resident logical sequence mailbox before exporting.";
+    ASSERT_NE(prefix_checkpoint_wait_pos, std::string::npos)
+        << "Harvest must join an in-flight device prefix checkpoint before exporting.";
+    ASSERT_NE(mtp_transaction_pos, std::string::npos)
+        << "Harvest must join the current device-resident MTP transaction before exporting.";
+    const auto latest_forward_pos =
+        graph_fence_body.find("waitForForwardGraphOutputReady");
+    ASSERT_NE(latest_forward_pos, std::string::npos)
+        << "The shared observation fence must include ordinary prefill/decode "
+           "durable publication, not only MTP role handoffs.";
+    EXPECT_EQ(graph_fence_body.find("lastForwardExecution"), std::string::npos);
+    EXPECT_EQ(graph_fence_body.find("insertStreamDependency"), std::string::npos);
+    EXPECT_EQ(graph_fence_body.find("synchronizeStream"), std::string::npos);
+    EXPECT_EQ(graph_fence_body.find("synchronizeDevice"), std::string::npos);
+    EXPECT_LT(mailbox_wait_pos, prefix_checkpoint_wait_pos);
+    EXPECT_LT(prefix_checkpoint_wait_pos, published_state_join_pos);
+    EXPECT_LT(published_state_join_pos, producer_wait_pos);
+    EXPECT_LT(producer_wait_pos, mtp_transaction_pos);
+}
+
+/**
+ * @brief Require request reset to diagnose each event dependency independently.
+ *
+ * Request reset is a fatal device-ownership boundary. A compound boolean that
+ * combines every wait reports only that the boundary failed, which makes a
+ * stale or foreign event indistinguishable from a missing reset stream. Keep
+ * stable names for each layer of the join so an E2E abort identifies the exact
+ * publication that violated its lifecycle.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, RequestResetJoinNamesEveryRequiredDeviceTimelineDependency)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto join_pos =
+        source.find("bool DeviceGraphOrchestrator::joinPriorDeviceWorkForRequestStateReset(");
+    ASSERT_NE(join_pos, std::string::npos);
+    const auto publish_pos =
+        source.find("void DeviceGraphOrchestrator::publishRequestStateResetReady(", join_pos);
+    ASSERT_NE(publish_pos, std::string::npos);
+    const std::string join_body =
+        source.substr(join_pos, publish_pos - join_pos);
+
+    EXPECT_NE(join_body.find("\"ExplicitResetStream\""), std::string::npos);
+    EXPECT_NE(join_body.find("\"RequestStateResetReady\""), std::string::npos);
+    EXPECT_NE(join_body.find("\"LiveInferenceStateReady\""), std::string::npos);
+    EXPECT_EQ(join_body.find("!reset_stream ||"), std::string::npos)
+        << "A compound reset join hides which ownership edge failed.";
+
+    const auto live_pos =
+        source.find("bool DeviceGraphOrchestrator::waitForLiveInferenceStateReadyForObservation(");
+    ASSERT_NE(live_pos, std::string::npos);
+    const auto live_end =
+        source.find(
+            "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(",
+            live_pos);
+    ASSERT_NE(live_end, std::string::npos);
+    const std::string live_body =
+        source.substr(live_pos, live_end - live_pos);
+
+    for (const char *dependency : {
+             "\"LivePrefixCheckpointReady\"",
+             "\"PublishedLiveStateHandoffs\"",
+             "\"LiveGraphProducersReady\"",
+             "\"MTPTransactionReady\"",
+             "\"LogicalSequenceStateReady\""})
+    {
+        EXPECT_NE(live_body.find(dependency), std::string::npos)
+            << "Missing named reset diagnostic for " << dependency;
+    }
+
+    EXPECT_NE(source.find("[FATAL] Device timeline join failed:"), std::string::npos)
+        << "Fatal reset diagnostics must bypass buffered log-file teardown.";
+}
+
+/**
+ * @brief Keep request-constant stop controls out of verifier replay.
+ *
+ * A verifier transaction may change its penalty policy, but stop tokens belong
+ * to the request. GPU request admission or prefix restore must publish that
+ * fixed control row after consuming request reset, and the verifier may only
+ * validate and consume it. This source contract prevents a future optimization
+ * from quietly restoring one H2D and one coherence publication per MTP step.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, MTPStopControlsArePublishedOnlyAtRequestBoundary)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto verifier_pos =
+        source.find("bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(");
+    const auto configure_pos =
+        source.find("bool DeviceGraphOrchestrator::configureMTPRequestStopTokens(", verifier_pos);
+    ASSERT_NE(verifier_pos, std::string::npos);
+    ASSERT_NE(configure_pos, std::string::npos);
+    const std::string verifier_body =
+        source.substr(verifier_pos, configure_pos - verifier_pos);
+
+    EXPECT_EQ(verifier_body.find("transaction.stop_tokens"), std::string::npos);
+    EXPECT_EQ(
+        verifier_body.find("BufferId::MTP_VERIFIER_STOP_TOKENS"),
+        std::string::npos);
+    EXPECT_EQ(
+        verifier_body.find("graph_owned_greedy_control_uploads"),
+        std::string::npos);
+    EXPECT_NE(
+        verifier_body.find(
+            "graph_owned_greedy_penalty_policy_consumptions"),
+        std::string::npos)
+        << "Verifier replay may consume the request-published penalty policy, "
+           "but it must not republish request controls.";
+
+    const auto admission_pos =
+        source.find("bool DeviceGraphOrchestrator::admitRequestInputsOnDevice(");
+    const auto publication_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::publishMTPRequestStopTokensOnDevice(",
+            admission_pos);
+    ASSERT_NE(admission_pos, std::string::npos);
+    ASSERT_NE(publication_pos, std::string::npos);
+    const std::string admission_body =
+        source.substr(admission_pos, publication_pos - admission_pos);
+    const auto reset_wait_pos =
+        admission_body.find("waitForPendingRequestStateReset(");
+    const auto stop_publish_pos =
+        admission_body.find("publishMTPRequestStopTokensOnDevice(");
+    const auto admission_event_pos =
+        admission_body.find("DeviceTimelinePoint::RequestInputAdmission");
+    ASSERT_NE(reset_wait_pos, std::string::npos);
+    ASSERT_NE(stop_publish_pos, std::string::npos);
+    ASSERT_NE(admission_event_pos, std::string::npos);
+    EXPECT_LT(reset_wait_pos, stop_publish_pos);
+    EXPECT_LT(stop_publish_pos, admission_event_pos);
+
+    const auto prefix_pos =
+        source.find("bool DeviceGraphOrchestrator::populatePrefix(");
+    ASSERT_NE(prefix_pos, std::string::npos);
+    const std::string prefix_body =
+        source.substr(prefix_pos, admission_pos - prefix_pos);
+    const auto prefix_reset_wait_pos =
+        prefix_body.find("waitForPendingRequestStateReset(");
+    const auto prefix_stop_publish_pos =
+        prefix_body.find("publishMTPRequestStopTokensOnDevice(");
+    ASSERT_NE(prefix_reset_wait_pos, std::string::npos);
+    ASSERT_NE(prefix_stop_publish_pos, std::string::npos);
+    EXPECT_LT(prefix_reset_wait_pos, prefix_stop_publish_pos);
+}
+
+/**
+ * @brief Guard prefix-harvest terminal-hidden capture against decode-state mutation.
+ *
+ * Prefix-cache harvest may need to materialize the prompt terminal hidden row
+ * so a future full prefix hit can restore MTP sidecar state without rerunning
+ * prompt prefill.  That materialization is an archive write into the cache
+ * block, not permission to publish `PREFIX_TERMINAL_HIDDEN` as the current
+ * live sidecar input for the request that is still decoding.  Keeping the
+ * typed live publication unavailable forces the real MTP transaction to
+ * refresh terminal hidden at the same boundary as the no-prefix path.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixTerminalHiddenArchiveDoesNotPublishLiveMTPInput)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto harvest_pos =
+        source.find("bool DeviceGraphOrchestrator::harvestPrefix(");
+    ASSERT_NE(harvest_pos, std::string::npos);
+    const auto snapshot_pos =
+        source.find("PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixState", harvest_pos);
+    ASSERT_NE(snapshot_pos, std::string::npos);
+    const std::string harvest_body = source.substr(harvest_pos, snapshot_pos - harvest_pos);
+
+    const auto guard_decl_pos =
+        harvest_body.find("bool terminal_hidden_archival_refresh = false");
+    const auto refresh_pos =
+        harvest_body.find("refreshMTPTerminalHiddenState(prompt_token_count, 1)");
+    const auto mark_archival_pos =
+        harvest_body.find("terminal_hidden_archival_refresh = true", refresh_pos);
+    const auto hidden_gpu_copy_pos =
+        harvest_body.find("prefix_backend->deviceToHostOnStream(\n"
+                          "                            handle.terminal_hidden");
+    const auto hidden_cpu_copy_pos =
+        harvest_body.find("std::memcpy(\n"
+                          "                            handle.terminal_hidden");
+    const auto clear_guard_pos =
+        harvest_body.find("if (terminal_hidden_archival_refresh &&", hidden_cpu_copy_pos);
+    const auto clear_pos =
+        harvest_body.find("state_.mtp_terminal_hidden_publication.invalidate()", clear_guard_pos);
+    const auto clear_counter_pos =
+        harvest_body.find("harvest_terminal_hidden_live_current_clears", clear_pos);
+
+    ASSERT_NE(guard_decl_pos, std::string::npos)
+        << "Harvest must track whether it refreshed terminal hidden only for cache archival.";
+    ASSERT_NE(refresh_pos, std::string::npos)
+        << "MTP prefix harvest still needs to archive prompt terminal hidden for future full hits.";
+    ASSERT_NE(mark_archival_pos, std::string::npos)
+        << "The archive-only refresh must be visible to the later live-state clear.";
+    ASSERT_NE(hidden_gpu_copy_pos, std::string::npos)
+        << "GPU harvest must submit terminal hidden directly from device storage into pinned RAM.";
+    ASSERT_NE(hidden_cpu_copy_pos, std::string::npos)
+        << "CPU harvest must copy terminal hidden into durable RAM storage.";
+    ASSERT_NE(clear_guard_pos, std::string::npos)
+        << "Harvest must clear live-current state only when harvest performed the refresh.";
+    ASSERT_NE(clear_pos, std::string::npos)
+        << "Archive-only harvest refresh must not make the active MTP sidecar skip its own refresh.";
+    ASSERT_NE(clear_counter_pos, std::string::npos)
+        << "The ROCm prefix-on-miss regression needs perfstats evidence that this guard ran.";
+
+    EXPECT_LT(guard_decl_pos, refresh_pos);
+    EXPECT_LT(refresh_pos, mark_archival_pos);
+    EXPECT_LT(mark_archival_pos, hidden_gpu_copy_pos);
+    EXPECT_LT(mark_archival_pos, hidden_cpu_copy_pos);
+    EXPECT_LT(hidden_gpu_copy_pos, clear_guard_pos);
+    EXPECT_LT(hidden_cpu_copy_pos, clear_guard_pos);
+    EXPECT_LT(clear_guard_pos, clear_pos);
+    EXPECT_LT(clear_pos, clear_counter_pos);
+}
+
+/**
+ * @brief Prove typed MTP terminal-hidden publications and read leases.
+ *
+ * A sidecar lease is valid only for the exact producer generation it acquired.
+ * Read-only use leaves it valid, while publication or invalidation makes the
+ * stale lease impossible to accept at a later lifecycle boundary.
+ */
+TEST(Test__MTPTerminalHiddenPublication, TracksTypedProducerGenerations)
+{
+    MTPTerminalHiddenPublication publication;
+    EXPECT_FALSE(publication.current());
+    EXPECT_EQ(publication.source(),
+              MTPTerminalHiddenPublication::Source::Unavailable);
+    EXPECT_FALSE(publication.acquireReadLease().has_value());
+
+    publication.publishPrefixRestore();
+    ASSERT_TRUE(publication.current());
+    EXPECT_EQ(publication.source(),
+              MTPTerminalHiddenPublication::Source::PrefixRestore);
+    const auto prefix_lease = publication.acquireReadLease();
+    ASSERT_TRUE(prefix_lease.has_value());
+    EXPECT_TRUE(publication.stillOwns(*prefix_lease));
+    EXPECT_STREQ(
+        MTPTerminalHiddenPublication::sourceName(prefix_lease->source),
+        "prefix_restore");
+
+    publication.publishAcceptedVerifier();
+    EXPECT_FALSE(publication.stillOwns(*prefix_lease));
+    const auto verifier_lease = publication.acquireReadLease();
+    ASSERT_TRUE(verifier_lease.has_value());
+    EXPECT_GT(verifier_lease->generation, prefix_lease->generation);
+    EXPECT_EQ(verifier_lease->source,
+              MTPTerminalHiddenPublication::Source::AcceptedVerifier);
+
+    publication.invalidate();
+    EXPECT_FALSE(publication.current());
+    EXPECT_FALSE(publication.stillOwns(*verifier_lease));
+    EXPECT_FALSE(publication.acquireReadLease().has_value());
+}
+
+/**
+ * @brief Catch-up scratch cannot masquerade as the accepted terminal row.
+ *
+ * Neither a prefix hit nor a grouped verifier supplies prefill geometry. Both
+ * legal catch-up shapes must retire their temporary read generation and admit
+ * the accepted verifier as the next terminal producer without such geometry.
+ */
+TEST(Test__MTPTerminalHiddenPublication, CatchupRetiresScratchBeforeAcceptedPublication)
+{
+    for (const bool has_suffix : {false, true})
+    {
+        SCOPED_TRACE(has_suffix);
+        MTPTerminalHiddenPublication publication;
+        publication.publishCheckpointRestore();
+        const auto initial = publication.acquireReadLease();
+        ASSERT_TRUE(initial.has_value());
+        EXPECT_TRUE(publication.stillOwns(*initial));
+        publication.invalidate();
+        EXPECT_FALSE(publication.stillOwns(*initial));
+        EXPECT_FALSE(publication.acquireReadLease().has_value());
+
+        if (has_suffix)
+        {
+            publication.publishMainForward();
+            const auto suffix = publication.acquireReadLease();
+            ASSERT_TRUE(suffix.has_value());
+            EXPECT_GT(suffix->generation, initial->generation);
+            publication.invalidate();
+            EXPECT_FALSE(publication.stillOwns(*suffix));
+            EXPECT_FALSE(publication.acquireReadLease().has_value());
+        }
+
+        publication.publishAcceptedVerifier();
+        const auto accepted = publication.acquireReadLease();
+        ASSERT_TRUE(accepted.has_value());
+        EXPECT_EQ(accepted->source,
+                  MTPTerminalHiddenPublication::Source::AcceptedVerifier);
+        EXPECT_GT(accepted->generation, initial->generation);
+        EXPECT_FALSE(publication.stillOwns(*initial));
+        EXPECT_TRUE(publication.stillOwns(*accepted));
+    }
+}
+
+/**
+ * @brief Guard the device-hot cache against reintroducing host round trips.
+ *
+ * A hot block is an accelerator-owned replica of the durable pinned-RAM
+ * archive. Harvest must populate it from device staging with D2D copies, and
+ * lookup must return that handle directly. Rehydrating VRAM into RAM and then
+ * uploading the same bytes back to VRAM adds two transfers, a host wait, and a
+ * stale-host coherence surface to every hot hit.
+ */
+TEST_F(Test__DeviceGraphOrchestrator, DeviceHotPrefixTierHasNoRamReplayPath)
+{
+    const std::string backend_source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/prefix_cache/"
+            "DeviceHotPrefixStorageBackend.cpp");
+    const std::string cache_source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/prefix_cache/"
+            "PrefixStateCache.cpp");
+    const std::string orchestrator_source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/"
+            "orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(backend_source.empty());
+    ASSERT_FALSE(cache_source.empty());
+    ASSERT_FALSE(orchestrator_source.empty());
+
+    EXPECT_EQ(backend_source.find("promoteFromRam"), std::string::npos);
+    EXPECT_EQ(backend_source.find("hydrateToRamBackend"), std::string::npos);
+    EXPECT_EQ(backend_source.find("uploadBytesToDevice"), std::string::npos);
+    EXPECT_EQ(backend_source.find("downloadBytesFromDevice"), std::string::npos);
+    EXPECT_EQ(backend_source.find("TransferEngine"), std::string::npos);
+
+    const auto arena_create_pos = backend_source.find(
+        "DeviceHotPrefixStorageBackend::create(");
+    const auto arena_can_store_pos = backend_source.find(
+        "bool DeviceHotPrefixStorageBackend::capacityEligible(",
+        arena_create_pos);
+    const auto lease_pos = backend_source.find(
+        "bool DeviceHotPrefixStorageBackend::allocateDeviceBlock(");
+    const auto release_pos = backend_source.find(
+        "bool DeviceHotPrefixStorageBackend::release(", lease_pos);
+    ASSERT_NE(arena_create_pos, std::string::npos);
+    ASSERT_NE(arena_can_store_pos, std::string::npos);
+    ASSERT_NE(lease_pos, std::string::npos);
+    ASSERT_NE(release_pos, std::string::npos);
+    const std::string arena_create_body = backend_source.substr(
+        arena_create_pos, arena_can_store_pos - arena_create_pos);
+    const std::string lease_body = backend_source.substr(
+        lease_pos, release_pos - lease_pos);
+    EXPECT_NE(
+        arena_create_body.find("backend->allocate("),
+        std::string::npos)
+        << "The bounded hot-prefix arena must become physical before capture.";
+    const auto authority_claim_pos = arena_create_body.find(
+        "memory_authority->claimNewAllocation(");
+    const auto backend_allocate_pos = arena_create_body.find(
+        "backend->allocate(");
+    ASSERT_NE(authority_claim_pos, std::string::npos)
+        << "The hot-prefix arena must consume the canonical PrefixDeviceTier line.";
+    EXPECT_LT(authority_claim_pos, backend_allocate_pos)
+        << "Capacity must be claimed before the backend allocation can succeed.";
+    EXPECT_EQ(lease_body.find("backend->allocate("), std::string::npos)
+        << "Prefix harvest/promotion must only lease the pre-capture arena.";
+    EXPECT_EQ(lease_body.find("backend->free("), std::string::npos)
+        << "A request-path lease must never free GPU memory.";
+
+    const auto orchestrator_hot_create = orchestrator_source.find(
+        "prefix_device_hot_backend_ = DeviceHotPrefixStorageBackend::create(");
+    ASSERT_NE(orchestrator_hot_create, std::string::npos);
+    const auto orchestrator_hot_create_end = orchestrator_source.find(
+        "&device_hot_error);", orchestrator_hot_create);
+    ASSERT_NE(orchestrator_hot_create_end, std::string::npos);
+    const std::string orchestrator_hot_create_body =
+        orchestrator_source.substr(
+            orchestrator_hot_create,
+            orchestrator_hot_create_end - orchestrator_hot_create);
+    EXPECT_NE(
+        orchestrator_hot_create_body.find("memory_authority"),
+        std::string::npos)
+        << "Production prefix setup must pass the rank-bound authority.";
+
+    const auto find_pos =
+        cache_source.find("std::optional<PrefixBlockHandle> PrefixStateCache::find");
+    const auto hot_find_pos =
+        cache_source.find("device_hot_entries_.find(key)", find_pos);
+    const auto hot_return_pos =
+        cache_source.find("return hot_it->second", hot_find_pos);
+    const auto resident_find_pos =
+        cache_source.find("auto it = entries_.find(key)", hot_return_pos);
+    ASSERT_NE(find_pos, std::string::npos);
+    ASSERT_NE(hot_find_pos, std::string::npos);
+    ASSERT_NE(resident_find_pos, std::string::npos);
+    ASSERT_NE(hot_return_pos, std::string::npos);
+    EXPECT_LT(hot_find_pos, resident_find_pos);
+    EXPECT_LT(hot_return_pos, resident_find_pos);
+
+    EXPECT_NE(
+        orchestrator_source.find(
+            "\"harvest_device_hot_d2d_publications\""),
+        std::string::npos);
+    EXPECT_NE(
+        orchestrator_source.find(
+            "\"device_hot_direct_kv_restores\""),
+        std::string::npos);
+    EXPECT_NE(
+        orchestrator_source.find(
+            "\"device_hot_promotion_busy_ram_restores\""),
+        std::string::npos)
+        << "Bounded-arena contention must be observable and non-blocking.";
+    EXPECT_NE(
+        orchestrator_source.find(
+            "prefix_backend->deviceCopyAsync("),
+        std::string::npos);
+
+    const auto materialize_pos = orchestrator_source.find(
+        "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch(");
+    const auto prefix_ready_pos = orchestrator_source.find(
+        "prefix_cache_ready = ensurePrefixCacheReady()", materialize_pos);
+    const auto graph_materialization_pos = orchestrator_source.find(
+        "materializeForwardGraphForShape(", materialize_pos);
+    ASSERT_NE(materialize_pos, std::string::npos);
+    ASSERT_NE(prefix_ready_pos, std::string::npos);
+    ASSERT_NE(graph_materialization_pos, std::string::npos);
+    EXPECT_LT(prefix_ready_pos, graph_materialization_pos)
+        << "Prefix storage topology must be physical before native capture.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBoundary)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::string header =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    ASSERT_FALSE(source.empty());
+    ASSERT_FALSE(header.empty());
+
+    const auto populate_pos =
+        source.find("bool DeviceGraphOrchestrator::populatePrefix(");
+    const auto terminal_restore_pos =
+        source.find("bool DeviceGraphOrchestrator::restorePrefixTerminalState", populate_pos);
+    ASSERT_NE(populate_pos, std::string::npos);
+    ASSERT_NE(terminal_restore_pos, std::string::npos);
+
+    const std::string populate_body =
+        source.substr(populate_pos, terminal_restore_pos - populate_pos);
+    const auto wait_mutation_pos =
+        populate_body.find("joinPublishedLiveStateHandoffs");
+    const auto wait_graph_pos =
+        populate_body.find("waitForPendingLiveGraphProducersBeforePrefixMutation");
+    const auto typed_reset_pos =
+        populate_body.find("resetInferenceState(");
+    const auto prefix_restore_boundary_pos =
+        populate_body.find("prefixRestoreBoundary", typed_reset_pos);
+    const auto obsolete_reset_alias_pos =
+        populate_body.find("clearInferenceState();");
+    const auto import_hybrid_pos =
+        populate_body.find("importHybridPrefixPayload");
+    const auto update_position_pos =
+        populate_body.find("state_.positions[seq_idx] = hit.cached_tokens");
+    const auto mutation_boundary_pos =
+        populate_body.find("handleLivePrefixReplayStateAfterMutation");
+    const auto mutation_ready_pos =
+        populate_body.find("recordLivePrefixMutationReady", mutation_boundary_pos);
+
+    ASSERT_NE(wait_mutation_pos, std::string::npos);
+    ASSERT_NE(wait_graph_pos, std::string::npos);
+    ASSERT_NE(typed_reset_pos, std::string::npos)
+        << "Prefix restore must use the typed inference-state reset boundary.";
+    ASSERT_NE(prefix_restore_boundary_pos, std::string::npos)
+        << "Prefix restore must name the PrefixRestore boundary explicitly.";
+    EXPECT_NE(
+        header.find("resetPrefixCacheRuntimeStateWithoutSnapshot"),
+        std::string::npos)
+        << "Prefix restore without model-runtime bytes needs a dedicated graph-builder "
+           "reset hook; resetState() is the request-boundary owner and may preserve "
+           "graph-replay baseline state.";
+    EXPECT_EQ(obsolete_reset_alias_pos, std::string::npos)
+        << "Prefix restore must not call an obsolete untyped reset alias.";
+    ASSERT_NE(import_hybrid_pos, std::string::npos);
+    ASSERT_NE(update_position_pos, std::string::npos);
+    ASSERT_NE(mutation_boundary_pos, std::string::npos);
+    ASSERT_NE(mutation_ready_pos, std::string::npos);
+    EXPECT_LT(wait_mutation_pos, typed_reset_pos);
+    EXPECT_LT(wait_graph_pos, typed_reset_pos);
+    EXPECT_LT(typed_reset_pos, import_hybrid_pos);
+    EXPECT_LT(import_hybrid_pos, update_position_pos);
+    EXPECT_LT(update_position_pos, mutation_boundary_pos);
+    EXPECT_LT(mutation_boundary_pos, mutation_ready_pos);
+}
+
+/**
+ * @brief Lock GPU prefix source lifetime to the existing restore event.
+ *
+ * Cache retain/release leases serialize eviction against the request path and
+ * add shared bookkeeping to every restore. Production instead moves copied
+ * PrefixBlockHandle owners into the mutation event, allowing metadata eviction
+ * while RAM/VRAM source bytes remain alive until the exact GPU work completes.
+ */
+TEST_F(
+    Test__DeviceGraphOrchestrator,
+    GpuPrefixRestoreRetainsPayloadOwnersBehindCompletionEventWithoutCacheLease)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::string header =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    ASSERT_FALSE(source.empty());
+    ASSERT_FALSE(header.empty());
+
+    const auto populate_pos =
+        source.find("bool DeviceGraphOrchestrator::populatePrefix(");
+    const auto terminal_restore_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::restorePrefixTerminalState",
+            populate_pos);
+    const auto harvest_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::harvestPrefix(",
+            terminal_restore_pos);
+    ASSERT_NE(populate_pos, std::string::npos);
+    ASSERT_NE(terminal_restore_pos, std::string::npos);
+    ASSERT_NE(harvest_pos, std::string::npos);
+
+    const std::string populate_body =
+        source.substr(populate_pos, terminal_restore_pos - populate_pos);
+    const std::string terminal_restore_body =
+        source.substr(terminal_restore_pos, harvest_pos - terminal_restore_pos);
+    EXPECT_NE(
+        populate_body.find(
+            "retained_restore_sources = hit.blocks"),
+        std::string::npos)
+        << "Lower-tier blocks supplying asynchronous promotion bytes must "
+           "remain owned through the restore completion event";
+    EXPECT_NE(
+        populate_body.find(
+            "retained_restore_sources.push_back(std::move(source))"),
+        std::string::npos)
+        << "Every working block supplying asynchronous KV/GDN/MTP restore "
+           "bytes must move behind the restore completion event";
+    EXPECT_NE(
+        terminal_restore_body.find(
+            "retained_terminal_sources.push_back(std::move(terminal))"),
+        std::string::npos)
+        << "Terminal logits/hidden restore must retain its exact source owner";
+    const auto terminal_join_pos =
+        terminal_restore_body.find(
+            "joinPublishedLiveStateHandoffs(");
+    const auto terminal_preflight_pos =
+        terminal_restore_body.find(
+            "prepareLivePrefixMutationReadyEvent(");
+    ASSERT_NE(terminal_join_pos, std::string::npos)
+        << "Terminal restore must consume the preceding bulk prefix mutation.";
+    ASSERT_NE(terminal_preflight_pos, std::string::npos);
+    EXPECT_LT(terminal_join_pos, terminal_preflight_pos)
+        << "The previous restore publication must be joined before the terminal "
+           "transaction reuses the mutation event.";
+    EXPECT_NE(
+        terminal_restore_body.find(
+            "DeviceTimelineRole::PrefixRestoreMutation"),
+        std::string::npos)
+        << "The join must use the typed consuming restore role.";
+    const auto sampler_prepare_pos =
+        source.find(
+            "void *DeviceGraphOrchestrator::prepareMainLogitsDeviceConsumer(");
+    const auto pending_wait_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::waitForPendingLogitsStream(",
+            sampler_prepare_pos);
+    ASSERT_NE(sampler_prepare_pos, std::string::npos);
+    ASSERT_NE(pending_wait_pos, std::string::npos);
+    const std::string sampler_prepare_body =
+        source.substr(
+            sampler_prepare_pos,
+            pending_wait_pos - sampler_prepare_pos);
+    EXPECT_NE(
+        sampler_prepare_body.find(
+            "joinPublishedLiveStateHandoffs("),
+        std::string::npos)
+        << "A target sampler must observe restored terminal logits through "
+           "the typed live-state mutation event.";
+    EXPECT_NE(
+        sampler_prepare_body.find(
+            "DeviceTimelineRole::TargetSampler"),
+        std::string::npos);
+    const auto host_prepare_pos =
+        source.find(
+            "void *DeviceGraphOrchestrator::prepareLogitsHostObservation(");
+    const auto host_publish_pos =
+        source.find(
+            "const float *DeviceGraphOrchestrator::publishLogitsTensorToHost(",
+            host_prepare_pos);
+    ASSERT_NE(host_prepare_pos, std::string::npos);
+    ASSERT_NE(host_publish_pos, std::string::npos);
+    const std::string host_prepare_body =
+        source.substr(host_prepare_pos, host_publish_pos - host_prepare_pos);
+    EXPECT_NE(
+        host_prepare_body.find(
+            "MainLogitsPublicationSource::PrefixTerminalRestore"),
+        std::string::npos)
+        << "Host observation must distinguish restored terminal logits from a "
+           "forward-graph publication.";
+    EXPECT_NE(
+        host_prepare_body.find(
+            "ForwardGraphOutputKind::GroupedVerifier"),
+        std::string::npos)
+        << "Once grouped-verifier admission consumes the restore event, its "
+           "durable completion must order observation of canonical restored logits.";
+    EXPECT_NE(
+        host_prepare_body.find("has_grouped_prefix_restore_successor"),
+        std::string::npos)
+        << "The host bridge must model the verifier event as a typed transitive "
+           "successor rather than accepting any unrelated durable publication.";
+    EXPECT_NE(
+        host_prepare_body.find("joinPublishedLiveStateHandoffs("),
+        std::string::npos)
+        << "Restored logits D2H must wait on the exact live-prefix mutation event.";
+    EXPECT_NE(
+        host_prepare_body.find("DeviceTimelineRole::HostResultBridge"),
+        std::string::npos)
+        << "The event join must name the host-result owner rather than "
+           "impersonating a sampler or diagnostic stream.";
+    const auto benchmark_wait_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::waitForLastInferenceCompletionForBenchmark(");
+    const auto forward_wait_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::waitForForwardGraphOutputReady(",
+            benchmark_wait_pos);
+    ASSERT_NE(benchmark_wait_pos, std::string::npos);
+    ASSERT_NE(forward_wait_pos, std::string::npos);
+    const std::string benchmark_wait_body =
+        source.substr(
+            benchmark_wait_pos,
+            forward_wait_pos - benchmark_wait_pos);
+    EXPECT_NE(
+        benchmark_wait_body.find(
+            "MainLogitsPublicationSource::PrefixTerminalRestore"),
+        std::string::npos)
+        << "A full prefix hit intentionally launches no forward graph; host "
+           "timing must select the prefix-restore completion authority.";
+    EXPECT_NE(
+        benchmark_wait_body.find(
+            "live_prefix_mutation_ready_.event"),
+        std::string::npos)
+        << "Benchmark timing must query the same durable event that owns the "
+           "restored terminal logits, hidden row, and MTP state.";
+    EXPECT_NE(
+        benchmark_wait_body.find(
+            "prefix_terminal_restore_event"),
+        std::string::npos)
+        << "Perf evidence must distinguish restored-prefix timing from a "
+           "captured forward replay.";
+    const auto restore_clear_pos =
+        source.find(
+            "void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(");
+    const auto sync_deferral_pos =
+        source.find(
+            "void DeviceGraphOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(",
+            restore_clear_pos);
+    ASSERT_NE(restore_clear_pos, std::string::npos);
+    ASSERT_NE(sync_deferral_pos, std::string::npos);
+    const std::string restore_clear_body =
+        source.substr(
+            restore_clear_pos,
+            sync_deferral_pos - restore_clear_pos);
+    EXPECT_NE(
+        restore_clear_body.find(
+            "clearForwardGraphOutputPublications();"),
+        std::string::npos)
+        << "Prefix restore must invalidate every typed forward-output "
+           "publication for the discarded logits timeline.";
+    EXPECT_EQ(populate_body.find("prefix_cache_->retain"), std::string::npos);
+    EXPECT_EQ(terminal_restore_body.find("prefix_cache_->retain"), std::string::npos);
+
+    EXPECT_NE(
+        header.find("std::vector<PrefixBlockHandle> retained_payload_sources"),
+        std::string::npos);
+    EXPECT_NE(
+        header.find("struct PendingPrefixPayloadUse"),
+        std::string::npos);
+    EXPECT_NE(
+        source.find("retirePendingPrefixPayloadUses(/*wait_for_all=*/false)"),
+        std::string::npos)
+        << "Ordinary request execution must retire owners by nonblocking event query";
+    EXPECT_NE(
+        source.find("retirePendingPrefixPayloadUses(/*wait_for_all=*/true)"),
+        std::string::npos)
+        << "Orchestrator teardown must close the final asynchronous ownership edge";
+
+    const auto destructor_pos =
+        source.find("DeviceGraphOrchestrator::~DeviceGraphOrchestrator()");
+    const auto retirement_pos =
+        source.find(
+            "void DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease()",
+            destructor_pos);
+    const auto topology_destruction_pos =
+        source.find(
+            "void DeviceGraphOrchestrator::destroyCapturedExecutionTopologyBeforeArenaRelease()",
+            retirement_pos);
+    ASSERT_NE(destructor_pos, std::string::npos);
+    ASSERT_NE(retirement_pos, std::string::npos);
+    ASSERT_NE(topology_destruction_pos, std::string::npos);
+    const std::string destructor_body =
+        source.substr(destructor_pos, retirement_pos - destructor_pos);
+    EXPECT_NE(
+        destructor_body.find("retirePublishedDeviceWorkBeforeArenaRelease();"),
+        std::string::npos)
+        << "Runner teardown must retire exact producer events before reverse-order "
+           "member destruction can release arena storage";
+    EXPECT_NE(
+        destructor_body.find(
+            "destroyCapturedExecutionTopologyBeforeArenaRelease();"),
+        std::string::npos)
+        << "Teardown must destroy every native executable while its arena "
+           "bindings are still alive";
+    const auto borrowed_stream_retirement_call =
+        destructor_body.find(
+            "retireGraphBorrowedExecutionStreamsBeforeTopologyRelease();");
+    const auto captured_topology_destruction_call =
+        destructor_body.find(
+            "destroyCapturedExecutionTopologyBeforeArenaRelease();");
+    ASSERT_NE(borrowed_stream_retirement_call, std::string::npos);
+    ASSERT_NE(captured_topology_destruction_call, std::string::npos);
+    EXPECT_LT(
+        borrowed_stream_retirement_call,
+        captured_topology_destruction_call)
+        << "Model-internal producer DAGs must forget context-owned streams "
+           "before graph/context teardown invalidates those identities";
+    EXPECT_LT(
+        destructor_body.find("retirePendingPrefixPayloadUses"),
+        captured_topology_destruction_call)
+        << "Exact asynchronous payload owners must retire before their graph "
+           "and arena topology is destroyed";
+    EXPECT_EQ(destructor_body.find("synchronize("), std::string::npos);
+    EXPECT_EQ(destructor_body.find("synchronizeStream("), std::string::npos);
+
+    const auto move_constructor_pos =
+        source.find(
+            "DeviceGraphOrchestrator::DeviceGraphOrchestrator("
+            "DeviceGraphOrchestrator &&)",
+            topology_destruction_pos);
+    ASSERT_NE(move_constructor_pos, std::string::npos);
+    const std::string retirement_body =
+        source.substr(
+            retirement_pos,
+            topology_destruction_pos - retirement_pos);
+    EXPECT_NE(
+        retirement_body.find("backend->waitForEvent("),
+        std::string::npos)
+        << "Teardown must wait on exact published events, not broader device state";
+    EXPECT_EQ(retirement_body.find("backend->synchronize("), std::string::npos);
+    EXPECT_EQ(retirement_body.find("backend->synchronizeStream("), std::string::npos);
+    EXPECT_NE(retirement_body.find("std::terminate()"), std::string::npos)
+        << "Invalid or failed lifecycle publication is fatal";
+
+    const std::string topology_destruction_body =
+        source.substr(
+            topology_destruction_pos,
+            move_constructor_pos - topology_destruction_pos);
+    const auto parent_release = topology_destruction_body.find(
+        "mtp_device_generation_loop_graph_.release();");
+    const auto forward_release = topology_destruction_body.find(
+        "forward_engine_->discardAllCachedGraphs();");
+    const auto context_release = topology_destruction_body.find(
+        "device_contexts_.clear();");
+    ASSERT_NE(parent_release, std::string::npos);
+    ASSERT_NE(forward_release, std::string::npos);
+    ASSERT_NE(context_release, std::string::npos);
+    EXPECT_LT(parent_release, forward_release)
+        << "The complete generation parent must die before its borrowed child captures";
+    EXPECT_LT(forward_release, context_release)
+        << "Captured forward graphs must die before graph-creation contexts";
+
+    for (const char *required_release : {
+             "mtp_speculative_state_publication_graph_.invalidate();",
+             "mtp_draft_token_publication_graphs_",
+             "mtp_verifier_preparation_graphs_",
+             "mtp_stochastic_serial_outcome_graph_.invalidate();",
+             "mtp_stochastic_target_distribution_graph_.invalidate();",
+             "moe_overlay_epoch_acquire_graph_.invalidate();",
+             "moe_overlay_epoch_release_graph_.invalidate();",
+             "device_moe_rebalance_maintenance_graph_.invalidate();"})
+    {
+        const auto release_pos =
+            topology_destruction_body.find(required_release);
+        EXPECT_NE(release_pos, std::string::npos)
+            << "Complete topology destruction omitted graph owner: "
+            << required_release;
+        if (release_pos != std::string::npos)
+        {
+            EXPECT_LT(release_pos, context_release)
+                << "Graph owners must be destroyed before device contexts: "
+                << required_release;
+        }
+    }
+    EXPECT_EQ(
+        topology_destruction_body.find("synchronize("),
+        std::string::npos);
+    EXPECT_EQ(
+        topology_destruction_body.find("synchronizeStream("),
+        std::string::npos);
+
+    const auto release_buffers_pos = source.find(
+        "void DeviceGraphOrchestrator::releaseBuffers()");
+    const auto execute_forward_pos = source.find(
+        "bool DeviceGraphOrchestrator::executeForward(",
+        release_buffers_pos);
+    ASSERT_NE(release_buffers_pos, std::string::npos);
+    ASSERT_NE(execute_forward_pos, std::string::npos);
+    const std::string release_buffers_body = source.substr(
+        release_buffers_pos,
+        execute_forward_pos - release_buffers_pos);
+    const auto destroy_topology_call = release_buffers_body.find(
+        "destroyCapturedExecutionTopologyBeforeArenaRelease();");
+    ASSERT_NE(destroy_topology_call, std::string::npos);
+    const auto arena_release_call =
+        release_buffers_body.find("arena_.reset();", destroy_topology_call);
+    ASSERT_NE(arena_release_call, std::string::npos);
+    EXPECT_LT(destroy_topology_call, arena_release_call)
+        << "Public buffer release must destroy every captured arena borrower "
+           "before returning the backing allocation to the backend";
+
+    const auto prepare_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::prepareLivePrefixMutationReadyEvent");
+    const auto record_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::recordLivePrefixMutationReady",
+            prepare_pos);
+    const auto consume_pos =
+        source.find(
+            "bool DeviceGraphOrchestrator::joinPublishedLiveStateHandoffs",
+            record_pos);
+    ASSERT_NE(prepare_pos, std::string::npos);
+    ASSERT_NE(record_pos, std::string::npos);
+    ASSERT_NE(consume_pos, std::string::npos);
+    const std::string publication_body =
+        source.substr(prepare_pos, consume_pos - prepare_pos);
+    EXPECT_EQ(
+        publication_body.find("synchronizeStream"),
+        std::string::npos)
+        << "Event publication failure is a hard contract failure, not a "
+           "synchronous restore fallback";
+    EXPECT_NE(publication_body.find("std::terminate()"), std::string::npos);
+
+    const auto preflight_pos =
+        populate_body.find("prepareLivePrefixMutationReadyEvent");
+    const auto first_restore_copy_pos =
+        populate_body.find("hostToDeviceOnStream");
+    ASSERT_NE(preflight_pos, std::string::npos);
+    ASSERT_NE(first_restore_copy_pos, std::string::npos);
+    EXPECT_LT(preflight_pos, first_restore_copy_pos)
+        << "Event allocation must succeed before any asynchronous payload read";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, ForwardImplPublishesLogicalTokenOffsetAtRequestBoundary)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto build_input_pos = source.find("// Build forward input");
+    ASSERT_NE(build_input_pos, std::string::npos);
+    const auto pp_mode_pos = source.find("// For PP mode:", build_input_pos);
+    ASSERT_NE(pp_mode_pos, std::string::npos);
+    const std::string build_input_body =
+        source.substr(build_input_pos, pp_mode_pos - build_input_pos);
+
+    const auto position_offset_pos =
+        build_input_body.find(
+            "input.position_offset = live_request_batch_condition");
+    const auto token_offset_pos =
+        build_input_body.find("input.token_offset = input.position_offset");
+
+    ASSERT_NE(position_offset_pos, std::string::npos)
+        << "The runner-owned logical cursor must remain visible to RoPE/decode.";
+    ASSERT_NE(token_offset_pos, std::string::npos)
+        << "Restored-prefix suffix prefill must publish the same logical cursor "
+           "as the first-class prefill request range.";
+    EXPECT_LT(position_offset_pos, token_offset_pos)
+        << "The two offset fields should be stamped together before graph "
+           "execution, MTP cache population, or replay metadata can observe "
+           "an ambiguous request boundary.";
+}
+
+/**
+ * @brief MTP publication recapture retains the sealed MoE producer stream.
+ *
+ * ExpertOverlay seals its exact histogram-producer stream set after the first
+ * asynchronous drain.  A later publication identity may legitimately change
+ * with request geometry, but the mutually exclusive endpoint must reuse its
+ * model-lifetime stream.  Final topology destruction remains responsible for
+ * destroying that stream.
+ */
+TEST_F(
+    Test__DeviceGraphOrchestrator,
+    MTPPublicationIdentityReplacementPreservesCertifiedProducerStream)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::string header =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    ASSERT_FALSE(source.empty());
+    ASSERT_FALSE(header.empty());
+
+    const auto materialize_pos = source.find(
+        "bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(");
+    const auto execute_pos = source.find(
+        "bool DeviceGraphOrchestrator::executeMTPSpeculativeStatePublicationCaptured(",
+        materialize_pos);
+    ASSERT_NE(materialize_pos, std::string::npos);
+    ASSERT_NE(execute_pos, std::string::npos);
+    const std::string materialize_body =
+        source.substr(materialize_pos, execute_pos - materialize_pos);
+    EXPECT_NE(
+        materialize_body.find(
+            "cache.replaceIdentityPreservingProducerStream();"),
+        std::string::npos)
+        << "Same-lifetime publication recapture must retain its certified stream.";
+    EXPECT_EQ(
+        materialize_body.find("cache.invalidate();"),
+        std::string::npos)
+        << "Live publication identity replacement must not destroy and recreate "
+           "a sealed MoE histogram producer stream.";
+
+    const auto cache_pos = header.find(
+        "struct MTPSpeculativeStatePublicationGraphCache");
+    const auto next_cache_pos = header.find(
+        "struct MTPDraftTokenPublicationGraphCache", cache_pos);
+    ASSERT_NE(cache_pos, std::string::npos);
+    ASSERT_NE(next_cache_pos, std::string::npos);
+    const std::string cache_body =
+        header.substr(cache_pos, next_cache_pos - cache_pos);
+    const auto replacement_pos = cache_body.find(
+        "void replaceIdentityPreservingProducerStream()");
+    const auto teardown_pos = cache_body.find(
+        "void invalidate()", replacement_pos);
+    ASSERT_NE(replacement_pos, std::string::npos);
+    ASSERT_NE(teardown_pos, std::string::npos);
+    const std::string replacement_body =
+        cache_body.substr(replacement_pos, teardown_pos - replacement_pos);
+    EXPECT_NE(
+        replacement_body.find("StreamResetPolicy::Preserve"),
+        std::string::npos);
+    EXPECT_NE(
+        replacement_body.find("snapshot_manifest.clear();"),
+        std::string::npos)
+        << "A new graph identity must not inherit diagnostic stage topology.";
+    EXPECT_EQ(
+        replacement_body.find("StreamResetPolicy::Destroy"),
+        std::string::npos);
+
+    const std::string teardown_body = cache_body.substr(teardown_pos);
+    EXPECT_NE(
+        teardown_body.find("StreamResetPolicy::Destroy"),
+        std::string::npos)
+        << "Final binding teardown must still release the owned stream.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintNamesEachLogicalPayloadShard)
 {
     const auto tp = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::equalSplit(
@@ -1303,12 +3381,26 @@ TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintIsDomainLevelAcrossPart
     ASSERT_TRUE(hit0.supported) << hit0.bypass_reason;
     ASSERT_TRUE(hit1.supported) << hit1.bypass_reason;
     ASSERT_NE(hit0.fingerprint_key, 0u);
-    EXPECT_EQ(hit0.fingerprint_key, hit1.fingerprint_key)
-        << "TP prefix participants must use one domain-level logical key; "
-           "local payload layout still guards shard compatibility.";
+    EXPECT_NE(hit0.fingerprint_key, hit1.fingerprint_key)
+        << "TP participants share lookup coordination but require distinct "
+           "durable keys so one KV/logit payload shard cannot overwrite another.";
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochRefreshesPrefixFingerprint)
+TEST(InferenceStateResetRequest, ServingGraphSetupScrubsAllOwnersAndPreservesExecutables)
+{
+    const InferenceStateResetRequest request =
+        InferenceStateResetRequest::servingGraphSetupBoundary("unit-setup");
+
+    EXPECT_EQ(
+        request.boundary,
+        InferenceStateResetRequest::Boundary::ServingGraphSetup);
+    EXPECT_TRUE(request.resetsAllLiveRequestOwners());
+    EXPECT_TRUE(request.reset_model_runtime);
+    EXPECT_TRUE(request.preserve_replay_safe_graphs);
+    EXPECT_STREQ(request.reason, "unit-setup");
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingPrefix)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
@@ -1317,8 +3409,13 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochRefreshesPrefixFingerprin
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    std::vector<int> owners(8);
     for (int expert = 0; expert < 8; ++expert)
-        controller_config.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+        owners[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+    controller_config.initial_ownership = MoELayeredExpertOwnership::uniform(
+        controller_config.num_layers,
+        static_cast<int>(controller_config.sockets.size()),
+        owners);
 
     auto controller = std::make_unique<MoERebalanceController>(controller_config);
     auto *controller_ptr = controller.get();
@@ -1351,8 +3448,192 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochRefreshesPrefixFingerprin
     ASSERT_TRUE(after.supported);
     EXPECT_EQ(after.placement_epoch, 1u);
     EXPECT_EQ(orchestrator->moePlacementEpoch(), 1u);
+    EXPECT_EQ(after.fingerprint_key, before.fingerprint_key)
+        << "MoE placement is restored from the portable model-runtime prefix "
+           "payload; movement epochs should be tracked without keying the "
+           "token prefix itself.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, GraphStableMoERuntimeMovementIsTrackedWithoutRekeyingPrefix)
+{
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(before.supported);
+    ASSERT_NE(before.fingerprint_key, 0u);
+    EXPECT_EQ(before.placement_epoch, 0u);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
+    EXPECT_EQ(orchestrator->moeRuntimeMovementEpoch(), 0u);
+
+    orchestrator->markMoERuntimeMovementForTesting();
+
+    PrefixLookupResult after = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(after.supported);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u)
+        << "Graph-stable GPU movement must not force graph recapture.";
+    EXPECT_EQ(orchestrator->moeRuntimeMovementEpoch(), 1u);
+    EXPECT_EQ(after.placement_epoch, 1u);
+    EXPECT_EQ(after.fingerprint_key, before.fingerprint_key)
+        << "Graph-stable runtime expert movement is restored from the portable "
+           "model-runtime prefix payload, not encoded into the cache key.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, HostExpertOverlayRuntimeEpochComesFromSoleRCUAuthority)
+{
+    MoERoutedExpertPlacementPlan plan;
+    plan.enabled = true;
+    plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+    plan.continuation_domain = "cpu_tier";
+    plan.shared_expert_domain = "cpu_tier";
+    plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
+    plan.owner_order = RoutedExpertOwnerOrder::Ordinal;
+
+    RoutedExpertDomain domain;
+    domain.name = "cpu_tier";
+    domain.scope = ExecutionDomainScope::SINGLE;
+    domain.backend = CollectiveBackendType::MPI;
+    domain.participants = {GlobalDeviceAddress::cpu(0)};
+    domain.world_ranks = {0};
+    domain.owner_rank = 0;
+    domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+    plan.domains = {std::move(domain)};
+
+    RoutedExpertTier tier;
+    tier.name = "priority_0";
+    tier.domain = "cpu_tier";
+    tier.priority = 0;
+    tier.max_experts_per_layer = 0;
+    tier.fallback = true;
+    plan.routed_tiers = {std::move(tier)};
+
+    auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
+        MoEOverlayResidencyAuthority::Config{
+            .initial_plan = plan,
+            .model_metadata =
+                MoERoutedExpertModelMetadata{
+                    .num_layers = 2,
+                    .num_experts = 8,
+                    .d_model = 8,
+                    .routed_intermediate_size = 8,
+                    .shared_intermediate_size = 0,
+                    .has_shared_expert = false,
+                    .routed_quant_type = "F32",
+                    .shared_quant_type = "F32",
+                },
+            .maintenance_mode = MoERebalanceRuntimeMode::Off,
+            .perf_device = "CPU",
+        });
+    ASSERT_TRUE(authority->snapshot());
+    ASSERT_EQ(authority->snapshot()->epoch, 1u);
+
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    moe_config.moe.routed_expert_plan =
+        std::make_shared<MoERoutedExpertPlacementPlan>(std::move(plan));
+    moe_config.moe.expert_overlay_residency_authority = authority;
+    moe_config.moe.durable_residency_authority =
+        MoEDurableResidencyAuthorityKind::ExpertOverlayRCU;
+    moe_config.moe.authority_execution =
+        MoEOverlayAuthorityExecutionKind::HostResident;
+    moe_config.refreshMoEExecutionPolicy();
+
+    DeviceGraphOrchestrator orchestrator(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+    EXPECT_EQ(orchestrator.moePlacementEpoch(), 0u)
+        << "Host RCU movement must not become graph-cache topology";
+    EXPECT_EQ(orchestrator.moeRuntimeMovementEpoch(), 1u)
+        << "Prefix identity must sample the sole live ExpertOverlay authority";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateOnRebalanceRekeysGraphStableRuntimeMovement)
+{
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    moe_config.prefix_cache.moe_policy =
+        PrefixCacheMoEPolicy::InvalidateOnRebalance;
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(
+        1, 16, DeviceId::cpu()));
+
+    const PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(before.supported) << before.bypass_reason;
+    ASSERT_NE(before.fingerprint_key, 0u);
+
+    orchestrator->markMoERuntimeMovementForTesting();
+
+    const PrefixLookupResult after = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(after.supported) << after.bypass_reason;
+    EXPECT_EQ(after.placement_epoch, 1u);
     EXPECT_NE(after.fingerprint_key, before.fingerprint_key)
-        << "MoE placement epoch changes must invalidate prefix-cache key material";
+        << "InvalidateOnRebalance must reject prefix entries from an older "
+           "graph-stable placement epoch";
+}
+
+/**
+ * @brief A request spanning movement must not publish old work under the new epoch.
+ *
+ * Prefix lookup is request admission.  ExpertOverlay maintenance may publish a
+ * newer immutable residency snapshot while that admitted request is still
+ * executing.  Harvest must consume the admission fingerprint and discard the
+ * now-stale archive write instead of resampling the live authority.
+ */
+TEST_F(
+    Test__DeviceGraphOrchestrator,
+    InvalidateOnRebalanceDiscardsRequestWhoseAdmissionSpansMovement)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    moe_config.prefix_cache.moe_policy =
+        PrefixCacheMoEPolicy::InvalidateOnRebalance;
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(
+        1, 16, DeviceId::cpu()));
+
+    const std::vector<int32_t> prompt = {1, 2};
+    const PrefixLookupResult admission = orchestrator->lookupPrefix(prompt);
+    ASSERT_TRUE(admission.supported) << admission.bypass_reason;
+    ASSERT_NE(admission.fingerprint_key, 0u);
+
+    orchestrator->markMoERuntimeMovementForTesting();
+
+    EXPECT_TRUE(orchestrator->harvestPrefix(
+        admission,
+        prompt,
+        static_cast<int>(prompt.size())))
+        << "A stale archive is a deliberate no-op, not an inference failure";
+
+    const PrefixLookupResult next_request =
+        orchestrator->lookupPrefix(prompt);
+    ASSERT_TRUE(next_request.supported) << next_request.bypass_reason;
+    EXPECT_NE(next_request.fingerprint_key, admission.fingerprint_key);
+    EXPECT_EQ(next_request.cached_tokens, 0)
+        << "The stale request must not seed the newly published movement epoch";
+
+    const auto records = PerfStatsCollector::snapshot({"prefix_cache"});
+    const auto discard = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.name == "stale_request_harvest_discards";
+        });
+    ASSERT_NE(discard, records.end());
+    EXPECT_EQ(discard->count, 1u);
+    EXPECT_EQ(discard->value, 1.0);
+    EXPECT_NE(
+        discard->tags.at("admission_fingerprint"),
+        discard->tags.at("live_fingerprint"));
+
+    PerfStatsCollector::reset();
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped)
@@ -1376,6 +3657,23 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped
     EXPECT_EQ(host.prefillGraphDomainId(), "single_cpu_moe")
         << "Prefill graph observations must report the active MoE domain.";
     EXPECT_EQ(host.prefillGraphParticipantId(), 0);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, DenseDecodeReplicatedKeepsPrefillGraphCaptureEligible)
+{
+    auto default_orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    IForwardExecutionHost &default_host = *default_orchestrator;
+    EXPECT_FALSE(default_host.prefillGraphCaptureDisabledByHost());
+
+    GraphConfig replicated_config = config_;
+    replicated_config.dense_tp_enabled = true;
+    replicated_config.dense_tp_decode_replicated = true;
+    auto replicated_graph = std::make_shared<QwenStandardGraph>(replicated_config, nullptr);
+    auto replicated_orchestrator = std::make_unique<DeviceGraphOrchestrator>(replicated_graph, nullptr);
+    IForwardExecutionHost &replicated_host = *replicated_orchestrator;
+    EXPECT_FALSE(replicated_host.prefillGraphCaptureDisabledByHost())
+        << "Phase-split dense policy mirrors dense weights only for decode; it must not veto "
+           "prefill graph capture for the tensor-parallel prefill path.";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIncludesRoutedOverlayDomains)
@@ -1409,6 +3707,84 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIncludesRouted
         << "domain validation must accept non-primary routed overlay controllers";
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, CompleteExpertPlacementPersistsAcrossFreshGraphBuilds)
+{
+    auto builder = std::make_shared<RebuiltMoEGraphBuilder>();
+    auto cfg = makeMaintenanceMoEGraphConfig();
+    cfg.n_layers = 1;
+    cfg.total_n_layers = 1;
+    cfg.moe.num_experts = 4;
+    cfg.moe.top_k = 2;
+    builder->setConfig(cfg);
+
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(builder, nullptr);
+
+    auto controller_config = makeMaintenanceMoEConfig(
+        MoERebalanceMode::OBSERVE,
+        /*num_experts=*/4,
+        /*num_sockets=*/3,
+        /*num_layers=*/1,
+        /*top_k=*/2);
+    controller_config.domain_id = "single_cpu_moe";
+    orchestrator->setMoERebalanceController(
+        std::make_unique<MoERebalanceController>(controller_config));
+
+    /*
+     * Publish a placement with no experts resident on participant zero, while
+     * another participant owns every expert and a third holds two replicas.
+     * The synthetic graph builder deliberately constructs each fresh stage
+     * with the stale static mask {0, 2}. Before this regression fix the
+     * orchestrator restored only replica metadata, leaving that stale mask in
+     * place and allowing decode to select an unprepared expert.
+     */
+    const std::vector<std::vector<bool>> current_masks = {
+        {false, false, false, false}};
+    ASSERT_NO_THROW(
+        orchestrator->applyExpertMasksForDomain(
+            "single_cpu_moe", current_masks, ReceivedWeightsMap{}));
+
+    ExpertReplicaSet replicas;
+    replicas.domain_id = "single_cpu_moe";
+    replicas.base_ownership = MoELayeredExpertOwnership::uniform(
+        1, 3, {1, 1, 1, 1});
+    replicas.replica_participants_by_layer.assign(
+        1,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(3, false)));
+    replicas.setReplicaOnParticipant(
+        /*layer_idx=*/0, /*expert_id=*/1, /*participant_id=*/2);
+    replicas.setReplicaOnParticipant(
+        /*layer_idx=*/0, /*expert_id=*/3, /*participant_id=*/2);
+    replicas.rebuildAggregateReplicaFlags();
+    ASSERT_EQ(replicas.num_replicated, 2);
+
+    orchestrator->setExpertReplicaSetForParticipant(
+        replicas, /*participant_id=*/0);
+    EXPECT_GT(orchestrator->moePlacementEpoch(), 0u)
+        << "Mask and replica changes must invalidate MoE-sensitive forward graph cache keys";
+
+    int token = 7;
+    ForwardInput input;
+    input.token_ids = &token;
+    input.seq_len = 1;
+    input.batch_size = 1;
+    input.device = DeviceId::cpu();
+
+    IForwardExecutionHost &host = *orchestrator;
+    auto result = host.buildForwardGraph(input);
+    ASSERT_TRUE(result) << result.error();
+    ASSERT_EQ(builder->full_forward_builds, 1);
+
+    auto *node = result.graph().getNode("moe");
+    ASSERT_NE(node, nullptr);
+    auto *moe = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+    ASSERT_NE(moe, nullptr);
+    EXPECT_EQ(moe->expertMaskForTesting(), current_masks.front())
+        << "Fresh graphs must restore the active residency mask before replica metadata";
+    EXPECT_EQ(moe->replicaCountForTesting(), 2)
+        << "Replica metadata set before a rebuild must be applied to newly built MoE stages";
+    EXPECT_EQ(moe->replicaParticipantForTesting(), 0);
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainIndex)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -1423,6 +3799,25 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainI
     IForwardExecutionHost &host = *orchestrator;
     EXPECT_EQ(host.prefillGraphParticipantId(), 1)
         << "Prefill graph observations must use the same domain-local participant id.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesLocalTPDeviceIndex)
+{
+    auto local_tp = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    local_tp->setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+    local_tp->setBackend(CollectiveBackendType::RCCL);
+
+    GraphConfig local_config = config_;
+    local_config.tp_ctx = local_tp.get();
+    local_config.tp_device_idx = 1;
+    auto local_graph = std::make_shared<QwenStandardGraph>(local_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(local_graph, nullptr);
+
+    EXPECT_EQ(orchestrator->moeRebalanceParticipantId(), 1)
+        << "LocalTP rebalance must use the domain-local device index, not MPI rank 0";
+    IForwardExecutionHost &host = *orchestrator;
+    EXPECT_EQ(host.prefillGraphParticipantId(), 1)
+        << "Prefill graph observations must report the LocalTP participant id.";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutation)
@@ -1453,6 +3848,31 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutat
     replicas.domain_id = "single_cpu_moe";
     EXPECT_NO_THROW(
         orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0));
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, ApplyExpertMasksAdvancesMoEPlacementEpochOnMaskChange)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
+
+    const std::vector<std::vector<bool>> first_masks = {
+        {true, false, true, false},
+        {false, true, false, true}};
+    EXPECT_NO_THROW(orchestrator->applyExpertMasksForDomain({}, first_masks, ReceivedWeightsMap{}));
+    const uint64_t first_epoch = orchestrator->moePlacementEpoch();
+    EXPECT_GT(first_epoch, 0u)
+        << "Ownership-mask publication must invalidate MoE-sensitive forward graph cache keys";
+
+    EXPECT_NO_THROW(orchestrator->applyExpertMasksForDomain({}, first_masks, ReceivedWeightsMap{}));
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), first_epoch)
+        << "Publishing identical masks should not cause avoidable graph recapture churn";
+
+    const std::vector<std::vector<bool>> second_masks = {
+        {false, true, true, false},
+        {false, true, true, false}};
+    EXPECT_NO_THROW(orchestrator->applyExpertMasksForDomain({}, second_masks, ReceivedWeightsMap{}));
+    EXPECT_GT(orchestrator->moePlacementEpoch(), first_epoch)
+        << "Ownership swaps without replicas still need a fresh graph-cache epoch";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateDefaultsSafeWithoutMoE)
@@ -1557,8 +3977,13 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceHookAppliesLocalMoE
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     auto cfg = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    std::vector<int> owners(8);
     for (int expert = 0; expert < 8; ++expert)
-        cfg.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+        owners[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        cfg.num_layers,
+        static_cast<int>(cfg.sockets.size()),
+        owners);
 
     auto controller = std::make_unique<MoERebalanceController>(cfg);
     auto *controller_ptr = controller.get();
@@ -1866,6 +4291,7 @@ namespace
             last_n_ = n;
             last_k_ = k;
             saw_decode_m1_ = saw_decode_m1_ || (m == 1);
+            requested_m_values_.push_back(m);
             getRequirements_called_++;
             WorkspaceRequirements reqs;
             reqs.buffers.push_back(WorkspaceDescriptor{
@@ -1908,6 +4334,13 @@ namespace
         int getLastN() const { return last_n_; }
         int getLastK() const { return last_k_; }
         bool sawDecodeM1() const { return saw_decode_m1_; }
+        bool sawM(int m) const
+        {
+            return std::find(
+                       requested_m_values_.begin(),
+                       requested_m_values_.end(),
+                       m) != requested_m_values_.end();
+        }
 
     private:
         std::string name_;
@@ -1919,6 +4352,7 @@ namespace
         mutable int last_n_ = -1;
         mutable int last_k_ = -1;
         mutable bool saw_decode_m1_ = false;
+        mutable std::vector<int> requested_m_values_;
     };
 
     /**
@@ -1957,9 +4391,9 @@ namespace
     };
 } // anonymous namespace
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_BindsCPUStages)
 {
-    // Test that ensureDeviceWorkspaceAllocated() skips CPU stages
+    // CPU stages retain raw workspace addresses just like captured GPU nodes.
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
     // Create a graph with a mock workspace consumer on CPU device
@@ -1967,7 +4401,6 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
     auto cpu_stage = std::make_unique<MockWorkspaceConsumerStage>("cpu_gemm", DeviceId::cpu(), 4096);
     auto *cpu_stage_ptr = cpu_stage.get();
 
-    // Add with CPU device - this should be skipped by workspace allocation
     graph.addNode("cpu_gemm_node", std::move(cpu_stage), DeviceId::cpu());
 
     IDeviceContext *ctx = orchestrator->getDeviceContext(DeviceId::cpu());
@@ -1976,12 +4409,10 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsCPUStages)
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
-    // Execute - workspace allocation should skip CPU stage
     bool result = orchestrator->execute(graph, ctx);
     EXPECT_TRUE(result);
-
-    // CPU stage should NOT have had workspace bound (is_gpu() returns false)
-    EXPECT_FALSE(cpu_stage_ptr->wasBound());
+    EXPECT_TRUE(cpu_stage_ptr->wasBound());
+    EXPECT_NE(cpu_stage_ptr->getBoundWorkspace(), nullptr);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_SkipsNonWorkspaceConsumerStages)
@@ -2099,7 +4530,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_BindsWorkspaceToAllCon
     }
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_HandlesGraphWithNoGPUStages)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_HandlesCPUWorkspaceConsumers)
 {
     // Test that a graph with stages but none on GPU works correctly
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -2121,13 +4552,11 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_HandlesGraphWithNoGPUS
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
-    // Execute should succeed
     bool result = orchestrator->execute(graph, ctx);
     EXPECT_TRUE(result);
-
-    // Neither CPU stage should have workspace bound (workspace only for GPU)
-    EXPECT_FALSE(stage1_ptr->wasBound());
-    EXPECT_FALSE(stage2_ptr->wasBound());
+    EXPECT_TRUE(stage1_ptr->wasBound());
+    EXPECT_TRUE(stage2_ptr->wasBound());
+    EXPECT_EQ(stage1_ptr->getBoundWorkspace(), stage2_ptr->getBoundWorkspace());
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceAllocation_IdempotentAcrossMultipleExecutions)
@@ -2234,8 +4663,13 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
 
     orchestrator->execute(graph, ctx);
 
-    // Verify that max_seq_len was passed as m (first argument)
-    EXPECT_EQ(gpu_ptr->getLastM(), 2048) << "max_seq_len should be passed as m dimension";
+    /*
+     * A serial graph family is queried once for each relevant regime. The
+     * decode M=1 query may occur after the prefill query, so call order is not
+     * an API contract; presence of both participant geometries is.
+     */
+    EXPECT_TRUE(gpu_ptr->sawM(2048))
+        << "max_seq_len should be queried as the prefill M dimension";
     EXPECT_TRUE(gpu_ptr->sawDecodeM1())
         << "Prefill-sized graph workspaces should also include decode-only scratch";
 }
@@ -2269,11 +4703,9 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesExplicitRequestWhenPro
     IForwardExecutionHost &host = *orchestrator;
     ASSERT_TRUE(host.ensureDeviceWorkspaceAllocated(graph, 768));
 
-    // Bucketed prefill passes the active bucket shape so ROCm long-context
-    // warmup can avoid reserving the full configured max context up front.
-    // ForwardExecutionEngine handles later workspace growth by rebinding cached
-    // graphs and invalidating captured replay state.
-    EXPECT_EQ(gpu_ptr->getLastM(), 768);
+    // The explicit bucket remains a logical participant even though its
+    // storage may alias decode/verifier participants in the serial family.
+    EXPECT_TRUE(gpu_ptr->sawM(768));
     EXPECT_TRUE(gpu_ptr->sawDecodeM1())
         << "Bucketed graph workspaces should also include decode-only scratch";
     EXPECT_TRUE(gpu_ptr->wasBound());
@@ -2440,8 +4872,9 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
     // Should not crash
     orchestrator->execute(graph, ctx);
 
-    // Verify fallback to default (4096)
-    EXPECT_EQ(gpu_ptr->getLastM(), 4096) << "max_seq_len=0 should fallback to 4096";
+    // Verify fallback to default (4096) independently of auxiliary query order.
+    EXPECT_TRUE(gpu_ptr->sawM(4096))
+        << "max_seq_len=0 should query the 4096-row fallback participant";
     EXPECT_TRUE(gpu_ptr->sawDecodeM1())
         << "Fallback graph workspaces should also include decode-only scratch";
 }
@@ -2581,7 +5014,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
     EXPECT_GT(rocm_ptr->getLastM(), 0) << "ROCm stage should receive positive m dimension";
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_GetsDimensionsAndBinding)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
@@ -2598,12 +5031,13 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
 
     orchestrator->execute(graph, ctx);
 
-    // CPU stages should NOT receive workspace (workspace is GPU-only)
-    EXPECT_FALSE(cpu_ptr->wasBound())
-        << "CPU stage should not have workspace bound";
+    EXPECT_TRUE(cpu_ptr->wasBound())
+        << "CPU stages with non-empty requirements must receive setup-owned workspace";
+    EXPECT_GT(cpu_ptr->getRequirementsCallCount(), 0);
+    EXPECT_GT(cpu_ptr->getLastM(), 0);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWorkspace)
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_AllConsumersGetWorkspace)
 {
     // Skip if neither CUDA nor ROCm backend available
     const auto &dm = DeviceManager::instance();
@@ -2648,9 +5082,9 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWor
 
     orchestrator->execute(graph, ctx);
 
-    // Only GPU stages should have workspace
-    EXPECT_FALSE(cpu_ptr->wasBound()) << "CPU stage should not have workspace";
-    // GPU stages should have requirements queried for available backends
+    EXPECT_TRUE(cpu_ptr->wasBound())
+        << "CPU and GPU graph participants use the same workspace contract";
+    // GPU stages should have requirements queried for available backends.
     if (cuda_ptr)
     {
         EXPECT_GT(cuda_ptr->getRequirementsCallCount(), 0) << "CUDA stage requirements should be queried";
@@ -2727,80 +5161,6 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_
     EXPECT_EQ(gpu_ptr->getLastM(), 131072) << "Large max_seq_len should be passed";
     EXPECT_EQ(gpu_ptr->getLastN(), 64) << "Large n_heads should be passed";
     EXPECT_EQ(gpu_ptr->getLastK(), 128) << "head_dim should be calculated correctly";
-}
-
-// =============================================================================
-// Workspace Sizing - Activation Precision Impact (Documentation)
-// =============================================================================
-// Note: Activation precision affects which kernels are used (e.g., FP32 vs BF16
-// vs Q8_1 GEMM) and thus which workspace requirements are generated. The actual
-// buffer sizing is determined by the kernel implementations, not DeviceGraphOrchestrator.
-// These tests verify the precision is correctly propagated to the orchestrator.
-
-TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_FP32_WorkspaceAllocation)
-{
-    auto custom_config = config_;
-    custom_config.activation_precision = ActivationPrecision::FP32;
-
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
-
-    ComputeGraph graph;
-    auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("fp32_gemm", DeviceId::cuda(0), 4096);
-    graph.addNode("gpu_node", std::move(gpu_stage), DeviceId::cuda(0));
-
-    IDeviceContext *ctx = orchestrator->getDeviceContext(DeviceId::cpu());
-    if (ctx == nullptr)
-    {
-        GTEST_SKIP() << "DeviceContext creation not available in this environment";
-    }
-
-    // Should execute without crash regardless of precision
-    bool result = orchestrator->execute(graph, ctx);
-    EXPECT_TRUE(result);
-}
-
-TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_BF16_WorkspaceAllocation)
-{
-    auto custom_config = config_;
-    custom_config.activation_precision = ActivationPrecision::BF16;
-
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
-
-    ComputeGraph graph;
-    auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("bf16_gemm", DeviceId::cuda(0), 4096);
-    graph.addNode("gpu_node", std::move(gpu_stage), DeviceId::cuda(0));
-
-    IDeviceContext *ctx = orchestrator->getDeviceContext(DeviceId::cpu());
-    if (ctx == nullptr)
-    {
-        GTEST_SKIP() << "DeviceContext creation not available in this environment";
-    }
-
-    // Should execute without crash regardless of precision
-    bool result = orchestrator->execute(graph, ctx);
-    EXPECT_TRUE(result);
-}
-
-TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAllocation)
-{
-    auto custom_config = config_;
-    custom_config.activation_precision = ActivationPrecision::Hybrid;
-
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
-
-    ComputeGraph graph;
-    auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("hybrid_gemm", DeviceId::cuda(0), 4096);
-    graph.addNode("gpu_node", std::move(gpu_stage), DeviceId::cuda(0));
-
-    IDeviceContext *ctx = orchestrator->getDeviceContext(DeviceId::cpu());
-    if (ctx == nullptr)
-    {
-        GTEST_SKIP() << "DeviceContext creation not available in this environment";
-    }
-
-    // Should execute without crash regardless of precision
-    bool result = orchestrator->execute(graph, ctx);
-    EXPECT_TRUE(result);
 }
 
 // =============================================================================

@@ -4,25 +4,34 @@
  *
  * Contains all weight preparation, serialization, and rebalancing logic
  * extracted from MoEExpertComputeStage.cpp. See MoEExpertWeightService.h for API docs.
+ * CPU preparation establishes NUMA placement in exclusive final storage before
+ * decoding or copying. Publication only borrows complete owned engines; it must
+ * never migrate, replace, or discard already filled execution storage.
  */
 
 #include "MoEExpertWeightService.h"
 #include "ExpertWeightPayloadProvider.h"
 #include "GPUExpertTransfer.h"
+#include "GpuExpertSlotPool.h"
+#include "GpuExpertTransferStagingPool.h"
+#include "DeviceMoERebalanceController.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../kernels/PackedWeightsSerialization.h"
-#include "../../kernels/cpu/native_vnni/CPUPackedWeights.h"
-#include "../../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "../../kernels/cpu/gemm/CPUPackedWeights.h"
+#include "../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "../../loaders/MmapRegion.h"
 #include "../../loaders/ExpertGemmRegistry.h"
+#include "../../loaders/GPUVramPreflight.h"
 #include "../../loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "../../backends/BackendManager.h"
+#include "../../backends/GPUDeviceContextPool.h"
 #include "../../utils/Assertions.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/OpenMPUtils.h"
+#include "../../utils/PerfStatsCollector.h"
 #include "../../loaders/PreparedWeightStore.h"
 
 #ifdef HAVE_CUDA
@@ -31,7 +40,7 @@
 #endif
 
 #ifdef HAVE_ROCM
-#include "../../kernels/rocm/ROCmWeightPacker.h"
+#include "../../kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "../../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #endif
 
@@ -40,18 +49,22 @@
 #include <sys/syscall.h>
 #include <numa.h>
 #include <numaif.h>
-#include <sched.h>
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
+#include <mutex>
+#include <new>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace llaminar2
@@ -63,33 +76,70 @@ namespace llaminar2
     namespace
     {
 
-        /// Query the NUMA node of a virtual address using move_pages(2).
-        /// Returns -1 if NUMA info unavailable (non-Linux or unmapped page).
-        static int queryNUMANode(const void *ptr)
+        /**
+         * @brief Resolve the model context's sole admitted allocation authority.
+         *
+         * GPU expert preparation is a physical allocation boundary. A missing
+         * store or authority is therefore a lifecycle error, never permission
+         * to reconstruct a free-memory budget or allocate optimistically.
+         */
+        static std::shared_ptr<PhysicalMemoryAuthority>
+        requirePhysicalMemoryAuthority(
+            const MoEWeightContext &ctx,
+            const char *operation)
         {
-#ifdef __linux__
-            if (!ptr)
-                return -1;
-            void *pages[] = {const_cast<void *>(ptr)};
-            int status[1] = {-1};
-            if (move_pages(0, 1, pages, nullptr, status, 0) == 0 && status[0] >= 0)
-                return status[0];
-#endif
-            (void)ptr;
-            return -1;
+            if (!ctx.prepared_store)
+            {
+                throw std::logic_error(
+                    std::string(operation) +
+                    " requires the model-owned PreparedWeightStore");
+            }
+            auto authority =
+                ctx.prepared_store->physicalMemoryAuthority();
+            if (!authority)
+            {
+                throw std::logic_error(
+                    std::string(operation) +
+                    " reached GPU allocation before physical-memory admission");
+            }
+            return authority;
         }
 
-        /// Get NUMA node of the CPU this thread is currently running on.
-        static int currentCPUNode()
+        /**
+         * @brief Query physical placement through the canonical NUMA authority.
+         * @param ptr Address within retained, filled execution storage.
+         * @return Actual physical node, or -1 when the kernel cannot resolve it.
+         */
+        static int queryNUMANode(const void *ptr)
         {
-#ifdef __linux__
-            int cpu = sched_getcpu();
-            if (cpu < 0)
-                return -1;
-            return numa_node_of_cpu(cpu);
-#else
-            return -1;
-#endif
+            return NUMAAllocator::instance().getNUMANodeForAddress(ptr);
+        }
+
+        static std::shared_ptr<void> reusableGpuDirectTransferStreamFor(
+            const DeviceId &device,
+            uint64_t &create_ns,
+            int &created_count,
+            int &reuse_count)
+        {
+            if (!device.is_gpu())
+                return nullptr;
+
+            bool created = false;
+            const auto stream_start = std::chrono::steady_clock::now();
+            IWorkerGPUContext &gpu_ctx = GPUDeviceContextPool::instance().getContext(device);
+            void *stream = gpu_ctx.getOrCreateAuxiliaryStream("moe_gpu_direct_transfer", &created);
+            create_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - stream_start)
+                                                   .count());
+            if (!stream)
+                return nullptr;
+
+            if (created)
+                ++created_count;
+            else
+                ++reuse_count;
+
+            return std::shared_ptr<void>(stream, [](void *) {});
         }
 
         static size_t systemPageSize()
@@ -126,7 +176,7 @@ namespace llaminar2
                 }
                 if (node != expected_node)
                 {
-                    LOG_ERROR("[MoEWeightService][NUMA] NUMA migration verification failed for " << label
+                    LOG_ERROR("[MoEWeightService][NUMA] NUMA placement verification failed for " << label
                                                                                                   << ": expected node " << expected_node
                                                                                                   << ", found node " << node
                                                                                                   << " at " << reinterpret_cast<const void *>(page));
@@ -137,103 +187,38 @@ namespace llaminar2
             return true;
         }
 
-        static bool migrateRangeToNUMANode(void *ptr, size_t bytes, int target_node, const char *label)
-        {
-#ifdef __linux__
-            if (!ptr || bytes == 0)
-                return true;
-            if (target_node < 0)
-            {
-                LOG_ERROR("[MoEWeightService][NUMA] Cannot migrate " << label
-                                                                      << ": target NUMA node is unknown");
-                return false;
-            }
-            if (numa_available() < 0)
-            {
-                LOG_ERROR("[MoEWeightService][NUMA] Cannot migrate " << label
-                                                                      << ": libnuma policy APIs are unavailable");
-                return false;
-            }
-            if (target_node > numa_max_node())
-            {
-                LOG_ERROR("[MoEWeightService][NUMA] Cannot migrate " << label
-                                                                      << ": target NUMA node " << target_node
-                                                                      << " exceeds max node " << numa_max_node());
-                return false;
-            }
 
-            const size_t page_size = systemPageSize();
-            const uintptr_t raw_start = reinterpret_cast<uintptr_t>(ptr);
-            const uintptr_t raw_end = raw_start + bytes;
-            const uintptr_t page_start = raw_start & ~(static_cast<uintptr_t>(page_size) - 1);
-            const uintptr_t page_end = (raw_end + page_size - 1) & ~(static_cast<uintptr_t>(page_size) - 1);
-            const size_t page_bytes = static_cast<size_t>(page_end - page_start);
-
-            struct bitmask *nodemask = numa_allocate_nodemask();
-            if (!nodemask)
-            {
-                LOG_ERROR("[MoEWeightService][NUMA] Failed to allocate nodemask for " << label);
-                return false;
-            }
-
-            numa_bitmask_clearall(nodemask);
-            numa_bitmask_setbit(nodemask, target_node);
-            errno = 0;
-            const int rc = mbind(reinterpret_cast<void *>(page_start),
-                                 page_bytes,
-                                 MPOL_BIND,
-                                 nodemask->maskp,
-                                 nodemask->size,
-                                 MPOL_MF_MOVE | MPOL_MF_STRICT);
-            const int bind_errno = errno;
-            numa_free_nodemask(nodemask);
-
-            if (rc != 0)
-            {
-                LOG_ERROR("[MoEWeightService][NUMA] mbind migration failed for " << label
-                                                                                 << " (" << page_bytes
-                                                                                 << " page-rounded bytes, node="
-                                                                                 << target_node << "): errno="
-                                                                                 << bind_errno << " ("
-                                                                                 << std::strerror(bind_errno) << ")");
-                return false;
-            }
-
-            return verifyRangeNUMANode(ptr, bytes, target_node, label);
-#else
-            (void)ptr;
-            (void)bytes;
-            (void)target_node;
-            (void)label;
-            return false;
-#endif
-        }
-
-        static bool enforceExpertKernelNUMA(ITensorGemm *kernel,
+        /**
+         * @brief Authenticate an already prepared destination without moving live bytes.
+         * @param kernel Quantized or floating-point final CPU execution owner.
+         * @param target_node Required NUMA node from the declared CPU placement.
+         * @param layer_idx Model layer for a precise failure diagnostic.
+         * @param expert_id Logical expert for a precise failure diagnostic.
+         * @param role Gate, up, or down projection diagnostic name.
+         * @return Whether sampled final pages belong to the required node.
+         */
+        static bool verifyExpertKernelNUMA(ITensorGemm *kernel,
                                             int target_node,
                                             int layer_idx,
                                             int expert_id,
                                             const char *role)
         {
             auto *vnni_kernel = dynamic_cast<cpu::native_vnni::CPUNativeVNNIGemmKernel *>(kernel);
-            if (!vnni_kernel)
-                return true;
-
-            auto &packed = const_cast<cpu::native_vnni::CPUNativeVNNIPackedWeights &>(
-                vnni_kernel->packedWeights());
-
             std::ostringstream interleaved_label;
             interleaved_label << "layer " << layer_idx << " expert " << expert_id
                               << " " << role << " native_interleaved";
-            if (!migrateRangeToNUMANode(packed.native_interleaved.data(),
-                                        packed.native_interleaved.size(),
-                                        target_node,
-                                        interleaved_label.str().c_str()))
+            if (vnni_kernel)
             {
-                return false;
+                const auto &packed = vnni_kernel->packedWeights();
+                return verifyRangeNUMANode(packed.native_interleaved.data(),
+                    packed.native_interleaved.size(), target_node,
+                    interleaved_label.str().c_str());
             }
-
-            return true;
+            ContiguousFloatingPointWeightDescriptor floating{};
+            if (!kernel || !kernel->exportContiguousFloatingPointWeights(floating) || !floating.valid())
+                return false;
+            return verifyRangeNUMANode(floating.data, floating.bytes, target_node,
+                                      interleaved_label.str().c_str());
         }
 
         /// Audit NUMA placement of expert GEMM weights.
@@ -385,6 +370,230 @@ namespace llaminar2
             }
         }
 
+        /**
+         * Resolve the canonical format descriptor embedded in a portable
+         * packed-weight record. Codebook id alone is ambiguous for K-family
+         * superblocks, so the serialized superblock bit is part of the lookup.
+         */
+        static const NativeVnniFormatInfo *nativeVnniFormatForPacked(
+            uint8_t codebook_id,
+            bool is_superblock)
+        {
+            return native_vnni_formats::forSourceIdentity(
+                codebook_id, is_superblock);
+        }
+
+        /** Build the exact source provenance carried by a prepared engine. */
+        static NativeVnniSourceIdentity sourceIdentityFor(
+            const NativeVnniFormatInfo &format)
+        {
+            return {
+                .codebook_id = format.codebook_id,
+                .is_superblock = format.is_superblock,
+                .present = true,
+            };
+        }
+
+        static ExpertSlabDescriptor makeExpertSlabDescriptor(const MoEWeightContext &ctx, WeightRole role)
+        {
+            ExpertSlabDescriptor desc;
+            desc.layer_idx = ctx.layer_idx;
+            desc.role = role;
+            desc.device = ctx.device_id;
+            desc.num_experts = ctx.num_experts;
+            desc.local_expert_start = ctx.local_expert_start;
+            desc.local_expert_count = (ctx.local_expert_count < 0) ? ctx.num_experts : ctx.local_expert_count;
+            if (role == WeightRole::MoEExpertDown)
+            {
+                desc.rows_per_expert = ctx.d_model;
+                desc.cols_per_expert = ctx.expert_intermediate;
+            }
+            else
+            {
+                desc.rows_per_expert = ctx.expert_intermediate;
+                desc.cols_per_expert = ctx.d_model;
+            }
+            return desc;
+        }
+
+        static std::optional<ExpertSlabRef> resolveExpertSlabRef(
+            MoEWeightContext &ctx,
+            WeightRole role,
+            std::optional<ExpertSlabRef> &cached_ref,
+            bool create_if_missing)
+        {
+            if (!ctx.prepared_store)
+                return std::nullopt;
+            if (cached_ref.has_value())
+                return cached_ref;
+
+            const auto desc = makeExpertSlabDescriptor(ctx, role);
+            auto found = ctx.prepared_store->findExpertSlab(desc);
+            if (found.has_value())
+            {
+                cached_ref = *found;
+                return cached_ref;
+            }
+
+            if (!create_if_missing)
+                return std::nullopt;
+
+            cached_ref = ctx.prepared_store->registerExpertSlab(desc);
+            return cached_ref;
+        }
+
+        static void resolveExpertSlabRefs(MoEWeightContext &ctx, bool create_if_missing)
+        {
+            (void)resolveExpertSlabRef(ctx, WeightRole::MoEExpertGate, ctx.gate_slab_ref, create_if_missing);
+            (void)resolveExpertSlabRef(ctx, WeightRole::MoEExpertUp, ctx.up_slab_ref, create_if_missing);
+            (void)resolveExpertSlabRef(ctx, WeightRole::MoEExpertDown, ctx.down_slab_ref, create_if_missing);
+        }
+
+        static int gpuOrdinalFor(const DeviceId &device)
+        {
+            if (device.is_cuda())
+                return device.cuda_ordinal();
+            if (device.is_rocm())
+                return device.rocm_ordinal();
+            return -1;
+        }
+
+        static const char *gpuDirectRoleLabel(WeightRole role)
+        {
+            if (role == WeightRole::MoEExpertGate)
+                return "gate";
+            if (role == WeightRole::MoEExpertUp)
+                return "up";
+            if (role == WeightRole::MoEExpertDown)
+                return "down";
+            return nullptr;
+        }
+
+        static DeviceNativeVNNIMatrixDesc nativeVnniDescFromSlot(
+            const WeightVRAMPool::WeightSlot &slot,
+            int N,
+            int K,
+            uint32_t blocks_per_row,
+            uint8_t codebook_id)
+        {
+            DeviceNativeVNNIMatrixDesc desc{};
+            desc.payload = slot.d_native_vnni_payload;
+            desc.scales = slot.d_native_vnni_scales;
+            desc.mins = slot.d_native_vnni_mins;
+            desc.emins = slot.d_native_vnni_emins;
+            desc.n = N;
+            desc.k = K;
+            desc.blocks_per_row = blocks_per_row;
+            desc.codebook_id = codebook_id;
+            return desc;
+        }
+
+        static GpuExpertPackedDescriptor packedDescFromSlot(
+            const WeightVRAMPool::WeightSlot &slot,
+            int N,
+            int K,
+            uint32_t blocks_per_row,
+            uint8_t codebook_id,
+            uint8_t payload_bytes_per_block,
+            bool is_asymmetric,
+            bool has_emins)
+        {
+            return makeGpuExpertPackedDescriptor(
+                nativeVnniDescFromSlot(slot, N, K, blocks_per_row, codebook_id),
+                payload_bytes_per_block,
+                is_asymmetric,
+                has_emins);
+        }
+
+        static std::shared_ptr<ITensorGemm> createGpuDirectKernelFromSlot(
+            const DeviceId &device,
+            int device_ordinal,
+            const WeightVRAMPool::WeightSlot &slot,
+            int N,
+            int K,
+            uint32_t blocks_per_row,
+            uint8_t codebook_id,
+            NativeVnniSourceIdentity source_identity,
+            const std::shared_ptr<void> &lifetime_owner)
+        {
+#ifdef HAVE_CUDA
+            if (device.is_cuda())
+            {
+                return std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                    N, K, device_ordinal,
+                    slot.d_native_vnni_payload,
+                    static_cast<uint16_t *>(slot.d_native_vnni_scales),
+                    static_cast<uint16_t *>(slot.d_native_vnni_mins),
+                    static_cast<uint32_t *>(slot.d_native_vnni_emins),
+                    codebook_id, blocks_per_row,
+                    lifetime_owner,
+                    source_identity);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm())
+            {
+                return std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                    N, K, device_ordinal,
+                    slot.d_native_vnni_payload,
+                    slot.d_native_vnni_scales,
+                    slot.d_native_vnni_mins,
+                    slot.d_native_vnni_emins,
+                    codebook_id, blocks_per_row,
+                    lifetime_owner,
+                    source_identity);
+            }
+#endif
+            return nullptr;
+        }
+
+        static std::shared_ptr<void> eventOwnerFor(IBackend *backend, int ordinal, void *event)
+        {
+            return std::shared_ptr<void>(
+                event,
+                [backend, ordinal](void *ptr)
+                {
+                    if (ptr && backend)
+                        backend->destroyEvent(ptr, ordinal);
+                });
+        }
+
+        static void appendUniqueLifetime(
+            std::vector<std::shared_ptr<void>> &lifetimes,
+            const std::shared_ptr<void> &lifetime)
+        {
+            if (!lifetime)
+                return;
+            auto it = std::find(lifetimes.begin(), lifetimes.end(), lifetime);
+            if (it == lifetimes.end())
+                lifetimes.push_back(lifetime);
+        }
+
+        static std::shared_ptr<std::mutex> gpuInitialExpertPrepareMutexFor(const MoEWeightContext &ctx)
+        {
+            static std::mutex registry_mutex;
+            static std::unordered_map<std::string, std::weak_ptr<std::mutex>> registry;
+
+            std::ostringstream key;
+            key << static_cast<const void *>(ctx.prepared_store)
+                << '|' << ctx.device_id.to_string()
+                << "|layer=" << ctx.layer_idx
+                << "|experts=" << ctx.num_experts
+                << "|local=" << ctx.local_expert_start
+                << ':' << ((ctx.local_expert_count < 0) ? ctx.num_experts : ctx.local_expert_count)
+                << "|shape=" << ctx.expert_intermediate
+                << 'x' << ctx.d_model;
+
+            std::lock_guard<std::mutex> lock(registry_mutex);
+            auto &entry = registry[key.str()];
+            if (auto existing = entry.lock())
+                return existing;
+
+            auto created = std::make_shared<std::mutex>();
+            entry = created;
+            return created;
+        }
+
     } // anonymous namespace
 
     // =========================================================================
@@ -406,15 +615,21 @@ namespace llaminar2
             return false;
         }
 
-        // EP range: only extract views for local experts
-        // Dynamic rebalancing may set an expert mask while using replicated
-        // parent tensors. In that case, extracting all views is safe because
-        // every global expert id is physically present. LocalTP static expert
-        // ownership can also be expressed as a mask, but its parent tensor is
-        // presliced to the local expert range. Presliced tensors are the source
-        // of truth for physical bounds, so they must never attempt to view
-        // global expert ids outside [local_start, local_end).
-        const bool extract_all = !ctx.expert_mask.empty();
+        // A mask is authoritative logical ownership. For a full parent tensor it
+        // controls which engines are prepared while every global expert remains
+        // directly addressable. For a packed parent tensor its sorted true bits
+        // are also the packed-slot map: slot i contains the i-th enabled global
+        // expert. This is the same order used by ModelLoader's explicit expert
+        // selection and avoids inventing a second, contiguous ownership rule.
+        const bool has_expert_mask = !ctx.expert_mask.empty();
+        if (has_expert_mask &&
+            ctx.expert_mask.size() != static_cast<size_t>(num_experts))
+        {
+            throw std::runtime_error(
+                "[MoEWeightService] Expert ownership mask size does not match num_experts");
+        }
+        const size_t active_mask_count =
+            static_cast<size_t>(std::count(ctx.expert_mask.begin(), ctx.expert_mask.end(), true));
         const int local_start = ctx.local_expert_start;
         const int local_count = (ctx.local_expert_count < 0)
                                     ? num_experts
@@ -429,13 +644,14 @@ namespace llaminar2
         // GGUF 3D: shape = [ne[0], ne[1], ne[2]] = [cols, rows, num_experts_in_tensor]
         // Each expert's 2D slice is [rows, cols] at element offset within the tensor.
         //
-        // With expert-parallel weight sharding, the 3D tensor may contain only
+        // With expert-ID-apportioned loading, the 3D tensor may contain only
         // local experts (shape[2] == local_count) instead of all experts.
         // In that case, global expert index `e` maps to local tensor index
         // `e - local_start`. When the tensor has all experts (shape[2] == num_experts),
         // the offset uses the global index directly.
-        auto extract_views = [local_start, local_end, extract_all](
+        auto extract_views = [local_start, local_count, local_end, has_expert_mask, active_mask_count, &ctx](
                                  TensorBase *tensor_3d, int n_experts,
+                                 const char *role_name,
                                  std::vector<std::shared_ptr<TensorBase>> &views) -> bool
         {
             const auto &shape = tensor_3d->shape();
@@ -451,27 +667,104 @@ namespace llaminar2
             size_t tensor_expert_count = shape[2];
             size_t elements_per_expert = rows * cols;
 
-            // Determine if the tensor was pre-sliced (expert-parallel sharding)
+            // Determine whether the expert-ID axis was pre-sliced.
             // or contains all experts (replicated mode).
             const bool is_presliced = (static_cast<int>(tensor_expert_count) != n_experts);
 
+            std::vector<int> packed_index_by_expert(
+                static_cast<size_t>(n_experts), -1);
+            if (is_presliced && has_expert_mask)
+            {
+                if (active_mask_count != tensor_expert_count)
+                {
+                    std::ostringstream oss;
+                    oss << "[MoEWeightService] Packed " << role_name
+                        << " tensor contains " << tensor_expert_count
+                        << " experts but its authoritative ownership mask contains "
+                        << active_mask_count
+                        << " for layer " << ctx.layer_idx;
+                    throw std::runtime_error(oss.str());
+                }
+
+                int packed_index = 0;
+                for (int expert_id = 0; expert_id < n_experts; ++expert_id)
+                {
+                    if (ctx.expert_mask[static_cast<size_t>(expert_id)])
+                        packed_index_by_expert[static_cast<size_t>(expert_id)] = packed_index++;
+                }
+            }
+            else if (is_presliced)
+            {
+                if (local_start < 0 || local_count <= 0 || local_end > n_experts ||
+                    static_cast<size_t>(local_count) != tensor_expert_count)
+                {
+                    std::ostringstream oss;
+                    oss << "[MoEWeightService] Packed " << role_name
+                        << " tensor cannot be mapped by its contiguous local span"
+                        << " layer=" << ctx.layer_idx
+                        << " tensor_experts=" << tensor_expert_count
+                        << " local_start=" << local_start
+                        << " local_count=" << local_count
+                        << " num_experts=" << n_experts;
+                    throw std::runtime_error(oss.str());
+                }
+                for (int expert_id = local_start; expert_id < local_end; ++expert_id)
+                {
+                    packed_index_by_expert[static_cast<size_t>(expert_id)] =
+                        expert_id - local_start;
+                }
+            }
+            else
+            {
+                for (int expert_id = 0; expert_id < n_experts; ++expert_id)
+                    packed_index_by_expert[static_cast<size_t>(expert_id)] = expert_id;
+            }
+
             for (int e = 0; e < n_experts; ++e)
             {
-                // Skip non-local experts under EP. A full replicated tensor can
-                // still extract every global expert when dynamic rebalance asks
-                // for it, but a presliced LocalTP tensor contains only local
-                // expert storage and must clamp to the physical local range.
-                if ((is_presliced || !extract_all) && (e < local_start || e >= local_end))
+                // Full replicated tensors keep every view available when a mask
+                // is present because dynamic ownership may later change. Without
+                // a mask, preserve the declared contiguous local range. Packed
+                // tensors always follow the explicit map constructed above.
+                if (is_presliced &&
+                    packed_index_by_expert[static_cast<size_t>(e)] < 0)
+                    continue;
+                if (!is_presliced && !has_expert_mask &&
+                    (e < local_start || e >= local_end))
                     continue;
 
-                // For pre-sliced tensors: local expert `e` is at tensor index `e - local_start`
-                // For full tensors: expert `e` is at tensor index `e`
-                size_t tensor_idx = is_presliced ? static_cast<size_t>(e - local_start)
-                                                 : static_cast<size_t>(e);
+                const size_t tensor_idx = static_cast<size_t>(
+                    packed_index_by_expert[static_cast<size_t>(e)]);
                 size_t element_offset = tensor_idx * elements_per_expert;
 
                 std::vector<size_t> view_shape = {rows, cols};
-                auto view = tensor_3d->create_view(view_shape, element_offset);
+                std::shared_ptr<TensorBase> view;
+                try
+                {
+                    view = tensor_3d->create_view(view_shape, element_offset);
+                }
+                catch (const std::exception &ex)
+                {
+                    std::ostringstream oss;
+                    oss << "[MoEWeightService] create_view failed"
+                        << " layer=" << ctx.layer_idx
+                        << " role=" << role_name
+                        << " expert=" << e
+                        << " tensor_idx=" << tensor_idx
+                        << " tensor_shape=[" << shape[0] << "," << shape[1] << "," << shape[2] << "]"
+                        << " view_shape=[" << rows << "," << cols << "]"
+                        << " offset_elements=" << element_offset
+                        << " num_experts=" << n_experts
+                        << " tensor_expert_count=" << tensor_expert_count
+                        << " is_presliced=" << (is_presliced ? "true" : "false")
+                        << " local_start=" << local_start
+                        << " local_count=" << local_count
+                        << " local_end=" << local_end
+                        << " mask_size=" << ctx.expert_mask.size()
+                        << " active_mask_count=" << active_mask_count
+                        << ": " << ex.what();
+                    throw std::runtime_error(oss.str());
+                }
                 if (!view)
                 {
                     LOG_ERROR("[MoE] Failed to create view for expert " << e
@@ -483,17 +776,24 @@ namespace llaminar2
             return true;
         };
 
-        if (!extract_views(ctx.gate_exps, num_experts, ctx.expert_gate_views))
+        if (!extract_views(ctx.gate_exps, num_experts, "gate", ctx.expert_gate_views))
             return false;
-        if (!extract_views(ctx.up_exps, num_experts, ctx.expert_up_views))
+        if (!extract_views(ctx.up_exps, num_experts, "up", ctx.expert_up_views))
             return false;
-        if (!extract_views(ctx.down_exps, num_experts, ctx.expert_down_views))
+        if (!extract_views(ctx.down_exps, num_experts, "down", ctx.expert_down_views))
             return false;
 
-        LOG_DEBUG("[MoEWeightService] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
-                                                  << " expert 2D views (EP range [" << local_start
-                                                  << ", " << local_end << ")"
-                                                  << (extract_all ? " extract_all=true" : "") << ")");
+        const size_t extracted_count = static_cast<size_t>(std::count_if(
+            ctx.expert_gate_views.begin(),
+            ctx.expert_gate_views.end(),
+            [](const std::shared_ptr<TensorBase> &view)
+            {
+                return view != nullptr;
+            }));
+        LOG_TRACE("[MoEWeightService] Extracted " << extracted_count << "/" << num_experts
+                                                  << " expert 2D views"
+                                                  << (has_expert_mask ? " from authoritative ownership mask" : "")
+                                                  << ")");
         return true;
     }
 
@@ -511,7 +811,7 @@ namespace llaminar2
             return false;
         }
 
-        // EP range
+        // Expert-ID ownership range.
         // Dynamic rebalancing: when expert_mask is set, prepare ONLY mask-active
         // experts (not all). Views exist for all experts, but GEMM engines are
         // expensive (VNNI repacking). Newly-acquired experts get engines from
@@ -543,20 +843,27 @@ namespace llaminar2
         ctx.prepared_up_gemm.resize(num_experts, nullptr);
         ctx.prepared_down_gemm.resize(num_experts, nullptr);
 
-        if (!ctx.device_id.is_gpu() && ctx.prepared_store)
+        std::shared_ptr<std::mutex> gpu_prepare_mutex;
+        std::unique_lock<std::mutex> gpu_prepare_lock;
+        if (ctx.device_id.is_gpu() && ctx.prepared_store)
+        {
+            /*
+             * Prefill/decode graph stages for the same layer may be constructed
+             * concurrently.  Hold this per-store/device/layer mutex through
+             * store lookup and initial GPU pack so the second stage observes the
+             * first stage's registered slabs instead of allocating another full
+             * expert pool.
+             */
+            gpu_prepare_mutex = gpuInitialExpertPrepareMutexFor(ctx);
+            gpu_prepare_lock = std::unique_lock<std::mutex>(*gpu_prepare_mutex);
+        }
+
+        if (ctx.prepared_store)
         {
             auto make_desc = [&](WeightRole role)
             {
-                ExpertSlabDescriptor desc;
-                desc.layer_idx = ctx.layer_idx;
-                desc.role = role;
-                desc.device = ctx.device_id;
-                desc.num_experts = ctx.num_experts;
-                desc.local_expert_start = ctx.local_expert_start;
-                desc.local_expert_count = local_count;
-                desc.rows_per_expert = ctx.expert_intermediate;
-                desc.cols_per_expert = ctx.d_model;
-                return desc;
+                (void)local_count;
+                return makeExpertSlabDescriptor(ctx, role);
             };
 
             auto has_required_experts = [&](const ExpertSlabRef &ref)
@@ -609,7 +916,8 @@ namespace llaminar2
                     ctx.up_slab_ref = *up_ref;
                     ctx.down_slab_ref = *down_ref;
                     LOG_DEBUG("[MoEWeightService] Reused " << (prep_count * 3)
-                                                           << " CPU expert GEMM engines from PreparedWeightStore for layer "
+                                                           << (ctx.device_id.is_gpu() ? " GPU" : " CPU")
+                                                           << " expert GEMM engines from PreparedWeightStore for layer "
                                                            << ctx.layer_idx << " (slabs=" << ctx.prepared_store->expertSlabCount() << ")");
                     return true;
                 }
@@ -640,6 +948,14 @@ namespace llaminar2
                     ctx.gate_slab_ref = *gate_ref;
                     ctx.up_slab_ref = *up_ref;
                     ctx.down_slab_ref = *down_ref;
+                    if (ctx.device_id.is_gpu())
+                    {
+                        LOG_ERROR("[MoEWeightService] PreparedWeightStore GPU expert slabs for layer "
+                                  << ctx.layer_idx << " on " << ctx.device_id.to_string()
+                                  << " are missing " << missing_experts.size()
+                                  << " required expert(s); refusing duplicate GPU repack allocation");
+                        return false;
+                    }
                     experts_to_prep = std::move(missing_experts);
                     prep_count = static_cast<int>(experts_to_prep.size());
                     LOG_DEBUG("[MoEWeightService] PreparedWeightStore slabs for layer "
@@ -664,13 +980,26 @@ namespace llaminar2
         // Each expert has unique tensors (unique raw_data() keys), so no cache
         // key collisions.  The heavy VNNI interleave runs lock-free.
         // Phase D: prepareExpertGemmLocal returns shared_ptr without global registry.
-        const int target_numa_node = currentCPUNode();
-        if (target_numa_node < 0)
+        const int target_numa_node = ctx.cpu_numa_placement.node();
+        const bool enforce_numa_placement =
+            ctx.cpu_numa_placement.requiresNodeBinding();
+        if (enforce_numa_placement && numa_available() < 0)
         {
-            LOG_ERROR("[MoEWeightService][NUMA] Cannot determine target NUMA node for CPU expert packing");
+            LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert packing on NUMA node "
+                      << target_numa_node << ": libnuma policy APIs are unavailable");
             return false;
         }
+        if (!enforce_numa_placement)
+        {
+            LOG_DEBUG("[MoEWeightService][NUMA] CPU expert packing uses aggregate CPU domain; "
+                      "strict single-node placement is disabled for layer "
+                      << ctx.layer_idx);
+        }
         std::atomic<bool> error_flag{false};
+
+        const auto placement = enforce_numa_placement
+            ? CPUWeightStoragePlacement::onNode(target_numa_node)
+            : CPUWeightStoragePlacement::local();
 
         // Per-expert engine storage for parallel assignment (avoids push_back race)
         std::vector<std::shared_ptr<ITensorGemm>> local_gate_engines(prep_count);
@@ -691,12 +1020,26 @@ namespace llaminar2
                 continue;
             }
 
-            auto gate_engine = KernelFactory::prepareExpertGemmLocal(
-                ctx.expert_gate_views[e].get(), ctx.device_id);
-            auto up_engine = KernelFactory::prepareExpertGemmLocal(
-                ctx.expert_up_views[e].get(), ctx.device_id);
-            auto down_engine = KernelFactory::prepareExpertGemmLocal(
-                ctx.expert_down_views[e].get(), ctx.device_id);
+            // Each worker first-touches its final allocation before packing.
+            // Exceptions must stay inside the OpenMP region; no partially built
+            // projection is published when any member of the triple fails.
+            std::shared_ptr<ITensorGemm> gate_engine, up_engine, down_engine;
+            try
+            {
+                gate_engine = KernelFactory::prepareExpertGemmLocal(
+                    ctx.expert_gate_views[e], ctx.device_id, KernelFactory::GemmPreparationKind::AUTO, placement);
+                up_engine = KernelFactory::prepareExpertGemmLocal(
+                    ctx.expert_up_views[e], ctx.device_id, KernelFactory::GemmPreparationKind::AUTO, placement);
+                down_engine = KernelFactory::prepareExpertGemmLocal(
+                    ctx.expert_down_views[e], ctx.device_id, KernelFactory::GemmPreparationKind::AUTO, placement);
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("[MoEWeightService] CPU preparation failed for layer "
+                          << ctx.layer_idx << " expert " << e << ": " << error.what());
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
+            }
 
             if (!gate_engine || !up_engine || !down_engine)
             {
@@ -704,17 +1047,14 @@ namespace llaminar2
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
             }
-            if (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
-                !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
-                !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down"))
+            if (enforce_numa_placement &&
+                (!verifyExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
+                 !verifyExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
+                 !verifyExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down")))
             {
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
             }
-
-            ctx.prepared_gate_gemm[e] = gate_engine.get();
-            ctx.prepared_up_gemm[e] = up_engine.get();
-            ctx.prepared_down_gemm[e] = down_engine.get();
 
             // Store in per-index slot (no contention — each idx is unique)
             local_gate_engines[idx] = std::move(gate_engine);
@@ -728,6 +1068,12 @@ namespace llaminar2
             ctx.moe_owned_kernels.reserve(ctx.moe_owned_kernels.size() + prep_count * 3);
             for (int idx = 0; idx < prep_count; ++idx)
             {
+                // Publish only after the complete parallel preparation succeeds.
+                // A failed worker cannot leave dangling borrowed engine pointers.
+                const int e = experts_to_prep[idx];
+                ctx.prepared_gate_gemm[e] = local_gate_engines[idx].get();
+                ctx.prepared_up_gemm[e] = local_up_engines[idx].get();
+                ctx.prepared_down_gemm[e] = local_down_engines[idx].get();
                 if (local_gate_engines[idx])
                     ctx.moe_owned_kernels.push_back(std::move(local_gate_engines[idx]));
                 if (local_up_engines[idx])
@@ -756,15 +1102,7 @@ namespace llaminar2
                                      TensorBase *parent_3d,
                                      const ExpertSlabRef *existing_ref) -> ExpertSlabRef
             {
-                ExpertSlabDescriptor desc;
-                desc.layer_idx = ctx.layer_idx;
-                desc.role = role;
-                desc.device = ctx.device_id;
-                desc.num_experts = ctx.num_experts;
-                desc.local_expert_start = ctx.local_expert_start;
-                desc.local_expert_count = (ctx.local_expert_count < 0) ? ctx.num_experts : ctx.local_expert_count;
-                desc.rows_per_expert = ctx.expert_intermediate;
-                desc.cols_per_expert = ctx.d_model;
+                ExpertSlabDescriptor desc = makeExpertSlabDescriptor(ctx, role);
                 // source_identity left default — TensorBase doesn't expose WeightIdentity.
                 // Phase C will wire this through WeightManager lookup.
                 (void)parent_3d;
@@ -830,9 +1168,13 @@ namespace llaminar2
             }
         }
 
-        // NUMA audit: verify packed weights landed on the correct NUMA node.
-        auditExpertNUMA(experts_to_prep, ctx.prepared_gate_gemm,
-                        "initial_pack", ctx.layer_idx, target_numa_node);
+        // NUMA audit: verify packed weights landed on the requested NUMA node.
+        // Aggregate CPU domains intentionally skip this single-node check.
+        if (enforce_numa_placement)
+        {
+            auditExpertNUMA(experts_to_prep, ctx.prepared_gate_gemm,
+                            "initial_pack", ctx.layer_idx, target_numa_node);
+        }
 
         // Mark experts as prepared in the payload provider (enables host data release)
         if (ctx.payload_provider)
@@ -845,7 +1187,7 @@ namespace llaminar2
         // The VNNI interleaved engines now own their own copy — the original
         // mmap data is never accessed again. Releasing per-layer reduces peak RSS
         // by ~500 MB/layer instead of waiting for a bulk release at the end.
-        // NOTE: Only safe for mmap-backed tensors. Expert-parallel sliced tensors
+        // NOTE: Only safe for mmap-backed tensors. Expert-ID-sliced tensors
         // are heap-allocated copies — MADV_DONTNEED on heap memory corrupts malloc metadata.
         if (ctx.advise_raw_pages_after_prepare)
         {
@@ -884,7 +1226,11 @@ namespace llaminar2
             else if (!tensor->is_raw_data_released())
             {
                 size_t bytes = tensor->size_bytes();
-                tensor->release_raw_data();
+                /* The public host-release boundary retires any exact CUDA/HIP
+                 * registration before freeing storage. Calling the raw hook
+                 * directly can leave registered pages live when this parent
+                 * tensor was uploaded during multi-tier preparation. */
+                tensor->release_host_weight_data();
                 freed += bytes;
                 LOG_DEBUG("[MoEWeightService] " << name << ": released "
                                                 << (bytes >> 20) << " MB heap data");
@@ -914,27 +1260,82 @@ namespace llaminar2
     // Weight serialization (for MPI transfer)
     // =========================================================================
 
-    ExpertWeightBlobs MoEExpertWeightService::detachAndSerializeExpert(MoEWeightContext &ctx, int expert_id)
+    ExpertPackedWeights MoEExpertWeightService::detachPreparedExpert(
+        MoEWeightContext &ctx,
+        int expert_id)
     {
-        ExpertWeightBlobs blobs;
-
-        auto serialize_proj = [&](ITensorGemm *engine, const char * /*proj_name*/) -> std::vector<uint8_t>
+        if (expert_id < 0 || expert_id >= ctx.num_experts)
         {
-            if (!engine)
-                return {};
-            if (!engine->hasWeights())
-                return {};
-            auto packed = engine->detachWeights();
-            if (!packed)
-                return {};
-            return packed_weights_serialization::serialize(*packed);
+            throw std::out_of_range(
+                "Cannot detach prepared expert outside the layer geometry");
+        }
+
+        std::array<ITensorGemm *, 3> engines{
+            ctx.prepared_gate_gemm[expert_id],
+            ctx.prepared_up_gemm[expert_id],
+            ctx.prepared_down_gemm[expert_id],
         };
+        if (std::any_of(
+                engines.begin(),
+                engines.end(),
+                [](ITensorGemm *engine)
+                {
+                    return engine == nullptr || !engine->hasWeights();
+                }))
+        {
+            throw std::runtime_error(
+                "Cannot detach an incomplete prepared CPU expert");
+        }
 
-        blobs.gate = serialize_proj(ctx.prepared_gate_gemm[expert_id], "gate");
-        blobs.up = serialize_proj(ctx.prepared_up_gemm[expert_id], "up");
-        blobs.down = serialize_proj(ctx.prepared_down_gemm[expert_id], "down");
+        ExpertPackedWeights weights;
+        weights.gate = engines[0]->detachWeights();
+        weights.up = engines[1]->detachWeights();
+        weights.down = engines[2]->detachWeights();
+        if (!weights.complete())
+        {
+            throw std::runtime_error(
+                "Prepared CPU expert did not implement complete detachable weights");
+        }
+        return weights;
+    }
 
-        return blobs;
+    ExpertPackedWeights MoEExpertWeightService::clonePreparedExpert(
+        const MoEWeightContext &ctx,
+        int expert_id)
+    {
+        if (expert_id < 0 || expert_id >= ctx.num_experts)
+        {
+            throw std::out_of_range(
+                "Cannot clone prepared expert outside the layer geometry");
+        }
+
+        std::array<ITensorGemm *, 3> engines{
+            ctx.prepared_gate_gemm[expert_id],
+            ctx.prepared_up_gemm[expert_id],
+            ctx.prepared_down_gemm[expert_id],
+        };
+        if (std::any_of(
+                engines.begin(),
+                engines.end(),
+                [](ITensorGemm *engine)
+                {
+                    return engine == nullptr || !engine->hasWeights();
+                }))
+        {
+            throw std::runtime_error(
+                "Cannot clone an incomplete prepared CPU expert");
+        }
+
+        ExpertPackedWeights weights;
+        weights.gate = engines[0]->cloneWeights();
+        weights.up = engines[1]->cloneWeights();
+        weights.down = engines[2]->cloneWeights();
+        if (!weights.complete())
+        {
+            throw std::runtime_error(
+                "Prepared CPU expert did not implement complete cloneable weights");
+        }
+        return weights;
     }
 
     ExpertWeightBlobs MoEExpertWeightService::serializeExpert(const MoEWeightContext &ctx, int expert_id)
@@ -943,7 +1344,7 @@ namespace llaminar2
 
         ExpertWeightBlobs blobs;
 
-        auto serialize_proj = [expert_id, &ctx](ITensorGemm *engine, const char *proj_name) -> std::vector<uint8_t>
+        auto serialize_proj = [expert_id, &ctx](ITensorGemm *engine, const char *proj_name) -> ExpertTransferBuffer
         {
             if (!engine || !engine->hasWeights())
             {
@@ -962,7 +1363,10 @@ namespace llaminar2
                 return {};
             }
 
-            return packed_weights_serialization::serialize(*packed);
+            ExpertTransferBuffer buffer;
+            if (!packed_weights_serialization::serializeInto(*packed, buffer))
+                return {};
+            return buffer;
         };
 
         blobs.gate = serialize_proj(ctx.prepared_gate_gemm[expert_id], "gate");
@@ -979,19 +1383,36 @@ namespace llaminar2
     std::vector<const TensorBase *> MoEExpertWeightService::releaseDepartedExperts(
         MoEWeightContext &ctx, const std::vector<bool> &new_mask)
     {
+        if (new_mask.size() < static_cast<size_t>(std::max(0, ctx.num_experts)))
+        {
+            throw std::runtime_error(
+                "MoEExpertWeightService::releaseDepartedExperts received a mask smaller than num_experts");
+        }
+
         std::vector<const TensorBase *> evict_tensors;
         std::vector<int> departed_ids;
+        std::vector<ITensorGemm *> departed_engines;
+
+        auto remember_departed_engine = [&](ITensorGemm *engine)
+        {
+            if (!engine)
+                return;
+            if (std::find(departed_engines.begin(), departed_engines.end(), engine) == departed_engines.end())
+                departed_engines.push_back(engine);
+        };
 
         for (int e = 0; e < ctx.num_experts; ++e)
         {
-            if (!new_mask[e] && ctx.prepared_gate_gemm[e])
+            const bool has_any_projection =
+                ctx.prepared_gate_gemm[e] ||
+                ctx.prepared_up_gemm[e] ||
+                ctx.prepared_down_gemm[e];
+            if (!new_mask[e] && has_any_projection)
             {
                 departed_ids.push_back(e);
-
-                // Release packed weights from GEMM engines
-                ctx.prepared_gate_gemm[e]->releaseWeights();
-                ctx.prepared_up_gemm[e]->releaseWeights();
-                ctx.prepared_down_gemm[e]->releaseWeights();
+                remember_departed_engine(ctx.prepared_gate_gemm[e]);
+                remember_departed_engine(ctx.prepared_up_gemm[e]);
+                remember_departed_engine(ctx.prepared_down_gemm[e]);
 
                 // Collect tensor views for batch cache eviction by the caller
                 if (e < static_cast<int>(ctx.expert_gate_views.size()) && ctx.expert_gate_views[e])
@@ -1035,19 +1456,65 @@ namespace llaminar2
                                                               << " departed experts from PreparedWeightStore");
         }
 
+        if (!departed_engines.empty() && !ctx.moe_owned_kernels.empty())
+        {
+            std::vector<ITensorGemm *> released_owned_engines;
+            for (const auto &owned : ctx.moe_owned_kernels)
+            {
+                if (!owned)
+                    continue;
+                ITensorGemm *raw = owned.get();
+                if (std::find(departed_engines.begin(), departed_engines.end(), raw) == departed_engines.end())
+                    continue;
+                if (std::find(released_owned_engines.begin(), released_owned_engines.end(), raw) != released_owned_engines.end())
+                    continue;
+                owned->releaseWeights();
+                released_owned_engines.push_back(raw);
+            }
+
+            const size_t before = ctx.moe_owned_kernels.size();
+            ctx.moe_owned_kernels.erase(
+                std::remove_if(ctx.moe_owned_kernels.begin(),
+                               ctx.moe_owned_kernels.end(),
+                               [&](const std::shared_ptr<ITensorGemm> &owned)
+                               {
+                                   if (!owned)
+                                       return false;
+                                   return std::find(departed_engines.begin(),
+                                                    departed_engines.end(),
+                                                    owned.get()) != departed_engines.end();
+                               }),
+                ctx.moe_owned_kernels.end());
+            const size_t released = before - ctx.moe_owned_kernels.size();
+            if (released > 0)
+            {
+                LOG_DEBUG("[MoEWeightService] Released " << released
+                                                         << " graph-local expert GEMM owners for "
+                                                         << departed_ids.size()
+                                                         << " departed experts on layer "
+                                                         << ctx.layer_idx);
+            }
+        }
+
         return evict_tensors;
     }
 
     bool MoEExpertWeightService::registerAndPrepareNewExperts(
         MoEWeightContext &ctx,
         const std::vector<bool> &new_mask,
-        const std::unordered_map<int, ExpertWeightBlobs> *received_weights)
+        const std::unordered_map<int, ExpertWeightBlobs> *received_weights,
+        const std::unordered_map<int, PreparedExpertEngines> *
+            received_prepared_experts)
     {
         // Find newly-acquired experts (true in new_mask, not previously prepared)
         std::vector<int> new_experts;
         for (int e = 0; e < ctx.num_experts; ++e)
         {
-            if (new_mask[e] && !ctx.prepared_gate_gemm[e])
+            const bool has_complete_engine =
+                ctx.prepared_gate_gemm[e] &&
+                ctx.prepared_up_gemm[e] &&
+                ctx.prepared_down_gemm[e];
+            if (new_mask[e] && !has_complete_engine)
                 new_experts.push_back(e);
         }
         if (new_experts.empty())
@@ -1062,17 +1529,34 @@ namespace llaminar2
             return registerAndPrepareNewExpertsGPU(ctx, new_experts, received_weights);
         }
 
-        // CPU path: deserialize transferred weights or resolve existing store-owned engines.
+        // CPU path: adopt final directly-received engines, resolve an existing
+        // canonical store owner, or consume the portable archive wire record.
+        // The wire record contains eager CPU NativeVNNI data as well as the
+        // original native blocks needed by accelerator destinations. CPU uses
+        // the eager representation without another quantization pass.
         auto t_start = std::chrono::high_resolution_clock::now();
         int transferred_count = 0;
         std::atomic<bool> error_flag{false};
         const int count = static_cast<int>(new_experts.size());
-        const int target_numa_node = currentCPUNode();
-        if (target_numa_node < 0)
+        const int target_numa_node = ctx.cpu_numa_placement.node();
+        const bool enforce_numa_placement =
+            ctx.cpu_numa_placement.requiresNodeBinding();
+        if (enforce_numa_placement && numa_available() < 0)
         {
-            LOG_ERROR("[MoEWeightService][NUMA] Cannot determine target NUMA node for CPU expert arrivals");
+            LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert arrivals on NUMA node "
+                      << target_numa_node << ": libnuma policy APIs are unavailable");
             return false;
         }
+        if (!enforce_numa_placement)
+        {
+            LOG_DEBUG("[MoEWeightService][NUMA] CPU expert arrivals use aggregate CPU domain; "
+                      "strict single-node placement is disabled for layer "
+                      << ctx.layer_idx);
+        }
+
+        const auto placement = enforce_numa_placement
+            ? CPUWeightStoragePlacement::onNode(target_numa_node)
+            : CPUWeightStoragePlacement::local();
 
         auto cached_engine_for = [&](const std::optional<ExpertSlabRef> &slab_ref, int expert_id) -> ITensorGemm *
         {
@@ -1081,9 +1565,9 @@ namespace llaminar2
             return ctx.prepared_store->expertGemmKernel(*slab_ref, expert_id);
         };
 
-        // Prepare engines: use store-owned engines first, then transferred blobs.
-        // Raw tensor repacking is intentionally forbidden after initial eager graph
-        // materialization because host expert data may already have been released.
+        // Prepare engines: use store-owned engines first, then direct prepared
+        // arrivals, then the canonical portable archive payload. Raw tensor
+        // repacking remains forbidden after initial graph materialization.
         for (int idx = 0; idx < count; ++idx)
         {
             if (error_flag.load(std::memory_order_relaxed))
@@ -1103,40 +1587,80 @@ namespace llaminar2
                 continue;
             }
 
-            // Fast path: create kernels directly from pre-packed transferred blobs
-            const ExpertWeightBlobs *blobs = nullptr;
-            if (received_weights)
+            const PreparedExpertEngines *prepared = nullptr;
+            if (received_prepared_experts)
             {
-                auto it = received_weights->find(e);
-                if (it != received_weights->end() && !it->second.empty())
-                    blobs = &it->second;
+                auto it = received_prepared_experts->find(e);
+                if (it != received_prepared_experts->end())
+                    prepared = &it->second;
             }
 
-            if (!blobs)
+            if (prepared && prepared->complete())
             {
-                LOG_ERROR("[MoEWeightService] Missing transferred/store-owned packed weights for new CPU expert "
-                          << e << " on layer " << ctx.layer_idx << "; raw expert repack fallback is disabled");
-                error_flag.store(true, std::memory_order_relaxed);
-                continue;
+                gate_engine = prepared->gate;
+                up_engine = prepared->up;
+                down_engine = prepared->down;
             }
-
-            gate_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->gate);
-            up_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->up);
-            down_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->down);
-
-            if (gate_engine && up_engine && down_engine)
-                ++transferred_count;
-
-            if (!gate_engine || !up_engine || !down_engine)
+            else
             {
-                LOG_ERROR("[MoEWeightService] Failed to deserialize transferred packed GEMM weights for new CPU expert "
-                          << e << " on layer " << ctx.layer_idx << "; raw expert repack fallback is disabled");
-                error_flag.store(true, std::memory_order_relaxed);
-                continue;
+                const ExpertWeightBlobs *portable = nullptr;
+                std::optional<ExpertWeightBlobs> provider_payload;
+                if (received_weights)
+                {
+                    const auto found = received_weights->find(e);
+                    if (found != received_weights->end() &&
+                        !found->second.empty())
+                    {
+                        portable = &found->second;
+                    }
+                }
+                if (!portable && ctx.payload_provider)
+                {
+                    provider_payload =
+                        ctx.payload_provider->payloadFor(ctx.layer_idx, e);
+                    if (provider_payload && !provider_payload->empty())
+                        portable = &*provider_payload;
+                }
+
+                const auto build_projection = [placement](
+                                                  const ExpertTransferBuffer &blob)
+                    -> std::shared_ptr<ITensorGemm>
+                {
+                    if (blob.empty())
+                        return nullptr;
+                    return KernelFactory::createExpertGemmFromTransferBlob(
+                        blob.data(), blob.size(), placement);
+                };
+                if (portable)
+                {
+                    gate_engine = build_projection(portable->gate);
+                    up_engine = build_projection(portable->up);
+                    down_engine = build_projection(portable->down);
+                }
+
+                if (!gate_engine || !up_engine || !down_engine)
+                {
+                    LOG_ERROR("[MoEWeightService] Missing complete prepared/archive weights for new CPU expert "
+                              << e << " on layer " << ctx.layer_idx
+                              << "; raw tensor repacking is forbidden after materialization");
+                    error_flag.store(true, std::memory_order_relaxed);
+                    continue;
+                }
+
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency",
+                    "cpu_portable_payload_arrivals",
+                    1.0,
+                    "maintenance",
+                    ctx.device_id.to_string(),
+                    {{"layer", std::to_string(ctx.layer_idx)},
+                     {"expert", std::to_string(e)}});
             }
-            if (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
-                !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
-                !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down"))
+            ++transferred_count;
+            if (enforce_numa_placement &&
+                (!verifyExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
+                 !verifyExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
+                 !verifyExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down")))
             {
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
@@ -1167,9 +1691,12 @@ namespace llaminar2
                                                         << " experts (" << transferred_count << " transferred): "
                                                         << std::fixed << std::setprecision(1) << prep_ms << " ms");
 
-        auditExpertNUMA(new_experts, ctx.prepared_gate_gemm,
-                        (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
-                        ctx.layer_idx, target_numa_node);
+        if (enforce_numa_placement)
+        {
+            auditExpertNUMA(new_experts, ctx.prepared_gate_gemm,
+                            (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
+                            ctx.layer_idx, target_numa_node);
+        }
 
         // Phase C: Register new arrivals in PreparedWeightStore using cached slab refs
         if (ctx.prepared_store && !new_experts.empty())
@@ -1246,16 +1773,21 @@ namespace llaminar2
         struct WeightGroup
         {
             const char *label;
-            std::vector<std::shared_ptr<TensorBase>> &views;
             std::vector<ITensorGemm *> &out_gemms;
         };
         WeightGroup groups[] = {
-            {"gate", ctx.expert_gate_views, ctx.prepared_gate_gemm},
-            {"up", ctx.expert_up_views, ctx.prepared_up_gemm},
-            {"down", ctx.expert_down_views, ctx.prepared_down_gemm},
+            {"gate", ctx.prepared_gate_gemm},
+            {"up", ctx.prepared_up_gemm},
+            {"down", ctx.prepared_down_gemm},
         };
+        resolveExpertSlabRefs(ctx, /*create_if_missing=*/false);
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend,
+            requirePhysicalMemoryAuthority(
+                ctx,
+                "GPU expert rebalance preparation"),
+            PhysicalMemoryOwner::RoutedExpertWeights);
         orchestrator->addDevice(gpu_ordinal);
 
         size_t max_raw_bytes = 0;
@@ -1265,6 +1797,7 @@ namespace llaminar2
         {
             std::unique_ptr<IPackedWeights> packed;
             const cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *native = nullptr;
+            const NativeVnniFormatInfo *format_info = nullptr;
             RepackFormat format = RepackFormat::Q4_0;
         };
         std::vector<TransferSource> transfer_sources;
@@ -1297,7 +1830,7 @@ namespace llaminar2
             return nullptr;
         };
 
-        auto blobFor = [&](int expert_id, const char *label) -> const std::vector<uint8_t> *
+        auto blobFor = [&](int expert_id, const char *label) -> const ExpertTransferBuffer *
         {
             const ExpertWeightBlobs *blobs = blobsForExpert(expert_id);
             if (!blobs)
@@ -1320,7 +1853,7 @@ namespace llaminar2
             return true;
         };
 
-        auto makeTransferSource = [&](const std::vector<uint8_t> &blob,
+        auto makeTransferSource = [&](const ExpertTransferBuffer &blob,
                                       int expert_id,
                                       const char *label) -> std::optional<TransferSource>
         {
@@ -1344,7 +1877,12 @@ namespace llaminar2
 
             const auto &cpu_packed = native->packed();
             auto repack_fmt = codebookIdToRepackFormat(cpu_packed.codebook_id, cpu_packed.is_superblock);
-            if (!repack_fmt)
+            const auto *format_info = nativeVnniFormatForPacked(
+                cpu_packed.codebook_id,
+                cpu_packed.is_superblock);
+            if (!repack_fmt || !format_info || cpu_packed.N <= 0 ||
+                cpu_packed.K <= 0 || (cpu_packed.K % 32) != 0 ||
+                native->nativeBlocks().empty())
             {
                 LOG_ERROR("[MoEWeightService::GPU-rebalance] Unsupported transferred packed format for expert "
                           << expert_id << " " << label
@@ -1355,6 +1893,7 @@ namespace llaminar2
 
             TransferSource source;
             source.native = native;
+            source.format_info = format_info;
             source.format = *repack_fmt;
             source.packed = std::move(packed);
             return source;
@@ -1362,17 +1901,28 @@ namespace llaminar2
 
         std::vector<int> experts_to_load;
         experts_to_load.reserve(new_experts.size());
-        auto cached_engine_for = [&](const std::optional<ExpertSlabRef> &slab_ref, int expert_id) -> ITensorGemm *
+        auto cached_engine_for = [&](std::optional<ExpertSlabRef> &slab_ref,
+                                     WeightRole role,
+                                     int expert_id) -> ITensorGemm *
         {
-            if (!ctx.prepared_store || !slab_ref.has_value())
+            if (!ctx.prepared_store || expert_id < 0 || expert_id >= ctx.num_experts)
                 return nullptr;
-            return ctx.prepared_store->expertGemmKernel(*slab_ref, expert_id);
+            if (slab_ref.has_value())
+            {
+                if (auto *engine = ctx.prepared_store->expertGemmKernel(*slab_ref, expert_id))
+                    return engine;
+            }
+            auto found = ctx.prepared_store->findExpertSlab(makeExpertSlabDescriptor(ctx, role));
+            if (!found.has_value())
+                return nullptr;
+            slab_ref = *found;
+            return ctx.prepared_store->expertGemmKernel(*found, expert_id);
         };
         for (int e : new_experts)
         {
-            ITensorGemm *cached_gate = cached_engine_for(ctx.gate_slab_ref, e);
-            ITensorGemm *cached_up = cached_engine_for(ctx.up_slab_ref, e);
-            ITensorGemm *cached_down = cached_engine_for(ctx.down_slab_ref, e);
+            ITensorGemm *cached_gate = cached_engine_for(ctx.gate_slab_ref, WeightRole::MoEExpertGate, e);
+            ITensorGemm *cached_up = cached_engine_for(ctx.up_slab_ref, WeightRole::MoEExpertUp, e);
+            ITensorGemm *cached_down = cached_engine_for(ctx.down_slab_ref, WeightRole::MoEExpertDown, e);
             if (cached_gate && cached_up && cached_down)
             {
                 groups[0].out_gemms[e] = cached_gate;
@@ -1386,7 +1936,7 @@ namespace llaminar2
                 LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e
                                                                       << " requires transferred/provider blobs for all gate/up/down weights on "
                                                                       << ctx.device_id.to_string() << " (layer " << ctx.layer_idx
-                                                                      << "). Raw GGUF fallback is not allowed during GPU rebalance after host release.");
+                                                                      << "). The canonical archive payload is mandatory after host release.");
                 return false;
             }
 
@@ -1408,44 +1958,6 @@ namespace llaminar2
             for (int idx = 0; idx < count; ++idx)
             {
                 const int e = experts_to_load[idx];
-                const auto &view = grp.views[e];
-                if (!view)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Null view for expert "
-                              << e << " in " << grp.label);
-                    return false;
-                }
-
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
-                if (!vnni)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
-                                                                          << grp.label << " has no VNNI format info");
-                    return false;
-                }
-
-#ifdef HAVE_ROCM
-                if (ctx.device_id.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
-                {
-                    if (!rocm::ensureIQGridTablesInitialized(gpu_ordinal))
-                    {
-                        LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to initialize ROCm IQ grid tables for "
-                                  << ctx.device_id.to_string());
-                        return false;
-                    }
-                }
-#endif
-
-                const int N = static_cast<int>(view->rows());
-                const int K = static_cast<int>(view->cols());
-                const size_t raw_bytes = quantizedViewRawBytes(*view);
-                if (raw_bytes == 0)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Could not determine raw byte size for expert "
-                              << e << " " << grp.label);
-                    return false;
-                }
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
                 auto *blob = blobFor(e, grp.label);
@@ -1460,12 +1972,29 @@ namespace llaminar2
                 auto source = makeTransferSource(*blob, e, grp.label);
                 if (!source)
                     return false;
+                const auto &packed = source->native->packed();
+                const auto &format = *source->format_info;
+#ifdef HAVE_ROCM
+                if (ctx.device_id.is_rocm() &&
+                    format.codebook_id >= 11 && format.codebook_id <= 17 &&
+                    !rocm::ensureIQGridTablesInitialized(gpu_ordinal))
+                {
+                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to initialize ROCm IQ grid tables for "
+                              << ctx.device_id.to_string());
+                    return false;
+                }
+#endif
                 const size_t source_bytes = source->native->nativeBlocks().size();
+                orchestrator->planWeight(
+                    gpu_ordinal,
+                    slot_name,
+                    packed.N,
+                    packed.K,
+                    format.payload_bytes,
+                    format.is_asymmetric,
+                    format.has_emins,
+                    source_bytes);
                 transfer_sources.push_back(std::move(*source));
-
-                orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
-                                         vnni->payload_bytes, vnni->is_asymmetric,
-                                         vnni->has_emins, source_bytes);
                 max_raw_bytes = std::max(max_raw_bytes, source_bytes);
                 ++total_planned;
             }
@@ -1477,7 +2006,16 @@ namespace llaminar2
 
         // Phase 2: Allocate VRAM pool + pinned ring buffer
         const auto &rocm_cfg = debugEnv().rocm;
-        orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+        const int repack_streams = std::clamp(rocm_cfg.repack_streams, 1, 8);
+        const size_t staging_budget_bytes = rocm_cfg.repack_budget_mb > 0
+                                                ? static_cast<size_t>(rocm_cfg.repack_budget_mb) * 1024ULL * 1024ULL
+                                                : 0;
+        const size_t staging_slot_bytes = staging_budget_bytes > 0
+                                              ? std::min(max_raw_bytes,
+                                                         std::max<size_t>(1, staging_budget_bytes /
+                                                                                 static_cast<size_t>(repack_streams)))
+                                              : max_raw_bytes;
+        orchestrator->allocate(staging_slot_bytes, repack_streams);
 
         // Phase 3: Create weight jobs from raw GGUF data
         size_t transfer_source_idx = 0;
@@ -1486,29 +2024,7 @@ namespace llaminar2
             for (int idx = 0; idx < count; ++idx)
             {
                 const int e = experts_to_load[idx];
-                const auto &view = grp.views[e];
-
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable->vnniFormatInfo();
-
-                auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
-                if (!repack_fmt)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Unsupported repack format for expert "
-                              << e << " " << grp.label
-                              << " (codebook=" << static_cast<int>(vnni->codebook_id)
-                              << ", superblock=" << vnni->is_superblock << ")");
-                    return false;
-                }
-
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
-
-                WeightJob job;
-                job.name = slot_name;
-                job.format = *repack_fmt;
-                job.N = static_cast<int>(view->rows());
-                job.K = static_cast<int>(view->cols());
-                job.is_asymmetric = vnni->is_asymmetric;
 
                 if (transfer_source_idx >= transfer_sources.size())
                 {
@@ -1516,6 +2032,13 @@ namespace llaminar2
                     return false;
                 }
                 const auto &source = transfer_sources[transfer_source_idx++];
+                const auto &packed = source.native->packed();
+                const auto &format = *source.format_info;
+                WeightJob job;
+                job.name = slot_name;
+                job.N = packed.N;
+                job.K = packed.K;
+                job.is_asymmetric = format.is_asymmetric;
                 job.host_raw_data = source.native->nativeBlocks().data();
                 job.raw_bytes = source.native->nativeBlocks().size();
                 job.format = source.format;
@@ -1535,12 +2058,12 @@ namespace llaminar2
         }
 
         // Phase 5: Create per-expert GEMM kernels from pool slots
+        transfer_source_idx = 0;
         for (auto &grp : groups)
         {
             for (int idx = 0; idx < count; ++idx)
             {
                 const int e = experts_to_load[idx];
-                const auto &view = grp.views[e];
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
                 auto slot = pool->getSlot(slot_name);
@@ -1550,10 +2073,16 @@ namespace llaminar2
                     return false;
                 }
 
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable->vnniFormatInfo();
-                const int N = static_cast<int>(view->rows());
-                const int K = static_cast<int>(view->cols());
+                if (transfer_source_idx >= transfer_sources.size())
+                {
+                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Kernel publication source accounting mismatch");
+                    return false;
+                }
+                const auto &source = transfer_sources[transfer_source_idx++];
+                const auto &packed = source.native->packed();
+                const auto &format = *source.format_info;
+                const int N = packed.N;
+                const int K = packed.K;
                 const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
 
                 std::shared_ptr<ITensorGemm> kernel;
@@ -1567,8 +2096,9 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator);
+                        canonicalDeviceVnniCodebookId(format.codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(format));
                 }
 #endif
 #ifdef HAVE_ROCM
@@ -1580,8 +2110,9 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator);
+                        canonicalDeviceVnniCodebookId(format.codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(format));
                 }
 #endif
 
@@ -1646,6 +2177,8 @@ namespace llaminar2
         // Phase C: Register GPU rebalanced experts in PreparedWeightStore
         if (ctx.prepared_store)
         {
+            resolveExpertSlabRefs(ctx, /*create_if_missing=*/true);
+
             auto register_gpu_rebalance = [&](const std::optional<ExpertSlabRef> &slab_ref,
                                               const std::vector<ITensorGemm *> &engines)
             {
@@ -1755,7 +2288,12 @@ namespace llaminar2
 
         // Create one LoadOrchestrator for ALL expert weights (3 groups × local_count).
         // Single VRAM allocation, pipelined H2D + GPU repack.
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend,
+            requirePhysicalMemoryAuthority(
+                ctx,
+                "GPU expert initial preparation"),
+            PhysicalMemoryOwner::RoutedExpertWeights);
         orchestrator->addDevice(gpu_ordinal);
 
         size_t max_raw_bytes = 0;
@@ -1822,7 +2360,16 @@ namespace llaminar2
 
         // Phase 2: Allocate VRAM pool + pinned ring buffer
         const auto &rocm_cfg = debugEnv().rocm;
-        orchestrator->allocate(max_raw_bytes, rocm_cfg.repack_streams);
+        const int repack_streams = std::clamp(rocm_cfg.repack_streams, 1, 8);
+        const size_t staging_budget_bytes = rocm_cfg.repack_budget_mb > 0
+                                                ? static_cast<size_t>(rocm_cfg.repack_budget_mb) * 1024ULL * 1024ULL
+                                                : 0;
+        const size_t staging_slot_bytes = staging_budget_bytes > 0
+                                              ? std::min(max_raw_bytes,
+                                                         std::max<size_t>(1, staging_budget_bytes /
+                                                                                 static_cast<size_t>(repack_streams)))
+                                              : max_raw_bytes;
+        orchestrator->allocate(staging_slot_bytes, repack_streams);
 
         // Phase 3: Create weight jobs
         for (auto &grp : groups)
@@ -1910,8 +2457,9 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator); // lifetime: keeps VRAM pool alive
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
                 }
 #endif
 #ifdef HAVE_ROCM
@@ -1923,8 +2471,9 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator); // lifetime: keeps VRAM pool alive
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
                 }
 #endif
 
@@ -1977,15 +2526,7 @@ namespace llaminar2
             auto register_gpu_slab = [&](WeightRole role,
                                          const std::vector<ITensorGemm *> &engines) -> ExpertSlabRef
             {
-                ExpertSlabDescriptor desc;
-                desc.layer_idx = ctx.layer_idx;
-                desc.role = role;
-                desc.device = ctx.device_id;
-                desc.num_experts = ctx.num_experts;
-                desc.local_expert_start = ctx.local_expert_start;
-                desc.local_expert_count = (ctx.local_expert_count < 0) ? ctx.num_experts : ctx.local_expert_count;
-                desc.rows_per_expert = ctx.expert_intermediate;
-                desc.cols_per_expert = ctx.d_model;
+                ExpertSlabDescriptor desc = makeExpertSlabDescriptor(ctx, role);
 
                 auto slab_ref = ctx.prepared_store->registerExpertSlab(desc);
 
@@ -2032,127 +2573,2540 @@ namespace llaminar2
     // GPU-direct expert transfer (GPU↔GPU, same packed format)
     // =========================================================================
 
-    bool MoEExpertWeightService::transferExpertsGPUDirect(
+    size_t GpuDirectStagedExpertArrivals::activationCount() const
+    {
+        size_t count = 0;
+        for (const auto &projection : projections)
+        {
+            if (projection.activation.has_value())
+                ++count;
+        }
+        return count;
+    }
+
+    std::vector<int> GpuDirectStagedExpertArrivals::expertIds() const
+    {
+        std::vector<int> ids;
+        ids.reserve(projections.size());
+        for (const auto &projection : projections)
+        {
+            if (projection.expert_id >= 0)
+                ids.push_back(projection.expert_id);
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        return ids;
+    }
+
+    bool GpuDirectTransferSlotProjection::valid() const
+    {
+        return expert_id >= 0 &&
+               (role == WeightRole::MoEExpertGate ||
+                role == WeightRole::MoEExpertUp ||
+                role == WeightRole::MoEExpertDown) &&
+               staged.valid() &&
+               N > 0 &&
+               K > 0 &&
+               blocks_per_row > 0 &&
+               payload_bytes_per_block > 0 &&
+               staged.n == N &&
+               staged.k == K &&
+               staged.blocks_per_row == blocks_per_row &&
+               staged.payload_bytes_per_block == payload_bytes_per_block &&
+               staged.is_asymmetric == is_asymmetric &&
+               staged.has_emins == has_emins &&
+               staged.codebook_id == codebook_id &&
+               source_identity.present &&
+               native_vnni_formats::forSourceIdentity(
+                   source_identity.codebook_id,
+                   source_identity.is_superblock) != nullptr &&
+               canonicalDeviceVnniCodebookId(source_identity.codebook_id) ==
+                   codebook_id &&
+               transfer_slot_lifetime != nullptr;
+    }
+
+    size_t GpuDirectTransferSlotArrivals::totalBytes() const
+    {
+        size_t bytes = 0;
+        for (const auto &projection : projections)
+            bytes += projection.bytes();
+        return bytes;
+    }
+
+    std::vector<int> GpuDirectTransferSlotArrivals::expertIds() const
+    {
+        std::vector<int> ids;
+        ids.reserve(projections.size());
+        for (const auto &projection : projections)
+        {
+            if (projection.expert_id >= 0)
+                ids.push_back(projection.expert_id);
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        return ids;
+    }
+
+    std::vector<std::shared_ptr<void>> GpuDirectTransferSlotArrivals::transferSlotLifetimes() const
+    {
+        std::vector<std::shared_ptr<void>> lifetimes;
+        lifetimes.reserve(projections.size() + completion.transient_lifetimes.size());
+        for (const auto &projection : projections)
+            appendUniqueLifetime(lifetimes, projection.transfer_slot_lifetime);
+        for (const auto &lifetime : completion.transient_lifetimes)
+            appendUniqueLifetime(lifetimes, lifetime);
+        return lifetimes;
+    }
+
+    std::vector<GpuExpertStagedActivation> MoEExpertWeightService::activationBatchForStagedArrivals(
+        const GpuDirectStagedExpertArrivals &arrivals)
+    {
+        std::vector<GpuExpertStagedActivation> batch;
+        batch.reserve(arrivals.projections.size());
+        for (const auto &projection : arrivals.projections)
+        {
+            if (projection.activation.has_value())
+                batch.push_back(*projection.activation);
+        }
+        return batch;
+    }
+
+    bool MoEExpertWeightService::activateGpuDirectTransferSlotArrivals(
+        MoEWeightContext &ctx,
+        const GpuDirectTransferSlotArrivals &arrivals,
+        void *activation_stream,
+        GpuDirectStagedExpertArrivals *activated_arrivals,
+        GpuDirectTransferCompletion *completion)
+    {
+        using Clock = std::chrono::steady_clock;
+        if (activated_arrivals)
+            *activated_arrivals = GpuDirectStagedExpertArrivals{};
+        if (completion)
+            *completion = GpuDirectTransferCompletion{};
+
+        if (arrivals.empty())
+            return true;
+
+        if (!activation_stream)
+        {
+            LOG_ERROR("[MoEWeightService] Transfer-slot activation requires an explicit stream for "
+                      << ctx.device_id.to_string() << " layer " << ctx.layer_idx);
+            return false;
+        }
+        if (!activated_arrivals)
+        {
+            LOG_ERROR("[MoEWeightService] Transfer-slot activation requires an output arrival carrier");
+            return false;
+        }
+        if (arrivals.device_id.is_valid() && arrivals.device_id != ctx.device_id)
+        {
+            LOG_ERROR("[MoEWeightService] Refusing transfer-slot activation for mismatched device: arrivals="
+                      << arrivals.device_id.to_string()
+                      << " ctx=" << ctx.device_id.to_string());
+            return false;
+        }
+        if (arrivals.layer_idx >= 0 && arrivals.layer_idx != ctx.layer_idx)
+        {
+            LOG_ERROR("[MoEWeightService] Refusing transfer-slot activation for mismatched layer: arrivals="
+                      << arrivals.layer_idx << " ctx=" << ctx.layer_idx);
+            return false;
+        }
+        if (!ctx.device_id.is_gpu())
+        {
+            LOG_ERROR("[MoEWeightService] Transfer-slot activation requires a GPU destination, got "
+                      << ctx.device_id.to_string());
+            return false;
+        }
+        if (!ctx.gpu_direct_slot_pool || !*ctx.gpu_direct_slot_pool)
+        {
+            LOG_ERROR("[MoEWeightService] Transfer-slot activation requires an existing GPU expert slot pool"
+                      << " on " << ctx.device_id.to_string()
+                      << " layer " << ctx.layer_idx);
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(ctx.device_id);
+        if (!backend)
+        {
+            LOG_ERROR("[MoEWeightService] No backend available for transfer-slot activation on "
+                      << ctx.device_id.to_string());
+            return false;
+        }
+
+        const int device_ordinal = gpuOrdinalFor(ctx.device_id);
+        if (device_ordinal < 0)
+        {
+            LOG_ERROR("[MoEWeightService] Invalid GPU ordinal for transfer-slot activation on "
+                      << ctx.device_id.to_string());
+            return false;
+        }
+
+        for (const auto &projection : arrivals.projections)
+        {
+            if (!projection.valid())
+            {
+                LOG_ERROR("[MoEWeightService] Invalid transfer-slot projection for layer "
+                          << ctx.layer_idx << " expert=" << projection.expert_id);
+                return false;
+            }
+            if (projection.expert_id >= ctx.num_experts)
+            {
+                LOG_ERROR("[MoEWeightService] Transfer-slot projection expert id out of range: "
+                          << projection.expert_id << " num_experts=" << ctx.num_experts);
+                return false;
+            }
+        }
+
+        uint64_t wait_event_ns = 0;
+        if (arrivals.completion.valid())
+        {
+            if (arrivals.completion.device_id != ctx.device_id ||
+                arrivals.completion.device_ordinal != device_ordinal)
+            {
+                LOG_ERROR("[MoEWeightService] Transfer-slot staging completion targets "
+                          << arrivals.completion.device_id.to_string()
+                          << " ordinal=" << arrivals.completion.device_ordinal
+                          << " but activation is on " << ctx.device_id.to_string()
+                          << " ordinal=" << device_ordinal
+                          << " layer=" << ctx.layer_idx);
+                return false;
+            }
+
+            const auto wait_start = Clock::now();
+            if (!backend->streamWaitEvent(
+                    activation_stream,
+                    arrivals.completion.ready_event.get(),
+                    device_ordinal))
+            {
+                LOG_ERROR("[MoEWeightService] Failed to make activation stream wait on transfer-slot staging event"
+                          << " layer=" << ctx.layer_idx
+                          << " device=" << ctx.device_id.to_string());
+                return false;
+            }
+            wait_event_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     Clock::now() - wait_start)
+                                                     .count());
+        }
+
+        auto *slot_pool = ctx.gpu_direct_slot_pool->get();
+        const auto arrival_expert_ids = arrivals.expertIds();
+        const size_t available_active_slots = slot_pool->availableSlots();
+        if (available_active_slots < arrival_expert_ids.size())
+        {
+            LOG_ERROR("[MoEWeightService] Transfer-slot activation lacks active-slot capacity for layer "
+                      << ctx.layer_idx << " on " << ctx.device_id.to_string()
+                      << ": requested=" << arrival_expert_ids.size()
+                      << " available=" << available_active_slots
+                      << " capacity=" << slot_pool->activeCapacity()
+                      << " used=" << slot_pool->usedSlots());
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "gpu_direct_transfer_slot_activation_capacity_rejects",
+                1.0,
+                "rebalance",
+                ctx.device_id.to_string(),
+                {{"layer", std::to_string(ctx.layer_idx)}});
+            return false;
+        }
+
+        std::unordered_map<int, GpuExpertSlotPool::AcquiredSlot> active_slots;
+        for (int expert_id : arrival_expert_ids)
+        {
+            auto acquired = slot_pool->acquire(expert_id);
+            if (!acquired.has_value())
+            {
+                LOG_ERROR("[MoEWeightService] Failed to acquire active GPU expert slot for staged expert "
+                          << expert_id << " layer " << ctx.layer_idx
+                          << " on " << ctx.device_id.to_string());
+                return false;
+            }
+            active_slots.emplace(expert_id, std::move(*acquired));
+        }
+
+        GpuDirectStagedExpertArrivals out;
+        out.device_id = ctx.device_id;
+        out.source_device = arrivals.source_device;
+        out.layer_idx = ctx.layer_idx;
+        out.projections.reserve(arrivals.projections.size());
+
+        std::vector<GpuExpertStagedActivation> activation_batch;
+        activation_batch.reserve(arrivals.projections.size());
+        size_t activation_bytes = 0;
+        uint64_t wrap_ns = 0;
+
+        for (const auto &projection : arrivals.projections)
+        {
+            auto active_it = active_slots.find(projection.expert_id);
+            if (active_it == active_slots.end())
+                return false;
+
+            const char *label = gpuDirectRoleLabel(projection.role);
+            if (!label)
+                return false;
+
+            auto slot_it = std::find_if(
+                active_it->second.projections.begin(),
+                active_it->second.projections.end(),
+                [&](const GpuExpertSlotPool::ProjectionSlot &slot)
+                {
+                    return slot.spec.label == label;
+                });
+            if (slot_it == active_it->second.projections.end())
+            {
+                LOG_ERROR("[MoEWeightService] Active GPU expert slot for expert "
+                          << projection.expert_id << " lacks " << label
+                          << " projection on layer " << ctx.layer_idx);
+                return false;
+            }
+
+            auto active_desc = packedDescFromSlot(
+                slot_it->slot,
+                projection.N,
+                projection.K,
+                projection.blocks_per_row,
+                projection.codebook_id,
+                projection.payload_bytes_per_block,
+                projection.is_asymmetric,
+                projection.has_emins);
+            if (!gpuExpertPackedDescriptorsCompatible(projection.staged, active_desc))
+            {
+                LOG_ERROR("[MoEWeightService] Transfer-slot and active-slot descriptors are incompatible for "
+                          << label << " expert " << projection.expert_id
+                          << " layer " << ctx.layer_idx);
+                return false;
+            }
+
+            GpuExpertStagedActivation activation;
+            activation.staged = projection.staged;
+            activation.active = active_desc;
+            activation_bytes += active_desc.totalBytes();
+            activation_batch.push_back(activation);
+
+            const auto wrap_start = Clock::now();
+            auto kernel = createGpuDirectKernelFromSlot(
+                ctx.device_id,
+                device_ordinal,
+                slot_it->slot,
+                projection.N,
+                projection.K,
+                projection.blocks_per_row,
+                projection.codebook_id,
+                projection.source_identity,
+                active_it->second.lifetime);
+            wrap_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 Clock::now() - wrap_start)
+                                                 .count());
+            if (!kernel)
+            {
+                LOG_ERROR("[MoEWeightService] Failed to create active-slot GEMM wrapper for "
+                          << label << " expert " << projection.expert_id
+                          << " layer " << ctx.layer_idx
+                          << " on " << ctx.device_id.to_string());
+                return false;
+            }
+
+            GpuDirectStagedExpertProjection staged_projection;
+            staged_projection.expert_id = projection.expert_id;
+            staged_projection.role = projection.role;
+            staged_projection.engine = kernel.get();
+            staged_projection.engine_lifetime = std::move(kernel);
+            staged_projection.activation = activation;
+            out.projections.push_back(std::move(staged_projection));
+        }
+
+        const auto activation_start = Clock::now();
+        if (!GPUExpertTransfer::activateStagedExperts(
+                activation_batch,
+                ctx.device_id,
+                activation_stream))
+        {
+            LOG_ERROR("[MoEWeightService] Transfer-slot activation batch failed for "
+                      << activation_batch.size()
+                      << " projection(s) layer " << ctx.layer_idx
+                      << " dst=" << ctx.device_id.to_string());
+            return false;
+        }
+        const uint64_t activation_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      Clock::now() - activation_start)
+                                      .count());
+
+        int completion_events = 0;
+        if (completion)
+        {
+            void *ready_event = backend->createEvent(device_ordinal);
+            if (!ready_event ||
+                !backend->recordEvent(ready_event, device_ordinal, activation_stream))
+            {
+                if (ready_event)
+                    backend->destroyEvent(ready_event, device_ordinal);
+                LOG_ERROR("[MoEWeightService] Failed to record transfer-slot activation completion event"
+                          << " layer " << ctx.layer_idx
+                          << " on " << ctx.device_id.to_string());
+                return false;
+            }
+
+            completion->device_id = ctx.device_id;
+            completion->device_ordinal = device_ordinal;
+            completion->ready_event = eventOwnerFor(backend, device_ordinal, ready_event);
+            completion->source_ready_event = arrivals.completion.ready_event;
+            completion->transfer_stream = std::shared_ptr<void>(activation_stream, [](void *) {});
+            completion->transient_lifetimes = arrivals.transferSlotLifetimes();
+            out.completion = *completion;
+            completion_events = 1;
+        }
+
+        PerfStatsCollector::Tags tags{
+            {"layer", std::to_string(ctx.layer_idx)},
+            {"dst", ctx.device_id.to_string()}};
+        if (arrivals.source_device.has_value())
+            tags.emplace("src", arrivals.source_device->to_string());
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_activation_count",
+                                       static_cast<double>(activation_batch.size()),
+                                       "rebalance", ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_activation_batches",
+                                       activation_batch.empty() ? 0.0 : 1.0,
+                                       "rebalance", ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_activation_bytes",
+                                       static_cast<double>(activation_bytes),
+                                       "rebalance", ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_activation_completion_events",
+                                       static_cast<double>(completion_events),
+                                       "rebalance", ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_activation_wait",
+                                           wait_event_ns,
+                                           "rebalance", ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_activation_copy",
+                                           activation_ns,
+                                           "rebalance", ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_activation_wrap",
+                                           wrap_ns,
+                                           "rebalance", ctx.device_id.to_string(), tags);
+
+        *activated_arrivals = std::move(out);
+        return true;
+    }
+
+    bool MoEExpertWeightService::installActivatedGpuDirectArrivals(
+        MoEWeightContext &ctx,
+        const GpuDirectStagedExpertArrivals &arrivals)
+    {
+        if (arrivals.empty())
+            return true;
+        if (arrivals.device_id.is_valid() && arrivals.device_id != ctx.device_id)
+        {
+            LOG_ERROR("[MoEWeightService] Refusing staged GPU arrival install for mismatched device: arrivals="
+                      << arrivals.device_id.to_string()
+                      << " ctx=" << ctx.device_id.to_string());
+            return false;
+        }
+        if (arrivals.layer_idx >= 0 && arrivals.layer_idx != ctx.layer_idx)
+        {
+            LOG_ERROR("[MoEWeightService] Refusing staged GPU arrival install for mismatched layer: arrivals="
+                      << arrivals.layer_idx << " ctx=" << ctx.layer_idx);
+            return false;
+        }
+
+        auto vector_for_role = [&](WeightRole role) -> std::vector<ITensorGemm *> *
+        {
+            if (role == WeightRole::MoEExpertGate)
+                return &ctx.prepared_gate_gemm;
+            if (role == WeightRole::MoEExpertUp)
+                return &ctx.prepared_up_gemm;
+            if (role == WeightRole::MoEExpertDown)
+                return &ctx.prepared_down_gemm;
+            return nullptr;
+        };
+
+        auto slab_ref_for_role = [&](WeightRole role) -> std::optional<ExpertSlabRef> *
+        {
+            if (role == WeightRole::MoEExpertGate)
+                return &ctx.gate_slab_ref;
+            if (role == WeightRole::MoEExpertUp)
+                return &ctx.up_slab_ref;
+            if (role == WeightRole::MoEExpertDown)
+                return &ctx.down_slab_ref;
+            return nullptr;
+        };
+
+        auto registry_role_for = [](WeightRole role) -> std::optional<ExpertGemmRegistry::WeightRole>
+        {
+            if (role == WeightRole::MoEExpertGate)
+                return ExpertGemmRegistry::WeightRole::GATE;
+            if (role == WeightRole::MoEExpertUp)
+                return ExpertGemmRegistry::WeightRole::UP;
+            if (role == WeightRole::MoEExpertDown)
+                return ExpertGemmRegistry::WeightRole::DOWN;
+            return std::nullopt;
+        };
+
+        auto remember_owner = [&](const std::shared_ptr<ITensorGemm> &owner)
+        {
+            if (!owner)
+                return;
+            const ITensorGemm *raw = owner.get();
+            auto it = std::find_if(
+                ctx.moe_owned_kernels.begin(),
+                ctx.moe_owned_kernels.end(),
+                [&](const std::shared_ptr<ITensorGemm> &existing)
+                {
+                    return existing && existing.get() == raw;
+                });
+            if (it == ctx.moe_owned_kernels.end())
+                ctx.moe_owned_kernels.push_back(owner);
+        };
+
+        std::vector<ExpertArrival> gate_arrivals;
+        std::vector<ExpertArrival> up_arrivals;
+        std::vector<ExpertArrival> down_arrivals;
+        auto arrivals_for_role = [&](WeightRole role) -> std::vector<ExpertArrival> *
+        {
+            if (role == WeightRole::MoEExpertGate)
+                return &gate_arrivals;
+            if (role == WeightRole::MoEExpertUp)
+                return &up_arrivals;
+            if (role == WeightRole::MoEExpertDown)
+                return &down_arrivals;
+            return nullptr;
+        };
+
+        std::vector<int> installed_experts;
+        installed_experts.reserve(arrivals.projections.size());
+
+        if (ctx.prepared_store)
+            resolveExpertSlabRefs(ctx, /*create_if_missing=*/true);
+
+        for (const auto &projection : arrivals.projections)
+        {
+            if (!projection.valid())
+            {
+                LOG_ERROR("[MoEWeightService] Invalid staged GPU-direct projection for layer "
+                          << ctx.layer_idx << " expert=" << projection.expert_id);
+                return false;
+            }
+            if (projection.expert_id >= ctx.num_experts)
+            {
+                LOG_ERROR("[MoEWeightService] Staged GPU-direct projection expert id out of range: "
+                          << projection.expert_id << " num_experts=" << ctx.num_experts);
+                return false;
+            }
+
+            auto *engines = vector_for_role(projection.role);
+            if (!engines || projection.expert_id >= static_cast<int>(engines->size()))
+            {
+                LOG_ERROR("[MoEWeightService] Staged GPU-direct projection role/vector mismatch for expert "
+                          << projection.expert_id << " layer " << ctx.layer_idx);
+                return false;
+            }
+
+            (*engines)[projection.expert_id] = projection.engine;
+            remember_owner(projection.engine_lifetime);
+            installed_experts.push_back(projection.expert_id);
+
+            if (ctx.expert_registry)
+            {
+                auto registry_role = registry_role_for(projection.role);
+                if (registry_role.has_value())
+                {
+                    ctx.expert_registry->replaceEngine(
+                        ctx.device_id,
+                        ctx.layer_idx,
+                        projection.expert_id,
+                        *registry_role,
+                        projection.engine,
+                        projection.engine_lifetime);
+                }
+            }
+
+            if (auto *role_arrivals = arrivals_for_role(projection.role))
+            {
+                ExpertArrival arrival;
+                arrival.expert_id = projection.expert_id;
+                arrival.engine = projection.engine;
+                arrival.engine_lifetime = projection.engine_lifetime;
+                arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+                arrival.source_device = arrivals.source_device;
+                if (arrivals.completion.valid())
+                {
+                    auto store_completion = arrivals.completion;
+                    store_completion.transient_lifetimes.clear();
+                    arrival.gpu_direct_completion = std::move(store_completion);
+                }
+                role_arrivals->push_back(std::move(arrival));
+            }
+        }
+
+        if (ctx.payload_provider)
+        {
+            std::sort(installed_experts.begin(), installed_experts.end());
+            installed_experts.erase(
+                std::unique(installed_experts.begin(), installed_experts.end()),
+                installed_experts.end());
+            for (int expert_id : installed_experts)
+                ctx.payload_provider->markExpertPrepared(ctx.layer_idx, expert_id);
+        }
+
+        if (ctx.prepared_store)
+        {
+            auto register_role_arrivals = [&](WeightRole role, const std::vector<ExpertArrival> &role_arrivals)
+            {
+                if (role_arrivals.empty())
+                    return;
+                auto *slab_ref = slab_ref_for_role(role);
+                if (slab_ref && slab_ref->has_value())
+                    ctx.prepared_store->registerArrivedExperts(**slab_ref, role_arrivals);
+            };
+
+            register_role_arrivals(WeightRole::MoEExpertGate, gate_arrivals);
+            register_role_arrivals(WeightRole::MoEExpertUp, up_arrivals);
+            register_role_arrivals(WeightRole::MoEExpertDown, down_arrivals);
+        }
+
+        return true;
+    }
+
+    bool MoEExpertWeightService::stageExpertsGPUDirectToTransferSlots(
         const MoEWeightContext &src_ctx,
         MoEWeightContext &dst_ctx,
         const std::vector<int> &expert_ids,
-        int layer_idx)
+        int layer_idx,
+        void *source_producer_stream,
+        GpuDirectTransferSlotArrivals *staged_arrivals,
+        std::vector<int> *satisfied_expert_ids,
+        size_t active_arrival_capacity,
+        size_t staging_pool_capacity,
+        std::vector<std::shared_ptr<GpuExpertTransferStagingPool>> *transfer_staging_pools)
     {
-#ifdef HAVE_ROCM
-        if (!src_ctx.device_id.is_rocm() || !dst_ctx.device_id.is_rocm())
+        using Clock = std::chrono::steady_clock;
+        const auto t_start = Clock::now();
+        if (staged_arrivals)
+            *staged_arrivals = GpuDirectTransferSlotArrivals{};
+
+        if (satisfied_expert_ids)
+            satisfied_expert_ids->clear();
+
+        if (expert_ids.empty())
+            return true;
+
+        if (!staged_arrivals)
         {
-            LOG_DEBUG("[MoEWeightService] GPU-direct transfer requires both contexts on ROCm "
+            LOG_ERROR("[MoEWeightService] GPU-direct transfer-slot staging requires an output carrier");
+            return false;
+        }
+
+        if (!src_ctx.device_id.is_gpu() || !dst_ctx.device_id.is_gpu() ||
+            src_ctx.device_id.type != dst_ctx.device_id.type)
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging requires same-backend GPU contexts "
                       << "(src=" << src_ctx.device_id.to_string()
                       << " dst=" << dst_ctx.device_id.to_string() << ")");
             return false;
         }
 
-        using namespace llaminar2::rocm;
-
-        // Get source batch packed weights from lifetime pointers
-        auto *src_gate_batch = static_cast<MoEBatchPackedWeightsROCm *>(src_ctx.moe_packed_gate_lifetime.get());
-        auto *src_up_batch = static_cast<MoEBatchPackedWeightsROCm *>(src_ctx.moe_packed_up_lifetime.get());
-        auto *src_down_batch = static_cast<MoEBatchPackedWeightsROCm *>(src_ctx.moe_packed_down_lifetime.get());
-
-        if (!src_gate_batch || !src_up_batch || !src_down_batch)
+        if (!source_producer_stream)
         {
-            LOG_DEBUG("[MoEWeightService] GPU-direct transfer: source batch packed weights not available");
+            LOG_ERROR("[MoEWeightService] GPU-direct transfer-slot staging requires an explicit source producer stream for "
+                      << src_ctx.device_id.to_string());
             return false;
         }
 
-        auto *dst_gate_batch = static_cast<MoEBatchPackedWeightsROCm *>(dst_ctx.moe_packed_gate_lifetime.get());
-        auto *dst_up_batch = static_cast<MoEBatchPackedWeightsROCm *>(dst_ctx.moe_packed_up_lifetime.get());
-        auto *dst_down_batch = static_cast<MoEBatchPackedWeightsROCm *>(dst_ctx.moe_packed_down_lifetime.get());
-
-        if (!dst_gate_batch || !dst_up_batch || !dst_down_batch)
+        IBackend *backend = getBackendFor(dst_ctx.device_id);
+        IBackend *source_backend = getBackendFor(src_ctx.device_id);
+        if (!backend || !source_backend)
         {
-            LOG_DEBUG("[MoEWeightService] GPU-direct transfer: destination batch packed weights not available");
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging missing backend"
+                      << " src=" << src_ctx.device_id.to_string()
+                      << " dst=" << dst_ctx.device_id.to_string());
             return false;
         }
 
-        const int src_rocm = src_ctx.device_id.rocm_ordinal();
-        const int dst_rocm = dst_ctx.device_id.rocm_ordinal();
+        const int dst_gpu_ordinal = gpuOrdinalFor(dst_ctx.device_id);
+        const int src_gpu_ordinal = gpuOrdinalFor(src_ctx.device_id);
+        if (dst_gpu_ordinal < 0 || src_gpu_ordinal < 0)
+            return false;
+        const auto memory_authority =
+            requirePhysicalMemoryAuthority(
+                dst_ctx,
+                "GPU-direct expert transfer-slot staging");
 
-        auto transferOneBatch = [&](
-                                    MoEBatchPackedWeightsROCm *src_batch,
-                                    MoEBatchPackedWeightsROCm *dst_batch,
-                                    std::shared_ptr<void> &dst_lifetime,
-                                    std::vector<ITensorGemm *> &dst_gemms,
-                                    const char *label) -> bool
+        struct WeightGroup
         {
-            const size_t vnni_per_expert = src_batch->vnni_bytes_per_expert;
-            const size_t scales_per_expert = src_batch->scales_per_expert * sizeof(uint16_t);
-            const size_t mins_per_expert = src_batch->mins_per_expert * sizeof(uint16_t);
-            const size_t emins_per_expert = src_batch->emins_per_expert * sizeof(uint32_t);
+            const char *label;
+            WeightRole role;
+            const std::vector<ITensorGemm *> &src_gemms;
+            const std::vector<ITensorGemm *> &dst_gemms;
+            std::vector<std::shared_ptr<TensorBase>> &dst_views;
+        };
 
-            for (int expert_id : expert_ids)
+        WeightGroup groups[] = {
+            {"gate", WeightRole::MoEExpertGate, src_ctx.prepared_gate_gemm, dst_ctx.prepared_gate_gemm, dst_ctx.expert_gate_views},
+            {"up", WeightRole::MoEExpertUp, src_ctx.prepared_up_gemm, dst_ctx.prepared_up_gemm, dst_ctx.expert_up_views},
+            {"down", WeightRole::MoEExpertDown, src_ctx.prepared_down_gemm, dst_ctx.prepared_down_gemm, dst_ctx.expert_down_views},
+        };
+        constexpr size_t group_count = sizeof(groups) / sizeof(groups[0]);
+
+        auto source_slab_ref_for = [&](WeightRole role) -> const std::optional<ExpertSlabRef> &
+        {
+            if (role == WeightRole::MoEExpertGate)
+                return src_ctx.gate_slab_ref;
+            if (role == WeightRole::MoEExpertUp)
+                return src_ctx.up_slab_ref;
+            return src_ctx.down_slab_ref;
+        };
+
+        auto stored_engine_for = [&](const MoEWeightContext &ctx,
+                                     WeightRole role,
+                                     const std::optional<ExpertSlabRef> &cached_ref,
+                                     int expert_id) -> ITensorGemm *
+        {
+            if (!ctx.prepared_store || expert_id < 0 || expert_id >= ctx.num_experts)
+                return nullptr;
+            if (cached_ref.has_value())
+                return ctx.prepared_store->expertGemmKernel(*cached_ref, expert_id);
+
+            auto found = ctx.prepared_store->findExpertSlab(makeExpertSlabDescriptor(ctx, role));
+            if (!found.has_value())
+                return nullptr;
+            return ctx.prepared_store->expertGemmKernel(*found, expert_id);
+        };
+
+        auto source_engine_for = [&](const WeightGroup &grp, int expert_id) -> ITensorGemm *
+        {
+            if (expert_id >= 0 &&
+                expert_id < static_cast<int>(grp.src_gemms.size()) &&
+                grp.src_gemms[expert_id])
             {
-                auto src_ptrs = src_batch->getExpertDevicePointers(src_rocm, expert_id);
-                auto dst_ptrs_rocm = dst_batch->getExpertDevicePointers(dst_rocm, expert_id);
+                return grp.src_gemms[expert_id];
+            }
+            return stored_engine_for(src_ctx, grp.role, source_slab_ref_for(grp.role), expert_id);
+        };
 
-                GPUExpertPointers src_gep, dst_gep;
-                src_gep.d_vnni = src_ptrs.d_native_vnni;
-                src_gep.d_scales = src_ptrs.d_native_scales;
-                src_gep.d_mins = src_ptrs.d_native_mins;
-                src_gep.d_emins = src_ptrs.d_native_emins;
-                dst_gep.d_vnni = dst_ptrs_rocm.d_native_vnni;
-                dst_gep.d_scales = dst_ptrs_rocm.d_native_scales;
-                dst_gep.d_mins = dst_ptrs_rocm.d_native_mins;
-                dst_gep.d_emins = dst_ptrs_rocm.d_native_emins;
+        auto destination_already_live = [&](int expert_id) -> bool
+        {
+            if (expert_id < 0 ||
+                expert_id >= static_cast<int>(dst_ctx.prepared_gate_gemm.size()) ||
+                expert_id >= static_cast<int>(dst_ctx.prepared_up_gemm.size()) ||
+                expert_id >= static_cast<int>(dst_ctx.prepared_down_gemm.size()))
+            {
+                return false;
+            }
+            return dst_ctx.prepared_gate_gemm[expert_id] &&
+                   dst_ctx.prepared_up_gemm[expert_id] &&
+                   dst_ctx.prepared_down_gemm[expert_id];
+        };
 
-                if (!GPUExpertTransfer::transferExpert(
-                        src_gep, dst_gep,
-                        src_ctx.device_id, dst_ctx.device_id,
-                        vnni_per_expert, scales_per_expert, mins_per_expert, emins_per_expert,
-                        nullptr))
-                {
-                    LOG_ERROR("[MoEWeightService] GPU-direct transfer failed for "
-                              << label << " expert " << expert_id
-                              << " layer " << layer_idx);
-                    return false;
-                }
+        std::vector<int> already_satisfied;
+        already_satisfied.reserve(expert_ids.size());
+        std::vector<int> staged_satisfied;
+        staged_satisfied.reserve(expert_ids.size());
 
-                // Create GEMM engine for the destination device pointing to transferred data
-                auto kernel = std::make_shared<ROCmQuantisedGemmKernel>(
-                    dst_batch->rows_per_expert, dst_batch->K, dst_rocm,
-                    dst_ptrs_rocm.d_native_vnni,
-                    dst_ptrs_rocm.d_native_scales,
-                    dst_ptrs_rocm.d_native_mins,
-                    dst_ptrs_rocm.d_native_emins,
-                    dst_batch->codebook_id, static_cast<uint32_t>(dst_batch->blocks_per_row),
-                    dst_lifetime);
-                dst_gemms[expert_id] = kernel.get();
-                dst_ctx.moe_owned_kernels.push_back(std::move(kernel));
+        auto publish_ids = [&](const std::vector<int> &ids)
+        {
+            if (satisfied_expert_ids)
+            {
+                *satisfied_expert_ids = ids;
+                std::sort(satisfied_expert_ids->begin(), satisfied_expert_ids->end());
+                satisfied_expert_ids->erase(
+                    std::unique(satisfied_expert_ids->begin(), satisfied_expert_ids->end()),
+                    satisfied_expert_ids->end());
+            }
+        };
+
+        auto publish_already_satisfied = [&]()
+        {
+            publish_ids(already_satisfied);
+        };
+
+        auto publish_success = [&]()
+        {
+            std::vector<int> all = already_satisfied;
+            all.insert(all.end(), staged_satisfied.begin(), staged_satisfied.end());
+            publish_ids(all);
+        };
+
+        std::vector<int> experts_to_stage;
+        experts_to_stage.reserve(expert_ids.size());
+        for (int expert_id : expert_ids)
+        {
+            if (expert_id < 0 || expert_id >= dst_ctx.num_experts)
+            {
+                publish_already_satisfied();
+                return false;
+            }
+            if (destination_already_live(expert_id))
+            {
+                already_satisfied.push_back(expert_id);
+                continue;
+            }
+            experts_to_stage.push_back(expert_id);
+        }
+
+        if (experts_to_stage.empty())
+        {
+            publish_success();
+            return true;
+        }
+        const size_t requested_active_capacity =
+            std::max(experts_to_stage.size(), active_arrival_capacity);
+        const size_t requested_staging_capacity =
+            std::max(experts_to_stage.size(), staging_pool_capacity);
+
+        auto source_descriptor_for = [&](const WeightGroup &grp,
+                                         int expert_id,
+                                         DeviceNativeVNNIMatrixDesc &out,
+                                         NativeVnniSourceIdentity &source_identity) -> bool
+        {
+            ITensorGemm *source_engine = source_engine_for(grp, expert_id);
+            if (!source_engine)
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source missing "
+                          << grp.label << " engine for expert " << expert_id
+                          << " layer " << layer_idx);
+                return false;
+            }
+            if (!source_engine->exportNativeVNNIMatrixDesc(out) || !out.valid())
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
+                          << grp.label << " engine for expert " << expert_id
+                          << " layer " << layer_idx
+                          << " cannot export NativeVNNI descriptor");
+                return false;
+            }
+            if (!source_engine->exportNativeVNNISourceIdentity(source_identity) ||
+                !source_identity.present ||
+                canonicalDeviceVnniCodebookId(source_identity.codebook_id) !=
+                    out.codebook_id)
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
+                          << grp.label << " engine for expert " << expert_id
+                          << " layer " << layer_idx
+                          << " cannot export compatible NativeVNNI source identity");
+                return false;
             }
             return true;
         };
 
-        if (!transferOneBatch(src_gate_batch, dst_gate_batch,
-                              dst_ctx.moe_packed_gate_lifetime,
-                              dst_ctx.prepared_gate_gemm, "gate"))
-            return false;
-        if (!transferOneBatch(src_up_batch, dst_up_batch,
-                              dst_ctx.moe_packed_up_lifetime,
-                              dst_ctx.prepared_up_gemm, "up"))
-            return false;
-        if (!transferOneBatch(src_down_batch, dst_down_batch,
-                              dst_ctx.moe_packed_down_lifetime,
-                              dst_ctx.prepared_down_gemm, "down"))
-            return false;
+        auto vnni_info_for = [&](const WeightGroup &grp,
+                                 int expert_id) -> const NativeVnniFormatInfo *
+        {
+            if (expert_id < 0 || expert_id >= static_cast<int>(grp.dst_views.size()) ||
+                !grp.dst_views[expert_id])
+            {
+                return nullptr;
+            }
+            auto *unpackable = dynamic_cast<IINT8Unpackable *>(grp.dst_views[expert_id].get());
+            return unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        };
 
-        LOG_DEBUG("[MoEWeightService] GPU-direct transferred " << expert_ids.size()
-                                                              << " experts (3 weight types) ROCm:" << src_rocm
-                                                              << " → ROCm:" << dst_rocm << " layer " << layer_idx);
+        auto validate_optional_destination_view =
+            [&](const WeightGroup &grp,
+                int expert_id,
+                const DeviceNativeVNNIMatrixDesc &src_desc,
+                const NativeVnniSourceIdentity &source_identity,
+                uint8_t payload_bytes_per_block,
+                uint8_t is_asymmetric,
+                uint8_t has_emins) -> bool
+        {
+            if (expert_id < 0 || expert_id >= static_cast<int>(grp.dst_views.size()) ||
+                !grp.dst_views[static_cast<size_t>(expert_id)])
+            {
+                return true;
+            }
+
+            const auto &view = grp.dst_views[static_cast<size_t>(expert_id)];
+            const int N = static_cast<int>(view->rows());
+            const int K = static_cast<int>(view->cols());
+            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+            if (src_desc.n != N ||
+                src_desc.k != K ||
+                src_desc.blocks_per_row != blocks_per_row)
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: descriptor mismatch for "
+                          << grp.label << " expert " << expert_id
+                          << " layer " << layer_idx);
+                return false;
+            }
+
+            if (const NativeVnniFormatInfo *vnni = vnni_info_for(grp, expert_id);
+                vnni &&
+                (src_desc.codebook_id != canonicalDeviceVnniCodebookId(vnni->codebook_id) ||
+                 source_identity.codebook_id != vnni->codebook_id ||
+                 source_identity.is_superblock != vnni->is_superblock ||
+                 payload_bytes_per_block != static_cast<uint8_t>(vnni->payload_bytes) ||
+                 (is_asymmetric != 0) != vnni->is_asymmetric ||
+                 (has_emins != 0) != vnni->has_emins))
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: destination "
+                          << grp.label << " view format disagrees with source descriptor for expert "
+                          << expert_id << " layer " << layer_idx);
+                return false;
+            }
+            return true;
+        };
+
+        std::vector<int> experts_to_copy;
+        experts_to_copy.reserve(experts_to_stage.size());
+        for (int expert_id : experts_to_stage)
+        {
+            bool can_copy = true;
+            for (const auto &grp : groups)
+            {
+                DeviceNativeVNNIMatrixDesc src_desc{};
+                NativeVnniSourceIdentity source_identity{};
+                if (!source_descriptor_for(
+                        grp, expert_id, src_desc, source_identity))
+                {
+                    can_copy = false;
+                    break;
+                }
+
+                uint8_t payload_bytes_per_block = 0;
+                uint8_t is_asymmetric = 0;
+                uint8_t has_emins = 0;
+                if (!deviceMoEProjectionFormat(
+                        src_desc,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
+                              << grp.label << " descriptor for expert " << expert_id
+                              << " layer " << layer_idx
+                              << " has unsupported NativeVNNI codebook");
+                    can_copy = false;
+                    break;
+                }
+
+                if (!validate_optional_destination_view(
+                        grp,
+                        expert_id,
+                        src_desc,
+                        source_identity,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    can_copy = false;
+                    break;
+                }
+            }
+            if (can_copy)
+                experts_to_copy.push_back(expert_id);
+        }
+
+        if (experts_to_copy.empty())
+        {
+            publish_success();
+            return true;
+        }
+
+        auto make_slot_pool_specs = [&](int sample_expert)
+            -> std::optional<std::vector<GpuExpertSlotPool::ProjectionSpec>>
+        {
+            std::vector<GpuExpertSlotPool::ProjectionSpec> specs;
+            specs.reserve(group_count);
+            for (const auto &grp : groups)
+            {
+                if (sample_expert < 0 || sample_expert >= dst_ctx.num_experts)
+                    return std::nullopt;
+
+                DeviceNativeVNNIMatrixDesc src_desc{};
+                NativeVnniSourceIdentity source_identity{};
+                if (!source_descriptor_for(
+                        grp, sample_expert, src_desc, source_identity))
+                    return std::nullopt;
+
+                uint8_t payload_bytes_per_block = 0;
+                uint8_t is_asymmetric = 0;
+                uint8_t has_emins = 0;
+                if (!deviceMoEProjectionFormat(
+                        src_desc,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    return std::nullopt;
+                }
+
+                if (!validate_optional_destination_view(
+                        grp,
+                        sample_expert,
+                        src_desc,
+                        source_identity,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    return std::nullopt;
+                }
+
+                GpuExpertSlotPool::ProjectionSpec spec;
+                spec.label = grp.label;
+                spec.N = src_desc.n;
+                spec.K = src_desc.k;
+                spec.payload_bytes_per_block = static_cast<int>(payload_bytes_per_block);
+                spec.is_asymmetric = is_asymmetric != 0;
+                spec.has_emins = has_emins != 0;
+                spec.codebook_id = src_desc.codebook_id;
+                specs.push_back(std::move(spec));
+            }
+            return specs;
+        };
+
+        uint64_t allocation_ns = 0;
+        auto ensure_slot_pool = [&]() -> std::shared_ptr<GpuExpertSlotPool>
+        {
+            if (!dst_ctx.gpu_direct_slot_pool)
+                return nullptr;
+            if (*dst_ctx.gpu_direct_slot_pool)
+                return *dst_ctx.gpu_direct_slot_pool;
+
+            auto specs = make_slot_pool_specs(experts_to_copy.front());
+            if (!specs.has_value())
+                return nullptr;
+
+            const int capacity = GpuExpertSlotPool::recommendedCapacity(
+                dst_ctx.num_experts,
+                requested_active_capacity);
+            const auto pool_start = Clock::now();
+            try
+            {
+                *dst_ctx.gpu_direct_slot_pool = GpuExpertSlotPool::create(
+                    backend,
+                    dst_ctx.device_id,
+                    dst_gpu_ordinal,
+                    layer_idx,
+                    capacity,
+                    std::move(*specs),
+                    memory_authority,
+                    PhysicalMemoryOwner::RoutedExpertWeights,
+                    /*transfer_capacity=*/0);
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_WARN("[MoEWeightService] GPU-direct transfer-slot pool creation failed for layer "
+                         << layer_idx << " on " << dst_ctx.device_id.to_string()
+                         << ": " << ex.what());
+                *dst_ctx.gpu_direct_slot_pool = nullptr;
+                return nullptr;
+            }
+            allocation_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                       Clock::now() - pool_start)
+                                                       .count());
+            return *dst_ctx.gpu_direct_slot_pool;
+        };
+
+        auto ensure_staging_pool = [&]() -> std::shared_ptr<GpuExpertTransferStagingPool>
+        {
+            if (!transfer_staging_pools)
+                return nullptr;
+
+            auto specs = make_slot_pool_specs(experts_to_copy.front());
+            if (!specs.has_value())
+                return nullptr;
+
+            for (auto &pool : *transfer_staging_pools)
+            {
+                if (pool && pool->compatibleWith(*specs))
+                    return pool;
+            }
+
+            const int requested_capacity = GpuExpertTransferStagingPool::recommendedCapacity(
+                dst_ctx.num_experts,
+                requested_staging_capacity);
+            if (requested_capacity <= 0)
+                return nullptr;
+
+            std::vector<int> capacity_attempts;
+            for (int capacity = requested_capacity; capacity > 0;)
+            {
+                if (capacity_attempts.empty() || capacity_attempts.back() != capacity)
+                    capacity_attempts.push_back(capacity);
+                if (capacity == 1)
+                    break;
+                capacity = std::max(1, capacity / 2);
+            }
+
+            std::string last_error;
+            for (int capacity : capacity_attempts)
+            {
+                const auto pool_start = Clock::now();
+                try
+                {
+                    auto pool = GpuExpertTransferStagingPool::create(
+                        backend,
+                        dst_ctx.device_id,
+                        dst_gpu_ordinal,
+                        capacity,
+                        *specs,
+                        memory_authority);
+                    transfer_staging_pools->push_back(pool);
+                    allocation_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                               Clock::now() - pool_start)
+                                                               .count());
+                    if (capacity < requested_capacity)
+                    {
+                        LOG_WARN("[MoEWeightService] GPU-direct transfer staging pool downshifted on "
+                                 << dst_ctx.device_id.to_string()
+                                 << " from requested rolling capacity=" << requested_capacity
+                                 << " to capacity=" << capacity);
+                        PerfStatsCollector::addCounter(
+                            "moe_rebalance",
+                            "gpu_direct_transfer_staging_pool_capacity_downshifts",
+                            1.0,
+                            "rebalance",
+                            dst_ctx.device_id.to_string(),
+                            {{"layer", std::to_string(layer_idx)},
+                             {"requested_capacity", std::to_string(requested_capacity)},
+                             {"capacity", std::to_string(capacity)}});
+                    }
+                    return pool;
+                }
+                catch (const std::exception &ex)
+                {
+                    last_error = ex.what();
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "gpu_direct_transfer_staging_pool_capacity_downshift_attempts",
+                        1.0,
+                        "rebalance",
+                        dst_ctx.device_id.to_string(),
+                        {{"layer", std::to_string(layer_idx)},
+                         {"requested_capacity", std::to_string(requested_capacity)},
+                         {"capacity", std::to_string(capacity)}});
+                    continue;
+                }
+            }
+
+            LOG_ERROR("[MoEWeightService] GPU-direct transfer staging pool creation failed on "
+                      << dst_ctx.device_id.to_string()
+                      << " for requested rolling wave capacity=" << requested_capacity
+                      << (last_error.empty() ? "" : ": ")
+                      << last_error);
+            return nullptr;
+        };
+
+        struct ScopedGpuDirectTransferStream
+        {
+            IBackend *dst_backend = nullptr;
+            IBackend *src_backend = nullptr;
+            DeviceId dst_device;
+            int dst_device_ordinal = -1;
+            int src_device_ordinal = -1;
+            void *source_producer_stream = nullptr;
+            void *stream = nullptr;
+            void *source_ready_event = nullptr;
+            void *completion_event = nullptr;
+            std::shared_ptr<void> stream_owner;
+            bool enqueue_attempted = false;
+            bool synchronized = false;
+            bool completion_recorded = false;
+
+            ScopedGpuDirectTransferStream(IBackend *dst_backend_in,
+                                          IBackend *src_backend_in,
+                                          DeviceId dst_device_in,
+                                          int dst_device_ordinal_in,
+                                          int src_device_ordinal_in,
+                                          void *source_producer_stream_in)
+                : dst_backend(dst_backend_in),
+                  src_backend(src_backend_in),
+                  dst_device(dst_device_in),
+                  dst_device_ordinal(dst_device_ordinal_in),
+                  src_device_ordinal(src_device_ordinal_in),
+                  source_producer_stream(source_producer_stream_in) {}
+
+            bool begin(uint64_t &create_ns, uint64_t &event_ns, int &created_count, int &reuse_count)
+            {
+                if (!dst_backend || !src_backend || !source_producer_stream)
+                    return false;
+                stream_owner = reusableGpuDirectTransferStreamFor(
+                    dst_device,
+                    create_ns,
+                    created_count,
+                    reuse_count);
+                if (!stream_owner)
+                    return false;
+                stream = stream_owner.get();
+
+                const auto event_start = std::chrono::steady_clock::now();
+                source_ready_event = src_backend->createEvent(src_device_ordinal);
+                if (!source_ready_event ||
+                    !src_backend->recordEvent(source_ready_event,
+                                              src_device_ordinal,
+                                              source_producer_stream) ||
+                    !dst_backend->streamWaitEvent(stream,
+                                                  source_ready_event,
+                                                  dst_device_ordinal))
+                {
+                    event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                          std::chrono::steady_clock::now() - event_start)
+                                                          .count());
+                    return false;
+                }
+                event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      std::chrono::steady_clock::now() - event_start)
+                                                      .count());
+                return true;
+            }
+
+            std::shared_ptr<void> makeEventOwner(void *event, IBackend *owner_backend, int ordinal)
+            {
+                return std::shared_ptr<void>(
+                    event,
+                    [owner_backend, ordinal](void *ptr)
+                    {
+                        if (ptr && owner_backend)
+                            owner_backend->destroyEvent(ptr, ordinal);
+                    });
+            }
+
+            void markEnqueueAttempted()
+            {
+                enqueue_attempted = true;
+            }
+
+            bool recordCompletion(GpuDirectTransferCompletion &out, uint64_t &event_ns)
+            {
+                if (!stream || !dst_backend)
+                    return false;
+                const auto event_start = std::chrono::steady_clock::now();
+                completion_event = dst_backend->createEvent(dst_device_ordinal);
+                if (!completion_event ||
+                    !dst_backend->recordEvent(completion_event, dst_device_ordinal, stream))
+                {
+                    event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                          std::chrono::steady_clock::now() - event_start)
+                                                          .count());
+                    return false;
+                }
+
+                out.device_id = dst_device;
+                out.device_ordinal = dst_device_ordinal;
+                out.ready_event = makeEventOwner(completion_event, dst_backend, dst_device_ordinal);
+                out.source_ready_event = makeEventOwner(source_ready_event, src_backend, src_device_ordinal);
+                out.transfer_stream = stream_owner;
+                completion_event = nullptr;
+                source_ready_event = nullptr;
+                completion_recorded = true;
+                event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      std::chrono::steady_clock::now() - event_start)
+                                                      .count());
+                return true;
+            }
+
+            ~ScopedGpuDirectTransferStream()
+            {
+                if (stream && enqueue_attempted && !synchronized && !completion_recorded && dst_backend)
+                    (void)dst_backend->synchronizeStream(stream, dst_device_ordinal);
+                if (completion_event && dst_backend)
+                    dst_backend->destroyEvent(completion_event, dst_device_ordinal);
+                if (source_ready_event && src_backend)
+                    src_backend->destroyEvent(source_ready_event, src_device_ordinal);
+            }
+        };
+
+        uint64_t transfer_stream_create_ns = 0;
+        uint64_t transfer_stream_event_ns = 0;
+        uint64_t transfer_enqueue_ns = 0;
+        size_t staged_bytes = 0;
+        int transfer_stream_creation_count = 0;
+        int transfer_stream_reuse_count = 0;
+        int staged_projection_count = 0;
+        int staged_expert_count = 0;
+
+        std::shared_ptr<GpuExpertSlotPool> slot_pool = ensure_slot_pool();
+        if (!slot_pool)
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct staging requires a destination active slot pool");
+            publish_already_satisfied();
+            return false;
+        }
+        std::shared_ptr<GpuExpertTransferStagingPool> staging_pool = ensure_staging_pool();
+        if (!staging_pool)
+        {
+            LOG_ERROR("[MoEWeightService] GPU-direct staging requires a destination transfer staging pool for layer "
+                      << layer_idx << " on " << dst_ctx.device_id.to_string());
+            publish_already_satisfied();
+            return false;
+        }
+        const size_t available_staging_slots = staging_pool->availableSlots();
+        if (available_staging_slots == 0)
+        {
+            LOG_ERROR("[MoEWeightService] GPU-direct staging pool lacks capacity for rolling wave on layer "
+                      << layer_idx << " on " << dst_ctx.device_id.to_string()
+                      << ": requested=" << experts_to_copy.size()
+                      << " available=" << available_staging_slots
+                      << " capacity=" << staging_pool->capacity()
+                      << " used=" << staging_pool->usedSlots());
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "gpu_direct_transfer_staging_pool_capacity_rejects",
+                1.0,
+                "rebalance",
+                dst_ctx.device_id.to_string(),
+                {{"layer", std::to_string(layer_idx)},
+                 {"src", src_ctx.device_id.to_string()},
+                 {"dst", dst_ctx.device_id.to_string()}});
+            publish_already_satisfied();
+            return false;
+        }
+        if (available_staging_slots < experts_to_copy.size())
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct staging trims rolling wave on layer "
+                      << layer_idx << " on " << dst_ctx.device_id.to_string()
+                      << ": requested=" << experts_to_copy.size()
+                      << " available=" << available_staging_slots
+                      << " capacity=" << staging_pool->capacity()
+                      << " used=" << staging_pool->usedSlots());
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "gpu_direct_transfer_staging_pool_wave_trims",
+                1.0,
+                "rebalance",
+                dst_ctx.device_id.to_string(),
+                {{"layer", std::to_string(layer_idx)},
+                 {"src", src_ctx.device_id.to_string()},
+                 {"dst", dst_ctx.device_id.to_string()}});
+            experts_to_copy.resize(available_staging_slots);
+        }
+
+        ScopedGpuDirectTransferStream transfer_batch(
+            backend,
+            source_backend,
+            dst_ctx.device_id,
+            dst_gpu_ordinal,
+            src_gpu_ordinal,
+            source_producer_stream);
+        if (!transfer_batch.begin(transfer_stream_create_ns,
+                                  transfer_stream_event_ns,
+                                  transfer_stream_creation_count,
+                                  transfer_stream_reuse_count))
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: failed to create async transfer stream for "
+                      << dst_ctx.device_id.to_string());
+            publish_already_satisfied();
+            return false;
+        }
+
+        GpuDirectTransferSlotArrivals out;
+        out.device_id = dst_ctx.device_id;
+        out.source_device = src_ctx.device_id;
+        out.layer_idx = layer_idx;
+        out.projections.reserve(experts_to_copy.size() * group_count);
+
+        std::vector<std::shared_ptr<void>> transfer_lifetimes;
+        transfer_lifetimes.reserve(experts_to_copy.size());
+
+        for (int expert_id : experts_to_copy)
+        {
+            auto staging_lease = staging_pool->acquire(expert_id);
+            if (!staging_lease.has_value())
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct staging could not acquire staging slot for expert "
+                          << expert_id << " layer " << layer_idx
+                          << " on " << dst_ctx.device_id.to_string());
+                publish_already_satisfied();
+                return false;
+            }
+            ++staged_expert_count;
+            appendUniqueLifetime(transfer_lifetimes, staging_lease->lifetime);
+
+            for (size_t group_index = 0; group_index < group_count; ++group_index)
+            {
+                const auto &grp = groups[group_index];
+                if (group_index >= staging_lease->projections.size())
+                {
+                    publish_already_satisfied();
+                    return false;
+                }
+
+                DeviceNativeVNNIMatrixDesc src_matrix{};
+                NativeVnniSourceIdentity source_identity{};
+                if (!source_descriptor_for(
+                        grp, expert_id, src_matrix, source_identity))
+                {
+                    publish_already_satisfied();
+                    return false;
+                }
+
+                uint8_t payload_bytes_per_block = 0;
+                uint8_t is_asymmetric = 0;
+                uint8_t has_emins = 0;
+                if (!deviceMoEProjectionFormat(
+                        src_matrix,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    publish_already_satisfied();
+                    return false;
+                }
+
+                auto src_desc = makeGpuExpertPackedDescriptor(
+                    src_matrix,
+                    payload_bytes_per_block,
+                    is_asymmetric != 0,
+                    has_emins != 0);
+                auto dst_desc = packedDescFromSlot(
+                    staging_lease->projections[group_index].slot,
+                    src_matrix.n,
+                    src_matrix.k,
+                    src_matrix.blocks_per_row,
+                    src_matrix.codebook_id,
+                    payload_bytes_per_block,
+                    is_asymmetric != 0,
+                    has_emins != 0);
+
+                const auto copy_start = Clock::now();
+                transfer_batch.markEnqueueAttempted();
+                if (!GPUExpertTransfer::transferExpert(
+                        src_desc,
+                        dst_desc,
+                        src_ctx.device_id,
+                        dst_ctx.device_id,
+                        transfer_batch.stream))
+                {
+                    LOG_ERROR("[MoEWeightService] GPU-direct transfer-slot staging failed for "
+                              << grp.label << " expert " << expert_id
+                              << " layer " << layer_idx
+                              << " src=" << src_ctx.device_id.to_string()
+                              << " dst=" << dst_ctx.device_id.to_string());
+                    publish_already_satisfied();
+                    return false;
+                }
+                transfer_enqueue_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 Clock::now() - copy_start)
+                                                                 .count());
+
+                GpuDirectTransferSlotProjection projection;
+                projection.expert_id = expert_id;
+                projection.role = grp.role;
+                projection.staged = dst_desc;
+                projection.N = src_matrix.n;
+                projection.K = src_matrix.k;
+                projection.blocks_per_row = src_matrix.blocks_per_row;
+                projection.payload_bytes_per_block = payload_bytes_per_block;
+                projection.is_asymmetric = is_asymmetric != 0;
+                projection.has_emins = has_emins != 0;
+                projection.codebook_id = src_matrix.codebook_id;
+                projection.source_identity = source_identity;
+                projection.transfer_slot_lifetime = staging_lease->lifetime;
+                out.projections.push_back(std::move(projection));
+                staged_bytes += src_desc.totalBytes();
+                ++staged_projection_count;
+            }
+
+            staged_satisfied.push_back(expert_id);
+        }
+
+        if (!transfer_batch.recordCompletion(out.completion, transfer_stream_event_ns))
+        {
+            LOG_ERROR("[MoEWeightService] GPU-direct transfer-slot staging completion event record failed for layer "
+                      << layer_idx << " on " << dst_ctx.device_id.to_string());
+            publish_already_satisfied();
+            return false;
+        }
+        out.completion.transient_lifetimes = transfer_lifetimes;
+
+        const uint64_t elapsed_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      Clock::now() - t_start)
+                                      .count());
+
+        PerfStatsCollector::Tags tags{
+            {"layer", std::to_string(layer_idx)},
+            {"src", src_ctx.device_id.to_string()},
+            {"dst", dst_ctx.device_id.to_string()}};
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_stage_count",
+                                       static_cast<double>(staged_projection_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_stage_experts",
+                                       static_cast<double>(staged_expert_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_stage_bytes",
+                                       static_cast<double>(staged_bytes),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_stage_stream_creations",
+                                       static_cast<double>(transfer_stream_creation_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_stage_stream_reuses",
+                                       static_cast<double>(transfer_stream_reuse_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_stage_allocate",
+                                           allocation_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_stage_event",
+                                           transfer_stream_event_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_stage_enqueue",
+                                           transfer_enqueue_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_stage",
+                                           elapsed_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+
+        *staged_arrivals = std::move(out);
+        publish_success();
         return true;
+    }
 
-#else
-        (void)src_ctx;
-        (void)dst_ctx;
-        (void)expert_ids;
-        (void)layer_idx;
-        LOG_DEBUG("[MoEWeightService] GPU-direct transfer requires ROCm");
-        return false;
+    bool MoEExpertWeightService::transferExpertsGPUDirect(
+        const MoEWeightContext &src_ctx,
+        MoEWeightContext &dst_ctx,
+        const std::vector<int> &expert_ids,
+        int layer_idx,
+        void *source_producer_stream,
+        std::vector<int> *satisfied_expert_ids,
+        GpuDirectTransferCompletion *completion)
+    {
+        using Clock = std::chrono::steady_clock;
+        const auto t_start = Clock::now();
+        if (completion)
+            *completion = GpuDirectTransferCompletion{};
+
+        if (expert_ids.empty())
+        {
+            if (satisfied_expert_ids)
+                satisfied_expert_ids->clear();
+            return true;
+        }
+
+        if (!src_ctx.device_id.is_gpu() || !dst_ctx.device_id.is_gpu() ||
+            src_ctx.device_id.type != dst_ctx.device_id.type)
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer requires same-backend GPU contexts "
+                      << "(src=" << src_ctx.device_id.to_string()
+                      << " dst=" << dst_ctx.device_id.to_string() << ")");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(dst_ctx.device_id);
+        if (!backend)
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer: no backend for "
+                      << dst_ctx.device_id.to_string());
+            return false;
+        }
+
+        IBackend *source_backend = getBackendFor(src_ctx.device_id);
+        if (!source_backend)
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer: no source backend for "
+                      << src_ctx.device_id.to_string());
+            return false;
+        }
+
+        if (!source_producer_stream)
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer requires an explicit source producer stream for "
+                      << src_ctx.device_id.to_string());
+            return false;
+        }
+
+        const int dst_gpu_ordinal = dst_ctx.device_id.is_cuda()
+                                        ? dst_ctx.device_id.cuda_ordinal()
+                                        : dst_ctx.device_id.rocm_ordinal();
+        const int src_gpu_ordinal = src_ctx.device_id.is_cuda()
+                                        ? src_ctx.device_id.cuda_ordinal()
+                                        : src_ctx.device_id.rocm_ordinal();
+        const auto memory_authority =
+            requirePhysicalMemoryAuthority(
+                dst_ctx,
+                "GPU-direct expert transfer");
+        struct WeightGroup
+        {
+            const char *label;
+            WeightRole role;
+            const std::vector<ITensorGemm *> &src_gemms;
+            std::vector<std::shared_ptr<TensorBase>> &dst_views;
+            std::vector<ITensorGemm *> &dst_gemms;
+            std::optional<ExpertSlabRef> &dst_slab_ref;
+        };
+
+        WeightGroup groups[] = {
+            {"gate", WeightRole::MoEExpertGate, src_ctx.prepared_gate_gemm, dst_ctx.expert_gate_views, dst_ctx.prepared_gate_gemm, dst_ctx.gate_slab_ref},
+            {"up", WeightRole::MoEExpertUp, src_ctx.prepared_up_gemm, dst_ctx.expert_up_views, dst_ctx.prepared_up_gemm, dst_ctx.up_slab_ref},
+            {"down", WeightRole::MoEExpertDown, src_ctx.prepared_down_gemm, dst_ctx.expert_down_views, dst_ctx.prepared_down_gemm, dst_ctx.down_slab_ref},
+        };
+        constexpr size_t group_count = sizeof(groups) / sizeof(groups[0]);
+        resolveExpertSlabRefs(dst_ctx, /*create_if_missing=*/true);
+
+        auto source_slab_ref_for = [&](WeightRole role) -> const std::optional<ExpertSlabRef> &
+        {
+            if (role == WeightRole::MoEExpertGate)
+                return src_ctx.gate_slab_ref;
+            if (role == WeightRole::MoEExpertUp)
+                return src_ctx.up_slab_ref;
+            return src_ctx.down_slab_ref;
+        };
+
+        auto stored_engine_for = [&](const MoEWeightContext &ctx,
+                                     WeightRole role,
+                                     const std::optional<ExpertSlabRef> &cached_ref,
+                                     int expert_id) -> ITensorGemm *
+        {
+            if (!ctx.prepared_store || expert_id < 0 || expert_id >= ctx.num_experts)
+                return nullptr;
+            if (cached_ref.has_value())
+                return ctx.prepared_store->expertGemmKernel(*cached_ref, expert_id);
+
+            auto found = ctx.prepared_store->findExpertSlab(makeExpertSlabDescriptor(ctx, role));
+            if (!found.has_value())
+                return nullptr;
+            return ctx.prepared_store->expertGemmKernel(*found, expert_id);
+        };
+
+        auto stored_engine_lifetime_for = [&](const MoEWeightContext &ctx,
+                                              WeightRole role,
+                                              const std::optional<ExpertSlabRef> &cached_ref,
+                                              int expert_id) -> std::shared_ptr<ITensorGemm>
+        {
+            if (!ctx.prepared_store || expert_id < 0 || expert_id >= ctx.num_experts)
+                return nullptr;
+            if (cached_ref.has_value())
+                return ctx.prepared_store->expertGemmKernelLifetime(*cached_ref, expert_id);
+
+            auto found = ctx.prepared_store->findExpertSlab(makeExpertSlabDescriptor(ctx, role));
+            if (!found.has_value())
+                return nullptr;
+            return ctx.prepared_store->expertGemmKernelLifetime(*found, expert_id);
+        };
+
+        auto source_engine_for = [&](const WeightGroup &grp, int expert_id) -> ITensorGemm *
+        {
+            if (expert_id >= 0 &&
+                expert_id < static_cast<int>(grp.src_gemms.size()) &&
+                grp.src_gemms[expert_id])
+            {
+                return grp.src_gemms[expert_id];
+            }
+            return stored_engine_for(src_ctx, grp.role, source_slab_ref_for(grp.role), expert_id);
+        };
+
+        auto destination_owns_engine = [&](ITensorGemm *raw) -> bool
+        {
+            if (!raw)
+                return false;
+            for (const auto &owned : dst_ctx.moe_owned_kernels)
+            {
+                if (owned && owned.get() == raw)
+                    return true;
+            }
+            return false;
+        };
+
+        auto adopt_stored_destination_engine = [&](WeightRole role,
+                                                   const std::optional<ExpertSlabRef> &cached_ref,
+                                                   int expert_id) -> ITensorGemm *
+        {
+            auto owner = stored_engine_lifetime_for(dst_ctx, role, cached_ref, expert_id);
+            if (owner)
+            {
+                ITensorGemm *raw = owner.get();
+                if (!destination_owns_engine(raw))
+                    dst_ctx.moe_owned_kernels.push_back(std::move(owner));
+                return raw;
+            }
+            return stored_engine_for(dst_ctx, role, cached_ref, expert_id);
+        };
+
+        auto ensure_destination_owner = [&](WeightRole role,
+                                            const std::optional<ExpertSlabRef> &cached_ref,
+                                            int expert_id,
+                                            ITensorGemm *raw)
+        {
+            if (!raw || destination_owns_engine(raw))
+                return;
+            auto owner = stored_engine_lifetime_for(dst_ctx, role, cached_ref, expert_id);
+            if (owner && owner.get() == raw)
+                dst_ctx.moe_owned_kernels.push_back(std::move(owner));
+        };
+
+        auto destinationHasExpert = [&](int expert_id) -> bool
+        {
+            if (expert_id < 0 ||
+                expert_id >= static_cast<int>(dst_ctx.prepared_gate_gemm.size()) ||
+                expert_id >= static_cast<int>(dst_ctx.prepared_up_gemm.size()) ||
+                expert_id >= static_cast<int>(dst_ctx.prepared_down_gemm.size()))
+            {
+                return false;
+            }
+
+            if (!dst_ctx.prepared_gate_gemm[expert_id])
+                dst_ctx.prepared_gate_gemm[expert_id] =
+                    adopt_stored_destination_engine(WeightRole::MoEExpertGate, dst_ctx.gate_slab_ref, expert_id);
+            if (!dst_ctx.prepared_up_gemm[expert_id])
+                dst_ctx.prepared_up_gemm[expert_id] =
+                    adopt_stored_destination_engine(WeightRole::MoEExpertUp, dst_ctx.up_slab_ref, expert_id);
+            if (!dst_ctx.prepared_down_gemm[expert_id])
+                dst_ctx.prepared_down_gemm[expert_id] =
+                    adopt_stored_destination_engine(WeightRole::MoEExpertDown, dst_ctx.down_slab_ref, expert_id);
+
+            ensure_destination_owner(WeightRole::MoEExpertGate, dst_ctx.gate_slab_ref,
+                                     expert_id, dst_ctx.prepared_gate_gemm[expert_id]);
+            ensure_destination_owner(WeightRole::MoEExpertUp, dst_ctx.up_slab_ref,
+                                     expert_id, dst_ctx.prepared_up_gemm[expert_id]);
+            ensure_destination_owner(WeightRole::MoEExpertDown, dst_ctx.down_slab_ref,
+                                     expert_id, dst_ctx.prepared_down_gemm[expert_id]);
+
+            return dst_ctx.prepared_gate_gemm[expert_id] &&
+                   dst_ctx.prepared_up_gemm[expert_id] &&
+                   dst_ctx.prepared_down_gemm[expert_id];
+        };
+
+        std::vector<int> satisfied;
+        satisfied.reserve(expert_ids.size());
+        auto publish_satisfied = [&]()
+        {
+            std::sort(satisfied.begin(), satisfied.end());
+            satisfied.erase(std::unique(satisfied.begin(), satisfied.end()), satisfied.end());
+            if (satisfied_expert_ids)
+                *satisfied_expert_ids = satisfied;
+        };
+
+        std::vector<int> experts_to_load;
+        experts_to_load.reserve(expert_ids.size());
+        for (int e : expert_ids)
+        {
+            if (e < 0 || e >= dst_ctx.num_experts)
+            {
+                publish_satisfied();
+                return false;
+            }
+            if (destinationHasExpert(e))
+            {
+                satisfied.push_back(e);
+                continue;
+            }
+            experts_to_load.push_back(e);
+        }
+
+        if (experts_to_load.empty())
+        {
+            publish_satisfied();
+            return true;
+        }
+
+        auto sourceDescriptorFor = [&](const WeightGroup &grp,
+                                       int expert_id,
+                                       DeviceNativeVNNIMatrixDesc &out) -> bool
+        {
+            ITensorGemm *source_engine = source_engine_for(grp, expert_id);
+            if (!source_engine)
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer: source missing "
+                          << grp.label << " engine for expert " << expert_id
+                          << " layer " << layer_idx);
+                return false;
+            }
+            if (!source_engine->exportNativeVNNIMatrixDesc(out) || !out.valid())
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer: source "
+                          << grp.label << " engine for expert " << expert_id
+                          << " layer " << layer_idx
+                          << " cannot export NativeVNNI descriptor");
+                return false;
+            }
+            return true;
+        };
+
+        auto vnniInfoFor = [&](const WeightGroup &grp,
+                               int expert_id) -> const NativeVnniFormatInfo *
+        {
+            if (expert_id < 0 || expert_id >= static_cast<int>(grp.dst_views.size()) ||
+                !grp.dst_views[expert_id])
+            {
+                return nullptr;
+            }
+            auto *unpackable = dynamic_cast<IINT8Unpackable *>(grp.dst_views[expert_id].get());
+            return unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        };
+
+        std::vector<int> experts_to_copy;
+        experts_to_copy.reserve(experts_to_load.size());
+        for (int e : experts_to_load)
+        {
+            bool can_copy = true;
+            for (const auto &grp : groups)
+            {
+                DeviceNativeVNNIMatrixDesc src_desc{};
+                if (!sourceDescriptorFor(grp, e, src_desc))
+                {
+                    can_copy = false;
+                    break;
+                }
+
+                const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, e);
+                if (!vnni)
+                {
+                    LOG_DEBUG("[MoEWeightService] GPU-direct transfer: destination "
+                              << grp.label << " view for expert " << e
+                              << " layer " << layer_idx
+                              << " has no NativeVNNI format info");
+                    can_copy = false;
+                    break;
+                }
+
+                const int N = static_cast<int>(grp.dst_views[e]->rows());
+                const int K = static_cast<int>(grp.dst_views[e]->cols());
+                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+                if (src_desc.n != N ||
+                    src_desc.k != K ||
+                    src_desc.blocks_per_row != blocks_per_row ||
+                    src_desc.codebook_id != vnni->codebook_id)
+                {
+                    LOG_DEBUG("[MoEWeightService] GPU-direct transfer: descriptor mismatch for "
+                              << grp.label << " expert " << e
+                              << " layer " << layer_idx
+                              << " src=(" << src_desc.n << "x" << src_desc.k
+                              << " bpr=" << src_desc.blocks_per_row
+                              << " cb=" << static_cast<int>(src_desc.codebook_id)
+                              << ") dst=(" << N << "x" << K
+                              << " bpr=" << blocks_per_row
+                              << " cb=" << static_cast<int>(vnni->codebook_id) << ")");
+                    can_copy = false;
+                    break;
+                }
+            }
+
+            if (can_copy)
+                experts_to_copy.push_back(e);
+        }
+
+        if (experts_to_copy.empty())
+        {
+            publish_satisfied();
+            return true;
+        }
+
+        auto make_slot_pool_specs = [&](int sample_expert)
+            -> std::optional<std::vector<GpuExpertSlotPool::ProjectionSpec>>
+        {
+            std::vector<GpuExpertSlotPool::ProjectionSpec> specs;
+            specs.reserve(group_count);
+            for (const auto &grp : groups)
+            {
+                const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, sample_expert);
+                if (!vnni)
+                    return std::nullopt;
+                const int N = static_cast<int>(grp.dst_views[sample_expert]->rows());
+                const int K = static_cast<int>(grp.dst_views[sample_expert]->cols());
+                GpuExpertSlotPool::ProjectionSpec spec;
+                spec.label = grp.label;
+                spec.N = N;
+                spec.K = K;
+                spec.payload_bytes_per_block = vnni->payload_bytes;
+                spec.is_asymmetric = vnni->is_asymmetric;
+                spec.has_emins = vnni->has_emins;
+                spec.codebook_id = vnni->codebook_id;
+                specs.push_back(std::move(spec));
+            }
+            return specs;
+        };
+
+        auto ensure_slot_pool = [&](uint64_t &allocation_ns_accum)
+            -> std::shared_ptr<GpuExpertSlotPool>
+        {
+            if (!dst_ctx.gpu_direct_slot_pool)
+                return nullptr;
+            if (*dst_ctx.gpu_direct_slot_pool)
+                return *dst_ctx.gpu_direct_slot_pool;
+
+            auto specs = make_slot_pool_specs(experts_to_copy.front());
+            if (!specs.has_value())
+                return nullptr;
+
+            const int capacity = GpuExpertSlotPool::recommendedCapacity(
+                dst_ctx.num_experts,
+                experts_to_copy.size());
+            const auto pool_start = Clock::now();
+            try
+            {
+                *dst_ctx.gpu_direct_slot_pool = GpuExpertSlotPool::create(
+                    backend,
+                    dst_ctx.device_id,
+                    dst_gpu_ordinal,
+                    layer_idx,
+                    capacity,
+                    std::move(*specs),
+                    memory_authority,
+                    PhysicalMemoryOwner::RoutedExpertWeights,
+                    GpuExpertSlotPool::recommendedTransferCapacity(
+                        dst_ctx.num_experts,
+                        experts_to_copy.size()));
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_WARN("[MoEWeightService] GPU-direct slot pool creation failed for layer "
+                         << layer_idx << " on " << dst_ctx.device_id.to_string()
+                         << ": " << ex.what()
+                         << " (falling back to per-expert direct allocations)");
+                *dst_ctx.gpu_direct_slot_pool = nullptr;
+                return nullptr;
+            }
+            allocation_ns_accum += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                             Clock::now() - pool_start)
+                                                             .count());
+            return *dst_ctx.gpu_direct_slot_pool;
+        };
+
+        auto create_kernel_from_slot = [&](const WeightVRAMPool::WeightSlot &slot,
+                                           const NativeVnniFormatInfo &vnni,
+                                           int N,
+                                           int K,
+                                           uint32_t blocks_per_row,
+                                           const std::shared_ptr<void> &lifetime_owner)
+            -> std::shared_ptr<ITensorGemm>
+        {
+#ifdef HAVE_CUDA
+            if (dst_ctx.device_id.is_cuda())
+            {
+                return std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                    N, K, dst_gpu_ordinal,
+                    slot.d_native_vnni_payload,
+                    static_cast<uint16_t *>(slot.d_native_vnni_scales),
+                    static_cast<uint16_t *>(slot.d_native_vnni_mins),
+                    static_cast<uint32_t *>(slot.d_native_vnni_emins),
+                    canonicalDeviceVnniCodebookId(vnni.codebook_id), blocks_per_row,
+                    lifetime_owner,
+                    sourceIdentityFor(vnni));
+            }
 #endif
+#ifdef HAVE_ROCM
+            if (dst_ctx.device_id.is_rocm())
+            {
+                return std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                    N, K, dst_gpu_ordinal,
+                    slot.d_native_vnni_payload,
+                    slot.d_native_vnni_scales,
+                    slot.d_native_vnni_mins,
+                    slot.d_native_vnni_emins,
+                    canonicalDeviceVnniCodebookId(vnni.codebook_id), blocks_per_row,
+                    lifetime_owner,
+                    sourceIdentityFor(vnni));
+            }
+#endif
+            return nullptr;
+        };
+
+        size_t transferred_bytes = 0;
+        size_t transfer_slot_activation_bytes = 0;
+        int transferred_projections = 0;
+        int transfer_slot_activation_projections = 0;
+        int transfer_slot_activation_batches = 0;
+        int pooled_experts = 0;
+        int unpooled_experts = 0;
+        int transfer_slot_experts = 0;
+        uint64_t allocation_ns = 0;
+        uint64_t transfer_enqueue_ns = 0;
+        uint64_t transfer_wait_ns = 0;
+        uint64_t transfer_slot_activation_ns = 0;
+        uint64_t transfer_stream_create_ns = 0;
+        uint64_t transfer_stream_event_ns = 0;
+        uint64_t wrapper_ns = 0;
+        uint64_t finalize_ns = 0;
+        int transfer_stream_count = 0;
+        int transfer_stream_creation_count = 0;
+        int transfer_stream_reuse_count = 0;
+        int transfer_stream_sync_count = 0;
+        int transfer_stream_event_wait_count = 0;
+
+        GpuDirectStagedExpertArrivals staged_arrivals;
+        staged_arrivals.device_id = dst_ctx.device_id;
+        staged_arrivals.source_device = src_ctx.device_id;
+        staged_arrivals.layer_idx = layer_idx;
+        staged_arrivals.projections.reserve(experts_to_copy.size() * group_count);
+        std::vector<std::shared_ptr<void>> transient_transfer_lifetimes;
+        transient_transfer_lifetimes.reserve(experts_to_copy.size());
+
+        struct ScopedGpuDirectTransferStream
+        {
+            IBackend *dst_backend = nullptr;
+            IBackend *src_backend = nullptr;
+            DeviceId dst_device;
+            int dst_device_ordinal = -1;
+            int src_device_ordinal = -1;
+            void *source_producer_stream = nullptr;
+            void *stream = nullptr;
+            void *source_ready_event = nullptr;
+            void *completion_event = nullptr;
+            std::shared_ptr<void> stream_owner;
+            bool enqueue_attempted = false;
+            bool synchronized = false;
+            bool completion_recorded = false;
+
+            ScopedGpuDirectTransferStream(IBackend *dst_backend_in,
+                                          IBackend *src_backend_in,
+                                          DeviceId dst_device_in,
+                                          int dst_device_ordinal_in,
+                                          int src_device_ordinal_in,
+                                          void *source_producer_stream_in)
+                : dst_backend(dst_backend_in),
+                  src_backend(src_backend_in),
+                  dst_device(dst_device_in),
+                  dst_device_ordinal(dst_device_ordinal_in),
+                  src_device_ordinal(src_device_ordinal_in),
+                  source_producer_stream(source_producer_stream_in) {}
+
+            bool begin(uint64_t &create_ns, uint64_t &event_ns, int &created_count, int &reuse_count)
+            {
+                if (!dst_backend || !src_backend || !source_producer_stream)
+                    return false;
+
+                stream_owner = reusableGpuDirectTransferStreamFor(
+                    dst_device,
+                    create_ns,
+                    created_count,
+                    reuse_count);
+                if (!stream_owner)
+                    return false;
+                stream = stream_owner.get();
+
+                const auto event_start = Clock::now();
+                source_ready_event = src_backend->createEvent(src_device_ordinal);
+                if (!source_ready_event ||
+                    !src_backend->recordEvent(source_ready_event,
+                                              src_device_ordinal,
+                                              source_producer_stream) ||
+                    !dst_backend->streamWaitEvent(stream,
+                                                  source_ready_event,
+                                                  dst_device_ordinal))
+                {
+                    event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                          Clock::now() - event_start)
+                                                          .count());
+                    return false;
+                }
+                event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      Clock::now() - event_start)
+                                                      .count());
+                return true;
+            }
+
+            std::shared_ptr<void> makeEventOwner(void *event, IBackend *owner_backend, int ordinal)
+            {
+                return std::shared_ptr<void>(
+                    event,
+                    [owner_backend, ordinal](void *ptr)
+                    {
+                        if (ptr && owner_backend)
+                            owner_backend->destroyEvent(ptr, ordinal);
+                    });
+            }
+
+            void markEnqueueAttempted()
+            {
+                enqueue_attempted = true;
+            }
+
+            bool recordCompletion(GpuDirectTransferCompletion &out, uint64_t &event_ns)
+            {
+                if (!stream || !dst_backend)
+                    return false;
+
+                const auto event_start = Clock::now();
+                completion_event = dst_backend->createEvent(dst_device_ordinal);
+                if (!completion_event ||
+                    !dst_backend->recordEvent(completion_event, dst_device_ordinal, stream))
+                {
+                    event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                          Clock::now() - event_start)
+                                                          .count());
+                    return false;
+                }
+
+                out.device_ordinal = dst_device_ordinal;
+                out.ready_event = makeEventOwner(completion_event, dst_backend, dst_device_ordinal);
+                out.source_ready_event = makeEventOwner(source_ready_event, src_backend, src_device_ordinal);
+                out.transfer_stream = stream_owner;
+
+                completion_event = nullptr;
+                source_ready_event = nullptr;
+                completion_recorded = true;
+                event_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      Clock::now() - event_start)
+                                                      .count());
+                return true;
+            }
+
+            bool finish(uint64_t &wait_ns)
+            {
+                if (!stream || !dst_backend)
+                    return true;
+                const auto wait_start = Clock::now();
+                const bool ok = dst_backend->synchronizeStream(stream, dst_device_ordinal);
+                wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     Clock::now() - wait_start)
+                                                     .count());
+                synchronized = true;
+                return ok;
+            }
+
+            ~ScopedGpuDirectTransferStream()
+            {
+                if (stream && enqueue_attempted && !synchronized && !completion_recorded)
+                    (void)dst_backend->synchronizeStream(stream, dst_device_ordinal);
+                if (completion_event && dst_backend)
+                    dst_backend->destroyEvent(completion_event, dst_device_ordinal);
+                if (source_ready_event && src_backend)
+                    src_backend->destroyEvent(source_ready_event, src_device_ordinal);
+            }
+        };
+
+        ScopedGpuDirectTransferStream transfer_batch(
+            backend,
+            source_backend,
+            dst_ctx.device_id,
+            dst_gpu_ordinal,
+            src_gpu_ordinal,
+            source_producer_stream);
+        if (!transfer_batch.begin(transfer_stream_create_ns,
+                                  transfer_stream_event_ns,
+                                  transfer_stream_creation_count,
+                                  transfer_stream_reuse_count))
+        {
+            LOG_DEBUG("[MoEWeightService] GPU-direct transfer: failed to create async transfer stream for "
+                      << dst_ctx.device_id.to_string());
+            publish_satisfied();
+            return false;
+        }
+        transfer_stream_count = 1;
+        transfer_stream_event_wait_count = 1;
+
+        for (int e : experts_to_copy)
+        {
+            std::optional<GpuExpertSlotPool::AcquiredSlot> pooled_slot;
+            std::optional<GpuExpertSlotPool::TransferSlot> transfer_slot;
+            std::shared_ptr<GpuExpertSlotPool> slot_pool = ensure_slot_pool(allocation_ns);
+            if (slot_pool)
+            {
+                pooled_slot = slot_pool->acquire(e);
+                if (pooled_slot.has_value())
+                    transfer_slot = slot_pool->acquireTransferSlot(e);
+                if (transfer_slot.has_value())
+                    ++transfer_slot_experts;
+            }
+
+            std::shared_ptr<LoadOrchestrator> expert_orchestrator;
+            WeightVRAMPool *fallback_pool = nullptr;
+            if (!pooled_slot.has_value())
+            {
+                const auto alloc_start = Clock::now();
+                expert_orchestrator = std::make_shared<LoadOrchestrator>(
+                    backend,
+                    memory_authority,
+                    PhysicalMemoryOwner::RoutedExpertWeights);
+                expert_orchestrator->addDevice(dst_gpu_ordinal);
+
+                for (const auto &grp : groups)
+                {
+                    const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, e);
+                    if (!vnni)
+                    {
+                        publish_satisfied();
+                        return false;
+                    }
+
+                    const int N = static_cast<int>(grp.dst_views[e]->rows());
+                    const int K = static_cast<int>(grp.dst_views[e]->cols());
+                    const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+                    expert_orchestrator->planWeight(
+                        dst_gpu_ordinal,
+                        slot_name,
+                        N,
+                        K,
+                        vnni->payload_bytes,
+                        vnni->is_asymmetric,
+                        vnni->has_emins,
+                        /*raw_gguf_bytes=*/0);
+                }
+
+                expert_orchestrator->allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0);
+                fallback_pool = expert_orchestrator->getPool(dst_gpu_ordinal);
+                if (!fallback_pool)
+                {
+                    publish_satisfied();
+                    return false;
+                }
+                allocation_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                           Clock::now() - alloc_start)
+                                                           .count());
+                ++unpooled_experts;
+            }
+            else
+            {
+                ++pooled_experts;
+            }
+
+            for (size_t group_index = 0; group_index < group_count; ++group_index)
+            {
+                auto &grp = groups[group_index];
+                DeviceNativeVNNIMatrixDesc src_matrix{};
+                if (!sourceDescriptorFor(grp, e, src_matrix))
+                {
+                    publish_satisfied();
+                    return false;
+                }
+
+                const NativeVnniFormatInfo *vnni = vnniInfoFor(grp, e);
+                if (!vnni)
+                {
+                    publish_satisfied();
+                    return false;
+                }
+
+                const int N = static_cast<int>(grp.dst_views[e]->rows());
+                const int K = static_cast<int>(grp.dst_views[e]->cols());
+                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+                WeightVRAMPool::WeightSlot active_slot{};
+                WeightVRAMPool::WeightSlot copy_dst_slot{};
+                std::shared_ptr<void> lifetime_owner;
+                bool copy_via_transfer_slot = false;
+                if (pooled_slot.has_value())
+                {
+                    if (group_index >= pooled_slot->projections.size())
+                    {
+                        publish_satisfied();
+                        return false;
+                    }
+                    const auto &projection = pooled_slot->projections[group_index];
+                    active_slot = projection.slot;
+                    copy_dst_slot = active_slot;
+                    lifetime_owner = pooled_slot->lifetime;
+                    if (transfer_slot.has_value())
+                    {
+                        if (group_index >= transfer_slot->projections.size())
+                        {
+                            publish_satisfied();
+                            return false;
+                        }
+                        copy_dst_slot = transfer_slot->projections[group_index].slot;
+                        copy_via_transfer_slot = true;
+                    }
+                }
+                else
+                {
+                    const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
+                    auto fallback_slot = fallback_pool ? fallback_pool->getSlot(slot_name) : std::nullopt;
+                    if (!fallback_slot)
+                    {
+                        publish_satisfied();
+                        return false;
+                    }
+                    active_slot = *fallback_slot;
+                    copy_dst_slot = active_slot;
+                    lifetime_owner = expert_orchestrator;
+                }
+
+                DeviceNativeVNNIMatrixDesc dst_matrix{};
+                dst_matrix.payload = copy_dst_slot.d_native_vnni_payload;
+                dst_matrix.scales = copy_dst_slot.d_native_vnni_scales;
+                dst_matrix.mins = copy_dst_slot.d_native_vnni_mins;
+                dst_matrix.emins = copy_dst_slot.d_native_vnni_emins;
+                dst_matrix.n = N;
+                dst_matrix.k = K;
+                dst_matrix.blocks_per_row = blocks_per_row;
+                dst_matrix.codebook_id = vnni->codebook_id;
+
+                auto src_desc = makeGpuExpertPackedDescriptor(
+                    src_matrix,
+                    vnni->payload_bytes,
+                    vnni->is_asymmetric,
+                    vnni->has_emins);
+                auto dst_desc = makeGpuExpertPackedDescriptor(
+                    dst_matrix,
+                    vnni->payload_bytes,
+                    vnni->is_asymmetric,
+                    vnni->has_emins);
+
+                const auto copy_start = Clock::now();
+                transfer_batch.markEnqueueAttempted();
+                const bool copied = GPUExpertTransfer::transferExpert(
+                    src_desc,
+                    dst_desc,
+                    src_ctx.device_id,
+                    dst_ctx.device_id,
+                    transfer_batch.stream);
+                transfer_enqueue_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 Clock::now() - copy_start)
+                                                                 .count());
+                if (!copied)
+                {
+                    LOG_ERROR("[MoEWeightService] GPU-direct transfer failed for "
+                              << grp.label << " expert " << e
+                              << " layer " << layer_idx
+                              << " src=" << src_ctx.device_id.to_string()
+                              << " dst=" << dst_ctx.device_id.to_string());
+                    publish_satisfied();
+                    return false;
+                }
+
+                if (copy_via_transfer_slot)
+                {
+                    DeviceNativeVNNIMatrixDesc active_matrix{};
+                    active_matrix.payload = active_slot.d_native_vnni_payload;
+                    active_matrix.scales = active_slot.d_native_vnni_scales;
+                    active_matrix.mins = active_slot.d_native_vnni_mins;
+                    active_matrix.emins = active_slot.d_native_vnni_emins;
+                    active_matrix.n = N;
+                    active_matrix.k = K;
+                    active_matrix.blocks_per_row = blocks_per_row;
+                    active_matrix.codebook_id = vnni->codebook_id;
+
+                    auto active_desc = makeGpuExpertPackedDescriptor(
+                        active_matrix,
+                        vnni->payload_bytes,
+                        vnni->is_asymmetric,
+                        vnni->has_emins);
+
+                    GpuExpertStagedActivation activation;
+                    activation.staged = dst_desc;
+                    activation.active = active_desc;
+                    transfer_slot_activation_bytes += active_desc.totalBytes();
+                    ++transfer_slot_activation_projections;
+                    auto active_activation = std::move(activation);
+
+                    const auto wrapper_start = Clock::now();
+                    auto kernel = create_kernel_from_slot(
+                        active_slot,
+                        *vnni,
+                        N,
+                        K,
+                        blocks_per_row,
+                        lifetime_owner);
+
+                    if (!kernel)
+                    {
+                        publish_satisfied();
+                        return false;
+                    }
+
+                    GpuDirectStagedExpertProjection projection;
+                    projection.expert_id = e;
+                    projection.role = grp.role;
+                    projection.engine = kernel.get();
+                    projection.engine_lifetime = std::move(kernel);
+                    projection.activation = std::move(active_activation);
+                    staged_arrivals.projections.push_back(std::move(projection));
+                    transferred_bytes += src_desc.totalBytes();
+                    ++transferred_projections;
+                    wrapper_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            Clock::now() - wrapper_start)
+                                                            .count());
+                    continue;
+                }
+
+                const auto wrapper_start = Clock::now();
+                auto kernel = create_kernel_from_slot(
+                    active_slot,
+                    *vnni,
+                    N,
+                    K,
+                    blocks_per_row,
+                    lifetime_owner);
+
+                if (!kernel)
+                {
+                    publish_satisfied();
+                    return false;
+                }
+
+                GpuDirectStagedExpertProjection projection;
+                projection.expert_id = e;
+                projection.role = grp.role;
+                projection.engine = kernel.get();
+                projection.engine_lifetime = std::move(kernel);
+                staged_arrivals.projections.push_back(std::move(projection));
+                transferred_bytes += src_desc.totalBytes();
+                ++transferred_projections;
+                wrapper_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                        Clock::now() - wrapper_start)
+                                                        .count());
+            }
+
+            if (transfer_slot.has_value() && transfer_slot->lifetime)
+                transient_transfer_lifetimes.push_back(transfer_slot->lifetime);
+
+            if (expert_orchestrator)
+            {
+                const auto finalize_start = Clock::now();
+                expert_orchestrator->finalize();
+                finalize_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                         Clock::now() - finalize_start)
+                                                         .count());
+            }
+        }
+
+        auto pending_transfer_slot_activations =
+            activationBatchForStagedArrivals(staged_arrivals);
+        if (!pending_transfer_slot_activations.empty())
+        {
+            const auto activation_start = Clock::now();
+            transfer_batch.markEnqueueAttempted();
+            const bool activated = GPUExpertTransfer::activateStagedExperts(
+                pending_transfer_slot_activations,
+                dst_ctx.device_id,
+                transfer_batch.stream);
+            transfer_slot_activation_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - activation_start)
+                    .count());
+            if (!activated)
+            {
+                LOG_ERROR("[MoEWeightService] GPU-direct transfer-slot activation batch failed for "
+                          << pending_transfer_slot_activations.size()
+                          << " projection(s) layer " << layer_idx
+                          << " dst=" << dst_ctx.device_id.to_string());
+                publish_satisfied();
+                return false;
+            }
+            transfer_slot_activation_batches = 1;
+        }
+
+        int transfer_completion_event_count = 0;
+        if (completion)
+        {
+            completion->device_id = dst_ctx.device_id;
+            if (!transfer_batch.recordCompletion(*completion, transfer_stream_event_ns))
+            {
+                LOG_ERROR("[MoEWeightService] GPU-direct transfer completion event record failed for layer "
+                          << layer_idx << " on " << dst_ctx.device_id.to_string());
+                publish_satisfied();
+                return false;
+            }
+            completion->transient_lifetimes = transient_transfer_lifetimes;
+            transfer_completion_event_count = 1;
+        }
+        else if (!transfer_batch.finish(transfer_wait_ns))
+        {
+            LOG_ERROR("[MoEWeightService] GPU-direct transfer stream synchronization failed for layer "
+                      << layer_idx << " on " << dst_ctx.device_id.to_string());
+            publish_satisfied();
+            return false;
+        }
+        transfer_stream_sync_count = completion ? 0 : 1;
+
+        const auto registration_start = Clock::now();
+        if (completion && completion->valid())
+            staged_arrivals.completion = *completion;
+        if (!installActivatedGpuDirectArrivals(dst_ctx, staged_arrivals))
+        {
+            publish_satisfied();
+            return false;
+        }
+        const uint64_t registration_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      Clock::now() - registration_start)
+                                      .count());
+
+        const uint64_t elapsed_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      Clock::now() - t_start)
+                                      .count());
+
+        for (int e : experts_to_copy)
+        {
+            if (!destinationHasExpert(e))
+            {
+                LOG_ERROR("[MoEWeightService] GPU-direct transfer completed but destination still lacks expert "
+                          << e << " layer " << layer_idx << " on " << dst_ctx.device_id.to_string());
+                publish_satisfied();
+                return false;
+            }
+            satisfied.push_back(e);
+        }
+
+        PerfStatsCollector::Tags tags{
+            {"layer", std::to_string(layer_idx)},
+            {"src", src_ctx.device_id.to_string()},
+            {"dst", dst_ctx.device_id.to_string()}};
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_count",
+                                       static_cast<double>(transferred_projections),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_bytes",
+                                       static_cast<double>(transferred_bytes),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_slot_pool_experts",
+                                       static_cast<double>(pooled_experts),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_unpooled_experts",
+                                       static_cast<double>(unpooled_experts),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_experts",
+                                       static_cast<double>(transfer_slot_experts),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_activation_count",
+                                       static_cast<double>(transfer_slot_activation_projections),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_activation_batches",
+                                       static_cast<double>(transfer_slot_activation_batches),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_slot_activation_bytes",
+                                       static_cast<double>(transfer_slot_activation_bytes),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_streams",
+                                       static_cast<double>(transfer_stream_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_stream_creations",
+                                       static_cast<double>(transfer_stream_creation_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_stream_reuses",
+                                       static_cast<double>(transfer_stream_reuse_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_stream_syncs",
+                                       static_cast<double>(transfer_stream_sync_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_event_waits",
+                                       static_cast<double>(transfer_stream_event_wait_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_completion_events",
+                                       static_cast<double>(transfer_completion_event_count),
+                                       "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_arrival_allocate",
+                                           allocation_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_stream_create",
+                                           transfer_stream_create_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_stream_event_wait",
+                                           transfer_stream_event_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_enqueue",
+                                           transfer_enqueue_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_wait",
+                                           transfer_wait_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_activation_copy",
+                                           transfer_slot_activation_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_copy",
+                                           transfer_enqueue_ns + transfer_wait_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_arrival_wrap",
+                                           wrapper_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_arrival_finalize",
+                                           finalize_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_arrival_register",
+                                           registration_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer",
+                                           elapsed_ns,
+                                           "rebalance", dst_ctx.device_id.to_string(), tags);
+
+        LOG_DEBUG("[MoEWeightService] GPU-direct transferred "
+                  << experts_to_copy.size() << " experts ("
+                  << transferred_projections << " projections, "
+                  << transferred_bytes << " bytes, pooled="
+                  << pooled_experts << ", unpooled=" << unpooled_experts << ") "
+                  << src_ctx.device_id.to_string()
+                  << " → " << dst_ctx.device_id.to_string()
+                  << " layer " << layer_idx);
+        publish_satisfied();
+        return true;
     }
 
 } // namespace llaminar2

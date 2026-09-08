@@ -1,0 +1,305 @@
+/**
+ * @file HybridGDNDeviceStateArena.h
+ * @brief Cache-owned, preplanned GPU storage for every GDN layer state bank.
+ *
+ * The arena translates model-level GDN geometry into one contiguous
+ * DeviceWorkspaceManager allocation. Each hybrid-cache layer receives stable
+ * local/full/request slices, and later kernel construction binds those slices
+ * through GDNDeviceStateBinding. When local and full geometry are identical,
+ * request slot zero is the scalar live state rather than a second allocation;
+ * this makes request-zero coherence structural and removes publication copies.
+ * No kernel allocation or graph-time capacity repair is permitted.
+ */
+
+#pragma once
+
+#include "HybridKVCacheConfig.h"
+#include "../backends/DeviceId.h"
+#include "../execution/local_execution/device/DeviceWorkspaceManager.h"
+
+#include <algorithm>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace llaminar2
+{
+    /**
+     * @brief Own the persistent GDN state allocation for one hybrid GPU cache.
+     *
+     * This class is intentionally backend-neutral. DeviceWorkspaceManager
+     * selects CUDA or ROCm from DeviceId, while the identical naming and
+     * slicing policy keeps both GPU backends structurally symmetric.
+     */
+    class HybridGDNDeviceStateArena
+    {
+    public:
+        HybridGDNDeviceStateArena() = default;
+        ~HybridGDNDeviceStateArena() = default;
+
+        HybridGDNDeviceStateArena(const HybridGDNDeviceStateArena &) = delete;
+        HybridGDNDeviceStateArena &operator=(const HybridGDNDeviceStateArena &) = delete;
+        HybridGDNDeviceStateArena(HybridGDNDeviceStateArena &&) = delete;
+        HybridGDNDeviceStateArena &operator=(HybridGDNDeviceStateArena &&) = delete;
+
+        /**
+         * @brief Allocate and bind every layer's local/full/request state.
+         *
+         * @param device CUDA or ROCm device that owns the cache.
+         * @param request_capacity Maximum independent request slots.
+         * @param geometry Canonical local/full bank and byte geometry.
+         * @param states Per-GDN-layer geometry and resulting bindings.
+         * @param initialization_stream Explicit stream used to zero the arena.
+         * @param memory_authority Rank-local authority that admitted recurrent state.
+         *
+         * @throws std::runtime_error for malformed geometry, a null stream,
+         *         allocation failure, zero-initialization failure, or any
+         *         missing/undersized named slice.
+         */
+        void initialize(
+            DeviceId device,
+            int request_capacity,
+            const HybridGDNStateGeometry &geometry,
+            std::vector<HybridGDNLayerState> &states,
+            void *initialization_stream,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
+        {
+            if (!device.is_gpu())
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena requires a CUDA or ROCm device");
+            if (request_capacity <= 0)
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena requires positive request capacity");
+            if (!initialization_stream)
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena requires an explicit initialization stream");
+            if (!memory_authority || !memory_authority->contains(device))
+            {
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena requires the admitted rank-local memory authority");
+            }
+            if (states.empty())
+                return;
+            if (workspace_)
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena cannot be initialized twice");
+
+            validateStates(geometry, states);
+
+            WorkspaceRequirements requirements;
+            for (size_t layer = 0; layer < states.size(); ++layer)
+            {
+                appendKernelRequirements(
+                    requirements,
+                    layer,
+                    "conv",
+                    states[layer].local_conv_state_size,
+                    states[layer].full_conv_state_size,
+                    request_capacity);
+                appendKernelRequirements(
+                    requirements,
+                    layer,
+                    "recurrence",
+                    states[layer].local_recurrence_state_size,
+                    states[layer].full_recurrence_state_size,
+                    request_capacity);
+            }
+
+            if (requirements.buffers.empty())
+                return;
+
+            /*
+             * The geometry owns the physical formula. WorkspaceRequirements
+             * only names and places slices inside that exact allocation; it is
+             * not a second memory estimator.
+             */
+            const size_t budget = geometry.deviceArenaBytes(
+                static_cast<int>(states.size()), request_capacity);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                device,
+                budget,
+                std::move(memory_authority),
+                PhysicalMemoryOwner::RecurrentLiveState);
+            if (!workspace_->allocate(requirements))
+            {
+                workspace_.reset();
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena failed to allocate planned device state");
+            }
+            if (workspace_->used() != budget)
+            {
+                workspace_.reset();
+                throw std::logic_error(
+                    "HybridGDNDeviceStateArena runtime layout diverged from canonical geometry");
+            }
+            if (!workspace_->zeroAll(initialization_stream))
+            {
+                workspace_.reset();
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena failed to initialize device state");
+            }
+
+            for (size_t layer = 0; layer < states.size(); ++layer)
+            {
+                states[layer].conv_device_state = resolveBinding(
+                    layer,
+                    "conv",
+                    states[layer].local_conv_state_size,
+                    states[layer].full_conv_state_size,
+                    request_capacity);
+                states[layer].recurrence_device_state = resolveBinding(
+                    layer,
+                    "recurrence",
+                    states[layer].local_recurrence_state_size,
+                    states[layer].full_recurrence_state_size,
+                    request_capacity);
+            }
+        }
+
+        /**
+         * @brief Report bytes reserved for persistent GDN state.
+         */
+        size_t bytes() const noexcept
+        {
+            return workspace_ ? workspace_->used() : 0;
+        }
+
+    private:
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
+
+        /**
+         * @brief Prove every runtime layer was initialized from @p geometry.
+         *
+         * This check prevents a future backend-specific constructor from
+         * changing a bank shape while the planner continues to admit another.
+         */
+        static void validateStates(
+            const HybridGDNStateGeometry &geometry,
+            const std::vector<HybridGDNLayerState> &states)
+        {
+            for (const auto &state : states)
+            {
+                if (state.n_k_heads != geometry.local_key_heads ||
+                    state.n_v_heads != geometry.local_value_heads ||
+                    state.d_k != geometry.d_k ||
+                    state.d_v != geometry.d_v ||
+                    state.local_conv_state_size !=
+                        geometry.local_conv_state_floats ||
+                    state.full_conv_state_size !=
+                        geometry.full_conv_state_floats ||
+                    state.local_recurrence_state_size !=
+                        geometry.local_recurrence_state_floats ||
+                    state.full_recurrence_state_size !=
+                        geometry.full_recurrence_state_floats)
+                {
+                    throw std::logic_error(
+                        "Hybrid GDN runtime state does not match canonical geometry");
+                }
+            }
+        }
+
+        static std::string bufferName(
+            size_t layer,
+            const char *kernel,
+            const char *bank)
+        {
+            return "hybrid_gdn_layer_" + std::to_string(layer) +
+                   "_" + kernel + "_" + bank;
+        }
+
+        static void appendKernelRequirements(
+            WorkspaceRequirements &requirements,
+            size_t layer,
+            const char *kernel,
+            int local_state_floats,
+            int full_state_floats,
+            int request_capacity)
+        {
+            if (local_state_floats <= 0)
+                return;
+
+            const int distinct_full_state_floats =
+                full_state_floats > 0 ? full_state_floats : local_state_floats;
+            if (distinct_full_state_floats != local_state_floats)
+            {
+                requirements.buffers.push_back({
+                    bufferName(layer, kernel, "primary"),
+                    static_cast<size_t>(local_state_floats) * sizeof(float),
+                    256,
+                    true});
+                requirements.buffers.push_back({
+                    bufferName(layer, kernel, "secondary"),
+                    static_cast<size_t>(distinct_full_state_floats) * sizeof(float),
+                    256,
+                    true});
+            }
+
+            const int largest_state_floats =
+                std::max(local_state_floats, distinct_full_state_floats);
+            requirements.buffers.push_back({
+                bufferName(layer, kernel, "requests"),
+                static_cast<size_t>(request_capacity) *
+                    static_cast<size_t>(largest_state_floats) * sizeof(float),
+                256,
+                true});
+        }
+
+        GDNDeviceStateBinding resolveBinding(
+            size_t layer,
+            const char *kernel,
+            int local_state_floats,
+            int full_state_floats,
+            int request_capacity) const
+        {
+            if (local_state_floats <= 0)
+                return {};
+
+            GDNDeviceStateBinding binding;
+            binding.primary_state_floats = local_state_floats;
+
+            const int effective_full_state_floats =
+                full_state_floats > 0 ? full_state_floats : local_state_floats;
+            const std::string request_name =
+                bufferName(layer, kernel, "requests");
+            binding.request_state_bank = static_cast<float *>(
+                workspace_->getBuffer(request_name));
+            binding.request_state_bank_floats =
+                workspace_->getBufferSize(request_name) / sizeof(float);
+            binding.request_capacity = request_capacity;
+
+            if (effective_full_state_floats == local_state_floats)
+            {
+                /*
+                 * A single geometry has one canonical request-zero owner. Both
+                 * scalar decode and grouped request APIs address this exact
+                 * allocation, so no copy can be forgotten or reordered.
+                 */
+                binding.primary_state = binding.request_state_bank;
+            }
+            else
+            {
+                /*
+                 * Distinct LocalTP geometries retain isolated scalar banks.
+                 * The packed request bank uses the active geometry's stride,
+                 * so aliasing either scalar bank would let smaller request rows
+                 * overlap the larger scalar state.
+                 */
+                binding.primary_state = static_cast<float *>(
+                    workspace_->getBuffer(bufferName(layer, kernel, "primary")));
+                binding.secondary_state = static_cast<float *>(
+                    workspace_->getBuffer(bufferName(layer, kernel, "secondary")));
+                binding.secondary_state_floats = effective_full_state_floats;
+            }
+
+            if (!binding.valid())
+            {
+                throw std::runtime_error(
+                    "HybridGDNDeviceStateArena produced an invalid " +
+                    std::string(kernel) + " binding for layer " +
+                    std::to_string(layer));
+            }
+            return binding;
+        }
+    };
+} // namespace llaminar2

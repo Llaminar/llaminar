@@ -29,6 +29,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <future>
 #include <numeric>
@@ -72,6 +73,16 @@ protected:
 
     void TearDown() override
     {
+        for (size_t index = 0; index < producer_streams_.size(); ++index)
+        {
+            if (!producer_streams_[index])
+                continue;
+            (void)hipSetDevice(producer_stream_devices_[index]);
+            (void)hipStreamDestroy(producer_streams_[index]);
+        }
+        producer_streams_.clear();
+        producer_stream_devices_.clear();
+
         // Synchronize all devices
         for (int i = 0; i < rocm_device_count_; ++i)
         {
@@ -133,7 +144,43 @@ protected:
         copyHostToDevice(device_id, buffer, host_data.data(), count * sizeof(float));
     }
 
+    /**
+     * @brief Register one exact HIP producer stream for every RCCL participant.
+     *
+     * Production collectives consume graph-owned streams and refuse to infer a
+     * default stream. Keeping the integration fixture symmetric with CUDA makes
+     * each collective test exercise the real event handoff contract instead of
+     * failing before RCCL launch.
+     */
+    bool registerProducerStreams(
+        RCCLCoordinator &coordinator,
+        const std::vector<int> &device_ordinals)
+    {
+        producer_streams_.assign(device_ordinals.size(), nullptr);
+        producer_stream_devices_ = device_ordinals;
+        std::vector<void *> opaque_streams(device_ordinals.size(), nullptr);
+
+        for (size_t index = 0; index < device_ordinals.size(); ++index)
+        {
+            if (hipSetDevice(device_ordinals[index]) != hipSuccess)
+                return false;
+            if (hipStreamCreateWithFlags(
+                    &producer_streams_[index],
+                    hipStreamNonBlocking) != hipSuccess)
+            {
+                return false;
+            }
+            opaque_streams[index] =
+                static_cast<void *>(producer_streams_[index]);
+        }
+
+        coordinator.setComputeStreams(opaque_streams);
+        return true;
+    }
+
     int rocm_device_count_ = 0;
+    std::vector<hipStream_t> producer_streams_;
+    std::vector<int> producer_stream_devices_;
 };
 
 // =============================================================================
@@ -194,6 +241,63 @@ TEST_F(Test__RCCLCoordinator, InitializeMultiGPU)
     coord.shutdown();
 }
 
+/**
+ * @brief Prove that a used ROCm2 communicator clique aborts all ranks together.
+ *
+ * RCCL shares NCCL's all-active-ranks abort protocol. A completed collective
+ * marks both communicator ranks as safely initialized for RCCL teardown, then
+ * the fatal abort transaction must admit both ranks before joining either one.
+ * The test also verifies that post-abort coordinator destruction cannot strand
+ * the caller in a failure-callback join.
+ */
+TEST_F(Test__RCCLCoordinator, AbortMultiGPUCliqueCompletesAndShutdownJoins)
+{
+    using namespace std::chrono_literals;
+
+    if (rocm_device_count_ < 2)
+    {
+        GTEST_SKIP() << "Need at least 2 ROCm devices for communicator-abort coverage";
+    }
+
+    RCCLCoordinator coord;
+    ASSERT_TRUE(coord.initialize({0, 1}))
+        << "Failed to initialize ROCm2 communicator clique: "
+        << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
+
+    constexpr size_t count = 1;
+    void *device_zero = allocateDeviceBuffer(0, sizeof(float));
+    void *device_one = allocateDeviceBuffer(1, sizeof(float));
+    ASSERT_NE(device_zero, nullptr);
+    ASSERT_NE(device_one, nullptr);
+    fillDeviceBuffer(0, static_cast<float *>(device_zero), count, 1.0f);
+    fillDeviceBuffer(1, static_cast<float *>(device_one), count, 2.0f);
+    ASSERT_TRUE(coord.allreduceMultiAndSynchronize(
+        {device_zero, device_one},
+        count,
+        CollectiveDataType::FLOAT32,
+        CollectiveOp::ALLREDUCE_SUM));
+
+    const auto abort_start = std::chrono::steady_clock::now();
+    coord.abortCommunicators();
+    const auto abort_elapsed =
+        std::chrono::steady_clock::now() - abort_start;
+
+    EXPECT_FALSE(coord.isInitialized());
+    EXPECT_LT(abort_elapsed, 5s)
+        << "All local RCCL ranks must enter abort concurrently.";
+
+    const auto shutdown_start = std::chrono::steady_clock::now();
+    coord.shutdown();
+    const auto shutdown_elapsed =
+        std::chrono::steady_clock::now() - shutdown_start;
+    EXPECT_LT(shutdown_elapsed, 5s)
+        << "RCCL coordinator shutdown must join promptly after fatal abort.";
+
+    freeDeviceBuffer(0, device_zero);
+    freeDeviceBuffer(1, device_one);
+}
+
 TEST_F(Test__RCCLCoordinator, InitializeNonContiguousDevices)
 {
     if (rocm_device_count_ < 3)
@@ -229,6 +333,7 @@ TEST_F(Test__RCCLCoordinator, AllreduceSingleGPU)
 
     RCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0}));
 
     constexpr size_t COUNT = 1024;
 
@@ -269,6 +374,7 @@ TEST_F(Test__RCCLCoordinator, AllreduceMultiGPU)
 
     RCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
 
@@ -320,6 +426,7 @@ TEST_F(Test__RCCLCoordinator, AllgatherMultiGPU)
 
     RCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t SEND_COUNT = 512;
     constexpr size_t RECV_COUNT = SEND_COUNT * 2; // 2 devices
@@ -390,6 +497,7 @@ TEST_F(Test__RCCLCoordinator, BroadcastMultiGPU)
 
     RCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
 
@@ -442,6 +550,7 @@ TEST_F(Test__RCCLCoordinator, ThreadSafety)
 
     RCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
     constexpr int NUM_ITERATIONS = 10;

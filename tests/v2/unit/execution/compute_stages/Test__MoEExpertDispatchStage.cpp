@@ -1,5 +1,16 @@
+/**
+ * @file Test__MoEExpertDispatchStage.cpp
+ * @brief Device-free sparse-dispatch and captured-ticket protocol regressions.
+ *
+ * The suite proves route validation, immutable residency leases, sparse tier
+ * descriptors, and exact phase-specific histogram publication at the explicit
+ * heterogeneous boundary.  Ticket tests retain padded poison rows so any
+ * accidental use of physical rather than logical geometry fails loudly.
+ */
+
 #include "execution/compute_stages/ComputeStageFactory.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
+#include "execution/moe/DecodeExpertHistogram.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
 
@@ -17,18 +28,46 @@ namespace llaminar2::test
 namespace
 {
 
-    ExpertRoutedTier tier(const std::string &name, const std::string &domain, bool fallback = false)
+    TEST(Test__MoEExpertDispatchLeaseLifecycle,
+         MappedParentCannotStealHostLeaseTerminalOwnership)
     {
-        ExpertRoutedTier result;
+        using Owner = MoEOverlayHostDispatchLeaseOwner;
+        using Terminal = MoEOverlayHostDispatchLeaseTerminal;
+
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::FinalSparseReturn,
+                /*final_ordered_return=*/true),
+            Terminal::Release);
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::FinalSparseReturn,
+                /*final_ordered_return=*/false),
+            Terminal::Retain);
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::CurrentBatchLLEP,
+                /*final_ordered_return=*/true),
+            Terminal::Retain);
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::None,
+                /*final_ordered_return=*/true),
+            Terminal::Retain);
+    }
+
+    RoutedExpertTier tier(const std::string &name, const std::string &domain, bool fallback = false)
+    {
+        RoutedExpertTier result;
         result.name = name;
         result.domain = domain;
         result.fallback = fallback;
         return result;
     }
 
-    ExpertLayerPlacement placement(std::vector<int> routed_expert_tier)
+    RoutedExpertLayerPlacement placement(std::vector<int> routed_expert_tier)
     {
-        ExpertLayerPlacement result;
+        RoutedExpertLayerPlacement result;
         result.layer = 4;
         result.routed_expert_tier = std::move(routed_expert_tier);
         return result;
@@ -46,8 +85,8 @@ namespace
         const ITensor *weights,
         int seq_len,
         int top_k,
-        std::optional<ExpertLayerPlacement> expert_placement,
-        std::vector<ExpertRoutedTier> routed_tiers,
+        std::optional<RoutedExpertLayerPlacement> expert_placement,
+        std::vector<RoutedExpertTier> routed_tiers,
         MoEExpertDispatchOutput *output)
     {
         MoEExpertDispatchStage::Params params;
@@ -101,6 +140,120 @@ namespace
                                return binding.id == id && binding.access == BufferAccess::READ;
                            });
     }
+
+    RoutedExpertDomain residencyDomain(
+        std::string name,
+        GlobalDeviceAddress participant,
+        int world_rank,
+        CollectiveBackendType backend)
+    {
+        RoutedExpertDomain result;
+        result.name = std::move(name);
+        result.scope = ExecutionDomainScope::SINGLE;
+        result.backend = backend;
+        result.participants = {participant};
+        result.world_ranks = {world_rank};
+        result.owner_rank = world_rank;
+        result.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        return result;
+    }
+
+    MoERoutedExpertPlacementPlan dynamicResidencyPlan()
+    {
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.continuation_domain = "gpu_hot";
+        plan.shared_expert_domain = "gpu_hot";
+        plan.residency_policy =
+            RoutedExpertResidencyPolicy::HistogramTieredCache;
+        plan.domains = {
+            residencyDomain(
+                "gpu_hot",
+                GlobalDeviceAddress::cuda(0, 0),
+                0,
+                CollectiveBackendType::NCCL),
+            residencyDomain(
+                "cpu_cold",
+                GlobalDeviceAddress::cpu(1),
+                1,
+                CollectiveBackendType::MPI),
+        };
+        auto hot = tier("hot", "gpu_hot");
+        hot.priority = 0;
+        hot.max_experts_per_layer = 2;
+        auto cold = tier("cold", "cpu_cold", true);
+        cold.priority = 1;
+        plan.routed_tiers = {std::move(hot), std::move(cold)};
+        return plan;
+    }
+
+    class AcceptingResidencyTransport final
+        : public IMoEOverlayResidencyTransport
+    {
+    public:
+        class Wave final : public IMoEOverlayResidencyWave
+        {
+        public:
+            explicit Wave(AcceptingResidencyTransport *owner) : owner_(owner) {}
+
+            MoEOverlayResidencyWaveProgress pollStage(
+                std::string *) noexcept override
+            {
+                return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            bool beginPrepare(std::string *) noexcept override
+            {
+                ++owner_->prepare_calls;
+                return true;
+            }
+
+            MoEOverlayResidencyWaveProgress pollPrepare(
+                std::string *) noexcept override
+            {
+                return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            bool beginPublication(std::string *) noexcept override
+            {
+                ++owner_->publication_calls;
+                return true;
+            }
+
+            MoEOverlayResidencyWaveProgress pollPublication(
+                std::string *) noexcept override
+            {
+                return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            void abortStaged() noexcept override {}
+
+            void retirePrevious() noexcept override
+            {
+                ++owner_->retire_calls;
+            }
+
+        private:
+            AcceptingResidencyTransport *owner_ = nullptr;
+        };
+
+        MoEOverlayResidencyStageStart beginStage(
+            const MoEOverlayResidencyTransaction &) override
+        {
+            ++stage_calls;
+            return {
+                .status = MoEOverlayResidencyStageStartStatus::Started,
+                .wave = std::make_unique<Wave>(this),
+            };
+        }
+
+        int stage_calls = 0;
+        int prepare_calls = 0;
+        int publication_calls = 0;
+        int retire_calls = 0;
+    };
 
 } // namespace
 
@@ -157,6 +310,215 @@ TEST_F(Test__MoEExpertDispatchStage, PrefillTwoTiersRoutesEveryContributionOnceA
     expectContributionExactlyOnce(output, 0, 2, 1, 0, 0.45f);
 }
 
+TEST_F(
+    Test__MoEExpertDispatchStage,
+    GraphFrozenOwnerMapPublishesExactParticipantTargetsForRankBatching)
+{
+    auto plan = dynamicResidencyPlan();
+    plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
+    plan.placements = {placement({0, 0, 1, 1})};
+    auto owner_map = std::make_shared<const MoEExpertOwnerMap>(
+        MoEExpertOwnerMap::build(plan));
+
+    auto indices = routingTensor({1, 2}, {0.0f, 2.0f});
+    auto weights = routingTensor({1, 2}, {0.25f, 0.75f});
+    MoEExpertDispatchOutput output;
+    auto params = paramsFor(
+        indices.get(),
+        weights.get(),
+        1,
+        2,
+        plan.placements.front(),
+        plan.routed_tiers,
+        &output);
+    params.owner_map = owner_map;
+    MoEExpertDispatchStage stage(std::move(params));
+
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+    ASSERT_EQ(output.tiers.size(), 2u);
+    ASSERT_EQ(output.tiers[0].entries.size(), 1u);
+    ASSERT_EQ(output.tiers[1].entries.size(), 1u);
+    const auto *expert_zero_owner = owner_map->ownerFor(4, 0);
+    const auto *expert_two_owner = owner_map->ownerFor(4, 2);
+    ASSERT_NE(expert_zero_owner, nullptr);
+    ASSERT_NE(expert_two_owner, nullptr);
+    EXPECT_EQ(
+        output.tiers[0].entries[0].destination_participant,
+        expert_zero_owner->owner_participant);
+    EXPECT_EQ(
+        output.tiers[1].entries[0].destination_participant,
+        expert_two_owner->owner_participant);
+    EXPECT_GE(output.tiers[0].entries[0].destination_participant, 0);
+    EXPECT_GE(output.tiers[1].entries[0].destination_participant, 0);
+}
+
+TEST_F(
+    Test__MoEExpertDispatchStage,
+    LiveResidencyLeaseRoutesOneEpochWhileMigrationPublishesNext)
+{
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 5;
+    histogram_config.num_experts = 4;
+    histogram_config.top_k = 1;
+    histogram_config.window_size = 4;
+    histogram_config.sockets = {DeviceId::cuda(0), DeviceId::cpu()};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        5,
+        2,
+        {0, 0, 1, 1});
+    auto histogram =
+        std::make_unique<DecodeExpertHistogram>(histogram_config);
+    const std::vector<uint64_t> counts{1, 100, 90, 0};
+    histogram->mergeLayerCounts(
+        4,
+        counts.data(),
+        static_cast<int>(counts.size()),
+        false);
+
+    MoERoutedExpertModelMetadata metadata;
+    metadata.num_layers = 5;
+    metadata.num_experts = 4;
+    metadata.d_model = 8;
+    metadata.routed_intermediate_size = 4;
+    metadata.routed_quant_type = "F32";
+    auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
+        MoEOverlayResidencyAuthority::Config{
+            .initial_plan = dynamicResidencyPlan(),
+            .model_metadata = metadata,
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .perf_device = "CUDA:0",
+        });
+
+    auto ticket_storage =
+        std::make_shared<MoEOverlayDispatchTicketStorage>();
+    ticket_storage->bindFixedCapacity(
+        /*layer_idx=*/4,
+        /*bucket_rows=*/1,
+        /*top_k=*/1,
+        /*d_model=*/8,
+        DeviceId::cpu(),
+        /*workspace_generation=*/41);
+    auto &ticket = ticket_storage->ticket();
+    ticket.header->logical_row_count = 1;
+    ticket.routing_indices_fp32[0] = 2.0f;
+    ticket.routing_weights_fp32[0] = 1.0f;
+
+    MoEExpertDispatchOutput output;
+    auto params = paramsFor(
+        nullptr,
+        nullptr,
+        1,
+        1,
+        placement({0, 0, 1, 1}),
+        dynamicResidencyPlan().routed_tiers,
+        &output);
+    params.continuation_domain = "gpu_hot";
+    params.residency_authority = authority;
+    params.ticket_storage = ticket_storage;
+    MoEExpertDispatchStage stage(params);
+    EXPECT_TRUE(stage.hasMoEOverlayCollectiveRuntimeParams());
+    stage.updateMoEOverlayCollectiveRuntimeParams({
+        .generation_id = 7u,
+        .step_id = 11u,
+        .execution_semantics =
+            IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                ExecutionSemantics::GroupedVerifier,
+        .mtp_depth = 2,
+        .placement_epoch = 1u,
+    });
+
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+    ASSERT_EQ(output.residency_epoch, 1u);
+    EXPECT_EQ(ticket.header->residency_epoch, 1u);
+    ASSERT_NE(output.residency_lease, nullptr);
+    EXPECT_EQ(authority->activeTicketCount(), 1u);
+    expectContributionExactlyOnce(output, 1, 0, 0, 2, 1.0f);
+    ASSERT_EQ(output.tiers[1].entries.size(), 1u);
+    const int epoch_one_destination =
+        output.tiers[1].entries[0].destination_participant;
+    EXPECT_GE(epoch_one_destination, 0);
+
+    AcceptingResidencyTransport transport;
+    const auto transaction = authority->proposeFromHistogram();
+    ASSERT_EQ(transaction.migrations.size(), 2u);
+    const auto started = authority->beginApply(transaction, transport);
+    EXPECT_EQ(started.status, MoEOverlayResidencyApplyStatus::Started);
+    EXPECT_EQ(transport.stage_calls, 1);
+    EXPECT_EQ(authority->activeTicketCount(), 1u);
+    EXPECT_EQ(output.residency_epoch, 1u);
+
+    const auto preparing = authority->advanceBackground();
+    EXPECT_EQ(
+        preparing.status,
+        MoEOverlayResidencyApplyStatus::Preparing);
+    EXPECT_EQ(authority->snapshot()->epoch, 1u);
+
+    const auto publishing = authority->advanceBackground();
+    ASSERT_EQ(
+        publishing.status,
+        MoEOverlayResidencyApplyStatus::Publishing)
+        << publishing.error;
+    EXPECT_EQ(authority->snapshot()->epoch, 1u);
+
+    const auto published = authority->advanceBackground();
+    ASSERT_EQ(
+        published.status,
+        MoEOverlayResidencyApplyStatus::Published)
+        << published.error;
+    EXPECT_EQ(authority->snapshot()->epoch, 2u);
+    EXPECT_EQ(output.residency_epoch, 1u)
+        << "The in-flight dispatch keeps its exact immutable owner map";
+    EXPECT_EQ(ticket.header->residency_epoch, 1u);
+    EXPECT_EQ(authority->activeTicketCount(), 1u);
+    EXPECT_EQ(transport.stage_calls, 1);
+    EXPECT_EQ(transport.prepare_calls, 1);
+    EXPECT_EQ(transport.publication_calls, 1);
+    EXPECT_EQ(transport.retire_calls, 0);
+
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+    EXPECT_EQ(output.residency_epoch, 1u)
+        << "Every graph in one MTP sequence must retain its admitted epoch";
+    EXPECT_EQ(ticket.header->residency_epoch, 1u);
+    expectContributionExactlyOnce(output, 1, 0, 0, 2, 1.0f);
+
+    output.residency_lease.reset();
+    ASSERT_EQ(authority->activeTicketCount(), 0u);
+    EXPECT_EQ(transport.retire_calls, 0)
+        << "Inference return must not run maintenance cleanup";
+    EXPECT_EQ(
+        authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Idle);
+    EXPECT_EQ(transport.retire_calls, 1);
+
+    EXPECT_FALSE(stage.execute(ctx_.get()))
+        << "A retired pinned epoch must fail instead of falling forward to current";
+    EXPECT_EQ(authority->activeTicketCount(), 0u);
+
+    stage.updateMoEOverlayCollectiveRuntimeParams({
+        .generation_id = 7u,
+        .step_id = 12u,
+        .execution_semantics =
+            IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                ExecutionSemantics::Decode,
+        .mtp_depth = -1,
+        .placement_epoch = 2u,
+    });
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+    EXPECT_EQ(output.residency_epoch, 2u);
+    EXPECT_EQ(ticket.header->residency_epoch, 2u);
+    EXPECT_EQ(authority->activeTicketCount(), 1u);
+    expectContributionExactlyOnce(output, 0, 0, 0, 2, 1.0f);
+    ASSERT_EQ(output.tiers[0].entries.size(), 1u);
+    EXPECT_GE(output.tiers[0].entries[0].destination_participant, 0);
+    EXPECT_NE(
+        output.tiers[0].entries[0].destination_participant,
+        epoch_one_destination)
+        << "The next dispatch must consume the newly published epoch owner map";
+    output.residency_lease.reset();
+    EXPECT_EQ(authority->activeTicketCount(), 0u);
+}
+
 TEST_F(Test__MoEExpertDispatchStage, AdvertisesArenaInputContractForHostDispatch)
 {
     auto indices = routingTensor({1, 2}, {0.0f, 1.0f});
@@ -207,6 +569,240 @@ TEST_F(Test__MoEExpertDispatchStage, ArenaCapacityRoutingBuffersUseLivePrefixRow
     EXPECT_EQ(output.tiers[1].entries.size(), 2u);
     EXPECT_EQ(output.tiers[0].token_rows, (std::vector<int>{0, 1}));
     EXPECT_EQ(output.tiers[1].token_rows, (std::vector<int>{0, 1}));
+}
+
+TEST_F(Test__MoEExpertDispatchStage, CapturedTicketRoutesOnlyLogicalPrefixAndDeclaresNoTensorCoherenceInputs)
+{
+    constexpr int bucket_rows = 4;
+    constexpr int logical_rows = 2;
+    constexpr int top_k = 2;
+    auto ticket_storage =
+        std::make_shared<MoEOverlayDispatchTicketStorage>();
+    ticket_storage->bindFixedCapacity(
+        /*layer_idx=*/4,
+        bucket_rows,
+        top_k,
+        /*d_model=*/8,
+        DeviceId::cpu(),
+        /*workspace_generation=*/17);
+    auto &ticket = ticket_storage->ticket();
+    ticket.header->logical_row_count = logical_rows;
+
+    const std::vector<float> indices{
+        0.0f, 1.0f,
+        2.0f, 3.0f,
+        99.0f, 99.0f,
+        99.0f, 99.0f,
+    };
+    const std::vector<float> weights{
+        0.25f, 0.75f,
+        0.40f, 0.60f,
+        123.0f, 123.0f,
+        123.0f, 123.0f,
+    };
+    std::copy(
+        indices.begin(), indices.end(), ticket.routing_indices_fp32);
+    std::copy(
+        weights.begin(), weights.end(), ticket.routing_weights_fp32);
+
+    MoEExpertDispatchOutput output;
+    auto params = paramsFor(
+        nullptr,
+        nullptr,
+        bucket_rows,
+        top_k,
+        placement({0, 1, 0, 1}),
+        {tier("hot", "gpu_hot"), tier("cold", "cpu_cold")},
+        &output);
+    params.ticket_storage = ticket_storage;
+    params.routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
+    params.routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
+    params.hidden_buffer_id = BufferId::NORMALIZED;
+
+    MoEExpertDispatchStage stage(params);
+    EXPECT_FALSE(stage.hasMoEOverlayCollectiveRuntimeParams());
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    EXPECT_EQ(output.seq_len, bucket_rows);
+    EXPECT_EQ(output.logical_seq_len, logical_rows);
+    EXPECT_EQ(output.ticket_lifetime, ticket_storage);
+    EXPECT_EQ(output.residency_epoch, 1u);
+    EXPECT_EQ(ticket.header->residency_epoch, 1u);
+    ASSERT_EQ(output.tiers.size(), 2u);
+    EXPECT_EQ(output.tiers[0].token_rows, (std::vector<int>{0, 1}));
+    EXPECT_EQ(output.tiers[1].token_rows, (std::vector<int>{0, 1}));
+    EXPECT_EQ(output.tiers[0].entries.size(), 2u);
+    EXPECT_EQ(output.tiers[1].entries.size(), 2u);
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_TRUE(stage.supportsPaddedPrefillRealLengthContract());
+    EXPECT_TRUE(stage.bufferContract().inputs.empty());
+}
+
+TEST_F(
+    Test__MoEExpertDispatchStage,
+    CapturedTicketPublishesExactRealPrefillRowsWithoutPaddingContamination)
+{
+    constexpr int bucket_rows = 4;
+    constexpr int logical_rows = 2;
+    constexpr int top_k = 2;
+    auto ticket_storage =
+        std::make_shared<MoEOverlayDispatchTicketStorage>();
+    ticket_storage->bindFixedCapacity(
+        /*layer_idx=*/4,
+        bucket_rows,
+        top_k,
+        /*d_model=*/8,
+        DeviceId::cpu(),
+        /*workspace_generation=*/29);
+    auto &ticket = ticket_storage->ticket();
+    ticket.header->logical_row_count = logical_rows;
+
+    const std::vector<float> indices{
+        3.0f, 1.0f,
+        3.0f, 2.0f,
+        99.0f, 99.0f,
+        99.0f, 99.0f,
+    };
+    const std::vector<float> weights{
+        0.75f, 0.25f,
+        0.60f, 0.40f,
+        123.0f, 123.0f,
+        123.0f, 123.0f,
+    };
+    std::copy(
+        indices.begin(), indices.end(), ticket.routing_indices_fp32);
+    std::copy(
+        weights.begin(), weights.end(), ticket.routing_weights_fp32);
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 5;
+    histogram_config.num_experts = 4;
+    histogram_config.top_k = top_k;
+    histogram_config.window_size = 8;
+    histogram_config.sockets = {DeviceId::cpu()};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        /*num_layers=*/5,
+        /*participant_count=*/1,
+        {0, 0, 0, 0});
+    DecodeExpertHistogram histogram(std::move(histogram_config));
+
+    MoEExpertDispatchOutput output;
+    auto params = paramsFor(
+        nullptr,
+        nullptr,
+        bucket_rows,
+        top_k,
+        placement({0, 1, 0, 1}),
+        {tier("tier_0", "gpu_domain"),
+         tier("tier_1", "cpu_domain")},
+        &output);
+    params.ticket_storage = ticket_storage;
+    params.routing_evidence_publication =
+        MoEExpertDispatchStage::RoutingEvidencePublication{
+            .histogram = &histogram,
+            .source = ExpertHistogramSource::PrefillChunk,
+        };
+
+    MoEExpertDispatchStage stage(std::move(params));
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    EXPECT_EQ(output.residency_epoch, 1u);
+    EXPECT_EQ(ticket.header->residency_epoch, 1u);
+    EXPECT_EQ(histogram.windowTokenCount(), 2u);
+    EXPECT_EQ(
+        histogram.layerHistogram(ExpertHistogramSource::PrefillChunk, 4),
+        (std::vector<uint64_t>{0, 1, 1, 2}));
+    EXPECT_EQ(
+        histogram.layerHistogram(ExpertHistogramSource::DecodeToken, 4),
+        (std::vector<uint64_t>{0, 0, 0, 0}));
+    EXPECT_EQ(
+        histogram.layerHistogram(ExpertHistogramSource::GroupedVerifier, 4),
+        (std::vector<uint64_t>{0, 0, 0, 0}));
+    EXPECT_EQ(
+        histogram.layerHistogram(4),
+        (std::vector<uint64_t>{0, 1, 1, 2}));
+
+    const auto frozen = histogram.freezeAndRotateWindow();
+    ASSERT_TRUE(frozen.valid());
+    EXPECT_EQ(frozen.token_count, 2u);
+    EXPECT_EQ(frozen.source_token_counts[1], 2u);
+    EXPECT_EQ(frozen.source_token_counts[0], 0u);
+    EXPECT_EQ(frozen.source_token_counts[2], 0u);
+}
+
+TEST_F(
+    Test__MoEExpertDispatchStage,
+    CapturedTicketRejectsSpeculativeVerifierEvidenceBeforeAcceptedCommit)
+{
+    auto ticket_storage =
+        std::make_shared<MoEOverlayDispatchTicketStorage>();
+    ticket_storage->bindFixedCapacity(
+        /*layer_idx=*/4,
+        /*bucket_rows=*/2,
+        /*top_k=*/1,
+        /*d_model=*/8,
+        DeviceId::cpu(),
+        /*workspace_generation=*/31);
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 5;
+    histogram_config.num_experts = 2;
+    histogram_config.top_k = 1;
+    histogram_config.window_size = 4;
+    histogram_config.sockets = {DeviceId::cpu()};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        5,
+        1,
+        {0, 0});
+    DecodeExpertHistogram histogram(std::move(histogram_config));
+
+    MoEExpertDispatchOutput output;
+    auto params = paramsFor(
+        nullptr,
+        nullptr,
+        2,
+        1,
+        placement({0, 1}),
+        {tier("tier_0", "domain_0"), tier("tier_1", "domain_1")},
+        &output);
+    params.ticket_storage = ticket_storage;
+    params.routing_evidence_publication =
+        MoEExpertDispatchStage::RoutingEvidencePublication{
+            .histogram = &histogram,
+            .source = ExpertHistogramSource::GroupedVerifier,
+        };
+
+    EXPECT_THROW(
+        MoEExpertDispatchStage(std::move(params)),
+        std::invalid_argument);
+}
+
+TEST_F(Test__MoEExpertDispatchStage, CapturedTicketRejectsOutOfRangeLogicalRowCount)
+{
+    auto ticket_storage =
+        std::make_shared<MoEOverlayDispatchTicketStorage>();
+    ticket_storage->bindFixedCapacity(
+        /*layer_idx=*/4,
+        /*bucket_rows=*/4,
+        /*top_k=*/2,
+        /*d_model=*/8,
+        DeviceId::cpu(),
+        /*workspace_generation=*/3);
+    ticket_storage->ticket().header->logical_row_count = 5;
+
+    MoEExpertDispatchOutput output;
+    auto params = paramsFor(
+        nullptr,
+        nullptr,
+        4,
+        2,
+        placement({0, 1}),
+        {tier("hot", "gpu_hot"), tier("cold", "cpu_cold")},
+        &output);
+    params.ticket_storage = ticket_storage;
+
+    MoEExpertDispatchStage stage(params);
+    EXPECT_FALSE(stage.execute(ctx_.get()));
 }
 
 TEST_F(Test__MoEExpertDispatchStage, DecodeOneTokenWorksNaturally)

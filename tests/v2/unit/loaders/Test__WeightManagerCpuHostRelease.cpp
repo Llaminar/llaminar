@@ -458,34 +458,34 @@ TEST_F(Test__WeightManagerCpuHostRelease, ReleasesMultipleLayersQuantizedWeights
     }
 }
 
-TEST_F(Test__WeightManagerCpuHostRelease, GpuPathDoesNotUseCpuReleaseLogic)
+TEST_F(Test__WeightManagerCpuHostRelease, IncludeExpertJobsFalseSkipsRoutedExpertBindings)
 {
-    // The GPU path (prepareWeightsForDeviceImpl) has its own separate release
-    // mechanism. This test verifies that a binding prepared for GPU, when the
-    // WeightManager is asked to prepare for GPU, goes through the GPU path
-    // (not the CPU binding-driven path). The GPU path may or may not release
-    // depending on its own logic, but the CPU-specific release loop in
-    // prepareWeightsForDevice(frozen_weights, cpu_device) is NOT executed.
-    //
-    // Coverage note: The CPU release path is guarded by `if (device.is_cpu())`.
-    // This test verifies that guard works — the GPU path is a separate codepath.
     TestableCpuReleaseWeightManager wm(*mock_loader_);
-    DeviceId cuda0 = DeviceId::cuda(0);
+    DeviceId cpu = DeviceId::cpu();
 
     mock_loader_->addQ4_0RandomTensor("blk.0.attn_q.weight", {128, 64});
-    auto inner = mock_loader_->loadTensor("blk.0.attn_q.weight");
-    auto sliced = wrapInSlice(inner, 256, 64);
+    auto dense_inner = mock_loader_->loadTensor("blk.0.attn_q.weight");
+    auto dense_sliced = wrapInSlice(dense_inner, 256, 64);
 
-    auto binding = makeBinding(1, sliced.get(), "blk.0.attn_q.weight",
-                               WeightRole::AttentionQ, 0, cuda0, /*mark_prepared=*/true);
+    mock_loader_->addQ4_0RandomTensor("blk.0.ffn_gate_exps.weight", {128, 64});
+    auto expert_inner = mock_loader_->loadTensor("blk.0.ffn_gate_exps.weight");
+    auto expert_sliced = wrapInSlice(expert_inner, 256, 64);
+
+    auto dense_binding = makeBinding(1, dense_sliced.get(), "blk.0.attn_q.weight",
+                                     WeightRole::AttentionQ, 0, cpu, /*mark_prepared=*/true);
+    auto expert_binding = makeBinding(2, expert_sliced.get(), "blk.0.ffn_gate_exps.weight",
+                                      WeightRole::MoEExpertGate, 0, cpu, /*mark_prepared=*/true);
+    expert_binding.identity.residency_category = WeightResidencyCategory::AcceleratorRoutedExpert;
+
+    wm.preRegisterPrepared(dense_binding, cpu);
+    wm.preRegisterPrepared(expert_binding, cpu);
 
     InferenceStrategy strategy;
-    std::vector<WeightBinding> bindings_vec = {binding};
+    std::vector<WeightBinding> bindings_vec = {dense_binding, expert_binding};
     FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
 
-    // Calling with cuda0 takes the else branch (prepareWeightsForDeviceImpl),
-    // not the CPU binding-driven path. The GPU path has its own release behavior
-    // which is tested separately. Here we just confirm it doesn't crash.
-    wm.prepareWeightsForDevice(frozen, cuda0);
-    // No assertion on release state — GPU path has its own valid release logic
+    ASSERT_TRUE(wm.prepareWeightsForDevice(frozen, cpu, /*include_expert_jobs=*/false));
+
+    EXPECT_TRUE(dense_sliced->is_raw_data_released());
+    EXPECT_FALSE(expert_sliced->is_raw_data_released());
 }

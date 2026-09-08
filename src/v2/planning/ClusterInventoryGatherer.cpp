@@ -29,16 +29,34 @@ namespace llaminar2
     {
         ClusterInventory inventory;
 
-        // Ensure DeviceManager is initialized with NUMA-aware filtering by default.
-        // This avoids accidentally broadening visibility to cross-socket devices in local execution.
+        const bool single_rank = !mpi_ctx || mpi_ctx->world_size() == 1;
+
+        /*
+         * A NUMA binding describes the CPU locality of one MPI process; it is
+         * not a hardware-ownership boundary.  With several ranks, the local
+         * filter lets inventory binding assign each accelerator to its nearest
+         * rank.  A sole rank necessarily owns the complete host, including
+         * accelerators attached to another socket, so retaining that filter
+         * would make valid LocalTP devices disappear from the production plan.
+         *
+         * Inventory gathering runs before graph/context construction.  It is
+         * therefore safe to broaden an earlier bootstrap enumeration here;
+         * doing so after contexts existed would invalidate their DeviceManager
+         * indices and is intentionally outside this API's lifecycle.
+         */
         auto &dm = DeviceManager::instance();
-        if (dm.devices().empty())
+        if (dm.devices().empty() ||
+            (single_rank && dm.local_numa_node() >= 0))
         {
-            auto numa_info = NUMATopology::detectLocalNUMANode();
-            int target_numa_node = 0;
-            if (numa_info.detection_succeeded && numa_info.local_numa_node >= 0)
+            int target_numa_node = -1;
+            if (!single_rank)
             {
-                target_numa_node = numa_info.local_numa_node;
+                const auto numa_info = NUMATopology::detectLocalNUMANode();
+                target_numa_node =
+                    numa_info.detection_succeeded &&
+                            numa_info.local_numa_node >= 0
+                        ? numa_info.local_numa_node
+                        : 0;
             }
             dm.initialize(target_numa_node, false); // Tables already printed pre-MPI
         }
@@ -84,6 +102,8 @@ namespace llaminar2
                 ri.cpu_cores = sock.num_physical_cores();
                 ri.cpu.compute_units = sock.num_threads();
                 ri.cpu.memory_bytes = sock.memory_bytes;
+                ri.cpu.free_memory_bytes =
+                    sock.available_memory_bytes;
                 ri.cpu_memory_bytes = sock.memory_bytes;
                 if (!sock.model_name.empty())
                     ri.cpu.name = sock.model_name;
@@ -93,15 +113,19 @@ namespace llaminar2
                 // Fallback: single-rank or unknown mapping — report full machine
                 int total_cores = 0, total_threads = 0;
                 size_t total_mem = 0;
+                size_t available_mem = 0;
                 for (const auto &sock : hw.cpu_sockets)
                 {
                     total_cores += sock.num_physical_cores();
                     total_threads += sock.num_threads();
                     total_mem += sock.memory_bytes;
+                    available_mem += sock.available_memory_bytes;
                 }
                 ri.cpu_cores = total_cores;
                 ri.cpu.compute_units = total_threads;
                 ri.cpu.memory_bytes = total_mem;
+                ri.cpu.free_memory_bytes = std::min(
+                    available_mem, total_mem);
                 ri.cpu_memory_bytes = total_mem > 0 ? total_mem : ri.cpu_memory_bytes;
                 if (!hw.cpu_sockets.empty() && !hw.cpu_sockets[0].model_name.empty())
                     ri.cpu.name = hw.cpu_sockets[0].model_name;
@@ -109,7 +133,7 @@ namespace llaminar2
         };
 
         // For single-rank execution, create a simple inventory
-        if (!mpi_ctx || mpi_ctx->world_size() == 1)
+        if (single_rank)
         {
             RankInventory rank_inv;
             rank_inv.rank = 0;
@@ -134,6 +158,8 @@ namespace llaminar2
                 if (pages > 0 && page_size > 0)
                     rank_inv.cpu_memory_bytes = static_cast<size_t>(pages) * static_cast<size_t>(page_size);
             }
+            if (rank_inv.cpu.memory_bytes == 0)
+                rank_inv.cpu.memory_bytes = rank_inv.cpu_memory_bytes;
 
             // Enumerate actual GPUs from DeviceManager
             for (const auto &dev : devices)
@@ -145,6 +171,7 @@ namespace llaminar2
                     gpu.local_device_id = dev.device_id;
                     gpu.memory_bytes = dev.total_memory_bytes;
                     gpu.free_memory_bytes = dev.free_memory_bytes;
+                    gpu.compute_units = dev.compute_units;
                     gpu.name = dev.name;
                     gpu.numa_node = dev.numa_node;
                     gpu.compute_capability_major = dev.compute_capability / 10;
@@ -195,6 +222,7 @@ namespace llaminar2
                         const auto &dev = devices[static_cast<size_t>(dev_idx)];
                         gpu.memory_bytes = dev.total_memory_bytes;
                         gpu.free_memory_bytes = dev.free_memory_bytes;
+                        gpu.compute_units = dev.compute_units;
                         gpu.name = dev.name;
                         gpu.numa_node = dev.numa_node;
                         gpu.compute_capability_major = dev.compute_capability / 10;
@@ -280,6 +308,7 @@ namespace llaminar2
             gpu.local_device_id = dev.device_id;
             gpu.memory_bytes = dev.total_memory_bytes;
             gpu.free_memory_bytes = dev.free_memory_bytes;
+            gpu.compute_units = dev.compute_units;
             gpu.name = dev.name;
             gpu.numa_node = dev.numa_node;
             gpu.compute_capability_major = dev.compute_capability / 10;

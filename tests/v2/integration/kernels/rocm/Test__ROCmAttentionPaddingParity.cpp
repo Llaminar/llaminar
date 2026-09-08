@@ -15,9 +15,11 @@
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "utils/MPIContext.h"
 #include "../../../utils/PreparedWeightTestHarness.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 #ifdef HAVE_ROCM
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
@@ -539,6 +541,8 @@ TEST_F(Test__ROCmAttentionPaddingParity, LMHeadPaddedBucketUsesLastRealRowOnGPU)
     params.prepared_store = prepared_lm_head.store.get();
 
     LMHeadStage stage(params);
+    ScopedGPUStream producer_stream(device);
+    stage.setGPUStream(producer_stream.get());
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
         real_seq_len,
         bucket_seq_len,
@@ -549,6 +553,7 @@ TEST_F(Test__ROCmAttentionPaddingParity, LMHeadPaddedBucketUsesLastRealRowOnGPU)
         device,
         {hidden_states.get(), lm_head_weight.get()},
         {logits.get()},
+        producer_stream.get(),
         [&]()
         { return stage.execute(nullptr); }));
     ASSERT_FALSE(hasNaNOrInf(std::vector<float>(logits->data(), logits->data() + vocab_size)));
@@ -631,12 +636,41 @@ TEST_F(Test__ROCmAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
     auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(config);
     ASSERT_NE(kv_cache, nullptr);
 
+    /*
+     * Device-owned cache reads consume pointer tables and gather storage that
+     * graph construction publishes through the cache workspace. Bind that
+     * persistent storage before append so this regression exercises the same
+     * fully prepared cache lifetime as production graph execution.
+     */
+    auto *kv_workspace_consumer =
+        dynamic_cast<IWorkspaceConsumer *>(kv_cache.get());
+    ASSERT_NE(kv_workspace_consumer, nullptr);
+    const WorkspaceRequirements kv_reqs =
+        kv_workspace_consumer->getWorkspaceRequirements(
+            bucket_kv_len,
+            /*n=*/1,
+            head_dim);
+    DeviceWorkspaceManager kv_workspace(
+        device, kv_reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(kv_workspace.allocate(kv_reqs));
+    kv_workspace_consumer->bindWorkspace(&kv_workspace);
+
+    int32_t *device_real_kv_len = nullptr;
+    ASSERT_EQ(hipMalloc(&device_real_kv_len, sizeof(int32_t)), hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_real_kv_len,
+            &real_kv_len,
+            sizeof(real_kv_len),
+            hipMemcpyHostToDevice,
+            static_cast<hipStream_t>(stream)),
+        hipSuccess);
+    ASSERT_TRUE(kv_cache->bindGraphAppendCountSource(
+        0, 0, device_real_kv_len, bucket_kv_len, stream));
     ASSERT_TRUE(kv_cache->appendWithStream(0, 0, key.get(), value.get(), bucket_kv_len, stream));
     gpu_ctx.synchronizeStream(stream);
-    ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), bucket_kv_len);
-    kv_cache->clear_sequence(0, 0);
-    kv_cache->advanceHead(0, 0, real_kv_len);
     ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), real_kv_len);
+    ASSERT_EQ(hipFree(device_real_kv_len), hipSuccess);
 
     const auto expected_real_prefix = referenceSingleQueryGQAAttention(
         query->data(), key->data(), value->data(), real_kv_len, n_heads, n_kv_heads, head_dim);
@@ -681,6 +715,7 @@ TEST_F(Test__ROCmAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
         device,
         {query.get()},
         {output.get(), workspace_scores.get(), workspace_context.get(), workspace_mask.get()},
+        stream,
         [&]()
         { return stage.execute(nullptr); }));
     gpu_ctx.synchronizeStream(stream);

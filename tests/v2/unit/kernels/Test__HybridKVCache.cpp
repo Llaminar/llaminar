@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
 #include "kernels/HybridKVCacheConfig.h"
+#include "kernels/HybridGDNStateGeometry.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
@@ -154,6 +155,91 @@ namespace llaminar2::test
             EXPECT_EQ(map.toKVIndex(i), -1);
             EXPECT_EQ(map.toGDNIndex(i), i);
         }
+    }
+
+    // =============================================================================
+    // Test: canonical GDN geometry and physical byte formulas
+    // =============================================================================
+
+    /** @brief Equal local/full geometry owns one request-backed live bank. */
+    TEST(Test__HybridGDNStateGeometry,
+         UnshardedArenaDoesNotPriceAnImaginaryPrimaryBank)
+    {
+        const HybridGDNStateGeometry geometry =
+            HybridGDNStateGeometry::resolve(
+                /*attention_heads=*/4,
+                /*local_head_start=*/0,
+                /*local_attention_heads=*/0,
+                /*group_count=*/2,
+                /*time_step_rank=*/4,
+                /*state_size=*/2,
+                /*inner_size=*/8,
+                /*conv_kernel_size=*/3);
+
+        EXPECT_TRUE(geometry.hasSingleBankGeometry());
+        EXPECT_EQ(geometry.full_qkv_dim, 16);
+        EXPECT_EQ(geometry.local_qkv_dim, 16);
+        EXPECT_EQ(geometry.local_conv_state_floats, 32);
+        EXPECT_EQ(geometry.local_recurrence_state_floats, 16);
+
+        /*
+         * One 128-byte convolution request bank begins at zero. The 64-byte
+         * recurrence request bank begins at the next 256-byte boundary.
+         */
+        EXPECT_EQ(
+            geometry.deviceArenaBytes(
+                /*gdn_layers=*/1,
+                /*request_capacity=*/1),
+            320u);
+        EXPECT_EQ(geometry.deviceSerializedPayloadBytes(1), 192u);
+        EXPECT_EQ(geometry.localPayloadBytes(1), 192u);
+    }
+
+    /** @brief Modulo-linked K/V sharding uses exact weight/runtime ownership. */
+    TEST(Test__HybridGDNStateGeometry,
+         TensorParallelPartitionKeepsLinkedHeadCountsAndBytesExact)
+    {
+        const HybridGDNStateGeometry geometry =
+            HybridGDNStateGeometry::resolve(
+                /*attention_heads=*/64,
+                /*local_head_start=*/16,
+                /*local_attention_heads=*/16,
+                /*group_count=*/16,
+                /*time_step_rank=*/32,
+                /*state_size=*/128,
+                /*inner_size=*/4096,
+                /*conv_kernel_size=*/4);
+
+        EXPECT_EQ(geometry.local_key_heads, 4);
+        EXPECT_EQ(geometry.local_value_heads, 8);
+        EXPECT_EQ(geometry.local_qkv_dim, 2048);
+        EXPECT_EQ(geometry.full_qkv_dim, 8192);
+        EXPECT_EQ(geometry.local_conv_state_floats, 6144);
+        EXPECT_EQ(geometry.full_conv_state_floats, 24576);
+        EXPECT_EQ(geometry.local_recurrence_state_floats, 131072);
+        EXPECT_EQ(geometry.full_recurrence_state_floats, 524288);
+        EXPECT_FALSE(geometry.hasSingleBankGeometry());
+
+        const size_t one_layer = geometry.deviceArenaBytes(1, 2);
+        EXPECT_EQ(geometry.deviceArenaBytes(3, 2), 3u * one_layer);
+        EXPECT_GT(one_layer, geometry.localPayloadBytes(1));
+    }
+
+    /** @brief Non-integral TP boundaries fail before planning or allocation. */
+    TEST(Test__HybridGDNStateGeometry,
+         RejectsAHeadPartitionThatWouldRequireRounding)
+    {
+        EXPECT_THROW(
+            (void)HybridGDNStateGeometry::resolve(
+                /*attention_heads=*/64,
+                /*local_head_start=*/1,
+                /*local_attention_heads=*/16,
+                /*group_count=*/16,
+                /*time_step_rank=*/32,
+                /*state_size=*/128,
+                /*inner_size=*/4096,
+                /*conv_kernel_size=*/4),
+            std::invalid_argument);
     }
 
     // =============================================================================
@@ -332,7 +418,8 @@ namespace llaminar2::test
         state->conv_state[0] = 99.0f;
 
         // Clear should reset
-        cache->clear();
+        ASSERT_TRUE(cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
 
         EXPECT_EQ(state->recurrence_state[0], 0.0f);
         EXPECT_EQ(state->conv_state[0], 0.0f);
@@ -346,7 +433,9 @@ namespace llaminar2::test
         ASSERT_NE(state, nullptr);
         state->recurrence_state[0] = 42.0f;
 
-        cache->clear_layer(0);
+        ASSERT_TRUE(cache->resetLayerState(
+            0,
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
 
         EXPECT_EQ(state->recurrence_state[0], 0.0f);
     }
@@ -555,6 +644,72 @@ namespace llaminar2::test
         EXPECT_EQ(restored_v, v_payload);
     }
 
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRoundTripUsesLocalLayerIndicesForStageCache)
+    {
+        constexpr int FIRST_LAYER = 1;
+        constexpr int STAGE_LAYERS = 8;
+        auto stage_config = makeQwen35_08B_StageConfig(FIRST_LAYER, STAGE_LAYERS);
+        auto cache = std::make_unique<CPUHybridRingKVCacheFP32>(
+            stage_config, getTestMPIContext(), STAGE_LAYERS, BATCH_SIZE,
+            MAX_SEQ_LEN, N_KV_HEADS, HEAD_DIM);
+        auto restored = std::make_unique<CPUHybridRingKVCacheFP32>(
+            stage_config, getTestMPIContext(), STAGE_LAYERS, BATCH_SIZE,
+            MAX_SEQ_LEN, N_KV_HEADS, HEAD_DIM);
+
+        std::vector<int> gdn_layers;
+        std::vector<std::vector<float>> expected_recurrence;
+        std::vector<std::vector<float>> expected_conv;
+        for (int global_layer = FIRST_LAYER; global_layer < FIRST_LAYER + STAGE_LAYERS; ++global_layer)
+        {
+            auto *state = cache->getGDNState(global_layer);
+            if (!state)
+                continue;
+
+            for (size_t i = 0; i < state->recurrence_state.size(); ++i)
+            {
+                state->recurrence_state[i] =
+                    static_cast<float>(global_layer * 10000 + static_cast<int>(i % 251));
+            }
+            for (size_t i = 0; i < state->conv_state.size(); ++i)
+            {
+                state->conv_state[i] =
+                    static_cast<float>(global_layer * 20000 + static_cast<int>(i % 127));
+            }
+            gdn_layers.push_back(global_layer);
+            expected_recurrence.push_back(state->recurrence_state);
+            expected_conv.push_back(state->conv_state);
+        }
+        ASSERT_GT(gdn_layers.size(), 2u);
+
+        const HybridPrefixStateMetadata metadata = cache->hybridPrefixStateMetadata();
+        ASSERT_EQ(metadata.host_bytes, cache->gdnMemoryBytes());
+        ASSERT_GT(metadata.host_bytes, 0u);
+
+        constexpr uint8_t kGuard = 0xCD;
+        std::vector<uint8_t> payload(metadata.host_bytes + 4096u, kGuard);
+        HybridPrefixStateDescriptor desc;
+        desc.seq_idx = 0;
+        desc.logical_token_count = 13;
+        ASSERT_TRUE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
+        for (size_t i = metadata.host_bytes; i < payload.size(); ++i)
+        {
+            ASSERT_EQ(payload[i], kGuard)
+                << "hybrid prefix export wrote past metadata.host_bytes at guard offset "
+                << (i - metadata.host_bytes);
+        }
+
+        ASSERT_TRUE(restored->importHybridPrefixState(desc, payload.data(), nullptr));
+        for (size_t i = 0; i < gdn_layers.size(); ++i)
+        {
+            auto *state = restored->getGDNState(gdn_layers[i]);
+            ASSERT_NE(state, nullptr) << "missing restored GDN layer " << gdn_layers[i];
+            EXPECT_EQ(state->recurrence_state, expected_recurrence[i])
+                << "recurrence state mismatch for global layer " << gdn_layers[i];
+            EXPECT_EQ(state->conv_state, expected_conv[i])
+                << "conv state mismatch for global layer " << gdn_layers[i];
+        }
+    }
+
     TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRoundTripRestoresGDNState)
     {
         auto cache = createCache();
@@ -591,7 +746,8 @@ namespace llaminar2::test
         EXPECT_FLOAT_EQ(payload_floats[layer4_offset], 41.0f);
         EXPECT_FLOAT_EQ(payload_floats[layer4_offset + layer4->recurrence_state.size()], 43.0f);
 
-        cache->clear();
+        ASSERT_TRUE(cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
         EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 0.0f);
         EXPECT_FLOAT_EQ(layer0->conv_state[0], 0.0f);
         EXPECT_FLOAT_EQ(layer4->recurrence_state[0], 0.0f);
@@ -805,7 +961,8 @@ namespace llaminar2::test
         desc.logical_token_count = 5;
         ASSERT_TRUE(hybrid->exportHybridPrefixState(desc, payload.data(), nullptr));
 
-        cache->clear();
+        ASSERT_TRUE(cache->resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
         EXPECT_EQ(hybrid->getConvKernel(0), conv0);
         EXPECT_EQ(hybrid->getRecurrenceKernel(0), rec0);
         EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 0.0f);

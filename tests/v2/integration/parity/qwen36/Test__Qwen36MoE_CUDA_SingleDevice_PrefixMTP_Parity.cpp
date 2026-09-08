@@ -32,9 +32,10 @@ namespace
         auto test_case = cudaSingleDeviceCase();
         test_case.name = "Qwen3.6 MoE CUDA SingleDevice benchmark-prompt MTP diagnostic";
         test_case.prompt = qwen36MoEBenchmarkPrompt();
-        test_case.metadata_envs = {"LLAMINAR_QWEN36_MOE_CUDA_MTP_DIAGNOSTIC_METADATA"};
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_MOE_MTP_DIAGNOSTIC_METADATA"};
         test_case.default_metadata_path =
-            "pytorch_qwen36_moe_cuda_mtp_diagnostic_snapshots/metadata.txt";
+            "pytorch_qwen36_moe_mtp_diagnostic_snapshots/metadata.txt";
         test_case.decode_steps = 4;
         test_case.max_seq_len = 768;
         return test_case;
@@ -101,7 +102,7 @@ namespace
 #define QWEN36_MOE_PREFIX_MTP_DEPTH3_CASE cudaSingleDeviceDepth3Case
 #define QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION 0
 #define QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA 1
-#define QWEN36_MOE_PREFIX_MTP_TESTS_DEVICE_RESIDENT_PUBLICATION 0
+#define QWEN36_MOE_PREFIX_MTP_TESTS_DEVICE_RESIDENT_PUBLICATION 1
 #include "Qwen36MoESingleDevicePrefixMTPParityTests.inc"
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPPathGuards, NoMTPBenchmarkStyleUsesWorkspaceBackedGroupedSharedExpertTablePath)
@@ -136,6 +137,13 @@ int main(int argc, char **argv)
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+
+    std::string retirement_error;
+    if (!releaseMoEMTPModelContextCampaignCache(&retirement_error))
+    {
+        std::cerr << retirement_error << '\n';
+        result = 1;
+    }
 
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();

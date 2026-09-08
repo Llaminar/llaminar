@@ -13,6 +13,10 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 
+#include <algorithm>
+#include <array>
+#include <string_view>
+
 using namespace llaminar2;
 
 // ============================================================================
@@ -26,6 +30,59 @@ static const BufferDescriptor *findBuf(
         if (b.name == name)
             return &b;
     return nullptr;
+}
+
+/**
+ * @brief Configure the non-GlobalTP placeholder for gathered MTP logits.
+ *
+ * Production resolver configuration reserves the full gathered buffer only for
+ * CPU GlobalTP, where the MTP head remains column-sharded. Single-device and
+ * mirrored LocalTP lanes need the descriptor for one declarative schema, but a
+ * 1x1 placeholder prevents them from wasting a full-vocabulary arena region.
+ */
+static void configureMTPBufferGeometry(GraphResolverConfig &config)
+{
+    if (!config.custom_formulas.contains("mtp_target_query_rows"))
+        config.custom_formulas["mtp_target_query_rows"] = 4;
+    if (!config.custom_formulas.contains("mtp_kv_prefill_rows"))
+    {
+        config.custom_formulas["mtp_kv_prefill_rows"] = std::max(
+            static_cast<size_t>(std::max(1, config.seq_len)),
+            config.custom_formulas["mtp_target_query_rows"]);
+    }
+    if (!config.custom_formulas.contains("mtp_q_dim"))
+    {
+        config.custom_formulas["mtp_q_dim"] =
+            static_cast<size_t>(config.local_n_heads) *
+            static_cast<size_t>(config.head_dim);
+    }
+    if (!config.custom_formulas.contains("mtp_kv_dim"))
+    {
+        config.custom_formulas["mtp_kv_dim"] =
+            static_cast<size_t>(config.local_n_kv_heads) *
+            static_cast<size_t>(config.head_dim);
+    }
+    if (!config.custom_formulas.contains("mtp_d_ff"))
+        config.custom_formulas["mtp_d_ff"] = static_cast<size_t>(config.local_d_ff);
+    if (!config.custom_formulas.contains("mtp_fa_q_full_dim"))
+        config.custom_formulas["mtp_fa_q_full_dim"] = 2 * config.custom_formulas["mtp_q_dim"];
+    if (!config.custom_formulas.contains("mtp_attn_output_dim"))
+    {
+        config.custom_formulas["mtp_attn_output_dim"] =
+            std::max(
+                config.custom_formulas["mtp_q_dim"],
+                config.custom_formulas.contains("attn_output_dim")
+                    ? config.custom_formulas["attn_output_dim"]
+                    : config.custom_formulas["mtp_q_dim"]);
+    }
+}
+
+/** @brief Add the 1x1 gathered-logits placeholder for non-GlobalTP fixtures. */
+static void configureNoGlobalTPMTPGather(GraphResolverConfig &config)
+{
+    configureMTPBufferGeometry(config);
+    config.custom_formulas["mtp_global_gather_rows"] = 1;
+    config.custom_formulas["mtp_global_gather_vocab"] = 1;
 }
 
 // ============================================================================
@@ -64,12 +121,15 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     config.custom_formulas["gdn_time_step_rank"] = 32;
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
+    config.custom_formulas["mtp_target_query_rows"] = 4;
+    configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Qwen3.5 has 20 main layer buffers, 17 MTP verifier sidecar buffers,
-    // and the compact LM-head verifier row scratch used by row-indexed MTP.
-    EXPECT_EQ(reqs.buffers.size(), 38u) << "Expected 38 layer buffers";
+    // Qwen3.5 has the main layer buffers, compact LM-head verifier row
+    // scratch, and 21 MTP verifier sidecar buffers including the phase-split
+    // full-prefill KV handoff rows and conditional CPU GlobalTP gather arena.
+    EXPECT_EQ(reqs.buffers.size(), 42u) << "Expected 42 layer buffers";
 
     // ── Shared buffers ──
 
@@ -232,22 +292,22 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto *mtp_embedding = findBuf(reqs, "mtp_embedding");
     ASSERT_NE(mtp_embedding, nullptr);
-    EXPECT_EQ(mtp_embedding->shape[0], 4u);
+    EXPECT_EQ(mtp_embedding->shape[0], 4096u);
     EXPECT_EQ(mtp_embedding->shape[1], 2560u);
 
     auto *mtp_concat = findBuf(reqs, "mtp_concat");
     ASSERT_NE(mtp_concat, nullptr);
-    EXPECT_EQ(mtp_concat->shape[0], 4u);
+    EXPECT_EQ(mtp_concat->shape[0], 4096u);
     EXPECT_EQ(mtp_concat->shape[1], 5120u);
 
     auto *mtp_q = findBuf(reqs, "mtp_q");
     ASSERT_NE(mtp_q, nullptr);
-    EXPECT_EQ(mtp_q->shape[0], 4u);
+    EXPECT_EQ(mtp_q->shape[0], 4096u);
     EXPECT_EQ(mtp_q->shape[1], 4096u);
 
     auto *mtp_k = findBuf(reqs, "mtp_k");
     ASSERT_NE(mtp_k, nullptr);
-    EXPECT_EQ(mtp_k->shape[0], 4u);
+    EXPECT_EQ(mtp_k->shape[0], 4096u);
     EXPECT_EQ(mtp_k->shape[1], 1024u);
 
     auto *mtp_gate = findBuf(reqs, "mtp_gate");
@@ -259,9 +319,15 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     ASSERT_NE(mtp_logits, nullptr);
     EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 248320u);
+
+    auto *mtp_logits_gathered = findBuf(reqs, "mtp_logits_gathered");
+    ASSERT_NE(mtp_logits_gathered, nullptr);
+    EXPECT_EQ(mtp_logits_gathered->shape[0], 1u);
+    EXPECT_EQ(mtp_logits_gathered->shape[1], 1u)
+        << "Single-device MTP must not reserve a redundant gathered vocabulary.";
 }
 
-TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
+TEST(Test__Qwen35BufferSizes, LayerBuffers_SeparateVerifierAndIntegratedKVPrefillRows)
 {
     Qwen35SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -283,14 +349,59 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPRequestBatchVerifierRowsScale)
     config.custom_formulas["gdn_time_step_rank"] = 32;
     config.custom_formulas["fa_q_full_dim"] = 8192;
     config.custom_formulas["attn_output_dim"] = 4096;
-    config.custom_formulas["mtp_target_query_rows"] = 8;
+    constexpr size_t target_query_rows = 64;
+    config.custom_formulas["mtp_target_query_rows"] = target_query_rows;
+    configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
-    auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
-    ASSERT_NE(lm_head_input_rows, nullptr);
-    ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
-    EXPECT_EQ(lm_head_input_rows->shape[0], 8u);
-    EXPECT_EQ(lm_head_input_rows->shape[1], 2560u);
+    const std::array<const char *, 21> row_capacity_buffers = {
+        "lm_head_input_rows",
+        "mtp_embedding",
+        "mtp_norm_hidden",
+        "mtp_norm_embedding",
+        "mtp_concat",
+        "mtp_projected",
+        "mtp_hidden",
+        "mtp_q_raw",
+        "mtp_q_gate",
+        "mtp_q",
+        "mtp_k",
+        "mtp_v",
+        "mtp_k_full_prefill",
+        "mtp_v_full_prefill",
+        "mtp_attn_output",
+        "mtp_attn_proj",
+        "mtp_gate",
+        "mtp_up",
+        "mtp_ffn_output",
+        "mtp_logits",
+        "mtp_logits_gathered",
+    };
+    for (const char *name : row_capacity_buffers)
+    {
+        const BufferDescriptor *buffer = findBuf(reqs, name);
+        ASSERT_NE(buffer, nullptr) << "missing declarative MTP buffer " << name;
+        ASSERT_EQ(buffer->shape.size(), 2u) << name;
+        const size_t expected_rows =
+            std::string_view(name) == "mtp_logits_gathered"
+                ? 1u
+                : (std::string_view(name) == "mtp_embedding" ||
+                   std::string_view(name) == "mtp_norm_hidden" ||
+                   std::string_view(name) == "mtp_norm_embedding" ||
+                   std::string_view(name) == "mtp_concat" ||
+                   std::string_view(name) == "mtp_projected" ||
+                   std::string_view(name) == "mtp_q_raw" ||
+                   std::string_view(name) == "mtp_q_gate" ||
+                   std::string_view(name) == "mtp_q" ||
+                   std::string_view(name) == "mtp_k" ||
+                   std::string_view(name) == "mtp_v" ||
+                   std::string_view(name) == "mtp_k_full_prefill" ||
+                   std::string_view(name) == "mtp_v_full_prefill")
+                      ? static_cast<size_t>(config.seq_len)
+                      : target_query_rows;
+        EXPECT_EQ(buffer->shape[0], expected_rows)
+            << name << " used the wrong verifier or integrated-prefill row domain";
+    }
 }
 
 TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPAttnOutputUsesHybridAttnOutputDim)
@@ -321,6 +432,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_MTPAttnOutputUsesHybridAttnOutputDim)
     config.custom_formulas["gdn_time_step_rank"] = 48;
     config.custom_formulas["fa_q_full_dim"] = 10240;
     config.custom_formulas["attn_output_dim"] = 6144;
+    configureNoGlobalTPMTPGather(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -409,7 +521,7 @@ TEST(Test__Qwen35BufferSizes, ModelBuffers_TP2)
 // Layer Buffer Sizes with TP=2
 // ============================================================================
 
-TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
+TEST(Test__Qwen35BufferSizes, LayerBuffers_CPUGlobalTP2)
 {
     Qwen35SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
@@ -439,10 +551,15 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     config.custom_formulas["gdn_time_step_rank"] = 16;
     config.custom_formulas["fa_q_full_dim"] = 4096;
     config.custom_formulas["attn_output_dim"] = 2048;
+    config.custom_formulas["mtp_target_query_rows"] = 4;
+    config.custom_formulas["mtp_kv_prefill_rows"] = 4096;
+    config.custom_formulas["mtp_global_gather_rows"] = 4;
+    config.custom_formulas["mtp_global_gather_vocab"] = 248320;
+    configureMTPBufferGeometry(config);
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 38u);
+    EXPECT_EQ(reqs.buffers.size(), 42u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");
@@ -500,4 +617,56 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     ASSERT_NE(mtp_logits, nullptr);
     EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 124160u);
+
+    auto *mtp_logits_gathered = findBuf(reqs, "mtp_logits_gathered");
+    ASSERT_NE(mtp_logits_gathered, nullptr);
+    EXPECT_EQ(mtp_logits_gathered->shape[0], 4u);
+    EXPECT_EQ(mtp_logits_gathered->shape[1], 248320u)
+        << "CPU GlobalTP must gather only compact MTP rows into a full-vocabulary buffer.";
+}
+
+TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2MirroredMTPHeadKeepsFullSidecarLogits)
+{
+    Qwen35SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    GraphResolverConfig config{};
+    config.d_model = 2560;
+    config.n_heads = 16;
+    config.n_kv_heads = 4;
+    config.head_dim = 256;
+    config.vocab_size = 248320;
+    config.seq_len = 4096;
+    config.batch_size = 1;
+    config.local_n_heads = 8;
+    config.local_n_kv_heads = 2;
+    config.local_d_ff = 4608;
+    config.local_vocab = 124160;
+    config.custom_formulas["gdn_inner_size"] = 2048;
+    config.custom_formulas["gdn_qkv_dim"] = 4096;
+    config.custom_formulas["gdn_time_step_rank"] = 16;
+    config.custom_formulas["fa_q_full_dim"] = 4096;
+    config.custom_formulas["attn_output_dim"] = 2048;
+    config.custom_formulas["mtp_vocab"] = 248320;
+    configureNoGlobalTPMTPGather(config);
+
+    auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
+
+    auto *mtp_logits = findBuf(reqs, "mtp_logits");
+    ASSERT_NE(mtp_logits, nullptr);
+    EXPECT_EQ(mtp_logits->shape[0], 4u);
+    EXPECT_EQ(mtp_logits->shape[1], 248320u)
+        << "Mirrored LocalTP MTP heads must have full-vocab sidecar storage.";
+
+    auto *mtp_logits_gathered = findBuf(reqs, "mtp_logits_gathered");
+    ASSERT_NE(mtp_logits_gathered, nullptr);
+    EXPECT_EQ(mtp_logits_gathered->shape[0], 1u);
+    EXPECT_EQ(mtp_logits_gathered->shape[1], 1u)
+        << "Mirrored LocalTP must not also reserve the CPU GlobalTP gather arena.";
+
+    auto model_reqs = BufferAllocator::resolveModelBuffers(schema, config);
+    auto *logits_local = findBuf(model_reqs, "logits_local");
+    ASSERT_NE(logits_local, nullptr);
+    EXPECT_EQ(logits_local->shape[1], 124160u)
+        << "The mirrored MTP-head policy must not inflate ordinary TP logits_local.";
 }

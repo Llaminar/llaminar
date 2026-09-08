@@ -27,12 +27,10 @@
 
 #include "CPURingKVCache.h"
 
-#include "turboquant/TurboQuantDequantizeTQ4.h"
-#include "turboquant/TurboQuantDequantizeSplitTQ.h"
-#include "../../tensors/SIMDHelpers.h"
+#include "../kvcache/KVCacheLogicalBlockCodec.h"
+#include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 
 namespace llaminar2
@@ -319,453 +317,6 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Converted KV Access (get_kv_converted)
-    // =========================================================================
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    bool CPURingKVCache<KPrecision, VPrecision>::get_kv_converted(
-        int layer, int seq_idx,
-        ActivationPrecision target,
-        ITensor **out_k, ITensor **out_v,
-        int *out_kv_len,
-        const KVReadParams *rope)
-    {
-        // Only FP32 target is supported currently
-        if (target != ActivationPrecision::FP32)
-        {
-            LOG_ERROR("[CPURingKVCache] get_kv_converted: only FP32 target supported, got "
-                      << static_cast<int>(target));
-            return false;
-        }
-
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-        {
-            if (out_k)
-                *out_k = nullptr;
-            if (out_v)
-                *out_v = nullptr;
-            if (out_kv_len)
-                *out_kv_len = 0;
-            return false;
-        }
-
-        // FP32 cache: passthrough when head==0, linearize into shadow otherwise
-        if constexpr (KPrecision == ActivationPrecision::FP32 && VPrecision == ActivationPrecision::FP32)
-        {
-            auto &entry = entries_[layer][seq_idx];
-
-            if (entry.head == 0)
-            {
-                // No wrap: passthrough raw buffer (fast path)
-                if (out_k)
-                    *out_k = entry.K.get();
-                if (out_v)
-                    *out_v = entry.V.get();
-                if (out_kv_len)
-                    *out_kv_len = entry.size;
-
-                if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0 && rope->head_dim > 0)
-                {
-                    auto &shadow = ensureFP32Shadow(layer, seq_idx);
-                    if (shadow.converted_rows < entry.size)
-                    {
-                        const int new_rows = entry.size - shadow.converted_rows;
-                        apply_rope_to_k_fp32(
-                            entry.K->mutable_data() + static_cast<size_t>(shadow.converted_rows) * kv_dim_,
-                            new_rows, rope->head_dim, rope->n_kv_heads,
-                            rope->rope_theta, rope->position_start + shadow.converted_rows,
-                            rope->rope_dim);
-                        shadow.converted_rows = entry.size;
-                    }
-                }
-                return true;
-            }
-
-            // Ring has wrapped (head != 0): linearize into shadow buffer
-            auto &shadow = ensureFP32Shadow(layer, seq_idx);
-
-            // Detect head movement → full re-linearization needed
-            if (entry.head != shadow.last_head)
-            {
-                shadow.converted_rows = 0;
-                shadow.last_head = entry.head;
-            }
-
-            if (shadow.converted_rows < entry.size)
-            {
-                float *k_fp32 = shadow.K->mutable_data();
-                float *v_fp32 = shadow.V->mutable_data();
-                const float *src_k = entry.K->data();
-                const float *src_v = entry.V->data();
-
-                for (int r = shadow.converted_rows; r < entry.size; ++r)
-                {
-                    const int phys = (entry.head + r) % max_seq_len_;
-                    const size_t src_off = static_cast<size_t>(phys) * kv_dim_;
-                    const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                    std::memcpy(k_fp32 + dst_off, src_k + src_off, kv_dim_ * sizeof(float));
-                    std::memcpy(v_fp32 + dst_off, src_v + src_off, kv_dim_ * sizeof(float));
-                }
-
-                if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0 && rope->head_dim > 0)
-                {
-                    const size_t offset = static_cast<size_t>(shadow.converted_rows) * kv_dim_;
-                    apply_rope_to_k_fp32(
-                        k_fp32 + offset,
-                        entry.size - shadow.converted_rows, rope->head_dim, rope->n_kv_heads,
-                        rope->rope_theta, rope->position_start + shadow.converted_rows,
-                        rope->rope_dim);
-                }
-
-                shadow.converted_rows = entry.size;
-            }
-
-            if (out_k)
-                *out_k = shadow.K.get();
-            if (out_v)
-                *out_v = shadow.V.get();
-            if (out_kv_len)
-                *out_kv_len = entry.size;
-            return true;
-        }
-        else
-        {
-            auto &entry = entries_[layer][seq_idx];
-            const int kv_len = entry.size;
-
-            auto &shadow = ensureFP32Shadow(layer, seq_idx);
-
-            // Detect cache clear (kv_len decreased since last call)
-            if (kv_len < shadow.converted_rows)
-                shadow.converted_rows = 0;
-
-            // Detect ring head movement (wrap) → full reconversion needed
-            if (entry.head != shadow.last_head)
-            {
-                shadow.converted_rows = 0;
-                shadow.last_head = entry.head;
-            }
-
-            // Convert new rows incrementally
-            if (shadow.converted_rows < kv_len)
-            {
-                convertNewRows(layer, seq_idx, shadow, entry, rope);
-            }
-
-            if (out_k)
-                *out_k = shadow.K.get();
-            if (out_v)
-                *out_v = shadow.V.get();
-            if (out_kv_len)
-                *out_kv_len = kv_len;
-            return true;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Shadow buffer lazy allocation
-    // -------------------------------------------------------------------------
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    auto CPURingKVCache<KPrecision, VPrecision>::ensureFP32Shadow(int layer, int seq_idx) const
-        -> FP32Shadow &
-    {
-        // Lazy init the 2D vector if empty
-        if (fp32_shadows_.empty())
-        {
-            fp32_shadows_.resize(n_layers_);
-            for (auto &layer_vec : fp32_shadows_)
-                layer_vec.resize(batch_size_);
-        }
-
-        auto &shadow = fp32_shadows_[layer][seq_idx];
-        if (!shadow.K)
-        {
-            const size_t total = static_cast<size_t>(max_seq_len_) * static_cast<size_t>(kv_dim_);
-            shadow.K = std::make_unique<FP32Tensor>(std::vector<size_t>{total});
-            shadow.V = std::make_unique<FP32Tensor>(std::vector<size_t>{total});
-            shadow.converted_rows = 0;
-        }
-        return shadow;
-    }
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::invalidateFP32Shadow(int layer, int seq_idx) const
-    {
-        if (fp32_shadows_.empty() || layer < 0 || layer >= static_cast<int>(fp32_shadows_.size()) ||
-            seq_idx < 0 || seq_idx >= static_cast<int>(fp32_shadows_[layer].size()))
-        {
-            return;
-        }
-
-        auto &shadow = fp32_shadows_[layer][seq_idx];
-        shadow.converted_rows = 0;
-        shadow.last_head = -1;
-    }
-
-    // -------------------------------------------------------------------------
-    // Per-precision incremental conversion dispatch
-    // -------------------------------------------------------------------------
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::convertNewRows(
-        int layer, int seq_idx,
-        FP32Shadow &shadow, const EntryT &entry,
-        const KVReadParams *rope) const
-    {
-        const int from = shadow.converted_rows;
-        const int to = entry.size;
-        float *k_fp32 = shadow.K->mutable_data();
-        float *v_fp32 = shadow.V->mutable_data();
-
-        // FP16 cache
-        if constexpr (KPrecision == ActivationPrecision::FP16 && VPrecision == ActivationPrecision::FP16)
-        {
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const size_t src_off = static_cast<size_t>(phys) * kv_dim_;
-                const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                simd::convert_fp16_to_fp32(entry.K->typed_data() + src_off, k_fp32 + dst_off, kv_dim_);
-                simd::convert_fp16_to_fp32(entry.V->typed_data() + src_off, v_fp32 + dst_off, kv_dim_);
-            }
-
-            // Apply RoPE to newly converted K rows if requested
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // BF16 cache
-        else if constexpr (KPrecision == ActivationPrecision::BF16 && VPrecision == ActivationPrecision::BF16)
-        {
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const size_t src_off = static_cast<size_t>(phys) * kv_dim_;
-                const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                simd::convert_bf16_to_fp32(entry.K->typed_data() + src_off, k_fp32 + dst_off, kv_dim_);
-                simd::convert_bf16_to_fp32(entry.V->typed_data() + src_off, v_fp32 + dst_off, kv_dim_);
-            }
-
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // Q8_1 cache
-        else if constexpr (KPrecision == ActivationPrecision::Q8_1 && VPrecision == ActivationPrecision::Q8_1)
-        {
-            const size_t blocks_per_row = entry.K->blocks_per_row();
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const Q8_1Block *k_row = entry.K->typed_data() + phys * blocks_per_row;
-                const Q8_1Block *v_row = entry.V->typed_data() + phys * blocks_per_row;
-                const size_t dst_off = static_cast<size_t>(r) * kv_dim_;
-                simd::dequantize_q8_1_to_fp32(k_row, k_fp32 + dst_off, kv_dim_);
-                simd::dequantize_q8_1_to_fp32(v_row, v_fp32 + dst_off, kv_dim_);
-            }
-
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // TQ4 symmetric cache (both K and V are TQ4)
-        // NOTE: TQ paths pass from/to as physical row indices to turboquant helpers.
-        // After ring wrap, these need physical→logical mapping too (same as FP16/Q8_1 above).
-        // Currently safe because TQ caches don't use sequences exceeding max_seq_len in practice,
-        // but this should be fixed when TQ + ring wrap is needed.
-        else if constexpr (KPrecision == ActivationPrecision::TQ4 && VPrecision == ActivationPrecision::TQ4)
-        {
-            if (!rope || !rope->turboquant_ctx)
-            {
-                LOG_ERROR("[CPURingKVCache] TQ4 get_kv_converted requires turboquant_ctx in KVReadParams");
-                shadow.converted_rows = to;
-                return;
-            }
-            const auto &layer_ctx = rope->turboquant_ctx->for_layer(layer);
-
-            auto *K_tq4 = entry.K.get();
-            auto *V_tq4 = entry.V.get();
-            K_tq4->set_turboquant_context(&layer_ctx);
-            V_tq4->set_turboquant_context(&layer_ctx);
-
-            if (rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                turboquant_dequantize_kv_rows_with_rope(
-                    K_tq4->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    rope->head_dim, rope->n_kv_heads,
-                    K_tq4->blocks_per_row() * K_tq4->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq4->block_bytes(), V_tq4->block_bytes(),
-                    rope->rope_theta, rope->position_start + from);
-            }
-            else
-            {
-                turboquant_dequantize_kv_rows(
-                    K_tq4->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    head_dim_, n_kv_heads_,
-                    K_tq4->blocks_per_row() * K_tq4->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq4->block_bytes(), V_tq4->block_bytes());
-            }
-        }
-        // Split TQ cache: K is TQ8, V is TQ4
-        // NOTE: Same ring wrap limitation as TQ4 above.
-        else if constexpr (KPrecision == ActivationPrecision::TQ8 && VPrecision == ActivationPrecision::TQ4)
-        {
-            if (!rope || !rope->turboquant_ctx)
-            {
-                LOG_ERROR("[CPURingKVCache] Split TQ get_kv_converted requires turboquant_ctx in KVReadParams");
-                shadow.converted_rows = to;
-                return;
-            }
-            const auto &layer_ctx = rope->turboquant_ctx->for_layer(layer);
-
-            auto *K_tq8 = entry.K.get();
-            auto *V_tq4 = entry.V.get();
-            K_tq8->set_turboquant_context(&layer_ctx);
-            V_tq4->set_turboquant_context(&layer_ctx);
-
-            if (rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                turboquant_dequantize_split_kv_rows_with_rope(
-                    K_tq8->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    rope->head_dim, rope->n_kv_heads,
-                    K_tq8->blocks_per_row() * K_tq8->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq8->block_bytes(), V_tq4->block_bytes(),
-                    rope->rope_theta, rope->position_start + from);
-            }
-            else
-            {
-                turboquant_dequantize_split_kv_rows(
-                    K_tq8->typed_data(), V_tq4->typed_data(),
-                    layer_ctx, k_fp32, v_fp32,
-                    from, to,
-                    head_dim_, n_kv_heads_,
-                    K_tq8->blocks_per_row() * K_tq8->block_bytes(),
-                    V_tq4->blocks_per_row() * V_tq4->block_bytes(),
-                    K_tq8->block_bytes(), V_tq4->block_bytes());
-            }
-        }
-        // Q16_1 cache (both K and V are Q16_1)
-        // Q16_1 always uses HEAD_MAJOR layout: [n_kv_heads][position][head_dim]
-        // The Q16_1Tensor has shape (local_n_kv_heads * max_seq_len, head_dim).
-        // Each "raw row" is one head for one position (head_dim elements).
-        // The FP32 shadow is POSITION_MAJOR: row r = [head0..head1..] kv_dim wide.
-        else if constexpr (KPrecision == ActivationPrecision::Q16_1 && VPrecision == ActivationPrecision::Q16_1)
-        {
-            // Block geometry for K
-            const size_t k_block_elems = q16_block_size_elements(entry.K->q16_block_size());
-            const size_t k_block_bytes = q16_block_size_bytes(entry.K->q16_block_size());
-            const size_t k_bpr = entry.K->blocks_per_row(); // blocks per head_dim
-            const size_t k_head_row_bytes = k_bpr * k_block_bytes;
-
-            // Block geometry for V
-            const size_t v_block_elems = q16_block_size_elements(entry.V->q16_block_size());
-            const size_t v_block_bytes = q16_block_size_bytes(entry.V->q16_block_size());
-            const size_t v_bpr = entry.V->blocks_per_row();
-            const size_t v_head_row_bytes = v_bpr * v_block_bytes;
-
-            const uint8_t *k_raw = reinterpret_cast<const uint8_t *>(entry.K->raw_data());
-            const uint8_t *v_raw = reinterpret_cast<const uint8_t *>(entry.V->raw_data());
-
-            constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // int16_t qs[]
-
-            for (int r = from; r < to; ++r)
-            {
-                const int phys = (entry.head + r) % max_seq_len_;
-                const size_t dst_row_off = static_cast<size_t>(r) * kv_dim_;
-
-                for (int h = 0; h < local_n_kv_heads_; ++h)
-                {
-                    // HEAD_MAJOR raw row = h * max_seq_len + phys
-                    const size_t raw_row = static_cast<size_t>(h) * max_seq_len_ + phys;
-                    const size_t dst_head_off = dst_row_off + static_cast<size_t>(h) * head_dim_;
-
-                    // Dequantize K: head h, position phys
-                    const uint8_t *k_head = k_raw + raw_row * k_head_row_bytes;
-                    for (size_t b = 0; b < k_bpr; ++b)
-                    {
-                        const uint8_t *blk = k_head + b * k_block_bytes;
-                        float d;
-                        std::memcpy(&d, blk, sizeof(float));
-                        const int16_t *qs = reinterpret_cast<const int16_t *>(blk + QS_OFFSET);
-                        const size_t base = b * k_block_elems;
-                        const size_t count = std::min(k_block_elems, static_cast<size_t>(head_dim_) - base);
-                        for (size_t i = 0; i < count; ++i)
-                            k_fp32[dst_head_off + base + i] = d * static_cast<float>(qs[i]);
-                    }
-
-                    // Dequantize V: head h, position phys
-                    const uint8_t *v_head = v_raw + raw_row * v_head_row_bytes;
-                    for (size_t b = 0; b < v_bpr; ++b)
-                    {
-                        const uint8_t *blk = v_head + b * v_block_bytes;
-                        float d;
-                        std::memcpy(&d, blk, sizeof(float));
-                        const int16_t *qs = reinterpret_cast<const int16_t *>(blk + QS_OFFSET);
-                        const size_t base = b * v_block_elems;
-                        const size_t count = std::min(v_block_elems, static_cast<size_t>(head_dim_) - base);
-                        for (size_t i = 0; i < count; ++i)
-                            v_fp32[dst_head_off + base + i] = d * static_cast<float>(qs[i]);
-                    }
-                }
-            }
-
-            if (rope && rope->rope_theta > 0.0f && rope->n_kv_heads > 0)
-            {
-                const size_t offset = static_cast<size_t>(from) * kv_dim_;
-                apply_rope_to_k_fp32(
-                    k_fp32 + offset,
-                    to - from, rope->head_dim, rope->n_kv_heads,
-                    rope->rope_theta, rope->position_start + from,
-                    rope->rope_dim);
-            }
-        }
-        // Symmetric TQ8 cache (both K and V are TQ8) - not yet used, stub
-        else if constexpr (KPrecision == ActivationPrecision::TQ8 && VPrecision == ActivationPrecision::TQ8)
-        {
-            LOG_ERROR("[CPURingKVCache] Symmetric TQ8 get_kv_converted not yet implemented");
-            shadow.converted_rows = to;
-            return;
-        }
-        else
-        {
-            LOG_ERROR("[CPURingKVCache] get_kv_converted not implemented for precision K="
-                      << static_cast<int>(KPrecision) << " V=" << static_cast<int>(VPrecision));
-            shadow.converted_rows = to;
-            return;
-        }
-
-        shadow.converted_rows = to;
-    }
-
-    // =========================================================================
     // Individual K / V Accessors
     // =========================================================================
     // These are thin wrappers that return the raw K or V tensor pointer.
@@ -812,15 +363,22 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Cache Management (clear operations)
+    // Explicit State-Lifetime Reset Operations
     // =========================================================================
     // These reset the ring buffer bookkeeping (head and size) WITHOUT freeing
     // the underlying tensor memory. This allows the cache to be reused across
     // inference sessions without reallocation.
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::clear()
+    bool CPURingKVCache<KPrecision, VPrecision>::resetRequestState(
+        const StateResetContext &context)
     {
+        if (!context.permitsRequestReset() ||
+            context.execution_stream || !context.hasReason())
+        {
+            LOG_ERROR("[CPURingKVCache] Request-state reset requires a named CPU boundary with no GPU stream");
+            return false;
+        }
         for (int layer = 0; layer < n_layers_; ++layer)
         {
             for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
@@ -829,42 +387,71 @@ namespace llaminar2
                 entries_[layer][seq_idx].size = 0;
             }
         }
-        for (auto &layer_shadows : fp32_shadows_)
-        {
-            for (auto &shadow : layer_shadows)
-            {
-                shadow.converted_rows = 0;
-                shadow.last_head = -1;
-            }
-        }
         wrap_warned_ = false;
+        return true;
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::clear_sequence(int layer, int seq_idx)
+    bool CPURingKVCache<KPrecision, VPrecision>::resetLayerSequenceState(
+        int layer,
+        int seq_idx,
+        const StateResetContext &context)
     {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        if (!context.permitsLayerSequenceReset() ||
+            context.execution_stream || !context.hasReason() ||
+            layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_)
         {
-            return;
+            LOG_ERROR("[CPURingKVCache] Layer/sequence reset has invalid ownership"
+                      << " layer=" << layer
+                      << " seq_idx=" << seq_idx);
+            return false;
         }
         entries_[layer][seq_idx].head = 0;
         entries_[layer][seq_idx].size = 0;
-        invalidateFP32Shadow(layer, seq_idx);
+        return true;
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::clear_layer(int layer)
+    bool CPURingKVCache<KPrecision, VPrecision>::resetSequenceState(
+        int seq_idx,
+        const StateResetContext &context)
     {
-        if (layer < 0 || layer >= n_layers_)
+        if (!context.permitsSequenceReset() ||
+            context.execution_stream || !context.hasReason() ||
+            seq_idx < 0 || seq_idx >= batch_size_)
         {
-            return;
+            LOG_ERROR("[CPURingKVCache] Sequence-state reset has invalid ownership"
+                      << " seq_idx=" << seq_idx);
+            return false;
+        }
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            entries_[layer][seq_idx].head = 0;
+            entries_[layer][seq_idx].size = 0;
+        }
+        return true;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    bool CPURingKVCache<KPrecision, VPrecision>::resetLayerState(
+        int layer,
+        const StateResetContext &context)
+    {
+        if (!context.permitsLayerReset() ||
+            context.execution_stream || !context.hasReason() ||
+            layer < 0 || layer >= n_layers_)
+        {
+            LOG_ERROR("[CPURingKVCache] Layer-state reset has invalid ownership"
+                      << " layer=" << layer);
+            return false;
         }
         for (int seq_idx = 0; seq_idx < batch_size_; ++seq_idx)
         {
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].size = 0;
-            invalidateFP32Shadow(layer, seq_idx);
         }
+        return true;
     }
 
     // =========================================================================
@@ -1091,7 +678,7 @@ namespace llaminar2
         (void)gpu_stream;
         if (layer < 0 || layer >= n_layers_ ||
             seq_idx < 0 || seq_idx >= batch_size_ ||
-            verifier_rows < 2 || verifier_rows > 4 ||
+            verifier_rows < 2 ||
             !K || !V)
         {
             return false;
@@ -1196,37 +783,42 @@ namespace llaminar2
                    static_cast<size_t>(head) * head_bytes;
         };
 
-        // Calculate the destination positions up front from the same state
-        // transition as serial decode.  Data copies use the original positions;
-        // metadata is committed only after every row copy has succeeded.
-        int next_head = entry.head;
-        int next_size = entry.size;
-        std::array<int, 4> dst_positions{};
-        for (int row = 0; row < verifier_rows; ++row)
+        /*
+         * Derive every destination from one immutable base state. For rows that
+         * fit before saturation, serial decode writes after the current visible
+         * tail. Every remaining row overwrites the oldest slot and advances the
+         * head. This closed form is the same transition as row-at-a-time decode,
+         * but it needs no runtime-sized destination vector and therefore performs
+         * no allocation or deallocation in the grouped verifier hot path.
+         *
+         * The live entry remains untouched until every native K/V copy has
+         * completed. Publishing head and size together below is therefore the
+         * single transactional metadata commit for the whole grouped operation.
+         */
+        const int base_head = entry.head;
+        const int base_size = entry.size;
+        const int rows_before_saturation = max_seq_len_ - base_size;
+        const int overwritten_rows =
+            std::max(0, verifier_rows - rows_before_saturation);
+        const int next_head =
+            (base_head + (overwritten_rows % max_seq_len_)) % max_seq_len_;
+        const int next_size =
+            std::min(max_seq_len_, base_size + verifier_rows);
+
+        if (overwritten_rows > 0 && !wrap_warned_)
         {
-            if (next_size < max_seq_len_)
-            {
-                dst_positions[static_cast<size_t>(row)] =
-                    (next_head + next_size) % max_seq_len_;
-                ++next_size;
-            }
-            else
-            {
-                if (!wrap_warned_)
-                {
-                    LOG_WARN("Context window full (" << max_seq_len_
-                                                     << " tokens). Sliding window is now overwriting oldest tokens. "
-                                                     << "Use -c <size> to increase context length.");
-                    wrap_warned_ = true;
-                }
-                dst_positions[static_cast<size_t>(row)] = next_head;
-                next_head = (next_head + 1) % max_seq_len_;
-            }
+            LOG_WARN("Context window full (" << max_seq_len_
+                                             << " tokens). Sliding window is now overwriting oldest tokens. "
+                                             << "Use -c <size> to increase context length.");
+            wrap_warned_ = true;
         }
 
         for (int row = 0; row < verifier_rows; ++row)
         {
-            const int dst_pos = dst_positions[static_cast<size_t>(row)];
+            const int dst_pos =
+                row < rows_before_saturation
+                    ? (base_head + base_size + row) % max_seq_len_
+                    : (base_head + row - rows_before_saturation) % max_seq_len_;
             if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
             {
                 for (int h = 0; h < local_n_kv_heads_; ++h)
@@ -1267,7 +859,25 @@ namespace llaminar2
 
         entry.head = next_head;
         entry.size = next_size;
-        invalidateFP32Shadow(layer, seq_idx);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_kv_cache_grouped_verifier_append_calls",
+            1.0,
+            "verifier",
+            "cpu",
+            {{"k_format", activationPrecisionToString(KPrecision)},
+             {"v_format", activationPrecisionToString(VPrecision)},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"source_k_layout", k_source_head_major ? "head_major" : "position_major"},
+             {"source_v_layout", v_source_head_major ? "head_major" : "position_major"},
+             {"destination_layout", layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR
+                                        ? "head_major"
+                                        : "position_major"},
+             {"local_kv_heads", std::to_string(local_n_kv_heads_)},
+             {"head_dim", std::to_string(head_dim_)},
+             {"ring_size", std::to_string(entry.size)},
+             {"ring_head", std::to_string(entry.head)},
+             {"commit_policy", "single_grouped_metadata_commit"}});
         return true;
     }
 
@@ -1560,7 +1170,6 @@ namespace llaminar2
             entry.head = (entry.head + evict) % max_seq_len_;
             entry.size -= evict;
             total_evicted_ += evict;
-            invalidateFP32Shadow(layer, seq_idx);
         }
     }
 
@@ -1675,6 +1284,12 @@ namespace llaminar2
     bool CPURingKVCache<KPrecision, VPrecision>::exportLogicalBlock(
         const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
     {
+        if (desc.payload_domain !=
+            KVCacheLogicalBlockPayloadDomain::Host)
+        {
+            LOG_ERROR("[CPURingKVCache::exportLogicalBlock] CPU cache refuses a device-domain prefix payload");
+            return false;
+        }
         const int local_layer = remapLayerIndex(desc.layer);
         if (local_layer < 0 || local_layer >= n_layers_ ||
             desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
@@ -1717,6 +1332,24 @@ namespace llaminar2
         const size_t v_rb = VTrait::row_bytes(entry.V.get(), kv_dim_, head_dim_);
         const size_t k_hb = KTrait::head_bytes(entry.K.get(), kv_dim_, head_dim_);
         const size_t v_hb = VTrait::head_bytes(entry.V.get(), kv_dim_, head_dim_);
+        const size_t k_payload_bytes = (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+                                           ? static_cast<size_t>(local_n_kv_heads_) *
+                                                 static_cast<size_t>(desc.token_count) * k_hb
+                                           : static_cast<size_t>(desc.token_count) * k_rb;
+        const size_t v_payload_bytes = (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+                                           ? static_cast<size_t>(local_n_kv_heads_) *
+                                                 static_cast<size_t>(desc.token_count) * v_hb
+                                           : static_cast<size_t>(desc.token_count) * v_rb;
+        auto canonicalize_export = [&]() -> bool
+        {
+            if (!kv_cache_codec::canonicalizeFloatingZeros(dst_k, k_payload_bytes, KPrecision) ||
+                !kv_cache_codec::canonicalizeFloatingZeros(dst_v, v_payload_bytes, VPrecision))
+            {
+                LOG_ERROR("[CPURingKVCache::exportLogicalBlock] logical payload canonicalization failed");
+                return false;
+            }
+            return true;
+        };
 
         if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
         {
@@ -1733,7 +1366,7 @@ namespace llaminar2
                     std::memcpy(out_v + dst_row * v_hb, src_v + src_v_row * v_hb, v_hb);
                 }
             }
-            return true;
+            return canonicalize_export();
         }
 
         for (int i = 0; i < desc.token_count; ++i)
@@ -1748,13 +1381,19 @@ namespace llaminar2
                         v_rb);
         }
 
-        return true;
+        return canonicalize_export();
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
     bool CPURingKVCache<KPrecision, VPrecision>::importLogicalBlock(
         const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
     {
+        if (desc.payload_domain !=
+            KVCacheLogicalBlockPayloadDomain::Host)
+        {
+            LOG_ERROR("[CPURingKVCache::importLogicalBlock] CPU cache refuses a device-domain prefix payload");
+            return false;
+        }
         const int local_layer = remapLayerIndex(desc.layer);
         if (local_layer < 0 || local_layer >= n_layers_ ||
             desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
@@ -1776,7 +1415,6 @@ namespace llaminar2
             {
                 entry.head = 0;
                 entry.size = 0;
-                invalidateFP32Shadow(local_layer, desc.seq_idx);
             }
             return true;
         }
@@ -1835,7 +1473,6 @@ namespace llaminar2
 
         entry.head = 0;
         entry.size = std::max(entry.size, desc.logical_token_start + desc.token_count);
-        invalidateFP32Shadow(local_layer, desc.seq_idx);
         return true;
     }
 
@@ -1868,33 +1505,8 @@ namespace llaminar2
                 entry.head = 0;
             }
             entry.size = cached_tokens;
-            invalidateFP32Shadow(layer, seq_idx);
         }
         return true;
-    }
-
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    void CPURingKVCache<KPrecision, VPrecision>::advanceHead(int layer, int seq_idx, int num_tokens)
-    {
-        if (layer < 0 || layer >= n_layers_ ||
-            seq_idx < 0 || seq_idx >= batch_size_ ||
-            num_tokens <= 0)
-        {
-            return;
-        }
-
-        auto &entry = entries_[layer][seq_idx];
-        if (entry.size + num_tokens <= max_seq_len_)
-        {
-            entry.size += num_tokens;
-        }
-        else
-        {
-            const int to_evict = entry.size + num_tokens - max_seq_len_;
-            entry.head = (entry.head + to_evict) % max_seq_len_;
-            entry.size = max_seq_len_;
-        }
-        invalidateFP32Shadow(layer, seq_idx);
     }
 
     // =========================================================================
@@ -1931,9 +1543,9 @@ namespace llaminar2
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
         case ActivationPrecision::TQ4:
-            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
-        case ActivationPrecision::TQ8:
             return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+        case ActivationPrecision::TQ8:
+            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
         default:
             LOG_ERROR("createCPURingKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1964,9 +1576,9 @@ namespace llaminar2
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::TQ4:
-            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
-        case ActivationPrecision::TQ8:
             return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+        case ActivationPrecision::TQ8:
+            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -2002,11 +1614,11 @@ namespace llaminar2
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                          n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
         case ActivationPrecision::TQ4:
-            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
-        case ActivationPrecision::TQ8:
             return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+        case ActivationPrecision::TQ8:
+            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
         default:
             LOG_ERROR("createShardedCPURingKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -2043,11 +1655,11 @@ namespace llaminar2
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                          n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::TQ4:
-            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
-        case ActivationPrecision::TQ8:
             return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+        case ActivationPrecision::TQ8:
+            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createShardedCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;

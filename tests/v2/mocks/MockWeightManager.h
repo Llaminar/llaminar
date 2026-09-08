@@ -32,6 +32,7 @@
 #include <cmath>
 #include <algorithm>
 #include <optional>
+#include <mutex>
 
 namespace llaminar2::test
 {
@@ -279,14 +280,21 @@ namespace llaminar2::test
         std::vector<std::string> weightNames() const;
 
         /**
-         * @brief Get number of times getWeight was called
+         * @brief Get a coherent snapshot of the number of weight requests.
+         *
+         * The mock may be shared by the concurrently constructed participant
+         * runners of a local-TP stage. Observation state is therefore guarded
+         * even though the configured weight maps are immutable during reads.
          */
-        size_t getWeightCallCount() const { return get_weight_calls_; }
+        size_t getWeightCallCount() const;
 
         /**
-         * @brief Get names of weights that were requested but not found
+         * @brief Get a coherent snapshot of missing weight requests.
+         *
+         * Returning a value prevents callers from retaining a reference while
+         * another participant appends a request during parallel graph build.
          */
-        const std::vector<std::string> &missingWeightRequests() const { return missing_requests_; }
+        std::vector<std::string> missingWeightRequests() const;
 
         /**
          * @brief Reset call counts and missing requests
@@ -311,9 +319,12 @@ namespace llaminar2::test
         std::optional<WeightShardingConfig> sharding_config_;
         std::shared_ptr<TensorParallelConfig> tp_config_;
 
-        // Call tracking
-        mutable size_t get_weight_calls_ = 0;
-        mutable std::vector<std::string> missing_requests_;
+        // A local-TP build shares this mock across participant construction.
+        // Keep its diagnostic observations coherent without serializing the
+        // immutable weight-map reads that dominate graph materialization.
+        mutable std::mutex observation_mutex_;
+        size_t get_weight_calls_ = 0;
+        std::vector<std::string> missing_requests_;
     };
 
     /**
@@ -397,14 +408,19 @@ namespace llaminar2::test
         DeviceId device,
         int layer_idx)
     {
-        ++get_weight_calls_;
         (void)device;    // Unused in mock
         (void)layer_idx; // Unused in mock
 
         auto it = weights_.find(name);
-        if (it == weights_.end())
+        const bool missing = it == weights_.end();
         {
-            missing_requests_.push_back(name);
+            std::lock_guard<std::mutex> lock(observation_mutex_);
+            ++get_weight_calls_;
+            if (missing)
+                missing_requests_.push_back(name);
+        }
+        if (missing)
+        {
             return nullptr;
         }
         return it->second;
@@ -650,8 +666,21 @@ namespace llaminar2::test
         return names;
     }
 
+    inline size_t MockWeightManager::getWeightCallCount() const
+    {
+        std::lock_guard<std::mutex> lock(observation_mutex_);
+        return get_weight_calls_;
+    }
+
+    inline std::vector<std::string> MockWeightManager::missingWeightRequests() const
+    {
+        std::lock_guard<std::mutex> lock(observation_mutex_);
+        return missing_requests_;
+    }
+
     inline void MockWeightManager::resetCounters()
     {
+        std::lock_guard<std::mutex> lock(observation_mutex_);
         get_weight_calls_ = 0;
         missing_requests_.clear();
     }

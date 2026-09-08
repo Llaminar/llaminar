@@ -740,6 +740,10 @@ namespace llaminar2::test::orchestration
             config.local_d_ff = model.d_ff;
             config.local_vocab = model.vocab_size;
 
+            // Memory scenarios must state the graph's verifier-row capacity.
+            // Thirty-one also exercises a depth beyond the default M=16 gate.
+            config.custom_formulas["mtp_target_query_rows"] = 31;
+
             return config;
         }
 

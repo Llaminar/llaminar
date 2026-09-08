@@ -29,6 +29,7 @@
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
 #include "../../execution/compute_stages/stages/QKNormStage.h"
+#include "../../execution/moe/MoERebalanceController.h"
 #include "../../execution/mtp/MTPSpecDecodeMetadata.h"
 #include "../../kernels/IHybridKVCache.h"
 #include "../../config/PipelineConfig.h"
@@ -37,6 +38,7 @@
 #include <chrono>
 #include <chrono>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 
 namespace llaminar2
@@ -48,7 +50,7 @@ namespace llaminar2
             if (!config.tp_config)
                 return 0;
 
-            // NodeLocalTP uses one MPI rank per CPU socket, but DeviceId::cpu()
+            // NodeTP uses one MPI rank per CPU socket, but DeviceId::cpu()
             // is a singleton.  Matching by device would always find rank 0's
             // assignment, so prefer the current rank's assignment when it owns
             // the requested device.
@@ -79,6 +81,57 @@ namespace llaminar2
         BufferId gatheredLogitsBufferId(bool all_positions)
         {
             return all_positions ? BufferId::ALL_POSITION_LOGITS : BufferId::LOGITS;
+        }
+
+        /**
+         * @brief Validate position ownership and select optional host rows.
+         *
+         * Graph builders must preserve the position representation declared by
+         * ForwardInput. They may not manufacture host rows for a contiguous GPU
+         * range: doing so records an asynchronous H2D copy whose mutable source
+         * can race the next chunk. ExplicitRows accepts either host rows or
+         * device-resident rows; ContiguousOffset accepts only a single request
+         * represented by the scalar position_offset.
+         *
+         * @param input Forward invocation whose position contract is validated.
+         * @param graph_name Graph path used to make fatal diagnostics actionable.
+         * @return Host position rows, or null for device rows/contiguous offsets.
+         * @throws std::runtime_error when the declared contract is inconsistent.
+         */
+        const int *validatedHostPositionRows(
+            const ForwardInput &input,
+            const char *graph_name)
+        {
+            if (input.position_policy == ForwardPositionPolicy::ContiguousOffset)
+            {
+                if (input.batch_size != 1)
+                {
+                    throw std::runtime_error(
+                        std::string(graph_name) +
+                        ": contiguous position offsets require batch_size=1");
+                }
+                if (input.position_ids || input.position_ids_device)
+                {
+                    throw std::runtime_error(
+                        std::string(graph_name) +
+                        ": contiguous position offsets must not also provide position rows");
+                }
+                return nullptr;
+            }
+
+            if (!input.position_ids && !input.position_ids_device)
+            {
+                throw std::runtime_error(
+                    std::string(graph_name) +
+                    ": explicit position policy requires host or device rows");
+            }
+            if (input.position_ids_device && !input.device.is_gpu())
+            {
+                throw std::runtime_error(
+                    std::string(graph_name) +
+                    ": device position rows require a GPU graph");
+            }
+            return input.position_ids;
         }
 
         /**
@@ -125,6 +178,7 @@ namespace llaminar2
             BufferId input_buffer_id = BufferId::NORMALIZED;
             bool compute_all_positions = false;
             bool use_prefill_replay_row_offset = true;
+            std::optional<DeviceRowRange> verifier_rows; ///< Only identity row layouts borrow the source count.
         };
 
         /**
@@ -137,7 +191,8 @@ namespace llaminar2
             const GraphConfig &config,
             const ActivationBuffers &buffers,
             TensorBase *lm_head_input,
-            int total_tokens)
+            int total_tokens,
+            std::optional<DeviceRowRange> verifier_rows)
         {
             const TensorBase *normalized = buffers.normalized;
             const TensorBase *compact_rows = buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
@@ -163,8 +218,19 @@ namespace llaminar2
             {
                 layout.seq_len = total_tokens;
                 layout.input_buffer_id = BufferId::NORMALIZED;
-                layout.compute_all_positions = config.compute_all_position_logits;
-                layout.use_prefill_replay_row_offset = true;
+                layout.verifier_rows = verifier_rows;
+                layout.compute_all_positions =
+                    config.compute_all_position_logits ||
+                    config.live_mtp_request_batch_condition;
+                /*
+                 * A full-identity verifier bypasses the compact row-copy stage,
+                 * but its normalized activation still begins at physical row
+                 * zero. It must therefore retain the verifier's no-offset
+                 * semantics rather than inheriting bucketed-prefill replay
+                 * offsets merely because both use NORMALIZED.
+                 */
+                layout.use_prefill_replay_row_offset =
+                    !config.compute_row_indexed_logits;
                 return layout;
             }
 
@@ -173,6 +239,28 @@ namespace llaminar2
             layout.compute_all_positions = false;
             layout.use_prefill_replay_row_offset = false;
             return layout;
+        }
+
+        /**
+         * @brief Decide whether compact verifier LM-head rows need decode-equivalent grouping.
+         *
+         * MTP verifier rows are publishable live-model state, so their LM-head
+         * projection must be byte-identical to running each row through the
+         * backend's normal M=1 decode projection.  Plain small-M GEMM may choose
+         * a different reduction order and drift by a few ULPs, which is enough to
+         * break the verifier contract.  The LMHeadStage decode-equivalent route
+         * keeps the grouped API while selecting backend policies proven against
+         * serial decode for the compact verifier window.
+         */
+        bool shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+            const GraphConfig &config,
+            DeviceId device,
+            const LMHeadInputLayout &layout)
+        {
+            return (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+                   layout.compute_all_positions &&
+                   layout.seq_len > 1 &&
+                   config.usesMTPGroupedDecodeEquivalentRows();
         }
 
         /**
@@ -226,6 +314,48 @@ namespace llaminar2
                 }
             }
             return selected_rows;
+        }
+
+        /**
+         * @brief Test whether row-indexed logits already form the dense input.
+         *
+         * The empty row list has the established meaning `[0, row_count)`.
+         * An explicit list is a dense identity cover only when it has one entry
+         * for every physical activation row and each entry names that same row.
+         * Malformed explicit lists deliberately return false so the ordinary
+         * resolver emits its detailed fatal validation error.
+         *
+         * @param config Graph policy carrying an optional explicit row list.
+         * @param row_count Number of compact logits requested by the verifier.
+         * @param total_tokens Number of physical rows in the activation tensor.
+         * @return True when LM head can consume the activation without copying.
+         */
+        bool rowIndexedLogitsCoverFullPhysicalInput(
+            const GraphConfig &config,
+            int row_count,
+            int total_tokens)
+        {
+            if (row_count <= 0 || row_count != total_tokens)
+                return false;
+
+            if (config.row_indexed_logits_selected_rows.empty())
+                return true;
+            if (static_cast<int>(
+                    config.row_indexed_logits_selected_rows.size()) !=
+                total_tokens)
+            {
+                return false;
+            }
+
+            for (int row = 0; row < total_tokens; ++row)
+            {
+                if (config.row_indexed_logits_selected_rows[
+                        static_cast<size_t>(row)] != row)
+                {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -288,17 +418,602 @@ namespace llaminar2
         return weight_bindings_.get_layer_weights != nullptr || weights_.get_layer_weights != nullptr;
     }
 
+    bool QwenGraphBase::hasDecodeReplicatedDenseWeightSource() const
+    {
+        return decode_replicated_dense_weight_bindings_.get_layer_weights != nullptr;
+    }
+
+    std::string QwenGraphBase::describeDecodeReplicatedDenseBindingState() const
+    {
+        auto state = [](const void *ptr)
+        {
+            return ptr ? "present" : "missing";
+        };
+        return std::string("layers=") +
+               (decode_replicated_dense_weight_bindings_.get_layer_weights ? "present" : "missing") +
+               " embedding=" + state(decode_replicated_dense_weight_bindings_.embedding_table) +
+               " final_norm=" + state(decode_replicated_dense_weight_bindings_.final_norm) +
+               " lm_head=" + state(decode_replicated_dense_weight_bindings_.lm_head);
+    }
+
+    bool QwenGraphBase::useDecodeReplicatedDenseWeights() const
+    {
+        return decode_replicated_dense_graph_active_ &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
+    bool QwenGraphBase::useReplicatedMTPSidecarDenseWeights() const
+    {
+        return mtp_replicated_dense_graph_active_ &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
+    bool QwenGraphBase::hasDecodeMirroredEmbeddingWeightSource() const
+    {
+        return decode_replicated_dense_weight_bindings_.embedding_table != nullptr;
+    }
+
+    bool QwenGraphBase::useDecodeMirroredEmbeddingWeights() const
+    {
+        return decode_mirrored_embedding_graph_active_ &&
+               hasDecodeMirroredEmbeddingWeightSource();
+    }
+
+    bool QwenGraphBase::hasMirroredMTPHeadWeightSource() const
+    {
+        return decode_replicated_dense_weight_bindings_.final_norm != nullptr &&
+               decode_replicated_dense_weight_bindings_.lm_head != nullptr;
+    }
+
+    bool QwenGraphBase::mirroredMTPHeadConfigured() const
+    {
+        /*
+         * Terminal-head ownership is a graph-layout policy, not a switch that
+         * may change when speculative execution is enabled.  Serial decode is
+         * the arithmetic oracle for grouped MTP, so both lanes must bind the
+         * same full-vocabulary weight and sampling surface.  Tying mirroring to
+         * mtp.enabled made the oracle column-sharded while the verifier was
+         * mirrored, leaving stochastic parity dependent on two different
+         * reduction and sampling implementations.
+         */
+        return config_.mtpUsesMirroredTerminalHeadBinding();
+    }
+
+    bool QwenGraphBase::mirroredMTPHeadActiveForProjectedRows(int total_tokens) const
+    {
+        /*
+         * Ordinary prefill can contain thousands of transformer rows while its
+         * LM head projects only the final row. Request-batched prefill projects
+         * one compact terminal row per request, and an all-position verifier
+         * projects its explicit target rows. The mirrored-head decision follows
+         * that terminal projection geometry, never the transformer activation
+         * size. Otherwise a long prefill leaves the scalar MTP first-target
+         * sample on a sharded head even though every participant already owns
+         * the replicated weight.
+         */
+        const int projected_rows =
+            config_.compute_row_indexed_logits
+                ? config_.row_indexed_logits_row_count
+                : (config_.compute_all_position_logits ||
+                   config_.live_mtp_request_batch_condition)
+                      ? total_tokens
+                      : 1;
+        return mirroredMTPHeadConfigured() &&
+               projected_rows > 0;
+    }
+
+    bool QwenGraphBase::useMirroredMTPHeadWeights() const
+    {
+        return mtp_mirrored_lm_head_graph_active_;
+    }
+
+    bool QwenGraphBase::useFullVocabEmbeddingForCurrentGraph() const
+    {
+        return useDecodeReplicatedDenseWeights() ||
+               useDecodeMirroredEmbeddingWeights();
+    }
+
+    bool QwenGraphBase::usesVocabParallelEmbeddingForCurrentGraph() const
+    {
+        TensorBase *embedding = modelEmbeddingTable();
+        return embedding && static_cast<int>(embedding->rows()) < config_.vocab_size;
+    }
+
+    int QwenGraphBase::embeddingVocabOffsetForCurrentGraph(DeviceId device) const
+    {
+        return usesVocabParallelEmbeddingForCurrentGraph()
+                   ? embeddingVocabOffsetForDevice(config_, device)
+                   : 0;
+    }
+
+    bool QwenGraphBase::useReplicatedAttentionStateWeights() const
+    {
+        return replicated_attention_state_graph_active_ &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
+    QwenGraphBase::FinalProjectionPolicy QwenGraphBase::resolveFinalProjectionPolicy(
+        const FinalProjectionPolicyRequest &request) const
+    {
+        FinalProjectionPolicy policy{
+            .norm_source = request.norm_source,
+            .head_policy = FinalHeadPolicy::PrimaryFullVocabulary,
+            .norm_gamma = nullptr,
+            .lm_head_weight = nullptr,
+            .lm_head_binding = nullptr,
+            .lm_head_output = nullptr,
+            .lm_head_vocab_size = 0,
+            .serial_equivalent_partition_width = 0,
+            .column_parallel = false,
+            .needs_allgather = false,
+        };
+
+        switch (request.norm_source)
+        {
+        case FinalNormSource::ModelOutputNorm:
+            policy.norm_gamma = modelFinalNorm();
+            break;
+        case FinalNormSource::MTPSidecarNorm:
+            policy.norm_gamma = request.mtp_norm;
+            break;
+        }
+
+        /*
+         * Keep the layout decision declarative and local to the policy resolver.
+         * Callers state whether a full-vocabulary head is required; this method
+         * chooses the tensor, binding, vocab width, and follow-up allgather
+         * contract as one coherent package.
+         */
+        policy.column_parallel =
+            !request.force_full_vocabulary_head &&
+            useColumnParallelLMHeadForGraph(request.column_parallel_output);
+        policy.lm_head_output =
+            policy.column_parallel
+                ? request.column_parallel_output
+                : request.full_vocab_output;
+        policy.lm_head_vocab_size =
+            policy.column_parallel ? config_.vocab_local : config_.vocab_size;
+        policy.needs_allgather =
+            needsDistributedLMHeadAllGather(policy.column_parallel);
+        policy.serial_equivalent_partition_width =
+            serialEquivalentLMHeadPartitionWidth(policy.column_parallel);
+
+        if (policy.column_parallel)
+        {
+            policy.head_policy = FinalHeadPolicy::PrimaryColumnParallel;
+        }
+        else if (useMirroredMTPHeadWeights())
+        {
+            policy.head_policy = FinalHeadPolicy::MirroredMTPFullVocabulary;
+        }
+        else if (useDecodeReplicatedDenseWeights())
+        {
+            policy.head_policy = FinalHeadPolicy::DecodeReplicatedFullVocabulary;
+        }
+        else
+        {
+            policy.head_policy = FinalHeadPolicy::PrimaryFullVocabulary;
+        }
+
+        policy.lm_head_weight = modelLMHeadForGraph(policy.column_parallel);
+        policy.lm_head_binding = modelLMHeadBindingForGraph(policy.column_parallel);
+        return policy;
+    }
+
+    int QwenGraphBase::serialEquivalentLMHeadPartitionWidth(
+        bool column_parallel) const
+    {
+        if (column_parallel || !useMirroredMTPHeadWeights())
+            return 0;
+
+        if (config_.vocab_local <= 0 || config_.vocab_size <= 0 ||
+            config_.vocab_local > config_.vocab_size)
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Mirrored MTP LM head requires a positive serial vocabulary partition");
+        }
+
+        int canonical_partition_width = config_.vocab_local;
+        if (config_.tp_config)
+        {
+            if (config_.tp_config->totalVocab() != config_.vocab_size)
+            {
+                throw std::logic_error(
+                    "[QwenGraphBase] Mirrored MTP LM-head TP assignments do not cover the configured vocabulary");
+            }
+
+            const auto *const local_assignment = config_.getAssignment();
+            if (!local_assignment ||
+                local_assignment->vocab_count != config_.vocab_local)
+            {
+                throw std::logic_error(
+                    "[QwenGraphBase] Mirrored MTP LM-head local vocabulary width disagrees with its typed TP assignment");
+            }
+
+            canonical_partition_width = 0;
+            for (const auto &assignment : config_.tp_config->assignments())
+            {
+                if (assignment.vocab_count <= 0)
+                {
+                    throw std::logic_error(
+                        "[QwenGraphBase] Mirrored MTP LM-head TP assignment contains an empty vocabulary shard");
+                }
+                canonical_partition_width =
+                    std::max(canonical_partition_width, assignment.vocab_count);
+            }
+        }
+
+        /*
+         * Equal TP division is not required. The largest assignment is the
+         * canonical serial launch policy and any smaller assignment is a tail
+         * shard. Every mirrored participant therefore uses one reduction tree
+         * even when the vocabulary leaves a remainder at this TP degree.
+         */
+        return canonical_partition_width == config_.vocab_size
+                   ? 0
+                   : canonical_partition_width;
+    }
+
+    bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
+    {
+        const int max_decode_like_rows = retainsMTPGraphCapacity(config_.mtp)
+            ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+            : 1;
+        const bool decode_like =
+            config_.dense_tp_enabled &&
+            config_.dense_tp_decode_replicated &&
+            forwardPhaseAllowsDecodeTopology() &&
+            total_tokens > 0 &&
+            total_tokens <= max_decode_like_rows;
+        if (!decode_like)
+            return false;
+        if (!hasDecodeReplicatedDenseWeightSource())
+        {
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated dense decode is configured but its layer weight bindings are missing: " +
+                describeDecodeReplicatedDenseBindingState());
+        }
+        return true;
+    }
+
+    bool QwenGraphBase::denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const
+    {
+        const int max_decode_like_rows = retainsMTPGraphCapacity(config_.mtp)
+            ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+            : 1;
+        return config_.dense_tp_enabled &&
+               config_.dense_tp_decode_mirrored_embedding &&
+               forwardPhaseAllowsDecodeTopology() &&
+               total_tokens > 0 &&
+               total_tokens <= max_decode_like_rows &&
+               hasDecodeMirroredEmbeddingWeightSource();
+    }
+
+    bool QwenGraphBase::replicatedAttentionStateActiveForTokens(int total_tokens) const
+    {
+        const int max_decode_like_rows = retainsMTPGraphCapacity(config_.mtp)
+            ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+            : 1;
+        const bool decode_like =
+            config_.dense_tp_enabled &&
+            config_.dense_tp_decode_replicated &&
+            forwardPhaseAllowsDecodeTopology() &&
+            total_tokens > 0 &&
+            total_tokens <= max_decode_like_rows;
+        if (!decode_like)
+            return false;
+        if (!hasDecodeReplicatedDenseWeightSource())
+        {
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated attention-state decode is configured but dense decode layer bindings are missing: " +
+                describeDecodeReplicatedDenseBindingState());
+        }
+        return true;
+    }
+
+    bool QwenGraphBase::forwardPhaseAllowsDecodeTopology() const noexcept
+    {
+        return !forward_execution_phase_.has_value() ||
+               *forward_execution_phase_ ==
+                   ForwardExecutionPhase::Decode;
+    }
+
+    bool QwenGraphBase::denseTPAllreduceEnabledForCurrentGraph() const
+    {
+        return !useDecodeReplicatedDenseWeights() &&
+               !useReplicatedMTPSidecarDenseWeights();
+    }
+
+    bool QwenGraphBase::attentionTPAllreduceEnabledForCurrentGraph() const
+    {
+        return !useReplicatedAttentionStateWeights() &&
+               !useReplicatedMTPSidecarDenseWeights();
+    }
+
+    bool QwenGraphBase::useColumnParallelLMHeadForGraph(
+        TensorBase *logits_local) const
+    {
+        if (!config_.lm_head_column_parallel || logits_local == nullptr)
+            return false;
+
+        /*
+         * MTP can explicitly mirror the terminal LM head on every TP
+         * participant.  In that mode MTP verifier/sidecar graphs produce the
+         * same full-vocab rows as serial decode, and advertising a local shard
+         * would reintroduce the tiny verifier logits collective this mode is
+         * designed to remove.
+         */
+        if (useMirroredMTPHeadWeights())
+            return false;
+
+        /*
+         * Full dense-decode replication includes the terminal projection and
+         * therefore cannot bind the primary vocabulary shard.  The narrower
+         * replicated MTP predictor deliberately does not: its dense/shared
+         * collective policy is orthogonal to terminal-head ownership.  Using
+         * denseTPAllreduceEnabledForCurrentGraph() here previously made those
+         * two policies alias and silently projected a sharded head as if it
+         * were full vocabulary.
+         */
+        return !useDecodeReplicatedDenseWeights();
+    }
+
+    bool QwenGraphBase::needsDistributedLMHeadAllGather(
+        bool column_parallel) const
+    {
+        return column_parallel &&
+               mpi_ctx_ &&
+               mpi_ctx_->world_size() > 1;
+    }
+
+    TensorBase *QwenGraphBase::graphLMHeadOutput(
+        bool column_parallel) const
+    {
+        if (needsDistributedLMHeadAllGather(column_parallel))
+            return buffers_.logits;
+        return column_parallel ? buffers_.logits_local : buffers_.logits;
+    }
+
+    bool QwenGraphBase::needsPhaseSplitPrefillKVCacheHandoff(
+        int total_tokens,
+        IKVCache *kv_cache,
+        DeviceId device) const
+    {
+        if (!kv_cache || !device.is_gpu())
+            return false;
+        if (!config_.dense_tp_enabled ||
+            !config_.dense_tp_decode_replicated ||
+            !hasDecodeReplicatedDenseWeightSource() ||
+            !config_.qkv_column_parallel)
+        {
+            return false;
+        }
+        /*
+         * A replicated MTP sidecar already projects every KV head into a
+         * full-width row on each participant.  The phase-split handoff exists
+         * only for a TP-local projection feeding a replicated decode cache.
+         * Sending a full sidecar row through that handoff would compact only
+         * `local_n_kv_heads`, all-gather those prefixes, and publish a row whose
+         * second half is another participant's copy of the first half.  Apart
+         * from corrupting shifted-prefill history, this also introduces a
+         * needless collective into the retained sidecar graph.
+         *
+         * Query the active typed sidecar policy rather than inferring layout
+         * from tensor capacity: an arena may reserve full-width buffers for
+         * several graph families, but only this graph scope establishes which
+         * bytes the projection owns.
+         */
+        if (mtp_kv_cache_only_graph_active_ &&
+            useReplicatedMTPSidecarDenseWeights())
+        {
+            return false;
+        }
+        if (!mtp_kv_cache_only_graph_active_ &&
+            (useReplicatedAttentionStateWeights() || useDecodeReplicatedDenseWeights()))
+            return false;
+        if (total_tokens <= 1)
+            return false;
+        if (config_.n_kv_heads <= 0 ||
+            config_.head_dim <= 0 ||
+            config_.local_n_kv_heads <= 0 ||
+            config_.local_n_kv_heads >= config_.n_kv_heads)
+        {
+            return false;
+        }
+        return !kv_cache->is_sharded();
+    }
+
+    QwenGraphBase::DecodeReplicatedDenseScope::DecodeReplicatedDenseScope(
+        QwenGraphBase &owner,
+        int total_tokens,
+        bool force_replicated_dense)
+        : owner_(owner),
+          previous_(owner.decode_replicated_dense_graph_active_),
+          previous_mtp_dense_(owner.mtp_replicated_dense_graph_active_),
+          previous_attention_(owner.replicated_attention_state_graph_active_),
+          previous_embedding_(owner.decode_mirrored_embedding_graph_active_),
+          previous_mtp_head_(owner.mtp_mirrored_lm_head_graph_active_)
+    {
+        if (force_replicated_dense &&
+            !owner_.hasDecodeReplicatedDenseWeightSource())
+        {
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated MTP sidecar is configured but its dense/shared weight bindings are missing: " +
+                owner_.describeDecodeReplicatedDenseBindingState());
+        }
+
+        /*
+         * A replicated MTP predictor is a graph-family ownership decision, not
+         * an M-based heuristic. The caller has already selected a frozen full
+         * sidecar weight set, so both dense and attention-state bindings must
+         * enter the same scope and their TP allreduces must disappear together.
+         */
+        owner_.decode_replicated_dense_graph_active_ =
+            owner_.denseDecodeReplicatedActiveForTokens(total_tokens);
+        owner_.mtp_replicated_dense_graph_active_ = force_replicated_dense;
+        owner_.decode_mirrored_embedding_graph_active_ =
+            owner_.denseDecodeMirroredEmbeddingActiveForTokens(total_tokens);
+        owner_.replicated_attention_state_graph_active_ =
+            force_replicated_dense ||
+            owner_.replicatedAttentionStateActiveForTokens(total_tokens);
+        owner_.mtp_mirrored_lm_head_graph_active_ =
+            owner_.mirroredMTPHeadActiveForProjectedRows(total_tokens);
+    }
+
+    QwenGraphBase::DecodeReplicatedDenseScope::~DecodeReplicatedDenseScope()
+    {
+        owner_.decode_replicated_dense_graph_active_ = previous_;
+        owner_.mtp_replicated_dense_graph_active_ = previous_mtp_dense_;
+        owner_.replicated_attention_state_graph_active_ = previous_attention_;
+        owner_.decode_mirrored_embedding_graph_active_ = previous_embedding_;
+        owner_.mtp_mirrored_lm_head_graph_active_ = previous_mtp_head_;
+    }
+
+    QwenGraphBase::ForwardExecutionPhaseScope::ForwardExecutionPhaseScope(
+        QwenGraphBase &owner,
+        ForwardExecutionPhase phase)
+        : owner_(owner),
+          previous_(owner.forward_execution_phase_)
+    {
+        owner_.forward_execution_phase_ = phase;
+    }
+
+    QwenGraphBase::ForwardExecutionPhaseScope::~ForwardExecutionPhaseScope()
+    {
+        owner_.forward_execution_phase_ = previous_;
+    }
+
+    QwenGraphBase::MirroredMTPHeadScope::MirroredMTPHeadScope(
+        QwenGraphBase &owner,
+        bool active)
+        : owner_(owner),
+          previous_(owner.mtp_mirrored_lm_head_graph_active_)
+    {
+        owner_.mtp_mirrored_lm_head_graph_active_ = active;
+    }
+
+    QwenGraphBase::MirroredMTPHeadScope::~MirroredMTPHeadScope()
+    {
+        owner_.mtp_mirrored_lm_head_graph_active_ = previous_;
+    }
+
+    QwenGraphBase::MTPKVCacheOnlyScope::MTPKVCacheOnlyScope(
+        QwenGraphBase &owner,
+        bool active)
+        : owner_(owner),
+          previous_(owner.mtp_kv_cache_only_graph_active_)
+    {
+        owner_.mtp_kv_cache_only_graph_active_ = active;
+    }
+
+    QwenGraphBase::MTPKVCacheOnlyScope::~MTPKVCacheOnlyScope()
+    {
+        owner_.mtp_kv_cache_only_graph_active_ = previous_;
+    }
+
+    namespace
+    {
+        LayerWeightBindings mergeReplicatedAttentionBindings(
+            LayerWeightBindings base,
+            const LayerWeightBindings &replicated)
+        {
+            auto pick = [](const WeightBinding *override_binding,
+                           const WeightBinding *base_binding)
+            {
+                return override_binding ? override_binding : base_binding;
+            };
+
+            base.wq = pick(replicated.wq, base.wq);
+            base.wk = pick(replicated.wk, base.wk);
+            base.wv = pick(replicated.wv, base.wv);
+            base.wo = pick(replicated.wo, base.wo);
+            base.q_bias = pick(replicated.q_bias, base.q_bias);
+            base.k_bias = pick(replicated.k_bias, base.k_bias);
+            base.v_bias = pick(replicated.v_bias, base.v_bias);
+            base.attn_qkv = pick(replicated.attn_qkv, base.attn_qkv);
+            base.attn_gate = pick(replicated.attn_gate, base.attn_gate);
+            base.ssm_alpha = pick(replicated.ssm_alpha, base.ssm_alpha);
+            base.ssm_beta = pick(replicated.ssm_beta, base.ssm_beta);
+            base.ssm_conv1d = pick(replicated.ssm_conv1d, base.ssm_conv1d);
+            base.ssm_dt_bias = pick(replicated.ssm_dt_bias, base.ssm_dt_bias);
+            base.ssm_a = pick(replicated.ssm_a, base.ssm_a);
+            base.ssm_norm = pick(replicated.ssm_norm, base.ssm_norm);
+            base.ssm_out = pick(replicated.ssm_out, base.ssm_out);
+            return base;
+        }
+
+        LayerWeightBindings mergeDenseDecodeBindings(
+            LayerWeightBindings base,
+            const LayerWeightBindings &decode_dense)
+        {
+            auto pick = [](const WeightBinding *override_binding,
+                           const WeightBinding *base_binding)
+            {
+                return override_binding ? override_binding : base_binding;
+            };
+
+            base.wq = pick(decode_dense.wq, base.wq);
+            base.wk = pick(decode_dense.wk, base.wk);
+            base.wv = pick(decode_dense.wv, base.wv);
+            base.wo = pick(decode_dense.wo, base.wo);
+            base.q_bias = pick(decode_dense.q_bias, base.q_bias);
+            base.k_bias = pick(decode_dense.k_bias, base.k_bias);
+            base.v_bias = pick(decode_dense.v_bias, base.v_bias);
+            base.attn_qkv = pick(decode_dense.attn_qkv, base.attn_qkv);
+            base.attn_gate = pick(decode_dense.attn_gate, base.attn_gate);
+            base.ssm_alpha = pick(decode_dense.ssm_alpha, base.ssm_alpha);
+            base.ssm_beta = pick(decode_dense.ssm_beta, base.ssm_beta);
+            base.ssm_conv1d = pick(decode_dense.ssm_conv1d, base.ssm_conv1d);
+            base.ssm_dt_bias = pick(decode_dense.ssm_dt_bias, base.ssm_dt_bias);
+            base.ssm_a = pick(decode_dense.ssm_a, base.ssm_a);
+            base.ssm_norm = pick(decode_dense.ssm_norm, base.ssm_norm);
+            base.ssm_out = pick(decode_dense.ssm_out, base.ssm_out);
+            base.gate_proj = pick(decode_dense.gate_proj, base.gate_proj);
+            base.up_proj = pick(decode_dense.up_proj, base.up_proj);
+            base.down_proj = pick(decode_dense.down_proj, base.down_proj);
+            base.moe_gate = pick(decode_dense.moe_gate, base.moe_gate);
+            base.moe_gate_exps = pick(decode_dense.moe_gate_exps, base.moe_gate_exps);
+            base.moe_up_exps = pick(decode_dense.moe_up_exps, base.moe_up_exps);
+            base.moe_down_exps = pick(decode_dense.moe_down_exps, base.moe_down_exps);
+            base.shared_expert_gate = pick(decode_dense.shared_expert_gate, base.shared_expert_gate);
+            base.shared_expert_up = pick(decode_dense.shared_expert_up, base.shared_expert_up);
+            base.shared_expert_down = pick(decode_dense.shared_expert_down, base.shared_expert_down);
+            base.shared_expert_gate_inp = pick(decode_dense.shared_expert_gate_inp, base.shared_expert_gate_inp);
+
+            return base;
+        }
+    }
+
     LayerWeightBindings QwenGraphBase::layerWeightBindingsForGraph(int layer_idx) const
     {
+        LayerWeightBindings bindings;
         if (weight_bindings_.get_layer_weights)
-            return weight_bindings_.get_layer_weights(layer_idx);
-        return {};
+            bindings = weight_bindings_.get_layer_weights(layer_idx);
+
+        if (useReplicatedAttentionStateWeights() &&
+            decode_replicated_dense_weight_bindings_.get_layer_weights)
+        {
+            bindings = mergeReplicatedAttentionBindings(
+                bindings,
+                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+        }
+
+        if ((useDecodeReplicatedDenseWeights() ||
+             useReplicatedMTPSidecarDenseWeights()) &&
+            decode_replicated_dense_weight_bindings_.get_layer_weights)
+        {
+            bindings = mergeDenseDecodeBindings(
+                bindings,
+                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+        }
+
+        return bindings;
     }
 
     LayerWeights QwenGraphBase::layerWeightsForGraph(int layer_idx) const
     {
         if (weight_bindings_.get_layer_weights)
-            return toLegacyLayerWeights(weight_bindings_.get_layer_weights(layer_idx));
+            return toLegacyLayerWeights(layerWeightBindingsForGraph(layer_idx));
         if (weights_.get_layer_weights)
             return weights_.get_layer_weights(layer_idx);
         return {};
@@ -306,35 +1021,128 @@ namespace llaminar2
 
     TensorBase *QwenGraphBase::modelEmbeddingTable() const
     {
+        if (useFullVocabEmbeddingForCurrentGraph())
+        {
+            TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.embedding_table);
+            if (decode_bound)
+                return decode_bound;
+            throw std::runtime_error(
+                "[QwenGraphBase] Full-vocab decode embedding was requested but no replicated embedding binding is available");
+        }
         TensorBase *bound = legacyTensor(weight_bindings_.embedding_table);
         return bound ? bound : weights_.embedding_table;
     }
 
     TensorBase *QwenGraphBase::modelFinalNorm() const
     {
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
+        {
+            /*
+             * A mirrored MTP verifier head must consume the same final
+             * normalization vector on every participant before the replicated
+             * full-vocabulary projection.  Pairing a replicated LM head with a
+             * TP-local final_norm lets otherwise identical mirrored children
+             * produce different draft distributions, which breaks stochastic
+             * MTP's single-token decode equivalence contract.
+             */
+            if (!decode_replicated_dense_weight_bindings_.final_norm)
+            {
+                throw std::runtime_error(
+                    useMirroredMTPHeadWeights()
+                        ? "[QwenGraphBase] Mirrored MTP head was requested but no replicated final_norm binding is available"
+                        : "[QwenGraphBase] Replicated dense decode was requested but no replicated final_norm binding is available");
+            }
+            TensorBase *decode_bound =
+                legacyTensor(decode_replicated_dense_weight_bindings_.final_norm);
+            if (decode_bound)
+                return decode_bound;
+            throw std::runtime_error(
+                useMirroredMTPHeadWeights()
+                    ? "[QwenGraphBase] Mirrored MTP head final_norm binding has no tensor"
+                    : "[QwenGraphBase] Replicated dense decode final_norm binding has no tensor");
+        }
         TensorBase *bound = legacyTensor(weight_bindings_.final_norm);
         return bound ? bound : weights_.final_norm;
     }
 
     TensorBase *QwenGraphBase::modelLMHead() const
     {
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
+        {
+            if (useMirroredMTPHeadWeights() && !hasMirroredMTPHeadWeightSource())
+            {
+                throw std::runtime_error(
+                    "[QwenGraphBase] Mirrored MTP head was requested but replicated final_norm/lm_head bindings are missing: " +
+                    describeDecodeReplicatedDenseBindingState());
+            }
+            TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.lm_head);
+            if (decode_bound)
+                return decode_bound;
+            throw std::runtime_error(
+                "[QwenGraphBase] Replicated dense decode was requested but no replicated LM head binding is available");
+        }
         TensorBase *bound = legacyTensor(weight_bindings_.lm_head);
         return bound ? bound : weights_.lm_head;
     }
 
+    TensorBase *QwenGraphBase::modelLMHeadForGraph(bool column_parallel) const
+    {
+        if (column_parallel)
+        {
+            TensorBase *bound = legacyTensor(weight_bindings_.lm_head);
+            if (bound)
+                return bound;
+            return weights_.lm_head;
+        }
+        return modelLMHead();
+    }
+
     const WeightBinding *QwenGraphBase::modelEmbeddingBinding() const
     {
+        if (useFullVocabEmbeddingForCurrentGraph())
+        {
+            if (!decode_replicated_dense_weight_bindings_.embedding_table)
+                throw std::runtime_error(
+                    "[QwenGraphBase] Full-vocab decode embedding was requested but no replicated embedding binding is available");
+            return decode_replicated_dense_weight_bindings_.embedding_table;
+        }
         return weight_bindings_.embedding_table;
     }
 
     const WeightBinding *QwenGraphBase::modelFinalNormBinding() const
     {
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
+        {
+            if (!decode_replicated_dense_weight_bindings_.final_norm)
+                throw std::runtime_error(
+                    useMirroredMTPHeadWeights()
+                        ? "[QwenGraphBase] Mirrored MTP head was requested but no replicated final_norm binding is available"
+                        : "[QwenGraphBase] Replicated dense decode was requested but no replicated final_norm binding is available");
+            return decode_replicated_dense_weight_bindings_.final_norm;
+        }
         return weight_bindings_.final_norm;
     }
 
     const WeightBinding *QwenGraphBase::modelLMHeadBinding() const
     {
+        if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
+        {
+            if (!decode_replicated_dense_weight_bindings_.lm_head)
+                throw std::runtime_error(
+                    useMirroredMTPHeadWeights()
+                        ? "[QwenGraphBase] Mirrored MTP head was requested but no replicated LM head binding is available"
+                        : "[QwenGraphBase] Replicated dense decode was requested but no replicated LM head binding is available");
+            return decode_replicated_dense_weight_bindings_.lm_head;
+        }
         return weight_bindings_.lm_head;
+    }
+
+    const WeightBinding *QwenGraphBase::modelLMHeadBindingForGraph(
+        bool column_parallel) const
+    {
+        if (column_parallel)
+            return weight_bindings_.lm_head;
+        return modelLMHeadBinding();
     }
 
     std::optional<PreparedWeightRef> QwenGraphBase::preparedRefForGraphWeight(
@@ -350,7 +1158,28 @@ namespace llaminar2
         // the sole source of truth for graph-executable prepared weights.
         if (binding && prepared_weight_store_)
         {
-            auto ref = prepared_weight_store_->preparedRefForBinding(binding->binding_id, device);
+            PreparedWeightKind expected_kind = PreparedWeightKind::None;
+            if (binding->identity.role == WeightRole::Embedding)
+            {
+                expected_kind = PreparedWeightKind::PreparedEmbedding;
+            }
+            else if (device.is_cuda())
+            {
+                expected_kind = PreparedWeightKind::CudaInt8PackedGemm;
+            }
+            else if (device.is_rocm())
+            {
+                expected_kind = PreparedWeightKind::RocmInt8PackedGemm;
+            }
+            else if (device.is_cpu())
+            {
+                expected_kind = PreparedWeightKind::CpuPackedGemm;
+            }
+
+            auto ref = prepared_weight_store_->preparedRefForBinding(
+                binding->binding_id,
+                device,
+                expected_kind);
             if (ref.has_value())
                 return ref;
         }
@@ -428,11 +1257,12 @@ namespace llaminar2
         lb.Q = toBase(arena_->getTensor(BufferId::Q_PROJ));
         lb.K = toBase(arena_->getTensor(BufferId::K_PROJ));
         lb.V = toBase(arena_->getTensor(BufferId::V_PROJ));
+        lb.K_full_prefill = toBase(arena_->getTensor(BufferId::K_FULL_PREFILL));
+        lb.V_full_prefill = toBase(arena_->getTensor(BufferId::V_FULL_PREFILL));
         lb.attn_output = toBase(arena_->getTensor(BufferId::ATTN_OUTPUT));
         lb.attn_proj = toBase(arena_->getTensor(BufferId::ATTN_PROJ));
         lb.workspace_scores = toBase(arena_->getTensor(BufferId::ATTN_SCORES_WORKSPACE));
         lb.workspace_context = toBase(arena_->getTensor(BufferId::ATTN_CONTEXT_WORKSPACE));
-        lb.workspace_mask = toBase(arena_->getTensor(BufferId::GEMM_WORKSPACE));
         lb.gate = toBase(arena_->getTensor(BufferId::GATE_PROJ));
         lb.up = toBase(arena_->getTensor(BufferId::UP_PROJ));
         lb.ffn_output = toBase(arena_->getTensor(BufferId::FFN_OUTPUT));
@@ -467,6 +1297,18 @@ namespace llaminar2
         return buffers_;
     }
 
+    HiddenStateRowsSelectStage::DeviceRowIndexSource
+    QwenGraphBase::resolveLMHeadDeviceRowIndexSource(
+        bool has_request_sequence_lengths) const
+    {
+        return has_request_sequence_lengths &&
+                       config_.row_indexed_logits_selected_rows.empty()
+                   ? HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                         RequestTerminalLengths
+                   : HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                         WorkspaceBoundDeviceIndices;
+    }
+
     TensorBase *QwenGraphBase::maybeAddLMHeadRowSelect(
         ComputeGraph &graph,
         const std::string &dependency_node,
@@ -476,6 +1318,8 @@ namespace llaminar2
         int bucket_seq_len,
         DeviceId device,
         std::string &dependency_out,
+        const int32_t *request_sequence_lengths_device,
+        int request_row_stride,
         BufferId input_buffer_id) const
     {
         dependency_out = dependency_node;
@@ -486,6 +1330,18 @@ namespace llaminar2
                 return final_norm_output;
 
             const int row_count = config_.row_indexed_logits_row_count;
+            if (rowIndexedLogitsCoverFullPhysicalInput(
+                    config_,
+                    row_count,
+                    total_tokens))
+            {
+                /*
+                 * The verifier requests the complete physical activation in
+                 * native order. Feed it directly to LM head: a row-copy stage
+                 * and its device index publication would be pure overhead.
+                 */
+                return final_norm_output;
+            }
             TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
             if (!scratch_rows)
             {
@@ -523,10 +1379,38 @@ namespace llaminar2
             row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
             if (device.is_gpu())
             {
-                row_params.workspace_buffer_name =
-                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
-                row_params.declare_selected_rows_workspace = false;
-                row_params.upload_selected_rows_to_workspace = false;
+                const bool has_explicit_verifier_rows =
+                    !config_.row_indexed_logits_selected_rows.empty();
+                row_params.device_row_index_source =
+                    resolveLMHeadDeviceRowIndexSource(
+                        request_sequence_lengths_device != nullptr);
+                if (!has_explicit_verifier_rows &&
+                    row_params.device_row_index_source ==
+                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                            RequestTerminalLengths)
+                {
+                    /*
+                     * Request-batched prefill owns real lengths in the arena.
+                     * The row-select kernel derives terminal rows from that
+                     * device array, so compact logits cannot accidentally read
+                     * stale verifier metadata from an earlier transaction.
+                     */
+                    row_params.request_sequence_lengths_device =
+                        request_sequence_lengths_device;
+                    row_params.request_row_stride = request_row_stride;
+                }
+                else
+                {
+                    /*
+                     * A grouped verifier carries one explicit source index per
+                     * compact logit row. The request-length arena remains live
+                     * during this forward, but it describes request terminals,
+                     * not verifier query rows. Explicit verifier metadata must
+                     * therefore take precedence whenever a row plan is present.
+                     */
+                    row_params.workspace_buffer_name =
+                        MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                }
             }
 
             graph.addNode("lm_head_rows_select",
@@ -550,9 +1434,10 @@ namespace llaminar2
             throw std::runtime_error("Bucketed prefill LM head row-select scratch buffer missing");
         }
 
-        // Initial execution uses the real count available at graph build. Later
-        // cache hits call updatePrefillReplayParams() on the stage, which mutates
-        // the captured pinned scalar before graph replay.
+        // CPU replay owns its selected row directly. GPU replay derives the
+        // row from the request-admission length array already consumed by the
+        // rest of the captured prefill graph; no pinned host scalar may become
+        // a second, independently mutable owner of the same logical length.
         const int initial_real_seq_len = real_seq_len > 0 ? real_seq_len : total_tokens;
         HiddenStateRowSelectStage::Params row_params;
         row_params.input = final_norm_output;
@@ -563,6 +1448,27 @@ namespace llaminar2
         row_params.device_id = device;
         row_params.input_buffer_id = input_buffer_id;
         row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
+        if (device.is_gpu())
+        {
+            if (!request_sequence_lengths_device ||
+                request_row_stride != total_tokens)
+            {
+                throw std::runtime_error(
+                    "Bucketed GPU LM-head row selection requires the exact "
+                    "device-resident request length and padded row stride");
+            }
+            row_params.selection_policy =
+                HiddenStateRowSelectStage::SelectionPolicy::
+                    DeviceResidentRequestLength;
+            row_params.request_sequence_length_device =
+                request_sequence_lengths_device;
+        }
+        else
+        {
+            row_params.selection_policy =
+                HiddenStateRowSelectStage::SelectionPolicy::
+                    DynamicDeviceScalar;
+        }
 
         graph.addNode("lm_head_row_select",
                       ComputeStageFactory::createHiddenStateRowSelect(row_params),
@@ -575,6 +1481,19 @@ namespace llaminar2
     // =============================================================================
     // GraphConfig Helper Methods
     // =============================================================================
+
+    bool GraphConfig::requiresEagerWorkspaceFamilyManifest() const noexcept
+    {
+        const bool phase_split_dense_graphs =
+            dense_tp_enabled &&
+            (dense_tp_decode_replicated ||
+             dense_tp_decode_mirrored_embedding);
+        const bool tiered_overlay_graphs =
+            moe.routed_expert_plan &&
+            moe.routed_expert_plan->usesExpertOverlayAuthority();
+        return retainsMTPGraphCapacity(mtp) || phase_split_dense_graphs ||
+               tiered_overlay_graphs;
+    }
 
     bool GraphConfig::hasUnifiedPP() const
     {
@@ -598,29 +1517,51 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
-        // Adapt generic ForwardInput to ForwardInput
-        ForwardInput qwen_input;
-        qwen_input.token_ids = input.token_ids;
-        qwen_input.token_ids_device = input.token_ids_device;
-        qwen_input.position_ids = input.position_ids;
-        qwen_input.position_ids_device = input.position_ids_device;
-        qwen_input.batch_size = input.batch_size;
-        qwen_input.seq_len = input.seq_len;
-        qwen_input.real_seq_len = input.real_seq_len;
-        qwen_input.bucket_seq_len = input.bucket_seq_len;
-        qwen_input.token_offset = input.token_offset;
-        qwen_input.position_offset = input.position_offset;
-        qwen_input.device = input.device;
-        qwen_input.kv_cache = input.kv_cache;
-        qwen_input.sequence_lengths = input.sequence_lengths;
+        const int total_tokens = input.batch_size * input.seq_len;
+        ForwardExecutionPhaseScope execution_phase_scope(
+            *this,
+            input.execution_phase);
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
+        /*
+         * Preserve the complete declarative input contract while entering the
+         * Qwen builder.  ForwardInput is already the graph system's shared
+         * value type, so a field-by-field adapter is both unnecessary and
+         * unsafe: adding a field such as position_policy can otherwise leave
+         * Qwen on that field's default while the execution engine requested a
+         * different policy.  Whole-value copying makes future input-policy
+         * additions structurally impossible to omit at this boundary.
+         */
+        ForwardInput qwen_input = input;
 
         // Adapt generic ForwardOutput to ForwardOutput
         ForwardOutput qwen_output;
         qwen_output.logits = output.logits;
         qwen_output.hidden = output.hidden;
 
-        // Build the graph
-        ComputeGraph graph = buildFullForwardGraph(qwen_input, qwen_output);
+        /*
+         * Prefix runtime rehydration changes graph topology: every MoE layer
+         * prepends one captured payload-transfer transaction. Keep that policy
+         * in a scoped graph-build value so derived declarative FFN builders can
+         * attach the transaction without consulting mutable host runtime state.
+         */
+        const bool previous_rehydration_scope =
+            prefix_runtime_rehydration_graph_active_;
+        prefix_runtime_rehydration_graph_active_ =
+            qwen_input.rehydrate_prefix_runtime_on_device;
+        ComputeGraph graph;
+        try
+        {
+            graph = buildFullForwardGraph(qwen_input, qwen_output);
+            prefix_runtime_rehydration_graph_active_ =
+                previous_rehydration_scope;
+        }
+        catch (...)
+        {
+            prefix_runtime_rehydration_graph_active_ =
+                previous_rehydration_scope;
+            throw;
+        }
 
         // Copy back output pointers (in case they were set by the builder)
         output.logits = qwen_output.logits;
@@ -631,6 +1572,8 @@ namespace llaminar2
 
     ComputeGraph QwenGraphBase::buildLayerGraph(const LayerContext &ctx)
     {
+        DecodeReplicatedDenseScope decode_dense_scope(*this, ctx.seq_len * ctx.batch_size);
+
         // Validate layer index against total model layers (supports absolute PP indices)
         int max_layers = config_.total_n_layers > 0 ? config_.total_n_layers : config_.n_layers;
         if (ctx.layer_idx < 0 || ctx.layer_idx >= max_layers)
@@ -652,12 +1595,16 @@ namespace llaminar2
         ComputeGraph attn_graph = buildAttentionGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
             ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device,
-            ctx.sequence_lengths, ctx.position_ids_device);
+            ctx.sequence_lengths, ctx.position_ids_device,
+            ctx.sequence_lengths_device);
 
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.batch_size, ctx.device);
+            ctx.batch_size, ctx.device,
+            ctx.device_state_publication_stream,
+            ctx.sequence_lengths_device,
+            static_cast<const int32_t *>(ctx.position_ids_device));
 
         // Merge: attention -> FFN
         std::string attn_last = attn_graph.terminalNode();
@@ -670,10 +1617,334 @@ namespace llaminar2
     // Model-Level Graph Building
     // =============================================================================
 
+    std::string QwenGraphBase::addMTPVerifierOutcomeToGraph(
+        ComputeGraph &graph,
+        const std::string &dependency_node,
+        TensorBase *logits,
+        int verifier_row_count,
+        DeviceId device) const
+    {
+        const MTPVerifierOutcomeGraphMode mode =
+            config_.mtp_verifier_outcome_graph_mode;
+        if (mode == MTPVerifierOutcomeGraphMode::Disabled)
+            return dependency_node;
+
+        if (!config_.grouped_mtp_verifier ||
+            !config_.compute_all_position_logits ||
+            !config_.compute_row_indexed_logits)
+        {
+            throw std::runtime_error(
+                "MTP verifier outcome graph mode requires the explicit grouped, "
+                "all-position, row-indexed verifier policy");
+        }
+        if (!device.is_gpu())
+        {
+            throw std::runtime_error(
+                "Graph-owned MTP verifier outcomes are GPU-only");
+        }
+        if (mode != MTPVerifierOutcomeGraphMode::Greedy)
+        {
+            throw std::runtime_error(
+                "Requested MTP verifier outcome graph mode is not implemented");
+        }
+        if (!logits || verifier_row_count <= 0 ||
+            verifier_row_count != config_.row_indexed_logits_row_count ||
+            !config_.mtp_verifier_outcome_graph_binding.validForGreedy())
+        {
+            throw std::runtime_error(
+                "Greedy MTP verifier outcome graph has malformed geometry or "
+                "persistent device bindings");
+        }
+
+        if (config_.mtp_verifier_outcome_ownership !=
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal)
+        {
+            throw std::runtime_error(
+                "Graph-owned MTP verifier outcomes require an explicit "
+                "participant-local ownership policy");
+        }
+
+        const bool multi_participant_tp =
+            config_.tp_ctx && config_.tp_ctx->degree() > 1;
+        const bool participant_full_vocabulary =
+            config_.mtpParticipantOwnsFullVocabulary();
+        if (multi_participant_tp && !participant_full_vocabulary)
+        {
+            throw std::runtime_error(
+                "Participant-local MTP outcomes require a complete verifier "
+                "head on every TP participant");
+        }
+
+        MTPVerifierOutcomeStage::Params params{
+            .device_id = device,
+            .logits = logits,
+            .mode = mode,
+            .binding = config_.mtp_verifier_outcome_graph_binding,
+            .verifier_row_count = verifier_row_count,
+            .vocab_size = config_.vocab_size,
+            .ownership_policy = config_.mtp_verifier_outcome_ownership,
+            .participant_full_vocabulary =
+                participant_full_vocabulary,
+            .stage_name = "mtp_verifier_outcome",
+        };
+        graph.addNode(
+            params.stage_name,
+            ComputeStageFactory::createMTPVerifierOutcome(params),
+            device);
+        graph.addDependency(params.stage_name, dependency_node);
+        return params.stage_name;
+    }
+
+    void QwenGraphBase::sealInferenceTransactionGraph(
+        ComputeGraph &graph,
+        const std::string &terminal_node) const
+    {
+        if (!graph.getNode(terminal_node))
+        {
+            throw std::out_of_range(
+                "Cannot seal inference transaction at missing graph node '" +
+                terminal_node + "'");
+        }
+
+        graph.setTerminalNode(terminal_node);
+        if (!requiresHeterogeneousTicketSegmentation(
+                graph.nativeCaptureEnvelope()))
+        {
+            return;
+        }
+
+        /*
+         * Authority and follower suffixes may start at different local nodes
+         * after CPU work, but both finish this same logical transaction. The
+         * terminal disposition names the final captured unit without creating
+         * an empty successor segment.
+         */
+        graph.setHeterogeneousTicketUnitContract(
+            terminal_node,
+            GraphHeterogeneousTicketUnitContract{
+                .identity = "heterogeneous_ticket_transaction_terminal",
+                .disposition =
+                    GraphHeterogeneousTicketUnitDisposition::
+                        TransactionTerminal,
+            });
+    }
+
+    std::string QwenGraphBase::maybeAddShiftedMTPPrefillTransaction(
+        ComputeGraph &graph,
+        const ForwardInput &input,
+        const std::string &dependency_node,
+        DeviceId device)
+    {
+        if (!input.shifted_mtp_prefill.has_value())
+            return dependency_node;
+
+        const auto &binding = *input.shifted_mtp_prefill;
+        const int total_tokens = input.batch_size * input.seq_len;
+        const bool main_prefill =
+            input.execution_phase == ForwardExecutionPhase::Prefill &&
+            input.state_transaction == ForwardStateTransaction::Ordinary;
+        const bool restored_prefix_decode_bridge =
+            input.execution_phase == ForwardExecutionPhase::Decode &&
+            input.state_transaction ==
+                ForwardStateTransaction::RestoredPrefixMTPDecodeBridge &&
+            input.batch_size == 1 && input.seq_len == 1;
+        if (!device.is_gpu() ||
+            (input.execution_role != ForwardExecutionRole::MainInference &&
+             !(restored_prefix_decode_bridge &&
+               input.execution_role ==
+                   ForwardExecutionRole::MTPCondition)) ||
+            (!main_prefill && !restored_prefix_decode_bridge) ||
+            total_tokens <= 0 ||
+            !binding.validForRequestCount(input.batch_size) ||
+            config_.mtp_shifted_prefill_hidden_publication !=
+                MTPShiftedPrefillHiddenPublicationPolicy::
+                    GraphIntegratedKVTransaction)
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP transaction requires a complete typed main-prefill or restored-prefix decode binding");
+        }
+        if (weight_bindings_.mtp.empty() ||
+            weight_bindings_.mtp.depths.empty())
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP prefill requires depth-zero MTP weight bindings");
+        }
+        if (!buffers_.current_hidden || !buffers_.layer_buffers.normalized ||
+            buffers_.current_hidden->rows() <
+                static_cast<size_t>(total_tokens) ||
+            buffers_.layer_buffers.normalized->rows() <
+                static_cast<size_t>(total_tokens))
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP prefill exceeds its persistent hidden-state arena capacity");
+        }
+
+        const std::string prepare_node =
+            "mtp_shifted_prefill_prepare_and_archive";
+        HiddenStateRowsSelectStage::Params prepare_params{
+            .device_id = device,
+            .input = buffers_.current_hidden,
+            .output = buffers_.layer_buffers.normalized,
+            .seq_len = total_tokens,
+            .d_model = config_.d_model,
+            .selected_row_count = total_tokens,
+            .input_buffer_id = BufferId::HIDDEN_STATE,
+            .output_buffer_id = BufferId::NORMALIZED,
+            .device_row_index_source =
+                HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                    ShiftedPrefillTransaction,
+            .request_sequence_lengths_device =
+                binding.request_segment_lengths_device,
+            .request_row_stride_source =
+                HiddenStateRowsSelectStage::RequestRowStrideSource::
+                    ExternalDeviceScalar,
+            .request_row_stride_device =
+                binding.request_row_stride_device,
+            .input_token_ids_device =
+                binding.request_token_ids_device,
+            .input_position_ids_device =
+                binding.request_position_ids_device,
+            .shifted_token_ids_output_device =
+                binding.shifted_token_ids_device,
+            .shifted_position_ids_output_device =
+                binding.shifted_position_ids_device,
+            .shifted_append_lengths_output_device =
+                binding.append_lengths_device,
+            .terminal_hidden_archive =
+                binding.terminal_hidden_archive,
+            .main_cached_tokens_by_request =
+                binding.main_cached_tokens_device,
+            .shifted_cached_tokens_by_request =
+                binding.shifted_cached_tokens_device,
+            .request_count = input.batch_size,
+            .terminal_hidden_archive_buffer_id =
+                BufferId::PREFIX_TERMINAL_HIDDEN,
+        };
+        graph.addNode(
+            prepare_node,
+            ComputeStageFactory::createHiddenStateRowsSelect(
+                std::move(prepare_params)),
+            device);
+        graph.addDependency(prepare_node, dependency_node);
+
+        MTPForwardInput mtp_input{
+            .draft_token_ids = nullptr,
+            .draft_token_ids_device =
+                binding.shifted_token_ids_device,
+            .terminal_hidden = buffers_.layer_buffers.normalized,
+            .kv_cache = binding.kv_cache,
+            .position_ids = nullptr,
+            .position_ids_device =
+                binding.shifted_position_ids_device,
+            .sequence_lengths = nullptr,
+            .sequence_lengths_device = binding.append_lengths_device,
+            .batch_size = input.batch_size,
+            .seq_len = input.seq_len,
+            .first_sequence_index = 0,
+            .device_state_publication_stream =
+                input.device_state_publication_stream,
+            .device = device,
+            .terminal_hidden_buffer_id = BufferId::NORMALIZED,
+            .kv_cache_only = true,
+        };
+        MTPForwardOutput mtp_output = binding.output;
+        ComputeGraph mtp_kv_graph = buildMTPGraph(
+            /*depth_idx=*/0,
+            weight_bindings_.mtp.depths.front(),
+            mtp_input,
+            mtp_output);
+        if (mtp_kv_graph.size() == 0 ||
+            mtp_kv_graph.terminalNode().empty())
+        {
+            throw std::runtime_error(
+                "Qwen GPU shifted MTP prefill produced an empty depth-zero KV graph");
+        }
+        const std::string transaction_terminal =
+            mtp_kv_graph.terminalNode();
+        graph.merge(std::move(mtp_kv_graph), prepare_node);
+        graph.setTerminalNode(transaction_terminal);
+        return transaction_terminal;
+    }
+
+    std::string QwenGraphBase::maybeAddMTPMainTerminalHiddenPublication(
+        ComputeGraph &graph,
+        const ForwardInput &input,
+        const std::string &dependency_node,
+        DeviceId device)
+    {
+        if (!input.mtp_main_terminal_hidden.has_value())
+            return dependency_node;
+
+        const auto &binding = *input.mtp_main_terminal_hidden;
+        const int total_tokens = input.batch_size * input.seq_len;
+        if (input.shifted_mtp_prefill.has_value() ||
+            input.execution_phase != ForwardExecutionPhase::Decode ||
+            (input.execution_role != ForwardExecutionRole::MainInference &&
+             input.execution_role != ForwardExecutionRole::MTPCondition) ||
+            !binding.validForRequestCount(input.batch_size) ||
+            binding.source_row_start + binding.request_count > total_tokens ||
+            !buffers_.current_hidden ||
+            buffers_.current_hidden->native_type() != TensorType::FP32 ||
+            buffers_.current_hidden->rows() <
+                static_cast<size_t>(total_tokens) ||
+            binding.terminal_hidden_archive->native_type() !=
+                TensorType::FP32 ||
+            binding.terminal_hidden_archive->rows() <
+                static_cast<size_t>(binding.request_count) ||
+            binding.terminal_hidden_archive->cols() <
+                static_cast<size_t>(config_.d_model))
+        {
+            throw std::runtime_error(
+                "Qwen MTP main decode requires a complete graph-integrated "
+                "terminal-hidden publication binding");
+        }
+
+        std::vector<int> selected_rows(
+            static_cast<size_t>(binding.request_count));
+        std::iota(
+            selected_rows.begin(),
+            selected_rows.end(),
+            binding.source_row_start);
+        HiddenStateRowsSelectStage::Params params{
+            .device_id = device,
+            .input = buffers_.current_hidden,
+            .output = binding.terminal_hidden_archive,
+            .seq_len = total_tokens,
+            .d_model = config_.d_model,
+            .selected_row_count = binding.request_count,
+            .selected_row_indices = std::move(selected_rows),
+            .input_buffer_id = BufferId::HIDDEN_STATE,
+            .output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
+            .device_row_index_source =
+                device.is_gpu()
+                    ? HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                          FixedContiguousRange
+                    : HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                          StageOwnedIndices,
+            .fixed_contiguous_row_start = binding.source_row_start,
+        };
+        constexpr const char *publication_node =
+            "mtp_main_terminal_hidden_publish";
+        graph.addNode(
+            publication_node,
+            ComputeStageFactory::createHiddenStateRowsSelect(
+                std::move(params)),
+            device);
+        graph.addDependency(publication_node, dependency_node);
+        graph.setTerminalNode(publication_node);
+        return publication_node;
+    }
+
     ComputeGraph QwenGraphBase::buildFullForwardGraph(
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        ForwardExecutionPhaseScope execution_phase_scope(
+            *this,
+            input.execution_phase);
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building full forward graph: "
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
@@ -691,7 +1962,6 @@ namespace llaminar2
         }
 
         DeviceId device = config_.default_device;
-        int total_tokens = input.batch_size * input.seq_len;
 
         ComputeGraph graph;
 
@@ -712,7 +1982,7 @@ namespace llaminar2
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
-        embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
         embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
@@ -730,9 +2000,8 @@ namespace llaminar2
         // When embedding is column-parallel sharded, each device holds
         // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
         // AllReduce(sum) combines the partial results.
-        const bool embedding_is_sharded =
-            modelEmbeddingTable() &&
-            static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
+        const bool embedding_is_sharded = usesVocabParallelEmbeddingForCurrentGraph();
+        bool embedding_allreduce_added = false;
         if (embedding_is_sharded && needsTPAllreduce())
         {
             size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
@@ -744,26 +2013,26 @@ namespace llaminar2
             {
                 graph.addNode("embedding_allreduce", std::move(allreduce_stage), device);
                 graph.addDependency("embedding_allreduce", "embedding");
+                embedding_allreduce_added = true;
             }
         }
 
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (complete graphs, not placeholders)
         // -------------------------------------------------------------------------
-        std::string prev_node = embedding_is_sharded && needsTPAllreduce()
+        std::string prev_node = embedding_allreduce_added
                                     ? "embedding_allreduce"
                                     : "embedding";
+        prev_node = maybeAddEmbeddingDiagnosticCheckpoints(
+            graph,
+            embed_output,
+            BufferId::HIDDEN_STATE,
+            prev_node,
+            total_tokens,
+            device);
 
-        // Position IDs must be provided externally (or use fallback for backward compat)
-        const int *position_ids = input.position_ids;
-        std::vector<int> local_position_ids;
-        if (!position_ids)
-        {
-            // Fallback: build position IDs internally (deprecated path)
-            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
-            position_ids = local_position_ids.data();
-            LOG_DEBUG("[QwenGraphBase] Position IDs built internally (deprecated - prefer external input)");
-        }
+        const int *position_ids =
+            validatedHostPositionRows(input, "Qwen standard forward graph");
 
         // Check if we have layer weight accessor
         if (!hasLayerWeightSource())
@@ -783,7 +2052,8 @@ namespace llaminar2
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths, input.position_ids_device);
+                input.sequence_lengths, input.position_ids_device,
+                input.sequence_lengths_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -796,7 +2066,10 @@ namespace llaminar2
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, device);
+                input.batch_size, device,
+                input.device_state_publication_stream,
+                input.sequence_lengths_device,
+                static_cast<const int32_t *>(input.position_ids_device));
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -827,9 +2100,15 @@ namespace llaminar2
                 ? BufferId::RESIDUAL
                 : BufferId::HIDDEN_STATE;
 
-        addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                            prev_node, total_tokens, device, final_norm_input_id);
-        prev_node = "final_norm";
+        prev_node = addFinalNormToGraph(
+            graph,
+            final_norm_input,
+            buffers_.layer_buffers.normalized,
+            prev_node,
+            total_tokens,
+            device,
+            final_norm_input_id,
+            input.sequence_lengths_device);
 
         std::string lm_head_dependency = prev_node;
         TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
@@ -840,7 +2119,9 @@ namespace llaminar2
             input.real_seq_len,
             input.bucket_seq_len,
             device,
-            lm_head_dependency);
+            lm_head_dependency,
+            input.sequence_lengths_device,
+            input.seq_len);
 
         // -------------------------------------------------------------------------
         // Stage 4: LM Head (with optional Column-Parallel + AllGather)
@@ -850,7 +2131,8 @@ namespace llaminar2
         // - LM head outputs to buffers_.logits_local: [seq_len, vocab_local]
         // - AllGather collects to buffers_.logits: [seq_len, vocab_size]
         // -------------------------------------------------------------------------
-        bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+        bool use_column_parallel =
+            useColumnParallelLMHeadForGraph(buffers_.logits_local);
 
         // Determine output buffer and vocab size for LM head stage
         TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
@@ -860,19 +2142,23 @@ namespace llaminar2
                   << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
         const LMHeadInputLayout lm_layout =
-            describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+            describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
+                projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device));
 
         LMHeadStage::Params lm_params;
         // Feed LM head from final RMSNorm, bucket one-row scratch, or compact
         // verifier rows. The layout helper keeps the row count and BufferId
         // contract synchronized.
         lm_params.hidden_states = lm_head_input;
-        lm_params.lm_head_weight = modelLMHead();
-        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
+        lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+        lm_params.prepared_ref = preparedRefForGraphWeight(
+            modelLMHeadBindingForGraph(use_column_parallel), device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = lm_layout.seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
+        lm_params.serial_equivalent_partition_width =
+            serialEquivalentLMHeadPartitionWidth(use_column_parallel);
         lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
         lm_params.prepared_store = prepared_weight_store_;
@@ -881,7 +2167,13 @@ namespace llaminar2
             use_column_parallel,
             lm_layout.compute_all_positions);
         lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+        lm_params.verifier_row_range = lm_layout.verifier_rows;
         lm_params.compute_all_positions = lm_layout.compute_all_positions;
+        lm_params.force_decode_equivalent_verifier_prefill =
+            shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                config_,
+                device,
+                lm_layout);
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -890,7 +2182,7 @@ namespace llaminar2
         prev_node = "lm_head";
 
         // Phase 5: AllGather stage for column-parallel LM head
-        if (use_column_parallel && mpi_ctx_)
+        if (needsDistributedLMHeadAllGather(use_column_parallel))
         {
             LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in buildFullForwardGraph: world_size="
                       << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
@@ -913,10 +2205,30 @@ namespace llaminar2
                           ComputeStageFactory::createAllGather(allgather_params),
                           device);
             graph.addDependency("lm_head_allgather", prev_node);
+            prev_node = "lm_head_allgather";
         }
 
+        prev_node = addMTPVerifierOutcomeToGraph(
+            graph,
+            prev_node,
+            graphLMHeadOutput(use_column_parallel),
+            lm_layout.seq_len,
+            device);
+
+        prev_node = maybeAddShiftedMTPPrefillTransaction(
+            graph,
+            input,
+            prev_node,
+            device);
+        prev_node = maybeAddMTPMainTerminalHiddenPublication(
+            graph,
+            input,
+            prev_node,
+            device);
+        sealInferenceTransactionGraph(graph, prev_node);
+
         // Set output
-        output.logits = buffers_.logits;
+        output.logits = graphLMHeadOutput(use_column_parallel);
 
         LOG_DEBUG("[QwenGraphBase] Built full forward graph with "
                   << graph.size() << " nodes");
@@ -936,6 +2248,9 @@ namespace llaminar2
         bool has_embedding,
         bool has_lm_head)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building partial forward graph: "
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len
@@ -982,7 +2297,6 @@ namespace llaminar2
         }
 
         DeviceId device = config_.default_device;
-        int total_tokens = input.batch_size * input.seq_len;
 
         ComputeGraph graph;
         std::string prev_node;
@@ -1006,7 +2320,7 @@ namespace llaminar2
             embed_params.num_tokens = total_tokens;
             embed_params.d_model = config_.d_model;
             embed_params.vocab_size = config_.vocab_size;
-            embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+            embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
             embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
@@ -1023,9 +2337,7 @@ namespace llaminar2
             // When embedding is column-parallel sharded, each device holds
             // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
             // AllReduce(sum) combines the partial results.
-            const bool embedding_is_sharded =
-                modelEmbeddingTable() &&
-                static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
+            const bool embedding_is_sharded = usesVocabParallelEmbeddingForCurrentGraph();
             if (embedding_is_sharded && needsTPAllreduce())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
@@ -1044,59 +2356,20 @@ namespace llaminar2
         else if (input.external_hidden_state)
         {
             // -----------------------------------------------------------------
-            // PP middle/final stage: Use external hidden state as starting point
-            // The external_hidden_state tensor contains activations from the
-            // previous PP stage. We need to copy it to our working buffer if
-            // they're different.
+            // PP middle/final stage: the execution engine has already handed the
+            // external activation to this graph's working buffer through
+            // TransferEngine. Graph construction only declares the layer DAG;
+            // it must never materialize or move tensor contents itself.
             // -----------------------------------------------------------------
             TensorBase *working_buffer = (buffers_.layer_buffers.residual && config_.isHybridQ16())
                                              ? buffers_.layer_buffers.residual
                                              : buffers_.current_hidden;
 
-            // Check if external buffer differs from working buffer
             if (input.external_hidden_state != working_buffer)
             {
-                LOG_DEBUG("[QwenGraphBase] PP middle stage: copying external hidden state to working buffer");
-
-                // NOTE: TensorCopyStage is not yet implemented. For now, we perform
-                // the copy inline. In Phase 3, we should add TensorCopyStage for
-                // proper graph-based memory transfer with device awareness.
-
-                size_t copy_bytes = static_cast<size_t>(total_tokens * config_.d_model);
-                if (config_.isHybridQ16())
-                {
-                    // Q16_1: copy the raw Q16_1 blocks
-                    // Block size = 32 elements, so num_blocks = copy_elements / 32
-                    size_t num_blocks = (copy_bytes + 31) / 32;
-                    copy_bytes = num_blocks * sizeof(Q16_1Block);
-                }
-                else
-                {
-                    // FP32: copy floats
-                    copy_bytes *= sizeof(float);
-                }
-
-                // Unified PP copy: data() handles all device coherence sync
-                // automatically (including D2H via staging buffer).
-                // This eliminates the previous 3-way D2D/CPU branch.
-                const void *src = input.external_hidden_state->data();
-                void *dst = working_buffer->mutable_data();
-                std::memcpy(dst, src, copy_bytes);
-
-                if (config_.default_device.is_gpu())
-                {
-                    DeviceId target_device = config_.default_device;
-                    if (!working_buffer->ensureOnDevice(target_device))
-                    {
-                        LOG_ERROR("[QwenGraphBase] Failed to upload working buffer to "
-                                  << target_device.toString());
-                        throw std::runtime_error("Failed to upload working buffer");
-                    }
-                    working_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, target_device);
-                }
-
-                LOG_DEBUG("[QwenGraphBase] PP copy: " << copy_bytes << " bytes to "
-                                                      << config_.default_device.toString());
+                LOG_TRACE(
+                    "[QwenGraphBase] PP external activation was prepared in the "
+                    "graph working buffer before declarative graph construction");
             }
             else
             {
@@ -1113,16 +2386,8 @@ namespace llaminar2
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (subset for this PP stage)
         // -------------------------------------------------------------------------
-        // Position IDs must be provided externally (or use fallback for backward compat)
-        const int *position_ids = input.position_ids;
-        std::vector<int> local_position_ids;
-        if (!position_ids)
-        {
-            // Fallback: build position IDs internally (deprecated path)
-            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
-            position_ids = local_position_ids.data();
-            LOG_DEBUG("[QwenGraphBase] Position IDs built internally (deprecated - prefer external input)");
-        }
+        const int *position_ids =
+            validatedHostPositionRows(input, "Qwen partial pipeline forward graph");
 
         // Build graphs for assigned layer range [first_layer, last_layer)
         for (int layer = first_layer; layer < last_layer; ++layer)
@@ -1134,7 +2399,8 @@ namespace llaminar2
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths, input.position_ids_device);
+                input.sequence_lengths, input.position_ids_device,
+                input.sequence_lengths_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -1160,7 +2426,10 @@ namespace llaminar2
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                input.batch_size, device);
+                input.batch_size, device,
+                input.device_state_publication_stream,
+                input.sequence_lengths_device,
+                static_cast<const int32_t *>(input.position_ids_device));
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -1188,9 +2457,15 @@ namespace llaminar2
                     ? BufferId::RESIDUAL
                     : BufferId::HIDDEN_STATE;
 
-            addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                prev_node, total_tokens, device, final_norm_input_id);
-            prev_node = "final_norm";
+            prev_node = addFinalNormToGraph(
+                graph,
+                final_norm_input,
+                buffers_.layer_buffers.normalized,
+                prev_node,
+                total_tokens,
+                device,
+                final_norm_input_id,
+                input.sequence_lengths_device);
 
             std::string lm_head_dependency = prev_node;
             TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
@@ -1201,10 +2476,13 @@ namespace llaminar2
                 input.real_seq_len,
                 input.bucket_seq_len,
                 device,
-                lm_head_dependency);
+                lm_head_dependency,
+                input.sequence_lengths_device,
+                input.seq_len);
 
             // LM Head (with optional Column-Parallel + AllGather)
-            bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+            bool use_column_parallel =
+                useColumnParallelLMHeadForGraph(buffers_.logits_local);
 
             TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
             int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
@@ -1213,16 +2491,20 @@ namespace llaminar2
                       << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
             const LMHeadInputLayout lm_layout =
-                describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+                describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
+                    projectionVerifierRows(device, input.seq_len, input.batch_size, input.sequence_lengths_device));
 
             LMHeadStage::Params lm_params;
             lm_params.hidden_states = lm_head_input;
-            lm_params.lm_head_weight = modelLMHead();
-            lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
+            lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+            lm_params.prepared_ref = preparedRefForGraphWeight(
+                modelLMHeadBindingForGraph(use_column_parallel), device);
             lm_params.logits = lm_head_output;
             lm_params.seq_len = lm_layout.seq_len;
             lm_params.d_model = config_.d_model;
             lm_params.vocab_size = lm_head_vocab_size;
+            lm_params.serial_equivalent_partition_width =
+                serialEquivalentLMHeadPartitionWidth(use_column_parallel);
             lm_params.bias_tensor = nullptr;
             lm_params.device_id = config_.default_device;
             lm_params.prepared_store = prepared_weight_store_;
@@ -1231,7 +2513,13 @@ namespace llaminar2
                 use_column_parallel,
                 lm_layout.compute_all_positions);
             lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+            lm_params.verifier_row_range = lm_layout.verifier_rows;
             lm_params.compute_all_positions = lm_layout.compute_all_positions;
+            lm_params.force_decode_equivalent_verifier_prefill =
+                shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                    config_,
+                    device,
+                    lm_layout);
 
             graph.addNode("lm_head",
                           ComputeStageFactory::createLMHead(lm_params),
@@ -1240,7 +2528,7 @@ namespace llaminar2
             prev_node = "lm_head";
 
             // AllGather stage for column-parallel LM head
-            if (use_column_parallel && mpi_ctx_)
+            if (needsDistributedLMHeadAllGather(use_column_parallel))
             {
                 LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in buildPartialForwardGraph: world_size="
                           << mpi_ctx_->world_size() << " total_tokens=" << total_tokens);
@@ -1261,10 +2549,18 @@ namespace llaminar2
                               ComputeStageFactory::createAllGather(allgather_params),
                               device);
                 graph.addDependency("lm_head_allgather", prev_node);
+                prev_node = "lm_head_allgather";
             }
 
+            prev_node = addMTPVerifierOutcomeToGraph(
+                graph,
+                prev_node,
+                graphLMHeadOutput(use_column_parallel),
+                lm_layout.seq_len,
+                device);
+
             // Set output logits
-            output.logits = buffers_.logits;
+            output.logits = graphLMHeadOutput(use_column_parallel);
         }
         else
         {
@@ -1325,15 +2621,8 @@ namespace llaminar2
         std::string prev_node;
         int total_tokens = input.batch_size * input.seq_len;
 
-        // Position IDs
-        const int *position_ids = input.position_ids;
-        std::vector<int> local_position_ids;
-        if (!position_ids)
-        {
-            local_position_ids = buildPositionIds(input.seq_len, input.batch_size, input.position_offset);
-            position_ids = local_position_ids.data();
-            LOG_DEBUG("[QwenGraphBase] Position IDs built internally for unified PP graph");
-        }
+        const int *position_ids =
+            validatedHostPositionRows(input, "Qwen unified pipeline forward graph");
 
         // =====================================================================
         // 3. Iterate over PP stages
@@ -1397,7 +2686,7 @@ namespace llaminar2
                 embed_params.num_tokens = total_tokens;
                 embed_params.d_model = config_.d_model;
                 embed_params.vocab_size = config_.vocab_size;
-                embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, stage_device);
+                embed_params.vocab_offset = embeddingVocabOffsetForCurrentGraph(stage_device);
                 embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
                 embed_params.device_id = stage_device;
                 embed_params.mpi_ctx = mpi_ctx_.get();
@@ -1408,6 +2697,25 @@ namespace llaminar2
                               ComputeStageFactory::createEmbedding(embed_params),
                               stage_device);
                 prev_node = "embedding";
+
+                if (usesVocabParallelEmbeddingForCurrentGraph() && needsTPAllreduce())
+                {
+                    const size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
+                    auto allreduce_stage = createTPAllreduceStage(
+                        embed_output,
+                        allreduce_count,
+                        stage_device,
+                        -1,
+                        /*is_attention=*/false,
+                        "embedding_allreduce",
+                        BufferId::HIDDEN_STATE);
+                    if (allreduce_stage)
+                    {
+                        graph.addNode("embedding_allreduce", std::move(allreduce_stage), stage_device);
+                        graph.addDependency("embedding_allreduce", "embedding");
+                        prev_node = "embedding_allreduce";
+                    }
+                }
 
                 LOG_DEBUG("[QwenGraphBase] Added embedding stage on device " << stage_device.to_string());
             }
@@ -1447,7 +2755,8 @@ namespace llaminar2
                 ComputeGraph attn_graph = buildAttentionGraph(
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                     input.batch_size, layer_kv_cache, position_ids, stage_device,
-                    input.sequence_lengths, input.position_ids_device);
+                    input.sequence_lengths, input.position_ids_device,
+                    input.sequence_lengths_device);
 
                 // Get the terminal node of attention sub-graph
                 std::string attn_last = attn_graph.terminalNode();
@@ -1467,7 +2776,12 @@ namespace llaminar2
                 // Build FFN graph
                 ComputeGraph ffn_graph = buildFFNGraph(
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
-                    input.batch_size, stage_device);
+                    input.batch_size,
+                    stage_device,
+                    input.device_state_publication_stream,
+                    input.sequence_lengths_device,
+                    static_cast<const int32_t *>(
+                        input.position_ids_device));
 
                 // Get the terminal node of FFN sub-graph
                 std::string ffn_last = ffn_graph.terminalNode();
@@ -1556,9 +2870,15 @@ namespace llaminar2
                         ? BufferId::RESIDUAL
                         : BufferId::HIDDEN_STATE;
 
-                addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                    prev_node, total_tokens, stage_device, final_norm_input_id);
-                prev_node = "final_norm";
+                prev_node = addFinalNormToGraph(
+                    graph,
+                    final_norm_input,
+                    buffers_.layer_buffers.normalized,
+                    prev_node,
+                    total_tokens,
+                    stage_device,
+                    final_norm_input_id,
+                    input.sequence_lengths_device);
 
                 std::string lm_head_dependency = prev_node;
                 TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
@@ -1569,10 +2889,12 @@ namespace llaminar2
                     input.real_seq_len,
                     input.bucket_seq_len,
                     stage_device,
-                    lm_head_dependency);
+                    lm_head_dependency,
+                    input.sequence_lengths_device,
+                    input.seq_len);
 
                 // LM Head
-                bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+                bool use_column_parallel = useColumnParallelLMHeadForGraph(buffers_.logits_local);
                 TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
                 int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
 
@@ -1580,16 +2902,20 @@ namespace llaminar2
                           << use_column_parallel << " vocab_size=" << lm_head_vocab_size);
 
                 const LMHeadInputLayout lm_layout =
-                    describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+                    describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens,
+                        projectionVerifierRows(stage_device, input.seq_len, input.batch_size, input.sequence_lengths_device));
 
                 LMHeadStage::Params lm_params;
                 lm_params.hidden_states = lm_head_input;
-                lm_params.lm_head_weight = modelLMHead();
-                lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), stage_device);
+                lm_params.lm_head_weight = modelLMHeadForGraph(use_column_parallel);
+                lm_params.prepared_ref = preparedRefForGraphWeight(
+                    modelLMHeadBindingForGraph(use_column_parallel), stage_device);
                 lm_params.logits = lm_head_output;
                 lm_params.seq_len = lm_layout.seq_len;
                 lm_params.d_model = config_.d_model;
                 lm_params.vocab_size = lm_head_vocab_size;
+                lm_params.serial_equivalent_partition_width =
+                    serialEquivalentLMHeadPartitionWidth(use_column_parallel);
                 lm_params.bias_tensor = nullptr;
                 lm_params.device_id = stage_device;
                 lm_params.prepared_store = prepared_weight_store_;
@@ -1598,7 +2924,13 @@ namespace llaminar2
                     use_column_parallel,
                     lm_layout.compute_all_positions);
                 lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+                lm_params.verifier_row_range = lm_layout.verifier_rows;
                 lm_params.compute_all_positions = lm_layout.compute_all_positions;
+                lm_params.force_decode_equivalent_verifier_prefill =
+                    shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                        config_,
+                        stage_device,
+                        lm_layout);
 
                 graph.addNode("lm_head",
                               ComputeStageFactory::createLMHead(lm_params),
@@ -1607,7 +2939,7 @@ namespace llaminar2
                 prev_node = "lm_head";
 
                 // AllGather stage for column-parallel LM head
-                if (use_column_parallel && mpi_ctx_)
+                if (needsDistributedLMHeadAllGather(use_column_parallel))
                 {
                     LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather in unified PP: world_size="
                               << mpi_ctx_->world_size());
@@ -1630,7 +2962,7 @@ namespace llaminar2
                     graph.addDependency("lm_head_allgather", prev_node);
                 }
 
-                output.logits = buffers_.logits;
+                output.logits = graphLMHeadOutput(use_column_parallel);
 
                 LOG_DEBUG("[QwenGraphBase] Added LM head stage on device " << stage_device.to_string());
             }
@@ -1650,6 +2982,9 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building forward graph from schema: "
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
@@ -1665,11 +3000,17 @@ namespace llaminar2
         GraphResolverConfig config = getResolverConfig(input.seq_len);
         config.batch_size = input.batch_size;
 
-        // KV cache state
+        // KV cache topology is declarative. The admitted request range owns
+        // the graph-planning cursor; GPU cache contents remain device-owned and
+        // must never be observed while constructing a graph.
         config.has_kv_cache = (input.kv_cache != nullptr);
         if (config.has_kv_cache)
         {
-            config.cached_tokens = input.kv_cache->get_cached_tokens(0, 0);
+            config.cached_tokens = std::max(
+                0,
+                input.token_offset != 0
+                    ? input.token_offset
+                    : input.position_offset);
         }
 
         // Execution policy from debugEnv
@@ -1698,7 +3039,8 @@ namespace llaminar2
         ComputeGraph graph = GraphBuilder::build(resolved);
 
         // Set output
-        output.logits = buffers_.logits;
+        output.logits = graphLMHeadOutput(
+            useColumnParallelLMHeadForGraph(buffers_.logits_local));
 
         LOG_DEBUG("[QwenGraphBase] Built schema-based forward graph with "
                   << graph.size() << " nodes");
@@ -1710,8 +3052,11 @@ namespace llaminar2
         const ForwardInput &input,
         TensorBase *output_hidden)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building embedding graph for "
-                  << (input.batch_size * input.seq_len) << " tokens");
+                  << total_tokens << " tokens");
 
         ComputeGraph graph;
 
@@ -1720,10 +3065,10 @@ namespace llaminar2
         params.token_ids = input.token_ids;
         params.token_ids_device = input.token_ids_device;
         params.output = output_hidden;
-        params.num_tokens = input.batch_size * input.seq_len;
+        params.num_tokens = total_tokens;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
-        params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        params.vocab_offset = embeddingVocabOffsetForCurrentGraph(config_.default_device);
         params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         params.device_id = config_.default_device;
         params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
@@ -1732,6 +3077,24 @@ namespace llaminar2
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(params),
                       config_.default_device);
+
+        if (usesVocabParallelEmbeddingForCurrentGraph() && needsTPAllreduce())
+        {
+            const size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
+            auto allreduce_stage = createTPAllreduceStage(
+                output_hidden,
+                allreduce_count,
+                config_.default_device,
+                -1,
+                /*is_attention=*/false,
+                "embedding_allreduce",
+                BufferId::HIDDEN_STATE);
+            if (allreduce_stage)
+            {
+                graph.addNode("embedding_allreduce", std::move(allreduce_stage), config_.default_device);
+                graph.addDependency("embedding_allreduce", "embedding");
+            }
+        }
 
         return graph;
     }
@@ -1793,17 +3156,31 @@ namespace llaminar2
         DeviceId device,
         TensorBase *logits_local)
     {
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building LM head graph for " << total_tokens << " tokens"
                                                                 << " lm_head_column_parallel=" << config_.lm_head_column_parallel
                                                                 << " vocab_local=" << config_.vocab_local);
 
         ComputeGraph graph;
+        const FinalProjectionPolicy final_projection =
+            resolveFinalProjectionPolicy({
+                .norm_source = FinalNormSource::ModelOutputNorm,
+                .mtp_norm = nullptr,
+                .full_vocab_output = output_logits,
+                .column_parallel_output = logits_local,
+                .total_tokens = total_tokens,
+                .force_full_vocabulary_head = false,
+                .compute_all_positions =
+                    config_.compute_all_position_logits ||
+                    config_.live_mtp_request_batch_condition,
+            });
 
         // Final RMSNorm
         RMSNormStage::Params norm_params;
         norm_params.input = hidden_states;
         norm_params.output = hidden_states; // In-place norm
-        norm_params.gamma = modelFinalNorm();
+        norm_params.gamma = final_projection.norm_gamma;
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = total_tokens;
         norm_params.device_id = device;
@@ -1821,11 +3198,10 @@ namespace llaminar2
         // - AllGather collects to output_logits: [seq_len, vocab_size]
         // =================================================================
 
-        bool use_column_parallel = config_.lm_head_column_parallel && logits_local != nullptr;
-
         // Determine output buffer and vocab size for LM head stage
-        TensorBase *lm_head_output = use_column_parallel ? logits_local : output_logits;
-        int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
+        const bool use_column_parallel = final_projection.column_parallel;
+        TensorBase *lm_head_output = final_projection.lm_head_output;
+        int lm_head_vocab_size = final_projection.lm_head_vocab_size;
 
         LOG_DEBUG("[QwenGraphBase] LM head: use_column_parallel=" << use_column_parallel
                                                                   << " lm_head_vocab_size=" << lm_head_vocab_size
@@ -1835,79 +3211,108 @@ namespace llaminar2
         std::string lm_head_dependency = "final_norm";
         int lm_head_seq_len = total_tokens;
         BufferId lm_head_input_buffer_id = BufferId::HIDDEN_STATE;
-        bool lm_head_compute_all_positions = config_.compute_all_position_logits;
+        bool lm_head_compute_all_positions =
+            config_.compute_all_position_logits ||
+            config_.live_mtp_request_batch_condition;
         bool lm_head_use_prefill_row_offset = true;
 
         if (config_.compute_all_position_logits && config_.compute_row_indexed_logits)
         {
             const int row_count = config_.row_indexed_logits_row_count;
-            TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
-            if (!scratch_rows)
+            if (rowIndexedLogitsCoverFullPhysicalInput(
+                    config_,
+                    row_count,
+                    total_tokens))
             {
-                LOG_ERROR("[QwenGraphBase] Standalone row-indexed verifier requires lm_head_input_rows scratch buffer");
-                throw std::runtime_error("standalone row-indexed verifier scratch buffer missing");
+                /*
+                 * Standalone verifier LM-head graphs obey the same layout
+                 * contract as full model graphs. The existing dense defaults
+                 * below already project every row from HIDDEN_STATE.
+                 */
+                lm_head_seq_len = total_tokens;
+                lm_head_compute_all_positions = true;
+                lm_head_use_prefill_row_offset = false;
             }
-            const int scratch_row_capacity =
-                scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
-            if (row_count <= 0 ||
-                row_count > total_tokens ||
-                row_count > scratch_row_capacity)
+            else
             {
-                LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires "
-                          << "1..min(scratch_rows,total_tokens) rows, got "
-                          << row_count << " for total_tokens=" << total_tokens
-                          << " scratch_rows=" << scratch_row_capacity);
-                throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
+                TensorBase *scratch_rows =
+                    buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+                if (!scratch_rows)
+                {
+                    LOG_ERROR("[QwenGraphBase] Standalone row-indexed verifier requires lm_head_input_rows scratch buffer");
+                    throw std::runtime_error("standalone row-indexed verifier scratch buffer missing");
+                }
+                const int scratch_row_capacity =
+                    scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
+                if (row_count <= 0 ||
+                    row_count > total_tokens ||
+                    row_count > scratch_row_capacity)
+                {
+                    LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires "
+                              << "1..min(scratch_rows,total_tokens) rows, got "
+                              << row_count << " for total_tokens=" << total_tokens
+                              << " scratch_rows=" << scratch_row_capacity);
+                    throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
+                }
+
+                std::vector<int> selected_rows = resolveRowIndexedLogitRows(
+                    config_,
+                    row_count,
+                    total_tokens,
+                    "standalone LM-head row-select");
+
+                HiddenStateRowsSelectStage::Params row_params;
+                row_params.input = hidden_states;
+                row_params.output = scratch_rows;
+                row_params.seq_len = total_tokens;
+                row_params.d_model = config_.d_model;
+                row_params.selected_row_count = row_count;
+                row_params.selected_row_indices = std::move(selected_rows);
+                row_params.device_id = device;
+                row_params.input_buffer_id = BufferId::HIDDEN_STATE;
+                row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+                if (device.is_gpu())
+                {
+                    row_params.device_row_index_source =
+                        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                            WorkspaceBoundDeviceIndices;
+                    row_params.workspace_buffer_name =
+                        MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                }
+
+                graph.addNode(
+                    "lm_head_rows_select",
+                    ComputeStageFactory::createHiddenStateRowsSelect(row_params),
+                    device);
+                graph.addDependency(
+                    "lm_head_rows_select",
+                    lm_head_dependency);
+
+                /*
+                 * Compact verifier rows are a new dense matrix. The LM head
+                 * projects every compact row starting at row zero.
+                 */
+                lm_head_input = scratch_rows;
+                lm_head_dependency = "lm_head_rows_select";
+                lm_head_seq_len = row_count;
+                lm_head_input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+                lm_head_compute_all_positions = true;
+                lm_head_use_prefill_row_offset = false;
             }
-
-            std::vector<int> selected_rows = resolveRowIndexedLogitRows(
-                config_,
-                row_count,
-                total_tokens,
-                "standalone LM-head row-select");
-
-            HiddenStateRowsSelectStage::Params row_params;
-            row_params.input = hidden_states;
-            row_params.output = scratch_rows;
-            row_params.seq_len = total_tokens;
-            row_params.d_model = config_.d_model;
-            row_params.selected_row_count = row_count;
-            row_params.selected_row_indices = std::move(selected_rows);
-            row_params.device_id = device;
-            row_params.input_buffer_id = BufferId::HIDDEN_STATE;
-            row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
-            if (device.is_gpu())
-            {
-                row_params.workspace_buffer_name =
-                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
-                row_params.declare_selected_rows_workspace = false;
-                row_params.upload_selected_rows_to_workspace = false;
-            }
-
-            graph.addNode("lm_head_rows_select",
-                          ComputeStageFactory::createHiddenStateRowsSelect(row_params),
-                          device);
-            graph.addDependency("lm_head_rows_select", lm_head_dependency);
-
-            // Compact verifier rows are a new dense matrix. The LM head should
-            // project every compact row starting at row zero.
-            lm_head_input = scratch_rows;
-            lm_head_dependency = "lm_head_rows_select";
-            lm_head_seq_len = row_count;
-            lm_head_input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
-            lm_head_compute_all_positions = true;
-            lm_head_use_prefill_row_offset = false;
         }
 
         // LM Head projection
         LMHeadStage::Params lm_params;
         lm_params.hidden_states = lm_head_input;
-        lm_params.lm_head_weight = modelLMHead();
-        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
+        lm_params.lm_head_weight = final_projection.lm_head_weight;
+        lm_params.prepared_ref = preparedRefForGraphWeight(
+            final_projection.lm_head_binding, device);
         lm_params.logits = lm_head_output;
         lm_params.seq_len = lm_head_seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
+        lm_params.serial_equivalent_partition_width =
+            final_projection.serial_equivalent_partition_width;
         lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
         lm_params.prepared_store = prepared_weight_store_;
@@ -1917,20 +3322,16 @@ namespace llaminar2
             lm_head_compute_all_positions);
         lm_params.compute_all_positions = lm_head_compute_all_positions;
         lm_params.use_prefill_replay_row_offset = lm_head_use_prefill_row_offset;
-        /*
-         * Phase 9.8 promotes compact verifier LM-head rows to the same small-M
-         * quantized GEMV/GEMM dispatch used by the rest of the grouped verifier
-         * path.  The previous GPU-only M=1 row loop was numerically safe, but it
-         * made M=2 verifier replay slower than serial decode.  Strict
-         * DenseVerifierRows and Qwen3.6 parity gates now own equivalence.
-         */
+        const LMHeadInputLayout lm_layout{
+            lm_head_seq_len,
+            lm_head_input_buffer_id,
+            lm_head_compute_all_positions,
+            lm_head_use_prefill_row_offset};
         lm_params.force_decode_equivalent_verifier_prefill =
-            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
-            lm_head_compute_all_positions &&
-            lm_head_seq_len > 1 &&
-            lm_head_seq_len <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            shouldForceDecodeEquivalentLMHeadVerifierPrefill(
+                config_,
+                device,
+                lm_layout);
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -1940,7 +3341,7 @@ namespace llaminar2
         // =================================================================
         // AllGather stage for column-parallel LM head
         // =================================================================
-        if (use_column_parallel && mpi_ctx_)
+        if (final_projection.needs_allgather)
         {
             LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather: world_size=" << mpi_ctx_->world_size()
                                                                               << " total_tokens=" << total_tokens);
@@ -1971,16 +3372,37 @@ namespace llaminar2
     // buildAttentionGraph is pure virtual - implemented by QwenStandardGraph, Qwen35Graph
     // =============================================================================
 
+    std::optional<DeviceRowRange> QwenGraphBase::projectionVerifierRows(
+        DeviceId device, int seq_len, int batch_size, const int32_t *lengths) const
+    {
+        // CPU owns its actual row count on the host. Ragged multi-request
+        // matrices cannot borrow lengths[0] as a whole-matrix prefix count.
+        if (!device.is_gpu() || batch_size != 1 || !lengths ||
+            !config_.usesMTPGroupedDecodeEquivalentRows())
+            return std::nullopt;
+        return DeviceRowRange::deviceCounted(seq_len, lengths);
+    }
+
     ComputeGraph QwenGraphBase::buildFFNGraph(
         const LayerWeights &layer,
         ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
         int batch_size,
-        DeviceId device)
+        DeviceId device,
+        void *device_state_publication_stream,
+        const int32_t *sequence_lengths_device,
+        const int32_t *absolute_position_ids_device)
     {
+        if (device.is_gpu() && !device_state_publication_stream)
+        {
+            throw std::invalid_argument(
+                "[QwenGraphBase::buildFFNGraph] GPU graph construction "
+                "requires an explicit non-null device-state publication stream");
+        }
+        (void)absolute_position_ids_device;
         ComputeGraph graph;
-        std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+        const std::string prefix = ffnGraphStagePrefix(layer_idx);
         std::string ffn_terminal; // Track the last node for terminalNode()
 
         // Compute total tokens for GEMM m parameter
@@ -1988,9 +3410,7 @@ namespace llaminar2
         const bool force_decode_equivalent_ffn_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            total_tokens <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            config_.usesMTPGroupedDecodeEquivalentRows();
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *gate_proj_binding =
             layer.gate_proj_binding ? layer.gate_proj_binding : layer_bindings.gate_proj;
@@ -2052,6 +3472,8 @@ namespace llaminar2
             gate_up_params.output_up_buffer_id = buffers.idFor(BufferId::UP_PROJ);
             gate_up_params.force_decode_equivalent_verifier_prefill =
                 force_decode_equivalent_ffn_verifier_prefill;
+            gate_up_params.verifier_row_range = projectionVerifierRows(
+                device, seq_len, batch_size, sequence_lengths_device);
 
             graph.addNode(prefix + "gate_up_proj",
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
@@ -2090,6 +3512,8 @@ namespace llaminar2
                 .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
                 .force_decode_equivalent_verifier_prefill =
                     force_decode_equivalent_ffn_verifier_prefill,
+                .verifier_row_range = projectionVerifierRows(
+                    device, seq_len, batch_size, sequence_lengths_device),
                 .prepared_ref = preparedRefForGraphWeight(down_proj_binding, device),
                 .prepared_store = prepared_weight_store_};
 
@@ -2114,7 +3538,7 @@ namespace llaminar2
             bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
             bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
 
-            if (needs_allreduce && needsTPAllreduce())
+            if (needs_allreduce && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * down_n;
                 LOG_DEBUG("[buildFFNGraph] Adding down_allreduce: ffn_column_parallel="
@@ -2161,7 +3585,7 @@ namespace llaminar2
                 bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
                 bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
 
-                if (needs_allreduce && needsTPAllreduce())
+                if (needs_allreduce && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
                 {
                     graph.addDependency(prefix + "ffn_residual", prefix + "down_allreduce");
                 }
@@ -2174,6 +3598,11 @@ namespace llaminar2
 
         graph.setTerminalNode(ffn_terminal);
         return graph;
+    }
+
+    std::string QwenGraphBase::ffnGraphStagePrefix(int layer_idx) const
+    {
+        return "layer" + std::to_string(layer_idx) + "_";
     }
 
     // =============================================================================
@@ -2404,10 +3833,14 @@ namespace llaminar2
 
         // TP-adjusted local dimensions
         // Use local head counts when QKV is column-parallel
-        config.local_n_heads = config_.qkv_column_parallel
+        const bool reserve_full_dense_decode_buffers = config_.dense_tp_decode_replicated;
+        const bool reserve_full_mtp_head_buffers =
+            mirroredMTPHeadConfigured();
+
+        config.local_n_heads = config_.qkv_column_parallel && !reserve_full_dense_decode_buffers
                                    ? config_.local_n_heads
                                    : config_.n_heads;
-        config.local_n_kv_heads = config_.qkv_column_parallel
+        config.local_n_kv_heads = config_.qkv_column_parallel && !reserve_full_dense_decode_buffers
                                       ? config_.local_n_kv_heads
                                       : config_.n_kv_heads;
 
@@ -2418,14 +3851,14 @@ namespace llaminar2
             config.local_n_kv_heads = config_.n_kv_heads;
 
         // Use local FFN dimension when FFN is column-parallel
-        config.local_d_ff = config_.ffn_column_parallel
+        config.local_d_ff = config_.ffn_column_parallel && !reserve_full_dense_decode_buffers
                                 ? config_.d_ff_local
                                 : config_.d_ff;
         if (config.local_d_ff <= 0)
             config.local_d_ff = config_.d_ff;
 
         // Use local vocab when LM head is column-parallel
-        config.local_vocab = config_.lm_head_column_parallel
+        config.local_vocab = config_.lm_head_column_parallel && !reserve_full_dense_decode_buffers
                                  ? config_.vocab_local
                                  : config_.vocab_size;
         if (config.local_vocab <= 0)
@@ -2433,6 +3866,81 @@ namespace llaminar2
 
         config.custom_formulas["mtp_target_query_rows"] =
             static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp));
+        /*
+         * Grouped verification remains bounded by configured speculative depth,
+         * while graph-integrated shifted prefill performs one KV-only MTP pass
+         * across the complete captured prompt bucket. The shared MTP projection
+         * scratch must cover the larger of those two graph families.
+         */
+        config.custom_formulas["mtp_kv_prefill_rows"] =
+            static_cast<size_t>(std::max(
+                std::max(1, seq_len),
+                resolveMTPMaxTargetQueryRows(config_.mtp)));
+
+        /*
+         * Main prefill remains TP-sharded when only the compact MTP predictor
+         * is replicated. Its sidecar graph nevertheless binds complete Q/K/V
+         * and dense-FFN weights on every participant. Keep that graph family's
+         * arena geometry independent of the main graph's local dimensions;
+         * otherwise the first full-width projection overwrites a TP-local MTP
+         * buffer before graph capture can publish its diagnostic snapshot.
+         */
+        const bool reserve_full_mtp_sidecar_buffers =
+            config_.mtpUsesReplicatedDenseSidecarBinding();
+        const int mtp_n_heads =
+            reserve_full_mtp_sidecar_buffers
+                ? config_.n_heads
+                : config.local_n_heads;
+        const int mtp_n_kv_heads =
+            reserve_full_mtp_sidecar_buffers
+                ? config_.n_kv_heads
+                : config.local_n_kv_heads;
+        const int mtp_d_ff =
+            reserve_full_mtp_sidecar_buffers
+                ? config_.d_ff
+                : config.local_d_ff;
+        config.custom_formulas["mtp_q_dim"] =
+            static_cast<size_t>(mtp_n_heads) *
+            static_cast<size_t>(config_.head_dim);
+        config.custom_formulas["mtp_kv_dim"] =
+            static_cast<size_t>(mtp_n_kv_heads) *
+            static_cast<size_t>(config_.head_dim);
+        config.custom_formulas["mtp_d_ff"] =
+            static_cast<size_t>(mtp_d_ff);
+        config.custom_formulas["mtp_vocab"] =
+            static_cast<size_t>(reserve_full_mtp_head_buffers
+                                    ? config_.vocab_size
+                                    : config.local_vocab);
+        /*
+         * An explicitly vocabulary-sharded MTP head needs compact gathered
+         * rows for stochastic sampling. Mirrored ownership writes the complete
+         * vocabulary on every TP participant and therefore reserves only the
+         * schema's 1x1 gathered-logits placeholder, irrespective of TP scope.
+         */
+        const bool spans_multiple_global_ranks =
+            (config_.tp_ctx != nullptr &&
+             !config_.tp_ctx->isLocal() &&
+             config_.tp_ctx->degree() > 1) ||
+            (config_.tp_ctx == nullptr &&
+             mpi_ctx_ != nullptr &&
+             mpi_ctx_->world_size() > 1);
+        const bool reserve_global_mtp_gather =
+            resolveMTPTerminalLogitsCollective({
+                .layout = config_.mtpTerminalLogitsLayout(),
+                .sidecar_produces_logits =
+                    retainsMTPGraphCapacity(config_.mtp),
+                .spans_multiple_global_ranks =
+                    spans_multiple_global_ranks,
+            }) ==
+            MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
+        config.custom_formulas["mtp_global_gather_rows"] =
+            reserve_global_mtp_gather
+                ? static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp))
+                : 1ULL;
+        config.custom_formulas["mtp_global_gather_vocab"] =
+            reserve_global_mtp_gather
+                ? static_cast<size_t>(config_.vocab_size)
+                : 1ULL;
 
         LOG_DEBUG("[QwenGraphBase::getResolverConfig] Created config: "
                   << "seq_len=" << config.seq_len << ", "
@@ -2444,14 +3952,15 @@ namespace llaminar2
         return config;
     }
 
-    void QwenGraphBase::addFinalNormToGraph(
+    std::string QwenGraphBase::addFinalNormToGraph(
         ComputeGraph &graph,
         TensorBase *hidden,
         TensorBase *normalized_out,
         const std::string &prev_node,
         int n_tokens,
         DeviceId device,
-        BufferId input_buffer_id)
+        BufferId input_buffer_id,
+        const int32_t *sequence_lengths_device)
     {
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
@@ -2470,14 +3979,33 @@ namespace llaminar2
         norm_params.input_buffer_id = input_buffer_id;
         norm_params.output_buffer_id = BufferId::NORMALIZED;
 
+        const std::string norm_dependency =
+            maybeAddFinalNormDiagnosticCheckpoint(
+                graph,
+                "final_norm_input",
+                hidden,
+                input_buffer_id,
+                prev_node,
+                n_tokens,
+                device,
+                sequence_lengths_device);
         graph.addNode("final_norm",
                       ComputeStageFactory::createRMSNorm(norm_params),
                       device);
 
-        if (!prev_node.empty())
+        if (!norm_dependency.empty())
         {
-            graph.addDependency("final_norm", prev_node);
+            graph.addDependency("final_norm", norm_dependency);
         }
+        return maybeAddFinalNormDiagnosticCheckpoint(
+            graph,
+            "final_norm_output",
+            normalized_out,
+            BufferId::NORMALIZED,
+            "final_norm",
+            n_tokens,
+            device,
+            sequence_lengths_device);
     }
 
     const TPDomain *QwenGraphBase::getDomainForLayer(int layer_idx, bool is_attention) const
@@ -2495,6 +4023,11 @@ namespace llaminar2
 
     bool QwenGraphBase::needsTPAllreduce() const
     {
+        if (!config_.dense_tp_enabled)
+        {
+            return false;
+        }
+
         // Unified check: any TP context with degree > 1 (LOCAL or GLOBAL)
         if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
         {
@@ -2508,6 +4041,63 @@ namespace llaminar2
         return false;
     }
 
+    QwenGraphBase::TPAllreducePlan QwenGraphBase::resolveTPAllreducePlan(
+        const TensorBase *buffer,
+        size_t count,
+        DeviceId device,
+        int layer_idx,
+        const std::optional<std::string> &precision_override) const
+    {
+        TPAllreducePlan plan{
+            .arithmetic_policy =
+                TPAllreduceArithmeticPolicy::NativeCollective,
+            .transport_precision = precision_override.value_or(
+                config_.getAllreducePrecisionForLayer(layer_idx)),
+        };
+
+        /*
+         * Prefill has a throughput contract, while every decode row has the
+         * serial-row equivalence contract.  Do not consult mtp.enabled here:
+         * speculative execution is required to be observationally equivalent
+         * to the exact same M1 graph with speculation disabled.
+         */
+        if (!forwardPhaseAllowsDecodeTopology())
+            return plan;
+
+        if (!config_.tp_ctx || !config_.tp_ctx->isLocal() ||
+            config_.tp_ctx->degree() <= 2)
+        {
+            return plan;
+        }
+
+        const auto backend = config_.tp_ctx->backend();
+        const bool native_gpu_transport =
+            backend == CollectiveBackendType::NCCL ||
+            backend == CollectiveBackendType::RCCL;
+        if (!device.is_gpu() || !native_gpu_transport)
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Decode TP degree greater than two requires "
+                "a canonical rank-order implementation for its declared "
+                "device/backend topology");
+        }
+
+        const size_t row_elements = buffer ? buffer->cols() : 0u;
+        if (!buffer || buffer->native_type() != TensorType::FP32 ||
+            row_elements == 0u || count == 0u ||
+            count % row_elements != 0u)
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Canonical decode TP reduction requires a "
+                "non-empty integral FP32 row matrix");
+        }
+
+        plan.arithmetic_policy =
+            TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+        plan.transport_precision = "fp32";
+        return plan;
+    }
+
     std::unique_ptr<IComputeStage> QwenGraphBase::createTPAllreduceStage(
         TensorBase *buffer,
         size_t count,
@@ -2515,12 +4105,14 @@ namespace llaminar2
         int layer_idx,
         bool is_attention,
         const std::string &stage_name,
-        std::optional<BufferId> tensor_buffer_id) const
+        std::optional<BufferId> tensor_buffer_id,
+        std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings,
+        std::optional<std::string> precision_override) const
     {
         // Unified path: use polymorphic ITPContext for both LOCAL and GLOBAL TP
         if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
         {
-            LOG_DEBUG("[QwenGraphBase] Creating TPAllreduceStage: degree="
+            LOG_TRACE("[QwenGraphBase] Creating TPAllreduceStage: degree="
                       << config_.tp_ctx->degree()
                       << " device_idx=" << config_.tp_device_idx
                       << " count=" << count
@@ -2534,8 +4126,18 @@ namespace llaminar2
             params.tensor = buffer;
             params.count = count;
             params.stage_name = stage_name;
-            params.precision = config_.getAllreducePrecisionForLayer(layer_idx);
+            const TPAllreducePlan arithmetic_plan =
+                resolveTPAllreducePlan(
+                    buffer,
+                    count,
+                    device,
+                    layer_idx,
+                    precision_override);
+            params.arithmetic_policy = arithmetic_plan.arithmetic_policy;
+            params.precision = arithmetic_plan.transport_precision;
             params.tensor_buffer_id = tensor_buffer_id;
+            params.sideband_device_index = config_.tp_device_idx;
+            params.sideband_workspace_bindings = std::move(sideband_workspace_bindings);
 
             return std::make_unique<TPAllreduceStage>(params);
         }
@@ -2570,6 +4172,9 @@ namespace llaminar2
 
     std::pair<int, int> QwenGraphBase::resolveLocalHeadCounts() const
     {
+        if (useReplicatedAttentionStateWeights())
+            return {config_.n_heads, config_.n_kv_heads};
+
         int local_n_heads = config_.qkv_column_parallel
                                 ? config_.local_n_heads
                                 : config_.n_heads;
@@ -2651,7 +4256,7 @@ namespace llaminar2
         if (!layer.q_norm || !layer.k_norm)
             return false;
 
-        LOG_DEBUG("[QwenGraphBase] Layer using QK norm");
+        LOG_TRACE("[QwenGraphBase] Layer using QK norm");
 
         graph.addNode(prefix + "q_norm",
                       ComputeStageFactory::createQKNorm({
@@ -2688,6 +4293,122 @@ namespace llaminar2
         return true;
     }
 
+    attention::AttentionExecutionPolicy
+    QwenGraphBase::resolveAttentionExecutionPolicy(
+        DeviceId device,
+        bool cache_backed) const
+    {
+        if (!device.is_cpu() && !device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "attention execution policy requires a valid CPU, CUDA, or ROCm device");
+        }
+
+        /*
+         * Native floating rings retain stable row addresses and can publish
+         * post-RoPE K once at append time. Re-transforming and linearizing
+         * their complete history on every decode token is both unnecessary
+         * O(context) work and prevents FlashAttention from consuming the
+         * device-owned ring directly. Quantized caches still require their
+         * explicit device conversion path because rotating before
+         * quantization changes that representation's established arithmetic.
+         */
+        const bool native_floating_cache =
+            config_.kv_cache_precision == KVCachePrecision::AUTO ||
+            config_.kv_cache_precision == KVCachePrecision::FP16 ||
+            config_.kv_cache_precision == KVCachePrecision::FP32;
+        const bool device_transforms_cached_keys =
+            cache_backed && device.is_gpu() && config_.rope_on_read &&
+            !native_floating_cache;
+        return {
+            .prefill_parallel_axis =
+                attention::AttentionPrefillParallelAxis::GeometrySelected,
+            .key_cache = {
+                .encoding =
+                    device_transforms_cached_keys
+                        ? attention::AttentionKeyCacheEncoding::
+                              PreRotaryDeviceTransform
+                        : attention::AttentionKeyCacheEncoding::PostRotary,
+                .rope_theta = config_.rope_theta,
+                .partial_rotary_factor = config_.partial_rotary_factor,
+            },
+        };
+    }
+
+    std::string QwenGraphBase::addKeyCachePublicationTransforms(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        int local_n_kv_heads,
+        int total_tokens,
+        const int *position_ids,
+        const void *position_ids_device,
+        DeviceId device,
+        const attention::AttentionExecutionPolicy &execution_policy,
+        const std::string &projection_dependency)
+    {
+        if (!buffers.K || local_n_kv_heads <= 0 || total_tokens <= 0 ||
+            projection_dependency.empty())
+        {
+            throw std::invalid_argument(
+                "K cache-publication transforms require K, positive geometry, and a producer node");
+        }
+
+        std::string key_terminal = projection_dependency;
+        if (layer.k_norm)
+        {
+            const std::string norm_node = prefix + "k_norm";
+            graph.addNode(norm_node,
+                          ComputeStageFactory::createQKNorm({
+                              .device_id = device,
+                              .input = buffers.K,
+                              .output = buffers.K,
+                              .gamma = layer.k_norm,
+                              .n_heads = local_n_kv_heads,
+                              .head_dim = config_.head_dim,
+                              .eps = config_.rms_norm_eps,
+                              .seq_len = total_tokens,
+                              .input_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                              .output_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                          }),
+                          device);
+            graph.addDependency(norm_node, key_terminal);
+            key_terminal = norm_node;
+        }
+
+        if (!execution_policy.key_cache.transformsOnRead())
+        {
+            const std::string rope_node = prefix + "k_rope";
+            const int pos_offset = position_ids ? position_ids[0] : 0;
+            const bool force_decode_equivalent_rope_verifier_prefill =
+                device.is_cpu() &&
+                config_.usesMTPGroupedDecodeEquivalentRows() &&
+                total_tokens > 1;
+            graph.addNode(rope_node,
+                          ComputeStageFactory::createKeyOnlyRoPE({
+                              .device_id = device,
+                              .K = buffers.K,
+                              .n_kv_heads = local_n_kv_heads,
+                              .head_dim = config_.head_dim,
+                              .pos_offset = pos_offset,
+                              .theta_base = config_.rope_theta,
+                              .seq_len = total_tokens,
+                              .partial_rotary_factor = config_.partial_rotary_factor,
+                              .position_ids = position_ids,
+                              .position_ids_device = position_ids_device,
+                              .force_decode_equivalent_verifier_prefill =
+                                  force_decode_equivalent_rope_verifier_prefill,
+                              .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                          }),
+                          device);
+            graph.addDependency(rope_node, key_terminal);
+            key_terminal = rope_node;
+        }
+
+        return key_terminal;
+    }
+
     std::string QwenGraphBase::addRoPE(
         ComputeGraph &graph,
         const std::string &prefix,
@@ -2697,16 +4418,15 @@ namespace llaminar2
         int total_tokens,
         const int *position_ids,
         const void *position_ids_device,
-        DeviceId device)
+        DeviceId device,
+        const attention::AttentionExecutionPolicy &execution_policy)
     {
         const std::string node_name = prefix + "rope";
         int pos_offset = position_ids ? position_ids[0] : 0;
         const bool force_decode_equivalent_rope_verifier_prefill =
             device.is_cpu() &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled &&
-            total_tokens > 1 &&
-            total_tokens <= 4;
+            config_.usesMTPGroupedDecodeEquivalentRows() &&
+            total_tokens > 1;
 
         graph.addNode(node_name,
                       ComputeStageFactory::createRoPE({
@@ -2722,7 +4442,7 @@ namespace llaminar2
                           .partial_rotary_factor = config_.partial_rotary_factor,
                           .position_ids = position_ids,
                           .position_ids_device = position_ids_device,
-                          .skip_k = config_.rope_on_read,
+                          .skip_k = execution_policy.key_cache.transformsOnRead(),
                           .force_decode_equivalent_verifier_prefill =
                               force_decode_equivalent_rope_verifier_prefill,
                           .q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
@@ -2741,9 +4461,13 @@ namespace llaminar2
         int seq_len,
         int batch_size,
         IKVCache *kv_cache,
+        const int32_t *request_sequence_lengths_device,
         DeviceId device,
+        const attention::AttentionExecutionPolicy &execution_policy,
         const std::string &rope_dependency,
-        bool layer_idx_is_cache_local)
+        const std::vector<std::string> &cache_source_dependencies,
+        bool layer_idx_is_cache_local,
+        int first_seq_idx)
     {
         int total_tokens = batch_size * seq_len;
         const int kv_stage_layer = kvCacheLayerForGraphStage(
@@ -2751,31 +4475,154 @@ namespace llaminar2
 
         if (kv_cache)
         {
+            /*
+             * Request-prefill lengths and request-condition append widths are
+             * different policies even though both are represented by one
+             * device INT32 row at the orchestration boundary. During padded
+             * prefill, each value is the number of real rows to copy from a
+             * fixed bucket and must govern KV append. During a live MTP main
+             * condition, the values are absolute post-append logical lengths
+             * used by positions, recurrent state, and terminal-row selection;
+             * the KV graph itself appends exactly its captured `seq_len` rows.
+             * Binding those absolute lengths as append counts makes the
+             * capture guard reject every value greater than `seq_len`, turning
+             * the condition append into a silent zero-row operation.
+             *
+             * Grouped verifier ownership is equally explicit. Compact
+             * request-batch prefill also enables all-position logits so it can
+             * select one terminal row per request; that output policy does not
+             * make its cache mutation speculative. Inferring append semantics
+             * from `compute_all_position_logits` would append every padded row
+             * and corrupt every request shorter than the physical graph width.
+             */
+            const int32_t *kv_append_lengths_device =
+                config_.live_mtp_request_batch_condition
+                    ? nullptr
+                    : request_sequence_lengths_device;
+            const bool phase_split_handoff =
+                needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
+            ITensor *append_K = buffers.K;
+            ITensor *append_V = buffers.V;
+            std::optional<BufferId> append_k_buffer_id = buffers.idFor(BufferId::K_PROJ);
+            std::optional<BufferId> append_v_buffer_id = buffers.idFor(BufferId::V_PROJ);
+            std::string append_dependency = rope_dependency;
+
+            if (phase_split_handoff)
+            {
+                if (!buffers.K_full_prefill || !buffers.V_full_prefill)
+                {
+                    LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires K_full_prefill/V_full_prefill buffers");
+                    throw std::runtime_error("phase-split prefill full K/V buffers missing");
+                }
+                auto *local_tp = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
+                if (!local_tp)
+                {
+                    LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires a LocalTP context");
+                    throw std::runtime_error("phase-split prefill KV handoff requires LocalTP context");
+                }
+                if (!local_tp->supportsRawAllgatherOnStreamGraphCapture())
+                {
+                    LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires graph-capturable raw allgather");
+                    throw std::runtime_error("phase-split prefill KV handoff requires graph-capturable raw allgather");
+                }
+
+                const int local_kv_dim = config_.local_n_kv_heads * config_.head_dim;
+                const int full_kv_dim = config_.n_kv_heads * config_.head_dim;
+                if (!buffers.K || !buffers.V ||
+                    local_kv_dim <= 0 ||
+                    static_cast<int>(buffers.K->cols()) < local_kv_dim ||
+                    static_cast<int>(buffers.V->cols()) < local_kv_dim ||
+                    static_cast<int>(buffers.K_full_prefill->cols()) < full_kv_dim ||
+                    static_cast<int>(buffers.V_full_prefill->cols()) < full_kv_dim)
+                {
+                    LOG_ERROR("[QwenGraphBase] Invalid phase-split prefill K/V handoff dimensions"
+                              << " local_kv_dim=" << local_kv_dim
+                              << " full_kv_dim=" << full_kv_dim);
+                    throw std::runtime_error("invalid phase-split prefill K/V handoff dimensions");
+                }
+
+                const std::string handoff_node = prefix + "tp_kv_state_allgather";
+                graph.addNode(handoff_node,
+                              ComputeStageFactory::createTPKVCacheStateAllGather({
+                                  .device_id = device,
+                                  .tp_ctx = local_tp,
+                                  .local_K = buffers.K,
+                                  .local_V = buffers.V,
+                                  .full_K = buffers.K_full_prefill,
+                                  .full_V = buffers.V_full_prefill,
+                                  .layer_idx = kv_stage_layer,
+                                  .tp_device_idx = config_.tp_device_idx,
+                                  .tokens = total_tokens,
+                                  .local_kv_dim = local_kv_dim,
+                                  .full_kv_dim = full_kv_dim,
+                                  .local_k_stride = local_kv_dim,
+                                  .local_v_stride = local_kv_dim,
+                                  .stage_name = handoff_node,
+                                  .local_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                                  .local_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
+                                  .full_k_buffer_id = buffers.idFor(BufferId::K_FULL_PREFILL),
+                                  .full_v_buffer_id = buffers.idFor(BufferId::V_FULL_PREFILL),
+                              }),
+                              device);
+
+                if (execution_policy.key_cache.transformsOnRead() &&
+                    !cache_source_dependencies.empty())
+                {
+                    for (const auto &dep : cache_source_dependencies)
+                    {
+                        if (!dep.empty())
+                            graph.addDependency(handoff_node, dep);
+                    }
+                }
+                else
+                {
+                    /*
+                     * Without RoPE-on-read the replicated cache must receive
+                     * post-RoPE K. Make the full-row allgather consume the RoPE
+                     * output directly. With RoPE-on-read, the branch above
+                     * gathers pre-RoPE K while Q RoPE proceeds independently.
+                     */
+                    graph.addDependency(handoff_node, rope_dependency);
+                }
+
+                append_K = buffers.K_full_prefill;
+                append_V = buffers.V_full_prefill;
+                append_k_buffer_id = buffers.idFor(BufferId::K_FULL_PREFILL);
+                append_v_buffer_id = buffers.idFor(BufferId::V_FULL_PREFILL);
+                append_dependency = handoff_node;
+            }
+
             graph.addNode(prefix + "kv_append",
                           ComputeStageFactory::createKVCacheAppend({
                               .device_id = device,
-                              .K = buffers.K,
-                              .V = buffers.V,
+                              .K = append_K,
+                              .V = append_V,
                               .kv_cache = kv_cache,
                               .layer_idx = kv_stage_layer,
-                              .seq_idx = 0,
+                              .seq_idx = first_seq_idx,
                               .num_tokens = total_tokens,
                               .batch_size = batch_size,
                               .seq_len = seq_len,
+                              .append_semantics =
+                                  config_.grouped_mtp_verifier
+                                      ? KVCacheAppendSemantics::DecodeEquivalentVerifier
+                                      : KVCacheAppendSemantics::Standard,
+                              .request_sequence_lengths_device =
+                                  kv_append_lengths_device,
                               .kv_cache_scale_k = config_.kv_cache_scale_k,
                               .kv_cache_scale_v = config_.kv_cache_scale_v,
                               .head_dim = config_.head_dim,
                               .turboquant_ctx = config_.turboquant_ctx,
                               .kv_rotation = config_.kv_rotation,
-                              .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
-                              .v_buffer_id = buffers.idFor(BufferId::V_PROJ),
+                              .k_buffer_id = append_k_buffer_id,
+                              .v_buffer_id = append_v_buffer_id,
                           }),
                           device);
 
             // In rope-on-read mode the RoPE stage skips K mutation, but it still
             // carries the Q/K norm dependencies. Appending directly after QKV GEMM
             // can cache pre-normalized K on Qwen3.5 FA layers.
-            graph.addDependency(prefix + "kv_append", rope_dependency);
+            graph.addDependency(prefix + "kv_append", append_dependency);
             return prefix + "kv_append";
         }
 
@@ -2794,15 +4641,20 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         const void *position_ids_device,
+        const int32_t *request_sequence_lengths_device,
         DeviceId device,
         bool has_qkv_proj,
+        const attention::AttentionExecutionPolicy &execution_policy,
         const std::string &rope_dependency,
+        const std::vector<std::string> &cache_source_dependencies,
         bool layer_idx_is_cache_local)
     {
         (void)position_ids_device;
         int total_tokens = batch_size * seq_len;
         const int kv_stage_layer = kvCacheLayerForGraphStage(
             kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
+        const bool phase_split_handoff =
+            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
 
         const std::string kv_append_dependency =
             addKVCacheAppend(
@@ -2813,8 +4665,11 @@ namespace llaminar2
                 seq_len,
                 batch_size,
                 kv_cache,
+                request_sequence_lengths_device,
                 device,
+                execution_policy,
                 rope_dependency,
+                cache_source_dependencies,
                 layer_idx_is_cache_local);
 
         // --- Determine K/V source for attention ---
@@ -2823,7 +4678,7 @@ namespace llaminar2
         int kv_len = total_tokens;
         bool use_gather_stage = false;
 
-        if (kv_cache)
+        if (kv_cache && !device.is_gpu())
         {
             int cached_tokens = kv_cache->get_cached_tokens(kv_stage_layer, 0);
             if (cached_tokens > 0 && batch_size == 1)
@@ -2849,6 +4704,22 @@ namespace llaminar2
                                                       << " batched decode but no gather buffers");
                 }
             }
+        }
+        else if (kv_cache && device.is_gpu())
+        {
+            /*
+             * GPU attention resolves the live cache through its captured
+             * device-state read. Keep only a host-known launch horizon here;
+             * neither cache metadata nor cache-sized tensor wrappers belong in
+             * graph construction. The first position ID is request geometry,
+             * not a mirror of the cache's canonical head/count allocation.
+             */
+            const int request_offset =
+                position_ids ? std::max(0, position_ids[0]) : 0;
+            kv_len = std::clamp(
+                request_offset + seq_len,
+                std::max(1, seq_len),
+                std::max(1, kv_cache->max_seq_len()));
         }
 
         // --- KV Cache Gather (batched decode) ---
@@ -2883,25 +4754,79 @@ namespace llaminar2
             attn_params.seq_len = seq_len;
             attn_params.kv_len = kv_len;
             attn_params.n_heads = local_n_heads;
-            attn_params.n_kv_heads = local_n_kv_heads;
+            /*
+             * Phase-split prefill seeds an unsharded cache so replicated decode
+             * can run without a KV collective. Prefill must consume that same
+             * post-append cache to remain numerically identical across full and
+             * chunked requests. The attention kernel therefore sees global KV
+             * geometry while its Q heads remain TP-local; head_start plus
+             * gqa_n_rep maps each local Q head to the correct replicated KV head.
+             */
+            const int attention_n_kv_heads =
+                phase_split_handoff ? config_.n_kv_heads : local_n_kv_heads;
+            attn_params.n_kv_heads = attention_n_kv_heads;
             attn_params.head_dim = config_.head_dim;
-            attn_params.head_start = config_.head_start;
+            /*
+             * `head_start` maps a participant-local Q head index into the
+             * global GQA head space.  A replicated dense graph instead binds
+             * the complete Q row `[0, n_heads)` on every participant, so its
+             * local index is already the global index and the offset must be
+             * zero.  Retaining the primary TP assignment here made identical
+             * replicated Q/K/V and shifted-cache bytes select different KV
+             * heads on non-zero participants.
+             *
+             * Resolve this from the emitted tensor geometry rather than from
+             * a mode name: any graph that owns all query heads starts at zero;
+             * a genuinely sharded prefill continues to use its typed TP
+             * assignment below.
+             */
+            const bool owns_full_query_head_range =
+                local_n_heads == config_.n_heads;
+            attn_params.head_start =
+                owns_full_query_head_range ? 0 : config_.head_start;
             // GQA rep: only when KV heads are replicated (not column-parallel)
-            if (local_n_kv_heads == config_.n_kv_heads && config_.n_kv_heads > 0 && local_n_heads != config_.n_heads)
+            if (attention_n_kv_heads == config_.n_kv_heads &&
+                config_.n_kv_heads > 0 &&
+                local_n_heads != config_.n_heads)
                 attn_params.gqa_n_rep = config_.n_heads / config_.n_kv_heads;
             attn_params.causal = true;
             attn_params.window_size = -1;
             attn_params.attention_mode = mode;
             attn_params.auto_detect_mode = true;
+            /*
+             * The graph resolves physical parallelism and cached-K encoding
+             * once. The exact same value already governed RoPE and cache append,
+             * so the attention consumer cannot silently choose different bytes.
+             */
+            attn_params.execution_policy = execution_policy;
             attn_params.workspace_scores = buffers.workspace_scores;
             attn_params.workspace_context = buffers.workspace_context;
-            attn_params.workspace_mask = buffers.workspace_mask;
+            /*
+             * Qwen attention has no external additive mask tensor. CUDA and
+             * ROCm FA2 derive causal, sliding-window, and continuation bounds
+             * from their device-owned attention geometry. Historically this
+             * field aliased GEMM_WORKSPACE even though no stage populated it
+             * as a mask; graph replay could consequently interpret recycled
+             * GEMM bytes with a new live-KV stride. Leave the optional mask
+             * null here. Explicit-mask kernel and stage callers retain their
+             * separate API contract.
+             */
             attn_params.kv_cache = kv_cache;
             attn_params.layer_idx = kv_stage_layer;
-            attn_params.read_kv_from_cache = device.is_gpu() &&
-                                             (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
-                                             (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
-                                                            kv_cache->precision() != ActivationPrecision::TQ4));
+            attn_params.active_query_rows_device =
+                device.is_gpu() && batch_size == 1
+                    ? request_sequence_lengths_device
+                    : nullptr;
+            /*
+             * GPU attention has one production source: the post-append,
+             * device-owned KV cache. This is true for prefill, continuation
+             * prefill, serial decode, and grouped verifier rows. Selecting the
+             * transient projection buffer for one phase changes both precision
+             * and RoPE timing, breaking batch invariance. Backends missing a
+             * native or converted grouped cache view fail at that contract
+             * boundary; there is no projection-buffer fallback.
+             */
+            attn_params.read_kv_from_cache = kv_cache && device.is_gpu();
             attn_params.position_offset = position_ids ? position_ids[0] : 0;
             attn_params.mpi_ctx = mpi_ctx_.get();
             attn_params.q_buffer_id = buffers.idFor(BufferId::Q_PROJ);
@@ -2912,13 +4837,6 @@ namespace llaminar2
             attn_params.turboquant_ctx = config_.turboquant_ctx;
             attn_params.kv_rotation = config_.kv_rotation;
 
-            if (config_.rope_on_read)
-            {
-                attn_params.apply_rope_to_k = true;
-                attn_params.rope_theta = config_.rope_theta;
-                attn_params.partial_rotary_factor = config_.partial_rotary_factor;
-            }
-
             graph.addNode(prefix + "attention",
                           ComputeStageFactory::createAttentionCompute(attn_params),
                           device);
@@ -2926,7 +4844,11 @@ namespace llaminar2
             if (use_gather_stage)
                 graph.addDependency(prefix + "attention", prefix + "kv_gather");
             else if (kv_cache)
+            {
                 graph.addDependency(prefix + "attention", kv_append_dependency);
+                if (phase_split_handoff)
+                    graph.addDependency(prefix + "attention", rope_dependency);
+            }
             else
                 graph.addDependency(prefix + "attention", rope_dependency);
         }
@@ -2934,18 +4856,17 @@ namespace llaminar2
         return prefix + "attention";
     }
 
-    std::string QwenGraphBase::addWoProjectionAndAllreduce(
+    std::string QwenGraphBase::addWoProjection(
         ComputeGraph &graph,
         const std::string &prefix,
         ActivationBuffers &buffers,
         TensorBase *wo_weight,
         const WeightBinding *wo_binding,
         int total_tokens,
-        int layer_idx,
         DeviceId device,
         const std::string &dependency,
         const std::string &wo_node_suffix,
-        const std::string &allreduce_node_suffix)
+        std::optional<DeviceRowRange> verifier_rows)
     {
         if (!wo_weight)
             return dependency;
@@ -2956,16 +4877,14 @@ namespace llaminar2
          * Grouped verifier rows are promoted through the attention output
          * projection as a normal small-M GEMM.  The serial M=1 verifier loop is
          * kept available inside GEMMStage for explicit diagnostics, but the
-         * production graph relies on the Phase 9.8 dense verifier proof
-         * (cosine/relative-L2/KL/sample equality for M=2..4) instead of paying a
-         * row-copy loop in every attention block.
+         * production graph relies on the Phase 9.8 dense verifier proof of
+         * byte-identical runtime-M grouped output instead of paying a row-copy
+         * loop in every attention block.
          */
         const bool force_decode_equivalent_wo_verifier_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            total_tokens <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            config_.usesMTPGroupedDecodeEquivalentRows();
 
         std::string wo_node = prefix + wo_node_suffix;
         graph.addNode(wo_node,
@@ -2984,33 +4903,52 @@ namespace llaminar2
                           .a_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
                           .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
                           .force_decode_equivalent_verifier_prefill = force_decode_equivalent_wo_verifier_prefill,
+                          .verifier_row_range = verifier_rows,
                           .prepared_ref = preparedRefForGraphWeight(wo_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
         graph.addDependency(wo_node, dependency);
+        return wo_node;
+    }
 
-        std::string terminal = wo_node;
-
-        // TP allreduce if row-parallel sharded
-        if (isRowParallelSharded(wo_weight) && needsTPAllreduce())
+    std::string QwenGraphBase::addWoAllreduce(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        TensorBase *wo_weight,
+        int total_tokens,
+        int layer_idx,
+        DeviceId device,
+        const std::string &dependency,
+        const std::string &allreduce_node_suffix)
+    {
+        if (!wo_weight ||
+            !isRowParallelSharded(wo_weight) ||
+            !needsTPAllreduce() ||
+            !attentionTPAllreduceEnabledForCurrentGraph())
         {
-            size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-            std::string ar_node = prefix + allreduce_node_suffix;
-
-            auto allreduce_stage = createTPAllreduceStage(
-                buffers.attn_proj, allreduce_count, device, layer_idx,
-                /*is_attention=*/true, ar_node, buffers.idFor(BufferId::ATTN_PROJ));
-
-            if (allreduce_stage)
-            {
-                graph.addNode(ar_node, std::move(allreduce_stage), device);
-                graph.addDependency(ar_node, wo_node);
-                terminal = ar_node;
-            }
+            return dependency;
         }
 
-        return terminal;
+        const size_t allreduce_count =
+            static_cast<size_t>(total_tokens) *
+            static_cast<size_t>(config_.d_model);
+        const std::string allreduce_node = prefix + allreduce_node_suffix;
+        auto allreduce_stage = createTPAllreduceStage(
+            buffers.attn_proj,
+            allreduce_count,
+            device,
+            layer_idx,
+            /*is_attention=*/true,
+            allreduce_node,
+            buffers.idFor(BufferId::ATTN_PROJ));
+        if (!allreduce_stage)
+            return dependency;
+
+        graph.addNode(allreduce_node, std::move(allreduce_stage), device);
+        graph.addDependency(allreduce_node, dependency);
+        return allreduce_node;
     }
 
 } // namespace llaminar2

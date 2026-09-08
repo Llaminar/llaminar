@@ -2,6 +2,7 @@
 #include "loaders/ExpertGemmRegistry.h"
 #include "tensors/TensorKernels.h"
 
+#include <array>
 #include <thread>
 #include <vector>
 
@@ -133,6 +134,153 @@ TEST(Test__ExpertGemmRegistry, ParticipantScopedEntriesOnSameDomainDeviceDoNotOv
     EXPECT_EQ(reg.getEngineForParticipant("cpu_cold", device, 0, 0, 1, 2, Role::GATE), rank0.get());
     EXPECT_EQ(reg.getEngineForParticipant("cpu_cold", device, 1, 1, 1, 2, Role::GATE), rank1.get());
     EXPECT_EQ(reg.getEngineForDomain("cpu_cold", device, 1, 2, Role::GATE), domain_default.get());
+    EXPECT_EQ(reg.size(), 3u);
+}
+
+TEST(Test__ExpertGemmRegistry,
+     ParticipantResidencyReplacementAtomicallyRebindsExactTripletsAndDomainAliases)
+{
+    ExpertGemmRegistry reg;
+    const DeviceId device = DeviceId::cpu();
+    const ExpertGemmRegistry::ParticipantLayerScope participant0{
+        .domain_name = "cpu_tier",
+        .device = device,
+        .participant_world_rank = 0,
+        .participant_index = 0,
+        .layer = 3,
+    };
+    const ExpertGemmRegistry::ParticipantLayerScope participant1{
+        .domain_name = "cpu_tier",
+        .device = device,
+        .participant_world_rank = 0,
+        .participant_index = 1,
+        .layer = 3,
+    };
+
+    auto stale = std::make_shared<MockGemm>(10);
+    for (const Role role : {Role::GATE, Role::UP, Role::DOWN})
+    {
+        reg.registerEngineForParticipant(
+            "cpu_tier", device, 0, 0, 3, 0, role, stale.get(), stale);
+        reg.registerEngineForDomain(
+            "cpu_tier", device, 3, 0, role, stale.get(), stale);
+    }
+    auto unrelated = std::make_shared<MockGemm>(99);
+    reg.registerEngine(
+        device, 8, 7, Role::GATE, unrelated.get(), unrelated);
+
+    const auto triplet = [](int base)
+    {
+        ExpertGemmRegistry::ParticipantExpertBinding binding;
+        binding.gate = std::make_shared<MockGemm>(base + 1);
+        binding.up = std::make_shared<MockGemm>(base + 2);
+        binding.down = std::make_shared<MockGemm>(base + 3);
+        return binding;
+    };
+    auto expert1 = triplet(100);
+    expert1.scope = participant0;
+    expert1.expert = 1;
+    auto expert0 = triplet(200);
+    expert0.scope = participant1;
+    expert0.expert = 0;
+    const std::array scopes{participant0, participant1};
+    const std::array bindings{expert1, expert0};
+
+    std::string error;
+    ASSERT_TRUE(reg.replaceParticipantResidency(scopes, bindings, &error))
+        << error;
+    EXPECT_EQ(
+        reg.getEngineForParticipant(
+            "cpu_tier", device, 0, 0, 3, 0, Role::GATE),
+        nullptr);
+    EXPECT_EQ(
+        reg.getEngineForParticipant(
+            "cpu_tier", device, 0, 0, 3, 1, Role::GATE),
+        expert1.gate.get());
+    EXPECT_EQ(
+        reg.getEngineForParticipant(
+            "cpu_tier", device, 0, 1, 3, 0, Role::DOWN),
+        expert0.down.get());
+    EXPECT_EQ(
+        reg.getEngineForDomain(
+            "cpu_tier", device, 3, 1, Role::UP),
+        expert1.up.get());
+    EXPECT_EQ(
+        reg.getEngineForDomain(
+            "cpu_tier", device, 3, 0, Role::DOWN),
+        expert0.down.get());
+    EXPECT_EQ(
+        reg.getEngine(device, 8, 7, Role::GATE),
+        unrelated.get())
+        << "non-overlay registry scopes must not be touched";
+
+    auto invalid = expert1;
+    invalid.down.reset();
+    const std::array invalid_bindings{invalid};
+    EXPECT_FALSE(reg.replaceParticipantResidency(
+        scopes, invalid_bindings, &error));
+    EXPECT_FALSE(error.empty());
+    EXPECT_EQ(
+        reg.getEngineForParticipant(
+            "cpu_tier", device, 0, 0, 3, 1, Role::GATE),
+        expert1.gate.get())
+        << "a rejected replacement must leave the prior publication intact";
+}
+
+TEST(Test__ExpertGemmRegistry,
+     ScopedLifetimeLookupRetainsOnlyTheExactRegisteredEngine)
+{
+    ExpertGemmRegistry reg;
+    const DeviceId device = DeviceId::cpu();
+    auto participant = std::make_shared<MockGemm>(450);
+    reg.registerEngineForParticipant(
+        "cpu_cold",
+        device,
+        1,
+        3,
+        2,
+        7,
+        Role::DOWN,
+        participant.get(),
+        participant);
+
+    auto lifetime = reg.getEngineLifetimeForParticipant(
+        "cpu_cold", device, 1, 3, 2, 7, Role::DOWN);
+    ASSERT_NE(lifetime, nullptr);
+    EXPECT_EQ(lifetime.get(), participant.get());
+    EXPECT_EQ(
+        reg.getEngineLifetimeForDomain(
+            "cpu_cold", device, 2, 7, Role::DOWN),
+        nullptr);
+
+    MockGemm borrowed(451);
+    auto unrelated_owner = std::make_shared<MockGemm>(452);
+    reg.registerEngine(
+        device,
+        2,
+        8,
+        Role::DOWN,
+        &borrowed,
+        unrelated_owner);
+    EXPECT_EQ(
+        reg.getEngineLifetime(device, 2, 8, Role::DOWN),
+        nullptr);
+}
+
+TEST(Test__ExpertGemmRegistry, AliasDomainAndParticipantFromBaseDeviceReusesEngine)
+{
+    ExpertGemmRegistry reg;
+    const DeviceId device = DeviceId::cuda(0);
+    auto base = std::make_shared<MockGemm>(515);
+
+    reg.registerEngine(device, 2, 7, Role::UP, base.get(), base);
+
+    EXPECT_TRUE(reg.aliasEngineForDomainFromDevice("cuda_hot", device, 2, 7, Role::UP));
+    EXPECT_TRUE(reg.aliasEngineForParticipantFromDevice("cuda_hot", device, 0, 1, 2, 7, Role::UP));
+
+    EXPECT_EQ(reg.getEngine(device, 2, 7, Role::UP), base.get());
+    EXPECT_EQ(reg.getEngineForDomain("cuda_hot", device, 2, 7, Role::UP), base.get());
+    EXPECT_EQ(reg.getEngineForParticipant("cuda_hot", device, 0, 1, 2, 7, Role::UP), base.get());
     EXPECT_EQ(reg.size(), 3u);
 }
 
@@ -369,6 +517,53 @@ TEST(Test__ExpertGemmRegistry, SubsetCompletenessAndCountsAreDeviceScoped)
     EXPECT_EQ(reg.countCompleteExpertsForLayer(DeviceId::cuda(0), 3, 4), 2u);
     EXPECT_EQ(reg.countEnginesForLayer(DeviceId::cuda(0), 3), 6u);
     EXPECT_EQ(reg.countEnginesForDevice(DeviceId::rocm(0)), 3u);
+}
+
+TEST(Test__ExpertGemmRegistry, ModelLifetimeAccountingIncludesOverlayScopes)
+{
+    ExpertGemmRegistry reg;
+    auto domain = std::make_shared<MockGemm>(10);
+    auto participant = std::make_shared<MockGemm>(20);
+    auto sibling = std::make_shared<MockGemm>(30);
+
+    reg.registerEngineForDomain(
+        "secondary",
+        DeviceId::rocm(0),
+        2,
+        7,
+        Role::GATE,
+        domain.get(),
+        domain);
+    reg.registerEngineForParticipant(
+        "secondary",
+        DeviceId::rocm(0),
+        1,
+        3,
+        2,
+        7,
+        Role::UP,
+        participant.get(),
+        participant);
+    reg.registerEngineForDomain(
+        "secondary",
+        DeviceId::rocm(1),
+        2,
+        7,
+        Role::DOWN,
+        sibling.get(),
+        sibling);
+
+    EXPECT_EQ(reg.countEnginesForDevice(DeviceId::rocm(0)), 0u)
+        << "Legacy unscoped lookup must remain scope-specific";
+    EXPECT_EQ(
+        reg.countOwnedEnginesForDeviceAcrossScopes(DeviceId::rocm(0)),
+        2u);
+    EXPECT_EQ(
+        reg.countOwnedEnginesForDeviceAcrossScopes(DeviceId::rocm(1)),
+        1u);
+    EXPECT_EQ(
+        reg.countOwnedEnginesForDeviceAcrossScopes(DeviceId::cuda(0)),
+        0u);
 }
 
 TEST(Test__ExpertGemmRegistry, RemovalAndReplacementUpdateCompleteness)

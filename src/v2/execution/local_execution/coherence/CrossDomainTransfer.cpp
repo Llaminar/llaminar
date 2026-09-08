@@ -9,6 +9,8 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../backends/ComputeBackend.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include <cstring>
 #include <chrono>
@@ -187,8 +189,9 @@ namespace llaminar2
             return false;
         }
 
-        // Mark destination as having valid GPU data (with event for fine-grained sync)
-        dst_cpu->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        // transferCpuToGpuImpl() is blocking. Publish that completed boundary
+        // explicitly instead of inventing an unrelated default-stream event.
+        TransferEngine::publishCompletedDeviceWrite(dst_cpu, device_id);
 
         auto end = std::chrono::high_resolution_clock::now();
         double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -337,7 +340,18 @@ namespace llaminar2
 
         // Use backend's deviceToHost for the transfer
         int device_ordinal = src_device.gpu_ordinal();
-        return backend->deviceToHost(dst, src, bytes, device_ordinal);
+        void *const stream =
+            GPUDeviceContextPool::instance()
+                .getContext(src_device)
+                .defaultStream();
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "CrossDomainTransfer::transferGpuToCpuImpl requires an "
+                "explicit source stream");
+        }
+        return backend->deviceToHost(
+            dst, src, bytes, device_ordinal, stream);
     }
 
     bool CrossDomainTransfer::transferCpuToGpuImpl(
@@ -369,7 +383,18 @@ namespace llaminar2
 
         // Use backend's hostToDevice for the transfer
         int device_ordinal = dst_device.gpu_ordinal();
-        return backend->hostToDevice(dst, src, bytes, device_ordinal);
+        void *const stream =
+            GPUDeviceContextPool::instance()
+                .getContext(dst_device)
+                .defaultStream();
+        if (!stream)
+        {
+            throw std::runtime_error(
+                "CrossDomainTransfer::transferCpuToGpuImpl requires an "
+                "explicit destination stream");
+        }
+        return backend->hostToDevice(
+            dst, src, bytes, device_ordinal, stream);
     }
 
     std::unique_ptr<TensorBase> CrossDomainTransfer::allocateCpuTensor(

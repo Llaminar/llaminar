@@ -59,6 +59,8 @@ namespace llaminar2
         devices_.clear();
         device_index_.clear();
         device_info_.clear();
+        cuda_p2p_.reset();
+        rocm_p2p_.reset();
 
         // Discover all device types
         discoverCpuDevices();
@@ -197,6 +199,12 @@ namespace llaminar2
 #ifdef HAVE_CUDA
         auto cuda_devices = cuda_enumeration::enumerate_cuda_devices();
 
+        if (cuda_devices.size() > 1u)
+        {
+            cuda_p2p_ =
+                cuda_enumeration::query_p2p_matrix(cuda_devices);
+        }
+
         for (const auto &dev : cuda_devices)
         {
             int numa_node = cuda_enumeration::get_cuda_device_numa_node(dev.device_id);
@@ -237,6 +245,12 @@ namespace llaminar2
     {
 #ifdef HAVE_ROCM
         auto rocm_devices = rocm_enumeration::enumerate_rocm_devices();
+
+        if (rocm_devices.size() > 1u)
+        {
+            rocm_p2p_ =
+                rocm_enumeration::query_p2p_matrix(rocm_devices);
+        }
 
         for (const auto &dev : rocm_devices)
         {
@@ -477,6 +491,8 @@ namespace llaminar2
 
     bool DeviceRegistry::canP2P(const GlobalDeviceAddress &a, const GlobalDeviceAddress &b) const
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+
         // CPU never does P2P
         if (a.isCPU() || b.isCPU())
             return false;
@@ -485,13 +501,21 @@ namespace llaminar2
         if (a.device_type != b.device_type)
             return false;
 
-        // Same device - trivially true
+        // A same-device query is valid only for a discovered endpoint.
         if (a == b)
-            return true;
+            return findInfo(a) != nullptr;
 
-        // For actual P2P capability, we'd need to query the driver
-        // For now, assume same-type GPUs on same NUMA can do P2P
-        return a.sameNuma(b);
+        /*
+         * NUMA proximity is not peer capability. PCIe ACS/IOMMU policy and
+         * backend support can disable direct access between GPUs attached to
+         * the same socket, so only the matrix queried from the active driver
+         * may answer this API.
+         */
+        const auto &matrix =
+            a.device_type == DeviceType::CUDA ? cuda_p2p_ : rocm_p2p_;
+        return matrix.has_value() &&
+               matrix->canAccessDevice(
+                   a.device_ordinal, b.device_ordinal);
     }
 
     // =========================================================================

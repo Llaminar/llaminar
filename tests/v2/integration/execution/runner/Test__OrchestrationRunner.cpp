@@ -160,7 +160,7 @@ namespace
         config.tp_devices.push_back(GlobalDeviceAddress::parse("0:cuda:0"));
         config.tp_devices.push_back(GlobalDeviceAddress::parse("0:cuda:1"));
         config.tp_degree = 2;
-        config.tp_scope = TPScope::LOCAL;
+        config.tp_scope = TPScope::RANK_LOCAL;
 
         auto runner = factory_->createFromOrchestrationConfig(config);
         ASSERT_NE(runner, nullptr);
@@ -432,28 +432,26 @@ namespace
         // Verify ROCm devices are correctly preserved
         RankExecutionPlan plan = createSimplePlan();
         plan.primary_device = GlobalDeviceAddress::parse("0:rocm:0");
-        plan.primary_device_numa_explicit = true;
 
         OrchestrationRunner runner(OrchestrationConfig{}, plan);
 
         const auto &returned = runner.executionPlan();
         EXPECT_EQ(returned.primary_device.device_type, DeviceType::ROCm);
-        EXPECT_TRUE(returned.primary_device_numa_explicit)
+        EXPECT_TRUE(returned.hasResolvedPrimaryDeviceNuma())
             << "Strict NUMA intent should be preserved in runner-facing execution plan";
     }
 
-    TEST_F(Test__OrchestrationRunner, ExecutionPlanAmbiguousDevice_HasNumaExplicitFalse)
+    TEST_F(Test__OrchestrationRunner, ExecutionPlanUnresolvedDeviceLeavesNumaUnconstrained)
     {
         RankExecutionPlan plan = createSimplePlan();
         plan.primary_device = GlobalDeviceAddress::parse("rocm:0");
-        plan.primary_device_numa_explicit = false;
 
         OrchestrationRunner runner(OrchestrationConfig{}, plan);
 
         const auto &returned = runner.executionPlan();
         EXPECT_EQ(returned.primary_device.device_type, DeviceType::ROCm);
-        EXPECT_FALSE(returned.primary_device_numa_explicit)
-            << "Ambiguous device intent should remain non-explicit in runner-facing execution plan";
+        EXPECT_FALSE(returned.hasResolvedPrimaryDeviceNuma())
+            << "Unresolved shorthand must remain unconstrained in the runner-facing execution plan";
     }
 
     TEST_F(Test__OrchestrationRunner, CpuShorthandMappedPlan_ExposesGlobalTPFields)
@@ -464,7 +462,6 @@ namespace
         plan.hostname = "localhost";
         plan.numa_node = 1;
         plan.primary_device = GlobalDeviceAddress::cpu(1, "localhost");
-        plan.primary_device_numa_explicit = true;
 
         plan.tp_scope = TPScope::GLOBAL;
         plan.global_tp_domain_id = 0;
@@ -481,7 +478,7 @@ namespace
         const auto &returned = runner.executionPlan();
         EXPECT_TRUE(returned.primary_device.isCPU());
         EXPECT_EQ(returned.primary_device.numa_node, 1);
-        EXPECT_TRUE(returned.primary_device_numa_explicit);
+        EXPECT_TRUE(returned.hasResolvedPrimaryDeviceNuma());
 
         EXPECT_EQ(returned.tp_scope, TPScope::GLOBAL);
         EXPECT_TRUE(returned.usesGlobalTP());
@@ -518,7 +515,7 @@ namespace
         config.tp_devices.push_back(GlobalDeviceAddress::parse("0:cuda:0"));
         config.tp_devices.push_back(GlobalDeviceAddress::parse("0:cuda:1"));
         config.tp_degree = 2;
-        config.tp_scope = TPScope::LOCAL;
+        config.tp_scope = TPScope::RANK_LOCAL;
 
         auto runner = factory_->createFromOrchestrationConfig(config);
         ASSERT_NE(runner, nullptr);
@@ -539,7 +536,7 @@ namespace
         // factory to return a NamedDomainGlobalRunner rather than OrchestrationRunner.
         OrchestrationConfig cfg;
         cfg.domain_definitions.push_back(DomainDefinition::parse(
-            "rocm_domain=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+            "rocm_domain=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0"));
         cfg.domain_definitions.push_back(DomainDefinition::parse(
             "cpu_domain=0:cpu:0,1:cpu:0;scope=node_local;ranks=0,1"));
         cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("0=rocm_domain:0-13"));
@@ -560,6 +557,30 @@ namespace
             << "Should not be an OrchestrationRunner for cross-rank named domain config";
     }
 
+    /**
+     * @brief Cross-rank PP is a property of the stage sequence, not one domain.
+     *
+     * Each stage may legitimately be rank-local. Distinct typed owners still
+     * require the global runner because the activation edge crosses MPI ranks.
+     */
+    TEST_F(Test__OrchestrationRunner, RankLocalStagesWithDistinctOwnersUseGlobalRunner)
+    {
+        OrchestrationConfig cfg;
+        cfg.domain_definitions.push_back(DomainDefinition::parse(
+            "head=0:cpu:0;scope=rank_local;owner=0"));
+        cfg.domain_definitions.push_back(DomainDefinition::parse(
+            "tail=1:cpu:0;scope=rank_local;owner=1"));
+        cfg.pp_stage_definitions.push_back(
+            PPStageDefinition::parse("0=head:0-13"));
+        cfg.pp_stage_definitions.push_back(
+            PPStageDefinition::parse("1=tail:14-27"));
+
+        ASSERT_TRUE(NamedDomainGlobalRunner::shouldUse(cfg));
+        auto runner = factory_->createFromOrchestrationConfig(cfg);
+        ASSERT_NE(runner, nullptr);
+        EXPECT_NE(dynamic_cast<NamedDomainGlobalRunner *>(runner.get()), nullptr);
+    }
+
     TEST_F(Test__OrchestrationRunner, SimpleSingleDeviceConfig_DoesNotCreateNamedDomainRunner)
     {
         // Simple single-device config must still go through OrchestrationRunner
@@ -574,6 +595,39 @@ namespace
         auto *named_runner = dynamic_cast<NamedDomainGlobalRunner *>(runner.get());
         EXPECT_EQ(named_runner, nullptr)
             << "Simple single-device config should use OrchestrationRunner, not NamedDomainGlobalRunner";
+    }
+
+    /**
+     * @brief Cross-rank participation does not imply multi-context ownership.
+     *
+     * Every MPI process constructs its own ordinary OrchestrationRunner for the
+     * legacy NodeTP path, so a process-resident model context remains one
+     * rank-local authority even though the plan performs MPI collectives.
+     */
+    TEST_F(Test__OrchestrationRunner, NodeTPUsesOneRankLocalModelAuthority)
+    {
+        OrchestrationConfig cfg;
+        cfg.tp_scope = TPScope::NODE_LOCAL;
+        cfg.tp_degree = 2;
+
+        EXPECT_EQ(
+            resolveRunnerModelAuthorityScope(cfg),
+            RunnerModelAuthorityScope::RankLocal);
+    }
+
+    /** @brief Named-domain composition requires an explicit context set. */
+    TEST_F(Test__OrchestrationRunner, NamedDomainRunnerRequiresMultiRankAuthoritySet)
+    {
+        OrchestrationConfig cfg;
+        cfg.domain_definitions.push_back(DomainDefinition::parse(
+            "cpu_domain=0:cpu:0,1:cpu:0;scope=node_local;ranks=0,1"));
+        cfg.pp_stage_definitions.push_back(
+            PPStageDefinition::parse("0=cpu_domain:0-27"));
+
+        ASSERT_TRUE(NamedDomainGlobalRunner::shouldUse(cfg));
+        EXPECT_EQ(
+            resolveRunnerModelAuthorityScope(cfg),
+            RunnerModelAuthorityScope::MultiRankSet);
     }
 
 } // anonymous namespace

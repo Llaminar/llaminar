@@ -7,6 +7,7 @@
 
 namespace llaminar2
 {
+    /** @brief Reason benchmark mode must not auto-enable padded prefill graphs. */
     enum class BenchmarkPrefillBucketDisableReason
     {
         None,
@@ -14,17 +15,35 @@ namespace llaminar2
         DynamicMoERebalance
     };
 
+    /**
+     * @brief Resolve whether benchmark mode may enable captured prefill buckets.
+     *
+     * @param uses_collectives True when the production graph contains TP/PP or
+     *        cross-rank collective stages.
+     * @param dynamic_moe_rebalance_active True when mutable placement would
+     *        invalidate a captured prefill graph.
+     * @param segmented_collective_capture_authority True when a typed protocol
+     *        publishes one common physical segment shape to every participant.
+     * @return The first reason bucketing must remain disabled, or @ref
+     *         BenchmarkPrefillBucketDisableReason::None.
+     */
     inline BenchmarkPrefillBucketDisableReason benchmarkPrefillBucketDisableReason(
         bool uses_collectives,
-        bool dynamic_moe_rebalance_active)
+        bool dynamic_moe_rebalance_active,
+        bool segmented_collective_capture_authority = false)
     {
-        if (uses_collectives)
+        if (uses_collectives && !segmented_collective_capture_authority)
             return BenchmarkPrefillBucketDisableReason::Collectives;
         if (dynamic_moe_rebalance_active)
             return BenchmarkPrefillBucketDisableReason::DynamicMoERebalance;
         return BenchmarkPrefillBucketDisableReason::None;
     }
 
+    /**
+     * @brief Return the user-facing explanation for a disable reason.
+     * @param reason Resolved benchmark bucket policy result.
+     * @return Static diagnostic text, or an empty string for @c None.
+     */
     inline const char *benchmarkPrefillBucketDisableMessage(
         BenchmarkPrefillBucketDisableReason reason)
     {
@@ -41,4 +60,5 @@ namespace llaminar2
             return "";
         }
     }
+
 } // namespace llaminar2

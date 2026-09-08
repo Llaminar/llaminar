@@ -2,6 +2,8 @@
 
 #include "loaders/PreparedWeightStore.h"
 
+#include <memory>
+
 using namespace llaminar2;
 
 namespace
@@ -53,6 +55,60 @@ TEST(Test__PreparedWeightStore_ExpertSlab, RegisterSlab_ValidDescriptor)
     EXPECT_EQ(ref.role, WeightRole::MoEExpertGate);
     EXPECT_EQ(ref.device, DeviceId::cpu());
     EXPECT_EQ(store.expertSlabCount(), 1u);
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, RegisterSlab_DuplicateDescriptorReusesExistingSlabAndArrivals)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto desc = makeDescriptor(3, WeightRole::MoEExpertGate, 8, DeviceId::cuda(0));
+    desc.local_expert_start = 128;
+    desc.local_expert_count = 8;
+
+    auto first_ref = store.registerExpertSlab(desc);
+    auto *engine = reinterpret_cast<ITensorGemm *>(0x1000);
+    std::vector<ExpertArrival> arrivals = {
+        makeArrival(5, engine, WeightDerivationKind::RebalancedExpertReplica, DeviceId::cuda(1)),
+    };
+    auto arrived = store.registerArrivedExperts(first_ref, arrivals);
+
+    ASSERT_EQ(arrived.size(), 1u);
+    EXPECT_EQ(store.expertGemmKernel(first_ref, 5), engine);
+
+    auto second_ref = store.registerExpertSlab(desc);
+
+    EXPECT_EQ(second_ref.slab_id, first_ref.slab_id);
+    EXPECT_EQ(second_ref.model_id, first_ref.model_id);
+    EXPECT_EQ(store.expertSlabCount(), 1u);
+    EXPECT_EQ(store.expertGemmKernel(second_ref, 5), engine);
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, RegisterSlab_DifferentLocalRangeReusesGlobalIndexedSlab)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto first_desc = makeDescriptor(3, WeightRole::MoEExpertGate, 256, DeviceId::cuda(0));
+    first_desc.local_expert_start = 0;
+    first_desc.local_expert_count = 128;
+
+    auto second_desc = first_desc;
+    second_desc.local_expert_start = 128;
+    second_desc.local_expert_count = 128;
+
+    auto first_ref = store.registerExpertSlab(first_desc);
+    auto *engine = reinterpret_cast<ITensorGemm *>(0x1000);
+    std::vector<ExpertArrival> arrivals = {
+        makeArrival(143, engine, WeightDerivationKind::RebalancedExpertReplica, DeviceId::cuda(1)),
+    };
+    auto arrived = store.registerArrivedExperts(first_ref, arrivals);
+    ASSERT_EQ(arrived.size(), 1u);
+
+    auto second_ref = store.registerExpertSlab(second_desc);
+
+    EXPECT_EQ(second_ref.slab_id, first_ref.slab_id);
+    EXPECT_EQ(store.expertSlabCount(), 1u);
+    EXPECT_EQ(store.expertGemmKernel(second_ref, 143), engine);
+    auto found = store.findExpertSlab(second_desc);
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->slab_id, first_ref.slab_id);
 }
 
 TEST(Test__PreparedWeightStore_ExpertSlab, RegisterSlab_InvalidNumExperts_Throws)
@@ -123,14 +179,6 @@ TEST(Test__PreparedWeightStore_ExpertSlab, FindExpertSlab_DistinguishesDescripto
     wrong_num_experts.num_experts = 16;
     expect_no_match(wrong_num_experts, "num_experts");
 
-    auto wrong_local_start = desc;
-    wrong_local_start.local_expert_start = 0;
-    expect_no_match(wrong_local_start, "local_expert_start");
-
-    auto wrong_local_count = desc;
-    wrong_local_count.local_expert_count = 8;
-    expect_no_match(wrong_local_count, "local_expert_count");
-
     auto wrong_rows = desc;
     wrong_rows.rows_per_expert = 4096;
     expect_no_match(wrong_rows, "rows_per_expert");
@@ -191,6 +239,29 @@ TEST(Test__PreparedWeightStore_ExpertSlab, RegisterArrivedExperts_PopulatesSlots
     EXPECT_EQ(store.expertGemmKernel(ref, 3), eng3);
     EXPECT_EQ(store.expertGemmKernel(ref, 7), eng7);
     EXPECT_EQ(store.expertGemmKernel(ref, 1), nullptr); // Not populated
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, ExpertGemmKernelLifetime_ReturnsRegisteredOwner)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto ref = store.registerExpertSlab(makeDescriptor(0, WeightRole::MoEExpertGate, 4));
+
+    auto *engine = reinterpret_cast<ITensorGemm *>(0x5000);
+    auto owner = std::shared_ptr<ITensorGemm>(engine, [](ITensorGemm *) {});
+
+    ExpertArrival arrival = makeArrival(2, engine);
+    arrival.engine_lifetime = owner;
+    auto actually_new = store.registerArrivedExperts(ref, {arrival});
+    ASSERT_EQ(actually_new.size(), 1u);
+
+    auto stored_owner = store.expertGemmKernelLifetime(ref, 2);
+    ASSERT_TRUE(stored_owner);
+    EXPECT_EQ(stored_owner.get(), engine);
+    EXPECT_EQ(store.expertGemmKernelLifetime(ref, 1), nullptr);
+
+    store.releaseDepartedExperts(ref, {2});
+    EXPECT_EQ(store.expertGemmKernel(ref, 2), nullptr);
+    EXPECT_EQ(store.expertGemmKernelLifetime(ref, 2), nullptr);
 }
 
 TEST(Test__PreparedWeightStore_ExpertSlab, RegisterArrivedExperts_Idempotent)
@@ -507,6 +578,42 @@ TEST(Test__PreparedWeightStore_ExpertSlab, SourceDevice_Preserved)
     // Expert is queryable
     EXPECT_EQ(store.expertGemmKernel(ref, 2), eng);
     EXPECT_EQ(store.totalPopulatedExperts(), 1u);
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, GpuDirectCompletion_PreservedUntilExpertDeparture)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto ref = store.registerExpertSlab(
+        makeDescriptor(0, WeightRole::MoEExpertGate, 4, DeviceId::rocm(0)));
+
+    auto *eng = reinterpret_cast<ITensorGemm *>(0x1000);
+    auto arrival = makeArrival(
+        2, eng, WeightDerivationKind::RebalancedExpertReplica, DeviceId::rocm(1));
+    GpuDirectTransferCompletion completion;
+    completion.device_id = DeviceId::rocm(0);
+    completion.device_ordinal = 0;
+    completion.ready_event = std::shared_ptr<void>(
+        reinterpret_cast<void *>(0x2000),
+        [](void *) {});
+    completion.source_ready_event = std::shared_ptr<void>(
+        reinterpret_cast<void *>(0x3000),
+        [](void *) {});
+    completion.transfer_stream = std::shared_ptr<void>(
+        reinterpret_cast<void *>(0x4000),
+        [](void *) {});
+    arrival.gpu_direct_completion = completion;
+
+    auto actually_new = store.registerArrivedExperts(ref, {arrival});
+    ASSERT_EQ(actually_new.size(), 1u);
+
+    auto stored = store.expertGpuDirectCompletion(ref, 2);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->device_id, DeviceId::rocm(0));
+    EXPECT_EQ(stored->device_ordinal, 0);
+    EXPECT_EQ(stored->ready_event.get(), completion.ready_event.get());
+
+    store.releaseDepartedExperts(ref, {2});
+    EXPECT_FALSE(store.expertGpuDirectCompletion(ref, 2).has_value());
 }
 
 // ---------------------------------------------------------------------------

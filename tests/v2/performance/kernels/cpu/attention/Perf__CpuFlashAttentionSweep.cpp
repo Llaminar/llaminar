@@ -9,7 +9,7 @@
  *   - Memory bandwidth (GB/s) — bytes touched / time
  *   - Roofline efficiency (%) — vs calibrated DRAM peak
  *   - GFLOP/s throughput
- *   - Per-phase breakdown (QK vs V) when LLAMINAR_PROFILING=1
+ *   - Per-phase breakdown (QK vs V) when LLAMINAR_PROFILE_KERNELS=1
  *
  * Model configurations: Qwen 2.5 family (0.5B, 1.5B, 3B, 7B, 14B, 32B).
  *

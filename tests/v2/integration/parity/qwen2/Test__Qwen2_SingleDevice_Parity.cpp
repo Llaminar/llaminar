@@ -1,453 +1,296 @@
 /**
  * @file Test__Qwen2_SingleDevice_Parity.cpp
- * @brief Single-device Qwen2 parity tests (CPU, CUDA, ROCm)
+ * @brief Canonically generated single-device Qwen2 real-weight parity matrix.
  *
- * Tests that single-device inference produces results matching
- * PyTorch reference outputs. No parallelism involved.
- *
- * Configurations:
- *   - CPU: Full-precision baseline
- *   - CUDA: Single NVIDIA GPU
- *   - ROCm: Single AMD GPU
- *
- * @author David Sanftenberg
- * @date February 2026
+ * Model artifacts, physical topology, activation/KV precision, and numerical
+ * contracts are declared as typed data. The shared model-parity generator
+ * expands those declarations and the ordinary production fixture retains every
+ * prefill/decode checkpoint comparison and CSV artifact.
  */
+
+#include "../ModelParityDefinition.h"
+#include "Qwen2ParityTestBase.h"
+
+#include "backends/GPUDeviceContextPool.h"
+#include "collective/BackendRouter.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
-#include "Qwen2ParityTestBase.h"
-#include "collective/BackendRouter.h"
-#include "backends/GPUDeviceContextPool.h"
+
+#include <iostream>
+#include <iterator>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen2;
 
-// =============================================================================
-// Test Configuration Definitions
-// =============================================================================
+namespace
+{
+    constexpr const char *kQwen2Prompt =
+        "The quick brown fox jumps over the lazy dog";
+    const std::vector<int> kQwen2PromptTokens = {
+        785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562,
+    };
 
-static const std::vector<TestConfig> kSingleDeviceConfigs = {
+    /** @return Shared Qwen2 numerical contract with explicit quality limits. */
+    BackendThresholds qwen2Thresholds(
+        float kl_threshold,
+        float min_top1_accuracy,
+        float min_top5_accuracy,
+        int pytorch_top1_in_topk = 3)
     {
-        .name = "CPU_KV_FP16",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f, // Q4_0 quantized GEMM diverges from FP32 reference equally on CPU and GPU
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.005f,
-            .min_top1_accuracy = 90.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "CPU_KV_Q8_1",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f, // Q4_0 quantized GEMM diverges from FP32 reference equally on CPU and GPU
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.005f,
-            .min_top1_accuracy = 90.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    {
-        .name = "CPU_KV_Q16_1",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f, // Q4_0 quantized GEMM diverges from FP32 reference equally on CPU and GPU
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.006f, // Relaxed: AVX2 fallback path introduces minor numeric drift in Q16_1 attention
-            .min_top1_accuracy = 90.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q16_1,
-    },
-    {
-        .name = "CUDA_KV_FP16",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
+        return BackendThresholds{
             .cosine_threshold = 0.96f,
             .decode_cosine_threshold = 0.95f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.009f, // CUDA non-determinism causes KL to fluctuate 0.002-0.008 between runs
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 80.0f, // CUDA non-determinism can shift one token out of top-5 (4/5 = 80%)
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
+            .kl_threshold = kl_threshold,
+            .min_top1_accuracy = min_top1_accuracy,
+            .min_top5_accuracy = min_top5_accuracy,
+            .pytorch_top1_in_topk = pytorch_top1_in_topk,
+        };
+    }
+
+    /** @return Authenticated standard-prompt model identity. */
+    ModelParityModelDefinition qwen2Model(
+        std::string test_id,
+        std::string model_path,
+        std::string reference_directory)
     {
-        .name = "CUDA_KV_Q8_1",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.008f, // CUDA non-determinism causes KL to fluctuate 0.002-0.006 between runs
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-            .pytorch_top1_in_topk = 5, // Q8_1 KV quantization pushes ref token past top-3 (both CUDA+ROCm)
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
+        return ModelParityModelDefinition{
+            .test_id = std::move(test_id),
+            .model_path = std::move(model_path),
+            .reference_directory = std::move(reference_directory),
+            .prompt = kQwen2Prompt,
+            .token_ids = kQwen2PromptTokens,
+            .decode_steps = 5,
+            .max_seq_len = 4096,
+            .attention_heads = 14,
+            .kv_heads = 2,
+        };
+    }
+
+    /** @return Exact one-participant topology for one backend. */
+    ModelParityTopologyDefinition singleDeviceTopology(
+        std::string test_id,
+        GlobalDeviceAddress address)
     {
-        .name = "ROCm_KV_FP16",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.008f, // ROCm gfx906 LM_HEAD KL is ~0.0069 after v3 snapshot regen while top-1/top-5 stay exact
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
+        return ModelParityTopologyDefinition{
+            .test_id = std::move(test_id),
+            .kind = ModelParityTopologyKind::SingleDevice,
+            .participants = {
+                ModelParityParticipant{
+                    .address = std::move(address),
+                    .world_rank = 0,
+                },
+            },
+            .collective = Collective::None,
+            .mpi_ranks = 1,
+        };
+    }
+
+    /** @return One model/topology definition with a generated KV axis. */
+    ModelParityDefinition singleDeviceDefinition(
+        ModelParityModelDefinition model,
+        ModelParityTopologyDefinition topology,
+        BackendThresholds thresholds,
+        std::vector<KVCachePrecision> kv_precisions,
+        std::vector<ModelParityPrecisionThresholdOverride> overrides = {})
     {
-        .name = "ROCm_KV_FP32",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.005f,
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP32,
-    },
+        ModelParityDefinition definition;
+        definition.model = std::move(model);
+        definition.topology = std::move(topology);
+        definition.thresholds = std::move(thresholds);
+        definition.precisions.activation = {ActivationPrecision::FP32};
+        definition.precisions.kv_cache = std::move(kv_precisions);
+        definition.precisions.threshold_overrides = std::move(overrides);
+        return definition;
+    }
+
+    /** @return Exact typed declarations whose expansion replaces 18 records. */
+    std::vector<ModelParityDefinition> qwen2SingleDeviceDefinitions()
     {
-        .name = "ROCm_KV_Q8_1",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.005f,
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-            .pytorch_top1_in_topk = 5, // Q8_1 KV quantization pushes ref token past top-3 (both CUDA+ROCm)
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    // =========================================================================
-    // TurboQuant KV cache configs — exercises the TQ (split TQ8-K/TQ4-V) path.
-    // These stay under the same end-to-end parity harness as the other KV
-    // precisions because the acceptance criterion is real inference quality.
-    // Thresholds match the corresponding Q8_1 configs.
-    // =========================================================================
-    {
-        .name = "CPU_KV_TQ",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.005f,
-            .min_top1_accuracy = 90.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ,
-    },
-    // =========================================================================
-    // Q8_0 model configs — exercises the native-VNNI code path (codebook 18)
-    // with per-block-of-32 FP16 weight scales preserved.
-    // (Q4_0 above also exercises the native-VNNI path, codebook 0)
-    // =========================================================================
-    {
-        .name = "CPU_Q8_0_KV_FP16",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f, // Q8_0 native-VNNI integer GEMM diverges more from FP32 reference
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "CPU_Q8_0_KV_Q8_1",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f, // Q8_0 native-VNNI integer GEMM diverges more from FP32 reference
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-            .pytorch_top1_in_topk = 5,
-        },
-        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    {
-        .name = "CUDA_Q8_0_KV_FP16",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f, // Q8_0 native-VNNI integer GEMM diverges more from FP32 reference
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "CUDA_Q8_0_ChatCalc_KV_FP16",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 80.0f, // Short chat prompt: one shifted token out of 5 still preserves top-1/KL.
-        },
-        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0_chat_calc",
-        .prompt = R"(<|im_start|>system
+        const auto q4_model = qwen2Model(
+            "Qwen2_Q4_0",
+            "models/qwen2.5-0.5b-instruct-q4_0.gguf",
+            "pytorch_qwen2_5_0_5b_instruct_q4_0_snapshots");
+        const auto q8_model = qwen2Model(
+            "Qwen2_Q8_0",
+            "models/qwen2.5-0.5b-instruct-q8_0.gguf",
+            "pytorch_qwen2_snapshots_q8_0");
+
+        const auto cpu = singleDeviceTopology(
+            "CPU0", GlobalDeviceAddress::cpu());
+        const auto cuda = singleDeviceTopology(
+            "CUDA0", GlobalDeviceAddress::cuda(0));
+        const auto rocm = singleDeviceTopology(
+            "ROCm0", GlobalDeviceAddress::rocm(0));
+
+        const auto cpu_q4_default = qwen2Thresholds(0.005f, 90.0f, 95.0f);
+        const auto cpu_q4_q16 = qwen2Thresholds(0.006f, 90.0f, 95.0f);
+        const auto cuda_q4_default = qwen2Thresholds(0.009f, 80.0f, 80.0f);
+        const auto cuda_q4_q8 = qwen2Thresholds(0.008f, 80.0f, 95.0f, 5);
+        const auto cuda_q4_tq = qwen2Thresholds(0.008f, 80.0f, 80.0f, 5);
+        const auto rocm_q4_default = qwen2Thresholds(0.005f, 80.0f, 95.0f);
+        const auto rocm_q4_fp16 = qwen2Thresholds(0.008f, 80.0f, 95.0f);
+        const auto rocm_q4_quantized =
+            qwen2Thresholds(0.005f, 80.0f, 95.0f, 5);
+        const auto q8_default = qwen2Thresholds(0.01f, 80.0f, 95.0f);
+        const auto q8_quantized = qwen2Thresholds(0.01f, 80.0f, 95.0f, 5);
+
+        std::vector<ModelParityDefinition> definitions;
+        definitions.push_back(singleDeviceDefinition(
+            q4_model,
+            cpu,
+            cpu_q4_default,
+            {
+                KVCachePrecision::FP16,
+                KVCachePrecision::Q8_1,
+                KVCachePrecision::Q16_1,
+                KVCachePrecision::TQ,
+            },
+            {
+                {
+                    .activation = ActivationPrecision::FP32,
+                    .kv_cache = KVCachePrecision::Q16_1,
+                    .thresholds = cpu_q4_q16,
+                },
+            }));
+        definitions.push_back(singleDeviceDefinition(
+            q4_model,
+            cuda,
+            cuda_q4_default,
+            {
+                KVCachePrecision::FP16,
+                KVCachePrecision::Q8_1,
+                KVCachePrecision::TQ,
+            },
+            {
+                {
+                    .activation = ActivationPrecision::FP32,
+                    .kv_cache = KVCachePrecision::Q8_1,
+                    .thresholds = cuda_q4_q8,
+                },
+                {
+                    .activation = ActivationPrecision::FP32,
+                    .kv_cache = KVCachePrecision::TQ,
+                    .thresholds = cuda_q4_tq,
+                },
+            }));
+        definitions.push_back(singleDeviceDefinition(
+            q4_model,
+            rocm,
+            rocm_q4_default,
+            {
+                KVCachePrecision::FP16,
+                KVCachePrecision::FP32,
+                KVCachePrecision::Q8_1,
+                KVCachePrecision::TQ,
+            },
+            {
+                {
+                    .activation = ActivationPrecision::FP32,
+                    .kv_cache = KVCachePrecision::FP16,
+                    .thresholds = rocm_q4_fp16,
+                },
+                {
+                    .activation = ActivationPrecision::FP32,
+                    .kv_cache = KVCachePrecision::Q8_1,
+                    .thresholds = rocm_q4_quantized,
+                },
+                {
+                    .activation = ActivationPrecision::FP32,
+                    .kv_cache = KVCachePrecision::TQ,
+                    .thresholds = rocm_q4_quantized,
+                },
+            }));
+
+        const auto q8_definition =
+            [&](const ModelParityTopologyDefinition &topology)
+        {
+            return singleDeviceDefinition(
+                q8_model,
+                topology,
+                q8_default,
+                {KVCachePrecision::FP16, KVCachePrecision::Q8_1},
+                {
+                    {
+                        .activation = ActivationPrecision::FP32,
+                        .kv_cache = KVCachePrecision::Q8_1,
+                        .thresholds = q8_quantized,
+                    },
+                });
+        };
+        definitions.push_back(q8_definition(cpu));
+        definitions.push_back(q8_definition(cuda));
+        definitions.push_back(q8_definition(rocm));
+
+        auto chat_model = qwen2Model(
+            "Qwen2_Q8_0_ChatCalc",
+            "models/qwen2.5-0.5b-instruct-q8_0.gguf",
+            "pytorch_qwen2_snapshots_q8_0_chat_calc");
+        chat_model.prompt = R"(<|im_start|>system
 You are a calculator. Reply with only the numeric answer, no explanation.<|im_end|>
 <|im_start|>user
 What is 2+2?<|im_end|>
 <|im_start|>assistant
-)",
-        .token_ids = {151644, 8948, 198, 2610, 525, 264, 29952, 13, 17841, 448, 1172, 279, 24064, 4226, 11, 902, 16148, 13, 151645, 198, 151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645, 198, 151644, 77091, 198},
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-        .decode_steps = 2,
-    },
+)";
+        chat_model.token_ids = {
+            151644, 8948, 198, 2610, 525, 264, 29952, 13, 17841, 448,
+            1172, 279, 24064, 4226, 11, 902, 16148, 13, 151645, 198,
+            151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645,
+            198, 151644, 77091, 198,
+        };
+        chat_model.decode_steps = 2;
+        definitions.push_back(singleDeviceDefinition(
+            std::move(chat_model),
+            cuda,
+            qwen2Thresholds(0.01f, 80.0f, 80.0f),
+            {KVCachePrecision::FP16}));
+        return definitions;
+    }
+
+    /** @return One ordered generated case vector for GoogleTest discovery. */
+    const std::vector<ModelParityCase> &qwen2SingleDeviceCases()
     {
-        .name = "CUDA_Q8_0_KV_Q8_1",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f, // Q8_0 native-VNNI integer GEMM diverges more from FP32 reference
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-            .pytorch_top1_in_topk = 5,
-        },
-        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    {
-        .name = "ROCm_Q8_0_KV_FP16",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f, // Q8_0 native-VNNI integer GEMM diverges more from FP32 reference
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "ROCm_Q8_0_KV_Q8_1",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f, // Q8_0 native-VNNI integer GEMM diverges more from FP32 reference
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-            .pytorch_top1_in_topk = 5, // Q8_1 KV quantization pushes ref token past top-3
-        },
-        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    // =========================================================================
-    // CUDA TurboQuant KV cache configs — GPU TQ8-K/TQ4-V split parity
-    // TQ adds more quantization noise than Q8_1 or FP16, so thresholds
-    // must be at least as loose as CUDA_KV_FP16 (which already uses 80%).
-    // =========================================================================
-    {
-        .name = "CUDA_KV_TQ",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.008f, // CUDA non-determinism causes KL to fluctuate 0.002-0.006 between runs
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 80.0f, // TQ4 V quantization + CUDA non-determinism can shift one token out of top-5 (4/5 = 80%)
-            .pytorch_top1_in_topk = 5,  // Q8_1 KV quantization pushes ref token past top-3 (both CUDA+ROCm)
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ,
-    },
-    // =========================================================================
-    // ROCm TurboQuant KV cache configs — Thresholds match ROCm_KV_Q8_1
-    // =========================================================================
-    {
-        .name = "ROCm_KV_TQ",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.005f,
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
-            .pytorch_top1_in_topk = 5, // Q8_1 KV quantization pushes ref token past top-3 (both CUDA+ROCm)
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ,
-    },
+        static const auto cases = []
+        {
+            std::vector<ModelParityCase> expanded;
+            for (const auto &definition : qwen2SingleDeviceDefinitions())
+            {
+                auto definition_cases =
+                    expandModelParityDefinition(definition);
+                expanded.insert(
+                    expanded.end(),
+                    std::make_move_iterator(definition_cases.begin()),
+                    std::make_move_iterator(definition_cases.end()));
+            }
+            return expanded;
+        }();
+        return cases;
+    }
+} // namespace
+
+class Qwen2SingleDeviceParityTest
+    : public ConfigDrivenParityTest<Qwen2SingleDeviceParityTest>,
+      public ModelParityCaseParameter
+{
 };
 
-// =============================================================================
-// Parameterized Test Fixture
-// =============================================================================
-
-class Qwen2SingleDeviceParityTest : public ConfigDrivenParityTest<Qwen2SingleDeviceParityTest>,
-                                    public ::testing::WithParamInterface<TestConfig>
+TEST_P(Qwen2SingleDeviceParityTest, ProductionParity)
 {
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
-
-// =============================================================================
-// Test Cases
-// =============================================================================
-
-TEST_P(Qwen2SingleDeviceParityTest, PrefillParity)
-{
-    auto summary = runSingleDevicePrefillParity();
-    assertParity(summary);
+    runProductionParityCampaign();
 }
-
-TEST_P(Qwen2SingleDeviceParityTest, DecodeParity)
-{
-    auto summary = runSingleDeviceDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen2SingleDeviceParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
-}
-
-// =============================================================================
-// Test Instantiation
-// =============================================================================
 
 INSTANTIATE_TEST_SUITE_P(
     Qwen2,
     Qwen2SingleDeviceParityTest,
-    ::testing::ValuesIn(kSingleDeviceConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
-    {
-        return info.param.name;
-    });
-
-// =============================================================================
-// Custom Main with MPI Initialization
-// =============================================================================
+    ::testing::ValuesIn(qwen2SingleDeviceCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
+    { return info.param.testName(); });
 
 int main(int argc, char **argv)
 {
@@ -456,19 +299,10 @@ int main(int argc, char **argv)
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
 
-    // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
-    // NCCLCoordinator cleanup happens while CUDA runtime is still active.
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();
 
     MPI_Finalize();
-
-    // Skip C++ static destructors via _exit() to avoid CUDA/ROCm atexit
-    // handler races. Meyers singletons (GPUDeviceWorkerPool, CUDABackend,
-    // CUDAConcurrentPrefillPool, etc.) may call CUDA/HIP APIs after the
-    // runtime's own atexit handler has torn down the driver context,
-    // causing intermittent SIGSEGV that mpirun reports as non-zero exit.
-    // Same pattern as Main.cpp.
     std::cout.flush();
     std::cerr.flush();
     _exit(result);

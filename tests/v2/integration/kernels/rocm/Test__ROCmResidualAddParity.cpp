@@ -18,6 +18,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
@@ -119,9 +120,23 @@ namespace
         void SetUp() override
         {
             SKIP_IF_NO_ROCM();
+            ASSERT_EQ(
+                hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+                hipSuccess);
+        }
+
+        void TearDown() override
+        {
+            if (stream_)
+            {
+                EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+                stream_ = nullptr;
+            }
         }
 
 #ifdef HAVE_ROCM
+        hipStream_t stream_ = nullptr;
+
         // Helper to allocate GPU memory and copy data
         float *allocGpuFloat(size_t count)
         {
@@ -519,20 +534,21 @@ namespace
 
         // Upload tensors to GPU using ensureOnDevice (as the pipeline does)
         DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+        ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream_));
 
         // ROCm kernel using apply_tensor() API (what the pipeline actually uses)
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
+        rocm_kernel.setGPUStream(stream_);
         ASSERT_TRUE(rocm_kernel.apply_tensor(
             input.get(), residual.get(), rocm_output.get(),
             num_elements, nullptr, 0));
 
-        (void)hipDeviceSynchronize();
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
 
         // Mark output dirty and sync back to host
-        rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(rocm_output, stream_);
         const float *result = rocm_output->data(); // This syncs GPU→host
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
@@ -564,17 +580,18 @@ namespace
             num_elements, nullptr, -1));
 
         DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+        ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream_));
 
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
+        rocm_kernel.setGPUStream(stream_);
         ASSERT_TRUE(rocm_kernel.apply_tensor(
             input.get(), residual.get(), rocm_output.get(),
             num_elements, nullptr, 0));
 
-        (void)hipDeviceSynchronize();
-        rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+        TransferEngine::publishCurrentDeviceWrite(rocm_output, stream_);
         const float *result = rocm_output->data();
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
@@ -607,17 +624,18 @@ namespace
         }
 
         DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
+        ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(rocm_device, stream_));
 
         // Mirror the pipeline's in-place residual pattern: output aliases residual/hidden.
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
+        rocm_kernel.setGPUStream(stream_);
         ASSERT_TRUE(rocm_kernel.apply_tensor(
             input.get(), residual.get(), residual.get(),
             num_elements, nullptr, 0));
 
-        (void)hipDeviceSynchronize();
-        residual->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+        TransferEngine::publishCurrentDeviceWrite(residual, stream_);
         const float *result = residual->data();
         ASSERT_NE(result, nullptr);
 

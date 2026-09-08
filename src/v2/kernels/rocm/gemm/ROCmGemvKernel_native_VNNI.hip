@@ -27,6 +27,12 @@
  * native-VNNI keeps per-block FP16 scales separate and decodes nibbles
  * directly to INT8.
  *
+ * Captured verifier launches separate physical scratch capacity from the
+ * device controller's live row count. Fused bundles use bounded row workers,
+ * keep the serial-M1 reduction tree, and specialize their publication target
+ * before capture. Neither inactive capacity nor an optional bias may extend
+ * decoder live ranges into register spills.
+ *
  * Split from ROCmGemvKernel.hip.
  *
  * @see ROCmGemvKernel_INT8_VNNI.hip for INT8 VNNI kernels
@@ -34,16 +40,31 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <string>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "../../../utils/PrefillGraphBucketDefaults.h"
+#include "execution/moe/DeviceMoEOverlayEpochABI.h"
+#include "execution/moe/DeviceMoERuntimeABI.h"
+#include "kernels/common/NativeVNNIDispatchCache.h"
+#include "kernels/common/DeviceRowWorkGrid.h"
+#include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
+#include "tensors/NativeVnniFormatInfo.h"
+#include "ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 
 #include <atomic>
 
@@ -53,7 +74,16 @@
 // ============================================================================
 static std::atomic<int> g_native_vnni_kb_override{-1};
 static std::atomic<int> g_native_vnni_target_waves_override{-1};
-static std::atomic<int> g_native_vnni_decode_equivalent_m1_config{0};
+/*
+ * Decode-equivalent dispatch is a property of one host worker's verifier
+ * transaction. LocalTP drives one worker per GPU in the same process, so a
+ * process-global mode bit lets either worker clear the other worker's policy
+ * while it is still lowering a grouped launch. Keep this state thread-local,
+ * matching CUDA, and pass resolved serial-M1 launch geometry explicitly from
+ * ROCmQuantisedGemmKernel whenever a grouped projection is emitted.
+ */
+static thread_local int g_native_vnni_decode_equivalent_m1_config = 0;
+static thread_local int g_native_vnni_serial_partition_n = 0;
 
 struct NativeVNNIDecodeGeneratedRuntimeConfig
 {
@@ -62,46 +92,33 @@ struct NativeVNNIDecodeGeneratedRuntimeConfig
     int target_waves_per_cu = -1;
 };
 
-static int chooseNativeVNNIDivisibleKB(int blocks_per_row, int kb_raw, int kb_max);
-
-static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIQ80DirectRuntimeConfig(
-    uint8_t codebook_id,
-    int n,
-    int k)
+/**
+ * @brief Select the historical policy for a self-describing execution format.
+ *
+ * Codebook 23 is a migration-only physical representation and therefore has
+ * no independent tuning corpus. Legacy one-ID callers retain the prior
+ * codebook-19 policy. Production callers carrying source provenance use the
+ * explicit two-ID entrypoints below and never consult this default.
+ */
+static constexpr uint8_t defaultNativeVNNIArithmeticPolicyCodebook(
+    uint8_t execution_codebook_id)
 {
-    /*
-     * Q8_0 is not a packed NativeVNNI payload format, so it cannot appear in
-     * the CSV-trained generated table. The runtime launcher still dispatches a
-     * graph-capturable direct-INT8 path for codebook 19; expose that policy
-     * through the query API so decode-equivalent grouped verifier planning does
-     * not misreport this supported path as an untrained shape.
-     */
-    constexpr uint8_t Q8_0_CODEBOOK = 19;
-    if (codebook_id != Q8_0_CODEBOOK || n <= 0 || k <= 0 || (k % 32) != 0)
-        return NativeVNNIDecodeGeneratedRuntimeConfig{};
-
-    constexpr int NUM_CUS = 60;
-    constexpr int TN = 64;
-    constexpr int MIN_BLOCKS_PER_WAVE = 1;
-    constexpr int KB_CAP = 64;
-    constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
-
-    const int blocks_per_row = k / 32;
-    const int grid_n = (n + TN - 1) / TN;
-    int kb_raw = max(1, ((Q8_0_TARGET_WAVES_PER_CU * NUM_CUS) + grid_n - 1) / grid_n);
-    int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
-    kb_max = min(kb_max, KB_CAP);
-    kb_raw = min(kb_raw, kb_max);
-
-    NativeVNNIDecodeGeneratedRuntimeConfig resolved{};
-    resolved.has_generated = true;
-    resolved.kb = chooseNativeVNNIDivisibleKB(blocks_per_row, kb_raw, kb_max);
-    resolved.target_waves_per_cu = Q8_0_TARGET_WAVES_PER_CU;
-    return resolved;
+    return execution_codebook_id ==
+                   llaminar2::kNativeVnniExpandedInt8MinCodebook
+               ? static_cast<uint8_t>(19)
+               : execution_codebook_id;
 }
 
-static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRuntimeConfig(
-    uint8_t codebook_id,
+/**
+ * @brief Resolve generated launch policy from an exact arithmetic codebook.
+ *
+ * The caller has already separated physical decoding from arithmetic policy.
+ * This function must not canonicalize or infer another codebook: doing so
+ * would make a CPU-cold promotion change its FP32 reduction tree.
+ */
+static NativeVNNIDecodeGeneratedRuntimeConfig
+resolveNativeVNNIDecodeGeneratedRuntimeConfigForPolicy(
+    uint8_t arithmetic_policy_codebook_id,
     int m,
     int n,
     int k)
@@ -120,22 +137,83 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
         return resolved;
 
     const int lookup_m =
-        (g_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed) != 0 &&
-         m > 1 && m <= 4)
+        (g_native_vnni_decode_equivalent_m1_config != 0 &&
+         m > 1)
             ? 1
             : m;
+    const int lookup_n =
+        g_native_vnni_serial_partition_n > 0
+            ? g_native_vnni_serial_partition_n
+            : n;
+
+    /*
+     * Generated policy is immutable for the process lifetime. Preserve each
+     * input as a full-width word so invalid or future geometry cannot alias the
+     * compact exact-overlay ABI. Caching a miss keeps totality checks cheap but
+     * never manufactures a runtime fallback.
+     */
+    using CacheKey = std::array<uint64_t, 4>;
+    using Cache = llaminar2::native_vnni::FixedDispatchCache<
+        CacheKey,
+        NativeVNNIDecodeGeneratedRuntimeConfig,
+        64,
+        llaminar2::native_vnni::DispatchCacheArrayHasher<4>>;
+    static thread_local Cache cache;
+    const CacheKey cache_key = {
+        static_cast<uint64_t>(arithmetic_policy_codebook_id),
+        static_cast<uint64_t>(static_cast<uint32_t>(lookup_m)),
+        static_cast<uint64_t>(static_cast<uint32_t>(lookup_n)),
+        static_cast<uint64_t>(static_cast<uint32_t>(k)),
+    };
+    bool cached_selector_found = false;
+    NativeVNNIDecodeGeneratedRuntimeConfig cached{};
+    if (cache.lookup(cache_key, cached_selector_found, cached))
+        return cached;
 
     llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig generated_cfg{};
     if (!llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(
-            codebook_id, lookup_m, n, k, generated_cfg))
+            arithmetic_policy_codebook_id,
+            lookup_m,
+            lookup_n,
+            k,
+            generated_cfg))
     {
-        return resolveNativeVNNIQ80DirectRuntimeConfig(codebook_id, n, k);
+        cache.insert(cache_key, false, cached);
+        return cached;
     }
 
-    resolved.has_generated = true;
-    resolved.kb = static_cast<int>(generated_cfg.kb);
-    resolved.target_waves_per_cu = static_cast<int>(generated_cfg.target_waves_per_cu);
-    return resolved;
+    /*
+     * Generic ROCm policy candidates encode a requested split count. The
+     * production launch can never create more K partitions than there are
+     * 32-value groups, so it resolves that request as min(requested, K / 32).
+     * Publish the same physical value through the query/cache surface. Leaving
+     * the nominal request here made serial-M1 policy queries disagree with the
+     * launch telemetry for small-K unseen shapes (for example KB20 at K=416,
+     * whose real launch is KB13), even though the kernel itself was correct.
+     */
+    const int requested_kb = static_cast<int>(generated_cfg.kb);
+    const int k_groups = k / 32;
+    cached.has_generated = true;
+    cached.kb = (requested_kb < k_groups) ? requested_kb : k_groups;
+    cached.target_waves_per_cu =
+        static_cast<int>(generated_cfg.target_waves_per_cu);
+    cache.insert(cache_key, true, cached);
+    return cached;
+}
+
+/** @brief Resolve policy for a legacy self-describing execution codebook. */
+static NativeVNNIDecodeGeneratedRuntimeConfig
+resolveNativeVNNIDecodeGeneratedRuntimeConfig(
+    uint8_t execution_codebook_id,
+    int m,
+    int n,
+    int k)
+{
+    return resolveNativeVNNIDecodeGeneratedRuntimeConfigForPolicy(
+        defaultNativeVNNIArithmeticPolicyCodebook(execution_codebook_id),
+        m,
+        n,
+        k);
 }
 
 static void recordNativeVNNISmallMLaunch(
@@ -148,12 +226,12 @@ static void recordNativeVNNISmallMLaunch(
     int target_waves_per_cu,
     bool batched,
     int projections,
-    bool atomic_reduce)
+    int arithmetic_policy_codebook = -1)
 {
-    if (!llaminar2::PerfStatsCollector::isEnabled())
+    if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
         return;
 
-    const char* path = (kb <= 1) ? "direct" : (atomic_reduce ? "atomic_reduce" : "split_reduce");
+    const char* path = (kb <= 1) ? "direct" : "split_reduce";
     llaminar2::PerfStatsCollector::addCounter(
         "kernel",
         "rocm_native_vnni_small_m_launch",
@@ -165,6 +243,11 @@ static void recordNativeVNNISmallMLaunch(
             {"n", std::to_string(n)},
             {"k", std::to_string(k)},
             {"codebook", std::to_string(codebook)},
+            {"arithmetic_policy_codebook",
+             std::to_string(
+                 arithmetic_policy_codebook >= 0
+                     ? arithmetic_policy_codebook
+                     : static_cast<int>(codebook))},
             {"grid_n", std::to_string(grid_n)},
             {"kb", std::to_string(kb)},
             {"path", path},
@@ -187,7 +270,17 @@ extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_wav
 
 extern "C" void rocmGemv_native_vnni_set_decode_equivalent_m1_config(int enabled)
 {
-    g_native_vnni_decode_equivalent_m1_config.store(enabled ? 1 : 0, std::memory_order_relaxed);
+    g_native_vnni_decode_equivalent_m1_config = enabled ? 1 : 0;
+}
+
+extern "C" void rocmGemv_native_vnni_set_serial_partition_n(int n)
+{
+    g_native_vnni_serial_partition_n = n;
+}
+
+extern "C" int rocmGemv_native_vnni_get_serial_partition_n()
+{
+    return g_native_vnni_serial_partition_n;
 }
 
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides()
@@ -197,7 +290,7 @@ extern "C" void rocmGemv_native_vnni_reset_tuning_overrides()
 
 static bool nativeVNNIDecodeEquivalentSmallMMode()
 {
-    return g_native_vnni_decode_equivalent_m1_config.load(std::memory_order_relaxed) != 0;
+    return g_native_vnni_decode_equivalent_m1_config != 0;
 }
 
 /**
@@ -269,13 +362,17 @@ enum NativeVNNIFormat : uint8_t {
     NVNNI_IQ1_S  = 16,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, delta correction
     NVNNI_IQ1_M  = 17,  // IQ1 grid (8 elem/lookup), 11-bit index, signed values {-1,0,+1}, dual-scale + delta
     NVNNI_Q8_0   = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
+    NVNNI_EXPANDED_INT8_MIN =
+        llaminar2::kNativeVnniExpandedInt8MinCodebook,
 };
 
 // Compile-time format properties
 template <NativeVNNIFormat FMT>
 struct NVNNITraits {
     // Asymmetric formats have a min correction term: f_acc += sum_a * block_m
-    static constexpr bool is_asymmetric = (FMT == NVNNI_Q4_1 || FMT == NVNNI_Q5_1 || FMT == NVNNI_IQ1_S);
+    static constexpr bool is_asymmetric =
+        FMT == NVNNI_Q4_1 || FMT == NVNNI_Q5_1 ||
+        FMT == NVNNI_IQ1_S || FMT == NVNNI_EXPANDED_INT8_MIN;
     // --- IQ grid format traits ---
     static constexpr bool is_iq3_grid = (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ3_XXS);
     static constexpr bool is_iq2_grid = (FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS || FMT == NVNNI_IQ2_XXS);
@@ -303,7 +400,8 @@ struct NVNNITraits {
     static constexpr bool is_6bit       = (FMT == NVNNI_Q6_K);
     static constexpr bool is_3bit       = (FMT == NVNNI_Q3_K);
     static constexpr bool is_2bit       = (FMT == NVNNI_Q2_K);
-    static constexpr bool is_8bit       = (FMT == NVNNI_Q8_0);
+    static constexpr bool is_8bit =
+        FMT == NVNNI_Q8_0 || FMT == NVNNI_EXPANDED_INT8_MIN;
     static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL);
     static constexpr int  payload_bytes =
         is_8bit ? 32 :                                // Q8_0: 32 raw INT8 values
@@ -323,6 +421,84 @@ struct NVNNITraits {
     static constexpr int grid_lds_bytes = grid_entries * grid_entry_bytes;
 };
 
+/**
+ * @brief Dilate four packed Q6 two-bit fields into four byte-local high nibbles.
+ *
+ * A Q6 high-bit byte stores four consecutive two-bit fields in bits
+ * `[1:0]`, `[3:2]`, `[5:4]`, and `[7:6]`.  Native-VNNI dot operands need
+ * those fields in bits `[5:4]` of four independent bytes.  The first
+ * shuffle step separates the two nibbles by twelve bits; the second separates
+ * each nibble's two-bit fields by six more bits.  The final shift places each
+ * field in the byte-local high-nibble position:
+ *
+ * @code
+ * abcdefgh -> 00ab0000 00cd0000 00ef0000 00gh0000
+ * @endcode
+ *
+ * This identity is exhaustive over the 256 possible input bytes and replaces
+ * four independent mask/shift deposits.  It changes only the integer decode;
+ * block order, SDOT4 order, scale conversion, and FP32 accumulation remain
+ * identical to serial decode.
+ *
+ * @param packed_fields The Q6 high-bit byte, zero-extended to 32 bits.
+ * @return Four expanded fields in bits `[5:4]` of the result's four bytes.
+ */
+static constexpr uint32_t rocm_native_vnni_expand_q6_high_fields_reference(
+    uint32_t packed_fields)
+{
+    return ((packed_fields & 0x03u) << 4) |
+           ((packed_fields & 0x0Cu) << 10) |
+           ((packed_fields & 0x30u) << 16) |
+           ((packed_fields & 0xC0u) << 22);
+}
+
+/**
+ * @brief Evaluate the low-instruction-count Q6 high-field dilation identity.
+ * @param packed_fields The Q6 high-bit byte, zero-extended to 32 bits.
+ * @return Four expanded fields in bits `[5:4]` of the result's four bytes.
+ */
+static constexpr uint32_t rocm_native_vnni_expand_q6_high_fields_dilated(
+    uint32_t packed_fields)
+{
+    const uint32_t separated_nibbles =
+        (packed_fields | (packed_fields << 12)) & 0x000F000Fu;
+    const uint32_t separated_pairs =
+        (separated_nibbles | (separated_nibbles << 6)) & 0x03030303u;
+    return separated_pairs << 4;
+}
+
+/**
+ * @brief Prove the optimized Q6 expansion for every possible packed byte.
+ * @return `true` only when all 256 values equal the direct reference mapping.
+ */
+static constexpr bool rocm_native_vnni_q6_high_field_dilation_is_exhaustive()
+{
+    for (uint32_t packed = 0; packed <= 0xFFu; ++packed)
+    {
+        if (rocm_native_vnni_expand_q6_high_fields_dilated(packed) !=
+            rocm_native_vnni_expand_q6_high_fields_reference(packed))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static_assert(
+    rocm_native_vnni_q6_high_field_dilation_is_exhaustive(),
+    "ROCm Q6 high-field dilation must equal the direct mapping for every byte");
+
+/**
+ * @brief Device wrapper for the compile-time-proven Q6 dilation identity.
+ * @param packed_fields The Q6 high-bit byte, zero-extended to 32 bits.
+ * @return Four expanded fields in bits `[5:4]` of the result's four bytes.
+ */
+__device__ __forceinline__ uint32_t rocm_native_vnni_expand_q6_high_fields(
+    uint32_t packed_fields)
+{
+    return rocm_native_vnni_expand_q6_high_fields_dilated(packed_fields);
+}
+
 template <NativeVNNIFormat FMT>
 struct NVNNIGroupedMoESupported {
     static constexpr bool value =
@@ -331,124 +507,56 @@ struct NVNNIGroupedMoESupported {
         FMT == NVNNI_Q3_K || FMT == NVNNI_Q2_K || FMT == NVNNI_IQ3_S ||
         FMT == NVNNI_IQ3_XXS || FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS ||
         FMT == NVNNI_IQ2_XXS || FMT == NVNNI_IQ1_S || FMT == NVNNI_IQ1_M ||
-        FMT == NVNNI_Q8_0;
+        FMT == NVNNI_Q8_0 || FMT == NVNNI_EXPANDED_INT8_MIN;
 };
 
-static int chooseNativeVNNIDivisibleKB(int blocks_per_row, int kb_raw, int kb_max)
+/**
+ * @brief Resolve serial-M1 policy from an exact source arithmetic codebook.
+ *
+ * Generated dispatch remains the economy authority for target wave count and
+ * for codebooks without a heterogeneous arithmetic contract.  A certified
+ * movable policy instead replaces only the K-partition count: launch tuning
+ * must not change the FP32 expression tree when an expert moves between CUDA
+ * and ROCm.
+ */
+static NativeVNNIDecodeGeneratedRuntimeConfig
+resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+    uint8_t arithmetic_policy_codebook_id,
+    int N,
+    int K)
 {
-    int kb = kb_raw;
-    if (blocks_per_row % kb_raw != 0)
-    {
-        for (int d = 1; d < kb_raw; ++d)
-        {
-            if (kb_raw - d >= 1 && blocks_per_row % (kb_raw - d) == 0)
-            {
-                kb = kb_raw - d;
-                break;
-            }
-            if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0)
-            {
-                kb = kb_raw + d;
-                break;
-            }
-        }
-    }
-    return max(1, kb);
-}
+    NativeVNNIDecodeGeneratedRuntimeConfig resolved =
+        resolveNativeVNNIDecodeGeneratedRuntimeConfigForPolicy(
+            arithmetic_policy_codebook_id, 1, N, K);
+    if (!resolved.has_generated)
+        return resolved;
 
-static bool nativeVNNIIsIQGridFormat(uint8_t codebook_id)
-{
-    return codebook_id >= static_cast<uint8_t>(NVNNI_IQ3_S) &&
-           codebook_id <= static_cast<uint8_t>(NVNNI_IQ1_M);
+    if (llaminar2::MoEProjectionNumericalContract::
+            ownsOrderedKPartitionTree(arithmetic_policy_codebook_id))
+    {
+        resolved.kb = llaminar2::MoEProjectionNumericalContract::
+            orderedKPartitionsForWidth(K);
+    }
+    return resolved;
 }
 
 /**
- * @brief Resolve the split-K policy used by the normal serial M=1 decode path.
+ * @brief Resolve the split-K policy used by normal serial M=1 decode.
  *
- * MTP verifier publication compares grouped M=2..4 rows against committed
+ * MTP verifier publication compares grouped runtime-M rows against committed
  * serial decode state. The grouped kernels may execute several rows at once,
- * but they must use the same split-K count as serial M=1 so the FP32 reduction
- * order is bitwise-identical. This helper mirrors `rocmGemv_native_vnni_fp32`
- * for policy only; it performs no tensor work and allocates nothing.
+ * but they must consume this same typed policy so their FP32 reduction order is
+ * bitwise-identical. Returning an empty result on a generated-policy miss
+ * forces the caller to fail rather than reconstruct an obsolete heuristic.
  */
-static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNISerialM1RuntimeConfig(
+static NativeVNNIDecodeGeneratedRuntimeConfig
+resolveNativeVNNISerialM1RuntimeConfig(
     uint8_t codebook_id,
     int N,
     int K)
 {
-    NativeVNNIDecodeGeneratedRuntimeConfig generated =
-        resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, 1, N, K);
-    if (generated.has_generated)
-        return generated;
-
-    NativeVNNIDecodeGeneratedRuntimeConfig resolved{};
-    if (N <= 0 || K <= 0 || (K % 32) != 0)
-        return resolved;
-
-    constexpr int NUM_CUS = 60;
-    constexpr int MIN_BLOCKS_PER_WAVE = 1;
-    constexpr int KB_CAP = 64;
-    const int blocks_per_row = K / 32;
-    const auto& rocm_env = llaminar2::debugEnv().rocm;
-
-    if (nativeVNNIIsIQGridFormat(codebook_id))
-    {
-        constexpr int IQ_LDS_TN = 256;
-        constexpr int IQ_LDS_MIN_N_BLOCKS = NUM_CUS / 2;
-        constexpr float IQ_K_HEAVY_RATIO = 4.0f;
-        constexpr int IQ_K_HEAVY_MIN_GRID_N = NUM_CUS / 10;
-        const int grid_n_lds = (N + IQ_LDS_TN - 1) / IQ_LDS_TN;
-        const bool n_saturated = grid_n_lds >= IQ_LDS_MIN_N_BLOCKS;
-        const bool is_k_heavy = (K >= IQ_K_HEAVY_RATIO * N) &&
-                                (grid_n_lds >= IQ_K_HEAVY_MIN_GRID_N);
-        if (n_saturated || is_k_heavy)
-        {
-            int max_waves_per_cu;
-            if (codebook_id >= static_cast<uint8_t>(NVNNI_IQ1_S))
-                max_waves_per_cu = 16;
-            else if (codebook_id >= static_cast<uint8_t>(NVNNI_IQ2_S) &&
-                     codebook_id <= static_cast<uint8_t>(NVNNI_IQ2_XXS))
-                max_waves_per_cu = 16;
-            else
-                max_waves_per_cu = 40;
-
-            constexpr int IQ_THREADS = 256;
-            constexpr int WAVES_PER_BLOCK = IQ_THREADS / 64;
-            const int target_total_blocks = (max_waves_per_cu * NUM_CUS) / WAVES_PER_BLOCK;
-            int kb_raw = max(1, (target_total_blocks + grid_n_lds - 1) / grid_n_lds);
-            constexpr int IQ_MIN_K_BLOCKS_PER_PART = 8;
-            int kb_max = max(1, blocks_per_row / IQ_MIN_K_BLOCKS_PER_PART);
-            kb_max = min(kb_max, KB_CAP);
-            kb_raw = min(kb_raw, kb_max);
-
-            resolved.has_generated = true;
-            resolved.kb = chooseNativeVNNIDivisibleKB(blocks_per_row, kb_raw, kb_max);
-            resolved.target_waves_per_cu = max_waves_per_cu;
-            return resolved;
-        }
-    }
-
-    constexpr int TN = 64;
-    constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
-    constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
-    const int grid_n = (N + TN - 1) / TN;
-    const int target_waves_per_cu =
-        (codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
-            ? Q8_0_TARGET_WAVES_PER_CU
-            : DEFAULT_TARGET_WAVES_PER_CU;
-    int kb_raw = max(1, ((target_waves_per_cu * NUM_CUS) + grid_n - 1) / grid_n);
-    int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
-    kb_max = min(kb_max, KB_CAP);
-    kb_raw = min(kb_raw, kb_max);
-
-    int kb = chooseNativeVNNIDivisibleKB(blocks_per_row, kb_raw, kb_max);
-    if (rocm_env.nvnni_q8_direct && codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
-        kb = 1;
-
-    resolved.has_generated = true;
-    resolved.kb = kb;
-    resolved.target_waves_per_cu = target_waves_per_cu;
-    return resolved;
+    return resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+        defaultNativeVNNIArithmeticPolicyCodebook(codebook_id), N, K);
 }
 
 static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNICommonSerialM1RuntimeConfig(
@@ -489,6 +597,74 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNICommonSerialM1Run
     return resolveNativeVNNICommonSerialM1RuntimeConfig(codebook_ids, Ns, num_projections, K);
 }
 
+/**
+ * @brief Resolve the exact graph-safe partition count executed by serial M=1.
+ *
+ * Generated policy stores the preferred count, while the launcher bounds it by
+ * both the number of 32-value K blocks and the captured-workspace ABI. Grouped
+ * MoE launchers call this helper so their partition boundaries are identical to
+ * the public serial decode entrypoint rather than merely using the same raw
+ * policy record.
+ *
+ * @param codebook_id NativeVNNI format identifier.
+ * @param N Output-column count.
+ * @param K Reduction width, divisible by 32.
+ * @return Effective K-partition count, or zero when no generated policy exists.
+ */
+static int resolveNativeVNNISerialM1KPartitions(
+    uint8_t codebook_id,
+    int N,
+    int K)
+{
+    if (N <= 0 || K <= 0 || (K % 32) != 0)
+        return 0;
+
+    const NativeVNNIDecodeGeneratedRuntimeConfig cfg =
+        resolveNativeVNNISerialM1RuntimeConfig(codebook_id, N, K);
+    if (!cfg.has_generated || cfg.kb <= 0)
+        return 0;
+
+    int partitions = cfg.kb;
+    if (partitions > K / 32)
+        partitions = K / 32;
+    if (partitions >
+        llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+    {
+        partitions =
+            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+    }
+    return partitions > 0 ? partitions : 1;
+}
+
+/**
+ * @brief Resolve graph-safe serial partitions from an exact source policy.
+ */
+static int resolveNativeVNNISerialM1KPartitionsForPolicy(
+    uint8_t arithmetic_policy_codebook_id,
+    int N,
+    int K)
+{
+    if (N <= 0 || K <= 0 || (K % 32) != 0)
+        return 0;
+
+    const NativeVNNIDecodeGeneratedRuntimeConfig cfg =
+        resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+            arithmetic_policy_codebook_id, N, K);
+    if (!cfg.has_generated || cfg.kb <= 0)
+        return 0;
+
+    int partitions = cfg.kb;
+    if (partitions > K / 32)
+        partitions = K / 32;
+    if (partitions >
+        llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions)
+    {
+        partitions =
+            llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+    }
+    return partitions > 0 ? partitions : 1;
+}
+
 extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
     uint8_t codebook_id,
     int N,
@@ -501,10 +677,197 @@ extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
     if (!cfg.has_generated)
         return false;
     if (kb)
-        *kb = cfg.kb;
+        *kb = resolveNativeVNNISerialM1KPartitions(codebook_id, N, K);
     if (target_waves_per_cu)
         *target_waves_per_cu = cfg.target_waves_per_cu;
     return true;
+}
+
+/**
+ * @brief Query serial-M1 geometry for an explicit arithmetic policy.
+ *
+ * Unlike the legacy query, this entrypoint never maps the migration-only
+ * execution codebook to a guessed policy. Callers must provide the canonical
+ * source policy codebook retained in prepared-weight provenance.
+ */
+extern "C" bool rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+    uint8_t arithmetic_policy_codebook_id,
+    int N,
+    int K,
+    int* kb,
+    int* target_waves_per_cu)
+{
+    const NativeVNNIDecodeGeneratedRuntimeConfig cfg =
+        resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+            arithmetic_policy_codebook_id, N, K);
+    if (!cfg.has_generated)
+        return false;
+    if (kb)
+    {
+        *kb = resolveNativeVNNISerialM1KPartitionsForPolicy(
+            arithmetic_policy_codebook_id, N, K);
+    }
+    if (target_waves_per_cu)
+        *target_waves_per_cu = cfg.target_waves_per_cu;
+    return true;
+}
+
+/**
+ * @brief Immutable serial-M1 split-K geometry available to one captured MoE graph.
+ *
+ * A dynamic expert-overlay table can contain several physical NativeVNNI
+ * codebooks, and a migrated expert can change physical representation without
+ * changing its source arithmetic policy.  The captured grouped kernel therefore
+ * cannot bake one table-wide codebook or one table-wide partition count into its
+ * launch.  This compact value table is copied into the graph's kernel arguments;
+ * each routed descriptor selects its own entry on device.
+ *
+ * Indexes are canonical source-policy codebooks.  Unsupported or untrained
+ * entries remain zero and are rejected before capture when the descriptor table
+ * advertises them.  `maximum_k_partitions` sizes the stable grid while every
+ * route still uses exactly its serial-M1 partition boundaries.
+ */
+struct ROCmMoESerialM1PolicyTable
+{
+    static constexpr int kCodebookCapacity = 32;
+
+    /*
+     * Eight byte-sized partition counts live in each scalar word.  Kernels
+     * receive these as four independent kernarg scalars: an addressable
+     * `uint8_t[32]` parameter made clang materialize a per-work-item private
+     * copy, producing 16--24 bytes of scratch in every descriptor-local wave.
+     */
+    uint64_t k_partitions_0_7 = 0;
+    uint64_t k_partitions_8_15 = 0;
+    uint64_t k_partitions_16_23 = 0;
+    uint64_t k_partitions_24_31 = 0;
+    uint8_t maximum_k_partitions = 0;
+    uint8_t reserved[3]{};
+};
+
+/** @brief Store one host-resolved partition count in the packed policy table. */
+static void setROCmMoESerialM1PolicyPartitions(
+    ROCmMoESerialM1PolicyTable& table,
+    uint8_t policy,
+    uint8_t partitions)
+{
+    if (policy >= ROCmMoESerialM1PolicyTable::kCodebookCapacity)
+        return;
+
+    const unsigned shift = static_cast<unsigned>(policy & 7u) * 8u;
+    const uint64_t encoded = static_cast<uint64_t>(partitions) << shift;
+    switch (policy >> 3u)
+    {
+    case 0:
+        table.k_partitions_0_7 |= encoded;
+        break;
+    case 1:
+        table.k_partitions_8_15 |= encoded;
+        break;
+    case 2:
+        table.k_partitions_16_23 |= encoded;
+        break;
+    case 3:
+        table.k_partitions_24_31 |= encoded;
+        break;
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief Build graph-stable descriptor-local split-K policy for one projection.
+ *
+ * The generated selector is immutable, as is the descriptor table's source
+ * arithmetic-policy mask.  Build entries only for that declared mask: table
+ * upload/update rejects a policy-mask change, while compact-to-expanded expert
+ * movement retains the source arithmetic policy in descriptor provenance.
+ * Consequently a captured graph remains valid across overlay publication
+ * without paying grid depth for unrelated codebooks.
+ *
+ * @param N Output width of the projection.
+ * @param K Reduction width of the projection.
+ * @param required_policy_mask Policies present in the current host descriptor
+ *                             table; every set bit must have generated evidence.
+ * @param table Receives the by-policy partition counts and maximum grid depth.
+ * @return True when all required policies are represented exactly.
+ */
+static bool buildROCmMoESerialM1PolicyTable(
+    int N,
+    int K,
+    uint32_t required_policy_mask,
+    ROCmMoESerialM1PolicyTable& table)
+{
+    static constexpr std::array<uint8_t, 16> kCanonicalPolicies = {
+        0, 4, 5, 6, 7, 8, 9, 10,
+        11, 12, 13, 14, 15, 16, 17, 19};
+
+    table = {};
+    uint32_t represented_mask = 0;
+    for (const uint8_t policy : kCanonicalPolicies)
+    {
+        const uint32_t policy_bit =
+            uint32_t{1} << static_cast<uint32_t>(policy);
+        if ((required_policy_mask & policy_bit) == 0)
+        {
+            /*
+             * Grid Z is the maximum partition count represented here.  Do not
+             * launch empty partition planes for formats the immutable table can
+             * never select; each extra plane creates one block per route and
+             * output tile in every captured decode replay.
+             */
+            continue;
+        }
+
+        const int partitions =
+            resolveNativeVNNISerialM1KPartitionsForPolicy(policy, N, K);
+        if (partitions <= 0)
+            continue;
+
+        setROCmMoESerialM1PolicyPartitions(
+            table,
+            policy,
+            static_cast<uint8_t>(partitions));
+        represented_mask |= policy_bit;
+        if (partitions > static_cast<int>(table.maximum_k_partitions))
+        {
+            table.maximum_k_partitions = static_cast<uint8_t>(partitions);
+        }
+    }
+
+    return table.maximum_k_partitions > 0 &&
+           (required_policy_mask & ~represented_mask) == 0;
+}
+
+/**
+ * @brief Record proof that descriptor-local decode policy was selected.
+ *
+ * This counter is emitted by the host launcher, including while a graph is
+ * being recorded.  It does not inspect device data or synchronize the stream;
+ * production campaigns can therefore prove mixed/runtime routing without
+ * perturbing the captured execution timeline.
+ */
+static void recordROCmMoEDescriptorLocalDecode(
+    const char* projection,
+    const char* descriptor_source,
+    uint8_t table_codebook,
+    uint32_t policy_codebook_mask,
+    const ROCmMoESerialM1PolicyTable& policy_table)
+{
+    if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
+        return;
+    llaminar2::PerfStatsCollector::addCounter(
+        "kernel",
+        "rocm_moe_descriptor_local_decode_calls",
+        1.0,
+        "moe",
+        {},
+        {{"projection", projection},
+         {"descriptor_source", descriptor_source},
+         {"table_codebook", std::to_string(table_codebook)},
+         {"policy_codebook_mask", std::to_string(policy_codebook_mask)},
+         {"maximum_k_partitions",
+          std::to_string(policy_table.maximum_k_partitions)}});
 }
 
 extern "C" bool rocmGemv_native_vnni_query_generated_config(
@@ -524,6 +887,61 @@ extern "C" bool rocmGemv_native_vnni_query_generated_config(
     if (target_waves_per_cu)
         *target_waves_per_cu = cfg.target_waves_per_cu;
     return true;
+}
+
+/**
+ * @brief Measure the in-TU ROCm generated-selector cache without touching HIP.
+ *
+ * The timing loop calls the same static resolver as the production launcher,
+ * avoiding the out-of-line public-query overhead that would otherwise dominate
+ * a nanosecond-scale host measurement. A matched loop-only interval is
+ * subtracted from the result.
+ */
+extern "C" double rocmGemv_native_vnni_measure_generated_config_ns(
+    uint8_t codebook_id,
+    int M,
+    const int *Ns,
+    const int *Ks,
+    int query_count,
+    int iterations,
+    uint64_t *out_checksum)
+{
+    if (!Ns || !Ks || query_count <= 0 || iterations <= 0)
+        return -1.0;
+
+    uint64_t checksum = 0;
+    const auto baseline_begin = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        const int index = iteration % query_count;
+        checksum += static_cast<uint64_t>(Ns[index] + Ks[index]);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    const auto baseline_end = std::chrono::steady_clock::now();
+
+    const auto selector_begin = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration)
+    {
+        const int index = iteration % query_count;
+        const NativeVNNIDecodeGeneratedRuntimeConfig config =
+            resolveNativeVNNIDecodeGeneratedRuntimeConfig(
+                codebook_id, M, Ns[index], Ks[index]);
+        checksum += static_cast<uint64_t>(config.has_generated) |
+                    (static_cast<uint64_t>(config.kb) << 8) |
+                    (static_cast<uint64_t>(config.target_waves_per_cu) << 24);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    const auto selector_end = std::chrono::steady_clock::now();
+
+    if (out_checksum)
+        *out_checksum = checksum;
+    const double baseline_ns = std::chrono::duration<double, std::nano>(
+        baseline_end - baseline_begin).count();
+    const double selector_ns = std::chrono::duration<double, std::nano>(
+        selector_end - selector_begin).count();
+    return std::max(
+        0.0,
+        (selector_ns - baseline_ns) / static_cast<double>(iterations));
 }
 
 // ============================================================================
@@ -859,9 +1277,6 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
                 const uint16_t hi_bits = d_block_mins[linear];
                 const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
-                f_acc[c] += (static_cast<float>(acc_lo) * scale_lo
-                          + static_cast<float>(acc_hi) * scale_hi) * scale_ab;
-
                 if constexpr (Traits::is_dual_scale_asym)
                 {
                     constexpr int32_t ones = 0x01010101;
@@ -876,8 +1291,18 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     // Q2_K: per-sub-block emin correction
                     constexpr float min_lo = 0.0f;
                     constexpr float min_hi = 0.0f;
-                    f_acc[c] += (static_cast<float>(sum_a_lo) * min_lo
-                              + static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
+                    f_acc[c] =
+                        rocm_native_vnni_commit_corrected_dual_scale_block(
+                            f_acc[c],
+                            acc_lo,
+                            acc_hi,
+                            scale_lo,
+                            scale_hi,
+                            sum_a_lo,
+                            sum_a_hi,
+                            min_lo,
+                            min_hi,
+                            scale_ab);
                 }
 
                 // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
@@ -886,7 +1311,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 // dl * delta * sum_a_per_group for each of the 4 groups.
                 // Delta signs: qh0 bit 3 (group 0), qh0 bit 7 (group 1),
                 //              qh1 bit 3 (group 2), qh1 bit 7 (group 3).
-                if constexpr (FMT == NVNNI_IQ1_M)
+                else if constexpr (FMT == NVNNI_IQ1_M)
                 {
                     constexpr float IQ1S_DELTA = 0.125f;
                     constexpr int32_t ones = 0x01010101;
@@ -907,8 +1332,31 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                     const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-                    f_acc[c] += ((d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
-                              + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi) * scale_ab;
+                    f_acc[c] = rocm_native_vnni_commit_iq1_m_block(
+                        f_acc[c],
+                        acc_lo,
+                        acc_hi,
+                        sa_g0,
+                        sa_g1,
+                        sa_g2,
+                        sa_g3,
+                        d0,
+                        d1,
+                        d2,
+                        d3,
+                        scale_lo,
+                        scale_hi,
+                        scale_ab);
+                }
+                else
+                {
+                    f_acc[c] = rocm_native_vnni_commit_dual_scale_block(
+                        f_acc[c],
+                        acc_lo,
+                        acc_hi,
+                        scale_lo,
+                        scale_hi,
+                        scale_ab);
                 }
             }
             else
@@ -919,19 +1367,28 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
                 const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                f_acc[c] += static_cast<float>(block_acc) * block_d * scale_ab;
-
                 if constexpr (Traits::is_asymmetric)
                 {
                     const uint16_t min_bits = d_block_mins[linear];
                     const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                    f_acc[c] += static_cast<float>(sum_a) * block_m * scale_ab;
+                    f_acc[c] =
+                        rocm_native_vnni_commit_corrected_single_scale_block(
+                            f_acc[c],
+                            block_acc,
+                            block_d,
+                            sum_a,
+                            block_m,
+                            scale_ab);
+                }
+                else
+                {
+                    f_acc[c] = rocm_native_vnni_commit_single_scale_block(
+                        f_acc[c], block_acc, block_d, scale_ab);
                 }
             }
         }
     }
 }
-
 
 // ============================================================================
 // Native-VNNI GEMV kernel: lossless decode with per-block FP16 scales
@@ -1299,8 +1756,8 @@ __global__ void gemv_native_vnni_kernel_t(
 
                             // Low nibbles + scattered 2-bit highs + subtract-32
                             const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
-                            const uint32_t hb_lo = ((h_lo & 0x03u) << 4)  | ((h_lo & 0x0Cu) << 10)
-                                                 | ((h_lo & 0x30u) << 16) | ((h_lo & 0xC0u) << 22);
+                            const uint32_t hb_lo =
+                                rocm_native_vnni_expand_q6_high_fields(h_lo);
                             uint32_t val_lo = (lo_nibs | hb_lo) ^ 0x80808080u;
                             val_lo -= 0x20202020u;
                             val_lo ^= 0x80808080u;
@@ -1308,8 +1765,8 @@ __global__ void gemv_native_vnni_kernel_t(
 
                             // High nibbles + scattered 2-bit highs + subtract-32
                             const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
-                            const uint32_t hb_hi = ((h_hi & 0x03u) << 4)  | ((h_hi & 0x0Cu) << 10)
-                                                 | ((h_hi & 0x30u) << 16) | ((h_hi & 0xC0u) << 22);
+                            const uint32_t hb_hi =
+                                rocm_native_vnni_expand_q6_high_fields(h_hi);
                             uint32_t val_hi = (hi_nibs | hb_hi) ^ 0x80808080u;
                             val_hi -= 0x20202020u;
                             val_hi ^= 0x80808080u;
@@ -1517,9 +1974,6 @@ __global__ void gemv_native_vnni_kernel_t(
                         const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
                         const uint16_t hi_bits = d_block_mins[linear];
                         const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
-                        f_acc[c] += (static_cast<float>(acc_lo) * scale_lo
-                                  + static_cast<float>(acc_hi) * scale_hi) * scale_ab;
-
                         // Q2_K/IQ1_M: dual-scale + emin/delta correction
                         // Q2_K: emins from separate d_block_emins array
                         // IQ1_M: has ±IQ1S_DELTA per-group correction (handled below)
@@ -1545,15 +1999,25 @@ __global__ void gemv_native_vnni_kernel_t(
                                 min_lo = 0.0f;
                                 min_hi = 0.0f;
                             }
-                            f_acc[c] += (static_cast<float>(sum_a_lo) * min_lo
-                                      + static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
+                            f_acc[c] =
+                                rocm_native_vnni_commit_corrected_dual_scale_block(
+                                    f_acc[c],
+                                    acc_lo,
+                                    acc_hi,
+                                    scale_lo,
+                                    scale_hi,
+                                    sum_a_lo,
+                                    sum_a_hi,
+                                    min_lo,
+                                    min_hi,
+                                    scale_ab);
                         }
 
                         // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
                         // True weight[j] = dl * (grid[j] + delta), but the sdot4 above
                         // only accumulates dl * dot(a, grid).  We add the missing
                         // dl * delta * sum_a_per_group for each of the 4 groups.
-                        if constexpr (FMT == NVNNI_IQ1_M)
+                        else if constexpr (FMT == NVNNI_IQ1_M)
                         {
                             constexpr float IQ1S_DELTA = 0.125f;
                             constexpr int32_t ones = 0x01010101;
@@ -1573,8 +2037,31 @@ __global__ void gemv_native_vnni_kernel_t(
                             const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                             const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-                            f_acc[c] += ((d0 * static_cast<float>(sa_g0) + d1 * static_cast<float>(sa_g1)) * scale_lo
-                                      + (d2 * static_cast<float>(sa_g2) + d3 * static_cast<float>(sa_g3)) * scale_hi) * scale_ab;
+                            f_acc[c] = rocm_native_vnni_commit_iq1_m_block(
+                                f_acc[c],
+                                acc_lo,
+                                acc_hi,
+                                sa_g0,
+                                sa_g1,
+                                sa_g2,
+                                sa_g3,
+                                d0,
+                                d1,
+                                d2,
+                                d3,
+                                scale_lo,
+                                scale_hi,
+                                scale_ab);
+                        }
+                        else
+                        {
+                            f_acc[c] = rocm_native_vnni_commit_dual_scale_block(
+                                f_acc[c],
+                                acc_lo,
+                                acc_hi,
+                                scale_lo,
+                                scale_hi,
+                                scale_ab);
                         }
                     }
                     else
@@ -1586,15 +2073,25 @@ __global__ void gemv_native_vnni_kernel_t(
                             block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
                         const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                        f_acc[c] += static_cast<float>(block_acc) * block_d * scale_ab;
-
                         // Asymmetric min correction: f_acc += sum_a * block_m
                         // Derives from: value = d*q + m  →  Σ a_i*value_i = d*Σ(a_i*q_i) + m*Σ(a_i)
                         if constexpr (Traits::is_asymmetric)
                         {
                             const uint16_t min_bits = d_block_mins[linear];
                             const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                            f_acc[c] += static_cast<float>(sum_a) * block_m * scale_ab;
+                            f_acc[c] =
+                                rocm_native_vnni_commit_corrected_single_scale_block(
+                                    f_acc[c],
+                                    block_acc,
+                                    block_d,
+                                    sum_a,
+                                    block_m,
+                                    scale_ab);
+                        }
+                        else
+                        {
+                            f_acc[c] = rocm_native_vnni_commit_single_scale_block(
+                                f_acc[c], block_acc, block_d, scale_ab);
                         }
                     }
                 }
@@ -1615,17 +2112,19 @@ __global__ void gemv_native_vnni_kernel_t(
                 const float result = f_acc[c] * scale_a;
                 if (kblocks == 1)
                 {
-                    // Direct: write final output
+                    // A single K partition already owns the final output row.
                     d_C_fp32[n] = result;
-                }
-                else if (d_partial_fp32 == nullptr)
-                {
-                    // Atomic reduce: accumulate directly to output (pre-zeroed)
-                    atomicAdd(&d_C_fp32[n], result);
                 }
                 else
                 {
-                    // Scatter: plain store to partial buffer (no atomicAdd)
+                    /*
+                     * Every K partition owns one persistent workspace row.
+                     * The following ordered reducer consumes those rows in
+                     * serial-decode partition order.  There is deliberately
+                     * no null-workspace/atomic route: allowing completion
+                     * order to choose the FP32 fold order would make MTP
+                     * verification depend on GPU scheduling.
+                     */
                     d_partial_fp32[static_cast<size_t>(kb) * N + n] = result;
                 }
             }
@@ -1643,12 +2142,255 @@ struct DeviceNativeVNNIMatrixDesc
     int k;
     uint32_t blocks_per_row;
     uint8_t codebook_id;
-    uint8_t reserved[3];
+    uint8_t allocation_payload_bytes_per_block;
+    uint8_t allocation_has_mins;
+    uint8_t allocation_has_emins;
+    uint8_t source_codebook_id;
+    uint8_t source_is_superblock;
+    uint8_t source_identity_present;
+    uint8_t reserved;
+    uint32_t reserved_tail;
 };
+
+static_assert(
+    sizeof(DeviceNativeVNNIMatrixDesc) == 56,
+    "ROCm NativeVNNI descriptor must match the shared device ABI");
+
+constexpr int kDeviceMoEMaxExperts = 256;
+constexpr int kDeviceMoEMaxTopK = 16;
+constexpr uint32_t kDeviceMoEFlagValid = 1u << 0;
+constexpr uint32_t kDeviceMoEFlagResident = 1u << 1;
+constexpr uint32_t kDeviceMoEFlagLocalCompute = 1u << 4;
+
+struct DeviceMoEExpertDescriptorView
+{
+    DeviceNativeVNNIMatrixDesc gate;
+    DeviceNativeVNNIMatrixDesc up;
+    DeviceNativeVNNIMatrixDesc down;
+    const void *floating_gate_data;
+    int32_t floating_gate_n;
+    int32_t floating_gate_k;
+    const void *floating_up_data;
+    int32_t floating_up_n;
+    int32_t floating_up_k;
+    const void *floating_down_data;
+    int32_t floating_down_n;
+    int32_t floating_down_k;
+    int32_t logical_expert_id;
+    int32_t owner_participant;
+    int32_t local_slot;
+    uint32_t flags;
+    uint32_t weight_format;
+    uint32_t reserved;
+};
+
+static_assert(
+    sizeof(DeviceMoEExpertDescriptorView) == 240,
+    "ROCm GEMV expert descriptor view must match the shared runtime ABI");
+
+struct DeviceMoEPlacementBankView
+{
+    DeviceMoEExpertDescriptorView experts[kDeviceMoEMaxExperts];
+    uint8_t local_compute_mask[kDeviceMoEMaxExperts];
+    uint8_t replica_role[kDeviceMoEMaxExperts];
+    uint32_t resident_participant_mask[kDeviceMoEMaxExperts];
+    int32_t overlay_route_participant[kDeviceMoEMaxExperts];
+    uint32_t epoch;
+    uint32_t expert_count;
+    uint32_t reserved[2];
+};
+
+static_assert(
+    sizeof(DeviceMoEPlacementBankView) ==
+    llaminar2::moe_runtime_abi::kPlacementBankBytes);
+static_assert(
+    offsetof(DeviceMoEPlacementBankView, overlay_route_participant) ==
+    llaminar2::moe_runtime_abi::kOverlayRouteParticipantOffset);
+
+struct DeviceMoELayerRuntimeView
+{
+    uint32_t active_bank;
+    uint32_t active_epoch;
+    uint32_t expert_count;
+    uint32_t top_k;
+    DeviceMoEPlacementBankView banks[2];
+    int32_t topk_expert_ids[kDeviceMoEMaxTopK];
+    float topk_weights[kDeviceMoEMaxTopK];
+    uint64_t decode_histogram[kDeviceMoEMaxExperts];
+    uint64_t decode_local_histogram[kDeviceMoEMaxExperts];
+    uint64_t prefill_histogram[kDeviceMoEMaxExperts];
+    uint64_t prefill_local_histogram[kDeviceMoEMaxExperts];
+    uint64_t grouped_verifier_histogram[kDeviceMoEMaxExperts];
+    uint64_t grouped_verifier_local_histogram[kDeviceMoEMaxExperts];
+    uint64_t router_hot_cache_eligible_dispatches;
+    uint64_t router_hot_cache_used_dispatches;
+    uint64_t router_hot_cache_improved_dispatches;
+    uint64_t router_hot_cache_default_load_spread_total;
+    uint64_t router_hot_cache_actual_load_spread_total;
+    uint64_t router_hot_cache_load_spread_improvement_total;
+    uint64_t router_hot_cache_active_dispatches;
+    uint64_t router_hot_cache_miss_dispatches;
+    uint64_t router_hot_cache_selected_expert_slots;
+    uint64_t router_hot_cache_replicated_selected_expert_slots;
+    int32_t *route_expert_ids;
+    float *route_weights;
+    int32_t *route_participant_ids;
+    int32_t *deferred_verifier_route_expert_ids;
+    int32_t *deferred_verifier_route_participant_ids;
+    int32_t *expert_counts;
+    int32_t *expert_offsets;
+    int32_t *grouped_token_ids;
+    float *grouped_route_weights;
+    float *grouped_gate_scratch;
+    float *grouped_up_scratch;
+    float *grouped_output_partials;
+    void *decode_scratch;
+    void *reserved_ptrs[3];
+    uint64_t reserved_u64[4];
+    uint32_t prefill_token_capacity;
+    uint32_t prefill_route_capacity;
+    uint32_t deferred_verifier_route_capacity;
+    uint32_t participant_id;
+    uint32_t participant_count;
+    uint32_t current_batch_llep_movement_observed;
+    uint32_t current_batch_llep_non_owner_assignment_observed;
+    uint32_t current_batch_llep_transient_bank_active;
+    llaminar2::moe_runtime_abi::DeviceMoERuntimeHistogramBank
+        *runtime_histogram_banks;
+    const uint32_t *runtime_histogram_active_bank;
+    const llaminar2::DeviceMoEOverlayEpochTicket *overlay_epoch_ticket;
+    const DeviceMoEPlacementBankView *overlay_placement_banks;
+    const llaminar2::DeviceMoEOverlayEpochStatus *overlay_epoch_status;
+};
+
+static_assert(
+    sizeof(DeviceMoELayerRuntimeView) ==
+    llaminar2::moe_runtime_abi::kLayerRuntimeBytes);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, route_participant_ids) ==
+    llaminar2::moe_runtime_abi::kRouteParticipantIdsOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, participant_count) ==
+    llaminar2::moe_runtime_abi::kParticipantCountOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView,
+             current_batch_llep_movement_observed) ==
+    llaminar2::moe_runtime_abi::kCurrentBatchLLEPMovementObservedOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView,
+             current_batch_llep_non_owner_assignment_observed) ==
+    llaminar2::moe_runtime_abi::
+        kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView,
+             current_batch_llep_transient_bank_active) ==
+    llaminar2::moe_runtime_abi::
+        kCurrentBatchLLEPTransientBankActiveOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, runtime_histogram_banks) ==
+    llaminar2::moe_runtime_abi::kRuntimeHistogramBanksOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, runtime_histogram_active_bank) ==
+    llaminar2::moe_runtime_abi::kRuntimeHistogramActiveBankOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, overlay_epoch_ticket) ==
+    llaminar2::moe_runtime_abi::kOverlayEpochTicketOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, overlay_placement_banks) ==
+    llaminar2::moe_runtime_abi::kOverlayPlacementBanksOffset);
+static_assert(
+    offsetof(DeviceMoELayerRuntimeView, overlay_epoch_status) ==
+    llaminar2::moe_runtime_abi::kOverlayEpochStatusOffset);
+
+/** Sentinel returned when a runtime inference bank is not provable. */
+constexpr uint32_t kInvalidMoERuntimeExecutionBank = 0xffffffffu;
+
+/** @return Canonical durable placement banks for this runtime role. */
+__device__ __forceinline__ const DeviceMoEPlacementBankView *
+moe_runtime_durable_placement_banks(const DeviceMoELayerRuntimeView *runtime)
+{
+    return runtime && runtime->overlay_placement_banks
+               ? runtime->overlay_placement_banks
+               : (runtime ? runtime->banks : nullptr);
+}
+
+/** @return Placement banks visible to this exact captured child graph. */
+__device__ __forceinline__ const DeviceMoEPlacementBankView *
+moe_runtime_placement_banks(const DeviceMoELayerRuntimeView *runtime)
+{
+    if (!runtime)
+        return nullptr;
+    return runtime->current_batch_llep_transient_bank_active != 0u
+               ? runtime->banks
+               : moe_runtime_durable_placement_banks(runtime);
+}
+
+/**
+ * @brief Select the request-pinned runtime bank without following maintenance.
+ *
+ * A null ticket is the explicit non-overlay path.  ExpertOverlay readers use
+ * the ticket's bank only when its positive generation and exact epoch agree
+ * with that bank's descriptor publication.
+ */
+__device__ __forceinline__ uint32_t moe_runtime_execution_bank(
+    const DeviceMoELayerRuntimeView *runtime)
+{
+    if (!runtime)
+        return kInvalidMoERuntimeExecutionBank;
+    if (!runtime->overlay_epoch_ticket)
+    {
+        return runtime->active_bank <= 1u
+                   ? runtime->active_bank
+                   : kInvalidMoERuntimeExecutionBank;
+    }
+
+    const uint64_t epoch = runtime->overlay_epoch_ticket->epoch;
+    const uint64_t selector = runtime->overlay_epoch_ticket->selector;
+    const uint32_t bank = static_cast<uint32_t>(selector & 1u);
+    const uint64_t generation = selector >> 1u;
+    const DeviceMoEPlacementBankView *placement_banks =
+        moe_runtime_durable_placement_banks(runtime);
+    if (epoch == 0u || generation == 0u || bank > 1u ||
+        !placement_banks ||
+        static_cast<uint64_t>(placement_banks[bank].epoch) != epoch)
+    {
+        return kInvalidMoERuntimeExecutionBank;
+    }
+    if (runtime->current_batch_llep_transient_bank_active != 0u)
+    {
+        const uint32_t transient_bank = runtime->active_bank;
+        if (!runtime->overlay_placement_banks || transient_bank > 1u ||
+            static_cast<uint64_t>(runtime->banks[transient_bank].epoch) !=
+                epoch)
+        {
+            return kInvalidMoERuntimeExecutionBank;
+        }
+        return transient_bank;
+    }
+    return bank;
+}
+
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ bool native_vnni_desc_shape_ok(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int N,
+    int K)
+{
+    using Traits = NVNNITraits<FMT>;
+    return desc.payload &&
+           desc.scales &&
+           desc.n == N &&
+           desc.k == K &&
+           desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
+           desc.codebook_id == static_cast<uint8_t>(FMT) &&
+           (!(Traits::is_asymmetric || Traits::is_dual_scale) || desc.mins) &&
+           (!Traits::is_dual_scale_asym || desc.emins);
+}
 
 __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
     const float* const* __restrict__ gate_ptrs,
     const float* const* __restrict__ up_ptrs,
+    const int* __restrict__ expert_ids,
     int8_t* __restrict__ A_int8,
     float* __restrict__ scales_A_blockwise,
     int num_active,
@@ -1656,6 +2398,7 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
 {
     const int slot = blockIdx.x;
     if (slot >= num_active) return;
+    if (expert_ids && expert_ids[slot] < 0) return;
 
     constexpr int BLOCK_SIZE = 32;
     constexpr int NUM_WARPS = 8;
@@ -1673,22 +2416,23 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
         const int k_start = b * BLOCK_SIZE;
         const float g = gate[k_start + lane];
         const float u = up[k_start + lane];
-        const float val = (g / (1.0f + expf(-g))) * u;
+        const float val =
+            llaminar2::rocm::decode_equivalent::swigluValue(g, u);
 
         float abs_val = fabsf(val);
         #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
 
-        const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
-        const float inv_scale = 1.0f / scale;
+        const float scale =
+            llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
 
         if (lane == 0)
             row_scales[b] = scale;
 
-        const float qval = val * inv_scale;
         row_int8[k_start + lane] = static_cast<int8_t>(
-            rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+            llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+                val, scale));
     }
 }
 
@@ -1811,6 +2555,10 @@ __device__ __forceinline__ void moe_decode_native_vnni_groups(
             const uint32_t h_hi = qh_p[g + 4];
 
             const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
+            // The grouped verifier keeps the direct deposits: on gfx906 its
+            // larger live-row state schedules this form 2.7% faster than the
+            // serial kernel's bit-dilation identity.  Both forms are exhaustive
+            // integer identities over all 256 possible packed high-bit bytes.
             const uint32_t hb_lo = ((h_lo & 0x03u) << 4)  | ((h_lo & 0x0Cu) << 10)
                                  | ((h_lo & 0x30u) << 16) | ((h_lo & 0xC0u) << 22);
             uint32_t val_lo = (lo_nibs | hb_lo) ^ 0x80808080u;
@@ -1982,254 +2730,103 @@ __device__ __forceinline__ void moe_decode_native_vnni_groups(
 }
 
 template <NativeVNNIFormat FMT>
-__device__ __forceinline__ float moe_native_vnni_dual_scale_correction(
-    const int32_t* __restrict__ a4,
-    const uint8_t* __restrict__ payload,
-    const uint32_t* __restrict__ emin_base,
-    size_t linear,
-    float scale_lo,
-    float scale_hi,
-    float scale_ab)
-{
-    using Traits = NVNNITraits<FMT>;
-    float correction = 0.0f;
+__device__ __forceinline__ float moe_native_vnni_dot_desc_range(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    int N,
+    int K,
+    int b_start,
+    int b_end);
 
-    if constexpr (Traits::is_dual_scale_asym)
-    {
-        constexpr int32_t ones = 0x01010101;
-        int32_t sum_a_lo = 0;
-        int32_t sum_a_hi = 0;
-        #pragma unroll
-        for (int g = 0; g < 4; ++g)
-            sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
-        #pragma unroll
-        for (int g = 4; g < 8; ++g)
-            sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
-
-        const uint32_t emin_packed = emin_base[linear];
-        const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
-        const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
-        const float min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
-        const float min_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
-        correction += (static_cast<float>(sum_a_lo) * min_lo +
-                       static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
-    }
-
-    if constexpr (FMT == NVNNI_IQ1_M)
-    {
-        constexpr float IQ1S_DELTA = 0.125f;
-        constexpr int32_t ones = 0x01010101;
-        const uint8_t qh0 = payload[4];
-        const uint8_t qh1 = payload[5];
-
-        const int32_t sum_a_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
-                                __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
-        const int32_t sum_a_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
-                                __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
-        const int32_t sum_a_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
-                                __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
-        const int32_t sum_a_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
-                                __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
-
-        const float delta0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-        const float delta1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-        const float delta2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-        const float delta3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-
-        correction += ((delta0 * static_cast<float>(sum_a_g0) + delta1 * static_cast<float>(sum_a_g1)) * scale_lo +
-                       (delta2 * static_cast<float>(sum_a_g2) + delta3 * static_cast<float>(sum_a_g3)) * scale_hi) * scale_ab;
-    }
-
-    return correction;
-}
-
-template <NativeVNNIFormat FMT, bool INDEX_BY_EXPERT_ID>
-__global__ void moe_grouped_native_vnni_down_kernel_t(
+/**
+ * @brief Publish one weighted ROCm decode row per original router slot.
+ *
+ * Each `(route, column)` lane computes a complete increasing-K NativeVNNI dot
+ * and writes a unique destination. Remote/invalid routes write zero. No route
+ * accumulation or floating-point atomic occurs before the LocalTP collective.
+ */
+template <NativeVNNIFormat FMT, bool INDEX_BY_EXPERT_ID = true>
+__global__ void moe_grouped_native_vnni_down_route_kernel_t(
     const int8_t* __restrict__ A_int8,
     const float* __restrict__ scales_A_blockwise,
     const DeviceNativeVNNIMatrixDesc* __restrict__ descs,
     const int* __restrict__ expert_ids,
     const float* __restrict__ route_weights,
-    float* __restrict__ output,
+    float* __restrict__ route_output,
     int num_active,
     int N,
     int K)
 {
     static_assert(NVNNIGroupedMoESupported<FMT>::value,
-                  "Grouped MoE down requires a supported native-VNNI descriptor");
+                  "Canonical grouped MoE down requires a supported format");
 
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
-    if (n >= N) return;
+    const int route = blockIdx.y;
+    if (route >= num_active || n >= N)
+        return;
+
+    const size_t output_index =
+        static_cast<size_t>(route) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const int descriptor_index = INDEX_BY_EXPERT_ID ? expert_ids[route] : route;
+    if (descriptor_index < 0)
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+
+    const DeviceNativeVNNIMatrixDesc desc = descs[descriptor_index];
+    if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
 
     const int blocks_per_row = K / 32;
+    const int8_t* a_slot =
+        A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
+    const float* scale_slot =
+        scales_A_blockwise +
+        static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
+    const float expert_acc = moe_native_vnni_dot_desc_range<FMT>(
+        desc, n, a_slot, scale_slot, N, K, 0, blocks_per_row);
+    route_output[output_index] = rocm_native_vnni_weight_route_rn(
+        route_weights[route], expert_acc);
+}
+
+/**
+ * @brief Fold independently computed route rows in the serial router order.
+ *
+ * Route projection is parallel across grid Y. This reducer owns one output
+ * column and reproduces the serial decode sequence `(((0 + r0) + r1) + ...)`
+ * with explicit round-to-nearest operations. No route can race another route's
+ * destination, and no scheduler-dependent atomic ordering enters the result.
+ */
+__global__ void moe_grouped_native_vnni_down_ordered_reduce_kernel(
+    const float* __restrict__ route_contributions,
+    float* __restrict__ output,
+    int num_active,
+    int N)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    if (n >= N)
+        return;
+
     float total = 0.0f;
-
     #pragma unroll 1
-    for (int slot = 0; slot < num_active; ++slot)
+    for (int route = 0; route < num_active; ++route)
     {
-        int desc_idx = slot;
-        if constexpr (INDEX_BY_EXPERT_ID)
-            desc_idx = expert_ids[slot];
-        const DeviceNativeVNNIMatrixDesc desc = descs[desc_idx];
-        const uint8_t* payload_base = desc.payload;
-        const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
-        const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
-        const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
-        const int8_t* a_slot = A_int8 + static_cast<size_t>(slot) * K;
-        const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-
-        float expert_acc = 0.0f;
-        for (int b = 0; b < blocks_per_row; ++b)
-        {
-            const int32_t* a4 = reinterpret_cast<const int32_t*>(a_slot + b * 32);
-            int32_t packed_groups[8];
-            const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-            const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
-            moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
-
-            const float scale_ab = scale_slot[b];
-            if constexpr (NVNNITraits<FMT>::is_dual_scale)
-            {
-                int32_t acc_lo = 0;
-                int32_t acc_hi = 0;
-                #pragma unroll
-                for (int g = 0; g < 4; ++g)
-                    acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
-                #pragma unroll
-                for (int g = 4; g < 8; ++g)
-                    acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
-
-                const uint16_t scale_lo_bits = scale_base[linear];
-                const uint16_t scale_hi_bits = min_base[linear];
-                const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-                const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-                expert_acc += (static_cast<float>(acc_lo) * scale_lo +
-                               static_cast<float>(acc_hi) * scale_hi) * scale_ab;
-                expert_acc += moe_native_vnni_dual_scale_correction<FMT>(
-                    a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
-            }
-            else
-            {
-                int32_t block_acc = 0;
-                #pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
-
-                const uint16_t scale_bits = scale_base[linear];
-                const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                expert_acc += static_cast<float>(block_acc) * block_d * scale_ab;
-
-                if constexpr (NVNNITraits<FMT>::is_asymmetric)
-                {
-                    constexpr int32_t ones = 0x01010101;
-                    int32_t sum_a = 0;
-                    #pragma unroll
-                    for (int g = 0; g < 8; ++g)
-                        sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
-
-                    const uint16_t min_bits = min_base[linear];
-                    const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                    expert_acc += static_cast<float>(sum_a) * block_m * scale_ab;
-                }
-            }
-        }
-
-        total += route_weights[slot] * expert_acc;
+        total = rocm_native_vnni_accumulate_rn(
+            total,
+            route_contributions[
+                static_cast<size_t>(route) * static_cast<size_t>(N) +
+                static_cast<size_t>(n)]);
     }
-
     output[n] = total;
-}
-
-template <NativeVNNIFormat FMT>
-__global__ void moe_grouped_native_vnni_down_parallel_experts_kernel_t(
-    const int8_t* __restrict__ A_int8,
-    const float* __restrict__ scales_A_blockwise,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ descs,
-    const int* __restrict__ expert_ids,
-    const float* __restrict__ route_weights,
-    float* __restrict__ output,
-    int num_active,
-    int N,
-    int K)
-{
-    static_assert(NVNNIGroupedMoESupported<FMT>::value,
-                  "Grouped MoE parallel down requires a supported native-VNNI descriptor");
-
-    constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int slot = blockIdx.y;
-    if (slot >= num_active || n >= N) return;
-
-    const int expert_id = expert_ids[slot];
-    if (expert_id < 0) return;
-
-    const int blocks_per_row = K / 32;
-    const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
-    const uint8_t* payload_base = desc.payload;
-    const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
-    const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
-    const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
-    const int8_t* a_slot = A_int8 + static_cast<size_t>(slot) * K;
-    const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-
-    float expert_acc = 0.0f;
-    for (int b = 0; b < blocks_per_row; ++b)
-    {
-        const int32_t* a4 = reinterpret_cast<const int32_t*>(a_slot + b * 32);
-        int32_t packed_groups[8];
-        const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-        const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
-        moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
-
-        const float scale_ab = scale_slot[b];
-        if constexpr (NVNNITraits<FMT>::is_dual_scale)
-        {
-            int32_t acc_lo = 0;
-            int32_t acc_hi = 0;
-            #pragma unroll
-            for (int g = 0; g < 4; ++g)
-                acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
-            #pragma unroll
-            for (int g = 4; g < 8; ++g)
-                acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
-
-            const uint16_t scale_lo_bits = scale_base[linear];
-            const uint16_t scale_hi_bits = min_base[linear];
-            const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-            const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-            expert_acc += (static_cast<float>(acc_lo) * scale_lo +
-                           static_cast<float>(acc_hi) * scale_hi) * scale_ab;
-            expert_acc += moe_native_vnni_dual_scale_correction<FMT>(
-                a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
-        }
-        else
-        {
-            int32_t block_acc = 0;
-            #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
-
-            const uint16_t scale_bits = scale_base[linear];
-            const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-            expert_acc += static_cast<float>(block_acc) * block_d * scale_ab;
-
-            if constexpr (NVNNITraits<FMT>::is_asymmetric)
-            {
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum_a = 0;
-                #pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
-
-                const uint16_t min_bits = min_base[linear];
-                const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                expert_acc += static_cast<float>(sum_a) * block_m * scale_ab;
-            }
-        }
-    }
-
-    atomicAdd(output + n, route_weights[slot] * expert_acc);
 }
 
 __global__ void moe_grouped_hidden_quantize_blockwise_kernel(
@@ -2250,15 +2847,38 @@ __global__ void moe_grouped_hidden_quantize_blockwise_kernel(
     for (int mask = 16; mask > 0; mask >>= 1)
         abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
 
-    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
-    const float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
     if (lane == 0)
         scales_A_blockwise[block_idx] = scale;
 
-    const float qval = val * inv_scale;
     A_int8[k] = static_cast<int8_t>(
-        rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+            val, scale));
 }
+
+/*
+ * Grouped MoE decode is defined before the generic verifier-row kernels in this
+ * translation unit, but both paths must call the same arithmetic primitives.
+ * Keep these declarations here so the grouped dot cannot grow a second copy of
+ * the serial M=1 accumulation tree.
+ */
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ int32_t native_vnni_activation_sum_a(
+    const int32_t* __restrict__ a4);
+
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
+    float& f_acc,
+    const int32_t* __restrict__ a4,
+    const int32_t* __restrict__ packed_groups,
+    const uint8_t* __restrict__ payload,
+    const uint16_t* __restrict__ scale_base,
+    const uint16_t* __restrict__ min_base,
+    const uint32_t* __restrict__ emin_base,
+    size_t linear,
+    float scale_ab,
+    int32_t sum_a);
 
 template <NativeVNNIFormat FMT>
 __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
@@ -2271,6 +2891,17 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
     int b_start,
     int b_end)
 {
+    if (!A_int8 ||
+        !scales_A_blockwise ||
+        n < 0 ||
+        n >= N ||
+        K <= 0 ||
+        (K % 32) != 0 ||
+        !native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        return 0.0f;
+    }
+
     const int blocks_per_row = K / 32;
     const uint8_t* payload_base = desc.payload;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
@@ -2290,53 +2921,242 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
         moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
         const float scale_ab = scales_A_blockwise[b];
-        if constexpr (NVNNITraits<FMT>::is_dual_scale)
-        {
-            int32_t acc_lo = 0;
-            int32_t acc_hi = 0;
-            #pragma unroll
-            for (int g = 0; g < 4; ++g)
-                acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
-            #pragma unroll
-            for (int g = 4; g < 8; ++g)
-                acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
-
-            const uint16_t scale_lo_bits = scale_base[linear];
-            const uint16_t scale_hi_bits = min_base[linear];
-            const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-            const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-            acc += (static_cast<float>(acc_lo) * scale_lo +
-                    static_cast<float>(acc_hi) * scale_hi) * scale_ab;
-            acc += moe_native_vnni_dual_scale_correction<FMT>(
-                a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
-        }
-        else
-        {
-            int32_t block_acc = 0;
-            #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
-
-            const uint16_t scale_bits = scale_base[linear];
-            const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-            acc += static_cast<float>(block_acc) * block_d * scale_ab;
-
-            if constexpr (NVNNITraits<FMT>::is_asymmetric)
-            {
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum_a = 0;
-                #pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
-
-                const uint16_t min_bits = min_base[linear];
-                const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                acc += static_cast<float>(sum_a) * block_m * scale_ab;
-            }
-        }
+        const int32_t sum_a = native_vnni_activation_sum_a<FMT>(a4);
+        native_vnni_small_m_accumulate_decoded_block<FMT>(
+            acc,
+            a4,
+            packed_groups,
+            payload,
+            scale_base,
+            min_base,
+            emin_base,
+            linear,
+            scale_ab,
+            sum_a);
     }
 
     return acc;
+}
+
+/**
+ * @brief Compute one ordered split-K partial for each routed expert row.
+ *
+ * Scratch is laid out as `[KB][route][N]`, matching serial GEMV's outer KB
+ * dimension. The first KB plane is therefore also a contiguous `[route][N]`
+ * destination and can be overwritten by the following reducer after each lane
+ * has consumed its own KB-zero value.
+ */
+template <NativeVNNIFormat FMT, bool INDEX_BY_EXPERT_ID = true>
+__global__ void moe_grouped_native_vnni_down_kpart_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ descs,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ partials,
+    int num_active,
+    int N,
+    int K,
+    int k_partitions)
+{
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE split-K down requires a supported format");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    const int k_part = blockIdx.z;
+    if (route >= num_active || k_part >= k_partitions || n >= N)
+        return;
+
+    const size_t partial_index =
+        (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+         static_cast<size_t>(route)) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const int descriptor_index = INDEX_BY_EXPERT_ID ? expert_ids[route] : route;
+    if (descriptor_index < 0)
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const DeviceNativeVNNIMatrixDesc desc = descs[descriptor_index];
+    if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int blocks_per_part =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
+    const int b_start = k_part * blocks_per_part;
+    int b_end = b_start + blocks_per_part;
+    if (b_end > blocks_per_row)
+        b_end = blocks_per_row;
+
+    const int8_t* route_a =
+        A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
+    const float* route_scales =
+        scales_A_blockwise +
+        static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
+    partials[partial_index] = b_start < b_end
+        ? moe_native_vnni_dot_desc_range<FMT>(
+              desc, n, route_a, route_scales, N, K, b_start, b_end)
+        : 0.0f;
+}
+
+/**
+ * @brief Reduce one expert's K partials and publish its rounded route row.
+ *
+ * The loop is deliberately scalar and increasing in KB, exactly matching the
+ * serial M=1 reducer. `route_output` may alias the first KB plane of `partials`:
+ * each lane reads every source for its own `(route,column)` before replacing
+ * that lane's KB-zero value.
+ */
+__global__ void moe_grouped_native_vnni_down_kpart_reduce_kernel(
+    const float* __restrict__ partials,
+    const float* __restrict__ route_weights,
+    float* __restrict__ route_output,
+    int num_active,
+    int N,
+    int k_partitions)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    if (route >= num_active || n >= N)
+        return;
+
+    float expert_sum = 0.0f;
+    #pragma unroll 1
+    for (int k_part = 0; k_part < k_partitions; ++k_part)
+    {
+        const size_t partial_index =
+            (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+             static_cast<size_t>(route)) * static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        expert_sum = rocm_native_vnni_accumulate_rn(
+            expert_sum, partials[partial_index]);
+    }
+
+    route_output[
+        static_cast<size_t>(route) * static_cast<size_t>(N) +
+        static_cast<size_t>(n)] = rocm_native_vnni_weight_route_rn(
+            route_weights[route], expert_sum);
+}
+
+/**
+ * @brief Compute table-backed gate/up partials with serial-M1 K boundaries.
+ */
+template <NativeVNNIFormat FMT>
+__global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ gate_partials,
+    float* __restrict__ up_partials,
+    int num_active,
+    int N,
+    int K,
+    int k_partitions)
+{
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE split-K gate/up requires a supported format");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    const int k_part = blockIdx.z;
+    if (route >= num_active || k_part >= k_partitions || n >= N)
+        return;
+
+    const size_t partial_index =
+        (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+         static_cast<size_t>(route)) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const int expert_id = expert_ids[route];
+    if (expert_id < 0)
+    {
+        gate_partials[partial_index] = 0.0f;
+        up_partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
+    const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+    if (!native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
+    {
+        gate_partials[partial_index] = 0.0f;
+        up_partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int blocks_per_part =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
+    const int b_start = k_part * blocks_per_part;
+    int b_end = b_start + blocks_per_part;
+    if (b_end > blocks_per_row)
+        b_end = blocks_per_row;
+
+    gate_partials[partial_index] = b_start < b_end
+        ? moe_native_vnni_dot_desc_range<FMT>(
+              gate_desc, n, A_int8, scales_A_blockwise,
+              N, K, b_start, b_end)
+        : 0.0f;
+    up_partials[partial_index] = b_start < b_end
+        ? moe_native_vnni_dot_desc_range<FMT>(
+              up_desc, n, A_int8, scales_A_blockwise,
+              N, K, b_start, b_end)
+        : 0.0f;
+}
+
+/**
+ * @brief Publish table/runtime gate/up rows from ordered split-K partials.
+ */
+__global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_kernel(
+    const float* __restrict__ gate_partials,
+    const float* __restrict__ up_partials,
+    const int* __restrict__ expert_ids,
+    float* const* __restrict__ gate_outputs,
+    float* const* __restrict__ up_outputs,
+    int num_active,
+    int N,
+    int k_partitions)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    if (route >= num_active || n >= N)
+        return;
+
+    if (expert_ids[route] < 0)
+    {
+        gate_outputs[route][n] = 0.0f;
+        up_outputs[route][n] = 0.0f;
+        return;
+    }
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    #pragma unroll 1
+    for (int k_part = 0; k_part < k_partitions; ++k_part)
+    {
+        const size_t partial_index =
+            (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+             static_cast<size_t>(route)) * static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        gate_sum = rocm_native_vnni_accumulate_rn(
+            gate_sum, gate_partials[partial_index]);
+        up_sum = rocm_native_vnni_accumulate_rn(
+            up_sum, up_partials[partial_index]);
+    }
+
+    gate_outputs[route][n] = gate_sum;
+    up_outputs[route][n] = up_sum;
 }
 
 template <NativeVNNIFormat FMT>
@@ -2374,8 +3194,15 @@ __global__ void moe_grouped_native_vnni_gate_up_kernel_t(
     if (slot >= num_active || n >= N) return;
 
     const int expert_id = expert_ids[slot];
+    if (expert_id < 0)
+        return;
     const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
     const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+    if (!native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
+    {
+        return;
+    }
 
     gate_outputs[slot][n] = moe_native_vnni_dot_desc<FMT>(
         gate_desc, n, A_int8, scales_A_blockwise, N, K);
@@ -2383,42 +3210,112 @@ __global__ void moe_grouped_native_vnni_gate_up_kernel_t(
         up_desc, n, A_int8, scales_A_blockwise, N, K);
 }
 
-template <NativeVNNIFormat FMT, int FIXED_K_PARTITIONS = 0>
-__global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
+template <NativeVNNIFormat FMT>
+__global__ void moe_grouped_native_vnni_gate_up_runtime_kernel_t(
     const int8_t* __restrict__ A_int8,
     const float* __restrict__ scales_A_blockwise,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
-    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* const* __restrict__ gate_outputs,
+    float* const* __restrict__ up_outputs,
+    int num_active,
+    int N,
+    int K,
+    int num_experts)
+{
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE runtime gate/up requires a supported native-VNNI descriptor");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int slot = blockIdx.y;
+    if (slot >= num_active || n >= N) return;
+
+    const int expert_id = expert_ids[slot];
+    if (expert_id < 0 || expert_id >= num_experts)
+    {
+        gate_outputs[slot][n] = 0.0f;
+        up_outputs[slot][n] = 0.0f;
+        return;
+    }
+
+    const uint32_t execution_bank = moe_runtime_execution_bank(runtime);
+    if (execution_bank > 1u)
+    {
+        gate_outputs[slot][n] = 0.0f;
+        up_outputs[slot][n] = 0.0f;
+        return;
+    }
+    const DeviceMoEPlacementBankView &bank =
+        moe_runtime_placement_banks(runtime)[execution_bank];
+    const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
+    const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
+    if (!native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
+    {
+        gate_outputs[slot][n] = 0.0f;
+        up_outputs[slot][n] = 0.0f;
+        return;
+    }
+
+    gate_outputs[slot][n] = moe_native_vnni_dot_desc<FMT>(
+        gate_desc, n, A_int8, scales_A_blockwise, N, K);
+    up_outputs[slot][n] = moe_native_vnni_dot_desc<FMT>(
+        up_desc, n, A_int8, scales_A_blockwise, N, K);
+}
+
+/**
+ * @brief Compute runtime-placement gate/up partials using serial-M1 K slices.
+ */
+template <NativeVNNIFormat FMT>
+__global__ void moe_grouped_native_vnni_gate_up_runtime_kpart_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
     const int* __restrict__ expert_ids,
     float* __restrict__ gate_partials,
     float* __restrict__ up_partials,
     int num_active,
     int N,
     int K,
+    int num_experts,
     int k_partitions)
 {
     static_assert(NVNNIGroupedMoESupported<FMT>::value,
-                  "Grouped MoE K-partition gate/up requires a supported native-VNNI descriptor");
-    static_assert(FIXED_K_PARTITIONS == 0 || FIXED_K_PARTITIONS == 2 ||
-                      FIXED_K_PARTITIONS == 4 || FIXED_K_PARTITIONS == 8 ||
-                      FIXED_K_PARTITIONS == 16,
-                  "unsupported fixed grouped MoE K-partition count");
+                  "Runtime grouped MoE split-K gate/up requires a supported format");
 
     constexpr int TILE_N = 64;
-    const int effective_k_partitions =
-        (FIXED_K_PARTITIONS != 0) ? FIXED_K_PARTITIONS : k_partitions;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int k_part = blockIdx.y;
-    const int slot = blockIdx.z;
-    if (slot >= num_active || k_part >= effective_k_partitions || n >= N) return;
+    const int route = blockIdx.y;
+    const int k_part = blockIdx.z;
+    if (route >= num_active || k_part >= k_partitions || n >= N)
+        return;
 
-    const int expert_id = expert_ids[slot];
     const size_t partial_index =
-        (static_cast<size_t>(slot) * static_cast<size_t>(effective_k_partitions) + static_cast<size_t>(k_part)) *
-            static_cast<size_t>(N) +
+        (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+         static_cast<size_t>(route)) * static_cast<size_t>(N) +
         static_cast<size_t>(n);
+    const int expert_id = expert_ids[route];
+    if (expert_id < 0 || expert_id >= num_experts)
+    {
+        gate_partials[partial_index] = 0.0f;
+        up_partials[partial_index] = 0.0f;
+        return;
+    }
 
-    if (expert_id < 0)
+    const uint32_t execution_bank = moe_runtime_execution_bank(runtime);
+    if (execution_bank > 1u)
+    {
+        gate_partials[partial_index] = 0.0f;
+        up_partials[partial_index] = 0.0f;
+        return;
+    }
+    const DeviceMoEPlacementBankView &bank =
+        moe_runtime_placement_banks(runtime)[execution_bank];
+    const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
+    const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
+    if (!native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
     {
         gate_partials[partial_index] = 0.0f;
         up_partials[partial_index] = 0.0f;
@@ -2426,120 +3323,853 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
     }
 
     const int blocks_per_row = K / 32;
-    const int blocks_per_part = (blocks_per_row + effective_k_partitions - 1) / effective_k_partitions;
+    const int blocks_per_part =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
     const int b_start = k_part * blocks_per_part;
     int b_end = b_start + blocks_per_part;
-    if (b_end > blocks_per_row) b_end = blocks_per_row;
+    if (b_end > blocks_per_row)
+        b_end = blocks_per_row;
 
-    if (b_start >= b_end)
+    gate_partials[partial_index] = b_start < b_end
+        ? moe_native_vnni_dot_desc_range<FMT>(
+              gate_desc, n, A_int8, scales_A_blockwise,
+              N, K, b_start, b_end)
+        : 0.0f;
+    up_partials[partial_index] = b_start < b_end
+        ? moe_native_vnni_dot_desc_range<FMT>(
+              up_desc, n, A_int8, scales_A_blockwise,
+              N, K, b_start, b_end)
+        : 0.0f;
+}
+
+template <NativeVNNIFormat FMT>
+__global__ void moe_grouped_native_vnni_down_runtime_route_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ route_weights,
+    float* __restrict__ route_output,
+    int num_active,
+    int N,
+    int K,
+    int num_experts)
+{
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE runtime down requires a supported native-VNNI descriptor");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int slot = blockIdx.y;
+    if (slot >= num_active || n >= N)
+        return;
+
+    const int expert_id = expert_ids[slot];
+    const size_t output_index =
+        static_cast<size_t>(slot) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    if (expert_id < 0 || expert_id >= num_experts)
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+
+    const uint32_t execution_bank = moe_runtime_execution_bank(runtime);
+    if (execution_bank > 1u)
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+    const int blocks_per_row = K / 32;
+    const DeviceMoEPlacementBankView &bank =
+        moe_runtime_placement_banks(runtime)[execution_bank];
+    const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
+    if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+
+    const int8_t* a_slot = A_int8 + static_cast<size_t>(slot) * K;
+    const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+    const float expert_acc = moe_native_vnni_dot_desc<FMT>(
+        desc, n, a_slot, scale_slot, N, K);
+    route_output[output_index] = rocm_native_vnni_weight_route_rn(
+        route_weights[slot], expert_acc);
+}
+
+/**
+ * @brief Compute runtime-placement down partials using serial-M1 K slices.
+ */
+template <NativeVNNIFormat FMT>
+__global__ void moe_grouped_native_vnni_down_runtime_kpart_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    int k_partitions)
+{
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Runtime grouped MoE split-K down requires a supported format");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    const int k_part = blockIdx.z;
+    if (route >= num_active || k_part >= k_partitions || n >= N)
+        return;
+
+    const size_t partial_index =
+        (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+         static_cast<size_t>(route)) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const int expert_id = expert_ids[route];
+    if (expert_id < 0 || expert_id >= num_experts)
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const uint32_t execution_bank = moe_runtime_execution_bank(runtime);
+    if (execution_bank > 1u)
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
+    const DeviceMoEPlacementBankView &bank =
+        moe_runtime_placement_banks(runtime)[execution_bank];
+    const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
+    if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int blocks_per_part =
+        (blocks_per_row + k_partitions - 1) / k_partitions;
+    const int b_start = k_part * blocks_per_part;
+    int b_end = b_start + blocks_per_part;
+    if (b_end > blocks_per_row)
+        b_end = blocks_per_row;
+
+    const int8_t* route_a =
+        A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
+    const float* route_scales =
+        scales_A_blockwise +
+        static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
+    partials[partial_index] = b_start < b_end
+        ? moe_native_vnni_dot_desc_range<FMT>(
+              desc, n, route_a, route_scales, N, K, b_start, b_end)
+        : 0.0f;
+}
+
+/**
+ * @brief Return the canonical source policy carried by a device descriptor.
+ *
+ * Q8_1 and Q8_K keep distinct source identities but intentionally share the
+ * Q8_0 accelerator arithmetic policy.  Expanded codebook 23 never supplies a
+ * policy of its own: its authoritative source identity selects the reduction
+ * tree that existed before migration.
+ */
+__device__ __forceinline__ uint8_t
+moe_native_vnni_descriptor_policy_codebook(
+    const DeviceNativeVNNIMatrixDesc* desc)
+{
+    if (!desc)
+        return 0xffu;
+    uint8_t policy = desc->source_identity_present
+                         ? desc->source_codebook_id
+                         : desc->codebook_id;
+    if (policy == 20 || policy == 21)
+        policy = 19;
+    return policy;
+}
+
+/**
+ * @brief Resolve one descriptor's exact serial-M1 K-partition count on device.
+ */
+__device__ __forceinline__ int moe_native_vnni_descriptor_k_partitions(
+    const DeviceNativeVNNIMatrixDesc* desc,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31)
+{
+    const uint8_t policy =
+        moe_native_vnni_descriptor_policy_codebook(desc);
+    if (policy >= ROCmMoESerialM1PolicyTable::kCodebookCapacity)
+        return 0;
+
+    uint64_t packed = 0;
+    switch (policy >> 3u)
+    {
+    case 0:
+        packed = policy_partitions_0_7;
+        break;
+    case 1:
+        packed = policy_partitions_8_15;
+        break;
+    case 2:
+        packed = policy_partitions_16_23;
+        break;
+    case 3:
+        packed = policy_partitions_24_31;
+        break;
+    default:
+        return 0;
+    }
+    const unsigned shift = static_cast<unsigned>(policy & 7u) * 8u;
+    return static_cast<int>((packed >> shift) & uint64_t{0xff});
+}
+
+/**
+ * @brief Decode one descriptor using its physical execution codebook.
+ *
+ * The switch is uniform for every lane in a `(route, K-partition)` block.  It
+ * therefore preserves the specialized decoder bodies while allowing a single
+ * captured graph to consume compact and streamed-expanded expert slots.
+ */
+__device__ __forceinline__ float moe_native_vnni_dot_desc_range_dynamic(
+    const DeviceNativeVNNIMatrixDesc* desc,
+    int n,
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    int N,
+    int K,
+    int b_start,
+    int b_end)
+{
+    if (!desc)
+        return 0.0f;
+    switch (static_cast<NativeVNNIFormat>(desc->codebook_id))
+    {
+    case NVNNI_Q4_0:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q4_0>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ4_NL:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ4_NL>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_Q4_1:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q4_1>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_Q5_0:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q5_0>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_Q5_1:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q5_1>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_Q6_K:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q6_K>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_Q3_K:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q3_K>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_Q2_K:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q2_K>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ3_S:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ3_S>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ3_XXS:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ3_XXS>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ2_S:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ2_S>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ2_XS:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ2_XS>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ2_XXS:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ2_XXS>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ1_S:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ1_S>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_IQ1_M:
+        return moe_native_vnni_dot_desc_range<NVNNI_IQ1_M>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_Q8_0:
+        return moe_native_vnni_dot_desc_range<NVNNI_Q8_0>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_EXPANDED_INT8_MIN:
+        return moe_native_vnni_dot_desc_range<NVNNI_EXPANDED_INT8_MIN>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    default:
+        // Descriptor publication validates this before the graph can observe it.
+        __builtin_trap();
+        return 0.0f;
+    }
+}
+
+/**
+ * @brief Load gate/up descriptors from a static table or the active runtime bank.
+ */
+template <bool RUNTIME_TABLE>
+__device__ __forceinline__ bool moe_native_vnni_load_gate_up_descriptors(
+    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    int expert_id,
+    int num_experts,
+    const DeviceNativeVNNIMatrixDesc*& gate_desc,
+    const DeviceNativeVNNIMatrixDesc*& up_desc)
+{
+    if (expert_id < 0 || expert_id >= num_experts)
+        return false;
+    if constexpr (RUNTIME_TABLE)
+    {
+        const uint32_t execution_bank =
+            moe_runtime_execution_bank(runtime);
+        if (execution_bank > 1u)
+            return false;
+        const DeviceMoEPlacementBankView& bank =
+            moe_runtime_placement_banks(runtime)[execution_bank];
+        gate_desc = &bank.experts[expert_id].gate;
+        up_desc = &bank.experts[expert_id].up;
+    }
+    else
+    {
+        gate_desc = &gate_descs[expert_id];
+        up_desc = &up_descs[expert_id];
+    }
+    return true;
+}
+
+/** @brief Load a down descriptor from a static table or active runtime bank. */
+template <bool RUNTIME_TABLE>
+__device__ __forceinline__ bool moe_native_vnni_load_down_descriptor(
+    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    int expert_id,
+    int num_experts,
+    const DeviceNativeVNNIMatrixDesc*& down_desc)
+{
+    if (expert_id < 0 || expert_id >= num_experts)
+        return false;
+    if constexpr (RUNTIME_TABLE)
+    {
+        const uint32_t execution_bank =
+            moe_runtime_execution_bank(runtime);
+        if (execution_bank > 1u)
+            return false;
+        const DeviceMoEPlacementBankView& bank =
+            moe_runtime_placement_banks(runtime)[execution_bank];
+        down_desc = &bank.experts[expert_id].down;
+    }
+    else
+    {
+        down_desc = &down_descs[expert_id];
+    }
+    return true;
+}
+
+/**
+ * @brief Produce descriptor-local gate/up split-K partials for a stable graph.
+ */
+template <bool RUNTIME_TABLE>
+__global__ void moe_grouped_native_vnni_gate_up_descriptor_kpart_kernel(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ gate_partials,
+    float* __restrict__ up_partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31,
+    int maximum_k_partitions)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    const int k_part = blockIdx.z;
+    if (route >= num_active || n >= N ||
+        k_part >= maximum_k_partitions)
+    {
+        return;
+    }
+
+    const size_t partial_index =
+        (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+         static_cast<size_t>(route)) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const DeviceNativeVNNIMatrixDesc* gate_desc = nullptr;
+    const DeviceNativeVNNIMatrixDesc* up_desc = nullptr;
+    if (!moe_native_vnni_load_gate_up_descriptors<RUNTIME_TABLE>(
+            gate_descs, up_descs, runtime, expert_ids[route], num_experts,
+            gate_desc, up_desc))
     {
         gate_partials[partial_index] = 0.0f;
         up_partials[partial_index] = 0.0f;
         return;
     }
 
-    const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
-    const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+    const int gate_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            gate_desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    const int up_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            up_desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    if (gate_partitions <= 0 || up_partitions <= 0)
+    {
+        // A published descriptor without generated arithmetic evidence is fatal.
+        __builtin_trap();
+        return;
+    }
 
-    gate_partials[partial_index] = moe_native_vnni_dot_desc_range<FMT>(
-        gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-    up_partials[partial_index] = moe_native_vnni_dot_desc_range<FMT>(
-        up_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    const int blocks_per_row = K / 32;
+    if (k_part < gate_partitions)
+    {
+        const int blocks_per_part =
+            (blocks_per_row + gate_partitions - 1) / gate_partitions;
+        const int b_start = k_part * blocks_per_part;
+        const int b_end = min(blocks_per_row, b_start + blocks_per_part);
+        gate_partials[partial_index] = b_start < b_end
+            ? moe_native_vnni_dot_desc_range_dynamic(
+                  gate_desc, n, A_int8, scales_A_blockwise,
+                  N, K, b_start, b_end)
+            : 0.0f;
+    }
+    else
+    {
+        gate_partials[partial_index] = 0.0f;
+    }
+
+    if (k_part < up_partitions)
+    {
+        const int blocks_per_part =
+            (blocks_per_row + up_partitions - 1) / up_partitions;
+        const int b_start = k_part * blocks_per_part;
+        const int b_end = min(blocks_per_row, b_start + blocks_per_part);
+        up_partials[partial_index] = b_start < b_end
+            ? moe_native_vnni_dot_desc_range_dynamic(
+                  up_desc, n, A_int8, scales_A_blockwise,
+                  N, K, b_start, b_end)
+            : 0.0f;
+    }
+    else
+    {
+        up_partials[partial_index] = 0.0f;
+    }
 }
 
-__global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_kernel(
+/**
+ * @brief Reduce descriptor-local gate/up partials in each source policy's order.
+ */
+template <bool RUNTIME_TABLE>
+__global__ void moe_grouped_native_vnni_gate_up_descriptor_reduce_kernel(
     const float* __restrict__ gate_partials,
     const float* __restrict__ up_partials,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
     float* const* __restrict__ gate_outputs,
     float* const* __restrict__ up_outputs,
     int num_active,
     int N,
-    int k_partitions)
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31)
 {
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int slot = blockIdx.y;
-    if (slot >= num_active || n >= N) return;
+    const int route = blockIdx.y;
+    if (route >= num_active || n >= N)
+        return;
 
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-    const size_t slot_base = static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
-    for (int k_part = 0; k_part < k_partitions; ++k_part)
+    const DeviceNativeVNNIMatrixDesc* gate_desc = nullptr;
+    const DeviceNativeVNNIMatrixDesc* up_desc = nullptr;
+    if (!moe_native_vnni_load_gate_up_descriptors<RUNTIME_TABLE>(
+            gate_descs, up_descs, runtime, expert_ids[route], num_experts,
+            gate_desc, up_desc))
     {
-        const size_t idx = slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
-        gate_sum += gate_partials[idx];
-        up_sum += up_partials[idx];
+        gate_outputs[route][n] = 0.0f;
+        up_outputs[route][n] = 0.0f;
+        return;
     }
 
-    gate_outputs[slot][n] = gate_sum;
-    up_outputs[slot][n] = up_sum;
+    const int gate_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            gate_desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    const int up_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            up_desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    if (gate_partitions <= 0 || up_partitions <= 0)
+    {
+        __builtin_trap();
+        return;
+    }
+
+    // A one-partition serial launch publishes the dot directly.  Copying its
+    // sole partial avoids changing a possible signed zero through `0 + value`.
+    const size_t first_partial_index =
+        static_cast<size_t>(route) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    float gate_sum = gate_partials[first_partial_index];
+    if (gate_partitions > 1)
+    {
+        gate_sum = 0.0f;
+        #pragma unroll 1
+        for (int part = 0; part < gate_partitions; ++part)
+        {
+            const size_t partial_index =
+                (static_cast<size_t>(part) *
+                     static_cast<size_t>(num_active) +
+                 static_cast<size_t>(route)) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            gate_sum = rocm_native_vnni_accumulate_rn(
+                gate_sum, gate_partials[partial_index]);
+        }
+    }
+
+    float up_sum = up_partials[first_partial_index];
+    if (up_partitions > 1)
+    {
+        up_sum = 0.0f;
+        #pragma unroll 1
+        for (int part = 0; part < up_partitions; ++part)
+        {
+            const size_t partial_index =
+                (static_cast<size_t>(part) *
+                     static_cast<size_t>(num_active) +
+                 static_cast<size_t>(route)) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            up_sum = rocm_native_vnni_accumulate_rn(
+                up_sum, up_partials[partial_index]);
+        }
+    }
+
+    gate_outputs[route][n] = gate_sum;
+    up_outputs[route][n] = up_sum;
 }
 
-template <int K_PARTITIONS>
-__global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_swiglu_quant_kernel(
+/**
+ * @brief Reduce gate/up partials and publish the exact Q8 SwiGLU row in-place.
+ *
+ * Production grouped M=1 decode consumes gate/up only through the following
+ * down projection, for both explicit routing and runtime-table routing.
+ * Materializing two FP32 rows and launching a second kernel to read them back
+ * is therefore avoidable.  This reducer retains the exact descriptor-local
+ * ascending-partition additions used above, then performs the same 32-value
+ * SwiGLU maximum reduction and Q8 rounding as
+ * `moe_grouped_swiglu_quantize_blockwise_kernel`.
+ *
+ * One 64-lane workgroup owns two independent Q8 blocks.  XOR masks never set
+ * wavefront bit 5, so the lower and upper 32 lanes cannot exchange values on a
+ * wave64 device.  Invalid routes intentionally leave their Q8 scratch
+ * untouched: the down kernel authenticates the same negative expert id before
+ * reading that scratch and publishes a zero canonical route row.
+ */
+template <bool RUNTIME_TABLE>
+__global__ void
+moe_grouped_native_vnni_gate_up_descriptor_reduce_swiglu_q8_kernel(
     const float* __restrict__ gate_partials,
     const float* __restrict__ up_partials,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
     int8_t* __restrict__ swiglu_int8,
     float* __restrict__ swiglu_scales,
     int num_active,
-    int N)
+    int N,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31)
 {
-    static_assert(K_PARTITIONS == 2 || K_PARTITIONS == 4 ||
-                      K_PARTITIONS == 8 || K_PARTITIONS == 16,
-                  "unsupported grouped MoE K-partition count");
+    constexpr int TILE_N = 64;
+    constexpr int Q8_BLOCK = 32;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    if (route >= num_active)
+        return;
 
-    const int slot = blockIdx.y;
-    if (slot >= num_active) return;
-
-    constexpr int BLOCK_SIZE = 32;
-    const int blocks_per_row = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    const int lane = threadIdx.x & 31;
-    const int half_wave = threadIdx.x >> 5;
-    const int block_idx = blockIdx.x * 2 + half_wave;
-    if (block_idx >= blocks_per_row) return;
-
-    int8_t* row_int8 = swiglu_int8 + static_cast<size_t>(slot) * static_cast<size_t>(N);
-    float* row_scales = swiglu_scales + static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row);
-    const size_t slot_base = static_cast<size_t>(slot) * static_cast<size_t>(K_PARTITIONS) * static_cast<size_t>(N);
-
-    const int n = block_idx * BLOCK_SIZE + lane;
-    float val = 0.0f;
-    if (n < N)
+    const DeviceNativeVNNIMatrixDesc* gate_desc = nullptr;
+    const DeviceNativeVNNIMatrixDesc* up_desc = nullptr;
+    if (!moe_native_vnni_load_gate_up_descriptors<RUNTIME_TABLE>(
+            gate_descs, up_descs, runtime, expert_ids[route], num_experts,
+            gate_desc, up_desc))
     {
-        float gate_sum = 0.0f;
-        float up_sum = 0.0f;
-        #pragma unroll
-        for (int k_part = 0; k_part < K_PARTITIONS; ++k_part)
-        {
-            const size_t idx =
-                slot_base +
-                static_cast<size_t>(k_part) * static_cast<size_t>(N) +
-                static_cast<size_t>(n);
-            gate_sum += gate_partials[idx];
-            up_sum += up_partials[idx];
-        }
-        val = (gate_sum / (1.0f + expf(-gate_sum))) * up_sum;
+        return;
     }
 
-    float abs_val = fabsf(val);
+    const int gate_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            gate_desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    const int up_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            up_desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    if (gate_partitions <= 0 || up_partitions <= 0)
+    {
+        __builtin_trap();
+        return;
+    }
+
+    const bool active_lane = n < N;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    if (active_lane)
+    {
+        /*
+         * Preserve the one-partition signed-zero rule and the exact
+         * increasing-partition FP32 addition order of the standalone reducer.
+         */
+        const size_t first_partial_index =
+            static_cast<size_t>(route) * static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        gate_sum = gate_partials[first_partial_index];
+        if (gate_partitions > 1)
+        {
+            gate_sum = 0.0f;
+            #pragma unroll 1
+            for (int part = 0; part < gate_partitions; ++part)
+            {
+                const size_t partial_index =
+                    (static_cast<size_t>(part) *
+                         static_cast<size_t>(num_active) +
+                     static_cast<size_t>(route)) * static_cast<size_t>(N) +
+                    static_cast<size_t>(n);
+                gate_sum = rocm_native_vnni_accumulate_rn(
+                    gate_sum, gate_partials[partial_index]);
+            }
+        }
+
+        up_sum = up_partials[first_partial_index];
+        if (up_partitions > 1)
+        {
+            up_sum = 0.0f;
+            #pragma unroll 1
+            for (int part = 0; part < up_partitions; ++part)
+            {
+                const size_t partial_index =
+                    (static_cast<size_t>(part) *
+                         static_cast<size_t>(num_active) +
+                     static_cast<size_t>(route)) * static_cast<size_t>(N) +
+                    static_cast<size_t>(n);
+                up_sum = rocm_native_vnni_accumulate_rn(
+                    up_sum, up_partials[partial_index]);
+            }
+        }
+    }
+
+    const float swiglu = active_lane
+                             ? llaminar2::rocm::decode_equivalent::swigluValue(
+                                   gate_sum, up_sum)
+                             : 0.0f;
+    float block_abs_max = fabsf(swiglu);
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
-        abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
+        block_abs_max = fmaxf(
+            block_abs_max,
+            __shfl_xor(block_abs_max, mask));
 
-    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
-    const float inv_scale = 1.0f / scale;
+    if (!active_lane)
+        return;
 
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(block_abs_max);
+    const int q8_block = n / Q8_BLOCK;
+    const int lane = threadIdx.x & (Q8_BLOCK - 1);
     if (lane == 0)
-        row_scales[block_idx] = scale;
-
-    if (n < N)
     {
-        const float qval = val * inv_scale;
-        row_int8[n] = static_cast<int8_t>(
-            rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        swiglu_scales[
+            static_cast<size_t>(route) * static_cast<size_t>(N / Q8_BLOCK) +
+            static_cast<size_t>(q8_block)] = scale;
     }
+    swiglu_int8[
+        static_cast<size_t>(route) * static_cast<size_t>(N) +
+        static_cast<size_t>(n)] = static_cast<int8_t>(
+            llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+                swiglu, scale));
 }
 
+/**
+ * @brief Produce descriptor-local down partials for table or runtime routing.
+ */
+template <bool RUNTIME_TABLE>
+__global__ void moe_grouped_native_vnni_down_descriptor_kpart_kernel(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31,
+    int maximum_k_partitions)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    const int k_part = blockIdx.z;
+    if (route >= num_active || n >= N ||
+        k_part >= maximum_k_partitions)
+    {
+        return;
+    }
+
+    const size_t partial_index =
+        (static_cast<size_t>(k_part) * static_cast<size_t>(num_active) +
+         static_cast<size_t>(route)) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const DeviceNativeVNNIMatrixDesc* desc = nullptr;
+    if (!moe_native_vnni_load_down_descriptor<RUNTIME_TABLE>(
+            down_descs, runtime, expert_ids[route], num_experts, desc))
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const int route_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    if (route_partitions <= 0)
+    {
+        __builtin_trap();
+        return;
+    }
+    if (k_part >= route_partitions)
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int blocks_per_part =
+        (blocks_per_row + route_partitions - 1) / route_partitions;
+    const int b_start = k_part * blocks_per_part;
+    const int b_end = min(blocks_per_row, b_start + blocks_per_part);
+    const int8_t* route_a =
+        A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
+    const float* route_scales =
+        scales_A_blockwise +
+        static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
+    partials[partial_index] = b_start < b_end
+        ? moe_native_vnni_dot_desc_range_dynamic(
+              desc, n, route_a, route_scales, N, K, b_start, b_end)
+        : 0.0f;
+}
+
+/**
+ * @brief Reduce one route's descriptor-local K tree, then apply router weight.
+ */
+template <bool RUNTIME_TABLE>
+__global__ void moe_grouped_native_vnni_down_descriptor_reduce_kernel(
+    const float* __restrict__ partials,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ route_weights,
+    float* __restrict__ route_output,
+    int num_active,
+    int N,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31)
+{
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int route = blockIdx.y;
+    if (route >= num_active || n >= N)
+        return;
+
+    const size_t output_index =
+        static_cast<size_t>(route) * static_cast<size_t>(N) +
+        static_cast<size_t>(n);
+    const DeviceNativeVNNIMatrixDesc* desc = nullptr;
+    if (!moe_native_vnni_load_down_descriptor<RUNTIME_TABLE>(
+            down_descs, runtime, expert_ids[route], num_experts, desc))
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
+
+    const int route_partitions =
+        moe_native_vnni_descriptor_k_partitions(
+            desc,
+            policy_partitions_0_7,
+            policy_partitions_8_15,
+            policy_partitions_16_23,
+            policy_partitions_24_31);
+    if (route_partitions <= 0)
+    {
+        __builtin_trap();
+        return;
+    }
+
+    float expert_sum = partials[output_index];
+    if (route_partitions > 1)
+    {
+        expert_sum = 0.0f;
+        #pragma unroll 1
+        for (int part = 0; part < route_partitions; ++part)
+        {
+            const size_t partial_index =
+                (static_cast<size_t>(part) *
+                     static_cast<size_t>(num_active) +
+                 static_cast<size_t>(route)) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            expert_sum = rocm_native_vnni_accumulate_rn(
+                expert_sum, partials[partial_index]);
+        }
+    }
+    route_output[output_index] = rocm_native_vnni_weight_route_rn(
+        route_weights[route], expert_sum);
+}
 
 // ============================================================================
 // Reduce kernel: sum K-partitions from scatter buffer to final output.
@@ -2564,49 +4194,33 @@ __global__ void gemv_native_vnni_reduce_kernel_t(
         float sum = 0.0f;
         #pragma unroll 16
         for (int kb = 0; kb < kblocks; ++kb)
-            sum += d_partial_fp32[static_cast<size_t>(kb) * N + n];
+            sum = rocm_native_vnni_accumulate_rn(
+                sum,
+                d_partial_fp32[static_cast<size_t>(kb) * N + n]);
 
         d_C_fp32[n] = sum;
     }
 }
 
+/**
+ * @brief Publishes one runtime verifier row from ordered split-K partials.
+ *
+ * Grid Y owns the verifier row.  Consequently the reducer's register state,
+ * launch shape, and ascending-KB addition order do not depend on the total
+ * speculative depth.  This is the same reduction tree used by serial M=1
+ * decode, applied independently to each row's `[KB][M][N]` partial slice.
+ */
 template <int TILE_N, int CPT>
-__global__ void gemv_native_vnni_reduce_m2_kernel_t(
-    const float* __restrict__ d_partial_fp32,    // [KB × 2 × N] partial buffer
-    float* __restrict__ d_C_fp32,                // [2 × N] output
-    int N, int kblocks)
-{
-    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
-
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
-    {
-        const int n = n_base + c;
-        if (n >= N) return;
-
-        float sum0 = 0.0f;
-        float sum1 = 0.0f;
-        #pragma unroll 16
-        for (int kb = 0; kb < kblocks; ++kb)
-        {
-            sum0 += d_partial_fp32[(static_cast<size_t>(kb) * 2u) * N + n];
-            sum1 += d_partial_fp32[(static_cast<size_t>(kb) * 2u + 1u) * N + n];
-        }
-
-        d_C_fp32[n] = sum0;
-        d_C_fp32[static_cast<size_t>(N) + n] = sum1;
-    }
-}
-
-template <int TILE_N, int CPT, int SMALL_M>
 __global__ void gemv_native_vnni_reduce_small_m_kernel_t(
-    const float* __restrict__ d_partial_fp32,    // [KB × SMALL_M × N] partial buffer
-    float* __restrict__ d_C_fp32,                // [SMALL_M × N] output
-    int N, int kblocks)
+    const float* __restrict__ d_partial_fp32,    // [KB x M x N] partial buffer
+    float* __restrict__ d_C_fp32,                // [M x N] output
+    int M, int N, int kblocks, llaminar2::DeviceRowRange rows)
 {
-    static_assert(SMALL_M >= 2 && SMALL_M <= 4, "small-M native-VNNI supports M in {2,3,4}");
-
+    const int row = static_cast<int>(blockIdx.y);
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    // Never read inactive partials left by an earlier, wider replay.
+    if (row >= rows.activeRows())
+        return;
 
     #pragma unroll
     for (int c = 0; c < CPT; ++c)
@@ -2615,26 +4229,54 @@ __global__ void gemv_native_vnni_reduce_small_m_kernel_t(
         if (n >= N)
             continue;
 
-        #pragma unroll
-        for (int row = 0; row < SMALL_M; ++row)
+        float sum = 0.0f;
+        #pragma unroll 16
+        for (int kb = 0; kb < kblocks; ++kb)
         {
-            float sum = 0.0f;
-            #pragma unroll 16
-            for (int kb = 0; kb < kblocks; ++kb)
-            {
-                const size_t idx =
-                    (static_cast<size_t>(kb) * SMALL_M + static_cast<size_t>(row)) *
-                    static_cast<size_t>(N) + static_cast<size_t>(n);
-                sum += d_partial_fp32[idx];
-            }
-            d_C_fp32[static_cast<size_t>(row) * N + n] = sum;
+            const size_t idx =
+                (static_cast<size_t>(kb) * static_cast<size_t>(M) +
+                 static_cast<size_t>(row)) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            sum = rocm_native_vnni_accumulate_rn(
+                sum, d_partial_fp32[idx]);
         }
+        d_C_fp32[static_cast<size_t>(row) * N + n] = sum;
     }
 }
 
 constexpr int NVNNI_SMALL_M_MAX_BATCH = 8;
-constexpr int NVNNI_SMALL_M_GRAPH_SAFE_KB_CAP = 64;
+constexpr int NVNNI_SMALL_M_GRAPH_SAFE_KB_CAP =
+    llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
+constexpr int NVNNI_VERIFIER_SHORT_ROWS_PER_TILE = 2;
+constexpr int NVNNI_VERIFIER_WIDE_ROWS_PER_TILE = 4;
 
+/**
+ * @brief Select the measured verifier-row reuse geometry for a runtime batch.
+ *
+ * M=2 retains the two-row specialization because a four-row accumulator adds
+ * idle predicates without any extra weight reuse.  M>=3 uses four rows: this
+ * matches the common four-row transaction and amortizes each packed-weight
+ * decode across its live rows. The launch family owns how these fixed tiles
+ * are scheduled; counted fused bundles use a bounded grid with live iteration.
+ * This arithmetic reuse geometry is total for every positive runtime M.
+ *
+ * @param m Number of grouped verifier rows in the launch.
+ * @return Compile-time kernel geometry selected by the host launch wrapper.
+ */
+constexpr int native_vnni_verifier_rows_per_tile(int m)
+{
+    return m <= NVNNI_VERIFIER_SHORT_ROWS_PER_TILE
+        ? NVNNI_VERIFIER_SHORT_ROWS_PER_TILE
+        : NVNNI_VERIFIER_WIDE_ROWS_PER_TILE;
+}
+
+/**
+ * @brief Per-launch projection inventory with one borrowed row owner.
+ *
+ * Each physical scratch tile copies this descriptor, rebases only its outputs,
+ * and slices rows in the original controller coordinate system. No device
+ * pointer is rebound during replay and no projection maintains its own count.
+ */
 struct NativeVNNISmallMBatchedArgs
 {
     int num_projections = 0;
@@ -2649,8 +4291,17 @@ struct NativeVNNISmallMBatchedArgs
     float* output[NVNNI_SMALL_M_MAX_BATCH] = {};
     float* partial[NVNNI_SMALL_M_MAX_BATCH] = {};
     uint8_t codebook[NVNNI_SMALL_M_MAX_BATCH] = {};
+    // Preserve the aligned projection planes at the front of the launch ABI.
+    // Row admission dies before decoder dispatch, unlike those live operands.
+    llaminar2::DeviceRowRange rows; ///< Required physical/live row contract.
 };
 
+/**
+ * @brief Resolve the projection owning one captured column tile.
+ * @param args Immutable ordered column intervals and borrowed operand planes.
+ * @param global_tile Workgroup X coordinate in the concatenated bundle grid.
+ * @return Uniform projection index; launch validation guarantees membership.
+ */
 __device__ __forceinline__ int native_vnni_batched_projection_for_tile(
     const NativeVNNISmallMBatchedArgs& args,
     int global_tile)
@@ -2663,6 +4314,60 @@ __device__ __forceinline__ int native_vnni_batched_projection_for_tile(
             proj = i;
     }
     return proj;
+}
+
+
+/**
+ * @brief One resolved projection, borrowed by every physical decoder arm.
+ *
+ * Resolve the bundle before switching codebooks so the eight-projection
+ * pointer tables need not stay live through each inlined decoder. The partial
+ * pointer already names this CTA's physical K plane, never a live-row stride.
+ */
+struct NativeVNNISmallMProjection
+{
+    unsigned n; ///< Validated positive physical output width.
+    unsigned column_base; ///< This lane's nonnegative output column, including tail lanes.
+    const uint8_t* payload; ///< Borrowed packed weight blocks.
+    const uint16_t* scales; ///< Primary scale plane.
+    const uint16_t* mins; ///< Optional secondary/minimum plane.
+    const uint32_t* emins; ///< Optional extended minima.
+    const float* bias; ///< Optional output bias.
+    float* output; ///< This physical row tile's output.
+    float* partial; ///< This CTA's split-K plane, or null for direct output.
+};
+
+/** @brief Capture-time publication contract; producers never need both destinations. */
+enum class NativeVNNIVerifierPublication : uint8_t { DirectOutput, OrderedPartial };
+
+/**
+ * @brief Resolve one lane's projection before entering a format decoder.
+ * @param args Captured bundle inventory; no device allocation is performed.
+ * @param projection Bundle index selected uniformly by this workgroup.
+ * @param physical_m Physical scratch stride, independent of live rows.
+ * @return Borrowed operands with the physical split-K plane already selected.
+ */
+template <int TILE_N, int CPT, NativeVNNIVerifierPublication Publication>
+__device__ __forceinline__ NativeVNNISmallMProjection native_vnni_resolve_small_m_projection(
+    const NativeVNNISmallMBatchedArgs& args, int projection,
+    int physical_m)
+{
+    const auto n = static_cast<unsigned>(args.N[projection]);
+    const auto local_tile = blockIdx.x - static_cast<unsigned>(args.grid_offsets[projection]);
+    float* partial = nullptr;
+    float* output = nullptr;
+    const float* bias = nullptr;
+    if constexpr (Publication == NativeVNNIVerifierPublication::OrderedPartial)
+        partial = args.partial[projection] + static_cast<size_t>(blockIdx.y) * physical_m * n;
+    else
+    {
+        output = args.output[projection];
+        bias = args.bias[projection];
+    }
+    return {n, local_tile * TILE_N + threadIdx.x * CPT,
+            args.payload[projection], args.scales[projection],
+            args.mins[projection], args.emins[projection],
+            bias, output, partial};
 }
 
 template <NativeVNNIFormat FMT>
@@ -2720,10 +4425,96 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
         const uint16_t scale_hi_bits = min_base[linear];
         const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
         const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-        f_acc += (static_cast<float>(acc_lo) * scale_lo +
-                  static_cast<float>(acc_hi) * scale_hi) * scale_ab;
-        f_acc += moe_native_vnni_dual_scale_correction<FMT>(
-            a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
+        // Corrected formats form one complete block contribution before the
+        // row update. This is the same publication boundary used by CUDA and
+        // prevents a backend-specific extra rounding against the running row.
+        if constexpr (Traits::is_dual_scale_asym)
+        {
+            constexpr int32_t ones = 0x01010101;
+            int32_t sum_a_lo = 0;
+            int32_t sum_a_hi = 0;
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+                sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
+            #pragma unroll
+            for (int g = 4; g < 8; ++g)
+                sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
+
+            float min_lo;
+            float min_hi;
+            if constexpr (Traits::needs_emin_array)
+            {
+                const uint32_t emin_packed = emin_base[linear];
+                const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
+                const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
+                min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
+                min_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
+            }
+            else
+            {
+                min_lo = 0.0f;
+                min_hi = 0.0f;
+            }
+            f_acc = rocm_native_vnni_commit_corrected_dual_scale_block(
+                f_acc,
+                acc_lo,
+                acc_hi,
+                scale_lo,
+                scale_hi,
+                sum_a_lo,
+                sum_a_hi,
+                min_lo,
+                min_hi,
+                scale_ab);
+        }
+
+        else if constexpr (FMT == NVNNI_IQ1_M)
+        {
+            constexpr float IQ1S_DELTA = 0.125f;
+            constexpr int32_t ones = 0x01010101;
+            const uint8_t qh0 = payload[4];
+            const uint8_t qh1 = payload[5];
+
+            const int32_t sa_g0 = __builtin_amdgcn_sdot4(
+                a4[1], ones, __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
+            const int32_t sa_g1 = __builtin_amdgcn_sdot4(
+                a4[3], ones, __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
+            const int32_t sa_g2 = __builtin_amdgcn_sdot4(
+                a4[5], ones, __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
+            const int32_t sa_g3 = __builtin_amdgcn_sdot4(
+                a4[7], ones, __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+
+            const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+            f_acc = rocm_native_vnni_commit_iq1_m_block(
+                f_acc,
+                acc_lo,
+                acc_hi,
+                sa_g0,
+                sa_g1,
+                sa_g2,
+                sa_g3,
+                d0,
+                d1,
+                d2,
+                d3,
+                scale_lo,
+                scale_hi,
+                scale_ab);
+        }
+        else
+        {
+            f_acc = rocm_native_vnni_commit_dual_scale_block(
+                f_acc,
+                acc_lo,
+                acc_hi,
+                scale_lo,
+                scale_hi,
+                scale_ab);
+        }
     }
     else
     {
@@ -2734,13 +4525,22 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
 
         const uint16_t scale_bits = scale_base[linear];
         const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-        f_acc += static_cast<float>(block_acc) * block_d * scale_ab;
-
         if constexpr (Traits::is_asymmetric)
         {
             const uint16_t min_bits = min_base[linear];
             const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-            f_acc += static_cast<float>(sum_a) * block_m * scale_ab;
+            f_acc = rocm_native_vnni_commit_corrected_single_scale_block(
+                f_acc,
+                block_acc,
+                block_d,
+                sum_a,
+                block_m,
+                scale_ab);
+        }
+        else
+        {
+            f_acc = rocm_native_vnni_commit_single_scale_block(
+                f_acc, block_acc, block_d, scale_ab);
         }
     }
 }
@@ -2759,10 +4559,10 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_row(
     const int8_t* __restrict__ d_A_int8,
     const float* __restrict__ d_scale_A_blockwise,
     const int32_t* __restrict__ d_sum_A_blockwise,
-    int row,
-    int K,
-    int blocks_per_row,
-    int b,
+    unsigned row,
+    unsigned K,
+    unsigned blocks_per_row,
+    unsigned b,
     const int32_t* __restrict__ packed_groups,
     const uint8_t* __restrict__ payload,
     const uint16_t* __restrict__ scale_base,
@@ -2786,198 +4586,6 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_row(
         linear, scale_ab, sum_a);
 }
 
-template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
-__device__ __forceinline__ void gemv_native_vnni_small_m_batched_body(
-    const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
-    const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
-    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
-    NativeVNNISmallMBatchedArgs args,
-    int K,
-    int kblocks)
-{
-    static_assert(SMALL_M >= 2 && SMALL_M <= 4, "small-M native-VNNI supports M in {2,3,4}");
-    static_assert(CPT == 1 || CPT == 2, "native-VNNI small-M supports CPT in {1,2}");
-    static_assert(NVNNIGroupedMoESupported<FMT>::value,
-                  "small-M native-VNNI requires a supported native-VNNI format");
-
-    /*
-     * Decode-equivalent verifier launches put the verifier-row dimension in
-     * grid.z, not threadIdx.y.  That keeps each row on the same 64-thread
-     * workgroup shape as serial M=1 replay while still batching all rows into
-     * one graph-capturable kernel launch.  The older threadIdx.y layout remains
-     * available for the non-equivalence-tuned path.
-     */
-    const int row = (blockDim.y > 1)
-        ? static_cast<int>(threadIdx.y)
-        : static_cast<int>(blockIdx.z);
-    if (row >= SMALL_M)
-        return;
-
-    const int global_tile = blockIdx.x;
-    const int proj = native_vnni_batched_projection_for_tile(args, global_tile);
-    const int local_tile = global_tile - args.grid_offsets[proj];
-    const int N = args.N[proj];
-    const int n_base = local_tile * TILE_N + threadIdx.x * CPT;
-    const int kb = blockIdx.y;
-
-    const int blocks_per_row = K / 32;
-    const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
-    const int b_start = kb * b_per;
-    const int b_end = min(b_start + b_per, blocks_per_row);
-
-    const uint8_t* payload_base = args.payload[proj];
-    const uint16_t* scale_base = args.scales[proj];
-    const uint16_t* min_base = args.mins[proj];
-    const uint32_t* emin_base = args.emins[proj];
-    const float* bias_base = args.bias[proj];
-    float* out_base = args.output[proj];
-    float* partial_base = args.partial[proj];
-
-    float acc[CPT];
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
-        acc[c] = 0.0f;
-
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
-    {
-        const int n = n_base + c;
-        if (n >= N)
-            continue;
-
-        for (int b = b_start; b < b_end; ++b)
-        {
-            int32_t packed_groups[8];
-            const size_t linear =
-                static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-            const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
-            moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
-
-            native_vnni_small_m_accumulate_row<FMT>(
-                acc[c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
-                row, K, blocks_per_row, b, packed_groups, payload, scale_base,
-                min_base, emin_base, linear);
-        }
-    }
-
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
-    {
-        const int n = n_base + c;
-        if (n >= N)
-            continue;
-
-        const size_t out_idx =
-            static_cast<size_t>(row) * static_cast<size_t>(N) + static_cast<size_t>(n);
-        if (kblocks == 1)
-        {
-            out_base[out_idx] = acc[c] + (bias_base ? bias_base[n] : 0.0f);
-        }
-        else if (partial_base == nullptr)
-        {
-            atomicAdd(&out_base[out_idx], acc[c]);
-        }
-        else
-        {
-            partial_base[(static_cast<size_t>(kb) * SMALL_M + static_cast<size_t>(row)) *
-                         static_cast<size_t>(N) + static_cast<size_t>(n)] = acc[c];
-        }
-    }
-}
-
-template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
-__global__ void gemv_native_vnni_small_m_batched_kernel_t(
-    const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
-    const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
-    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
-    NativeVNNISmallMBatchedArgs args,
-    int K,
-    int kblocks)
-{
-    gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, FMT>(
-        d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-}
-
-template <int TILE_N, int CPT, int SMALL_M>
-__global__ void gemv_native_vnni_small_m_batched_mixed_kernel_t(
-    const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
-    const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
-    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
-    NativeVNNISmallMBatchedArgs args,
-    int K,
-    int kblocks)
-{
-    const int proj = native_vnni_batched_projection_for_tile(args, blockIdx.x);
-    switch (static_cast<NativeVNNIFormat>(args.codebook[proj]))
-    {
-    case NVNNI_Q4_0:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q4_0>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ4_NL:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ4_NL>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_Q4_1:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q4_1>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_Q5_0:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q5_0>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_Q5_1:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q5_1>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_Q6_K:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q6_K>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_Q3_K:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q3_K>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_Q2_K:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q2_K>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ3_S:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ3_S>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ3_XXS:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ3_XXS>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ2_S:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_S>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ2_XS:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_XS>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ2_XXS:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_XXS>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ1_S:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ1_S>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_IQ1_M:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ1_M>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    case NVNNI_Q8_0:
-        gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q8_0>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
-        return;
-    default:
-        return;
-    }
-}
 
 /**
  * @brief Decode-equivalent batched small-M GEMV body that shares weight decode across rows.
@@ -2986,7 +4594,8 @@ __global__ void gemv_native_vnni_small_m_batched_mixed_kernel_t(
  * row, which preserves the serial decode order but decodes the same packed
  * weight block once per row.  For MTP verifier economics that is the wrong
  * tradeoff on wide projections: dequantization is a material part of the
- * cost, and M=2..4 should amortize it.
+ * cost, and grouped verifier execution should amortize it across the complete
+ * four-row production transaction.
  *
  * This body keeps the same per-row FP32 accumulation order as serial decode:
  * each row sees blocks in increasing `b` order, and split-K partials are
@@ -2994,57 +4603,70 @@ __global__ void gemv_native_vnni_small_m_batched_mixed_kernel_t(
  * lane decodes one weight block and then accumulates all verifier rows before
  * moving to the next block.
  */
-template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
-__device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
-    const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
-    const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
-    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
-    NativeVNNISmallMBatchedArgs args,
-    int K,
-    int kblocks)
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT,
+          NativeVNNIVerifierPublication Publication>
+__device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_tile(
+    const int8_t* __restrict__ d_A_int8,                // [M x K]
+    const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
+    const int32_t* __restrict__ d_sum_A_blockwise,      // Required [M x blocks_per_row]
+    NativeVNNISmallMProjection projection,
+    unsigned K,
+    unsigned partition_blocks,
+    unsigned active_m,
+    unsigned row_base,
+    const float* resolved_bias)
 {
-    static_assert(SMALL_M >= 2 && SMALL_M <= 4, "small-M native-VNNI supports M in {2,3,4}");
     static_assert(CPT == 1 || CPT == 2, "native-VNNI small-M supports CPT in {1,2}");
+    static_assert(
+        ROWS_PER_TILE == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE ||
+            ROWS_PER_TILE == NVNNI_VERIFIER_WIDE_ROWS_PER_TILE,
+        "native-VNNI verifier row tile must be one of the measured geometries");
     static_assert(NVNNIGroupedMoESupported<FMT>::value,
                   "small-M native-VNNI requires a supported native-VNNI format");
 
-    const int global_tile = blockIdx.x;
-    const int proj = native_vnni_batched_projection_for_tile(args, global_tile);
-    const int local_tile = global_tile - args.grid_offsets[proj];
-    const int N = args.N[proj];
-    const int n_base = local_tile * TILE_N + threadIdx.x * CPT;
-    const int kb = blockIdx.y;
+    const unsigned N = projection.n;
+    const unsigned n_base = projection.column_base;
+    const unsigned kb = blockIdx.y;
+    // Public launch validation admits only positive N/K and partition widths.
+    // Preserve that contract through inlining so address products do not keep
+    // unnecessary signed high halves live in the scalar register file.
+    __builtin_assume(N > 0);
+    __builtin_assume(K > 0);
+    __builtin_assume(partition_blocks > 0);
+    // Fused callers publish activation sums with the shared quantized input.
+    // The public boundary rejects a missing plane; no decoder may reconstruct
+    // another sum authority inside its row loop.
+    __builtin_assume(d_sum_A_blockwise != nullptr);
+    const unsigned blocks_per_row = K / 32;
+    const unsigned b_per = partition_blocks;
+    const unsigned b_start = kb * b_per;
+    const unsigned b_end = min(b_start + b_per, blocks_per_row);
 
-    const int blocks_per_row = K / 32;
-    const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
-    const int b_start = kb * b_per;
-    const int b_end = min(b_start + b_per, blocks_per_row);
+    const uint8_t* payload_base = projection.payload;
+    const uint16_t* scale_base = projection.scales;
+    const uint16_t* min_base = projection.mins;
+    const uint32_t* emin_base = projection.emins;
+    float* out_base = projection.output;
+    float* partial_base = projection.partial;
 
-    const uint8_t* payload_base = args.payload[proj];
-    const uint16_t* scale_base = args.scales[proj];
-    const uint16_t* min_base = args.mins[proj];
-    const uint32_t* emin_base = args.emins[proj];
-    const float* bias_base = args.bias[proj];
-    float* out_base = args.output[proj];
-    float* partial_base = args.partial[proj];
-
-    float acc[SMALL_M][CPT];
+    float acc[ROWS_PER_TILE][CPT];
     #pragma unroll
-    for (int row = 0; row < SMALL_M; ++row)
+    for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
     {
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
-            acc[row][c] = 0.0f;
+            acc[tile_row][c] = 0.0f;
     }
 
     #pragma unroll
     for (int c = 0; c < CPT; ++c)
     {
-        const int n = n_base + c;
-        if (n >= N)
-            continue;
-
-        for (int b = b_start; b < b_end; ++b)
+        // Tail lanes borrow the final valid column for read-only arithmetic.
+        // Mask only publication below: keeping an EXEC mask through the whole
+        // row/decoder loop extends scalar lifetimes and causes register spills.
+        // Valid columns retain their exact addresses and operation order.
+        const unsigned n = min(n_base + c, N - 1);
+        for (unsigned b = b_start; b < b_end; ++b)
         {
             int32_t packed_groups[8];
             const size_t linear =
@@ -3053,10 +4675,13 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
             moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
             #pragma unroll
-            for (int row = 0; row < SMALL_M; ++row)
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
+                const unsigned row = row_base + tile_row;
+                if (row >= active_m)
+                    continue;
                 native_vnni_small_m_accumulate_row<FMT>(
-                    acc[row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
+                    acc[tile_row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
                     row, K, blocks_per_row, b, packed_groups, payload, scale_base,
                     min_base, emin_base, linear);
             }
@@ -3066,133 +4691,204 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
     #pragma unroll
     for (int c = 0; c < CPT; ++c)
     {
-        const int n = n_base + c;
+        const unsigned n = n_base + c;
         if (n >= N)
             continue;
 
         #pragma unroll
-        for (int row = 0; row < SMALL_M; ++row)
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
         {
+            const unsigned row = row_base + tile_row;
+            if (row >= active_m)
+                continue;
             const size_t out_idx =
                 static_cast<size_t>(row) * static_cast<size_t>(N) + static_cast<size_t>(n);
-            if (kblocks == 1)
+            if constexpr (Publication == NativeVNNIVerifierPublication::DirectOutput)
             {
-                out_base[out_idx] = acc[row][c] + (bias_base ? bias_base[n] : 0.0f);
-            }
-            else if (partial_base == nullptr)
-            {
-                atomicAdd(&out_base[out_idx], acc[row][c]);
+                out_base[out_idx] = acc[tile_row][c] + resolved_bias[c];
             }
             else
             {
-                partial_base[(static_cast<size_t>(kb) * SMALL_M + static_cast<size_t>(row)) *
-                             static_cast<size_t>(N) + static_cast<size_t>(n)] = acc[row][c];
+                partial_base[out_idx] = acc[tile_row][c];
             }
         }
     }
 }
 
-template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
-__global__ void gemv_native_vnni_small_m_batched_shared_kernel_t(
-    const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
-    const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
-    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
-    NativeVNNISmallMBatchedArgs args,
-    int K,
-    int kblocks)
+/**
+ * @brief Visit live row tiles with a bounded grid and unchanged tile arithmetic.
+ *
+ * Column/split-K workers already expose parallelism for wide projections.
+ * Grid stride admits additional tiles only when the device count includes
+ * them, avoiding thousands of workgroups whose sole job would be to exit.
+ * Each tile resets its fixed register accumulator and publishes to the same
+ * physical scratch plane as the rectangular launch; no row shares a reduction.
+ */
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT,
+          NativeVNNIVerifierPublication Publication>
+__device__ __forceinline__ void gemv_native_vnni_small_m_batched_shared_body(
+    const int8_t* __restrict__ d_A_int8,
+    const float* __restrict__ d_scale_A_blockwise,
+    const int32_t* __restrict__ d_sum_A_blockwise,
+    NativeVNNISmallMProjection projection, unsigned K, unsigned partition_blocks, unsigned active_m)
 {
-    gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, FMT>(
-        d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+    float resolved_bias[CPT] = {};
+    if constexpr (Publication == NativeVNNIVerifierPublication::DirectOutput)
+    {
+        // Bias is immutable across rows. Materialize each lane's value once,
+        // then retire its pointer/presence predicate before decoding weights.
+        // Tail lanes read a valid column but never publish their output.
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+            if (projection.bias)
+                resolved_bias[c] = projection.bias[min(projection.column_base + c, projection.n - 1)];
+    }
+    projection.bias = nullptr;
+    // A runtime traversal must not speculate extra register-resident row tiles.
+    #pragma unroll 1
+    for (unsigned row_base = blockIdx.z * ROWS_PER_TILE;
+         row_base < active_m; row_base += gridDim.z * ROWS_PER_TILE)
+    {
+        gemv_native_vnni_small_m_batched_shared_tile<TILE_N, CPT, ROWS_PER_TILE, FMT, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
+            projection, K, partition_blocks, active_m, row_base, resolved_bias);
+    }
 }
 
-template <int TILE_N, int CPT, int SMALL_M>
-__global__ void gemv_native_vnni_small_m_batched_shared_mixed_kernel_t(
-    const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
-    const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
-    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT,
+          NativeVNNIVerifierPublication Publication>
+__global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched_shared_kernel_t(
+    const int8_t* __restrict__ d_A_int8,                // [M x K]
+    const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
+    const int32_t* __restrict__ d_sum_A_blockwise,      // [M x blocks_per_row], nullable
     NativeVNNISmallMBatchedArgs args,
     int K,
-    int kblocks)
+    int partition_blocks)
 {
+    // The row descriptor is also the sole physical scratch-stride authority.
+    const int M = args.rows.physicalRows();
+    // Resolve admission before format dispatch. The count's pointer/bounds
+    // are dead before the decoder's long scalar-register live ranges begin.
+    const int active_m = args.rows.activeRows();
+    if (static_cast<int>(blockIdx.z) * ROWS_PER_TILE >= active_m)
+        return;
     const int proj = native_vnni_batched_projection_for_tile(args, blockIdx.x);
-    switch (static_cast<NativeVNNIFormat>(args.codebook[proj]))
+    const auto projection = native_vnni_resolve_small_m_projection<TILE_N, CPT, Publication>(
+        args, proj, M);
+    gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, FMT, Publication>(
+        d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
+}
+
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIVerifierPublication Publication>
+__global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched_shared_mixed_kernel_t(
+    const int8_t* __restrict__ d_A_int8,                // [M x K]
+    const float* __restrict__ d_scale_A_blockwise,      // [M x blocks_per_row]
+    const int32_t* __restrict__ d_sum_A_blockwise,      // [M x blocks_per_row], nullable
+    NativeVNNISmallMBatchedArgs args,
+    int K,
+    int partition_blocks)
+{
+    // The row descriptor is also the sole physical scratch-stride authority.
+    const int M = args.rows.physicalRows();
+    // Resolve admission before format dispatch. The count's pointer/bounds
+    // are dead before the decoder's long scalar-register live ranges begin.
+    const int active_m = args.rows.activeRows();
+    if (static_cast<int>(blockIdx.z) * ROWS_PER_TILE >= active_m)
+        return;
+    const int proj = native_vnni_batched_projection_for_tile(args, blockIdx.x);
+    const auto projection = native_vnni_resolve_small_m_projection<TILE_N, CPT, Publication>(
+        args, proj, M);
+    const auto codebook = static_cast<NativeVNNIFormat>(
+        __builtin_amdgcn_readfirstlane(static_cast<int>(args.codebook[proj])));
+    switch (codebook)
     {
     case NVNNI_Q4_0:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q4_0>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q4_0, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ4_NL:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ4_NL>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ4_NL, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q4_1:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q4_1>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q4_1, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q5_0:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q5_0>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q5_0, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q5_1:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q5_1>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q5_1, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q6_K:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q6_K>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q6_K, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q3_K:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q3_K>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q3_K, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q2_K:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q2_K>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q2_K, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ3_S:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ3_S>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ3_S, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ3_XXS:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ3_XXS>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ3_XXS, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ2_S:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_S>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_S, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ2_XS:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_XS>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_XS, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ2_XXS:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_XXS>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ2_XXS, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ1_S:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ1_S>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ1_S, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_IQ1_M:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_IQ1_M>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ1_M, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     case NVNNI_Q8_0:
-        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, SMALL_M, NVNNI_Q8_0>(
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q8_0, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
+        return;
+    case NVNNI_EXPANDED_INT8_MIN:
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_EXPANDED_INT8_MIN, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m);
         return;
     default:
         return;
     }
 }
 
-template <int TILE_N, int CPT, int SMALL_M>
+/**
+ * @brief Reduces one runtime row for every projection in a fused batch.
+ *
+ * `blockIdx.y` owns a row residue class, advancing by gridDim.y only while
+ * rows are live. The fixed-width register state and ascending-KB fold preserve
+ * serial-M1 arithmetic for every depth without launching idle physical rows.
+ */
+template <int TILE_N, int CPT>
 __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
     NativeVNNISmallMBatchedArgs args,
     int kblocks)
 {
-    static_assert(SMALL_M >= 2 && SMALL_M <= 4, "small-M native-VNNI supports M in {2,3,4}");
-
+    // The row descriptor is also the sole physical scratch-stride authority.
+    const int M = args.rows.physicalRows();
     const int global_tile = blockIdx.x;
     const int proj = native_vnni_batched_projection_for_tile(args, global_tile);
     const int local_tile = global_tile - args.grid_offsets[proj];
@@ -3202,23 +4898,28 @@ __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
     const float* partial_base = args.partial[proj];
     const float* bias_base = args.bias[proj];
     float* out_base = args.output[proj];
-
-    #pragma unroll
-    for (int c = 0; c < CPT; ++c)
+    // Physical M remains the scratch stride even when fewer rows are live.
+    const int active_m = args.rows.activeRows();
+    #pragma unroll 1
+    for (int row = static_cast<int>(blockIdx.y); row < active_m;
+         row += static_cast<int>(gridDim.y))
     {
-        const int n = n_base + c;
-        if (n >= N)
-            continue;
-
         #pragma unroll
-        for (int row = 0; row < SMALL_M; ++row)
+        for (int c = 0; c < CPT; ++c)
         {
+            const int n = n_base + c;
+            if (n >= N)
+                continue;
+
             float sum = 0.0f;
-            #pragma unroll 16
+            // Runtime rows must not multiply sixteen simultaneous address
+            // live ranges; the ascending serial-M1 fold remains unchanged.
+            #pragma unroll 1
             for (int kb = 0; kb < kblocks; ++kb)
             {
-                sum += partial_base[(static_cast<size_t>(kb) * SMALL_M + static_cast<size_t>(row)) *
-                                    static_cast<size_t>(N) + static_cast<size_t>(n)];
+                sum += partial_base[(static_cast<size_t>(kb) * static_cast<size_t>(M) +
+                                     static_cast<size_t>(row)) * static_cast<size_t>(N) +
+                                    static_cast<size_t>(n)];
             }
             out_base[static_cast<size_t>(row) * N + n] =
                 sum + (bias_base ? bias_base[n] : 0.0f);
@@ -3226,39 +4927,57 @@ __global__ void gemv_native_vnni_reduce_small_m_batched_kernel_t(
     }
 }
 
-template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
+/**
+ * @brief Runtime-row NativeVNNI verifier GEMV with fixed four-row work tiles.
+ *
+ * A workgroup decodes each packed weight block once and applies it to at most
+ * four verifier rows.  Larger speculative batches add independent Z-grid tiles;
+ * they never enlarge the accumulator array or alter an existing row's block
+ * order.  Split-K output is always written to declared workspace so the
+ * following reducer can publish partitions in serial-M1 order.
+ */
+template <int TILE_N, int CPT, int ROWS_PER_TILE, NativeVNNIFormat FMT>
 __global__ void gemv_native_vnni_small_m_kernel_t(
-    const int8_t*    __restrict__ d_A_int8,       // [SMALL_M × K] quantized activations
-    const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × payload_bytes]
-    const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row × N]
-    const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row × N], nullable when unused
-    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row × N], Q2_K only
-    float*           __restrict__ d_C_fp32,       // [SMALL_M × N] output
-    float*           __restrict__ d_partial_fp32, // [KB × SMALL_M × N] partials
-    const float*     __restrict__ d_scale_A_blockwise, // [SMALL_M × blocks_per_row]
-    const int32_t*   __restrict__ d_sum_A_blockwise,   // [SMALL_M × blocks_per_row], nullable
-    int N, int K, int kblocks)
+    const int8_t*    __restrict__ d_A_int8,       // [M x K] quantized activations
+    const uint8_t*   __restrict__ d_payload,      // [blocks_per_row x N x payload_bytes]
+    const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row x N]
+    const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row x N], nullable when unused
+    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row x N], Q2_K only
+    float*           __restrict__ d_C_fp32,       // [M x N] output
+    float*           __restrict__ d_partial_fp32, // [KB x M x N] partials
+    const float*     __restrict__ d_scale_A_blockwise, // [M x blocks_per_row]
+    const int32_t*   __restrict__ d_sum_A_blockwise,   // [M x blocks_per_row], nullable
+    int M, int N, int K, int kblocks, llaminar2::DeviceRowRange rows)
 {
-    static_assert(SMALL_M >= 2 && SMALL_M <= 4, "small-M native-VNNI supports M in {2,3,4}");
     static_assert(CPT == 1 || CPT == 2, "native-VNNI small-M supports CPT in {1,2}");
+    static_assert(
+        ROWS_PER_TILE == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE ||
+            ROWS_PER_TILE == NVNNI_VERIFIER_WIDE_ROWS_PER_TILE,
+        "native-VNNI verifier row tile must be one of the measured geometries");
     static_assert(NVNNIGroupedMoESupported<FMT>::value,
                   "small-M native-VNNI requires a supported native-VNNI format");
 
     const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
     const int kb = blockIdx.y;
+    const int row_base = static_cast<int>(blockIdx.z) * ROWS_PER_TILE;
+    // The whole workgroup exits before weight decode when its tile is idle.
+    // M remains the physical partial-buffer stride on every replay.
+    const int active_m = rows.activeRows();
+    if (row_base >= active_m)
+        return;
 
     const int blocks_per_row = K / 32;
     const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
     const int b_start = kb * b_per;
     const int b_end = min(b_start + b_per, blocks_per_row);
 
-    float acc[SMALL_M][CPT];
+    float acc[ROWS_PER_TILE][CPT];
     #pragma unroll
-    for (int row = 0; row < SMALL_M; ++row)
+    for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
     {
         #pragma unroll
         for (int c = 0; c < CPT; ++c)
-            acc[row][c] = 0.0f;
+            acc[tile_row][c] = 0.0f;
     }
 
     #pragma unroll
@@ -3275,27 +4994,16 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
             const uint8_t* payload = d_payload + linear * NVNNITraits<FMT>::payload_bytes;
             moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
-            if constexpr (SMALL_M == 2)
+            #pragma unroll
+            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
             {
+                const int row = row_base + tile_row;
+                if (row >= active_m)
+                    continue;
                 native_vnni_small_m_accumulate_row<FMT>(
-                    acc[0][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
-                    0, K, blocks_per_row, b, packed_groups, payload, d_block_scales,
+                    acc[tile_row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
+                    row, K, blocks_per_row, b, packed_groups, payload, d_block_scales,
                     d_block_mins, d_block_emins, linear);
-                native_vnni_small_m_accumulate_row<FMT>(
-                    acc[1][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
-                    1, K, blocks_per_row, b, packed_groups, payload, d_block_scales,
-                    d_block_mins, d_block_emins, linear);
-            }
-            else
-            {
-                #pragma unroll
-                for (int row = 0; row < SMALL_M; ++row)
-                {
-                    native_vnni_small_m_accumulate_row<FMT>(
-                        acc[row][c], d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise,
-                        row, K, blocks_per_row, b, packed_groups, payload, d_block_scales,
-                        d_block_mins, d_block_emins, linear);
-                }
             }
         }
     }
@@ -3307,131 +5015,28 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
         if (n >= N)
             continue;
 
-        if constexpr (SMALL_M == 2)
+        #pragma unroll
+        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
         {
+            const int row = row_base + tile_row;
+            if (row >= active_m)
+                continue;
+            const size_t out_idx =
+                static_cast<size_t>(row) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
             if (kblocks == 1)
             {
-                d_C_fp32[n] = acc[0][c];
-                d_C_fp32[static_cast<size_t>(N) + n] = acc[1][c];
-            }
-            else if (d_partial_fp32 == nullptr)
-            {
-                atomicAdd(&d_C_fp32[n], acc[0][c]);
-                atomicAdd(&d_C_fp32[static_cast<size_t>(N) + n], acc[1][c]);
+                d_C_fp32[out_idx] = acc[tile_row][c];
             }
             else
             {
-                d_partial_fp32[static_cast<size_t>(kb) * 2u *
-                               static_cast<size_t>(N) + static_cast<size_t>(n)] = acc[0][c];
-                d_partial_fp32[(static_cast<size_t>(kb) * 2u + 1u) *
-                               static_cast<size_t>(N) + static_cast<size_t>(n)] = acc[1][c];
+                const size_t partial_idx =
+                    (static_cast<size_t>(kb) * static_cast<size_t>(M) +
+                     static_cast<size_t>(row)) * static_cast<size_t>(N) +
+                    static_cast<size_t>(n);
+                d_partial_fp32[partial_idx] = acc[tile_row][c];
             }
         }
-        else
-        {
-            #pragma unroll
-            for (int row = 0; row < SMALL_M; ++row)
-            {
-                if (kblocks == 1)
-                {
-                    d_C_fp32[static_cast<size_t>(row) * N + n] = acc[row][c];
-                }
-                else if (d_partial_fp32 == nullptr)
-                {
-                    atomicAdd(&d_C_fp32[static_cast<size_t>(row) * N + n], acc[row][c]);
-                }
-                else
-                {
-                    const size_t idx =
-                        (static_cast<size_t>(kb) * SMALL_M + static_cast<size_t>(row)) *
-                        static_cast<size_t>(N) + static_cast<size_t>(n);
-                    d_partial_fp32[idx] = acc[row][c];
-                }
-            }
-        }
-    }
-}
-
-/**
- * Row-concurrent small-M native-VNNI GEMV for verifier replay.
- *
- * The generic grouped kernel above fuses M rows into one launch but still lets
- * each output thread walk the verifier rows serially.  That is graph-friendly,
- * but it can lose to two independent decode launches at M=2.  This kernel makes
- * the verifier row a workgroup dimension: `threadIdx.y` owns one accepted/draft
- * row while `threadIdx.x` owns the output column tile.  Weight decoding is
- * duplicated across rows, but row accumulation runs concurrently and still uses
- * the same decode-equivalent FP32 accumulation helper as serial replay.
- */
-template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
-__global__ void gemv_native_vnni_small_m_row_parallel_kernel_t(
-    const int8_t*    __restrict__ d_A_int8,       // [SMALL_M x K] quantized activations
-    const uint8_t*   __restrict__ d_payload,      // [blocks_per_row x N x payload_bytes]
-    const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row x N]
-    const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row x N], nullable when unused
-    const uint32_t*  __restrict__ d_block_emins,  // [blocks_per_row x N], Q2_K only
-    float*           __restrict__ d_C_fp32,       // [SMALL_M x N] output
-    float*           __restrict__ d_partial_fp32, // [KB x SMALL_M x N] partials
-    const float*     __restrict__ d_scale_A_blockwise, // [SMALL_M x blocks_per_row]
-    const int32_t*   __restrict__ d_sum_A_blockwise,   // [SMALL_M x blocks_per_row], nullable
-    int N, int K, int kblocks)
-{
-    static_assert(SMALL_M >= 2 && SMALL_M <= 4, "row-parallel small-M supports M in {2,3,4}");
-    static_assert(CPT == 1, "row-parallel small-M currently uses one output column per lane");
-    static_assert(NVNNIGroupedMoESupported<FMT>::value,
-                  "row-parallel small-M requires a supported native-VNNI format");
-
-    /*
-     * See gemv_native_vnni_small_m_batched_body(): grid.z row ownership is the
-     * decode-equivalent layout, threadIdx.y is the throughput-tuned legacy
-     * layout.
-     */
-    const int row = (blockDim.y > 1)
-        ? static_cast<int>(threadIdx.y)
-        : static_cast<int>(blockIdx.z);
-    if (row >= SMALL_M)
-        return;
-
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    if (n >= N)
-        return;
-
-    const int kb = blockIdx.y;
-    const int blocks_per_row = K / 32;
-    const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
-    const int b_start = kb * b_per;
-    const int b_end = min(b_start + b_per, blocks_per_row);
-
-    float acc = 0.0f;
-    for (int b = b_start; b < b_end; ++b)
-    {
-        int32_t packed_groups[8];
-        const size_t linear =
-            static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
-        const uint8_t* payload = d_payload + linear * NVNNITraits<FMT>::payload_bytes;
-        moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
-        native_vnni_small_m_accumulate_row<FMT>(
-            acc, d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, row, K,
-            blocks_per_row, b, packed_groups, payload, d_block_scales,
-            d_block_mins, d_block_emins, linear);
-    }
-
-    const size_t out_idx = static_cast<size_t>(row) * static_cast<size_t>(N) +
-                           static_cast<size_t>(n);
-    if (kblocks == 1)
-    {
-        d_C_fp32[out_idx] = acc;
-    }
-    else if (d_partial_fp32 == nullptr)
-    {
-        atomicAdd(&d_C_fp32[out_idx], acc);
-    }
-    else
-    {
-        const size_t partial_idx =
-            (static_cast<size_t>(kb) * SMALL_M + static_cast<size_t>(row)) *
-            static_cast<size_t>(N) + static_cast<size_t>(n);
-        d_partial_fp32[partial_idx] = acc;
     }
 }
 
@@ -3536,17 +5141,34 @@ __global__ void gemv_iq_lds_kernel_t(
         // ---- Apply activation scale and write output ----
         const float result = f_acc * (d_scale_A_blockwise ? 1.0f : d_scale_A[0]);
         if (kblocks == 1)
+        {
             d_C_fp32[n] = result;
-        else if (d_partial_fp32 == nullptr)
-            atomicAdd(&d_C_fp32[n], result);
+        }
         else
+        {
+            /*
+             * IQ decode obeys the same partition contract as the linear
+             * codebooks: one persistent row per K partition followed by the
+             * fixed-order reducer.  Completion-order atomics are not a valid
+             * serial-decode arithmetic regime.
+             */
             d_partial_fp32[static_cast<size_t>(kb) * N + n] = result;
+        }
     }
 }
 
 
 extern "C" {
 
+/**
+ * @brief Execute table-routed gate/up and optionally publish fused Q8 SwiGLU.
+ *
+ * Supplying both fused publication pointers selects the production decode
+ * contract: the ordered gate/up reducer writes the exact Q8 rows consumed by
+ * down projection and does not materialize the FP32 output rows.  Supplying
+ * neither retains the independently executable two-step oracle.  A half-bound
+ * publication is rejected so callers cannot silently read stale workspace.
+ */
 bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
     const float* d_hidden,
     const DeviceNativeVNNIMatrixDesc* d_gate_desc_table,
@@ -3554,33 +5176,64 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
     const int* d_expert_ids,
     float* const* d_gate_outputs,
     float* const* d_up_outputs,
+    int8_t* d_fused_swiglu_int8,
+    float* d_fused_swiglu_scales,
     int8_t* d_hidden_int8,
     float* d_hidden_scales,
+    float* d_gate_partials,
+    float* d_up_partials,
     bool hidden_prequantized,
     int num_active,
     int N,
     int K,
+    int num_experts,
     uint8_t codebook_id,
+    uint32_t policy_codebook_mask,
     int device_id,
     void* stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if ((!hidden_prequantized && !d_hidden) || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
-        !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
-        num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+    const bool fused_swiglu_publication =
+        d_fused_swiglu_int8 != nullptr || d_fused_swiglu_scales != nullptr;
+    if (!stream || (!hidden_prequantized && !d_hidden) ||
+        !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+        ((!d_gate_outputs || !d_up_outputs) && !fused_swiglu_publication) ||
+        (static_cast<bool>(d_fused_swiglu_int8) !=
+         static_cast<bool>(d_fused_swiglu_scales)) ||
+        !d_hidden_int8 || !d_hidden_scales ||
+        !d_gate_partials || !d_up_partials ||
+        num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||
+        (K % 32) != 0)
     {
         fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] invalid arguments\n");
         return false;
     }
 
+    ROCmMoESerialM1PolicyTable policy_table{};
+    if (!buildROCmMoESerialM1PolicyTable(
+            N, K, policy_codebook_mask, policy_table))
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_gate_up_native_vnni_decode_table] "
+                "missing descriptor-local serial-M1 policy "
+                "(codebook=%u policy_mask=0x%08x N=%d K=%d)\n",
+                static_cast<unsigned>(codebook_id),
+                static_cast<unsigned>(policy_codebook_mask), N, K);
+        return false;
+    }
+    recordROCmMoEDescriptorLocalDecode(
+        "gate_up", "static_table", codebook_id,
+        policy_codebook_mask, policy_table);
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     (void)hipGetLastError();
     hipError_t err = hipSuccess;
     if (!hidden_prequantized)
     {
         const int blocks_per_row = K / 32;
         hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
-            dim3(blocks_per_row), dim3(32), 0, static_cast<hipStream_t>(stream),
+            dim3(blocks_per_row), dim3(32), 0, hip_stream,
             d_hidden, d_hidden_int8, d_hidden_scales, K);
 
         err = hipGetLastError();
@@ -3593,41 +5246,27 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
     }
 
     constexpr int TN = 64;
-    dim3 grid((N + TN - 1) / TN, num_active);
+    dim3 output_grid((N + TN - 1) / TN, num_active);
+    dim3 partial_grid(
+        (N + TN - 1) / TN,
+        num_active,
+        policy_table.maximum_k_partitions);
     dim3 block(TN);
 
-    #define LAUNCH_GROUPED_GATE_UP(FMT_TAG)                                                    \
-        hipLaunchKernelGGL(                                                                    \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<FMT_TAG>),                \
-            grid, block, 0, static_cast<hipStream_t>(stream),                                  \
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,                \
-            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K)
-
-    switch (static_cast<NativeVNNIFormat>(codebook_id))
-    {
-    case NVNNI_Q4_0:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q4_0);     break;
-    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_GATE_UP(NVNNI_IQ4_NL);   break;
-    case NVNNI_Q4_1:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q4_1);     break;
-    case NVNNI_Q5_0:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q5_0);     break;
-    case NVNNI_Q5_1:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q5_1);     break;
-    case NVNNI_Q6_K:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q6_K);     break;
-    case NVNNI_Q3_K:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q3_K);     break;
-    case NVNNI_Q2_K:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q2_K);     break;
-    case NVNNI_IQ3_S:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ3_S);    break;
-    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_GATE_UP(NVNNI_IQ3_XXS);  break;
-    case NVNNI_IQ2_S:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ2_S);    break;
-    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_GATE_UP(NVNNI_IQ2_XS);   break;
-    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_GATE_UP(NVNNI_IQ2_XXS);  break;
-    case NVNNI_IQ1_S:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ1_S);    break;
-    case NVNNI_IQ1_M:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ1_M);    break;
-    case NVNNI_Q8_0:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q8_0);     break;
-    default:
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] unsupported codebook_id=%u\n",
-                static_cast<unsigned>(codebook_id));
-        return false;
-    }
-
-    #undef LAUNCH_GROUPED_GATE_UP
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            moe_grouped_native_vnni_gate_up_descriptor_kpart_kernel<false>),
+        partial_grid, block, 0, hip_stream,
+        d_hidden_int8, d_hidden_scales,
+        d_gate_desc_table, d_up_desc_table,
+        static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
+        d_expert_ids, d_gate_partials, d_up_partials,
+        num_active, N, K, num_experts,
+        policy_table.k_partitions_0_7,
+        policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,
+        policy_table.k_partitions_24_31,
+        static_cast<int>(policy_table.maximum_k_partitions));
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -3636,41 +5275,100 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
                 hipGetErrorString(err));
         return false;
     }
+
+    if (fused_swiglu_publication)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                moe_grouped_native_vnni_gate_up_descriptor_reduce_swiglu_q8_kernel<false>),
+            output_grid, block, 0, hip_stream,
+            d_gate_partials, d_up_partials,
+            d_gate_desc_table, d_up_desc_table,
+            static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
+            d_expert_ids,
+            d_fused_swiglu_int8,
+            d_fused_swiglu_scales,
+            num_active, N, num_experts,
+            policy_table.k_partitions_0_7,
+            policy_table.k_partitions_8_15,
+            policy_table.k_partitions_16_23,
+            policy_table.k_partitions_24_31);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                moe_grouped_native_vnni_gate_up_descriptor_reduce_kernel<false>),
+            output_grid, block, 0, hip_stream,
+            d_gate_partials, d_up_partials,
+            d_gate_desc_table, d_up_desc_table,
+            static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
+            d_expert_ids, d_gate_outputs, d_up_outputs,
+            num_active, N, num_experts,
+            policy_table.k_partitions_0_7,
+            policy_table.k_partitions_8_15,
+            policy_table.k_partitions_16_23,
+            policy_table.k_partitions_24_31);
+    }
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_gate_up_native_vnni_decode_table] "
+                "descriptor-local ordered reduce launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
     return true;
 }
 
-bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+bool rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
     const float* d_hidden,
-    const DeviceNativeVNNIMatrixDesc* d_gate_desc_table,
-    const DeviceNativeVNNIMatrixDesc* d_up_desc_table,
+    const void* d_runtime_layer,
     const int* d_expert_ids,
     float* const* d_gate_outputs,
     float* const* d_up_outputs,
     int8_t* d_hidden_int8,
     float* d_hidden_scales,
-    bool hidden_prequantized,
     float* d_gate_partials,
     float* d_up_partials,
+    bool hidden_prequantized,
     int num_active,
     int N,
     int K,
+    int num_experts,
     uint8_t codebook_id,
-    int k_partitions,
+    uint32_t policy_codebook_mask,
     int device_id,
     void* stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 ||
-                                     k_partitions == 8 || k_partitions == 16);
-    if ((!hidden_prequantized && !d_hidden) || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+    if (!stream || (!hidden_prequantized && !d_hidden) ||
+        !d_runtime_layer || !d_expert_ids ||
         !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
         !d_gate_partials || !d_up_partials ||
-        num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0 || !valid_k_partitions)
+        num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 || (K % 32) != 0)
     {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] invalid arguments\n");
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_runtime] invalid arguments\n");
         return false;
     }
+
+    ROCmMoESerialM1PolicyTable policy_table{};
+    if (!buildROCmMoESerialM1PolicyTable(
+            N, K, policy_codebook_mask, policy_table))
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_gate_up_native_vnni_decode_runtime] "
+                "missing descriptor-local serial-M1 policy "
+                "(codebook=%u policy_mask=0x%08x N=%d K=%d)\n",
+                static_cast<unsigned>(codebook_id),
+                static_cast<unsigned>(policy_codebook_mask), N, K);
+        return false;
+    }
+    recordROCmMoEDescriptorLocalDecode(
+        "gate_up", "runtime_bank", codebook_id,
+        policy_codebook_mask, policy_table);
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     (void)hipGetLastError();
@@ -3685,214 +5383,127 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
         err = hipGetLastError();
         if (err != hipSuccess)
         {
-            fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] hidden quantize launch failed: %s\n",
+            fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_runtime] hidden quantize launch failed: %s\n",
                     hipGetErrorString(err));
             return false;
         }
     }
 
     constexpr int TN = 64;
-    dim3 partial_grid((N + TN - 1) / TN, k_partitions, num_active);
+    dim3 output_grid((N + TN - 1) / TN, num_active);
+    dim3 partial_grid(
+        (N + TN - 1) / TN,
+        num_active,
+        policy_table.maximum_k_partitions);
     dim3 block(TN);
+    const auto* runtime = static_cast<const DeviceMoELayerRuntimeView*>(d_runtime_layer);
 
-    #define LAUNCH_GROUPED_GATE_UP_KPART(FMT_TAG)                                             \
-        hipLaunchKernelGGL(                                                                    \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<FMT_TAG>),          \
-            partial_grid, block, 0, hip_stream,                                                \
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,                \
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions)
-
-    switch (static_cast<NativeVNNIFormat>(codebook_id))
-    {
-    case NVNNI_Q4_0:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q4_0);     break;
-    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ4_NL);   break;
-    case NVNNI_Q4_1:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q4_1);     break;
-    case NVNNI_Q5_0:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q5_0);     break;
-    case NVNNI_Q5_1:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q5_1);     break;
-    case NVNNI_Q6_K:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q6_K);     break;
-    case NVNNI_Q3_K:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q3_K);     break;
-    case NVNNI_Q2_K:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q2_K);     break;
-    case NVNNI_IQ3_S:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ3_S);    break;
-    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ3_XXS);  break;
-    case NVNNI_IQ2_S:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ2_S);    break;
-    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ2_XS);   break;
-    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ2_XXS);  break;
-    case NVNNI_IQ1_S:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ1_S);    break;
-    case NVNNI_IQ1_M:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ1_M);    break;
-    case NVNNI_Q8_0:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q8_0);     break;
-    default:
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
-                static_cast<unsigned>(codebook_id));
-        return false;
-    }
-
-    #undef LAUNCH_GROUPED_GATE_UP_KPART
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            moe_grouped_native_vnni_gate_up_descriptor_kpart_kernel<true>),
+        partial_grid, block, 0, hip_stream,
+        d_hidden_int8, d_hidden_scales,
+        static_cast<const DeviceNativeVNNIMatrixDesc*>(nullptr),
+        static_cast<const DeviceNativeVNNIMatrixDesc*>(nullptr),
+        runtime, d_expert_ids, d_gate_partials, d_up_partials,
+        num_active, N, K, num_experts,
+        policy_table.k_partitions_0_7,
+        policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,
+        policy_table.k_partitions_24_31,
+        static_cast<int>(policy_table.maximum_k_partitions));
 
     err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] partial gate/up launch failed: %s\n",
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_runtime] gate/up launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }
 
-    dim3 reduce_grid((N + TN - 1) / TN, num_active);
-    hipLaunchKernelGGL(moe_grouped_native_vnni_gate_up_kpart_reduce_kernel,
-        reduce_grid, block, 0, hip_stream,
-        d_gate_partials, d_up_partials, d_gate_outputs, d_up_outputs,
-        num_active, N, k_partitions);
-
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            moe_grouped_native_vnni_gate_up_descriptor_reduce_kernel<true>),
+        output_grid, block, 0, hip_stream,
+        d_gate_partials, d_up_partials,
+        static_cast<const DeviceNativeVNNIMatrixDesc*>(nullptr),
+        static_cast<const DeviceNativeVNNIMatrixDesc*>(nullptr),
+        runtime, d_expert_ids, d_gate_outputs, d_up_outputs,
+        num_active, N, num_experts,
+        policy_table.k_partitions_0_7,
+        policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,
+        policy_table.k_partitions_24_31);
     err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] reduce launch failed: %s\n",
+        fprintf(stderr,
+                "[rocmMoE_grouped_gate_up_native_vnni_decode_runtime] "
+                "descriptor-local ordered reduce launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }
     return true;
 }
 
-bool rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
-    const float* d_hidden,
-    const DeviceNativeVNNIMatrixDesc* d_gate_desc_table,
-    const DeviceNativeVNNIMatrixDesc* d_up_desc_table,
+/**
+ * @brief Publish grouped expert SwiGLU rows in serial-decode Q8 form.
+ *
+ * This is the sole production launcher for the fused grouped publisher used
+ * by direct, descriptor-table, and device-runtime down projections. Keeping a
+ * public launch boundary here also lets integration tests compare the exact
+ * Q8 payload and FP32 scales against standalone serial M=1 publication before
+ * any weight format or route reduction can obscure the source of a mismatch.
+ *
+ * @param d_gate_ptrs Device array of per-route gate-row pointers.
+ * @param d_up_ptrs Device array of per-route up-row pointers.
+ * @param d_expert_ids Optional device route validity array; negative routes
+ *        are skipped. Pass null when every route is valid.
+ * @param d_swiglu_int8 Device output payload `[num_active, K]`.
+ * @param d_swiglu_scales Device output scales `[num_active, K / 32]`.
+ * @param num_active Number of grouped route rows.
+ * @param K Width of each gate/up row; must be divisible by 32.
+ * @param device_id ROCm device ordinal.
+ * @param stream Exact non-null producer stream.
+ * @return True when the launch was accepted by HIP; false on invalid input or
+ *         an immediate launch failure.
+ */
+bool rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+    const float* const* d_gate_ptrs,
+    const float* const* d_up_ptrs,
     const int* d_expert_ids,
-    int8_t* d_hidden_int8,
-    float* d_hidden_scales,
-    bool hidden_prequantized,
-    float* d_gate_partials,
-    float* d_up_partials,
     int8_t* d_swiglu_int8,
     float* d_swiglu_scales,
     int num_active,
-    int N,
     int K,
-    uint8_t codebook_id,
-    int k_partitions,
     int device_id,
     void* stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 ||
-                                     k_partitions == 8 || k_partitions == 16);
-    if ((!hidden_prequantized && !d_hidden) || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
-        !d_hidden_int8 || !d_hidden_scales || !d_gate_partials || !d_up_partials ||
+    if (!stream || !d_gate_ptrs || !d_up_ptrs ||
         !d_swiglu_int8 || !d_swiglu_scales ||
-        num_active <= 0 || N <= 0 || K <= 0 || (N % 32) != 0 || (K % 32) != 0 || !valid_k_partitions)
+        num_active <= 0 || K <= 0 || (K % 32) != 0)
     {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] invalid arguments\n");
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_quantize_decode_equivalent] "
+                "invalid arguments\n");
         return false;
     }
 
-    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     (void)hipGetLastError();
-    hipError_t err = hipSuccess;
-    if (!hidden_prequantized)
-    {
-        const int blocks_per_row = K / 32;
-        hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
-            dim3(blocks_per_row), dim3(32), 0, hip_stream,
-            d_hidden, d_hidden_int8, d_hidden_scales, K);
+    hipLaunchKernelGGL(
+        moe_grouped_swiglu_quantize_blockwise_kernel,
+        dim3(num_active), dim3(256), 0, static_cast<hipStream_t>(stream),
+        d_gate_ptrs, d_up_ptrs, d_expert_ids,
+        d_swiglu_int8, d_swiglu_scales, num_active, K);
 
-        err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] hidden quantize launch failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-    }
-
-    constexpr int TN = 64;
-    dim3 partial_grid((N + TN - 1) / TN, k_partitions, num_active);
-    dim3 partial_block(TN);
-
-    #define LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(FMT_TAG, FIXED_KPARTS_TAG)             \
-        hipLaunchKernelGGL(                                                                    \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<FMT_TAG, FIXED_KPARTS_TAG>), \
-            partial_grid, partial_block, 0, hip_stream,                                        \
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,                \
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions)
-
-    #define DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(FIXED_KPARTS_TAG)                    \
-        do                                                                                    \
-        {                                                                                     \
-            switch (static_cast<NativeVNNIFormat>(codebook_id))                               \
-            {                                                                                 \
-            case NVNNI_Q4_0:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q4_0, FIXED_KPARTS_TAG);     break; \
-            case NVNNI_IQ4_NL:   LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ4_NL, FIXED_KPARTS_TAG);   break; \
-            case NVNNI_Q4_1:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q4_1, FIXED_KPARTS_TAG);     break; \
-            case NVNNI_Q5_0:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q5_0, FIXED_KPARTS_TAG);     break; \
-            case NVNNI_Q5_1:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q5_1, FIXED_KPARTS_TAG);     break; \
-            case NVNNI_Q6_K:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q6_K, FIXED_KPARTS_TAG);     break; \
-            case NVNNI_Q3_K:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q3_K, FIXED_KPARTS_TAG);     break; \
-            case NVNNI_Q2_K:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q2_K, FIXED_KPARTS_TAG);     break; \
-            case NVNNI_IQ3_S:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ3_S, FIXED_KPARTS_TAG);    break; \
-            case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ3_XXS, FIXED_KPARTS_TAG);  break; \
-            case NVNNI_IQ2_S:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ2_S, FIXED_KPARTS_TAG);    break; \
-            case NVNNI_IQ2_XS:   LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ2_XS, FIXED_KPARTS_TAG);   break; \
-            case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ2_XXS, FIXED_KPARTS_TAG);  break; \
-            case NVNNI_IQ1_S:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ1_S, FIXED_KPARTS_TAG);    break; \
-            case NVNNI_IQ1_M:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ1_M, FIXED_KPARTS_TAG);    break; \
-            case NVNNI_Q8_0:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q8_0, FIXED_KPARTS_TAG);     break; \
-            default:                                                                          \
-                fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n", \
-                        static_cast<unsigned>(codebook_id));                                  \
-                return false;                                                                 \
-            }                                                                                 \
-        } while (0)
-
-    if (k_partitions == 4)
-    {
-        DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(4);
-    }
-    else
-    {
-        DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(0);
-    }
-
-    #undef DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART
-    #undef LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART
-
-    err = hipGetLastError();
+    const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] partial gate/up launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
-    }
-
-    constexpr int QUANT_THREADS = 64;
-    const int swiglu_blocks_per_row = N / 32;
-    const dim3 quant_grid((swiglu_blocks_per_row + 1) / 2, num_active);
-    const dim3 quant_block(QUANT_THREADS);
-
-    #define LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(KPARTS_TAG)                              \
-        hipLaunchKernelGGL(                                                                      \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_reduce_swiglu_quant_kernel<KPARTS_TAG>), \
-            quant_grid, quant_block, 0, hip_stream,                                              \
-            d_gate_partials, d_up_partials, d_swiglu_int8, d_swiglu_scales,                     \
-            num_active, N)
-
-    switch (k_partitions)
-    {
-    case 2:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(2);  break;
-    case 4:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(4);  break;
-    case 8:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(8);  break;
-    case 16: LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(16); break;
-    default:
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] unsupported reduce K-partitions=%d\n",
-                k_partitions);
-        return false;
-    }
-
-    #undef LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] reduce/quant launch failed: %s\n",
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_quantize_decode_equivalent] "
+                "launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }
@@ -3906,6 +5517,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
     const float* d_weights,
     int8_t* d_swiglu_int8,
     float* d_swiglu_scales,
+    float* d_ordered_down_partials,
     float* d_output,
     int num_active,
     int N,
@@ -3916,39 +5528,68 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if (!d_gate_ptrs || !d_up_ptrs || !d_descs || !d_weights ||
-        !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
+    if (!stream || !d_gate_ptrs || !d_up_ptrs || !d_descs || !d_weights ||
+        !d_swiglu_int8 || !d_swiglu_scales ||
+        !d_ordered_down_partials || !d_output ||
         num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
     {
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] invalid arguments\n");
         return false;
     }
 
-    (void)hipGetLastError();
-    constexpr int QUANT_THREADS = 256;
-    hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
-        dim3(num_active), dim3(QUANT_THREADS), 0, static_cast<hipStream_t>(stream),
-        d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
-        num_active, K);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    const int k_partitions =
+        resolveNativeVNNISerialM1KPartitions(codebook_id, N, K);
+    if (k_partitions <= 0)
     {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] quantize launch failed: %s\n",
-                hipGetErrorString(err));
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode] "
+                "missing serial-M1 dispatch policy (codebook=%u N=%d K=%d)\n",
+                static_cast<unsigned>(codebook_id), N, K);
         return false;
     }
 
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    if (!rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+            d_gate_ptrs, d_up_ptrs, nullptr,
+            d_swiglu_int8, d_swiglu_scales,
+            num_active, K, device_id, stream))
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode] "
+                "grouped Q8 publication failed\n");
+        return false;
+    }
+    hipError_t err = hipSuccess;
+
     constexpr int TN = 64;
-    dim3 grid((N + TN - 1) / TN);
+    dim3 route_grid((N + TN - 1) / TN, num_active);
+    dim3 partial_grid((N + TN - 1) / TN, num_active, k_partitions);
     dim3 block(TN);
 
-    #define LAUNCH_GROUPED_DOWN_DIRECT(FMT_TAG)                                               \
-        hipLaunchKernelGGL(                                                                    \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<FMT_TAG, false>),           \
-            grid, block, 0, static_cast<hipStream_t>(stream),                                  \
-            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,                      \
-            d_output, num_active, N, K)
+    #define LAUNCH_GROUPED_DOWN_DIRECT(FMT_TAG)                              \
+        do                                                                    \
+        {                                                                     \
+            if (k_partitions == 1)                                            \
+            {                                                                 \
+                hipLaunchKernelGGL(                                           \
+                    HIP_KERNEL_NAME(                                          \
+                        moe_grouped_native_vnni_down_route_kernel_t<          \
+                            FMT_TAG, false>),                                 \
+                    route_grid, block, 0, hip_stream,                         \
+                    d_swiglu_int8, d_swiglu_scales, d_descs, nullptr,         \
+                    d_weights, d_ordered_down_partials, num_active, N, K);    \
+            }                                                                 \
+            else                                                              \
+            {                                                                 \
+                hipLaunchKernelGGL(                                           \
+                    HIP_KERNEL_NAME(                                          \
+                        moe_grouped_native_vnni_down_kpart_kernel_t<          \
+                            FMT_TAG, false>),                                 \
+                    partial_grid, block, 0, hip_stream,                       \
+                    d_swiglu_int8, d_swiglu_scales, d_descs, nullptr,         \
+                    d_ordered_down_partials, num_active, N, K, k_partitions); \
+            }                                                                 \
+        } while (false)
 
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {
@@ -3968,6 +5609,9 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
     case NVNNI_IQ1_S:    LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ1_S);    break;
     case NVNNI_IQ1_M:    LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ1_M);    break;
     case NVNNI_Q8_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q8_0);     break;
+    case NVNNI_EXPANDED_INT8_MIN:
+        LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_EXPANDED_INT8_MIN);
+        break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
@@ -3983,98 +5627,52 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
                 hipGetErrorString(err));
         return false;
     }
-    return true;
-}
 
-bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
-    const float* const* d_gate_ptrs,
-    const float* const* d_up_ptrs,
-    const DeviceNativeVNNIMatrixDesc* d_desc_table,
-    const int* d_expert_ids,
-    const float* d_weights,
-    int8_t* d_swiglu_int8,
-    float* d_swiglu_scales,
-    float* d_output,
-    int num_active,
-    int N,
-    int K,
-    uint8_t codebook_id,
-    int device_id,
-    void* stream)
-{
-    llaminar2::HipDeviceGuard::setDevice(device_id);
-
-    if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
-        !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
-        num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+    if (k_partitions > 1)
     {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] invalid arguments\n");
-        return false;
+        hipLaunchKernelGGL(
+            moe_grouped_native_vnni_down_kpart_reduce_kernel,
+            route_grid, block, 0, hip_stream,
+            d_ordered_down_partials, d_weights,
+            d_ordered_down_partials,
+            num_active, N, k_partitions);
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmMoE_grouped_swiglu_down_native_vnni_decode] "
+                    "K-partition reduce launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
 
-    (void)hipGetLastError();
-    constexpr int QUANT_THREADS = 256;
-    hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
-        dim3(num_active), dim3(QUANT_THREADS), 0, static_cast<hipStream_t>(stream),
-        d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
-        num_active, K);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] quantize launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
-    }
-
-    constexpr int TN = 64;
-    dim3 grid((N + TN - 1) / TN);
-    dim3 block(TN);
-
-    #define LAUNCH_GROUPED_DOWN_TABLE(FMT_TAG)                                                \
-        hipLaunchKernelGGL(                                                                    \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<FMT_TAG, true>),            \
-            grid, block, 0, static_cast<hipStream_t>(stream),                                  \
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,            \
-            d_output, num_active, N, K)
-
-    switch (static_cast<NativeVNNIFormat>(codebook_id))
-    {
-    case NVNNI_Q4_0:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q4_0);     break;
-    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ4_NL);   break;
-    case NVNNI_Q4_1:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q4_1);     break;
-    case NVNNI_Q5_0:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q5_0);     break;
-    case NVNNI_Q5_1:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q5_1);     break;
-    case NVNNI_Q6_K:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q6_K);     break;
-    case NVNNI_Q3_K:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q3_K);     break;
-    case NVNNI_Q2_K:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q2_K);     break;
-    case NVNNI_IQ3_S:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ3_S);    break;
-    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ3_XXS);  break;
-    case NVNNI_IQ2_S:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ2_S);    break;
-    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ2_XS);   break;
-    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ2_XXS);  break;
-    case NVNNI_IQ1_S:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ1_S);    break;
-    case NVNNI_IQ1_M:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ1_M);    break;
-    case NVNNI_Q8_0:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q8_0);     break;
-    default:
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] unsupported codebook_id=%u\n",
-                static_cast<unsigned>(codebook_id));
-        return false;
-    }
-
-    #undef LAUNCH_GROUPED_DOWN_TABLE
-
+    hipLaunchKernelGGL(
+        moe_grouped_native_vnni_down_ordered_reduce_kernel,
+        dim3((N + TN - 1) / TN), block, 0, hip_stream,
+        d_ordered_down_partials, d_output, num_active, N);
     err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] down launch failed: %s\n",
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode] "
+                "route reduce launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }
     return true;
 }
 
-bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
+/**
+ * @brief Execute table-routed down projection from exact Q8 SwiGLU rows.
+ *
+ * When @p swiglu_prequantized is true, @p d_swiglu_int8 and
+ * @p d_swiglu_scales are the publication produced by the fused gate/up
+ * reducer, and the FP32 gate/up pointer arrays are not read.  The false form
+ * remains the split-path oracle and performs the ordinary SwiGLU/Q8 kernel
+ * before down projection.
+ */
+bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
     const float* const* d_gate_ptrs,
     const float* const* d_up_ptrs,
     const DeviceNativeVNNIMatrixDesc* d_desc_table,
@@ -4084,93 +5682,257 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
     float* d_swiglu_scales,
     bool swiglu_prequantized,
     float* d_output,
+    float* d_canonical_route_contributions,
+    float* d_ordered_down_partials,
     int num_active,
     int N,
     int K,
+    int num_experts,
     uint8_t codebook_id,
+    uint32_t policy_codebook_mask,
     int device_id,
     void* stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if ((!swiglu_prequantized && (!d_gate_ptrs || !d_up_ptrs)) ||
-        !d_desc_table || !d_expert_ids || !d_weights ||
-        !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
-        num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+    const bool canonical_publication =
+        d_canonical_route_contributions != nullptr;
+    if (!stream ||
+        ((!d_gate_ptrs || !d_up_ptrs) && !swiglu_prequantized) ||
+        !d_desc_table ||
+        !d_expert_ids || !d_weights || !d_swiglu_int8 || !d_swiglu_scales ||
+        (static_cast<bool>(d_output) == canonical_publication) ||
+        !d_ordered_down_partials ||
+        num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||
+        (K % 32) != 0)
     {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] invalid arguments\n");
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] invalid arguments\n");
         return false;
     }
+
+    ROCmMoESerialM1PolicyTable policy_table{};
+    if (!buildROCmMoESerialM1PolicyTable(
+            N, K, policy_codebook_mask, policy_table))
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] "
+                "missing descriptor-local serial-M1 policy "
+                "(codebook=%u policy_mask=0x%08x N=%d K=%d)\n",
+                static_cast<unsigned>(codebook_id),
+                static_cast<unsigned>(policy_codebook_mask), N, K);
+        return false;
+    }
+    recordROCmMoEDescriptorLocalDecode(
+        "down", "static_table", codebook_id,
+        policy_codebook_mask, policy_table);
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
-    (void)hipGetLastError();
-    hipError_t err = hipSuccess;
-    if (!swiglu_prequantized)
+    if (!swiglu_prequantized &&
+        !rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+            d_gate_ptrs, d_up_ptrs, d_expert_ids,
+            d_swiglu_int8, d_swiglu_scales,
+            num_active, K, device_id, stream))
     {
-        constexpr int QUANT_THREADS = 256;
-        hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
-            dim3(num_active), dim3(QUANT_THREADS), 0, hip_stream,
-            d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
-            num_active, K);
-
-        err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] quantize launch failed: %s\n",
-                    hipGetErrorString(err));
-            return false;
-        }
-    }
-
-    err = hipMemsetAsync(d_output, 0, static_cast<size_t>(N) * sizeof(float), hip_stream);
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] output memset failed: %s\n",
-                hipGetErrorString(err));
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] "
+                "grouped Q8 publication failed\n");
         return false;
     }
+    hipError_t err = hipSuccess;
 
     constexpr int TN = 64;
-    dim3 grid((N + TN - 1) / TN, num_active);
+    float* const route_contributions = canonical_publication
+                                           ? d_canonical_route_contributions
+                                           : d_ordered_down_partials;
+    dim3 route_grid((N + TN - 1) / TN, num_active);
+    dim3 partial_grid(
+        (N + TN - 1) / TN,
+        num_active,
+        policy_table.maximum_k_partitions);
     dim3 block(TN);
 
-    #define LAUNCH_GROUPED_DOWN_PARALLEL(FMT_TAG)                                             \
-        hipLaunchKernelGGL(                                                                    \
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<FMT_TAG>),  \
-            grid, block, 0, hip_stream,                                                        \
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,            \
-            d_output, num_active, N, K)
-
-    switch (static_cast<NativeVNNIFormat>(codebook_id))
-    {
-    case NVNNI_Q4_0:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q4_0);     break;
-    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ4_NL);   break;
-    case NVNNI_Q4_1:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q4_1);     break;
-    case NVNNI_Q5_0:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q5_0);     break;
-    case NVNNI_Q5_1:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q5_1);     break;
-    case NVNNI_Q6_K:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q6_K);     break;
-    case NVNNI_Q3_K:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q3_K);     break;
-    case NVNNI_Q2_K:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q2_K);     break;
-    case NVNNI_IQ3_S:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ3_S);    break;
-    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ3_XXS);  break;
-    case NVNNI_IQ2_S:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ2_S);    break;
-    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ2_XS);   break;
-    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ2_XXS);  break;
-    case NVNNI_IQ1_S:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ1_S);    break;
-    case NVNNI_IQ1_M:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ1_M);    break;
-    case NVNNI_Q8_0:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q8_0);     break;
-    default:
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] unsupported codebook_id=%u\n",
-                static_cast<unsigned>(codebook_id));
-        return false;
-    }
-
-    #undef LAUNCH_GROUPED_DOWN_PARALLEL
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            moe_grouped_native_vnni_down_descriptor_kpart_kernel<false>),
+        partial_grid, block, 0, hip_stream,
+        d_swiglu_int8, d_swiglu_scales, d_desc_table,
+        static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
+        d_expert_ids, d_ordered_down_partials,
+        num_active, N, K, num_experts,
+        policy_table.k_partitions_0_7,
+        policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,
+        policy_table.k_partitions_24_31,
+        static_cast<int>(policy_table.maximum_k_partitions));
 
     err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] down launch failed: %s\n",
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] route launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            moe_grouped_native_vnni_down_descriptor_reduce_kernel<false>),
+        route_grid, block, 0, hip_stream,
+        d_ordered_down_partials, d_desc_table,
+        static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
+        d_expert_ids, d_weights, route_contributions,
+        num_active, N, num_experts,
+        policy_table.k_partitions_0_7,
+        policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,
+        policy_table.k_partitions_24_31);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] "
+                "descriptor-local K-partition reduce launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    if (!canonical_publication)
+    {
+        hipLaunchKernelGGL(
+            moe_grouped_native_vnni_down_ordered_reduce_kernel,
+            dim3((N + TN - 1) / TN), block, 0,
+            hip_stream,
+            route_contributions, d_output, num_active, N);
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] ordered reduce launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+    const float* const* d_gate_ptrs,
+    const float* const* d_up_ptrs,
+    const void* d_runtime_layer,
+    const int* d_expert_ids,
+    const float* d_weights,
+    int8_t* d_swiglu_int8,
+    float* d_swiglu_scales,
+    float* d_output,
+    float* d_ordered_down_partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint8_t codebook_id,
+    uint32_t policy_codebook_mask,
+    int device_id,
+    void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if (!stream || !d_gate_ptrs || !d_up_ptrs || !d_runtime_layer ||
+        !d_expert_ids || !d_weights || !d_swiglu_int8 || !d_swiglu_scales ||
+        !d_output || !d_ordered_down_partials ||
+        num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 || (K % 32) != 0)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime] invalid arguments\n");
+        return false;
+    }
+
+    ROCmMoESerialM1PolicyTable policy_table{};
+    if (!buildROCmMoESerialM1PolicyTable(
+            N, K, policy_codebook_mask, policy_table))
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime] "
+                "missing descriptor-local serial-M1 policy "
+                "(codebook=%u policy_mask=0x%08x N=%d K=%d)\n",
+                static_cast<unsigned>(codebook_id),
+                static_cast<unsigned>(policy_codebook_mask), N, K);
+        return false;
+    }
+    recordROCmMoEDescriptorLocalDecode(
+        "down", "runtime_bank", codebook_id,
+        policy_codebook_mask, policy_table);
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    if (!rocmMoE_grouped_swiglu_quantize_decode_equivalent(
+            d_gate_ptrs, d_up_ptrs, d_expert_ids,
+            d_swiglu_int8, d_swiglu_scales,
+            num_active, K, device_id, stream))
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime] "
+                "grouped Q8 publication failed\n");
+        return false;
+    }
+    hipError_t err = hipSuccess;
+
+    constexpr int TN = 64;
+    dim3 route_grid((N + TN - 1) / TN, num_active);
+    dim3 partial_grid(
+        (N + TN - 1) / TN,
+        num_active,
+        policy_table.maximum_k_partitions);
+    dim3 block(TN);
+    const auto* runtime = static_cast<const DeviceMoELayerRuntimeView*>(d_runtime_layer);
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            moe_grouped_native_vnni_down_descriptor_kpart_kernel<true>),
+        partial_grid, block, 0, hip_stream,
+        d_swiglu_int8, d_swiglu_scales,
+        static_cast<const DeviceNativeVNNIMatrixDesc*>(nullptr),
+        runtime, d_expert_ids, d_ordered_down_partials,
+        num_active, N, K, num_experts,
+        policy_table.k_partitions_0_7,
+        policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,
+        policy_table.k_partitions_24_31,
+        static_cast<int>(policy_table.maximum_k_partitions));
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime] route launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(
+            moe_grouped_native_vnni_down_descriptor_reduce_kernel<true>),
+        route_grid, block, 0, hip_stream,
+        d_ordered_down_partials,
+        static_cast<const DeviceNativeVNNIMatrixDesc*>(nullptr),
+        runtime, d_expert_ids, d_weights, d_ordered_down_partials,
+        num_active, N, num_experts,
+        policy_table.k_partitions_0_7,
+        policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,
+        policy_table.k_partitions_24_31);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime] "
+                "descriptor-local K-partition reduce launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(
+        moe_grouped_native_vnni_down_ordered_reduce_kernel,
+        dim3((N + TN - 1) / TN), block, 0, hip_stream,
+        d_ordered_down_partials, d_output, num_active, N);
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime] ordered reduce launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }
@@ -4188,7 +5950,15 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
 //
 // Eliminates atomicAdd and output memset from the old implementation.
 // ============================================================================
-template <int SMALL_M, NativeVNNIFormat FMT>
+/**
+ * @brief Record physical grouped tiles with device-owned arithmetic admission.
+ *
+ * The published count never changes the generated serial-M1 K partitions,
+ * scratch size, or captured grid. Each fixed scratch tile receives a slice of
+ * the same count owner; its producer and reducer agree on both logical row
+ * admission and the unchanged physical partial-buffer stride.
+ */
+template <NativeVNNIFormat FMT>
 bool rocmLaunch_native_vnni_small_m_fp32(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
@@ -4199,9 +5969,16 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     const float* d_scale_A_blockwise,
     const int32_t* d_sum_A_blockwise,
     float* d_partial_fp32,
-    int N, int K,
-    int device_id, void* stream)
+    int M, int N, int K,
+    int device_id, void* stream,
+    uint8_t arithmetic_policy_codebook_id,
+    const llaminar2::DeviceRowRange *row_range)
 {
+    const auto rows = row_range
+        ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
+    if (!stream || rows.physicalRows() != M)
+        return false;
+
     constexpr int NUM_CUS = 60;
     constexpr int MIN_BLOCKS_PER_WAVE = 1;
     constexpr int KB_CAP = NVNNI_SMALL_M_GRAPH_SAFE_KB_CAP;
@@ -4220,7 +5997,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     if (!validateNativeVNNIDecodeEquivalentKBOverride(
             "rocmGemv_native_vnni_small_m_fp32",
             explicit_kb_override,
-            SMALL_M,
+            M,
             N,
             K,
             1))
@@ -4229,15 +6006,17 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     }
     const auto generated_cfg =
         decode_equivalent
-            ? resolveNativeVNNISerialM1RuntimeConfig(static_cast<uint8_t>(FMT), N, K)
-            : resolveNativeVNNIDecodeGeneratedRuntimeConfig(static_cast<uint8_t>(FMT), SMALL_M, N, K);
+            ? resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+                  arithmetic_policy_codebook_id, N, K)
+            : resolveNativeVNNIDecodeGeneratedRuntimeConfigForPolicy(
+                  arithmetic_policy_codebook_id, M, N, K);
     if (decode_equivalent &&
         explicit_kb_override <= 0 &&
         !generated_cfg.has_generated)
     {
         fprintf(stderr,
                 "[rocmGemv_native_vnni_small_m_fp32] no serial M=1 split-K policy for decode-equivalent verifier launch (M=%d N=%d K=%d codebook=%u)\n",
-                SMALL_M, N, K, static_cast<unsigned>(FMT));
+                M, N, K, static_cast<unsigned>(FMT));
         return false;
     }
     const int kb_override =
@@ -4248,27 +6027,22 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         (explicit_waves_override > 0)
             ? explicit_waves_override
             : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
-    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    // Split-reduce is graph-capturable here: the partial buffer is declared by
-    // the GEMM workspace contract before capture, so replay only launches
-    // kernels over stable device pointers. Atomic reduction remains an explicit
-    // tuning mode rather than something GPU graphs silently force on.
-    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
                 "[rocmGemv_native_vnni_small_m_fp32] requested kb=%d exceeds graph-safe small-M cap=%d (M=%d N=%d K=%d)\n",
-                kb_override, KB_CAP, SMALL_M, N, K);
+                kb_override, KB_CAP, M, N, K);
         return false;
     }
 
     constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
     const int target_waves_per_cu = (waves_override > 0) ? waves_override : DEFAULT_TARGET_WAVES_PER_CU;
     const int target_total_waves = target_waves_per_cu * NUM_CUS;
-    const int waves_per_workgroup = decode_equivalent ? 1 : SMALL_M;
-    const int target_total_workgroups =
-        max(1, (target_total_waves + waves_per_workgroup - 1) / waves_per_workgroup);
-    int kb_raw = max(1, (target_total_workgroups + grid_n - 1) / grid_n);
+    const int verifier_rows_per_tile = native_vnni_verifier_rows_per_tile(M);
+    const int logical_row_tiles =
+        (M + verifier_rows_per_tile - 1) / verifier_rows_per_tile;
+    const int resident_tiles = max(1, grid_n * logical_row_tiles);
+    int kb_raw = max(1, (target_total_waves + resident_tiles - 1) / resident_tiles);
     int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
     kb_max = min(kb_max, KB_CAP);
     kb_raw = min(kb_raw, kb_max);
@@ -4289,31 +6063,15 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     }
     if (kb < 1) kb = 1;
 
-    if (kb > 1 && !d_partial_fp32 && !use_atomic_reduce)
+    if (kb > 1 && !d_partial_fp32)
     {
         fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] kb=%d>1 but no small-M partial buffer (M=%d N=%d K=%d)\n",
-                kb, SMALL_M, N, K);
+                kb, M, N, K);
         return false;
-    }
-    float* partial_arg = use_atomic_reduce ? nullptr : d_partial_fp32;
-    if (kb > 1 && use_atomic_reduce)
-    {
-        hipError_t memset_err = hipMemsetAsync(
-            d_C_fp32,
-            0,
-            static_cast<size_t>(SMALL_M) * static_cast<size_t>(N) * sizeof(float),
-            static_cast<hipStream_t>(stream));
-        if (memset_err != hipSuccess)
-        {
-            fprintf(stderr,
-                    "[rocmGemv_native_vnni_small_m_fp32] atomic output memset failed: %s (M=%d N=%d K=%d codebook=%u)\n",
-                    hipGetErrorString(memset_err), SMALL_M, N, K, static_cast<unsigned>(FMT));
-            return false;
-        }
     }
 
     recordNativeVNNISmallMLaunch(
-        SMALL_M,
+        M,
         N,
         K,
         static_cast<unsigned>(FMT),
@@ -4322,63 +6080,91 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         target_waves_per_cu,
         false,
         1,
-        kb > 1 && use_atomic_reduce);
+        static_cast<int>(arithmetic_policy_codebook_id));
 
-    if (decode_equivalent)
+    /*
+     * Partials are a reusable fixed-row tile, not a semantic M limit. Wider
+     * verifier graphs record multiple grouped kernel/reducer pairs while each
+     * pair retains weight reuse and scalar M=1's ordered split-K reduction.
+     */
+    const int workspace_tile_rows = min(
+        M,
+        llaminar2::kDefaultNativeVNNIVerifierRowCapacity);
+    for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
-        /*
-         * Decode-equivalent verifier rows must reuse the serial M=1 split-K
-         * policy, but they do not need to decode each packed weight block once
-         * per row.  The shared small-M kernel decodes a block once and then
-         * accumulates rows 0..M-1 with the same per-row b-order as serial
-         * replay.  This is the single-projection companion to the already
-         * promoted fused gate/up path.
-         */
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<TN, CPT, SMALL_M, FMT>),
-            dim3(grid_n, kb), dim3(THREADS, 1, 1), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-            d_C_fp32, partial_arg, d_scale_A_blockwise, d_sum_A_blockwise, N, K, kb);
-    }
-    else
-    {
-        dim3 block(THREADS, SMALL_M, 1);
-        dim3 grid(grid_n, kb, 1);
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_row_parallel_kernel_t<TN, CPT, SMALL_M, FMT>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-            d_C_fp32, partial_arg, d_scale_A_blockwise, d_sum_A_blockwise, N, K, kb);
-    }
+        const int tile_m = min(workspace_tile_rows, M - row_base);
+        const auto tile_rows = rows.slice(row_base, tile_m);
+        const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
+        const int tile_row_groups =
+            (tile_m + tile_rows_per_group - 1) / tile_rows_per_group;
+        const int8_t* tile_a =
+            d_A_int8 + static_cast<size_t>(row_base) * K;
+        const float* tile_scales =
+            d_scale_A_blockwise +
+            static_cast<size_t>(row_base) * blocks_per_row;
+        const int32_t* tile_sums =
+            d_sum_A_blockwise
+                ? d_sum_A_blockwise +
+                      static_cast<size_t>(row_base) * blocks_per_row
+                : nullptr;
+        float* tile_c =
+            d_C_fp32 + static_cast<size_t>(row_base) * N;
 
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] kernel launch failed: %s (M=%d N=%d K=%d codebook=%u)\n",
-                hipGetErrorString(err), SMALL_M, N, K, static_cast<unsigned>(FMT));
-        return false;
-    }
+        if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT>),
+                dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                tile_c, d_partial_fp32, tile_scales, tile_sums,
+                tile_m, N, K, kb, tile_rows);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<
+                    TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT>),
+                dim3(grid_n, kb, tile_row_groups), dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                tile_a, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                tile_c, d_partial_fp32, tile_scales, tile_sums,
+                tile_m, N, K, kb, tile_rows);
+        }
 
-    if (kb > 1 && !use_atomic_reduce)
-    {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_kernel_t<TN, CPT, SMALL_M>),
-            dim3(grid_n), dim3(THREADS, 1, 1), 0, static_cast<hipStream_t>(stream),
-            d_partial_fp32, d_C_fp32, N, kb);
-    }
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] kernel launch failed: %s (M=%d tile_base=%d tile_m=%d N=%d K=%d codebook=%u)\n",
+                    hipGetErrorString(err), M, row_base, tile_m, N, K,
+                    static_cast<unsigned>(FMT));
+            return false;
+        }
 
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] reduce launch failed: %s (M=%d N=%d K=%d codebook=%u)\n",
-                hipGetErrorString(err), SMALL_M, N, K, static_cast<unsigned>(FMT));
-        return false;
+        if (kb > 1)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_kernel_t<TN, CPT>),
+                dim3(grid_n, tile_m), dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream),
+                d_partial_fp32, tile_c, tile_m, N, kb, tile_rows);
+        }
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] reduce launch failed: %s (M=%d tile_base=%d tile_m=%d N=%d K=%d codebook=%u)\n",
+                    hipGetErrorString(err), M, row_base, tile_m, N, K,
+                    static_cast<unsigned>(FMT));
+            return false;
+        }
     }
 
     return true;
 }
 
-template <int SMALL_M, NativeVNNIFormat FMT>
+template <NativeVNNIFormat FMT>
 bool rocmLaunch_native_vnni_small_m_batched_fp32(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
@@ -4392,11 +6178,12 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     float* const* d_partials,
     const int* Ns,
     int num_projections,
-    int K,
+    int M, int K,
     int device_id,
     void* stream,
     int call_kb_override = -1,
-    int call_waves_override = -1)
+    int call_waves_override = -1,
+    const llaminar2::DeviceRowRange *row_range = nullptr)
 {
     constexpr int NUM_CUS = 60;
     constexpr int MIN_BLOCKS_PER_WAVE = 1;
@@ -4408,7 +6195,11 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     (void)device_id;
 
     const int blocks_per_row = K / 32;
-    NativeVNNISmallMBatchedArgs args{};
+    const auto rows = row_range ? *row_range :
+        llaminar2::DeviceRowRange::fullyActive(M);
+    if (!stream || rows.physicalRows() != M)
+        return false;
+    NativeVNNISmallMBatchedArgs args{.rows = rows};
     args.num_projections = num_projections;
     for (int p = 0; p < num_projections; ++p)
     {
@@ -4442,7 +6233,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     if (!validateNativeVNNIDecodeEquivalentKBOverride(
             "rocmGemv_native_vnni_small_m_batched_fp32",
             explicit_kb_override,
-            SMALL_M,
+            M,
             0,
             K,
             num_projections))
@@ -4455,7 +6246,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
                   static_cast<uint8_t>(FMT), Ns, num_projections, K)
             : (num_projections == 1
                    ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(
-                         static_cast<uint8_t>(FMT), SMALL_M, Ns[0], K)
+                         static_cast<uint8_t>(FMT), M, Ns[0], K)
                    : NativeVNNIDecodeGeneratedRuntimeConfig{});
     if (decode_equivalent &&
         explicit_kb_override <= 0 &&
@@ -4463,7 +6254,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     {
         fprintf(stderr,
                 "[rocmGemv_native_vnni_small_m_batched_fp32] fused verifier group has no common serial M=1 split-K policy (M=%d K=%d projections=%d codebook=%u)\n",
-                SMALL_M, K, num_projections, static_cast<unsigned>(FMT));
+                M, K, num_projections, static_cast<unsigned>(FMT));
         return false;
     }
     const int kb_override =
@@ -4474,26 +6265,23 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         (explicit_waves_override > 0)
             ? explicit_waves_override
             : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
-    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    // Batched split-reduce uses per-projection workspace partials. That keeps
-    // graph replay deterministic and avoids the hidden sync cost of atomics
-    // unless the ROCm atomic-reduce tuning knob is explicitly enabled.
-    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
                 "[rocmGemv_native_vnni_small_m_batched_fp32] requested kb=%d exceeds graph-safe small-M cap=%d (M=%d K=%d projections=%d)\n",
-                kb_override, KB_CAP, SMALL_M, K, num_projections);
+                kb_override, KB_CAP, M, K, num_projections);
         return false;
     }
 
     constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
     const int target_waves_per_cu = (waves_override > 0) ? waves_override : DEFAULT_TARGET_WAVES_PER_CU;
     const int target_total_waves = target_waves_per_cu * NUM_CUS;
-    const int waves_per_workgroup = decode_equivalent ? 1 : SMALL_M;
-    const int target_total_workgroups =
-        max(1, (target_total_waves + waves_per_workgroup - 1) / waves_per_workgroup);
-    int kb_raw = max(1, (target_total_workgroups + args.total_grid_n - 1) / args.total_grid_n);
+    const int verifier_rows_per_tile = native_vnni_verifier_rows_per_tile(M);
+    const int logical_row_tiles =
+        (M + verifier_rows_per_tile - 1) / verifier_rows_per_tile;
+    const int resident_tiles =
+        max(1, args.total_grid_n * logical_row_tiles);
+    int kb_raw = max(1, (target_total_waves + resident_tiles - 1) / resident_tiles);
     int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
     kb_max = min(kb_max, KB_CAP);
     kb_raw = min(kb_raw, kb_max);
@@ -4514,7 +6302,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     }
     if (kb < 1) kb = 1;
 
-    if (kb > 1 && !use_atomic_reduce)
+    if (kb > 1)
     {
         for (int p = 0; p < num_projections; ++p)
         {
@@ -4522,33 +6310,14 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
             {
                 fprintf(stderr,
                         "[rocmGemv_native_vnni_small_m_batched_fp32] kb=%d>1 but projection %d has no partial buffer (M=%d N=%d K=%d)\n",
-                        kb, p, SMALL_M, args.N[p], K);
-                return false;
-            }
-        }
-    }
-    if (kb > 1 && use_atomic_reduce)
-    {
-        for (int p = 0; p < num_projections; ++p)
-        {
-            args.partial[p] = nullptr;
-            hipError_t memset_err = hipMemsetAsync(
-                args.output[p],
-                0,
-                static_cast<size_t>(SMALL_M) * static_cast<size_t>(args.N[p]) * sizeof(float),
-                static_cast<hipStream_t>(stream));
-            if (memset_err != hipSuccess)
-            {
-                fprintf(stderr,
-                        "[rocmGemv_native_vnni_small_m_batched_fp32] atomic output memset failed: %s (M=%d N=%d K=%d projection=%d codebook=%u)\n",
-                        hipGetErrorString(memset_err), SMALL_M, args.N[p], K, p, static_cast<unsigned>(FMT));
+                        kb, p, M, args.N[p], K);
                 return false;
             }
         }
     }
 
     recordNativeVNNISmallMLaunch(
-        SMALL_M,
+        M,
         0,
         K,
         static_cast<unsigned>(FMT),
@@ -4556,83 +6325,98 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         kb,
         target_waves_per_cu,
         true,
-        num_projections,
-        kb > 1 && use_atomic_reduce);
+        num_projections);
 
-    bool all_n_equal = true;
-    for (int p = 1; p < num_projections; ++p)
-        all_n_equal = all_n_equal && (args.N[p] == args.N[0]);
-
-    (void)all_n_equal;
-    if (decode_equivalent)
+    const int workspace_tile_rows = min(
+        M,
+        llaminar2::kDefaultNativeVNNIVerifierRowCapacity);
+    for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
-        /*
-         * Verifier publication must use serial M=1 split-K policy, but it does
-         * not need to decode the same packed weight block once per verifier
-         * row.  The shared kernel keeps row-local accumulation order intact
-         * while amortizing decode across M=2..4 rows.
-         */
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<TN, CPT, SMALL_M, FMT>),
-            dim3(args.total_grid_n, kb), dim3(THREADS, 1, 1), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
-    }
-    else
-    {
-        dim3 block(THREADS, SMALL_M, 1);
-        dim3 grid(args.total_grid_n, kb, 1);
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_kernel_t<TN, CPT, SMALL_M, FMT>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
-    }
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr,
-                "[rocmGemv_native_vnni_small_m_batched_fp32] kernel launch failed: %s (M=%d K=%d projections=%d codebook=%u)\n",
-                hipGetErrorString(err), SMALL_M, K, num_projections, static_cast<unsigned>(FMT));
-        return false;
-    }
-
-    if (kb > 1 && !use_atomic_reduce)
-    {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT, SMALL_M>),
-            dim3(args.total_grid_n), dim3(THREADS, 1, 1), 0, static_cast<hipStream_t>(stream),
-            args, kb);
-    }
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr,
-                "[rocmGemv_native_vnni_small_m_batched_fp32] reduce launch failed: %s (M=%d K=%d projections=%d codebook=%u)\n",
-                hipGetErrorString(err), SMALL_M, K, num_projections, static_cast<unsigned>(FMT));
-        return false;
-    }
-
-    if (kb > 1 && use_atomic_reduce)
-    {
+        const int tile_m = min(workspace_tile_rows, M - row_base);
+        const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
+        NativeVNNISmallMBatchedArgs tile_args = args;
+        tile_args.rows = rows.slice(row_base, tile_m);
+        const int tile_row_groups = llaminar2::deviceRowWorkerGroups(
+            tile_args.rows, tile_rows_per_group,
+            static_cast<int64_t>(args.total_grid_n) * kb, target_total_waves);
+        const int reducer_row_groups = llaminar2::deviceRowWorkerGroups(
+            tile_args.rows, 1, args.total_grid_n, target_total_waves);
         for (int p = 0; p < num_projections; ++p)
         {
-            if (d_biases && d_biases[p])
+            tile_args.output[p] +=
+                static_cast<size_t>(row_base) * tile_args.N[p];
+        }
+
+        const int8_t* tile_a =
+            d_A_int8 + static_cast<size_t>(row_base) * K;
+        const float* tile_scales =
+            d_scale_A_blockwise +
+            static_cast<size_t>(row_base) * blocks_per_row;
+        const int32_t* tile_sums =
+            d_sum_A_blockwise
+                ? d_sum_A_blockwise +
+                      static_cast<size_t>(row_base) * blocks_per_row
+                : nullptr;
+
+        // Publication is fixed by the serial-M1 K-partition policy. Compile
+        // only its live destination/epilogue into this captured producer.
+        const auto launch = [&]<NativeVNNIVerifierPublication Publication>()
+        {
+            if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
             {
-                if (!rocmQuantGemm_biasAdd(
-                        d_outputs[p],
-                        d_biases[p],
-                        SMALL_M,
-                        Ns[p],
-                        device_id,
-                        stream))
-                {
-                    fprintf(stderr,
-                            "[rocmGemv_native_vnni_small_m_batched_fp32] bias add failed after atomic reduce (M=%d N=%d K=%d projection=%d codebook=%u)\n",
-                            SMALL_M, Ns[p], K, p, static_cast<unsigned>(FMT));
-                    return false;
-                }
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<
+                        TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, FMT, Publication>),
+                    dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                    dim3(THREADS, 1, 1), 0,
+                    static_cast<hipStream_t>(stream),
+                    tile_a, tile_scales, tile_sums, tile_args, K,
+                    (blocks_per_row + kb - 1) / kb);
             }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_kernel_t<
+                        TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, FMT, Publication>),
+                    dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                    dim3(THREADS, 1, 1), 0,
+                    static_cast<hipStream_t>(stream),
+                    tile_a, tile_scales, tile_sums, tile_args, K,
+                    (blocks_per_row + kb - 1) / kb);
+            }
+        };
+        if (kb == 1)
+            launch.template operator()<NativeVNNIVerifierPublication::DirectOutput>();
+        else
+            launch.template operator()<NativeVNNIVerifierPublication::OrderedPartial>();
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmGemv_native_vnni_small_m_batched_fp32] kernel launch failed: %s (M=%d tile_base=%d tile_m=%d K=%d projections=%d codebook=%u)\n",
+                    hipGetErrorString(err), M, row_base, tile_m, K,
+                    num_projections, static_cast<unsigned>(FMT));
+            return false;
+        }
+
+        if (kb > 1)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT>),
+                dim3(tile_args.total_grid_n, reducer_row_groups),
+                dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream), tile_args, kb);
+        }
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmGemv_native_vnni_small_m_batched_fp32] reduce launch failed: %s (M=%d tile_base=%d tile_m=%d K=%d projections=%d codebook=%u)\n",
+                    hipGetErrorString(err), M, row_base, tile_m, K,
+                    num_projections, static_cast<unsigned>(FMT));
+            return false;
         }
     }
 
@@ -4652,6 +6436,7 @@ static bool nativeVNNICodebookRequiresAux(uint8_t codebook_id)
     case NVNNI_IQ2_XS:
     case NVNNI_IQ1_S:
     case NVNNI_IQ1_M:
+    case NVNNI_EXPANDED_INT8_MIN:
         return true;
     default:
         return false;
@@ -4683,13 +6468,13 @@ static bool nativeVNNICodebookSupported(uint8_t codebook_id)
     case NVNNI_IQ1_S:
     case NVNNI_IQ1_M:
     case NVNNI_Q8_0:
+    case NVNNI_EXPANDED_INT8_MIN:
         return true;
     default:
         return false;
     }
 }
 
-template <int SMALL_M>
 bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
@@ -4704,11 +6489,12 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     const int* Ns,
     const uint8_t* codebook_ids,
     int num_projections,
-    int K,
+    int M, int K,
     int device_id,
     void* stream,
     int call_kb_override = -1,
-    int call_waves_override = -1)
+    int call_waves_override = -1,
+    const llaminar2::DeviceRowRange *row_range = nullptr)
 {
     constexpr int NUM_CUS = 60;
     constexpr int MIN_BLOCKS_PER_WAVE = 1;
@@ -4720,7 +6506,11 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     (void)device_id;
 
     const int blocks_per_row = K / 32;
-    NativeVNNISmallMBatchedArgs args{};
+    const auto rows = row_range ? *row_range :
+        llaminar2::DeviceRowRange::fullyActive(M);
+    if (!stream || rows.physicalRows() != M)
+        return false;
+    NativeVNNISmallMBatchedArgs args{.rows = rows};
     args.num_projections = num_projections;
     for (int p = 0; p < num_projections; ++p)
     {
@@ -4754,7 +6544,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     if (!validateNativeVNNIDecodeEquivalentKBOverride(
             "rocmGemv_native_vnni_small_m_batched_mixed_fp32",
             explicit_kb_override,
-            SMALL_M,
+            M,
             0,
             K,
             num_projections))
@@ -4767,7 +6557,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
                   codebook_ids, Ns, num_projections, K)
             : (num_projections == 1
                    ? resolveNativeVNNIDecodeGeneratedRuntimeConfig(
-                         codebook_ids[0], SMALL_M, Ns[0], K)
+                         codebook_ids[0], M, Ns[0], K)
                    : NativeVNNIDecodeGeneratedRuntimeConfig{});
     if (decode_equivalent &&
         explicit_kb_override <= 0 &&
@@ -4775,7 +6565,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     {
         fprintf(stderr,
                 "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] fused verifier group has no common serial M=1 split-K policy (M=%d K=%d projections=%d)\n",
-                SMALL_M, K, num_projections);
+                M, K, num_projections);
         return false;
     }
     const int kb_override =
@@ -4786,25 +6576,23 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
         (explicit_waves_override > 0)
             ? explicit_waves_override
             : (generated_cfg.has_generated ? generated_cfg.target_waves_per_cu : -1);
-    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    // Mixed-codebook batches follow the same ownership rule as homogeneous
-    // batches: graph capture is safe with declared split-reduce workspace.
-    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
                 "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] requested kb=%d exceeds graph-safe small-M cap=%d (M=%d K=%d projections=%d)\n",
-                kb_override, KB_CAP, SMALL_M, K, num_projections);
+                kb_override, KB_CAP, M, K, num_projections);
         return false;
     }
 
     constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
     const int target_waves_per_cu = (waves_override > 0) ? waves_override : DEFAULT_TARGET_WAVES_PER_CU;
     const int target_total_waves = target_waves_per_cu * NUM_CUS;
-    const int waves_per_workgroup = decode_equivalent ? 1 : SMALL_M;
-    const int target_total_workgroups =
-        max(1, (target_total_waves + waves_per_workgroup - 1) / waves_per_workgroup);
-    int kb_raw = max(1, (target_total_workgroups + args.total_grid_n - 1) / args.total_grid_n);
+    const int verifier_rows_per_tile = native_vnni_verifier_rows_per_tile(M);
+    const int logical_row_tiles =
+        (M + verifier_rows_per_tile - 1) / verifier_rows_per_tile;
+    const int resident_tiles =
+        max(1, args.total_grid_n * logical_row_tiles);
+    int kb_raw = max(1, (target_total_waves + resident_tiles - 1) / resident_tiles);
     int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
     kb_max = min(kb_max, KB_CAP);
     kb_raw = min(kb_raw, kb_max);
@@ -4825,7 +6613,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     }
     if (kb < 1) kb = 1;
 
-    if (kb > 1 && !use_atomic_reduce)
+    if (kb > 1)
     {
         for (int p = 0; p < num_projections; ++p)
         {
@@ -4833,33 +6621,14 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
             {
                 fprintf(stderr,
                         "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] kb=%d>1 but projection %d has no partial buffer (M=%d N=%d K=%d codebook=%u)\n",
-                        kb, p, SMALL_M, args.N[p], K, static_cast<unsigned>(args.codebook[p]));
-                return false;
-            }
-        }
-    }
-    if (kb > 1 && use_atomic_reduce)
-    {
-        for (int p = 0; p < num_projections; ++p)
-        {
-            args.partial[p] = nullptr;
-            hipError_t memset_err = hipMemsetAsync(
-                args.output[p],
-                0,
-                static_cast<size_t>(SMALL_M) * static_cast<size_t>(args.N[p]) * sizeof(float),
-                static_cast<hipStream_t>(stream));
-            if (memset_err != hipSuccess)
-            {
-                fprintf(stderr,
-                        "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] atomic output memset failed: %s (M=%d N=%d K=%d projection=%d codebook=%u)\n",
-                        hipGetErrorString(memset_err), SMALL_M, args.N[p], K, p, static_cast<unsigned>(args.codebook[p]));
+                        kb, p, M, args.N[p], K, static_cast<unsigned>(args.codebook[p]));
                 return false;
             }
         }
     }
 
     recordNativeVNNISmallMLaunch(
-        SMALL_M,
+        M,
         0,
         K,
         255,
@@ -4867,72 +6636,98 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
         kb,
         target_waves_per_cu,
         true,
-        num_projections,
-        kb > 1 && use_atomic_reduce);
+        num_projections);
 
-    if (decode_equivalent)
+    const int workspace_tile_rows = min(
+        M,
+        llaminar2::kDefaultNativeVNNIVerifierRowCapacity);
+    for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<TN, CPT, SMALL_M>),
-            dim3(args.total_grid_n, kb), dim3(THREADS, 1, 1), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
-    }
-    else
-    {
-        dim3 block(THREADS, SMALL_M, 1);
-        dim3 grid(args.total_grid_n, kb, 1);
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_mixed_kernel_t<TN, CPT, SMALL_M>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
-    }
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr,
-                "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] kernel launch failed: %s (M=%d K=%d projections=%d)\n",
-                hipGetErrorString(err), SMALL_M, K, num_projections);
-        return false;
-    }
-
-    if (kb > 1 && !use_atomic_reduce)
-    {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT, SMALL_M>),
-            dim3(args.total_grid_n), dim3(THREADS, 1, 1), 0, static_cast<hipStream_t>(stream),
-            args, kb);
-    }
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr,
-                "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] reduce launch failed: %s (M=%d K=%d projections=%d)\n",
-                hipGetErrorString(err), SMALL_M, K, num_projections);
-        return false;
-    }
-
-    if (kb > 1 && use_atomic_reduce)
-    {
+        const int tile_m = min(workspace_tile_rows, M - row_base);
+        const int tile_rows_per_group = native_vnni_verifier_rows_per_tile(tile_m);
+        NativeVNNISmallMBatchedArgs tile_args = args;
+        tile_args.rows = rows.slice(row_base, tile_m);
+        const int tile_row_groups = llaminar2::deviceRowWorkerGroups(
+            tile_args.rows, tile_rows_per_group,
+            static_cast<int64_t>(args.total_grid_n) * kb, target_total_waves);
+        const int reducer_row_groups = llaminar2::deviceRowWorkerGroups(
+            tile_args.rows, 1, args.total_grid_n, target_total_waves);
         for (int p = 0; p < num_projections; ++p)
         {
-            if (d_biases && d_biases[p])
+            tile_args.output[p] +=
+                static_cast<size_t>(row_base) * tile_args.N[p];
+        }
+
+        const int8_t* tile_a =
+            d_A_int8 + static_cast<size_t>(row_base) * K;
+        const float* tile_scales =
+            d_scale_A_blockwise +
+            static_cast<size_t>(row_base) * blocks_per_row;
+        const int32_t* tile_sums =
+            d_sum_A_blockwise
+                ? d_sum_A_blockwise +
+                      static_cast<size_t>(row_base) * blocks_per_row
+                : nullptr;
+
+        // Publication is fixed by the serial-M1 K-partition policy. Compile
+        // only its live destination/epilogue into this captured producer.
+        const auto launch = [&]<NativeVNNIVerifierPublication Publication>()
+        {
+            if (tile_rows_per_group == NVNNI_VERIFIER_SHORT_ROWS_PER_TILE)
             {
-                if (!rocmQuantGemm_biasAdd(
-                        d_outputs[p],
-                        d_biases[p],
-                        SMALL_M,
-                        Ns[p],
-                        device_id,
-                        stream))
-                {
-                    fprintf(stderr,
-                            "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] bias add failed after atomic reduce (M=%d N=%d K=%d projection=%d codebook=%u)\n",
-                            SMALL_M, Ns[p], K, p, static_cast<unsigned>(codebook_ids[p]));
-                    return false;
-                }
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<
+                        TN, CPT, NVNNI_VERIFIER_SHORT_ROWS_PER_TILE, Publication>),
+                    dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                    dim3(THREADS, 1, 1), 0,
+                    static_cast<hipStream_t>(stream),
+                    tile_a, tile_scales, tile_sums, tile_args, K,
+                    (blocks_per_row + kb - 1) / kb);
             }
+            else
+            {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_shared_mixed_kernel_t<
+                        TN, CPT, NVNNI_VERIFIER_WIDE_ROWS_PER_TILE, Publication>),
+                    dim3(tile_args.total_grid_n, kb, tile_row_groups),
+                    dim3(THREADS, 1, 1), 0,
+                    static_cast<hipStream_t>(stream),
+                    tile_a, tile_scales, tile_sums, tile_args, K,
+                    (blocks_per_row + kb - 1) / kb);
+            }
+        };
+        if (kb == 1)
+            launch.template operator()<NativeVNNIVerifierPublication::DirectOutput>();
+        else
+            launch.template operator()<NativeVNNIVerifierPublication::OrderedPartial>();
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] kernel launch failed: %s (M=%d tile_base=%d tile_m=%d K=%d projections=%d)\n",
+                    hipGetErrorString(err), M, row_base, tile_m, K,
+                    num_projections);
+            return false;
+        }
+
+        if (kb > 1)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT>),
+                dim3(tile_args.total_grid_n, reducer_row_groups),
+                dim3(THREADS, 1, 1), 0,
+                static_cast<hipStream_t>(stream), tile_args, kb);
+        }
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] reduce launch failed: %s (M=%d tile_base=%d tile_m=%d K=%d projections=%d)\n",
+                    hipGetErrorString(err), M, row_base, tile_m, K,
+                    num_projections);
+            return false;
         }
     }
 
@@ -4941,7 +6736,14 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
 
 extern "C" {
 
-bool rocmGemv_native_vnni_small_m_fp32_with_sums(
+/**
+ * @brief Execute verifier-depth GEMV with distinct decoder and math policy.
+ *
+ * `codebook_id` selects the physical weight decoder. The arithmetic policy ID
+ * selects the generated split-K geometry whose ordered reduction every row
+ * must reproduce. Expert promotion may change only the former.
+ */
+bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
     const void* d_block_scales,
@@ -4953,13 +6755,21 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums(
     float* d_partial_fp32,
     int M, int N, int K,
     uint8_t codebook_id,
-    int device_id, void* stream)
+    uint8_t arithmetic_policy_codebook_id,
+    int device_id, void* stream,
+    const llaminar2::DeviceRowRange *row_range)
 {
+    if (!stream || N <= 0 || K <= 0 ||
+        (row_range && row_range->physicalRows() != M))
+    {
+        fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] invalid stream or physical row geometry (M=%d N=%d K=%d)\n", M, N, K);
+        return false;
+    }
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if (M < 2 || M > 4)
+    if (M < 2)
     {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] M must be 2, 3, or 4 (M=%d N=%d K=%d)\n", M, N, K);
+        fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] M must be at least 2 (M=%d N=%d K=%d)\n", M, N, K);
         return false;
     }
     if ((K % 32) != 0)
@@ -4998,19 +6808,10 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums(
                     return false;                                                                 \
                 }                                                                                 \
             }                                                                                     \
-            switch (M)                                                                            \
-            {                                                                                     \
-            case 2: return rocmLaunch_native_vnni_small_m_fp32<2, FMT_TAG>(                       \
-                        d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,     \
-                        d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32, N, K, device_id, stream); \
-            case 3: return rocmLaunch_native_vnni_small_m_fp32<3, FMT_TAG>(                       \
-                        d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,     \
-                        d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32, N, K, device_id, stream); \
-            case 4: return rocmLaunch_native_vnni_small_m_fp32<4, FMT_TAG>(                       \
-                        d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,     \
-                        d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32, N, K, device_id, stream); \
-            default: return false;                                                                \
-            }                                                                                     \
+            return rocmLaunch_native_vnni_small_m_fp32<FMT_TAG>(                                 \
+                d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,            \
+                d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32,                           \
+                M, N, K, device_id, stream, arithmetic_policy_codebook_id, row_range);                       \
         } while (0)
 
     switch (static_cast<NativeVNNIFormat>(codebook_id))
@@ -5031,6 +6832,8 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums(
     case NVNNI_IQ1_S:    LAUNCH_SMALL_M(NVNNI_IQ1_S);
     case NVNNI_IQ1_M:    LAUNCH_SMALL_M(NVNNI_IQ1_M);
     case NVNNI_Q8_0:     LAUNCH_SMALL_M(NVNNI_Q8_0);
+    case NVNNI_EXPANDED_INT8_MIN:
+        LAUNCH_SMALL_M(NVNNI_EXPANDED_INT8_MIN);
     default:
         fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] unsupported codebook_id=%u (M=%d N=%d K=%d)\n",
                 static_cast<unsigned>(codebook_id), M, N, K);
@@ -5039,6 +6842,74 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums(
 
     #undef LAUNCH_SMALL_M
     return false;
+}
+
+/** @brief Execute verifier-depth GEMV for self-describing weight bytes. */
+bool rocmGemv_native_vnni_small_m_fp32_with_sums(
+    const int8_t* d_A_int8,
+    const uint8_t* d_payload,
+    const void* d_block_scales,
+    const void* d_block_mins,
+    const void* d_block_emins,
+    float* d_C_fp32,
+    const float* d_scale_A_blockwise,
+    const int32_t* d_sum_A_blockwise,
+    float* d_partial_fp32,
+    int M, int N, int K,
+    uint8_t codebook_id,
+    int device_id, void* stream)
+{
+    return rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+        d_A_int8,
+        d_payload,
+        d_block_scales,
+        d_block_mins,
+        d_block_emins,
+        d_C_fp32,
+        d_scale_A_blockwise,
+        d_sum_A_blockwise,
+        d_partial_fp32,
+        M,
+        N,
+        K,
+        codebook_id,
+        defaultNativeVNNIArithmeticPolicyCodebook(codebook_id),
+        device_id,
+        stream);
+}
+
+/** @brief Execute verifier-depth GEMV with explicit source math policy. */
+bool rocmGemv_native_vnni_small_m_fp32_with_policy(
+    const int8_t* d_A_int8,
+    const uint8_t* d_payload,
+    const void* d_block_scales,
+    const void* d_block_mins,
+    const void* d_block_emins,
+    float* d_C_fp32,
+    const float* d_scale_A_blockwise,
+    float* d_partial_fp32,
+    int M, int N, int K,
+    uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
+    int device_id, void* stream)
+{
+    return rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+        d_A_int8,
+        d_payload,
+        d_block_scales,
+        d_block_mins,
+        d_block_emins,
+        d_C_fp32,
+        d_scale_A_blockwise,
+        nullptr,
+        d_partial_fp32,
+        M,
+        N,
+        K,
+        codebook_id,
+        arithmetic_policy_codebook_id,
+        device_id,
+        stream);
 }
 
 bool rocmGemv_native_vnni_small_m_fp32(
@@ -5078,7 +6949,8 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
     int device_id,
     void* stream,
     int policy_kb,
-    int policy_target_waves)
+    int policy_target_waves,
+    const llaminar2::DeviceRowRange *row_range = nullptr)
 {
     hipError_t device_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_id));
     if (device_err != hipSuccess)
@@ -5089,9 +6961,9 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
         return false;
     }
 
-    if (M < 2 || M > 4)
+    if (M < 2)
     {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] M must be 2, 3, or 4 (M=%d K=%d projections=%d)\n",
+        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] M must be at least 2 (M=%d K=%d projections=%d)\n",
                 M, K, num_projections);
         return false;
     }
@@ -5108,7 +6980,7 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
         return false;
     }
     if (!d_A_int8 || !d_payloads || !d_block_scales || !d_outputs ||
-        !d_scale_A_blockwise || !d_partials || !Ns)
+        !d_scale_A_blockwise || !d_sum_A_blockwise || !d_partials || !Ns)
     {
         fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] missing required pointer (M=%d K=%d projections=%d)\n",
                 M, K, num_projections);
@@ -5158,18 +7030,10 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
                 }                                                                                       \
             }                                                                                           \
         }                                                                                               \
-        switch (M) {                                                                                    \
-            case 2: return rocmLaunch_native_vnni_small_m_batched_fp32<2, FMT_TAG>(                     \
-                d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs, \
-                d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream, policy_kb, policy_target_waves); \
-            case 3: return rocmLaunch_native_vnni_small_m_batched_fp32<3, FMT_TAG>(                     \
-                d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs, \
-                d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream, policy_kb, policy_target_waves); \
-            case 4: return rocmLaunch_native_vnni_small_m_batched_fp32<4, FMT_TAG>(                     \
-                d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs, \
-                d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream, policy_kb, policy_target_waves); \
-            default: return false;                                                                      \
-        }                                                                                               \
+        return rocmLaunch_native_vnni_small_m_batched_fp32<FMT_TAG>(                                  \
+            d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs,    \
+            d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, M, K,             \
+            device_id, stream, policy_kb, policy_target_waves, row_range);                                        \
     } while (0)
 
     switch (codebook_id)
@@ -5190,6 +7054,8 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
     case NVNNI_IQ1_S:    DISPATCH_BATCHED_FMT(NVNNI_IQ1_S);
     case NVNNI_IQ1_M:    DISPATCH_BATCHED_FMT(NVNNI_IQ1_M);
     case NVNNI_Q8_0:     DISPATCH_BATCHED_FMT(NVNNI_Q8_0);
+    case NVNNI_EXPANDED_INT8_MIN:
+        DISPATCH_BATCHED_FMT(NVNNI_EXPANDED_INT8_MIN);
     default:
         fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] unsupported codebook_id=%u (M=%d K=%d projections=%d)\n",
                 codebook_id, M, K, num_projections);
@@ -5217,13 +7083,14 @@ bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy(
     int device_id,
     void* stream,
     int policy_kb,
-    int policy_target_waves)
+    int policy_target_waves,
+    const llaminar2::DeviceRowRange *row_range)
 {
     return rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
         d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
         d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
         d_partials, Ns, num_projections, M, K, codebook_id, device_id,
-        stream, policy_kb, policy_target_waves);
+        stream, policy_kb, policy_target_waves, row_range);
 }
 
 bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
@@ -5251,28 +7118,6 @@ bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
         stream, -1, -1);
 }
 
-bool rocmGemv_native_vnni_small_m_batched_fp32(
-    const int8_t* d_A_int8,
-    const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
-    const float* const* d_biases,
-    float* const* d_outputs,
-    const float* d_scale_A_blockwise,
-    float* const* d_partials,
-    const int* Ns,
-    int num_projections,
-    int M, int K,
-    uint8_t codebook_id,
-    int device_id,
-    void* stream)
-{
-    return rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
-        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-        d_biases, d_outputs, d_scale_A_blockwise, nullptr, d_partials,
-        Ns, num_projections, M, K, codebook_id, device_id, stream);
-}
 
 static bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy_impl(
     const int8_t* d_A_int8,
@@ -5292,7 +7137,8 @@ static bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy_imp
     int device_id,
     void* stream,
     int policy_kb,
-    int policy_target_waves)
+    int policy_target_waves,
+    const llaminar2::DeviceRowRange *row_range = nullptr)
 {
     hipError_t device_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_id));
     if (device_err != hipSuccess)
@@ -5303,9 +7149,9 @@ static bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy_imp
         return false;
     }
 
-    if (M < 2 || M > 4)
+    if (M < 2)
     {
-        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] M must be 2, 3, or 4 (M=%d K=%d projections=%d)\n",
+        fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] M must be at least 2 (M=%d K=%d projections=%d)\n",
                 M, K, num_projections);
         return false;
     }
@@ -5322,7 +7168,7 @@ static bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy_imp
         return false;
     }
     if (!d_A_int8 || !d_payloads || !d_block_scales || !d_outputs ||
-        !d_scale_A_blockwise || !d_partials || !Ns || !codebook_ids)
+        !d_scale_A_blockwise || !d_sum_A_blockwise || !d_partials || !Ns || !codebook_ids)
     {
         fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_mixed_fp32] missing required pointer (M=%d K=%d projections=%d)\n",
                 M, K, num_projections);
@@ -5363,26 +7209,11 @@ static bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy_imp
         }
     }
 
-    switch (M)
-    {
-    case 2:
-        return rocmLaunch_native_vnni_small_m_batched_mixed_fp32<2>(
-            d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-            d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, codebook_ids,
-            num_projections, K, device_id, stream, policy_kb, policy_target_waves);
-    case 3:
-        return rocmLaunch_native_vnni_small_m_batched_mixed_fp32<3>(
-            d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-            d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, codebook_ids,
-            num_projections, K, device_id, stream, policy_kb, policy_target_waves);
-    case 4:
-        return rocmLaunch_native_vnni_small_m_batched_mixed_fp32<4>(
-            d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-            d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, codebook_ids,
-            num_projections, K, device_id, stream, policy_kb, policy_target_waves);
-    default:
-        return false;
-    }
+    return rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
+        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
+        d_partials, Ns, codebook_ids, num_projections, M, K, device_id,
+        stream, policy_kb, policy_target_waves, row_range);
 }
 
 bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy(
@@ -5403,13 +7234,14 @@ bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy(
     int device_id,
     void* stream,
     int policy_kb,
-    int policy_target_waves)
+    int policy_target_waves,
+    const llaminar2::DeviceRowRange *row_range)
 {
     return rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums_policy_impl(
         d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
         d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise,
         d_partials, Ns, codebook_ids, num_projections, M, K, device_id,
-        stream, policy_kb, policy_target_waves);
+        stream, policy_kb, policy_target_waves, row_range);
 }
 
 bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
@@ -5437,30 +7269,15 @@ bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
         stream, -1, -1);
 }
 
-bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
-    const int8_t* d_A_int8,
-    const uint8_t* const* d_payloads,
-    const uint16_t* const* d_block_scales,
-    const uint16_t* const* d_block_mins,
-    const uint32_t* const* d_block_emins,
-    const float* const* d_biases,
-    float* const* d_outputs,
-    const float* d_scale_A_blockwise,
-    float* const* d_partials,
-    const int* Ns,
-    const uint8_t* codebook_ids,
-    int num_projections,
-    int M, int K,
-    int device_id,
-    void* stream)
-{
-    return rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
-        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-        d_biases, d_outputs, d_scale_A_blockwise, nullptr, d_partials,
-        Ns, codebook_ids, num_projections, M, K, device_id, stream);
-}
 
-bool rocmGemv_native_vnni_fp32(
+/**
+ * @brief Execute serial NativeVNNI GEMV with an explicit arithmetic policy.
+ *
+ * The execution codebook owns physical decoding; the arithmetic policy
+ * codebook owns generated occupancy and split-K reduction order. These IDs
+ * differ after compact CPU weights are promoted into expanded codebook 23.
+ */
+bool rocmGemv_native_vnni_fp32_with_policy(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
     const void* d_block_scales,  // __half* (FP16 scale d)
@@ -5471,6 +7288,7 @@ bool rocmGemv_native_vnni_fp32(
     float* d_partial_fp32,       // [KB_MAX × N] partial buffer (nullable when KB=1)
     int N, int K,
     uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
     int device_id, void* stream,
     const float* d_scale_A_blockwise)
 {
@@ -5484,7 +7302,8 @@ bool rocmGemv_native_vnni_fp32(
 
     constexpr int NUM_CUS = 60;        // MI50/MI60
     constexpr int MIN_BLOCKS_PER_WAVE = 1;
-    constexpr int KB_CAP = 64;         // Must match SCATTER_KB_MAX in workspace alloc
+    constexpr int KB_CAP =
+        llaminar2::NativeVNNIGroupedDecodePolicy::maximum_k_partitions;
 
     const int blocks_per_row = K / 32;
     const uint16_t* d_scales_u16 = static_cast<const uint16_t*>(d_block_scales);
@@ -5492,10 +7311,41 @@ bool rocmGemv_native_vnni_fp32(
     const uint32_t* d_emins_u32  = static_cast<const uint32_t*>(d_block_emins);
 
     const auto& rocm_env = llaminar2::debugEnv().rocm;
-    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
-    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
+    const int api_kb_override =
+        g_native_vnni_kb_override.load(std::memory_order_relaxed);
+    const int api_waves_override =
+        g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
+    const int explicit_kb_override =
+        (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
+    const int explicit_waves_override =
+        (api_waves_override > 0)
+            ? api_waves_override
+            : rocm_env.nvnni_gemv_target_waves;
+    const bool has_explicit_tuning =
+        explicit_kb_override > 0 || explicit_waves_override > 0;
     const NativeVNNIDecodeGeneratedRuntimeConfig generated_cfg =
-        resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, 1, N, K);
+        resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+            arithmetic_policy_codebook_id, N, K);
+    if (!has_explicit_tuning && !generated_cfg.has_generated)
+    {
+        fprintf(
+            stderr,
+            "[rocmGemv_native_vnni_fp32] generated dispatch miss "
+            "(codebook=%u arithmetic_policy_codebook=%u N=%d K=%d)\n",
+            static_cast<unsigned>(codebook_id),
+            static_cast<unsigned>(arithmetic_policy_codebook_id),
+            N,
+            K);
+        return false;
+    }
+    const int policy_kb =
+        (explicit_kb_override > 0)
+            ? explicit_kb_override
+            : generated_cfg.kb;
+    const int policy_target_waves =
+        (explicit_waves_override > 0)
+            ? explicit_waves_override
+            : generated_cfg.target_waves_per_cu;
 
     // =========================================================================
     // IQ grid formats: LDS-cached grid kernel with 256-thread workgroups
@@ -5584,8 +7434,8 @@ bool rocmGemv_native_vnni_fp32(
             max_waves_per_cu = 16;
         else                         // IQ3_S, IQ3_XXS (≤2KB LDS, 94 VALU/block)
             max_waves_per_cu = 40;
-        if (generated_cfg.target_waves_per_cu > 0)
-            max_waves_per_cu = generated_cfg.target_waves_per_cu;
+        if (policy_target_waves > 0)
+            max_waves_per_cu = policy_target_waves;
 
         // Each 256-thread block contains 4 wavefronts (wavefront64).
         // Convert wave target to block target before computing KB.
@@ -5610,18 +7460,38 @@ bool rocmGemv_native_vnni_fp32(
                 if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
             }
         }
-        if (generated_cfg.kb > 0)
+        if (policy_kb > 0)
         {
-            kb = min(generated_cfg.kb, KB_CAP);
+            kb = min(policy_kb, KB_CAP);
             if (kb > blocks_per_row) kb = blocks_per_row;
         }
         if (kb < 1) kb = 1;
 
-        if (kb > 1 && !d_partial_fp32 && !use_atomic_reduce)
+        if (kb > 1 && !d_partial_fp32)
         {
             fprintf(stderr, "[rocmGemv_native_vnni_fp32] IQ: kb=%d>1 but no partial buffer (N=%d K=%d)\n", kb, N, K);
             return false;
         }
+
+        /*
+         * Publish the actual serial-decode route before launching it.  The
+         * NativeVNNI trainer uses this record to prove that its row oracle ran
+         * the same KB/occupancy policy returned by the serial-M1 resolver.  M=1
+         * used to be the only NativeVNNI path without this telemetry, which
+         * made a correct production launch indistinguishable from an unproven
+         * test-only oracle.
+         */
+        recordNativeVNNISmallMLaunch(
+            1,
+            N,
+            K,
+            static_cast<unsigned>(codebook_id),
+            grid_n,
+            kb,
+            max_waves_per_cu,
+            false,
+            1,
+            static_cast<int>(arithmetic_policy_codebook_id));
 
         dim3 block(IQ_THREADS, 1, 1);
 
@@ -5632,19 +7502,6 @@ bool rocmGemv_native_vnni_fp32(
                     dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),              \
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
                     d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);       \
-            } else if (use_atomic_reduce) {                                                   \
-                hipError_t memset_err = hipMemsetAsync(                                       \
-                    d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream));        \
-                if (memset_err != hipSuccess) {                                               \
-                    fprintf(stderr, "[rocmGemv_native_vnni_fp32] IQ atomic memset failed: %s (N=%d K=%d codebook=%u)\n", \
-                            hipGetErrorString(memset_err), N, K, static_cast<unsigned>(codebook_id)); \
-                    return false;                                                            \
-                }                                                                             \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
-                    dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),             \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
-                    d_C_fp32, nullptr, d_scale_A, d_scale_A_blockwise, N, K, kb);             \
             } else {                                                                          \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
@@ -5677,34 +7534,30 @@ bool rocmGemv_native_vnni_fp32(
     else
     {
         // =====================================================================
-        // Non-IQ formats + IQ small-N fallback: TN=64, 1 wavefront/WG
+        // Non-IQ formats + IQ small-N fallback: TN=128, 2 wavefronts/WG
         // =====================================================================
-        constexpr int TN = 64;
+        constexpr int TN = 128;
         constexpr int CPT = 1;
-        constexpr int THREADS = TN / CPT;  // 64 threads = 1 wavefront
+        constexpr int THREADS = TN / CPT;  // 128 threads = 2 wavefronts
 
         const int grid_n = (N + TN - 1) / TN;
 
-        // Check runtime tuning overrides. The explicit C API wins over env so
-        // microbench sweeps can override process-level defaults deterministically.
-        const int api_kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
-        const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
-        const int explicit_kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
-        const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
-        const int kb_override = (explicit_kb_override > 0) ? explicit_kb_override : generated_cfg.kb;
-        const int waves_override = (explicit_waves_override > 0) ? explicit_waves_override : generated_cfg.target_waves_per_cu;
-
         constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
 
-        // Q8_0 (codebook_id=19) has a trivial decode path (direct INT8 load),
-        // so it benefits from lower occupancy pressure. Tuning sweep shows
-        // tw=4 matches or beats INT8-VNNI on MI50/MI60 across all 7B shapes.
+        // Both expanded INT8 representations have the same payload traffic
+        // and direct decode.  Codebook 23 adds only the already-vectorized
+        // asymmetric correction, so it intentionally inherits codebook 19's
+        // trained launch policy until its own certification corpus is added.
         constexpr int Q8_0_TARGET_WAVES_PER_CU = 4;
-        const int default_waves = (codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
+        const bool uses_expanded_int8 =
+            codebook_id == static_cast<uint8_t>(NVNNI_Q8_0) ||
+            codebook_id == static_cast<uint8_t>(NVNNI_EXPANDED_INT8_MIN);
+        const int default_waves = uses_expanded_int8
                                       ? Q8_0_TARGET_WAVES_PER_CU
                                       : DEFAULT_TARGET_WAVES_PER_CU;
 
-        const int TARGET_WAVES_PER_CU = (waves_override > 0) ? waves_override : default_waves;
+        const int TARGET_WAVES_PER_CU =
+            (policy_target_waves > 0) ? policy_target_waves : default_waves;
         int target_total_waves = TARGET_WAVES_PER_CU * NUM_CUS;
         int kb_raw = max(1, (target_total_waves + grid_n - 1) / grid_n);
         int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
@@ -5722,24 +7575,35 @@ bool rocmGemv_native_vnni_fp32(
         }
         if (kb < 1) kb = 1;
 
-        // Experimental Q8_0 direct mode removes the second reduce launch for
-        // decode projections. It is opt-in while shape-level throughput is
-        // validated against the production split-K heuristic.
-        if (rocm_env.nvnni_q8_direct && codebook_id == static_cast<uint8_t>(NVNNI_Q8_0))
+        if (policy_kb > 0)
         {
-            kb = 1;
-        }
-        else if (kb_override > 0)
-        {
-            kb = min(kb_override, KB_CAP);
+            kb = min(policy_kb, KB_CAP);
             if (kb > blocks_per_row) kb = blocks_per_row;
         }
 
-        if (kb > 1 && !d_partial_fp32 && !use_atomic_reduce)
+        if (kb > 1 && !d_partial_fp32)
         {
             fprintf(stderr, "[rocmGemv_native_vnni_fp32] kb=%d>1 but no partial buffer (N=%d K=%d)\n", kb, N, K);
             return false;
         }
+
+        /*
+         * Keep serial M=1 route evidence symmetric with the grouped verifier
+         * kernels.  Recording the resolved values, rather than merely the
+         * requested overrides, also proves clamping and shape constraints did
+         * not silently select a different production launch.
+         */
+        recordNativeVNNISmallMLaunch(
+            1,
+            N,
+            K,
+            static_cast<unsigned>(codebook_id),
+            grid_n,
+            kb,
+            TARGET_WAVES_PER_CU,
+            false,
+            1,
+            static_cast<int>(arithmetic_policy_codebook_id));
 
         dim3 block(THREADS, 1, 1);
 
@@ -5750,19 +7614,6 @@ bool rocmGemv_native_vnni_fp32(
                     dim3(grid_n, 1), block, 0, static_cast<hipStream_t>(stream),             \
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
                     d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);      \
-            } else if (use_atomic_reduce) {                                                   \
-                hipError_t memset_err = hipMemsetAsync(                                       \
-                    d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream));        \
-                if (memset_err != hipSuccess) {                                               \
-                    fprintf(stderr, "[rocmGemv_native_vnni_fp32] atomic memset failed: %s (N=%d K=%d codebook=%u)\n", \
-                            hipGetErrorString(memset_err), N, K, static_cast<unsigned>(codebook_id)); \
-                    return false;                                                            \
-                }                                                                             \
-                hipLaunchKernelGGL(                                                           \
-                    HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
-                    dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),            \
-                    d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
-                    d_C_fp32, nullptr, d_scale_A, d_scale_A_blockwise, N, K, kb);            \
             } else {                                                                          \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
@@ -5794,6 +7645,9 @@ bool rocmGemv_native_vnni_fp32(
         case NVNNI_IQ1_S:    LAUNCH_NATIVE_VNNI(NVNNI_IQ1_S);    break;
         case NVNNI_IQ1_M:    LAUNCH_NATIVE_VNNI(NVNNI_IQ1_M);    break;
         case NVNNI_Q8_0:     LAUNCH_NATIVE_VNNI(NVNNI_Q8_0);     break;
+        case NVNNI_EXPANDED_INT8_MIN:
+            LAUNCH_NATIVE_VNNI(NVNNI_EXPANDED_INT8_MIN);
+            break;
         default:
             fprintf(stderr, "[rocmGemv_native_vnni_fp32] Unknown codebook_id=%u (N=%d K=%d)\n",
                     static_cast<unsigned>(codebook_id), N, K);
@@ -5812,6 +7666,39 @@ bool rocmGemv_native_vnni_fp32(
     }
 
     return true;
+}
+
+/** @brief Execute serial GEMV for self-describing weight bytes. */
+bool rocmGemv_native_vnni_fp32(
+    const int8_t* d_A_int8,
+    const uint8_t* d_payload,
+    const void* d_block_scales,
+    const void* d_block_mins,
+    const void* d_block_emins,
+    float* d_C_fp32,
+    const float* d_scale_A,
+    float* d_partial_fp32,
+    int N, int K,
+    uint8_t codebook_id,
+    int device_id, void* stream,
+    const float* d_scale_A_blockwise)
+{
+    return rocmGemv_native_vnni_fp32_with_policy(
+        d_A_int8,
+        d_payload,
+        d_block_scales,
+        d_block_mins,
+        d_block_emins,
+        d_C_fp32,
+        d_scale_A,
+        d_partial_fp32,
+        N,
+        K,
+        codebook_id,
+        defaultNativeVNNIArithmeticPolicyCodebook(codebook_id),
+        device_id,
+        stream,
+        d_scale_A_blockwise);
 }
 
 // ============================================================================

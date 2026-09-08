@@ -231,6 +231,15 @@ namespace llaminar2
             return (err == hipSuccess);
         }
 
+        bool hipMemsetAsyncDevice(void *dst, int value, size_t bytes, int device_ordinal, void *stream)
+        {
+            hipError_t err = hipSetDevice(device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemsetAsync(dst, value, bytes, static_cast<hipStream_t>(stream));
+            return (err == hipSuccess);
+        }
+
         bool hipMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream)
         {
             hipError_t err = hipMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, static_cast<hipStream_t>(stream));
@@ -250,18 +259,6 @@ namespace llaminar2
             // which is OK - it means P2P was already set up
             hipError_t err = hipDeviceEnablePeerAccess(peer_device, 0);
             return (err == hipSuccess || err == hipErrorPeerAccessAlreadyEnabled);
-        }
-
-        bool hipDeviceSynchronizeWrapper()
-        {
-            hipError_t err = hipDeviceSynchronize();
-            if (err == hipErrorStreamCaptureUnsupported ||
-                err == hipErrorStreamCaptureImplicit)
-            {
-                // Benign: graph capture is active on this device — skip sync.
-                return true;
-            }
-            return (err == hipSuccess);
         }
 
         // =========================================================================

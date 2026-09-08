@@ -309,6 +309,82 @@ TEST_F(GraphSnapshotCallbackTest, MultiStageGraph_AllCallbacksInvoked)
     verifyAllStagesInvoked({"stage1_norm", "stage2_norm", "stage3_residual"});
 }
 
+/**
+ * @brief Preserve eager fast-decode snapshots before an aliased buffer is reused.
+ *
+ * Cached CPU decode uses the fast stage policy but does not record GPU-style
+ * device-to-device snapshot copies.  The callback must therefore observe each
+ * producer immediately.  Publishing all callbacks after the graph would make
+ * `first_writer` incorrectly expose the bytes written later by
+ * `second_writer`, which invalidates grouped-versus-serial operation proofs.
+ */
+TEST_F(GraphSnapshotCallbackTest,
+       FastDecodeCapturesAliasedOutputAtEachProducer)
+{
+    constexpr size_t element_count = 64;
+    auto *first_input = createFP32Tensor({element_count});
+    auto *second_input = createFP32Tensor({element_count});
+    auto *zero = createFP32Tensor({element_count});
+    auto *shared_output = createFP32Tensor({element_count});
+    std::fill_n(first_input->mutable_data(), element_count, 1.0f);
+    std::fill_n(second_input->mutable_data(), element_count, 2.0f);
+    std::fill_n(zero->mutable_data(), element_count, 0.0f);
+
+    ComputeGraph graph;
+    graph.addNode(
+        "first_writer",
+        ComputeStageFactory::createResidualAdd({
+            .device_id = DeviceId::cpu(),
+            .input = first_input,
+            .residual = zero,
+            .output = shared_output,
+            .num_elements = element_count,
+        }),
+        DeviceId::cpu());
+    graph.addNode(
+        "second_writer",
+        ComputeStageFactory::createResidualAdd({
+            .device_id = DeviceId::cpu(),
+            .input = second_input,
+            .residual = zero,
+            .output = shared_output,
+            .num_elements = element_count,
+        }),
+        DeviceId::cpu());
+    graph.addDependency("second_writer", "first_writer");
+
+    std::unordered_map<std::string, float> first_values;
+    std::unordered_map<std::string, int> callback_counts;
+    GraphExecutorConfig config;
+    config.snapshot_callback =
+        [&](const std::string &stage_name, const StageDumpInfo &dump_info)
+        {
+            ASSERT_FALSE(dump_info.outputs.empty());
+            ASSERT_NE(dump_info.outputs.front().data, nullptr);
+            first_values[stage_name] =
+                static_cast<const float *>(dump_info.outputs.front().data)[0];
+            ++callback_counts[stage_name];
+        };
+
+    DeviceGraphExecutor executor(config);
+    DeviceGraphExecutor::DecodeCapturePolicy policy;
+    policy.allow_fast_decode = true;
+    policy.allow_cached_graph_replay = false;
+    ASSERT_TRUE(executor.executeDecodeWithCapturePolicy(
+        graph,
+        ctx_.get(),
+        /*segment_cache=*/nullptr,
+        /*gpu_stream=*/nullptr,
+        /*gpu_ctx=*/nullptr,
+        /*collective_nodes=*/nullptr,
+        policy));
+
+    EXPECT_EQ(callback_counts["first_writer"], 1);
+    EXPECT_EQ(callback_counts["second_writer"], 1);
+    EXPECT_FLOAT_EQ(first_values["first_writer"], 1.0f);
+    EXPECT_FLOAT_EQ(first_values["second_writer"], 2.0f);
+}
+
 // =============================================================================
 // Edge Cases
 // =============================================================================

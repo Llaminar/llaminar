@@ -29,23 +29,35 @@
 namespace llaminar2
 {
 
-    Q5_1Tensor::Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
+    Q5_1Tensor::Q5_1Tensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : Q5_1Tensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    Q5_1Tensor::Q5_1Tensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
         : shape_(shape),
           is_view_(false),
-          raw_data_(raw_data),
+          raw_data_(std::move(raw_data)),
           raw_data_ptr_(nullptr),
           view_byte_offset_(0),
           parent_(nullptr),
           device_(DeviceId::cpu()),
           device_blocks_(nullptr)
     {
-        if (shape_.size() != 2)
+        if (shape_.size() != 2u && shape_.size() != 3u)
         {
-            throw std::invalid_argument("Q5_1Tensor requires 2D shape");
+            throw std::invalid_argument("Q5_1Tensor requires a 2D matrix or 3D expert tensor");
         }
 
-        // Validate block alignment
-        const size_t num_elements = shape_[0] * shape_[1];
+        // A 3D GGUF expert tensor is [K, N, E]. The payload remains one
+        // contiguous sequence of Q5 blocks; expert views later expose [N, K].
+        size_t num_elements = 1u;
+        for (const size_t dimension : shape_)
+            num_elements *= dimension;
         const size_t num_blocks = (num_elements + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
         const size_t expected_bytes = num_blocks * sizeof(Q5_1Block);
 
@@ -109,10 +121,11 @@ namespace llaminar2
 
     Q5_1Tensor::~Q5_1Tensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 
@@ -592,10 +605,10 @@ namespace llaminar2
         return fp16_to_fp32(blocks[row_idx * blocks_per_row + k_block_offset].m);
     }
 
-    void Q5_1Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    void Q5_1Tensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        const size_t linear = vnniLinearIdx(ctx, n, b);
-        const auto *blk = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
+        const auto *blk = &typed_data()[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
         uint8_t *dst = vnniPayloadDst(ctx, linear);
         std::memcpy(dst, blk->qs, 16);
         std::memcpy(dst + 16, blk->qh, 4);

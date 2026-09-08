@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# @file llaminar-dev
+# @brief Build and enter Llaminar's devcontainer from an SSH session.
+#
+# The host half can prebuild/recreate the environment with the Dev Containers
+# CLI, discovers an existing container through its workspace label, and starts
+# a stopped instance after a host reboot. The container half owns persistent
+# tmux sessions so an SSH disconnect does not terminate a shell or Codex task.
+
+set -euo pipefail
+
+readonly CONTAINER_WORKSPACE="${LLAMINAR_CONTAINER_WORKSPACE:-/workspaces/llaminar}"
+readonly CONTAINER_USER="${LLAMINAR_CONTAINER_USER:-vscode}"
+readonly CODEX_SESSION="${LLAMINAR_CODEX_SESSION:-llaminar-codex}"
+readonly SHELL_SESSION="${LLAMINAR_SHELL_SESSION:-llaminar-shell}"
+readonly REBUILD_SESSION="${LLAMINAR_REBUILD_SESSION:-llaminar-rebuild}"
+readonly CODEX_STATE_VOLUME="${LLAMINAR_CODEX_STATE_VOLUME:-llaminar-codex-state}"
+readonly DEVCONTAINER_CLI_DEFAULT="$HOME/.local/devcontainers/bin/devcontainer"
+readonly REBUILD_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/llaminar"
+readonly REBUILD_LOG="$REBUILD_STATE_DIR/rebuild.log"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  llaminar [codex [CODEX_ARGS...]]
+  llaminar shell
+  llaminar exec COMMAND [ARG...]
+  llaminar status
+  llaminar rebuild [--no-cache]
+  llaminar rebuild-log
+  llaminar help | --help
+
+Manage and enter Llaminar's VS Code devcontainer from an SSH session. With no
+command, attach to (or create) the persistent `llaminar-codex` tmux session.
+
+Commands:
+  codex         Run Codex in a persistent container tmux session (default).
+  shell         Open a persistent development shell in the container.
+  exec          Run one non-interactive command in the container workspace.
+  status        Show container, tmux, Codex, and authentication status.
+  rebuild       Prebuild, then recreate the devcontainer in a host tmux session.
+  rebuild-log   Show the last host-side rebuild log.
+  help, --help  Show this help without starting Docker or the container.
+
+Connect over SSH:
+  ssh dbsanfte@HOST
+  llaminar
+
+Or connect and enter Codex in one step (TTY allocation is required):
+  ssh -t dbsanfte@HOST llaminar
+
+Codex sessions and VS Code history:
+  llaminar                         Start or reattach to Codex.
+  llaminar codex resume --last     Resume the most recent persisted thread.
+  llaminar codex resume            Select from persisted Codex threads.
+
+The VS Code extension and CLI share `/home/vscode/.codex`, backed by the named
+Docker volume `llaminar-codex-state`. Do not delete that volume. Rebuilding the
+devcontainer preserves its login, configuration, and conversation history.
+
+Development and diagnostics:
+  llaminar shell                   Start or reattach to a development shell.
+  llaminar exec nvidia-smi         Run a one-off command in the workspace.
+  llaminar exec git status --short Pass command arguments without a shell.
+  llaminar status                  Inspect container and Codex status.
+
+Detach and reattach:
+  Press Ctrl-b, then d, to detach without stopping Codex or the shell.
+  Run `llaminar` or `llaminar shell` again to reattach. An SSH disconnect also
+  leaves the tmux session running.
+
+Rebuild and recovery:
+  llaminar rebuild                 Build first, then replace the container.
+  llaminar rebuild --no-cache      Force an uncached image build.
+  llaminar rebuild-log             Read the most recent rebuild output.
+
+Rebuilds run inside the host tmux session `llaminar-rebuild`; an SSH disconnect
+does not stop them. Run `llaminar rebuild` again to reattach while one is active.
+The launcher refuses to rebuild unless the persistent Codex volume already
+exists and the devcontainer configuration mounts it at the expected path.
+
+Authentication recovery (run these interactively):
+  llaminar shell
+  codex login --device-auth
+
+  llaminar shell
+  bash .devcontainer/setup-github-cli.sh
+
+Environment overrides:
+  LLAMINAR_CODEX_SESSION       tmux session name for Codex
+  LLAMINAR_SHELL_SESSION       tmux session name for the shell
+  LLAMINAR_REBUILD_SESSION     host tmux session name for rebuilds
+  LLAMINAR_CODEX_STATE_VOLUME  persistent Codex Docker volume
+  LLAMINAR_CONTAINER_WORKSPACE workspace path inside the container
+  LLAMINAR_CONTAINER_USER      development user inside the container
+EOF
+}
+
+fail() {
+    printf 'llaminar: %s\n' "$*" >&2
+    exit 1
+}
+
+require_tty() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        fail "this command needs a terminal; connect with 'ssh -t HOST'"
+    fi
+}
+
+host_workspace() {
+    local script_path script_dir
+
+    script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+    script_dir="$(cd -- "$(dirname -- "$script_path")" && pwd -P)"
+    cd -- "$script_dir/.." && pwd -P
+}
+
+require_host_docker() {
+    command -v docker >/dev/null 2>&1 || fail "docker is not installed on the SSH host"
+    docker info >/dev/null 2>&1 || fail "the SSH user cannot reach the Docker daemon"
+}
+
+resolve_devcontainer_cli() {
+    local cli_path
+
+    if cli_path="$(command -v devcontainer 2>/dev/null)"; then
+        printf '%s\n' "$cli_path"
+        return
+    fi
+    if [[ -x "$DEVCONTAINER_CLI_DEFAULT" ]]; then
+        printf '%s\n' "$DEVCONTAINER_CLI_DEFAULT"
+        return
+    fi
+    fail "Dev Containers CLI is not installed; see .devcontainer/SSH_CODEX.md"
+}
+
+resolve_codex() {
+    local codex_path
+
+    if codex_path="$(command -v codex 2>/dev/null)"; then
+        printf '%s\n' "$codex_path"
+        return
+    fi
+    fail "Codex is not installed; rebuild the devcontainer or run the official installer inside it"
+}
+
+quote_command() {
+    local quoted_arg
+    local command_line=""
+
+    for quoted_arg in "$@"; do
+        printf -v quoted_arg '%q' "$quoted_arg"
+        command_line+="${command_line:+ }${quoted_arg}"
+    done
+    printf '%s\n' "$command_line"
+}
+
+attach_codex() {
+    local codex_path codex_command command_line
+
+    require_tty
+    command -v tmux >/dev/null 2>&1 || fail \
+        "tmux is not installed; rebuild the devcontainer from its updated Dockerfile"
+    codex_path="$(resolve_codex)"
+
+    if tmux has-session -t "=${CODEX_SESSION}" 2>/dev/null; then
+        if (( $# > 0 )); then
+            printf 'llaminar: attaching to existing %s session; supplied Codex arguments are not reapplied\n' \
+                "$CODEX_SESSION" >&2
+        fi
+        exec tmux attach-session -t "=${CODEX_SESSION}"
+    fi
+
+    # The interactive login shell is the container's environment authority: it
+    # activates the Python venv and publishes ccache, vcpkg, and PYTHONPATH in
+    # exactly the same way as a VS Code integrated terminal.
+    codex_command="$(quote_command "$codex_path" "$@")"
+    command_line="$(quote_command /bin/bash -lic "exec ${codex_command}")"
+    exec tmux new-session -s "$CODEX_SESSION" -c "$CONTAINER_WORKSPACE" "$command_line"
+}
+
+attach_shell() {
+    require_tty
+    command -v tmux >/dev/null 2>&1 || fail \
+        "tmux is not installed; rebuild the devcontainer from its updated Dockerfile"
+
+    if tmux has-session -t "=${SHELL_SESSION}" 2>/dev/null; then
+        exec tmux attach-session -t "=${SHELL_SESSION}"
+    fi
+    exec tmux new-session -s "$SHELL_SESSION" -c "$CONTAINER_WORKSPACE" \
+        'exec /bin/bash -l'
+}
+
+inside_status() {
+    local codex_path
+
+    printf 'workspace:  %s\n' "$CONTAINER_WORKSPACE"
+    printf 'user:       %s\n' "$(id -un)"
+    if command -v tmux >/dev/null 2>&1; then
+        printf 'tmux:       %s\n' "$(command -v tmux)"
+        tmux list-sessions 2>/dev/null || printf 'sessions:   none\n'
+    else
+        printf 'tmux:       not installed\n'
+    fi
+
+    codex_path="$(resolve_codex)"
+    printf 'codex:      %s\n' "$codex_path"
+    "$codex_path" --version
+    "$codex_path" login status 2>&1 || true
+}
+
+run_inside() {
+    local command_name="${1:-codex}"
+    if (( $# > 0 )); then
+        shift
+    fi
+
+    cd "$CONTAINER_WORKSPACE"
+    case "$command_name" in
+        codex)
+            attach_codex "$@"
+            ;;
+        shell)
+            (( $# == 0 )) || fail "shell does not accept arguments"
+            attach_shell
+            ;;
+        exec)
+            (( $# > 0 )) || fail "exec requires a command"
+            exec "$@"
+            ;;
+        status)
+            (( $# == 0 )) || fail "status does not accept arguments"
+            inside_status
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            fail "unknown command '$command_name'; run 'llaminar help'"
+            ;;
+    esac
+}
+
+codex_state_mount() {
+    local container_id="$1"
+
+    docker inspect --format \
+        '{{range .Mounts}}{{if eq .Destination "/home/vscode/.codex"}}{{.Type}}:{{.Name}}{{end}}{{end}}' \
+        "$container_id"
+}
+
+require_codex_state_mount() {
+    local container_id="$1"
+    local actual_mount
+
+    actual_mount="$(codex_state_mount "$container_id")"
+    [[ "$actual_mount" == "volume:${CODEX_STATE_VOLUME}" ]] || fail \
+        "devcontainer ${container_id} has Codex state mount '${actual_mount:-none}', expected 'volume:${CODEX_STATE_VOLUME}'; rebuild it before use"
+}
+
+validate_rebuild_preconditions() {
+    local workspace="$1"
+
+    command -v jq >/dev/null 2>&1 || fail "jq is required on the SSH host"
+    jq -e --arg volume "$CODEX_STATE_VOLUME" \
+        '.mounts | any(. == ("source=" + $volume + ",target=/home/vscode/.codex,type=volume"))' \
+        "$workspace/.devcontainer/devcontainer.json" >/dev/null || fail \
+        "devcontainer.json does not mount ${CODEX_STATE_VOLUME} at /home/vscode/.codex"
+    docker volume inspect "$CODEX_STATE_VOLUME" >/dev/null 2>&1 || fail \
+        "persistent Codex volume ${CODEX_STATE_VOLUME} does not exist; refusing to create an empty replacement"
+}
+
+ensure_trailing_newline() {
+    local json_file="$1"
+
+    [[ -s "$json_file" ]] || return
+    if [[ -n "$(tail -c 1 "$json_file")" ]]; then
+        printf '\n' >> "$json_file"
+    fi
+}
+
+perform_rebuild() {
+    local workspace cli_path container_id state_mount newline_trap no_cache=false
+    local -a build_args
+
+    (( $# <= 1 )) || fail "rebuild accepts only --no-cache"
+    case "${1:-}" in
+        "")
+            ;;
+        --no-cache)
+            no_cache=true
+            ;;
+        *)
+            fail "rebuild accepts only --no-cache"
+            ;;
+    esac
+
+    require_host_docker
+    workspace="$(host_workspace)"
+    cli_path="$(resolve_devcontainer_cli)"
+    validate_rebuild_preconditions "$workspace"
+
+    # The CLI currently rewrites devcontainer-lock.json without its existing
+    # final newline. Preserve the repository's formatting on success or error.
+    printf -v newline_trap 'ensure_trailing_newline %q' \
+        "$workspace/.devcontainer/devcontainer-lock.json"
+    trap "$newline_trap" EXIT
+
+    mkdir -p "$REBUILD_STATE_DIR"
+    exec > >(tee "$REBUILD_LOG") 2>&1
+
+    printf 'Llaminar devcontainer rebuild started: %s\n' "$(date --iso-8601=seconds)"
+    printf 'Workspace: %s\n' "$workspace"
+    printf 'Codex state: %s (preserved)\n' "$CODEX_STATE_VOLUME"
+    printf 'Dev Containers CLI: %s (%s)\n' "$cli_path" "$("$cli_path" --version)"
+
+    # Complete the potentially expensive image build before asking the CLI to
+    # remove the existing container. The repository and named Codex state are
+    # independent mounts and are never deletion targets in this operation.
+    build_args=(build --workspace-folder "$workspace")
+    if [[ "$no_cache" == true ]]; then
+        build_args+=(--no-cache)
+    fi
+    "$cli_path" "${build_args[@]}"
+
+    printf '\nImage build succeeded; recreating the devcontainer.\n'
+    "$cli_path" up \
+        --workspace-folder "$workspace" \
+        --remove-existing-container
+
+    container_id="$(find_container "$workspace")"
+    state_mount="$(codex_state_mount "$container_id")"
+    [[ "$state_mount" == "volume:${CODEX_STATE_VOLUME}" ]] || fail \
+        "new container has Codex state mount '${state_mount:-none}'"
+
+    docker exec \
+        --env HOME=/home/vscode \
+        --user "$CONTAINER_USER" \
+        --workdir "$CONTAINER_WORKSPACE" \
+        "$container_id" \
+        bash -lc '
+            set -euo pipefail
+            test -s "$HOME/.codex/auth.json"
+            command -v codex
+            codex --version
+            codex login status
+            session_count="$(find "$HOME/.codex/sessions" -type f -name "*.jsonl" | wc -l)"
+            (( session_count > 0 ))
+            printf "Saved Codex sessions: %s\n" "$session_count"
+        '
+
+    printf '\nLlaminar devcontainer rebuild completed: %s\n' "$(date --iso-8601=seconds)"
+    printf 'Container: %s\n' "$container_id"
+    printf 'Next: run llaminar status, then llaminar\n'
+}
+
+attach_rebuild() {
+    local workspace script_path command_line
+
+    require_tty
+    command -v tmux >/dev/null 2>&1 || fail "tmux is not installed on the SSH host"
+    require_host_docker
+    workspace="$(host_workspace)"
+    script_path="$(readlink -f "${BASH_SOURCE[0]}")"
+
+    if tmux has-session -t "=${REBUILD_SESSION}" 2>/dev/null; then
+        if (( $# > 0 )); then
+            printf 'llaminar: attaching to the active rebuild; supplied arguments are not reapplied\n' >&2
+        fi
+        exec tmux attach-session -t "=${REBUILD_SESSION}"
+    fi
+
+    command_line="$(quote_command "$script_path" --host-rebuild "$@")"
+    exec tmux new-session -s "$REBUILD_SESSION" -c "$workspace" "$command_line"
+}
+
+show_rebuild_log() {
+    (( $# == 0 )) || fail "rebuild-log does not accept arguments"
+    [[ -f "$REBUILD_LOG" ]] || fail "no rebuild log exists yet at ${REBUILD_LOG}"
+    cat "$REBUILD_LOG"
+}
+
+find_container() {
+    local host_workspace="$1"
+    local -a running_containers=()
+    local -a known_containers=()
+    local selected_container state
+
+    mapfile -t running_containers < <(
+        docker ps \
+            --filter "label=devcontainer.local_folder=${host_workspace}" \
+            --format '{{.ID}}'
+    )
+
+    if (( ${#running_containers[@]} > 1 )); then
+        fail "multiple running devcontainers claim ${host_workspace}: ${running_containers[*]}"
+    fi
+    if (( ${#running_containers[@]} == 1 )); then
+        require_codex_state_mount "${running_containers[0]}"
+        printf '%s\n' "${running_containers[0]}"
+        return
+    fi
+
+    mapfile -t known_containers < <(
+        docker ps -a \
+            --filter "label=devcontainer.local_folder=${host_workspace}" \
+            --format '{{.ID}}'
+    )
+    (( ${#known_containers[@]} > 0 )) || fail \
+        "no Llaminar devcontainer exists; run 'llaminar rebuild' to create it"
+
+    # `docker ps -a` returns newest containers first.  Older stopped containers
+    # may remain after a rebuild, so only revive the newest matching instance.
+    selected_container="${known_containers[0]}"
+    require_codex_state_mount "$selected_container"
+    state="$(docker inspect --format '{{.State.Status}}' "$selected_container")"
+    case "$state" in
+        created|exited)
+            printf 'llaminar: starting stopped devcontainer %s\n' "$selected_container" >&2
+            docker start "$selected_container" >/dev/null
+            docker exec --user "$CONTAINER_USER" \
+                --workdir "$CONTAINER_WORKSPACE" \
+                "$selected_container" \
+                bash "$CONTAINER_WORKSPACE/.devcontainer/onstart.sh" >&2
+            ;;
+        running)
+            ;;
+        *)
+            fail "devcontainer ${selected_container} is in unsupported state '${state}'"
+            ;;
+    esac
+    printf '%s\n' "$selected_container"
+}
+
+run_from_host() {
+    local workspace container_id command_name terminal_type state_mount
+    local -a docker_env_args=(
+        --env "LLAMINAR_CODEX_SESSION=${CODEX_SESSION}"
+        --env "LLAMINAR_SHELL_SESSION=${SHELL_SESSION}"
+        --env "LLAMINAR_CONTAINER_WORKSPACE=${CONTAINER_WORKSPACE}"
+        --env "LLAMINAR_CONTAINER_USER=${CONTAINER_USER}"
+    )
+    local -a docker_tty_args=()
+
+    require_host_docker
+    workspace="$(host_workspace)"
+    container_id="$(find_container "$workspace")"
+    command_name="${1:-codex}"
+    state_mount="$(codex_state_mount "$container_id")"
+
+    if [[ "$command_name" == "status" ]]; then
+        printf 'container:  %s (%s)\n' \
+            "$(docker inspect --format '{{.Name}}' "$container_id" | sed 's#^/##')" \
+            "$container_id"
+        printf 'codex-state: %s\n' "${state_mount:-not mounted; rebuild required}"
+    fi
+
+    if [[ "$command_name" == "codex" || "$command_name" == "shell" || $# == 0 ]]; then
+        require_tty
+        terminal_type="${TERM:-xterm-256color}"
+        if [[ "$terminal_type" == "dumb" ]]; then
+            terminal_type="xterm-256color"
+        fi
+        docker_tty_args=(-i -t --env "TERM=${terminal_type}")
+    elif [[ -t 0 ]]; then
+        docker_tty_args=(-i)
+    fi
+
+    exec docker exec "${docker_tty_args[@]}" \
+        "${docker_env_args[@]}" \
+        --user "$CONTAINER_USER" \
+        --workdir "$CONTAINER_WORKSPACE" \
+        "$container_id" \
+        "$CONTAINER_WORKSPACE/scripts/llaminar-dev" --inside "$@"
+}
+
+if [[ "${1:-}" == "--inside" ]]; then
+    shift
+    run_inside "$@"
+else
+    case "${1:-}" in
+        --host-rebuild)
+            shift
+            perform_rebuild "$@"
+            ;;
+        rebuild)
+            shift
+            attach_rebuild "$@"
+            ;;
+        rebuild-log)
+            shift
+            show_rebuild_log "$@"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            run_from_host "$@"
+            ;;
+    esac
+fi

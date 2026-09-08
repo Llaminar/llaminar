@@ -13,11 +13,14 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstring>
 #include <numeric>
 #include <random>
 
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
+#include "kernels/cpu/turboquant/TurboQuantDequantizeSplitTQ.h"
+#include "kernels/cpu/turboquant/TurboQuantQuantizeKV.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 
@@ -193,6 +196,323 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_HeadMajor_AppendAndGather_RoundTrip
         << "HEAD_MAJOR TQ4 V raw blocks changed after cache round-trip";
 }
 
+namespace
+{
+    /**
+     * @brief Prove that the production fused CPU quantizer is M-invariant.
+     *
+     * The reference tensors quantize the maximum row set with the established
+     * per-vector primitive. Every smaller grouped launch must produce exactly
+     * the corresponding byte prefix, including launches that cross the fused
+     * quantizer's OpenMP threshold.
+     */
+    void verifyFusedTurboQuantMTotality(
+        int head_dim,
+        bool value_uses_tq8)
+    {
+        constexpr int max_rows = 16;
+        constexpr int n_kv_heads = 4;
+        const int kv_dim = n_kv_heads * head_dim;
+
+        std::vector<float> k_values(
+            static_cast<size_t>(max_rows) * kv_dim);
+        std::vector<float> v_values(
+            static_cast<size_t>(max_rows) * kv_dim);
+        std::mt19937 rng(
+            static_cast<uint32_t>(0x51A7 + head_dim +
+                                  (value_uses_tq8 ? 1000 : 0)));
+        std::normal_distribution<float> distribution(0.0f, 1.0f);
+        for (float &value : k_values)
+            value = distribution(rng);
+        for (float &value : v_values)
+            value = distribution(rng);
+
+        TurboQuantContext root_context(head_dim, 42, 42);
+        const TurboQuantContext &layer_context =
+            root_context.for_layer(3);
+        const std::vector<size_t> reference_shape{
+            static_cast<size_t>(max_rows),
+            static_cast<size_t>(kv_dim)};
+        const auto reference_k = TQ8Tensor::quantize_from_fp32(
+            k_values.data(), reference_shape, head_dim, layer_context);
+        const auto reference_v_tq8 = value_uses_tq8
+                                         ? TQ8Tensor::quantize_from_fp32(
+                                               v_values.data(),
+                                               reference_shape,
+                                               head_dim,
+                                               layer_context)
+                                         : nullptr;
+        const auto reference_v_tq4 = value_uses_tq8
+                                         ? nullptr
+                                         : TQ4Tensor::quantize_from_fp32(
+                                               v_values.data(),
+                                               reference_shape,
+                                               head_dim,
+                                               layer_context);
+
+        const size_t k_block_bytes = reference_k->block_bytes();
+        const size_t v_block_bytes =
+            value_uses_tq8
+                ? reference_v_tq8->block_bytes()
+                : reference_v_tq4->block_bytes();
+        const size_t k_row_bytes =
+            static_cast<size_t>(n_kv_heads) * k_block_bytes;
+        const size_t v_row_bytes =
+            static_cast<size_t>(n_kv_heads) * v_block_bytes;
+        const auto *reference_k_bytes =
+            static_cast<const uint8_t *>(reference_k->raw_data());
+        const auto *reference_v_bytes = static_cast<const uint8_t *>(
+            value_uses_tq8
+                ? reference_v_tq8->raw_data()
+                : reference_v_tq4->raw_data());
+
+        for (int rows = 1; rows <= max_rows; ++rows)
+        {
+            std::vector<uint8_t> grouped_k(
+                static_cast<size_t>(rows) * k_row_bytes);
+            std::vector<uint8_t> grouped_v(
+                static_cast<size_t>(rows) * v_row_bytes);
+
+            turboquant_quantize_kv_rows(
+                k_values.data(),
+                v_values.data(),
+                grouped_k.data(),
+                grouped_v.data(),
+                rows,
+                head_dim,
+                n_kv_heads,
+                k_row_bytes,
+                v_row_bytes,
+                k_block_bytes,
+                v_block_bytes,
+                layer_context,
+                value_uses_tq8);
+
+            EXPECT_EQ(
+                std::memcmp(
+                    grouped_k.data(),
+                    reference_k_bytes,
+                    grouped_k.size()),
+                0)
+                << "K bytes changed with M=" << rows
+                << " head_dim=" << head_dim
+                << " value_mode="
+                << (value_uses_tq8 ? "TQ8" : "TQ4");
+            EXPECT_EQ(
+                std::memcmp(
+                    grouped_v.data(),
+                    reference_v_bytes,
+                    grouped_v.size()),
+                0)
+                << "V bytes changed with M=" << rows
+                << " head_dim=" << head_dim
+                << " value_mode="
+                << (value_uses_tq8 ? "TQ8" : "TQ4");
+        }
+    }
+
+    /**
+     * @brief Prove grouped CPU materialization is serial-row byte-equivalent.
+     *
+     * Each grouped launch is compared to the exact production helper invoked
+     * once per row. The sweep crosses both direct-loop and OpenMP scheduling
+     * boundaries and validates plain dequantization plus fused RoPE. Because
+     * the output is compared as raw FP32 bytes, this catches operation-order,
+     * ISA-dispatch, and scheduling differences that tolerance checks conceal.
+     */
+    void verifyFusedTurboQuantDequantMTotality(
+        int head_dim,
+        bool value_uses_tq8)
+    {
+        constexpr int max_rows = 16;
+        constexpr int n_kv_heads = 4;
+        constexpr float rope_theta = 1000000.0f;
+        constexpr int position_start = 29;
+        const int kv_dim = n_kv_heads * head_dim;
+        const size_t element_count =
+            static_cast<size_t>(max_rows) * kv_dim;
+
+        std::vector<float> k_values(element_count);
+        std::vector<float> v_values(element_count);
+        std::mt19937 rng(
+            static_cast<uint32_t>(0xD3A7 + head_dim +
+                                  (value_uses_tq8 ? 1000 : 0)));
+        std::normal_distribution<float> distribution(0.0f, 1.0f);
+        for (float &value : k_values)
+            value = distribution(rng);
+        for (float &value : v_values)
+            value = distribution(rng);
+
+        TurboQuantContext root_context(head_dim, 42, 42);
+        const TurboQuantContext &layer_context =
+            root_context.for_layer(3);
+        const std::vector<size_t> shape{
+            static_cast<size_t>(max_rows),
+            static_cast<size_t>(kv_dim)};
+        const auto k_tensor = TQ8Tensor::quantize_from_fp32(
+            k_values.data(), shape, head_dim, layer_context);
+        const auto v_tq8 = value_uses_tq8
+                                ? TQ8Tensor::quantize_from_fp32(
+                                      v_values.data(),
+                                      shape,
+                                      head_dim,
+                                      layer_context)
+                                : nullptr;
+        const auto v_tq4 = value_uses_tq8
+                                ? nullptr
+                                : TQ4Tensor::quantize_from_fp32(
+                                      v_values.data(),
+                                      shape,
+                                      head_dim,
+                                      layer_context);
+
+        const auto *k_raw =
+            static_cast<const uint8_t *>(k_tensor->raw_data());
+        const auto *v_raw = static_cast<const uint8_t *>(
+            value_uses_tq8 ? v_tq8->raw_data() : v_tq4->raw_data());
+        const size_t k_block_bytes = k_tensor->block_bytes();
+        const size_t v_block_bytes =
+            value_uses_tq8 ? v_tq8->block_bytes() : v_tq4->block_bytes();
+        const size_t k_row_bytes =
+            static_cast<size_t>(n_kv_heads) * k_block_bytes;
+        const size_t v_row_bytes =
+            static_cast<size_t>(n_kv_heads) * v_block_bytes;
+
+        const auto materialize = [&](float *k_output,
+                                     float *v_output,
+                                     int from_row,
+                                     int to_row,
+                                     bool with_rope)
+        {
+            if (value_uses_tq8)
+            {
+                if (with_rope)
+                {
+                    turboquant_dequantize_tq8_kv_rows_with_rope(
+                        k_raw, v_raw, layer_context,
+                        k_output, v_output,
+                        from_row, to_row,
+                        head_dim, n_kv_heads,
+                        k_row_bytes, v_row_bytes,
+                        k_block_bytes, v_block_bytes,
+                        rope_theta, position_start);
+                }
+                else
+                {
+                    turboquant_dequantize_tq8_kv_rows(
+                        k_raw, v_raw, layer_context,
+                        k_output, v_output,
+                        from_row, to_row,
+                        head_dim, n_kv_heads,
+                        k_row_bytes, v_row_bytes,
+                        k_block_bytes, v_block_bytes);
+                }
+            }
+            else if (with_rope)
+            {
+                turboquant_dequantize_split_kv_rows_with_rope(
+                    k_raw, v_raw, layer_context,
+                    k_output, v_output,
+                    from_row, to_row,
+                    head_dim, n_kv_heads,
+                    k_row_bytes, v_row_bytes,
+                    k_block_bytes, v_block_bytes,
+                    rope_theta, position_start);
+            }
+            else
+            {
+                turboquant_dequantize_split_kv_rows(
+                    k_raw, v_raw, layer_context,
+                    k_output, v_output,
+                    from_row, to_row,
+                    head_dim, n_kv_heads,
+                    k_row_bytes, v_row_bytes,
+                    k_block_bytes, v_block_bytes);
+            }
+        };
+
+        for (int rows = 1; rows <= max_rows; ++rows)
+        {
+            const size_t output_elements =
+                static_cast<size_t>(rows) * kv_dim;
+            for (const bool with_rope : {false, true})
+            {
+                std::vector<float> grouped_k(output_elements);
+                std::vector<float> grouped_v(output_elements);
+                std::vector<float> serial_k(output_elements);
+                std::vector<float> serial_v(output_elements);
+
+                materialize(
+                    grouped_k.data(), grouped_v.data(),
+                    /*from_row=*/0, /*to_row=*/rows, with_rope);
+                for (int row = 0; row < rows; ++row)
+                {
+                    materialize(
+                        serial_k.data(), serial_v.data(),
+                        row, row + 1, with_rope);
+                }
+
+                EXPECT_EQ(
+                    std::memcmp(
+                        grouped_k.data(),
+                        serial_k.data(),
+                        output_elements * sizeof(float)),
+                    0)
+                    << "K materialization changed with M=" << rows
+                    << " head_dim=" << head_dim
+                    << " value_mode="
+                    << (value_uses_tq8 ? "TQ8" : "TQ4")
+                    << " rope=" << with_rope;
+                EXPECT_EQ(
+                    std::memcmp(
+                        grouped_v.data(),
+                        serial_v.data(),
+                        output_elements * sizeof(float)),
+                    0)
+                    << "V materialization changed with M=" << rows
+                    << " head_dim=" << head_dim
+                    << " value_mode="
+                    << (value_uses_tq8 ? "TQ8" : "TQ4")
+                    << " rope=" << with_rope;
+            }
+        }
+    }
+}
+
+/**
+ * @test ProductionFusedQuantizerIsByteExactForEveryVerifierDepthAndMode
+ * @brief Sweeps M=1..16, D=64/128/256, and both selectable value modes.
+ */
+TEST_F(
+    Test__CPURingKVCache_SplitTQ,
+    ProductionFusedQuantizerIsByteExactForEveryVerifierDepthAndMode)
+{
+    for (const int head_dim : {64, 128, 256})
+    {
+        verifyFusedTurboQuantMTotality(
+            head_dim, /*value_uses_tq8=*/false);
+        verifyFusedTurboQuantMTotality(
+            head_dim, /*value_uses_tq8=*/true);
+    }
+}
+
+/**
+ * @test ProductionGroupedMaterializationIsSerialRowByteExact
+ * @brief Sweeps plain and fused-RoPE reads for every MTP depth and TQ mode.
+ */
+TEST_F(
+    Test__CPURingKVCache_SplitTQ,
+    ProductionGroupedMaterializationIsSerialRowByteExact)
+{
+    for (const int head_dim : {64, 128, 256})
+    {
+        verifyFusedTurboQuantDequantMTotality(
+            head_dim, /*value_uses_tq8=*/false);
+        verifyFusedTurboQuantDequantMTotality(
+            head_dim, /*value_uses_tq8=*/true);
+    }
+}
+
 TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_RingWrap_PreservesNewestTokens)
 {
     constexpr int MAX_SEQ = 4;
@@ -338,7 +658,8 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_Clear_ResetsAllLayers)
     EXPECT_EQ(cache.ring_size(0, 0), 3);
     EXPECT_EQ(cache.ring_size(1, 0), 3);
 
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_size(1, 0), 0);

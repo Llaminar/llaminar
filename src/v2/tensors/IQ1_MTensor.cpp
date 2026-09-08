@@ -30,8 +30,17 @@
 namespace llaminar2
 {
 
-    IQ1_MTensor::IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr), view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
+    IQ1_MTensor::IQ1_MTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : IQ1_MTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    IQ1_MTensor::IQ1_MTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
+        : shape_(shape), is_view_(false), raw_data_(std::move(raw_data)), raw_data_ptr_(nullptr), view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
     {
         if (shape.empty())
         {
@@ -244,10 +253,11 @@ namespace llaminar2
 
     IQ1_MTensor::~IQ1_MTensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 
@@ -471,13 +481,13 @@ namespace llaminar2
         simd::unpack_iq1_m_superblock_to_int8(super_block, output, scales, mins);
     }
 
-    void IQ1_MTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    void IQ1_MTensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
         const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
         const int sb_idx = b / 8;
         const int sub_idx = b % 8;
-        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+        const auto *blk = &typed_data()[static_cast<size_t>(source_n) * sb_per_row + sb_idx];
 
         const uint8_t *qs = blk->qs + sub_idx * 4;
         const uint8_t *qh = blk->qh + sub_idx * 2;

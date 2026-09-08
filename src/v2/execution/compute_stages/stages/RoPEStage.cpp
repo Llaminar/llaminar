@@ -1,6 +1,12 @@
 /**
  * @file RoPEStage.cpp
- * @brief Implementation of RoPEStage
+ * @brief Implements typed query/key rotary-position graph transactions.
+ *
+ * The stage owns one backend RoPE kernel and the stable dynamic-position state
+ * embedded in a captured graph. Normal attention presents Q with an optional K
+ * operand. K/V-only MTP cache publication presents K as the sole physical
+ * operand, allowing the backend to reuse the exact query rotation arithmetic
+ * without allocating or publishing a dummy query tensor.
  */
 
 #include "RoPEStage.h"
@@ -50,6 +56,23 @@ namespace llaminar2
     {
     }
 
+    bool RoPEStage::isKeyOnly() const noexcept
+    {
+        return params_.operand_set == RoPEOperandSet::KeyOnly;
+    }
+
+    ITensor *RoPEStage::primaryOperand() const noexcept
+    {
+        return isKeyOnly() ? params_.K : params_.Q;
+    }
+
+    int RoPEStage::primaryHeadCount() const noexcept
+    {
+        if (!isKeyOnly())
+            return params_.n_heads;
+        return params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
+    }
+
     ITensorRoPE *RoPEStage::getOrCreateStageKernel(TensorBase *Q_base)
     {
         if (!Q_base)
@@ -88,21 +111,30 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureRequiredPointers("RoPEStage", {
-                                                     {"Q", params_.Q},
-                                                 }))
+        if (isKeyOnly() &&
+            (params_.Q || params_.Q_out || params_.K_out ||
+             params_.q_buffer_id || params_.q_out_buffer_id ||
+             params_.k_out_buffer_id || params_.skip_k ||
+             params_.n_heads != 0 || params_.n_kv_heads <= 0))
+        {
+            LOG_ERROR("[RoPEStage] K-only policy requires one in-place K operand, "
+                      "an explicit positive KV-head count, and no query/output/skip state");
+            return false;
+        }
+        if (!ensureRequiredPointers(
+                "RoPEStage",
+                {{isKeyOnly() ? "K" : "Q", primaryOperand()}}))
         {
             return false;
         }
 
-        if (params_.device_id.is_gpu() && !gpuStream())
-        {
-            LOG_ERROR("[RoPEStage] GPU RoPE requires an explicit non-null stage stream");
-            return false;
-        }
+        void *const stage_stream =
+            params_.device_id.is_gpu() ? requireGPUStream() : nullptr;
 
         // Cast ITensor* to TensorBase* for CPU operations
-        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
+        auto *Q_base = requireTensorBasePtr(
+            primaryOperand(),
+            isKeyOnly() ? "K" : "Q");
         if (!Q_base)
         {
             LOG_ERROR("[RoPEStage] GPU tensors not yet supported");
@@ -116,18 +148,21 @@ namespace llaminar2
                                 : static_cast<int>(Q_base->rows());
 
         // Detect Hybrid mode: Q8_1 input with FP32 output buffers
-        const bool hybrid_mode = (params_.Q_out != nullptr) &&
+        const bool hybrid_mode = !isKeyOnly() &&
+                                 (params_.Q_out != nullptr) &&
                                  (Q_base->native_type() == TensorType::Q8_1) &&
                                  (params_.Q_out->native_type() == TensorType::FP32);
 
         // Detect HybridQ16 mode: Q8_1 Q input with Q16_1 Q output
-        const bool hybrid_q16_mode = (params_.Q_out != nullptr) &&
+        const bool hybrid_q16_mode = !isKeyOnly() &&
+                                     (params_.Q_out != nullptr) &&
                                      (Q_base->native_type() == TensorType::Q8_1) &&
                                      (params_.Q_out->native_type() == TensorType::Q16_1);
 
         // Detect K precision fix mode: K input is Q16_1 (from GEMM, not Q8_1)
         // This is the K precision fix for HybridQ16 where GEMM outputs K as Q16_1
-        const bool k_is_q16_1 = (params_.K != nullptr) &&
+        const bool k_is_q16_1 = !isKeyOnly() &&
+                                (params_.K != nullptr) &&
                                 (params_.K->native_type() == TensorType::Q16_1);
 
         if (params_.position_ids_device && !params_.device_id.is_gpu())
@@ -142,8 +177,9 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[RoPEStage] Execute: seq_len=" << seq_len
-                                                  << " n_heads=" << params_.n_heads
+        LOG_TRACE("[RoPEStage] Execute: seq_len=" << seq_len
+                                                  << " operands=" << (isKeyOnly() ? "K" : "Q/K")
+                                                  << " n_heads=" << primaryHeadCount()
                                                   << " n_kv_heads=" << params_.n_kv_heads
                                                   << " head_dim=" << params_.head_dim
                                                   << " pos_offset=" << params_.pos_offset
@@ -199,7 +235,7 @@ namespace llaminar2
             position_ids_ptr = position_ids_cache_.data();
         }
 
-        if (!params_.position_ids_device && gpuStream() != nullptr && position_ids_ptr != nullptr)
+        if (!params_.position_ids_device && stage_stream && position_ids_ptr != nullptr)
         {
             // Explicit non-contiguous/batched position ids must use a stable
             // host pointer. Contiguous GPU positions intentionally stay null.
@@ -220,9 +256,15 @@ namespace llaminar2
         const int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
 
         // Cast K and output tensors for kernel calls
-        auto *K_base = asTensorBasePtr(params_.K, "K");
-        auto *Q_out_base = asTensorBasePtr(params_.Q_out, "Q_out");
-        auto *K_out_base = asTensorBasePtr(params_.K_out, "K_out");
+        auto *K_base = isKeyOnly()
+                           ? nullptr
+                           : asTensorBasePtr(params_.K, "K");
+        auto *Q_out_base = isKeyOnly()
+                               ? nullptr
+                               : asTensorBasePtr(params_.Q_out, "Q_out");
+        auto *K_out_base = isKeyOnly()
+                               ? nullptr
+                               : asTensorBasePtr(params_.K_out, "K_out");
 
         // Hybrid mode: use apply_q8_1_to_fp32() for Q8_1 → FP32 with no requantization
         if (hybrid_mode)
@@ -387,7 +429,11 @@ namespace llaminar2
         //
         // When skip_k is true (RoPE-on-read mode), K is stored pre-RoPE in the
         // KV cache and RoPE will be fused into the attention dequant path.
-        auto *K_for_rope = (params_.skip_k) ? nullptr : K_base;
+        auto *K_for_rope = (params_.skip_k || isKeyOnly()) ? nullptr : K_base;
+        const int execution_n_heads = primaryHeadCount();
+        const int execution_n_kv_heads = isKeyOnly()
+                                             ? execution_n_heads
+                                             : n_kv_heads;
 
         if (params_.force_decode_equivalent_verifier_prefill && seq_len > 1)
         {
@@ -396,8 +442,8 @@ namespace llaminar2
                 K_for_rope,
                 position_ids_ptr,
                 seq_len,
-                params_.n_heads,
-                n_kv_heads,
+                execution_n_heads,
+                execution_n_kv_heads,
                 params_.head_dim,
                 params_.theta_base,
                 params_.mpi_ctx,
@@ -418,8 +464,8 @@ namespace llaminar2
             K_for_rope,
             position_ids_ptr,
             seq_len,
-            params_.n_heads,
-            n_kv_heads,
+            execution_n_heads,
+            execution_n_kv_heads,
             params_.head_dim,
             params_.theta_base,
             params_.mpi_ctx,
@@ -430,13 +476,15 @@ namespace llaminar2
 
     size_t RoPEStage::estimatedFlops() const
     {
-        if (!params_.Q)
+        const ITensor *operand = primaryOperand();
+        if (!operand)
             return 0;
 
-        const int seq_len = static_cast<int>(params_.Q->rows());
+        const int seq_len = static_cast<int>(operand->rows());
         // Per position per head: head_dim/2 rotations, each ~10 FLOPs (sin, cos, 4 muls, 2 adds)
-        size_t flops = static_cast<size_t>(10) * seq_len * params_.n_heads * (params_.head_dim / 2);
-        if (params_.K)
+        size_t flops = static_cast<size_t>(10) * seq_len * primaryHeadCount() *
+                       (params_.head_dim / 2);
+        if (!isKeyOnly() && params_.K)
         {
             int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
             flops += static_cast<size_t>(10) * seq_len * n_kv_heads * (params_.head_dim / 2);
@@ -446,13 +494,14 @@ namespace llaminar2
 
     size_t RoPEStage::estimatedMemoryBytes() const
     {
-        if (!params_.Q)
+        const ITensor *operand = primaryOperand();
+        if (!operand)
             return 0;
 
-        const int seq_len = static_cast<int>(params_.Q->rows());
-        size_t bytes = static_cast<size_t>(2) * seq_len * params_.n_heads *
+        const int seq_len = static_cast<int>(operand->rows());
+        size_t bytes = static_cast<size_t>(2) * seq_len * primaryHeadCount() *
                        params_.head_dim * sizeof(float); // Q read + write
-        if (params_.K)
+        if (!isKeyOnly() && params_.K)
         {
             int n_kv_heads = params_.n_kv_heads > 0 ? params_.n_kv_heads : params_.n_heads;
             bytes += static_cast<size_t>(2) * seq_len * n_kv_heads * params_.head_dim * sizeof(float);
@@ -465,7 +514,8 @@ namespace llaminar2
         switch (backend)
         {
         case ComputeBackendType::CPU:
-
+        case ComputeBackendType::GPU_CUDA:
+        case ComputeBackendType::GPU_ROCM:
             return true;
         default:
             return false;
@@ -482,13 +532,16 @@ namespace llaminar2
             LOG_ERROR("[RoPEStage] GPU graph launch preparation requires an explicit non-null stream");
             return false;
         }
-        if (!params_.Q)
+        ITensor *operand = primaryOperand();
+        if (!operand)
         {
-            LOG_ERROR("[RoPEStage] Cannot prepare graph launch without Q tensor");
+            LOG_ERROR("[RoPEStage] Cannot prepare graph launch without the configured operand");
             return false;
         }
 
-        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
+        auto *Q_base = requireTensorBasePtr(
+            operand,
+            isKeyOnly() ? "K" : "Q");
         if (!Q_base)
             return false;
 
@@ -508,7 +561,25 @@ namespace llaminar2
          * position rows fresh without rebuilding the graph.
          */
         setGPUStream(stream);
-        kernel->setGPUStream(stream);
+        bindStageStream(kernel);
+
+        const int requested_rotary_dim = static_cast<int>(
+            static_cast<float>(params_.head_dim) *
+            params_.partial_rotary_factor);
+        const int effective_rotary_dim =
+            requested_rotary_dim > 0 && requested_rotary_dim < params_.head_dim
+                ? requested_rotary_dim
+                : params_.head_dim;
+        if (!kernel->prepareInvariantDeviceState(
+                effective_rotary_dim,
+                params_.theta_base))
+        {
+            LOG_ERROR("[RoPEStage] Failed to prepare immutable RoPE state"
+                      << " rotary_dim=" << effective_rotary_dim
+                      << " theta=" << params_.theta_base);
+            return false;
+        }
+
         if (params_.position_ids_device && params_.seq_len > 0)
         {
             kernel->setDynamicDevicePositionIds(params_.position_ids_device, params_.seq_len);
@@ -528,11 +599,27 @@ namespace llaminar2
     StageDumpInfo RoPEStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
-        if (!params_.Q)
+        ITensor *operand = primaryOperand();
+        if (!operand)
             return info;
 
         // Use explicit seq_len if provided, otherwise derive from tensor
-        const int seq_len = (params_.seq_len > 0) ? params_.seq_len : static_cast<int>(params_.Q->rows());
+        const int seq_len = (params_.seq_len > 0)
+                                ? params_.seq_len
+                                : static_cast<int>(operand->rows());
+
+        if (isKeyOnly())
+        {
+            const int key_width = primaryHeadCount() * params_.head_dim;
+            info.addInput("K", operand, seq_len, key_width);
+            info.addOutput("K", operand, seq_len, key_width);
+            info.addScalarInt("seq_len", seq_len);
+            info.addScalarInt("n_kv_heads", params_.n_kv_heads);
+            info.addScalarInt("head_dim", params_.head_dim);
+            info.addScalarInt("pos_offset", params_.pos_offset);
+            info.addScalar("theta_base", params_.theta_base);
+            return info;
+        }
 
         // Detect Hybrid mode variants with separate output buffers.
         // Hybrid:      Q8_1 input -> FP32 output buffers
@@ -672,8 +759,21 @@ namespace llaminar2
     {
         StageBufferRequirements reqs;
 
-        if (!params_.Q)
+        ITensor *operand = primaryOperand();
+        if (!operand)
             return reqs; // Empty if tensors not set
+
+        if (isKeyOnly())
+        {
+            const size_t seq_len = operand->rows();
+            const size_t k_dim = static_cast<size_t>(
+                primaryHeadCount() * params_.head_dim);
+            reqs.addInout(
+                "K",
+                {seq_len, k_dim},
+                toBufferTensorType(operand->native_type()));
+            return reqs;
+        }
 
         // Get dimensions from tensors
         const size_t seq_len = params_.Q->rows();
@@ -703,16 +803,17 @@ namespace llaminar2
     IWorkspaceConsumer *RoPEStage::getKernelAsWorkspaceConsumer()
     {
         // Create kernel if not already cached (or dtype variant changed)
-        if (!params_.Q)
+        ITensor *operand = primaryOperand();
+        if (!operand)
         {
-            LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q tensor not set");
+            LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Configured operand is not set");
             return nullptr;
         }
 
-        auto *Q_base = dynamic_cast<TensorBase *>(params_.Q);
+        auto *Q_base = dynamic_cast<TensorBase *>(operand);
         if (!Q_base)
         {
-            LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Q is not TensorBase");
+            LOG_WARN("[RoPEStage::getKernelAsWorkspaceConsumer] Configured operand is not TensorBase");
             return nullptr;
         }
 
@@ -730,31 +831,39 @@ namespace llaminar2
 
     StageBufferContract RoPEStage::bufferContract() const
     {
-        if (!params_.q_buffer_id || !params_.k_buffer_id)
-            return {};
-
         auto contract = StageBufferContract::build();
 
-        // Hybrid mode: separate input → output buffers
-        if (params_.Q_out && params_.q_out_buffer_id)
+        /*
+         * Q-only RoPE is a first-class execution mode. Attention variants that
+         * rotate K on read intentionally pass K=nullptr, so requiring both
+         * BufferIds would silently erase Q's ownership declaration and permit
+         * capture to observe an unprepared input. Describe Q and K independently
+         * while retaining the same in-place/separate-output semantics.
+         */
+        if (params_.q_buffer_id)
         {
-            contract.addInput(*params_.q_buffer_id);
-            contract.addOutput(*params_.q_out_buffer_id);
-        }
-        else
-        {
-            // Standard in-place mode
-            contract.addInOut(*params_.q_buffer_id);
+            if (params_.Q_out && params_.q_out_buffer_id)
+            {
+                contract.addInput(*params_.q_buffer_id);
+                contract.addOutput(*params_.q_out_buffer_id);
+            }
+            else
+            {
+                contract.addInOut(*params_.q_buffer_id);
+            }
         }
 
-        if (params_.K_out && params_.k_out_buffer_id)
+        if (params_.k_buffer_id)
         {
-            contract.addInput(*params_.k_buffer_id);
-            contract.addOutput(*params_.k_out_buffer_id);
-        }
-        else
-        {
-            contract.addInOut(*params_.k_buffer_id);
+            if (params_.K_out && params_.k_out_buffer_id)
+            {
+                contract.addInput(*params_.k_buffer_id);
+                contract.addOutput(*params_.k_out_buffer_id);
+            }
+            else
+            {
+                contract.addInOut(*params_.k_buffer_id);
+            }
         }
 
         return contract;

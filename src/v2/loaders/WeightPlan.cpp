@@ -1,3 +1,13 @@
+/**
+ * @file WeightPlan.cpp
+ * @brief Implementation of declarative weight plans and frozen binding lookup.
+ *
+ * Device-qualified lookup deliberately scans the small graph-time binding
+ * collection.  Graph construction is cold-path work, and this makes an
+ * ambiguity a precise fatal diagnostic instead of an insertion-order-dependent
+ * route to the wrong heterogeneous expert slice.
+ */
+
 #include "WeightPlan.h"
 
 #include "WeightLifecycleTrace.h"
@@ -27,9 +37,28 @@ namespace llaminar2
         }
     }
 
-    WeightPlan::WeightPlan(InferenceStrategy strategy)
-        : strategy_(std::move(strategy))
+    namespace
     {
+        /** @return Whether an owner may back a persistent prepared-weight set. */
+        bool isPersistentWeightOwner(PhysicalMemoryOwner owner) noexcept
+        {
+            return owner == PhysicalMemoryOwner::PrimaryModelWeights ||
+                   owner == PhysicalMemoryOwner::AdditionalModelWeights ||
+                   owner == PhysicalMemoryOwner::RoutedExpertWeights;
+        }
+    } // namespace
+
+    WeightPlan::WeightPlan(
+        InferenceStrategy strategy,
+        PhysicalMemoryOwner physical_memory_owner)
+        : strategy_(std::move(strategy)),
+          physical_memory_owner_(physical_memory_owner)
+    {
+        if (!isPersistentWeightOwner(physical_memory_owner_))
+        {
+            throw std::invalid_argument(
+                "WeightPlan requires a persistent prepared-weight physical-memory owner");
+        }
     }
 
     void WeightPlan::add(WeightRequirement requirement)
@@ -91,9 +120,19 @@ namespace llaminar2
         return std::move(bindings_);
     }
 
-    FrozenModelWeightSet::FrozenModelWeightSet(InferenceStrategy strategy, std::vector<WeightBinding> bindings)
-        : strategy_(std::move(strategy)), bindings_(std::move(bindings))
+    FrozenModelWeightSet::FrozenModelWeightSet(
+        InferenceStrategy strategy,
+        std::vector<WeightBinding> bindings,
+        PhysicalMemoryOwner physical_memory_owner)
+        : strategy_(std::move(strategy)),
+          physical_memory_owner_(physical_memory_owner),
+          bindings_(std::move(bindings))
     {
+        if (!isPersistentWeightOwner(physical_memory_owner_))
+        {
+            throw std::invalid_argument(
+                "FrozenModelWeightSet requires a persistent prepared-weight physical-memory owner");
+        }
         for (size_t index = 0; index < bindings_.size(); ++index)
             indexBinding(index, bindings_[index]);
     }
@@ -128,6 +167,40 @@ namespace llaminar2
         if (it == layer_index_.end())
             return nullptr;
         return &bindings_[it->second];
+    }
+
+    const WeightBinding *FrozenModelWeightSet::optionalLayerForDevice(
+        int layer_idx,
+        const std::string &suffix,
+        DeviceId device) const
+    {
+        const WeightBinding *match = nullptr;
+        for (const auto &binding : bindings_)
+        {
+            if (binding.identity.layer != layer_idx ||
+                suffixForLayerWeight(binding.identity.canonical_name) != suffix)
+            {
+                continue;
+            }
+
+            const bool resident_on_device =
+                binding.residency.home_device == device ||
+                (binding.residency.resident_device &&
+                 *binding.residency.resident_device == device);
+            if (!resident_on_device)
+                continue;
+
+            if (match)
+            {
+                throw std::runtime_error(
+                    "Ambiguous device-qualified layer binding for layer=" +
+                    std::to_string(layer_idx) + " suffix=" + suffix +
+                    " device=" + device.to_string() +
+                    "; every graph must have one authoritative binding");
+            }
+            match = &binding;
+        }
+        return match;
     }
 
     std::vector<const WeightBinding *> FrozenModelWeightSet::forDevice(DeviceId device) const

@@ -5,142 +5,81 @@
  * Pure glue: extracts raw pointers from tensors, validates them, and
  * delegates all computation to the ITensorGatedDeltaNet kernel.
  *
- * When Q, K, V all point to the same merged QKV buffer (interleaved layout
- * [seq_len, q_dim + k_dim + v_dim]), this stage deinterleaves them into
- * separate contiguous arrays before passing to the kernel.
+ * When Q, K, V identify one merged QKV buffer with row layout
+ * `[Q | K | V]`, the stage passes that layout and its TP head mapping directly
+ * through the mandatory backend contract. CPU recurrence consumes source-row
+ * strides in place. GPU recurrence performs any required device-only layout
+ * transform in caller-owned graph workspace on the exact stage stream.
  *
- * GPU path: Uses ensureOnDevice() / allocateOnDevice() / gpu_data_ptr() to
- * keep data on-device. Merged QKV deinterleave is done on-device via the
- * kernel's deinterleave_qkv_device() method. No H2D/D2H copies in the hot path.
+ * GPU path: The executor and TransferEngine prepare arena bindings on the
+ * stage's explicit stream; this stage consumes device pointers only. Merged
+ * QKV deinterleave is done on-device via deinterleave_qkv_device(). No H2D/D2H
+ * copies occur in the hot path.
  *
- * CPU path: Uses data() / mutable_data() host pointers with CPU-side deinterleave.
+ * CPU execution never materializes temporary Q/K/V matrices in the stage.
  *
  * All preprocessing (L2 normalization, query scaling, gate computation)
  * is handled by the kernel, keeping this stage device-agnostic.
  */
 
 #include "GDNRecurrenceStage.h"
+#include "GDNSpeculativeWorkspaceContract.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
-
-#ifdef HAVE_CUDA
-#include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
-#endif
-
-#ifdef HAVE_ROCM
-#include "../../../kernels/rocm/ops/ROCmRowSelectKernels.h"
-#endif
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <limits>
-#include <vector>
 
 namespace llaminar2
 {
 
+    void GDNRecurrenceStage::updateDynamicParams(int pos_offset, int seq_len)
+    {
+        (void)pos_offset;
+
+        /*
+         * The execution engine supplies a per-request sequence width, whereas
+         * the grouped GDN kernel operates on one flattened [request, row]
+         * tensor.  Keep both views synchronized so request boundaries remain
+         * stable when the same graph object is prepared or replayed again.
+         */
+        params_.request_seq_len = seq_len;
+        if (seq_len <= 0 ||
+            params_.request_count <= 0 ||
+            seq_len > std::numeric_limits<int>::max() / params_.request_count)
+        {
+            /*
+             * Dynamic updates have a void interface.  Zero the flattened row
+             * count on malformed geometry so execution fails closed instead
+             * of indexing a multiplication result that overflowed `int`.
+             */
+            LOG_ERROR("[GDNRecurrenceStage] Invalid request-batched dynamic geometry: "
+                      << "request_count=" << params_.request_count
+                      << " request_seq_len=" << seq_len);
+            params_.seq_len = 0;
+            return;
+        }
+        params_.seq_len = params_.request_count * seq_len;
+    }
+
     namespace
     {
         std::atomic<uint32_t> g_gdn_recurrence_workspace_slice_counter{0};
-
-        /**
-         * Deinterleave a merged QKV buffer into separate contiguous Q, K, V arrays.
-         *
-         * Merged layout per row t (length = q_src_dim + k_src_dim + v_dim):
-         *   [ Q (nkh * d_k) | K (nkh * d_k) | V (n_v_heads_local * d_v) ]
-         *
-         * Output layout:
-         *   q_dst, k_dst : [T, n_v_heads_local * d_k]
-         *   v_dst        : [T, n_v_heads_local * d_v]  (straight copy)
-         *
-         * Head mapping: for each local V-head j in [0, n_v_heads_local),
-         *   k_idx = (j + global_v_offset) % nkh
-         *   q_dst[t, j] = q_src[t, k_idx]
-         *   k_dst[t, j] = k_src[t, k_idx]
-         *
-         * This mirrors the Qwen3.5/Qwen3.6 reference implementation, which
-         * tiles Q/K heads with repeat() rather than contiguous repeat_interleave().
-         *
-         * Fast path: when global_v_offset == 0 AND nkh == n_v_heads_local, the
-         * Q and K regions become a contiguous copy of the source buffer — emitted
-         * as a single memcpy per token.
-         */
-        void deinterleaveMergedQKV(
-            const float *qkv, int T, int qkv_stride,
-            int nkh, int n_v_heads_local, int d_k, int d_v,
-            int global_v_offset,
-            float *q_dst_buf, float *k_dst_buf, float *v_dst_buf)
-        {
-            const int q_src_dim = nkh * d_k;
-            const int k_src_dim = nkh * d_k;
-            const int v_dim = n_v_heads_local * d_v;
-            const int q_dst_dim = n_v_heads_local * d_k;
-            const int k_dst_dim = n_v_heads_local * d_k;
-
-            const bool identity_fast_path =
-                (global_v_offset == 0) && (nkh == n_v_heads_local);
-
-            for (int t = 0; t < T; ++t)
-            {
-                const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
-                const float *q_src = row;
-                const float *k_src = row + q_src_dim;
-                const float *v_src = row + q_src_dim + k_src_dim;
-                float *q_dst = q_dst_buf + static_cast<size_t>(t) * q_dst_dim;
-                float *k_dst = k_dst_buf + static_cast<size_t>(t) * k_dst_dim;
-                float *v_dst = v_dst_buf + static_cast<size_t>(t) * v_dim;
-
-                if (identity_fast_path)
-                {
-                    std::memcpy(q_dst, q_src, q_dst_dim * sizeof(float));
-                    std::memcpy(k_dst, k_src, k_dst_dim * sizeof(float));
-                }
-                else
-                {
-                    for (int j = 0; j < n_v_heads_local; ++j)
-                    {
-                        int k_idx = (j + global_v_offset) % nkh;
-                        if (k_idx < 0)
-                            k_idx += nkh;
-                        std::memcpy(q_dst + j * d_k,
-                                    q_src + k_idx * d_k,
-                                    d_k * sizeof(float));
-                        std::memcpy(k_dst + j * d_k,
-                                    k_src + k_idx * d_k,
-                                    d_k * sizeof(float));
-                    }
-                }
-
-                // V is already n_v_heads_local wide — straight copy.
-                std::memcpy(v_dst, v_src, v_dim * sizeof(float));
-            }
-        }
     } // namespace
-
-    struct GDNRecurrenceStage::GpuEffectiveSeqLenState
-    {
-        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
-        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar uploaded before capture/replay.
-        int *device_effective_seq_len = nullptr; ///< Device scalar read by the recurrence kernel.
-        bool device_value_uploaded = false;       ///< True once the current host scalar is resident.
-    };
 
     GDNRecurrenceStage::GDNRecurrenceStage(Params params)
         : IComputeStage(params.device_id),
           params_(std::move(params)),
           workspace_slice_id_(g_gdn_recurrence_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
-    }
-
-    GDNRecurrenceStage::~GDNRecurrenceStage()
-    {
-        releaseGpuEffectiveSeqLenState();
     }
 
     WorkspaceRequirements GDNRecurrenceStage::getWorkspaceRequirements(int m, int n, int k) const
@@ -152,25 +91,33 @@ namespace llaminar2
         if (params_.n_heads <= 0 || params_.d_k <= 0 || params_.d_v <= 0)
             return reqs;
 
-        const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
+        /*
+         * `m` is dynamic rows per request, but merged-QKV deinterleave and
+         * verifier snapshots cover the flattened request matrix. Preserve the
+         * graph's total row count as the lower bound for every workspace.
+         */
+        const int max_seq_len = std::max(
+            1,
+            std::max(params_.seq_len, m > 0 ? m : 0));
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
         if (speculative_slot_rows > 0)
         {
             const int rows = std::min(speculative_slot_rows, max_seq_len);
-            const size_t state_floats =
-                static_cast<size_t>(params_.n_heads) *
-                static_cast<size_t>(params_.d_k) *
-                static_cast<size_t>(params_.d_v);
+            const auto footprint =
+                gdn_workspace::recurrenceStateFootprint(
+                    rows,
+                    std::max(1, params_.request_count),
+                    params_.n_heads,
+                    params_.d_k,
+                    params_.d_v);
             reqs.buffers.push_back({speculativeStateSlotsBufferName(),
-                                    static_cast<size_t>(rows) * state_floats * sizeof(float),
+                                    footprint.slot_bytes,
                                     256,
                                     true});
             if (params_.device_id.is_gpu())
             {
-                const int work_slots =
-                    std::max(1, params_.request_count > 1 ? params_.request_count : 1);
                 reqs.buffers.push_back({speculativeStateWorkBufferName(),
-                                        static_cast<size_t>(work_slots) * state_floats * sizeof(float),
+                                        footprint.work_bytes,
                                         256,
                                         true});
             }
@@ -178,9 +125,6 @@ namespace llaminar2
 
         if (!params_.device_id.is_gpu())
             return reqs;
-
-        if (max_seq_len > 1)
-            reqs.buffers.push_back({effectiveSeqLenScalarBufferName(), sizeof(int), alignof(int), true});
 
         const bool merged_qkv = params_.Q == params_.K && params_.K == params_.V;
         if (!merged_qkv)
@@ -194,18 +138,13 @@ namespace llaminar2
             return reqs;
 
         const size_t bytes = deinterleaveScratchFloats(max_seq_len) * sizeof(float);
-        reqs.buffers.push_back({WS_DEINTERLEAVE_SCRATCH, bytes, 256, true});
+        reqs.buffers.push_back({deinterleaveScratchBufferName(), bytes, 256, true});
         return reqs;
     }
 
     void GDNRecurrenceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         bound_workspace_ = workspace;
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        }
         bindKernelWorkspace();
     }
 
@@ -222,10 +161,11 @@ namespace llaminar2
 
         float *scratch = nullptr;
         size_t scratch_floats = 0;
-        if (bound_workspace_ && bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH))
+        const std::string scratch_name = deinterleaveScratchBufferName();
+        if (bound_workspace_ && bound_workspace_->hasBuffer(scratch_name))
         {
-            scratch = static_cast<float *>(bound_workspace_->getBuffer(WS_DEINTERLEAVE_SCRATCH));
-            scratch_floats = bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH) / sizeof(float);
+            scratch = static_cast<float *>(bound_workspace_->getBuffer(scratch_name));
+            scratch_floats = bound_workspace_->getBufferSize(scratch_name) / sizeof(float);
         }
 
         params_.kernel->bindDeinterleaveWorkspace(scratch, scratch_floats);
@@ -263,19 +203,6 @@ namespace llaminar2
                     static_cast<size_t>(speculative_slot_rows),
                     available_floats / static_cast<size_t>(capture_state_size)));
             }
-        }
-        else if (!params_.device_id.is_gpu() && capture_state_size > 0)
-        {
-            const int max_rows = std::max(1, params_.seq_len);
-            capture_rows = std::min(speculative_slot_rows, max_rows);
-            const size_t required_floats =
-                static_cast<size_t>(capture_rows) * static_cast<size_t>(capture_state_size);
-            if (required_floats > host_verifier_state_slot_capacity_)
-            {
-                host_verifier_state_slots_.reset(new float[required_floats]);
-                host_verifier_state_slot_capacity_ = required_floats;
-            }
-            capture = required_floats == 0 ? nullptr : host_verifier_state_slots_.get();
         }
         verifier_capture_workspace_bound_ =
             capture != nullptr && capture_rows > 0 && capture_state_size > 0;
@@ -340,13 +267,17 @@ namespace llaminar2
         return std::clamp(prefill_effective_seq_len_, 1, params_.seq_len);
     }
 
-    bool GDNRecurrenceStage::shouldUseRealLengthContract() const
+    bool GDNRecurrenceStage::shouldUseScalarRealLengthContract() const
     {
-        return params_.seq_len > 1 &&
-               prefill_replay_params_set_ &&
-               prefill_bucket_seq_len_ == params_.seq_len &&
-               prefill_effective_seq_len_ > 0 &&
-               prefill_effective_seq_len_ < params_.seq_len &&
+        /*
+         * Scalar padded prefill and request batching have different state
+         * owners.  A one-request graph must advance the primary recurrence
+         * bank through chunkForwardWithEffectiveSeqLen(); only a genuine
+         * multi-request graph may update the packed request-state bank.
+         */
+        return params_.seq_len > 1 && params_.request_count == 1 &&
+               params_.request_seq_len == params_.seq_len &&
+               params_.request_seq_lens_device != nullptr &&
                params_.kernel &&
                params_.kernel->supportsPaddedPrefillRealLength();
     }
@@ -373,9 +304,20 @@ namespace llaminar2
         return role_prefix + "slice" + std::to_string(workspace_slice_id_);
     }
 
-    std::string GDNRecurrenceStage::effectiveSeqLenScalarBufferName() const
+    std::string GDNRecurrenceStage::deinterleaveScratchBufferName() const
     {
-        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + workspaceStableId();
+        /*
+         * Every GDN layer in one graph role executes in dependency order and
+         * can economically reuse one large deinterleave allocation. Different
+         * graph roles may replay on independent streams, so their mutable Q/K/V
+         * scratch must have distinct keys. Including the layer here would avoid
+         * the race but multiply long-context scratch by the number of GDN
+         * layers, which is unnecessary and prohibitively expensive.
+         */
+        if (params_.workspace_namespace.empty())
+            return WS_DEINTERLEAVE_SCRATCH;
+        return std::string(WS_DEINTERLEAVE_SCRATCH) + "_" +
+               params_.workspace_namespace;
     }
 
     std::string GDNRecurrenceStage::speculativeStateSlotsBufferName() const
@@ -385,7 +327,18 @@ namespace llaminar2
 
     std::string GDNRecurrenceStage::speculativeStateWorkBufferName() const
     {
-        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" + workspaceStableId();
+        /*
+         * This buffer is temporary input/output for one recurrence stage; unlike
+         * speculative state slots, it is not read after that layer completes.
+         * Transformer-layer dependencies serialize recurrence stages inside one
+         * graph role, so all layers can reuse one maximum-sized work allocation.
+         * Independently replayable roles retain separate names because they may
+         * execute concurrently on different streams.
+         */
+        if (params_.workspace_namespace.empty())
+            return WS_SPECULATIVE_STATE_WORK;
+        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" +
+               params_.workspace_namespace;
     }
 
     int GDNRecurrenceStage::requestedSpeculativeStateSlotRows() const
@@ -399,7 +352,7 @@ namespace llaminar2
     {
         return params_.kernel &&
                verifierStateCaptureWorkspaceRequired() &&
-               params_.recurrence_state != nullptr;
+               (params_.device_id.is_gpu() || params_.recurrence_state != nullptr);
     }
 
     bool GDNRecurrenceStage::verifierStateCaptureWorkspaceRequired() const
@@ -430,7 +383,7 @@ namespace llaminar2
         return false;
     }
 
-    const float *GDNRecurrenceStage::cpuVerifierStateCaptureSource() const
+    float *GDNRecurrenceStage::cpuVerifierStateCaptureWorkspace() const
     {
         if (params_.device_id.is_gpu() ||
             verifier_capture_rows_bound_ <= 0 ||
@@ -442,41 +395,77 @@ namespace llaminar2
         if (bound_workspace_ &&
             bound_workspace_->hasBuffer(speculativeStateSlotsBufferName()))
         {
-            return static_cast<const float *>(
+            return static_cast<float *>(
                 bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
         }
 
-        return !host_verifier_state_slots_
-                   ? nullptr
-                   : host_verifier_state_slots_.get();
+        return nullptr;
     }
 
     bool GDNRecurrenceStage::restoreCPUVerifierStateCaptureRowDirect(int row)
     {
-        if (!hasVerifierStateCapture() || params_.device_id.is_gpu())
-            return false;
-        if (!ensureVerifierStateCaptureWorkspaceBound())
-            return false;
-        if (row < 0 || row >= verifier_capture_rows_bound_)
-            return false;
-
-        const float *capture = cpuVerifierStateCaptureSource();
-        if (!capture || !params_.recurrence_state)
+        const CPUVerifierStateRestorePlan plan =
+            planCPUVerifierStateRestoreRow(row);
+        if (!plan.ready())
             return false;
 
         /*
-         * CPU GDN kernels are shared backend objects.  Rebinding that shared
+         * CPU GDN kernels are shared backend objects. Rebinding that shared
          * object during parallel MTP publication is racy, so CPU publication
-         * copies from the stage-owned capture slot directly.  GPU stages still
-         * delegate to the backend restore kernel because their slots live on
-         * device and must stay ordered on the explicit capture stream.
+         * copies directly from this stage's manager-owned workspace binding.
+         * GPU stages still delegate to the backend restore kernel because their
+         * slots live on device and must stay ordered on the explicit stream.
          */
         std::memcpy(
-            params_.recurrence_state,
-            capture + static_cast<size_t>(row) *
-                          static_cast<size_t>(verifier_capture_state_size_bound_),
-            static_cast<size_t>(verifier_capture_state_size_bound_) * sizeof(float));
+            plan.destination,
+            plan.source,
+            plan.bytes);
         return true;
+    }
+
+    CPUVerifierStateRestorePlan
+    GDNRecurrenceStage::planCPUVerifierStateRestoreRow(int row)
+    {
+        if (params_.device_id.is_gpu())
+            return {};
+        if (!hasVerifierStateCapture() ||
+            !ensureVerifierStateCaptureWorkspaceBound())
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+        if (row < 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::NoOp,
+            };
+        }
+        if (row >= verifier_capture_rows_bound_ ||
+            verifier_capture_state_size_bound_ <= 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        const float *capture = cpuVerifierStateCaptureWorkspace();
+        if (!capture || !params_.recurrence_state)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        return {
+            .status = CPUVerifierStateRestorePlanStatus::Ready,
+            .destination = params_.recurrence_state,
+            .source = capture +
+                static_cast<size_t>(row) *
+                    static_cast<size_t>(verifier_capture_state_size_bound_),
+            .bytes = static_cast<size_t>(verifier_capture_state_size_bound_) *
+                     sizeof(float),
+        };
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRow(int row, void *stream)
@@ -496,10 +485,32 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
+        // GPU publication restores the kernel-owned live bank on the verifier
+        // stream. GPU graph params deliberately contain no host state pointer.
         return params_.kernel->restoreVerifierStateCaptureRow(
-            params_.recurrence_state,
+            nullptr,
             row,
             stream ? stream : gpuStream());
+    }
+
+    bool GDNRecurrenceStage::restoreVerifierStateCaptureRows(
+        const int *host_row_indices,
+        int request_count,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() || params_.device_id.is_gpu() ||
+            !host_row_indices || request_count <= 0 || !params_.kernel)
+        {
+            return false;
+        }
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        return params_.kernel->restoreVerifierStateCaptureRows(
+            params_.recurrence_state,
+            host_row_indices,
+            request_count,
+            stream);
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -514,14 +525,17 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
-        /*
-         * Device-indexed publication is the vLLM-style hot path: the accepted
-         * verifier row is already resident in GPU metadata, and the backend
-         * kernel restores implementation-owned live state on the same stream.
-         * Do not pass the hybrid host mirror here. Refreshing that mirror would
-         * force a D2H synchronization and reintroduce the host/device coherence
-         * split Phase 9.5 is removing from MTP replay.
-         */
+        if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS"))
+        {
+            LOG_INFO("[MTPPublicationDiagnostics] phase=gdn_restore_device_row"
+                     << " layer=" << params_.layer_idx
+                     << " device=" << params_.device_id.toString()
+                     << " capture_rows=" << verifier_capture_rows_bound_
+                     << " state_size=" << verifier_capture_state_size_bound_
+                     << " stream=" << stream
+                     << " row_ptr=" << static_cast<const void *>(device_row_index));
+        }
+        // The accepted row index and destination live bank are both resident.
         return params_.kernel->restoreVerifierStateCaptureRowFromDeviceIndex(
             nullptr,
             device_row_index,
@@ -545,11 +559,11 @@ namespace llaminar2
         if (!params_.device_id.is_gpu())
         {
             /*
-             * CPU currently owns one host recurrence-state vector per layer.
-             * Batched publication needs a request-indexed state bank before it
-             * can update more than one request without overwriting another.
+             * CPU request banks consume host row indices through
+             * restoreVerifierStateCaptureRows(). Device metadata remains a
+             * GPU-only publication contract.
              */
-            LOG_ERROR("[GDNRecurrenceStage] Batched verifier-state restore requires request-owned CPU recurrence state banks");
+            LOG_ERROR("[GDNRecurrenceStage] Device-indexed batch restore is GPU-only; CPU publication requires host rows");
             return false;
         }
 
@@ -558,6 +572,18 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
+        if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS"))
+        {
+            LOG_INFO("[MTPPublicationDiagnostics] phase=gdn_restore_device_rows"
+                     << " layer=" << params_.layer_idx
+                     << " device=" << params_.device_id.toString()
+                     << " request_count=" << request_count
+                     << " row_index_stride=" << row_index_stride
+                     << " capture_rows=" << verifier_capture_rows_bound_
+                     << " state_size=" << verifier_capture_state_size_bound_
+                     << " stream=" << stream
+                     << " row_ptr=" << static_cast<const void *>(device_row_indices));
+        }
 
         return params_.kernel->restoreVerifierStateCaptureRowsFromDeviceIndices(
             nullptr,
@@ -568,12 +594,66 @@ namespace llaminar2
             stream);
     }
 
-    void GDNRecurrenceStage::onGraphReplayed()
+    bool GDNRecurrenceStage::restoreVerifierStateCaptureRequestTerminalRows(
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
+        void *stream)
     {
-        // GDN hybrid kernels are shared by verifier, correction, and normal decode
-        // graphs. Replay bypasses execute(), so refresh the host-side kernel
-        // workspace binding before MTP publication restores a captured row.
+        if (!hasVerifierStateCapture() ||
+            !params_.device_id.is_gpu() ||
+            !device_request_seq_lens ||
+            request_count <= 0 ||
+            request_row_width <= 0 ||
+            !stream)
+        {
+            return false;
+        }
+
         bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        return params_.kernel->restoreVerifierStateCaptureRequestTerminalRows(
+            /*dst_states=*/nullptr,
+            device_request_seq_lens,
+            request_count,
+            request_row_width,
+            stream);
+    }
+
+    bool GDNRecurrenceStage::requestBatchedTerminalStateCommittedDuringExecution(
+        int request_count,
+        int request_row_width) const
+    {
+        if (!params_.kernel ||
+            request_count <= 1 ||
+            request_row_width <= 0 ||
+            params_.request_count != request_count ||
+            params_.request_seq_len != request_row_width)
+        {
+            return false;
+        }
+        const int state_size =
+            params_.n_heads * params_.d_k * params_.d_v;
+        return params_.kernel->supportsRequestLiveStateBank(
+                   request_count,
+                   state_size) &&
+               verifier_capture_rows_bound_ < request_count * request_row_width;
+    }
+
+    void GDNRecurrenceStage::clearVerifierStateCaptureBindingAfterPublication()
+    {
+        if (!params_.device_id.is_gpu())
+            return;
+
+        /*
+         * Device-indexed MTP publication has copied the accepted capture row
+         * into the backend-owned live GPU recurrence state.  Leave that live
+         * state resident, but detach the verifier capture/work buffers from the
+         * shared kernel object so the next ordinary decode row updates live
+         * state rather than speculative scratch.
+         */
+        clearKernelVerifierStateWorkspace();
     }
 
     size_t GDNRecurrenceStage::deinterleaveScratchFloats(int seq_len) const
@@ -589,6 +669,7 @@ namespace llaminar2
     bool GDNRecurrenceStage::ensureGpuDeinterleaveWorkspaceBound(int seq_len) const
     {
         const size_t required_bytes = deinterleaveScratchFloats(seq_len) * sizeof(float);
+        const std::string scratch_name = deinterleaveScratchBufferName();
         if (required_bytes == 0)
         {
             LOG_ERROR("[GDNRecurrenceStage] Invalid merged-QKV deinterleave scratch shape"
@@ -600,15 +681,15 @@ namespace llaminar2
         }
 
         if (!bound_workspace_ ||
-            !bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH) ||
-            bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH) < required_bytes)
+            !bound_workspace_->hasBuffer(scratch_name) ||
+            bound_workspace_->getBufferSize(scratch_name) < required_bytes)
         {
             LOG_ERROR("[GDNRecurrenceStage] Missing required graph workspace buffer '"
-                      << WS_DEINTERLEAVE_SCRATCH << "' for merged-QKV GPU deinterleave"
+                      << scratch_name << "' for merged-QKV GPU deinterleave"
                       << " (requested=" << required_bytes << " bytes"
                       << ", available="
-                      << (bound_workspace_ && bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH)
-                              ? bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH)
+                      << (bound_workspace_ && bound_workspace_->hasBuffer(scratch_name)
+                              ? bound_workspace_->getBufferSize(scratch_name)
                               : 0)
                       << " bytes, seq_len=" << seq_len
                       << ", n_heads=" << params_.n_heads
@@ -627,25 +708,32 @@ namespace llaminar2
         prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
-        refreshPinnedEffectiveSeqLen();
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
-            (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
     }
 
     bool GDNRecurrenceStage::supportsPaddedPrefillRealLengthContract() const
     {
+        if (params_.device_id.is_gpu())
+        {
+            if (!params_.kernel || !params_.request_seq_lens_device)
+                return false;
+            if (params_.request_count <= 1)
+                return params_.kernel->supportsPaddedPrefillRealLength();
+
+            const int state_size =
+                params_.n_heads * params_.d_k * params_.d_v;
+            return params_.kernel->supportsRequestLiveStateBank(
+                params_.request_count,
+                state_size);
+        }
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
 
-    bool GDNRecurrenceStage::supportsPaddedPrefillGraphCapturePreflight() const
+    bool GDNRecurrenceStage::supportsLazyPrefillGraphCapturePreflight() const
     {
         if (params_.seq_len == 1)
             return isGraphCapturable();
 
-        if (params_.seq_len <= 1 || !params_.device_id.is_gpu() || !params_.kernel ||
-            !params_.kernel->supportsPaddedPrefillRealLength())
+        if (params_.seq_len <= 1 || !params_.device_id.is_gpu() || !params_.kernel)
             return false;
 
         if (params_.device_id.is_cuda())
@@ -669,139 +757,10 @@ namespace llaminar2
         return false;
     }
 
-    bool GDNRecurrenceStage::ensureGpuEffectiveSeqLenStateInitialized()
+    bool GDNRecurrenceStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
-        const std::string scalar_buffer = effectiveSeqLenScalarBufferName();
-        if (!bound_workspace_ ||
-            !bound_workspace_->hasBuffer(scalar_buffer) ||
-            bound_workspace_->getBufferSize(scalar_buffer) < sizeof(int))
-        {
-            LOG_ERROR("[GDNRecurrenceStage] Missing required graph workspace buffer '"
-                      << scalar_buffer << "' for effective sequence length on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        auto *device_effective_seq_len =
-            static_cast<int *>(bound_workspace_->getBuffer(scalar_buffer));
-        if (!device_effective_seq_len)
-        {
-            LOG_ERROR("[GDNRecurrenceStage] Graph workspace buffer '"
-                      << scalar_buffer << "' resolved to null on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
-            if (!device_effective_seq_len)
-                gpu_effective_seq_len_state_->device_value_uploaded = false;
-            return true;
-        }
-
-        auto state = std::make_unique<GpuEffectiveSeqLenState>();
-        state->device = params_.device_id;
-        state->device_effective_seq_len = device_effective_seq_len;
-
-        bool allocated = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            allocated = cuda::allocateRowSelectHostParam(
-                params_.device_id.cuda_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            allocated = rocm::allocateRowSelectHostParam(
-                params_.device_id.rocm_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-
-        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
-        {
-            LOG_ERROR("[GDNRecurrenceStage] Failed to allocate pinned effective length replay scalar on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        gpu_effective_seq_len_state_ = std::move(state);
-        refreshPinnedEffectiveSeqLen();
-        return true;
-    }
-
-    void GDNRecurrenceStage::refreshPinnedEffectiveSeqLen()
-    {
-        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
-            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
-    }
-
-    bool GDNRecurrenceStage::uploadGpuEffectiveSeqLen()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return false;
-        refreshPinnedEffectiveSeqLen();
-
-        if (isGraphCaptureActive())
-        {
-            if (!gpu_effective_seq_len_state_->device_value_uploaded)
-            {
-                LOG_ERROR("[GDNRecurrenceStage] Effective sequence length scalar was not uploaded before graph capture");
-                return false;
-            }
-            return true;
-        }
-
-        bool uploaded = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            uploaded = cuda::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            uploaded = rocm::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        gpu_effective_seq_len_state_->device_value_uploaded = uploaded;
-        return uploaded;
-    }
-
-    void GDNRecurrenceStage::releaseGpuEffectiveSeqLenState()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return;
-
-        if (gpu_effective_seq_len_state_->device.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            cuda::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.cuda_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-        else if (gpu_effective_seq_len_state_->device.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            rocm::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.rocm_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-
-        gpu_effective_seq_len_state_.reset();
+        return supportsLazyPrefillGraphCapturePreflight() &&
+               supportsPaddedPrefillRealLengthContract();
     }
 
     // =========================================================================
@@ -838,7 +797,7 @@ namespace llaminar2
         };
 
         // Bind stage stream to kernel before execution.
-        params_.kernel->setGPUStream(gpuStream());
+        bindStageStream(params_.kernel);
         {
             PerfStatsCollector::ScopedTimer timer(
                 "gdn_recurrence_cpu_detail",
@@ -864,9 +823,17 @@ namespace llaminar2
             !alog_base || !dtbias_base || !out_base)
             return false;
 
-        if (!params_.recurrence_state)
+        /*
+         * A raw recurrence pointer is part of the CPU execution contract only.
+         * CUDA and ROCm implementations select and, before capture, allocate
+         * their own persistent device state inside ITensorGatedDeltaNet. Their
+         * graph params therefore carry a null pointer by design. Rejecting that
+         * null here would prevent the backend owner from resolving its resident
+         * state and would reintroduce the obsolete host-mirror dependency.
+         */
+        if (!device().is_gpu() && !params_.recurrence_state)
         {
-            LOG_ERROR("[GDNRecurrenceStage] recurrence_state is null");
+            LOG_ERROR("[GDNRecurrenceStage] CPU recurrence_state is null");
             return false;
         }
 
@@ -933,7 +900,7 @@ namespace llaminar2
                     d_v = dv_mut;
                 }
 
-                LOG_DEBUG("[GDNRecurrenceStage] GPU merged QKV: "
+                LOG_TRACE("[GDNRecurrenceStage] GPU merged QKV: "
                           << params_.seq_len << "x" << (q_src_dim + k_src_dim + v_dim)
                           << " nkh=" << nkh << " n_heads=" << params_.n_heads
                           << " offset=" << params_.global_v_head_offset
@@ -950,7 +917,7 @@ namespace llaminar2
             bool ok;
             if (params_.seq_len == 1)
             {
-                LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                LOG_TRACE("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
                                                                             << " Q=" << static_cast<const void *>(d_q)
                                                                             << " K=" << static_cast<const void *>(d_k)
                                                                             << " V=" << static_cast<const void *>(d_v)
@@ -974,17 +941,33 @@ namespace llaminar2
             }
             else
             {
+                const bool request_batched =
+                    params_.request_count > 1 &&
+                    params_.request_seq_len > 0 &&
+                    params_.seq_len == params_.request_count * params_.request_seq_len;
+                if (params_.request_count > 1 && !request_batched)
+                {
+                    LOG_ERROR("[GDNRecurrenceStage] Request-batched GPU recurrence requires flattened "
+                              "seq_len == request_count * request_seq_len"
+                              << " (seq_len=" << params_.seq_len
+                              << ", request_count=" << params_.request_count
+                              << ", request_seq_len=" << params_.request_seq_len << ")");
+                    return false;
+                }
                 const int effective_seq_len = effectivePrefillSeqLen();
                 const bool padded_effective_len =
-                    prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
-                const bool use_real_length_contract = shouldUseRealLengthContract();
-                if (padded_effective_len && !use_real_length_contract)
+                    !request_batched &&
+                    prefill_replay_params_set_ &&
+                    effective_seq_len < params_.seq_len;
+                const bool use_scalar_real_length_contract =
+                    shouldUseScalarRealLengthContract();
+                if (padded_effective_len && !use_scalar_real_length_contract)
                 {
                     LOG_ERROR("[GDNRecurrenceStage] Padded prefill requires a backend real-length contract");
                     return false;
                 }
 
-                LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                LOG_TRACE("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
                                                                             << " Q=" << static_cast<const void *>(d_q)
                                                                             << " K=" << static_cast<const void *>(d_k)
                                                                             << " V=" << static_cast<const void *>(d_v)
@@ -999,23 +982,39 @@ namespace llaminar2
                                                                             << " d_v=" << params_.d_v
                                                                             << " seq=" << params_.seq_len
                                                                             << " effective_seq=" << effective_seq_len);
-                if (use_real_length_contract)
+                if (request_batched)
                 {
-                    const bool request_batched =
-                        params_.request_count > 1 &&
-                        params_.request_seq_len > 0 &&
-                        params_.seq_len == params_.request_count * params_.request_seq_len;
-                    if (request_batched)
+                    if (!params_.request_seq_lens_device)
                     {
-                        LOG_ERROR("[GDNRecurrenceStage] Request-batched GDN verifier does not support "
-                                  "the scalar padded-prefill real-length contract");
+                        LOG_ERROR("[GDNRecurrenceStage] GPU recurrence with dynamic real lengths requires device-owned request lengths");
                         return false;
                     }
-                    if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
+                    const int state_size = params_.n_heads * params_.d_k * params_.d_v;
+                    if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
                     {
-                        LOG_ERROR("[GDNRecurrenceStage] Failed to update GPU effective length scalar");
+                        LOG_ERROR("[GDNRecurrenceStage] Backend lacks device-owned live recurrence-state bank for "
+                                  << params_.request_count << " requests");
                         return false;
                     }
+                    ok = params_.kernel->chunkForwardBatchedRequestsWithDeviceSeqLens(
+                        d_q, d_k, d_v,
+                        d_alpha, d_beta,
+                        d_alog, d_dtbias,
+                        d_output, params_.recurrence_state,
+                        params_.seq_len, params_.request_count, params_.request_seq_len,
+                        params_.n_heads, params_.d_k, params_.d_v,
+                        params_.chunk_size, params_.use_qk_l2norm,
+                        params_.request_seq_lens_device);
+                }
+                else if (use_scalar_real_length_contract)
+                {
+                    /*
+                     * Request zero's resident length scalar is graph-stable
+                     * metadata, but the recurrence owner remains the primary
+                     * scalar bank.  The effective-length kernel reads that
+                     * scalar on device and commits the terminal real row
+                     * directly into the state consumed by decode.
+                     */
                     ok = params_.kernel->chunkForwardWithEffectiveSeqLen(
                         d_q, d_k, d_v,
                         d_alpha, d_beta,
@@ -1023,37 +1022,7 @@ namespace llaminar2
                         d_output, params_.recurrence_state,
                         params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
                         params_.chunk_size, params_.use_qk_l2norm,
-                        gpu_effective_seq_len_state_->device_effective_seq_len);
-                }
-                else if (params_.request_count > 1)
-                {
-                    const bool request_batched =
-                        params_.request_seq_len > 0 &&
-                        params_.seq_len == params_.request_count * params_.request_seq_len;
-                    if (!request_batched)
-                    {
-                        LOG_ERROR("[GDNRecurrenceStage] Request-batched GPU recurrence requires flattened "
-                                  "seq_len == request_count * request_seq_len"
-                                  << " (seq_len=" << params_.seq_len
-                                  << ", request_count=" << params_.request_count
-                                  << ", request_seq_len=" << params_.request_seq_len << ")");
-                        return false;
-                    }
-                    const int state_size = params_.n_heads * params_.d_k * params_.d_v;
-                    if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
-                    {
-                        LOG_ERROR("[GDNRecurrenceStage] Backend lacks request-owned live recurrence-state bank for "
-                                  << params_.request_count << " requests");
-                        return false;
-                    }
-                    ok = params_.kernel->chunkForwardBatchedRequests(
-                        d_q, d_k, d_v,
-                        d_alpha, d_beta,
-                        d_alog, d_dtbias,
-                        d_output, params_.recurrence_state,
-                        params_.seq_len, params_.request_count, params_.request_seq_len,
-                        params_.n_heads, params_.d_k, params_.d_v,
-                        params_.chunk_size, params_.use_qk_l2norm);
+                        params_.request_seq_lens_device);
                 }
                 else
                 {
@@ -1073,7 +1042,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_DEBUG("[GDNRecurrenceStage] GPU layer=" << params_.layer_idx
+            LOG_TRACE("[GDNRecurrenceStage] GPU layer=" << params_.layer_idx
                                                         << " seq_len=" << params_.seq_len
                                                         << " effective_seq_len=" << effectivePrefillSeqLen()
                                                         << " n_heads=" << params_.n_heads
@@ -1085,7 +1054,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // CPU path: use host pointers, CPU-side deinterleave
+        // CPU path: host-owned tensors, with merged rows consumed in place.
         // =====================================================================
         const float *q_data = q_base->data();
         const float *k_data = k_base->data();
@@ -1096,7 +1065,7 @@ namespace llaminar2
         const float *dtbias_data = dtbias_base->data();
         float *output_data = out_base->mutable_data();
 
-        // When Q, K, V all point to the same merged QKV buffer, deinterleave them.
+        // When Q, K, V identify one merged QKV buffer, preserve that layout.
         // Merged layout: [seq_len, q_dim + k_dim + v_dim] per row.
         // q_dim = k_dim = n_k_heads * d_k, v_dim = n_heads * d_v (n_heads = n_v_heads)
         //
@@ -1105,11 +1074,40 @@ namespace llaminar2
         //   2) n_k == n_v_local: Identity deinterleave (TP where n_k is replicated and equals n_v_local)
         //   3) n_k > n_v_local: Selection — pick the correct K-head subset for each V-head (high-degree TP)
         //
-        // The kernel expects separate contiguous [seq_len, n_v_local * dim] arrays.
+        // The mandatory merged-layout backend contract owns these mappings.
         const bool merged_qkv = (q_data == k_data && k_data == v_data);
 
         // Effective key head count for QKV split (may be full count if Q/K replicated for TP)
         const int nkh = (params_.n_k_heads > 0) ? params_.n_k_heads : params_.n_heads;
+        const bool request_batched =
+            params_.request_count > 1 &&
+            params_.request_seq_len > 0 &&
+            params_.seq_len == params_.request_count * params_.request_seq_len;
+        if (params_.request_count > 1 && !request_batched)
+        {
+            LOG_ERROR("[GDNRecurrenceStage] Request-batched CPU recurrence requires flattened "
+                      "seq_len == request_count * request_seq_len");
+            return false;
+        }
+        if (request_batched &&
+            (!params_.request_seq_lens_host ||
+             static_cast<int>(params_.request_seq_lens_host->size()) <
+                 params_.request_count))
+        {
+            LOG_ERROR("[GDNRecurrenceStage] Request-batched CPU recurrence requires host request lengths");
+            return false;
+        }
+        if (request_batched)
+        {
+            const int state_size =
+                params_.n_heads * params_.d_k * params_.d_v;
+            if (!params_.kernel->supportsRequestLiveStateBank(
+                    params_.request_count, state_size))
+            {
+                LOG_ERROR("[GDNRecurrenceStage] CPU backend lacks request-owned live recurrence state");
+                return false;
+            }
+        }
         bool ok = false;
 
         if (merged_qkv)
@@ -1120,12 +1118,47 @@ namespace llaminar2
             const int v_dim = params_.n_heads * params_.d_v;
             const int qkv_stride = q_src_dim + k_src_dim + v_dim;
 
+            if (request_batched)
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "gdn_recurrence_cpu_detail",
+                    "request_batched_merged_qkv",
+                    "execute",
+                    params_.device_id.toString(),
+                    detail_tags);
+                ok = params_.kernel->chunkForwardBatchedMergedQKVWithHostSeqLens(
+                    q_data,
+                    qkv_stride,
+                    alpha_data,
+                    beta_data,
+                    alog_data,
+                    dtbias_data,
+                    output_data,
+                    params_.recurrence_state,
+                    params_.seq_len,
+                    params_.request_count,
+                    params_.request_seq_len,
+                    nkh,
+                    params_.n_heads,
+                    params_.d_k,
+                    params_.d_v,
+                    params_.global_v_head_offset,
+                    params_.use_qk_l2norm,
+                    params_.request_seq_lens_host->data());
+                if (!ok)
+                {
+                    LOG_ERROR("[GDNRecurrenceStage] CPU grouped merged-QKV request kernel failed");
+                    return false;
+                }
+                return true;
+            }
+
             /*
-             * All-position verifier rows are tiny (M=2..4), and the hot path
-             * needs post-row state snapshots rather than a generic prefill
-             * layout.  Let CPU kernels that understand the merged layout read
-             * Q/K/V slices directly so we do not spend more time copying QKV
-             * than advancing the recurrence.
+             * All-position verifier rows are bounded by the graph's declared
+             * runtime capacity and need post-row state snapshots rather than a
+             * generic prefill layout. Let CPU kernels that understand the merged
+             * layout read Q/K/V slices directly so we do not spend more time
+             * copying QKV than advancing the recurrence.
              */
             const bool direct_merged_verifier =
                 params_.seq_len > 1 &&
@@ -1134,10 +1167,11 @@ namespace llaminar2
                 verifier_capture_state_size_bound_ > 0;
             if (direct_merged_verifier)
             {
-                if (!host_verifier_state_slots_ ||
-                    verifier_capture_rows_bound_ <= 0)
+                float *const verifier_state_slots =
+                    cpuVerifierStateCaptureWorkspace();
+                if (!verifier_state_slots || verifier_capture_rows_bound_ <= 0)
                 {
-                    LOG_ERROR("[GDNRecurrenceStage] CPU merged-QKV verifier requires bound host state slots");
+                    LOG_ERROR("[GDNRecurrenceStage] CPU merged-QKV verifier requires manager-owned state slots");
                     return false;
                 }
 
@@ -1167,9 +1201,9 @@ namespace llaminar2
                         params_.global_v_head_offset,
                         params_.chunk_size,
                         params_.use_qk_l2norm,
-                    host_verifier_state_slots_.get(),
-                    verifier_capture_state_size_bound_,
-                    verifier_capture_rows_bound_);
+                        verifier_state_slots,
+                        verifier_capture_state_size_bound_,
+                        verifier_capture_rows_bound_);
                 }
                 if (!ok)
                 {
@@ -1189,52 +1223,87 @@ namespace llaminar2
                 return true;
             }
 
-            // Dimensions after deinterleave (what the kernel expects: n_v_local heads)
-            const int q_dst_dim = params_.n_heads * params_.d_k;
-            const int k_dst_dim = params_.n_heads * params_.d_k;
-            const int T = params_.seq_len;
-
-            // Grow-only reusable scratch (no allocation after first call at max seq_len)
-            const size_t q_size = static_cast<size_t>(T) * q_dst_dim;
-            const size_t k_size = static_cast<size_t>(T) * k_dst_dim;
-            const size_t v_size = static_cast<size_t>(T) * v_dim;
-            if (q_deinterleave_.size() < q_size)
-                q_deinterleave_.resize(q_size);
-            if (k_deinterleave_.size() < k_size)
-                k_deinterleave_.resize(k_size);
-            if (v_deinterleave_.size() < v_size)
-                v_deinterleave_.resize(v_size);
-
-            const float *qkv = q_data; // merged buffer
+            const int effective_seq_len = effectivePrefillSeqLen();
+            const int kernel_seq_len = params_.seq_len > 1
+                                           ? effective_seq_len
+                                           : params_.seq_len;
+            const bool padded_effective_len =
+                prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
+            if (padded_effective_len && !supportsPaddedPrefillRealLengthContract())
+            {
+                LOG_ERROR("[GDNRecurrenceStage] Padded CPU merged-QKV prefill "
+                          "requires a real-length contract");
+                return false;
+            }
 
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "gdn_recurrence_cpu_detail",
-                    "host_deinterleave",
+                    params_.seq_len == 1
+                        ? "direct_merged_decode"
+                        : "direct_merged_prefill",
                     "execute",
                     params_.device_id.toString(),
                     detail_tags);
-                deinterleaveMergedQKV(
-                    qkv, T, qkv_stride,
-                    nkh, params_.n_heads, params_.d_k, params_.d_v,
+                ok = params_.kernel->chunkForwardMergedQKV(
+                    q_data,
+                    qkv_stride,
+                    alpha_data,
+                    beta_data,
+                    alog_data,
+                    dtbias_data,
+                    output_data,
+                    params_.recurrence_state,
+                    kernel_seq_len,
+                    nkh,
+                    params_.n_heads,
+                    params_.d_k,
+                    params_.d_v,
                     params_.global_v_head_offset,
-                    q_deinterleave_.data(),
-                    k_deinterleave_.data(),
-                    v_deinterleave_.data());
+                    params_.chunk_size,
+                    params_.use_qk_l2norm);
             }
-
-            q_data = q_deinterleave_.data();
-            k_data = k_deinterleave_.data();
-            v_data = v_deinterleave_.data();
-
-            LOG_DEBUG("[GDNRecurrenceStage] Deinterleaved merged QKV: "
-                      << T << "x" << qkv_stride << " -> Q(" << T << "x" << q_dst_dim
-                      << "), K(" << T << "x" << k_dst_dim << "), V(" << T << "x" << v_dim << ")"
-                      << " nkh=" << nkh << " n_heads=" << params_.n_heads
-                      << " global_v_offset=" << params_.global_v_head_offset);
+            if (!ok)
+            {
+                LOG_ERROR("[GDNRecurrenceStage] Mandatory CPU merged-QKV kernel failed");
+                return false;
+            }
+            if (kernel_seq_len < params_.seq_len)
+            {
+                const size_t first_pad =
+                    static_cast<size_t>(kernel_seq_len) *
+                    static_cast<size_t>(params_.n_heads * params_.d_v);
+                const size_t pad_count =
+                    static_cast<size_t>(params_.seq_len - kernel_seq_len) *
+                    static_cast<size_t>(params_.n_heads * params_.d_v);
+                std::memset(
+                    output_data + first_pad,
+                    0,
+                    pad_count * sizeof(float));
+            }
+            return true;
         }
 
-        if (params_.seq_len == 1)
+        if (request_batched)
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "gdn_recurrence_cpu_detail",
+                "request_batched_separate_qkv",
+                "execute",
+                params_.device_id.toString(),
+                detail_tags);
+            ok = params_.kernel->chunkForwardBatchedRequestsWithHostSeqLens(
+                q_data, k_data, v_data,
+                alpha_data, beta_data,
+                alog_data, dtbias_data,
+                output_data, params_.recurrence_state,
+                params_.seq_len, params_.request_count,
+                params_.request_seq_len,
+                params_.n_heads, params_.d_k, params_.d_v,
+                params_.chunk_size, params_.use_qk_l2norm,
+                params_.request_seq_lens_host->data());
+        }
+        else if (params_.seq_len == 1)
         {
             PerfStatsCollector::ScopedTimer timer(
                 "gdn_recurrence_cpu_detail",
@@ -1292,7 +1361,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[GDNRecurrenceStage] layer=" << params_.layer_idx
+        LOG_TRACE("[GDNRecurrenceStage] layer=" << params_.layer_idx
                                                 << " seq_len=" << params_.seq_len
                                                 << " effective_seq_len=" << effectivePrefillSeqLen()
                                                 << " n_heads=" << params_.n_heads

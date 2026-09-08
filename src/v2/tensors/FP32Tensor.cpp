@@ -81,6 +81,41 @@ namespace llaminar2
         // GPU allocation is handled by TensorBase::ensureOnDevice() when needed
     }
 
+    FP32Tensor::FP32Tensor(
+        const std::vector<size_t> &shape,
+        DeviceId device,
+        MappedStorageConstructionTag)
+        : shape_(shape), device_(device), is_view_(false),
+          parent_data_ptr_(nullptr), view_offset_(0), parent_(nullptr)
+    {
+        if (shape_.empty() ||
+            std::any_of(
+                shape_.begin(), shape_.end(),
+                [](size_t dimension) { return dimension == 0u; }))
+        {
+            throw std::invalid_argument(
+                "FP32Tensor mapped storage requires a non-empty positive shape");
+        }
+    }
+
+    FP32Tensor::FP32Tensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<float> host_data,
+        DeviceId device)
+        : shape_(shape), device_(device), is_view_(false),
+          host_data_(std::move(host_data)), parent_data_ptr_(nullptr),
+          view_offset_(0), parent_(nullptr)
+    {
+        if (shape.empty())
+            throw std::invalid_argument("FP32Tensor: shape cannot be empty");
+
+        size_t expected_elements = 1u;
+        for (const size_t dimension : shape)
+            expected_elements *= dimension;
+        if (host_data_.size() != expected_elements)
+            throw std::invalid_argument("FP32Tensor: data size mismatch");
+    }
+
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape,
                            DeviceId device,
                            AlignedVector<float> *parent_data,
@@ -98,6 +133,21 @@ namespace llaminar2
         const std::vector<size_t> &shape,
         DeviceId target_device)
     {
+        return createMappedWithHome(shape, target_device, target_device);
+    }
+
+    std::unique_ptr<FP32Tensor> FP32Tensor::createHostOwnedMapped(
+        const std::vector<size_t> &shape,
+        DeviceId mapped_device)
+    {
+        return createMappedWithHome(shape, DeviceId::cpu(), mapped_device);
+    }
+
+    std::unique_ptr<FP32Tensor> FP32Tensor::createMappedWithHome(
+        const std::vector<size_t> &shape,
+        DeviceId home_device,
+        DeviceId mapped_device)
+    {
         // Calculate tensor size
         size_t count = 1;
         for (auto dim : shape)
@@ -106,15 +156,20 @@ namespace llaminar2
         }
         size_t bytes = count * sizeof(float);
 
-        // Create tensor with regular constructor first (no host allocation for mapped)
-        auto tensor = std::make_unique<FP32Tensor>(shape, target_device);
+        auto tensor = std::unique_ptr<FP32Tensor>(new FP32Tensor(
+            shape,
+            home_device,
+            MappedStorageConstructionTag{}));
 
-        // Try to initialize as mapped tensor via base class
-        if (!tensor->initMappedMemory(bytes, target_device))
+        // Mapped allocation is an explicit placement contract. Returning a
+        // regular tensor here would silently move the caller onto a different
+        // storage and synchronization architecture.
+        if (!tensor->initMappedMemory(bytes, mapped_device))
         {
-            LOG_WARN("[FP32Tensor::createMapped] Failed to allocate mapped memory ("
-                     << bytes << " bytes), using regular allocation");
-            // tensor already has regular host allocation, just return it
+            LOG_ERROR("[FP32Tensor::createMappedWithHome] Failed to allocate required mapped memory ("
+                      << bytes << " bytes) on " << mapped_device.toString()
+                      << " for logical home " << home_device.toString());
+            return nullptr;
         }
 
         return tensor;
@@ -122,6 +177,7 @@ namespace llaminar2
 
     FP32Tensor::~FP32Tensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Mapped memory cleanup is handled by TensorBase destructor
         // Nothing tensor-specific to clean up here
     }
@@ -132,9 +188,15 @@ namespace llaminar2
 
         LOG_TRACE("[FP32Tensor::data] Called for tensor, host_valid=" << ::llaminar2::isHostValid(coherence_state_) << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_) << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null") << " is_mapped_=" << is_mapped_);
 
-        // Use base class to ensure host has current data
-        // For mapped tensors, ensureOnHost() is a no-op (data is always available)
-        const_cast<FP32Tensor *>(this)->ensureOnHost();
+        // Host access is a terminal observation boundary.  Returning the old
+        // host allocation after a failed device publication would silently
+        // turn an ordering defect into incorrect inference output, so surface
+        // the coherence failure immediately.
+        if (!const_cast<FP32Tensor *>(this)->ensureOnHost())
+        {
+            throw std::runtime_error(
+                "FP32Tensor::data could not acquire authoritative host data");
+        }
 
         // Mapped tensors use mapped_host_ptr_ from base class
         if (is_mapped_ && mapped_host_ptr_)
@@ -153,9 +215,14 @@ namespace llaminar2
     {
         assertValid("FP32Tensor::mutable_data");
 
-        // Ensure host has current data before modification
-        // For mapped tensors, ensureOnHost() is a no-op
-        ensureOnHost();
+        // A mutable host view cannot be granted while newer device data has no
+        // valid completion publication.  Mutating stale storage here would
+        // destroy the only recoverable copy and conceal the producer defect.
+        if (!ensureOnHost())
+        {
+            throw std::runtime_error(
+                "FP32Tensor::mutable_data could not acquire authoritative host data");
+        }
 
         // For non-mapped tensors: Invalidate GPU copy since host will be modified
         // For mapped tensors: Both host and device share memory, no invalidation needed

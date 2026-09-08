@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
@@ -99,6 +100,13 @@ namespace llaminar2
             throw std::runtime_error("[GPUDeviceContextPool] Invalid CUDA device ordinal " + std::to_string(device_ordinal) + " (valid range: 0-" + std::to_string(cuda_device_count_ - 1) + ")");
         }
 
+        if (retiring_nvidia_contexts_.contains(device_ordinal))
+        {
+            throw std::logic_error(
+                "[GPUDeviceContextPool] CUDA context acquisition raced exclusive generation retirement for device " +
+                std::to_string(device_ordinal));
+        }
+
         // Check if context already exists
         auto it = nvidia_contexts_.find(device_ordinal);
         if (it != nvidia_contexts_.end())
@@ -112,6 +120,13 @@ namespace llaminar2
         auto context = nvidia_factory_(device_ordinal);
         IWorkerGPUContext &ctx_ref = *context;
         nvidia_contexts_[device_ordinal] = std::move(context);
+        if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            nvidia_contexts_.erase(device_ordinal);
+            throw std::overflow_error(
+                "[GPUDeviceContextPool] Context generation identity exhausted");
+        }
+        nvidia_generations_[device_ordinal] = next_generation_++;
 
         return ctx_ref;
     }
@@ -145,6 +160,13 @@ namespace llaminar2
             throw std::runtime_error("[GPUDeviceContextPool] Invalid ROCm device ordinal " + std::to_string(device_ordinal) + " (valid range: 0-" + std::to_string(rocm_device_count_ - 1) + ")");
         }
 
+        if (retiring_amd_contexts_.contains(device_ordinal))
+        {
+            throw std::logic_error(
+                "[GPUDeviceContextPool] ROCm context acquisition raced exclusive generation retirement for device " +
+                std::to_string(device_ordinal));
+        }
+
         // Check if context already exists
         auto it = amd_contexts_.find(device_ordinal);
         if (it != amd_contexts_.end())
@@ -158,6 +180,13 @@ namespace llaminar2
         auto context = amd_factory_(device_ordinal);
         IWorkerGPUContext &ctx_ref = *context;
         amd_contexts_[device_ordinal] = std::move(context);
+        if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
+        {
+            amd_contexts_.erase(device_ordinal);
+            throw std::overflow_error(
+                "[GPUDeviceContextPool] Context generation identity exhausted");
+        }
+        amd_generations_[device_ordinal] = next_generation_++;
 
         return ctx_ref;
     }
@@ -254,18 +283,183 @@ namespace llaminar2
 
     void GPUDeviceContextPool::shutdown()
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        decltype(nvidia_contexts_) retired_nvidia_contexts;
+        decltype(amd_contexts_) retired_amd_contexts;
+        size_t nvidia_count = 0u;
+        size_t amd_count = 0u;
 
-        size_t nvidia_count = nvidia_contexts_.size();
-        size_t amd_count = amd_contexts_.size();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!retiring_nvidia_contexts_.empty() ||
+                !retiring_amd_contexts_.empty())
+            {
+                throw std::logic_error(
+                    "[GPUDeviceContextPool] Shutdown cannot overlap an exclusive runtime-generation retirement");
+            }
 
-        // Clear all contexts (destructors handle cleanup)
-        nvidia_contexts_.clear();
-        amd_contexts_.clear();
+            nvidia_count = nvidia_contexts_.size();
+            amd_count = amd_contexts_.size();
+            retired_nvidia_contexts.swap(nvidia_contexts_);
+            retired_amd_contexts.swap(amd_contexts_);
+            nvidia_generations_.clear();
+            amd_generations_.clear();
+        }
+
+        /* Worker teardown joins threads and enters CUDA/HIP to destroy exact
+         * streams, events, and library handles. Keep those operations outside
+         * the pool mutex so unrelated device acquisition cannot deadlock on a
+         * backend destructor that re-enters infrastructure. */
+        retired_nvidia_contexts.clear();
+        retired_amd_contexts.clear();
 
         LOG_DEBUG("[GPUDeviceContextPool] Shutdown cleared " << nvidia_count
                                                              << " NVIDIA and " << amd_count
                                                              << " AMD contexts");
+    }
+
+    GPUDeviceContextGenerationRetirementReceipt
+    GPUDeviceContextPool::retireExclusiveGeneration(DeviceId device)
+    {
+        auto scope = beginExclusiveGenerationRetirement(device);
+        return scope.receipt();
+    }
+
+    ExclusiveGPUDeviceGenerationRetirement
+    GPUDeviceContextPool::beginExclusiveGenerationRetirement(DeviceId device)
+    {
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "[GPUDeviceContextPool] Exclusive generation retirement requires an exact GPU device");
+        }
+
+        std::unique_ptr<IWorkerGPUContext> retired_context;
+        std::uint64_t retired_generation = 0u;
+        const int ordinal = device.gpu_ordinal();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto &contexts = device.is_cuda() ? nvidia_contexts_ : amd_contexts_;
+            auto &generations =
+                device.is_cuda() ? nvidia_generations_ : amd_generations_;
+            auto &retiring = device.is_cuda()
+                                 ? retiring_nvidia_contexts_
+                                 : retiring_amd_contexts_;
+
+            if (retiring.contains(ordinal))
+            {
+                throw std::logic_error(
+                    "[GPUDeviceContextPool] Device context generation is already retiring for " +
+                    device.toString());
+            }
+
+            /* Install exclusion even when no worker was materialized. The
+             * backend runtime generation still exists and must not race a lazy
+             * context acquisition during reset. */
+            retiring.insert(ordinal);
+
+            const auto context_it = contexts.find(ordinal);
+            if (context_it == contexts.end())
+            {
+                return ExclusiveGPUDeviceGenerationRetirement(
+                    this,
+                    GPUDeviceContextGenerationRetirementReceipt{
+                        .device = device,
+                    });
+            }
+
+            const auto generation_it = generations.find(ordinal);
+            if (generation_it == generations.end() ||
+                generation_it->second == 0u)
+            {
+                retiring.erase(ordinal);
+                throw std::logic_error(
+                    "[GPUDeviceContextPool] Live context has no generation identity for " +
+                    device.toString());
+            }
+
+            retired_generation = generation_it->second;
+            retired_context = std::move(context_it->second);
+            contexts.erase(context_it);
+            generations.erase(generation_it);
+        }
+
+        /*
+         * Context destruction joins the worker and destroys every exact stream,
+         * event, and library handle. Do it outside mutex_: cleanup may enter a
+         * backend runtime and must not serialize unrelated device acquisition.
+         */
+        try
+        {
+            retired_context.reset();
+        }
+        catch (...)
+        {
+            finishExclusiveGenerationRetirement(device);
+            throw;
+        }
+
+        LOG_INFO(
+            "[GPUDeviceContextPool] Retired exclusive context generation device="
+            << device.toString() << " generation=" << retired_generation);
+        return ExclusiveGPUDeviceGenerationRetirement(
+            this,
+            GPUDeviceContextGenerationRetirementReceipt{
+                .device = device,
+                .retired_generation = retired_generation,
+            });
+    }
+
+    void GPUDeviceContextPool::finishExclusiveGenerationRetirement(
+        DeviceId device) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto &retiring = device.is_cuda()
+                             ? retiring_nvidia_contexts_
+                             : retiring_amd_contexts_;
+        if (retiring.erase(device.gpu_ordinal()) != 1u)
+        {
+            LOG_ERROR(
+                "[GPUDeviceContextPool] Exclusive retirement lost its marker for "
+                << device.toString());
+            std::terminate();
+        }
+    }
+
+    ExclusiveGPUDeviceGenerationRetirement::~ExclusiveGPUDeviceGenerationRetirement()
+    {
+        release();
+    }
+
+    ExclusiveGPUDeviceGenerationRetirement::ExclusiveGPUDeviceGenerationRetirement(
+        ExclusiveGPUDeviceGenerationRetirement &&other) noexcept
+        : pool_(other.pool_), receipt_(other.receipt_)
+    {
+        other.pool_ = nullptr;
+        other.receipt_ = {};
+    }
+
+    ExclusiveGPUDeviceGenerationRetirement &
+    ExclusiveGPUDeviceGenerationRetirement::operator=(
+        ExclusiveGPUDeviceGenerationRetirement &&other) noexcept
+    {
+        if (this == &other)
+            return *this;
+        release();
+        pool_ = other.pool_;
+        receipt_ = other.receipt_;
+        other.pool_ = nullptr;
+        other.receipt_ = {};
+        return *this;
+    }
+
+    void ExclusiveGPUDeviceGenerationRetirement::release() noexcept
+    {
+        if (!pool_)
+            return;
+        pool_->finishExclusiveGenerationRetirement(receipt_.device);
+        pool_ = nullptr;
+        receipt_ = {};
     }
 
 } // namespace llaminar2

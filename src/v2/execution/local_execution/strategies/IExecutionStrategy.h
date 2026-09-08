@@ -153,12 +153,14 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Clear KV caches on all devices
+         * @brief Reset request-owned inference state on all devices.
          *
-         * Resets KV cache state for a new generation. Called by orchestrator
-         * when clear_cache() is invoked.
+         * This crosses the new-request boundary for each stage: main KV plus
+         * hybrid GDN state, MTP sidecars and handoffs, and logical sequence
+         * metadata are reset while graph topology, workspaces, prepared
+         * weights, and device contexts remain alive.
          *
-         * @param runners Device runners to clear
+         * @param runners Device runners to reset.
          */
         virtual void clearCaches(
             std::vector<DeviceGraphOrchestrator *> &runners) = 0;

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Performance regression benchmark check for Llaminar pre-commit and CI.
+# Standalone/CI performance regression check; never part of pre-commit.
 #
 # Local mode builds and benchmarks build_v2_release/llaminar2.
 # Container mode benchmarks an already-built runtime image:

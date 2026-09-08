@@ -16,13 +16,16 @@
 #pragma once
 
 #include <cstddef>
+#include <unordered_set>
 #include <vector>
 #include "BufferId.h"
 #include "BufferAccess.h"
+#include "../loaders/WeightPlan.h"
 
 namespace llaminar2
 {
     class ITensor;
+    class PreparedWeightStore;
 }
 
 namespace llaminar2
@@ -33,9 +36,10 @@ namespace llaminar2
      */
     struct BufferBinding
     {
-        BufferId id;                 ///< Which buffer
-        BufferAccess access;         ///< READ, WRITE, or READWRITE
-        const char *dtype = nullptr; ///< Expected dtype string for validation (optional)
+        BufferId id;                       ///< Which buffer
+        BufferAccess access;               ///< READ, WRITE, or READWRITE
+        const char *dtype = nullptr;       ///< Expected dtype string for validation (optional)
+        bool prepare_write_storage = true; ///< Whether pre-execute write allocation is required
     };
 
     /**
@@ -47,6 +51,22 @@ namespace llaminar2
         size_t size_bytes = 0;      ///< Required size
         size_t alignment = 64;      ///< Alignment requirement
         bool required = true;       ///< Fail if cannot allocate?
+    };
+
+    /**
+     * @brief Device-owned prepared weight consumed by a stage.
+     *
+     * The source tensor describes model identity and shape but is not the byte
+     * storage read by the GPU kernel. The PreparedWeightStore and
+     * PreparedWeightRef name that storage exactly, including its device. This
+     * prevents the executor from inferring prepared residency from mutable
+     * source-tensor flags or attempting to upload a host-only source tensor.
+     */
+    struct PreparedWeightBinding
+    {
+        ITensor *source_tensor = nullptr;
+        const PreparedWeightStore *store = nullptr;
+        PreparedWeightRef ref;
     };
 
     /**
@@ -64,7 +84,8 @@ namespace llaminar2
     {
         std::vector<BufferBinding> inputs;     ///< Read-only activation buffers (arena-managed)
         std::vector<BufferBinding> outputs;    ///< Write-only output buffers (arena-managed)
-        std::vector<ITensor *> weight_tensors; ///< Read-only model weights (external, NOT in arena)
+        std::vector<ITensor *> weight_tensors; ///< Raw model-weight tensors read directly by a stage
+        std::vector<PreparedWeightBinding> prepared_weights; ///< Device-owned prepared model weights
         std::vector<BufferBinding> inouts;     ///< Read-write (e.g., allreduce in-place, arena-managed)
         std::vector<WorkspaceDesc> workspaces; ///< Scratch buffers
 
@@ -74,13 +95,15 @@ namespace llaminar2
         /// True if this contract has any bindings at all
         bool empty() const
         {
-            return inputs.empty() && outputs.empty() && weight_tensors.empty() && inouts.empty();
+            return inputs.empty() && outputs.empty() && weight_tensors.empty() &&
+                   prepared_weights.empty() && inouts.empty();
         }
 
         /// Total number of buffer bindings (excluding workspaces)
         size_t bindingCount() const
         {
-            return inputs.size() + outputs.size() + weight_tensors.size() + inouts.size();
+            return inputs.size() + outputs.size() + weight_tensors.size() +
+                   prepared_weights.size() + inouts.size();
         }
 
         // ── Fluent builder methods ──────────────────────────────────────────
@@ -97,6 +120,25 @@ namespace llaminar2
             return *this;
         }
 
+        /**
+         * @brief Declare a write-only buffer whose stable storage is already bound.
+         *
+         * Captured publication stages often overwrite a persistent arena
+         * mailbox through a pointer fixed during setup.  Such a destination is
+         * not an input merely because its storage predates the stage, and
+         * treating it as READWRITE would manufacture a stale-coherence
+         * dependency at the graph frontier.  This binding still participates
+         * in post-execute device-write publication, but it neither requests
+         * input coherence nor permits the executor to rebind its storage.
+         */
+        StageBufferContract &addPreallocatedOutput(
+            BufferId id,
+            const char *dtype = nullptr)
+        {
+            outputs.push_back({id, BufferAccess::WRITE, dtype, false});
+            return *this;
+        }
+
         StageBufferContract &addWeight(ITensor *tensor)
         {
             if (tensor)
@@ -104,9 +146,35 @@ namespace llaminar2
             return *this;
         }
 
+        /**
+         * @brief Declare a prepared representation instead of a raw tensor read.
+         *
+         * All three values remain in the contract even when malformed so the
+         * executor can issue one deterministic, stage-scoped hard failure during
+         * pre-execution validation.
+         */
+        StageBufferContract &addPreparedWeight(
+            ITensor *source_tensor,
+            const PreparedWeightStore *store,
+            PreparedWeightRef ref)
+        {
+            prepared_weights.push_back({
+                .source_tensor = source_tensor,
+                .store = store,
+                .ref = ref,
+            });
+            return *this;
+        }
+
         StageBufferContract &addInOut(BufferId id, const char *dtype = nullptr)
         {
             inouts.push_back({id, BufferAccess::READWRITE, dtype});
+            return *this;
+        }
+
+        StageBufferContract &addPreallocatedInOut(BufferId id, const char *dtype = nullptr)
+        {
+            inouts.push_back({id, BufferAccess::READWRITE, dtype, false});
             return *this;
         }
 
@@ -139,6 +207,74 @@ namespace llaminar2
             result.insert(result.end(), inouts.begin(), inouts.end());
             return result;
         }
+
+        /// Find write bindings whose storage must be allocated before execute().
+        ///
+        /// Some in-place stages, notably TP allreduce, consume a buffer produced
+        /// immediately upstream and only need post-execute dirty marking. Calling
+        /// prepareForWrite() on those buffers can migrate a live multi-device
+        /// tensor's primary pointer before the collective has consumed it.
+        std::vector<BufferBinding> writesRequiringPrepare() const
+        {
+            std::vector<BufferBinding> result;
+            result.reserve(outputs.size() + inouts.size());
+            for (const auto &binding : outputs)
+            {
+                if (binding.prepare_write_storage)
+                    result.push_back(binding);
+            }
+            for (const auto &binding : inouts)
+            {
+                if (binding.prepare_write_storage)
+                    result.push_back(binding);
+            }
+            return result;
+        }
+    };
+
+    /**
+     * @brief Classifies arena reads at a captured graph's external frontier.
+     *
+     * The tracker consumes stage contracts in topological execution order. A
+     * read is external only when no earlier stage in the same capture unit has
+     * produced that BufferId. Reads of internal intermediates must not be joined
+     * or validated before capture: their producer kernels establish residency
+     * and ordering inside the native graph itself.
+     *
+     * One tracker instance represents exactly one capture unit. Starting a new
+     * instance at a segment boundary intentionally treats values produced by a
+     * prior segment as external dependencies of the next segment.
+     */
+    class GraphArenaDependencyTracker final
+    {
+    public:
+        /**
+         * @brief Observe one stage and return newly encountered external reads.
+         * @param contract Declarative contract for the next topological stage.
+         * @return Reads whose producer lies outside this capture unit.
+         */
+        std::vector<BufferBinding> observeStage(
+            const StageBufferContract &contract)
+        {
+            std::vector<BufferBinding> external_reads;
+            for (const auto &binding : contract.allArenaReads())
+            {
+                if (produced_.count(binding.id) == 0 &&
+                    joined_external_reads_.insert(binding.id).second)
+                {
+                    external_reads.push_back(binding);
+                }
+            }
+
+            for (const auto &binding : contract.allWrites())
+                produced_.insert(binding.id);
+
+            return external_reads;
+        }
+
+    private:
+        std::unordered_set<BufferId> produced_;
+        std::unordered_set<BufferId> joined_external_reads_;
     };
 
 } // namespace llaminar2

@@ -4,6 +4,8 @@
  */
 
 #include "BufferArena.h"
+
+#include "../transfer/TransferEngine.h"
 #include "CoherenceTracker.h"
 #include "config/CollectiveBackendType.h"
 #include "execution/debug/BufferRole.h"
@@ -12,11 +14,14 @@
 #include "tensors/ITensor.h"
 #include "models/qwen/Qwen2BufferSpec.h"
 #include "utils/Logger.h"
+#include "utils/VramBillOfMaterials.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -106,6 +111,63 @@ namespace llaminar2
         return true;
     }
 
+    bool BufferArena::registerBuffer(
+        BufferId id,
+        const BufferDescriptor &descriptor)
+    {
+        if (descriptor.shape.empty())
+        {
+            throw std::invalid_argument(
+                "BufferArena: graph buffer '" + descriptor.name +
+                "' must declare at least one shape dimension");
+        }
+
+        const size_t rows = descriptor.shape.front();
+        if (rows == 0)
+        {
+            throw std::invalid_argument(
+                "BufferArena: graph buffer '" + descriptor.name +
+                "' has a zero-sized row dimension");
+        }
+
+        // A rank-one tensor is represented as [rows, 1]. For rank-two and
+        // higher tensors, flatten every trailing logical axis into columns so
+        // the arena's matrix representation preserves the complete capacity.
+        size_t cols = 1;
+        for (size_t axis = 1; axis < descriptor.shape.size(); ++axis)
+        {
+            const size_t dimension = descriptor.shape[axis];
+            if (dimension == 0)
+            {
+                throw std::invalid_argument(
+                    "BufferArena: graph buffer '" + descriptor.name +
+                    "' has a zero-sized dimension at axis " +
+                    std::to_string(axis));
+            }
+            if (cols > std::numeric_limits<size_t>::max() / dimension)
+            {
+                throw std::overflow_error(
+                    "BufferArena: trailing shape product overflows for graph buffer '" +
+                    descriptor.name + "'");
+            }
+            cols *= dimension;
+        }
+
+        if (rows > std::numeric_limits<size_t>::max() / cols)
+        {
+            throw std::overflow_error(
+                "BufferArena: element count overflows for graph buffer '" +
+                descriptor.name + "'");
+        }
+
+        return registerBuffer(
+            id,
+            rows,
+            cols,
+            bufferTensorTypeToStr(descriptor.tensor_type),
+            descriptor.device);
+    }
+
     bool BufferArena::registerExternalBuffer(BufferId id, ITensor *tensor)
     {
         auto idx = static_cast<size_t>(id);
@@ -151,6 +213,11 @@ namespace llaminar2
         b.cols = tensor->cols();
         b.dtype = nullptr;
         b.coherence = {};
+        if (auto *base = dynamic_cast<TensorBase *>(tensor);
+            base && base->debugName().empty())
+        {
+            base->setDebugName(bufferIdName(id));
+        }
         return true;
     }
 
@@ -233,6 +300,10 @@ namespace llaminar2
             return BufferId::K_PROJ;
         if (name == "V")
             return BufferId::V_PROJ;
+        if (name == "K_full_prefill")
+            return BufferId::K_FULL_PREFILL;
+        if (name == "V_full_prefill")
+            return BufferId::V_FULL_PREFILL;
         if (name == "attn_output")
             return BufferId::ATTN_OUTPUT;
         if (name == "attn_proj")
@@ -267,6 +338,8 @@ namespace llaminar2
         // GDN (Gated Delta Network) buffers
         if (name == "gdn_qkv")
             return BufferId::GDN_QKV;
+        if (name == "gdn_recurrence_in")
+            return BufferId::GDN_RECURRENCE_IN;
         if (name == "gdn_z")
             return BufferId::GDN_Z;
         if (name == "gdn_alpha")
@@ -323,6 +396,10 @@ namespace llaminar2
             return BufferId::MTP_K_PROJ;
         if (name == "mtp_v")
             return BufferId::MTP_V_PROJ;
+        if (name == "mtp_k_full_prefill")
+            return BufferId::MTP_K_FULL_PREFILL;
+        if (name == "mtp_v_full_prefill")
+            return BufferId::MTP_V_FULL_PREFILL;
         if (name == "mtp_q_raw")
             return BufferId::MTP_FA_Q_RAW;
         if (name == "mtp_q_gate")
@@ -343,6 +420,8 @@ namespace llaminar2
             return BufferId::MTP_FFN_OUTPUT;
         if (name == "mtp_logits")
             return BufferId::MTP_LOGITS;
+        if (name == "mtp_logits_gathered")
+            return BufferId::MTP_LOGITS_GATHERED;
 
         return BufferId::_COUNT; // sentinel: no mapping
     }
@@ -375,53 +454,40 @@ namespace llaminar2
         const ManagedBuffer &b, BufferId id) const
     {
         std::vector<size_t> shape{b.rows, b.cols};
+        const std::string dtype = b.dtype ? std::string(b.dtype) : "FP32";
+        const bool is_fp32 = dtype == "FP32";
 
         // ── Factory-based allocation (NUMA-aware, dtype-aware) ──────────
         if (config_.factory)
         {
-            // Mapped memory for GPU FP32 tensors in snapshot/debugging mode
-            if (config_.use_mapped_memory && b.home_device.is_gpu() &&
-                b.dtype && std::string(b.dtype) == "FP32")
-            {
-                auto mapped = FP32Tensor::createMapped(shape, b.home_device);
-                if (mapped && mapped->isMapped())
-                {
-                    LOG_DEBUG("[BufferArena] Created mapped FP32 tensor for '"
-                              << bufferIdName(id) << "' on " << b.home_device.toString());
-                    return mapped;
-                }
-                LOG_WARN("[BufferArena] Mapped allocation failed for '"
-                         << bufferIdName(id) << "', using regular allocation");
-            }
-
             // Dispatch by dtype string
-            if (!b.dtype || std::string(b.dtype) == "FP32")
+            if (is_fp32)
             {
                 return config_.factory->createFP32(shape, b.home_device);
             }
-            else if (std::string(b.dtype) == "FP16")
+            else if (dtype == "FP16")
             {
                 return config_.factory->createFP16(shape);
             }
-            else if (std::string(b.dtype) == "BF16")
+            else if (dtype == "BF16")
             {
                 return config_.factory->createBF16(shape);
             }
-            else if (std::string(b.dtype) == "Q8_1")
+            else if (dtype == "Q8_1")
             {
                 return config_.factory->createQ8_1(shape, b.home_device);
             }
-            else if (std::string(b.dtype) == "Q16_1")
+            else if (dtype == "Q16_1")
             {
                 return config_.factory->createQ16_1(shape, b.home_device);
             }
-            else if (std::string(b.dtype) == "INT32")
+            else if (dtype == "INT32")
             {
                 return config_.factory->createINT32(shape);
             }
             else
             {
-                LOG_DEBUG("[BufferArena] Unknown dtype '" << b.dtype
+                LOG_DEBUG("[BufferArena] Unknown dtype '" << dtype
                                                           << "' for " << bufferIdName(id)
                                                           << ", defaulting to FP32");
                 return config_.factory->createFP32(shape, b.home_device);
@@ -464,6 +530,15 @@ namespace llaminar2
                           << bufferIdName(bid) << "'");
                 return false;
             }
+            if (b.home_device.is_gpu() && tensor->isMapped())
+            {
+                throw std::logic_error(
+                    "BufferArena: owned GPU graph buffer '" +
+                    std::string(bufferIdName(bid)) +
+                    "' resolved to mapped host storage; graph activations must "
+                    "remain device-local and mapped transport pages must be "
+                    "declared through TransferEngine");
+            }
 
             size_t bytes = tensor->size_bytes();
             stats_.total_buffers++;
@@ -471,6 +546,8 @@ namespace llaminar2
 
             b.owned_tensor = tensor;
             b.coherence.authority = CoherenceState::UNINITIALIZED;
+            if (b.owned_tensor->debugName().empty())
+                b.owned_tensor->setDebugName(bufferIdName(bid));
         }
 
         allocated_ = true;
@@ -493,10 +570,14 @@ namespace llaminar2
             size_t cols;
             const char *dtype;
             size_t bytes;
+            std::string device;
+            const char *ownership;
         };
         std::vector<BufInfo> infos;
         infos.reserve(stats_.total_buffers);
 
+        size_t owned_bytes = 0;
+        size_t external_bytes = 0;
         for (size_t i = 0; i < kBufferCount; ++i)
         {
             const auto &b = buffers_[i];
@@ -505,16 +586,57 @@ namespace llaminar2
             auto bid = static_cast<BufferId>(i);
             size_t bytes = 0;
             if (b.owned_tensor)
+            {
                 bytes = b.owned_tensor->size_bytes();
+                owned_bytes += bytes;
+            }
             else if (b.external_tensor)
+            {
                 bytes = b.external_tensor->size_bytes();
+                external_bytes += bytes;
+            }
+
+            std::string device = b.home_device.is_valid() ? b.home_device.toString() : "CPU";
+            if (auto *tensor = b.tensorBase())
+            {
+                if (auto current = tensor->current_device())
+                    device = current->toString();
+            }
+
             infos.push_back({bufferIdName(bid), b.rows, b.cols,
-                             b.dtype ? b.dtype : "ext", bytes});
+                             b.dtype ? b.dtype : "ext", bytes, device,
+                             b.owned_tensor ? "arena" : "external"});
         }
 
         std::sort(infos.begin(), infos.end(),
                   [](const BufInfo &a, const BufInfo &b)
                   { return a.bytes > b.bytes; });
+
+        if (vramBomEnabled())
+        {
+            logVramBomLine(
+                "arena_summary",
+                "buffers=" + std::to_string(infos.size()) +
+                    " owned_bytes=" + std::to_string(owned_bytes) +
+                    " owned_mib=" + vramBomMiB(owned_bytes) +
+                    " external_bytes=" + std::to_string(external_bytes) +
+                    " external_mib=" + vramBomMiB(external_bytes) +
+                    " total_bytes=" + std::to_string(owned_bytes + external_bytes) +
+                    " total_mib=" + vramBomMiB(owned_bytes + external_bytes));
+
+            for (const auto &info : infos)
+            {
+                logVramBomLine(
+                    "arena_buffer",
+                    "device=" + info.device +
+                        " name=" + info.name +
+                        " ownership=" + info.ownership +
+                        " rows=" + std::to_string(info.rows) +
+                        " cols=" + std::to_string(info.cols) +
+                        " dtype=" + info.dtype +
+                        " " + vramBomBytes(info.bytes));
+            }
+        }
 
         // Find max name length for alignment
         size_t max_name = 6; // "Buffer" header
@@ -548,11 +670,162 @@ namespace llaminar2
         }
 
         LOG_TRACE("[BufferArena] " << summary.str());
+        LOG_DEBUG("[BufferArena] " << allocationAddressMap());
+    }
+
+    std::string BufferArena::allocationAddressMap() const
+    {
+        if (!allocated_)
+            return {};
+
+        struct AddressInfo
+        {
+            const char *name = nullptr;
+            size_t rows = 0;
+            size_t cols = 0;
+            const char *dtype = nullptr;
+            size_t bytes = 0;
+            std::string device;
+            const char *address_space = nullptr;
+            const char *ownership = nullptr;
+            int alias_group = -1;
+            uintptr_t begin = 0;
+            uintptr_t end = 0;
+            bool bound = false;
+        };
+
+        std::vector<AddressInfo> infos;
+        infos.reserve(registeredCount());
+        for (size_t i = 0; i < kBufferCount; ++i)
+        {
+            const auto &b = buffers_[i];
+            if (!b.registered)
+                continue;
+
+            ITensor *tensor = b.tensor();
+            const void *address = tensor ? tensor->gpu_data_ptr() : nullptr;
+            const bool device_address = address != nullptr;
+            if (!address && tensor)
+                address = tensor->raw_data();
+
+            std::string device = "CPU";
+            if (auto *base = b.tensorBase())
+            {
+                if (const auto current = base->current_device();
+                    current.has_value())
+                {
+                    device = current->toString();
+                }
+                else if (device_address && b.home_device.is_valid())
+                {
+                    device = b.home_device.toString();
+                }
+            }
+            else if (device_address && b.home_device.is_valid())
+            {
+                device = b.home_device.toString();
+            }
+
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+            const size_t bytes = tensor ? tensor->size_bytes() : 0;
+            const uintptr_t end =
+                address && bytes <= std::numeric_limits<uintptr_t>::max() - begin
+                    ? begin + bytes
+                    : begin;
+            infos.push_back(AddressInfo{
+                .name = bufferIdName(static_cast<BufferId>(i)),
+                .rows = b.rows,
+                .cols = b.cols,
+                .dtype = b.dtype ? b.dtype : "ext",
+                .bytes = bytes,
+                .device = std::move(device),
+                .address_space = device_address ? "device" : "host",
+                .ownership = b.owned_tensor ? "arena" : "external",
+                .alias_group = b.alias_group,
+                .begin = begin,
+                .end = end,
+                .bound = address != nullptr});
+        }
+
+        std::sort(
+            infos.begin(),
+            infos.end(),
+            [](const AddressInfo &lhs, const AddressInfo &rhs)
+            {
+                if (lhs.device != rhs.device)
+                    return lhs.device < rhs.device;
+                if (lhs.bound != rhs.bound)
+                    return lhs.bound > rhs.bound;
+                if (lhs.begin != rhs.begin)
+                    return lhs.begin < rhs.begin;
+                if (lhs.end != rhs.end)
+                    return lhs.end < rhs.end;
+                return std::strcmp(lhs.name, rhs.name) < 0;
+            });
+
+        std::ostringstream output;
+        output << "Allocation address map (half-open ranges; sorted per device):\n";
+        std::string previous_device;
+        uintptr_t previous_end = 0;
+        bool have_previous = false;
+        for (const auto &info : infos)
+        {
+            if (info.device != previous_device)
+            {
+                previous_device = info.device;
+                previous_end = 0;
+                have_previous = false;
+                output << "  device=" << info.device << '\n';
+            }
+
+            output << "    name=" << info.name
+                   << " ownership=" << info.ownership
+                   << " space=" << info.address_space
+                   << " shape=" << info.rows << 'x' << info.cols
+                   << " dtype=" << info.dtype
+                   << " bytes=" << info.bytes
+                   << " alias_group=" << info.alias_group;
+            if (!info.bound)
+            {
+                output << " range=[unbound] relation=unbound\n";
+                continue;
+            }
+
+            output << " range=[0x" << std::hex << info.begin
+                   << ",0x" << info.end << ')' << std::dec;
+            if (!have_previous)
+            {
+                output << " relation=first";
+            }
+            else if (info.begin < previous_end)
+            {
+                output << " relation=overlap overlap_bytes="
+                       << (previous_end - info.begin);
+            }
+            else
+            {
+                const uintptr_t gap = info.begin - previous_end;
+                output << (gap == 0 ? " relation=adjacent"
+                                    : " relation=gap")
+                       << " gap_bytes=" << gap;
+            }
+            output << '\n';
+            previous_end = std::max(previous_end, info.end);
+            have_previous = true;
+        }
+        return output.str();
     }
 
     // =========================================================================
     // Runtime coherence
     // =========================================================================
+
+    bool BufferArena::allocateDeviceStorage(BufferId id, DeviceId target)
+    {
+        auto &b = buf(id);
+        TransferEngine::allocateDeviceStorage(b.tensorBase(), target);
+        return true;
+    }
 
     bool BufferArena::prepareForRead(BufferId id, DeviceId target, void *stream)
     {

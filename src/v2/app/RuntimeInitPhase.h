@@ -12,6 +12,7 @@
 
 namespace llaminar2
 {
+    struct NUMAInfo;
 
     /**
      * @brief Post-MPI runtime initialization
@@ -27,6 +28,51 @@ namespace llaminar2
     class RuntimeInitPhase
     {
     public:
+        /**
+         * @brief Resolve the immutable CPU backend NUMA identity for one rank.
+         *
+         * Explicit CPU device-map placement takes precedence and must agree
+         * with the process affinity detected after MPI launch. Multi-rank
+         * processes without an explicit CPU map inherit their detected local
+         * node so host staging remains rank-local. A genuinely aggregate
+         * single-process runtime returns `-1`.
+         *
+         * This pure policy function is public so unit tests can exhaust the
+         * placement matrix without starting MPI or mutating the process-global
+         * backend singleton.
+         *
+         * @param config Parsed orchestration configuration for this process.
+         * @param mpi_rank World rank being initialized.
+         * @param mpi_world_size Number of ranks in the world communicator.
+         * @param numa_info Affinity-derived NUMA observation for this process.
+         * @return Exact non-negative node for rank-local ownership, or `-1`
+         *         only for a legitimate aggregate single-process runtime.
+         * @throws std::runtime_error when explicit placement and affinity
+         *         disagree or two explicit declarations conflict.
+         */
+        static int resolveCPUBackendNUMANode(
+            const OrchestrationConfig &config,
+            int mpi_rank,
+            int mpi_world_size,
+            const NUMAInfo &numa_info);
+
+        /**
+         * @brief Decide whether this rank must enumerate accelerators host-wide.
+         *
+         * CPU affinity remains an execution preference, not a device
+         * visibility boundary. Any explicit accelerator intent—including a
+         * rank-agnostic ExpertOverlay domain—requires the complete host view so
+         * inventory binding can choose the actual owning rank after cards move
+         * between sockets.
+         *
+         * @param config Parsed orchestration intent.
+         * @param mpi_rank World rank being initialized.
+         * @return True when DeviceManager must disable NUMA filtering.
+         */
+        static bool requiresHostWideAcceleratorVisibility(
+            const OrchestrationConfig &config,
+            int mpi_rank);
+
         /**
          * @brief Run dry-run preflight on an already-created runner.
          *

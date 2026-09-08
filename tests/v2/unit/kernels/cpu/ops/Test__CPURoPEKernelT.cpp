@@ -16,12 +16,22 @@
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/Tensors.h" // For Q16_1Tensor
+#include "v2/utils/DebugEnv.h"
+#include "v2/utils/PerfStatsCollector.h"
+#include "../../../../utils/VerifierRowTestInventory.h"
 
+#include <array>
 #include <vector>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <memory>
 #include <numeric>
 #include <algorithm>
 #include <random>
+#include <stdexcept>
+#include <string>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -183,6 +193,266 @@ namespace llaminar2
                 norm_b += b[i] * b[i];
             }
             return dot / (std::sqrt(norm_a) * std::sqrt(norm_b) + 1e-8f);
+        }
+
+        /** @brief Enable grouped-route telemetry without depending on test order. */
+        class ScopedPerfStats
+        {
+        public:
+            ScopedPerfStats()
+            {
+                const char *old_value = std::getenv("LLAMINAR_PERF_STATS_SUMMARY");
+                if (old_value)
+                {
+                    had_old_value_ = true;
+                    old_value_ = old_value;
+                }
+                setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+                mutableDebugEnv().reload();
+                PerfStatsCollector::reset();
+            }
+
+            ~ScopedPerfStats()
+            {
+                if (had_old_value_)
+                    setenv("LLAMINAR_PERF_STATS_SUMMARY", old_value_.c_str(), 1);
+                else
+                    unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+                mutableDebugEnv().reload();
+                PerfStatsCollector::reset();
+            }
+
+        private:
+            bool had_old_value_ = false;
+            std::string old_value_;
+        };
+
+        /** @brief Report the first bitwise mismatch in a grouped RoPE tensor. */
+        void expect_byte_exact_fp32(const float *actual,
+                                    const float *expected,
+                                    size_t count,
+                                    const std::string &context)
+        {
+            if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+                return;
+            for (size_t index = 0; index < count; ++index)
+            {
+                uint32_t actual_bits = 0;
+                uint32_t expected_bits = 0;
+                std::memcpy(&actual_bits, actual + index, sizeof(actual_bits));
+                std::memcpy(&expected_bits, expected + index, sizeof(expected_bits));
+                if (actual_bits != expected_bits)
+                {
+                    ADD_FAILURE() << context << " first byte mismatch at element " << index
+                                  << " actual=" << actual[index]
+                                  << " expected=" << expected[index]
+                                  << " actual_bits=" << actual_bits
+                                  << " expected_bits=" << expected_bits;
+                    return;
+                }
+            }
+        }
+
+        /** @brief Report the first native-byte mismatch for a typed RoPE path. */
+        void expect_byte_exact_native(const void *actual,
+                                      const void *expected,
+                                      size_t byte_count,
+                                      const std::string &context)
+        {
+            const auto *actual_bytes = static_cast<const uint8_t *>(actual);
+            const auto *expected_bytes = static_cast<const uint8_t *>(expected);
+            if (std::memcmp(actual_bytes, expected_bytes, byte_count) == 0)
+                return;
+            for (size_t index = 0; index < byte_count; ++index)
+            {
+                if (actual_bytes[index] != expected_bytes[index])
+                {
+                    ADD_FAILURE() << context << " first native mismatch at byte " << index
+                                  << " actual=" << static_cast<unsigned>(actual_bytes[index])
+                                  << " expected=" << static_cast<unsigned>(expected_bytes[index]);
+                    return;
+                }
+            }
+        }
+
+        /** @brief Assert the grouped decode-equivalent RoPE primitive ran. */
+        void expect_grouped_rope_counter(
+            const char *tensor_format,
+            int verifier_rows,
+            int rotary_dim)
+        {
+            bool found = false;
+            for (const auto &record : PerfStatsCollector::snapshot(
+                     {"kernel.cpu_rope_grouped_verifier_rows_calls"}))
+            {
+                const auto format = record.tags.find("tensor_format");
+                const auto rows = record.tags.find("verifier_rows");
+                const auto rotary = record.tags.find("rotary_dim");
+                const auto policy = record.tags.find("math_policy");
+                const auto execution = record.tags.find("execution_policy");
+                found = found ||
+                        (format != record.tags.end() && format->second == tensor_format &&
+                         rows != record.tags.end() && rows->second == std::to_string(verifier_rows) &&
+                         rotary != record.tags.end() && rotary->second == std::to_string(rotary_dim) &&
+                         policy != record.tags.end() && policy->second == "serial_decode_equivalent" &&
+                         execution != record.tags.end() &&
+                         execution->second == "single_grouped_row_head_workshare" &&
+                         record.count == 1);
+            }
+            EXPECT_TRUE(found)
+                << "Grouped verifier RoPE did not publish its production route counter\n"
+                << PerfStatsCollector::summaryString(
+                       {"kernel.cpu_rope_grouped_verifier_rows_calls"}, 20);
+        }
+
+        /**
+         * @brief Construct one native tensor from deterministic FP32 values.
+         *
+         * Quantized formats use their production tensor conversion methods so
+         * scales and block metadata are valid. The grouped/serial witnesses are
+         * subsequently cloned with native memcpy, eliminating any chance that
+         * two separate quantization calls happen to mask a publication error.
+         */
+        template <ActivationPrecision Precision>
+        std::unique_ptr<TensorBase> make_native_rope_tensor(
+            const std::vector<size_t> &shape,
+            const float *source,
+            Q16BlockSize q16_block_size = Q16BlockSize::BLOCK_32)
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+            {
+                auto tensor = std::make_unique<FP32Tensor>(shape);
+                std::copy_n(source, tensor->numel(), tensor->mutable_data());
+                return tensor;
+            }
+            else if constexpr (Precision == ActivationPrecision::BF16)
+            {
+                auto tensor = std::make_unique<BF16Tensor>(shape);
+                simd::convert_fp32_to_bf16(
+                    source, tensor->mutable_typed_data(), tensor->numel());
+                return tensor;
+            }
+            else if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                auto tensor = std::make_unique<FP16Tensor>(shape);
+                simd::convert_fp32_to_fp16(
+                    source, tensor->mutable_typed_data(), tensor->numel());
+                return tensor;
+            }
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+            {
+                auto tensor = std::make_unique<Q8_1Tensor>(shape);
+                if (!tensor->copyFrom_fp32(source))
+                    throw std::runtime_error("Failed to initialize Q8_1 RoPE tensor");
+                return tensor;
+            }
+            else
+            {
+                static_assert(Precision == ActivationPrecision::Q16_1);
+                auto tensor = std::make_unique<Q16_1Tensor>(shape, q16_block_size);
+                if (!tensor->copyFrom_fp32(source))
+                    throw std::runtime_error("Failed to initialize Q16_1 RoPE tensor");
+                return tensor;
+            }
+        }
+
+        /**
+         * @brief Prove one native CPU RoPE format across the runtime-M inventory.
+         *
+         * The serial witness slices native storage into one-row tensors and
+         * calls the public production M=1 API. The grouped witness calls the
+         * verifier API once over all rows. Native bytes, not dequantized floats,
+         * are the acceptance criterion for Q, K, scales, sums, and code values.
+         */
+        template <ActivationPrecision Precision>
+        void run_native_grouped_rope_format(
+            const char *format_label,
+            Q16BlockSize q16_block_size = Q16BlockSize::BLOCK_32)
+        {
+            constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
+            constexpr int n_heads = 4;
+            constexpr int n_kv_heads = 2;
+            constexpr int head_dim = 128;
+            constexpr float rope_theta = 10000.0f;
+            const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+            const size_t k_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+            auto q_values = generate_random_fp32(max_rows * q_cols, -1.5f, 1.5f);
+            auto k_values = generate_random_fp32(max_rows * k_cols, -1.25f, 1.25f);
+
+            std::array<int, max_rows> positions{};
+            std::iota(positions.begin(), positions.end(), 101);
+            for (int rows : test::kGroupedVerifierRuntimeRows)
+            {
+                SCOPED_TRACE(std::string(format_label) + " rows=" + std::to_string(rows) +
+                             " q16_block=" +
+                             std::to_string(static_cast<int>(q16_block_size)));
+                const std::vector<size_t> q_shape = {
+                    static_cast<size_t>(rows), q_cols};
+                const std::vector<size_t> k_shape = {
+                    static_cast<size_t>(rows), k_cols};
+                auto q_serial = make_native_rope_tensor<Precision>(
+                    q_shape, q_values.data(), q16_block_size);
+                auto k_serial = make_native_rope_tensor<Precision>(
+                    k_shape, k_values.data(), q16_block_size);
+                auto q_grouped = make_native_rope_tensor<Precision>(
+                    q_shape, q_values.data(), q16_block_size);
+                auto k_grouped = make_native_rope_tensor<Precision>(
+                    k_shape, k_values.data(), q16_block_size);
+                ASSERT_EQ(q_serial->size_bytes(), q_grouped->size_bytes());
+                ASSERT_EQ(k_serial->size_bytes(), k_grouped->size_bytes());
+                std::memcpy(
+                    q_grouped->raw_mutable_data(), q_serial->raw_data(),
+                    q_serial->size_bytes());
+                std::memcpy(
+                    k_grouped->raw_mutable_data(), k_serial->raw_data(),
+                    k_serial->size_bytes());
+
+                const size_t q_row_bytes = q_serial->size_bytes() / rows;
+                const size_t k_row_bytes = k_serial->size_bytes() / rows;
+                CPURoPEKernelT<Precision> kernel;
+                for (int row = 0; row < rows; ++row)
+                {
+                    auto q_row = make_native_rope_tensor<Precision>(
+                        {1, q_cols}, q_values.data(), q16_block_size);
+                    auto k_row = make_native_rope_tensor<Precision>(
+                        {1, k_cols}, k_values.data(), q16_block_size);
+                    std::memcpy(
+                        q_row->raw_mutable_data(),
+                        static_cast<const uint8_t *>(q_serial->raw_data()) +
+                            static_cast<size_t>(row) * q_row_bytes,
+                        q_row_bytes);
+                    std::memcpy(
+                        k_row->raw_mutable_data(),
+                        static_cast<const uint8_t *>(k_serial->raw_data()) +
+                            static_cast<size_t>(row) * k_row_bytes,
+                        k_row_bytes);
+                    ASSERT_TRUE(kernel.apply_tensor(
+                        q_row.get(), k_row.get(), &positions[static_cast<size_t>(row)],
+                        1, n_heads, n_kv_heads, head_dim, rope_theta,
+                        nullptr, -1, positions[static_cast<size_t>(row)], 0));
+                    std::memcpy(
+                        static_cast<uint8_t *>(q_serial->raw_mutable_data()) +
+                            static_cast<size_t>(row) * q_row_bytes,
+                        q_row->raw_data(), q_row_bytes);
+                    std::memcpy(
+                        static_cast<uint8_t *>(k_serial->raw_mutable_data()) +
+                            static_cast<size_t>(row) * k_row_bytes,
+                        k_row->raw_data(), k_row_bytes);
+                }
+
+                PerfStatsCollector::reset();
+                ASSERT_TRUE(kernel.apply_verifier_rows_decode_equivalent(
+                    q_grouped.get(), k_grouped.get(), positions.data(),
+                    rows, n_heads, n_kv_heads, head_dim, rope_theta,
+                    nullptr, -1, positions.front(), 0));
+                expect_grouped_rope_counter(format_label, rows, head_dim);
+                expect_byte_exact_native(
+                    q_grouped->raw_data(), q_serial->raw_data(), q_serial->size_bytes(),
+                    std::string(format_label) + " grouped Q M=" + std::to_string(rows));
+                expect_byte_exact_native(
+                    k_grouped->raw_data(), k_serial->raw_data(), k_serial->size_bytes(),
+                    std::string(format_label) + " grouped K M=" + std::to_string(rows));
+            }
         }
 
     } // anonymous namespace
@@ -396,6 +666,7 @@ namespace llaminar2
 
     TEST_F(CPURoPEKernelTTest, FP32_grouped_verifier_rows_match_serial_decode_contract)
     {
+        ScopedPerfStats perfstats;
         constexpr int local_n_heads = 4;
         constexpr int local_n_kv_heads = 2;
         constexpr int local_head_dim = 32;
@@ -403,7 +674,7 @@ namespace llaminar2
         const int k_cols = local_n_kv_heads * local_head_dim;
         CPURoPEKernelT<ActivationPrecision::FP32> kernel;
 
-        for (int rows : {2, 3, 4})
+        for (int rows : test::kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE("rows=" + std::to_string(rows));
             const size_t q_size = static_cast<size_t>(rows) * q_cols;
@@ -474,13 +745,20 @@ namespace llaminar2
                 positions.front(),
                 0));
 
-            EXPECT_LT(max_abs_diff(q_grouped.data(), q_serial.data(), q_size), 1e-6f);
-            EXPECT_LT(max_abs_diff(k_grouped.data(), k_serial.data(), k_size), 1e-6f);
+            expect_grouped_rope_counter("FP32", rows, local_head_dim);
+            expect_byte_exact_fp32(
+                q_grouped.data(), q_serial.data(), q_size,
+                "full-RoPE grouped Q rows=" + std::to_string(rows));
+            expect_byte_exact_fp32(
+                k_grouped.data(), k_serial.data(), k_size,
+                "full-RoPE grouped K rows=" + std::to_string(rows));
+            PerfStatsCollector::reset();
         }
     }
 
     TEST_F(CPURoPEKernelTTest, FP32_grouped_verifier_partial_rope_matches_serial_decode_contract)
     {
+        ScopedPerfStats perfstats;
         constexpr int rows = 4;
         constexpr int local_n_heads = 3;
         constexpr int local_n_kv_heads = 2;
@@ -550,8 +828,36 @@ namespace llaminar2
             positions.front(),
             local_rotary_dim));
 
-        EXPECT_LT(max_abs_diff(q_grouped.data(), q_serial.data(), q_size), 1e-6f);
-        EXPECT_LT(max_abs_diff(k_grouped.data(), k_serial.data(), k_size), 1e-6f);
+        expect_grouped_rope_counter("FP32", rows, local_rotary_dim);
+        expect_byte_exact_fp32(
+            q_grouped.data(), q_serial.data(), q_size,
+            "partial-RoPE grouped Q rows=4");
+        expect_byte_exact_fp32(
+            k_grouped.data(), k_serial.data(), k_size,
+            "partial-RoPE grouped K rows=4");
+    }
+
+    /**
+     * @brief Sweep every native CPU RoPE storage contract across runtime M.
+     *
+     * Q16 block size is a physical code layout, not merely a performance hint,
+     * so all supported 32-, 64-, and 128-value layouts are independent cells.
+     * The existing FP32 partial-RoPE case remains separate because native
+     * BF16/FP16/Q8/Q16 partial rotation is not an advertised production path.
+     */
+    TEST_F(CPURoPEKernelTTest, GroupedVerifierRowsAllNativeFormatsMatchSerialDecodeByteExact)
+    {
+        ScopedPerfStats perfstats;
+        run_native_grouped_rope_format<ActivationPrecision::FP32>("FP32");
+        run_native_grouped_rope_format<ActivationPrecision::BF16>("BF16");
+        run_native_grouped_rope_format<ActivationPrecision::FP16>("FP16");
+        run_native_grouped_rope_format<ActivationPrecision::Q8_1>("Q8_1");
+        run_native_grouped_rope_format<ActivationPrecision::Q16_1>(
+            "Q16_1", Q16BlockSize::BLOCK_32);
+        run_native_grouped_rope_format<ActivationPrecision::Q16_1>(
+            "Q16_1", Q16BlockSize::BLOCK_64);
+        run_native_grouped_rope_format<ActivationPrecision::Q16_1>(
+            "Q16_1", Q16BlockSize::BLOCK_128);
     }
 
     // =========================================================================

@@ -6,10 +6,14 @@
  */
 
 #include "ROCmRMSNormKernelT.h"
+#include "../../../backends/DeviceId.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/ROCmKernelProfiler.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
+#include <string>
 
 // Extern "C" declarations for HIP kernels
 extern "C" bool hipOps_rmsnorm_fp32(
@@ -23,6 +27,45 @@ extern "C" bool hipOps_rmsnorm_bf16(
 extern "C" bool hipOps_rmsnorm_fp16(
     const uint16_t *input, const float *gamma, uint16_t *output,
     int rows, int cols, float epsilon, int device_idx, void *stream);
+
+namespace
+{
+    /**
+     * @brief Record one successful production ROCm RMSNorm verifier launch.
+     *
+     * The HIP kernels use one workgroup per logical row. Grouping any runtime
+     * M therefore keeps every row's M=1 reduction order intact while issuing a
+     * single kernel launch. This counter is omitted for serial M=1 witnesses so
+     * the integration gate can reject hidden row replay or multiple launches.
+     *
+     * @param tensor_format Native activation/output representation.
+     * @param verifier_rows Number of MTP verifier rows in this launch.
+     * @param cols Number of values reduced and normalized per row.
+     * @param device ROCm ordinal on which the grouped kernel was launched.
+     */
+    void recordROCmGroupedRMSNormCall(
+        const char *tensor_format,
+        int verifier_rows,
+        int cols,
+        int device)
+    {
+        if (verifier_rows < 2)
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "rocm_rmsnorm_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            llaminar2::DeviceId::rocm(device).to_string(),
+            {{"tensor_format", tensor_format},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"cols", std::to_string(cols)},
+             {"capture_mode", llaminar2::isGraphCaptureActive() ? "graph_capture" : "direct"},
+             {"row_mapping", "one_block_per_row"},
+             {"invocation_policy", "single_grouped_launch"}});
+    }
+} // namespace
 
 namespace llaminar2
 {
@@ -74,11 +117,15 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
                 LOG_ERROR("[ROCmRMSNormKernelT<FP32>] Null tensor pointer");
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmRMSNormKernelT<FP32>] apply_tensor requires an explicit non-null HIP stream");
                 return false;
             }
             if (input->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32)
@@ -104,8 +151,15 @@ namespace llaminar2
             const float *d_weight_ptr = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             float *d_output_ptr = static_cast<float *>(output_fp32->gpu_data_ptr());
 
-            bool ok = hipOps_rmsnorm_fp32(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx, gpu_stream_);
-            // No sync needed - coherence system handles sync when data is read
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::RMS_NORM,
+                static_cast<hipStream_t>(gpu_stream_));
+            const bool ok = hipOps_rmsnorm_fp32(
+                d_input_ptr, d_weight_ptr, d_output_ptr,
+                rows, cols, epsilon, device_idx, gpu_stream_);
+            if (ok)
+                recordROCmGroupedRMSNormCall("FP32", rows, cols, device_idx);
+            // No sync is required; executor stream ordering owns completion.
             return ok;
         }
 
@@ -166,11 +220,15 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
                 LOG_ERROR("[ROCmRMSNormKernelT<BF16>] Null tensor pointer");
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmRMSNormKernelT<BF16>] apply_tensor requires an explicit non-null HIP stream");
                 return false;
             }
             if (input->native_type() != TensorType::BF16 || output->native_type() != TensorType::BF16)
@@ -195,8 +253,15 @@ namespace llaminar2
             const float *d_weight_ptr = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output_ptr = static_cast<uint16_t *>(output_bf16->gpu_data_ptr());
 
-            bool ok = hipOps_rmsnorm_bf16(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx, gpu_stream_);
-            // No sync needed - coherence system handles sync when data is read
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::RMS_NORM,
+                static_cast<hipStream_t>(gpu_stream_));
+            const bool ok = hipOps_rmsnorm_bf16(
+                d_input_ptr, d_weight_ptr, d_output_ptr,
+                rows, cols, epsilon, device_idx, gpu_stream_);
+            if (ok)
+                recordROCmGroupedRMSNormCall("BF16", rows, cols, device_idx);
+            // No sync is required; executor stream ordering owns completion.
             return ok;
         }
 
@@ -257,11 +322,15 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             int device_idx)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
             if (!input || !weight || !output)
             {
                 LOG_ERROR("[ROCmRMSNormKernelT<FP16>] Null tensor pointer");
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmRMSNormKernelT<FP16>] apply_tensor requires an explicit non-null HIP stream");
                 return false;
             }
             if (input->native_type() != TensorType::FP16 || output->native_type() != TensorType::FP16)
@@ -286,8 +355,15 @@ namespace llaminar2
             const float *d_weight_ptr = static_cast<const float *>(weight_fp32->gpu_data_ptr());
             uint16_t *d_output_ptr = static_cast<uint16_t *>(output_fp16->gpu_data_ptr());
 
-            bool ok = hipOps_rmsnorm_fp16(d_input_ptr, d_weight_ptr, d_output_ptr, rows, cols, epsilon, device_idx, gpu_stream_);
-            // No sync needed - coherence system handles sync when data is read
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::RMS_NORM,
+                static_cast<hipStream_t>(gpu_stream_));
+            const bool ok = hipOps_rmsnorm_fp16(
+                d_input_ptr, d_weight_ptr, d_output_ptr,
+                rows, cols, epsilon, device_idx, gpu_stream_);
+            if (ok)
+                recordROCmGroupedRMSNormCall("FP16", rows, cols, device_idx);
+            // No sync is required; executor stream ordering owns completion.
             return ok;
         }
 

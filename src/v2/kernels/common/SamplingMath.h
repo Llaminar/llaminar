@@ -1,12 +1,20 @@
 /**
  * @file SamplingMath.h
- * @brief Shared CPU/CUDA/ROCm stochastic sampling math.
+ * @brief Shared CPU/CUDA/ROCm sampling and device-generation transitions.
+ *
+ * Request admission supplies immutable policy; the resident controller owns
+ * budgets, response publication and completion thereafter. These host/device
+ * helpers give both GPU compilers and device-free state-machine tests the same
+ * arithmetic and lifecycle, without a second host ledger or backend-specific
+ * interpretation of a sampled token.
  */
 #pragma once
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+
+#include "utils/PrefillGraphBucketDefaults.h"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define LLAMINAR_SAMPLING_HD __host__ __device__ inline
@@ -17,14 +25,400 @@
 namespace llaminar2::sampling_math
 {
     constexpr int kMaxTopK = 256;
-    constexpr int kSpeculativeBatchMaxRows = 4;
+
+    /**
+     * @brief Default number of draft-token comparisons in one MTP transaction.
+     *
+     * A target verifier evaluates one row per draft token plus a terminal bonus
+     * row.  The shared grouped-verifier capacity therefore leaves exactly one
+     * row for that bonus.  Kernels consume the runtime row count and do not
+     * specialize on this value; it sizes the default graph-owned mailboxes and
+     * value-owned launch parameters only.
+     */
+    constexpr int kSpeculativeBatchMaxRows =
+        kDefaultNativeVNNIVerifierRowCapacity - 1;
     constexpr int kSpeculativeBatchMaxOutputTokens =
         kSpeculativeBatchMaxRows + 1;
     constexpr int kSpeculativeBatchMaxStopTokens = 8;
-    constexpr int kSpeculativeBatchMetaCount = 10;
+    constexpr int kSpeculativeBatchMetaCount = 12;
     constexpr float kMaxUnitThreshold = 0.99999994f;
     constexpr uint64_t kInverseSampleDomain = 0xA0761D6478BD642FULL;
     constexpr uint64_t kMTPSpecDrawPurposesPerToken = 8;
+
+    /**
+     * @brief ABI version for the retained first-transaction MTP diagnostic.
+     *
+     * The record is copied byte-for-byte from device storage only after a
+     * mirrored participant mismatch has already made inference fatal. Keeping
+     * an explicit version in the payload prevents a stale host formatter from
+     * silently interpreting a changed device layout.
+     */
+    constexpr uint32_t kMTPFirstTransactionDiagnosticVersion = 2;
+
+    /** @brief ABI version for the last committed verifier transaction identity. */
+    constexpr uint32_t kMTPCommittedVerifierIdentityVersion = 1;
+
+    /**
+     * @brief Authority-owned identity of the last response-visible MTP transaction.
+     *
+     * The verifier input row is reusable graph scratch: observing it after a
+     * transaction does not prove that the row belongs to the transaction whose
+     * response and controller counters became visible.  The response/state
+     * commit operation copies the exact active `[target, drafts...]` prefix
+     * into this record in the same request-owned lane that advances those
+     * counters. GPU execution owns the record on device; CPU execution owns it
+     * on the host. It writes @ref valid last, so an ordered diagnostic read
+     * observes either no committed identity or one complete, versioned
+     * transaction.
+     *
+     * This record is evidence only.  It is never read by sampling, controller,
+     * KV, or response-publication code and therefore cannot become a host
+     * shadow of device execution state.
+     */
+    struct alignas(8) MTPCommittedVerifierIdentityRecord
+    {
+        uint32_t valid = 0; ///< Written last after every other field is complete.
+        uint32_t version = kMTPCommittedVerifierIdentityVersion;
+        int32_t transaction_count = 0;
+        int32_t draft_depth = 0;
+        int32_t verifier_input_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+    };
+    static_assert(
+        sizeof(MTPCommittedVerifierIdentityRecord) % sizeof(int32_t) == 0,
+        "The arena stores committed verifier identities as whole INT32 words");
+
+    /**
+     * @brief Materialize a committed verifier identity from explicit authority values.
+     *
+     * CPU publication has no device-generation controller row: its transaction
+     * count and selected depth are host-owned values committed by the typed
+     * speculative-state publisher. GPU publication obtains the same two values
+     * from its device controller and delegates here. Keeping the byte layout and
+     * validation in one host/device helper prevents the two ownership domains
+     * from producing subtly different diagnostic evidence.
+     *
+     * @param verifier_input_tokens Exact request-local `[target, drafts...]` row.
+     * @param verifier_input_token_stride Physical row capacity in INT32 words.
+     * @param transaction_count Monotonic committed transaction ordinal.
+     * @param draft_depth Number of speculative predictor tokens in the row.
+     * @param record Authority-owned persistent identity destination.
+     * @return true when a complete committed identity was published.
+     */
+    LLAMINAR_SAMPLING_HD bool materialize_committed_verifier_identity(
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        int transaction_count,
+        int draft_depth,
+        MTPCommittedVerifierIdentityRecord *record)
+    {
+        if (!record || !verifier_input_tokens ||
+            draft_depth <= 0 || draft_depth > kSpeculativeBatchMaxRows ||
+            verifier_input_token_stride < draft_depth + 1 ||
+            transaction_count <= 0)
+        {
+            return false;
+        }
+        for (int row = 0; row <= draft_depth; ++row)
+        {
+            if (verifier_input_tokens[row] < 0)
+                return false;
+        }
+
+        record->valid = 0;
+        record->version = kMTPCommittedVerifierIdentityVersion;
+        record->transaction_count = transaction_count;
+        record->draft_depth = draft_depth;
+        for (int row = 0; row < kSpeculativeBatchMaxOutputTokens; ++row)
+        {
+            record->verifier_input_tokens[row] =
+                row <= draft_depth ? verifier_input_tokens[row] : -1;
+        }
+        record->valid = 1;
+        return true;
+    }
+
+    /**
+     * @brief Ordered MTP-sidecar boundaries retained for transaction zero.
+     *
+     * The proposal graph reuses one activation workspace for every draft and
+     * every device-controlled transaction.  A terminal failure therefore sees
+     * only the last sidecar that happened to execute.  These stable boundary
+     * identifiers let the captured draft-publication stage preserve a compact
+     * digest immediately after each sidecar, before the shared workspace is
+     * overwritten by the next proposal.
+     */
+    enum class MTPFirstTransactionDraftBoundary : int32_t
+    {
+        TerminalHiddenInput = 0,
+        Embedding,
+        NormalizedTerminalHidden,
+        NormalizedEmbedding,
+        ConcatenatedInput,
+        ProjectedInput,
+        AttentionQuery,
+        AttentionKey,
+        AttentionValue,
+        AttentionOutput,
+        AttentionProjection,
+        MoEExpertIndices,
+        MoEExpertWeights,
+        MoERoutedOutput,
+        MoESharedOutput,
+        FFNOutput,
+        FinalHidden,
+        ScoredLogits,
+        Count,
+    };
+    constexpr int kMTPFirstTransactionDraftBoundaryCount =
+        static_cast<int>(MTPFirstTransactionDraftBoundary::Count);
+
+    /**
+     * @brief Device-resident evidence from the first stochastic MTP transaction.
+     *
+     * A device-controlled generation graph may execute several verifier
+     * transactions before its single terminal host observation. Ordinary
+     * scratch buffers therefore contain the final transaction, which is too
+     * late to diagnose a participant divergence that happened in transaction
+     * zero. The fused serial-equivalent outcome kernel optionally records this
+     * fixed-size payload before publication advances the device controller.
+     *
+     * The payload deliberately retains hashes rather than complete Top-K rows.
+     * Each hash covers the exact token-id and FP32 probability bits in canonical
+     * scan order. Together with the seed, logical position, thresholds, sampled
+     * tokens, verifier inputs, and compact result, this distinguishes four
+     * boundaries without perturbing the production graph topology:
+     *
+     *  - unequal target-distribution hashes identify grouped-forward drift;
+     *  - equal hashes with unequal thresholds identify RNG-position drift;
+     *  - equal hashes/thresholds with unequal samples identify kernel drift;
+     *  - equal samples with unequal compact results identify reducer drift.
+     *
+     * No pointer is stored in the record. It is a trivially copyable shared ABI
+     * consumed by CUDA, ROCm, and exceptional-path host diagnostics.
+     */
+    struct alignas(8) MTPFirstTransactionDiagnosticRecord
+    {
+        uint32_t valid = 0; ///< Written last by lane zero after the record is complete.
+        uint32_t version = kMTPFirstTransactionDiagnosticVersion;
+        uint64_t threshold_seed = 0;
+        int32_t threshold_base_position = -1;
+        int32_t threshold_position_offset = 0;
+        int32_t comparison_row_count = 0;
+        int32_t top_k = 0;
+        int32_t transaction_count = -1;
+        int32_t transaction_commit_budget = 0;
+        int32_t leading_committed_output_count = 0;
+        int32_t verifier_input_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t sampled_target_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t sampled_matches_verifier_input[kSpeculativeBatchMaxOutputTokens] = {};
+        uint32_t threshold_bits[kSpeculativeBatchMaxOutputTokens] = {};
+        uint64_t target_distribution_hashes[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t output_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+        int32_t output_meta[kSpeculativeBatchMetaCount] = {};
+
+        /*
+         * Proposal-side evidence is written by the captured draft publication
+         * fragments before the verifier runs.  Each digest covers the exact
+         * 32-bit words of one current sidecar row.  The word count is retained
+         * beside the hash so absent model-specific boundaries cannot compare
+         * equal to a real zero-filled tensor by accident.
+         */
+        int32_t draft_diagnostic_depth = 0;
+        int32_t draft_condition_tokens[kSpeculativeBatchMaxRows] = {};
+        int32_t draft_position_ids[kSpeculativeBatchMaxRows] = {};
+        uint32_t
+            draft_boundary_word_counts[kSpeculativeBatchMaxRows]
+                                      [kMTPFirstTransactionDraftBoundaryCount] = {};
+        uint64_t
+            draft_boundary_hashes[kSpeculativeBatchMaxRows]
+                                  [kMTPFirstTransactionDraftBoundaryCount] = {};
+    };
+    static_assert(
+        sizeof(MTPFirstTransactionDiagnosticRecord) % sizeof(int32_t) == 0,
+        "The arena stores the first-transaction diagnostic as whole INT32 words");
+
+    /**
+     * @brief Return the exact IEEE-754 bit pattern used by sampling math.
+     *
+     * CUDA and HIP both support this scalar union representation in device
+     * code. Recording bits rather than formatting floats on-device preserves
+     * byte equality and leaves presentation to the fatal host diagnostic.
+     */
+    LLAMINAR_SAMPLING_HD uint32_t sampling_float_bits(float value)
+    {
+        union FloatBits
+        {
+            float fp32;
+            uint32_t bits;
+        } converted{};
+        converted.fp32 = value;
+        return converted.bits;
+    }
+
+    /**
+     * @brief Append one 32-bit word to a byte-ordered FNV-1a diagnostic hash.
+     */
+    LLAMINAR_SAMPLING_HD uint64_t append_diagnostic_u32_fnv1a(
+        uint64_t hash,
+        uint32_t value)
+    {
+        constexpr uint64_t kFNVPrime = 1099511628211ULL;
+        for (unsigned int byte = 0; byte < sizeof(value); ++byte)
+        {
+            hash ^= static_cast<uint8_t>(value >> (byte * 8U));
+            hash *= kFNVPrime;
+        }
+        return hash;
+    }
+
+    /**
+     * @brief Hash one compact target row in its serial sampling scan order.
+     */
+    LLAMINAR_SAMPLING_HD uint64_t hash_compact_distribution_exact(
+        const int32_t *token_ids,
+        const float *probabilities,
+        int top_k)
+    {
+        uint64_t hash = 1469598103934665603ULL;
+        for (int column = 0; column < top_k; ++column)
+        {
+            hash = append_diagnostic_u32_fnv1a(
+                hash,
+                static_cast<uint32_t>(token_ids[column]));
+            hash = append_diagnostic_u32_fnv1a(
+                hash,
+                sampling_float_bits(probabilities[column]));
+        }
+        return hash;
+    }
+
+    /**
+     * @brief Populate one deterministic row of transaction-zero evidence.
+     *
+     * Every physical diagnostic row is initialized, including rows outside the
+     * active depth. This prevents stale bytes from an earlier request from
+     * creating a false mirrored mismatch when two participants previously ran
+     * different verifier depths.
+     */
+    LLAMINAR_SAMPLING_HD void record_mtp_first_transaction_sample_row(
+        MTPFirstTransactionDiagnosticRecord *record,
+        int row,
+        bool active,
+        const int32_t *target_token_ids,
+        const float *target_probabilities,
+        int top_k,
+        const int32_t *verifier_input_tokens,
+        int comparison_row_count,
+        float threshold,
+        int32_t sampled_token)
+    {
+        if (!record || row < 0 ||
+            row >= kSpeculativeBatchMaxOutputTokens)
+        {
+            return;
+        }
+
+        record->verifier_input_tokens[row] =
+            active && verifier_input_tokens
+                ? verifier_input_tokens[row]
+                : -1;
+        record->sampled_target_tokens[row] =
+            active ? sampled_token : -1;
+        record->sampled_matches_verifier_input[row] =
+            active && row < comparison_row_count && verifier_input_tokens
+                ? (sampled_token == verifier_input_tokens[row + 1] ? 1 : 0)
+                : -1;
+        record->threshold_bits[row] =
+            active ? sampling_float_bits(threshold) : 0u;
+        record->target_distribution_hashes[row] =
+            active && target_token_ids && target_probabilities
+                ? hash_compact_distribution_exact(
+                      target_token_ids,
+                      target_probabilities,
+                      top_k)
+                : 0ULL;
+    }
+
+    /**
+     * @brief Complete transaction-zero evidence after compact reduction.
+     *
+     * This function is called by lane zero only, after the workgroup barrier
+     * and after the ordinary serial-equivalent reducer has populated its output
+     * rows. `valid` is written last so an event-ordered observer can reject an
+     * incomplete or ABI-incompatible record without guessing.
+     */
+    LLAMINAR_SAMPLING_HD void finalize_mtp_first_transaction_diagnostic(
+        MTPFirstTransactionDiagnosticRecord *record,
+        uint64_t threshold_seed,
+        int threshold_base_position,
+        int threshold_position_offset,
+        int comparison_row_count,
+        int top_k,
+        int transaction_count,
+        int transaction_commit_budget,
+        int leading_committed_output_count,
+        const int32_t *output_tokens,
+        int output_token_capacity,
+        const int32_t *output_meta)
+    {
+        if (!record)
+            return;
+
+        record->valid = 0;
+        record->version = kMTPFirstTransactionDiagnosticVersion;
+        record->threshold_seed = threshold_seed;
+        record->threshold_base_position = threshold_base_position;
+        record->threshold_position_offset = threshold_position_offset;
+        record->comparison_row_count = comparison_row_count;
+        record->top_k = top_k;
+        record->transaction_count = transaction_count;
+        record->transaction_commit_budget = transaction_commit_budget;
+        record->leading_committed_output_count =
+            leading_committed_output_count;
+
+        for (int slot = 0;
+             slot < kSpeculativeBatchMaxOutputTokens;
+             ++slot)
+        {
+            record->output_tokens[slot] =
+                output_tokens && slot < output_token_capacity
+                    ? output_tokens[slot]
+                    : -1;
+        }
+        for (int field = 0; field < kSpeculativeBatchMetaCount; ++field)
+        {
+            record->output_meta[field] =
+                output_meta ? output_meta[field] : 0;
+        }
+        record->valid = 1;
+    }
+
+    /**
+     * @brief Value-owned explicit thresholds captured with one GPU launch.
+     *
+     * Production seeded MTP derives these values from device-owned logical
+     * positions, but explicit-threshold integration probes still need a stable
+     * graph-capturable launch ABI. Passing one bounded aggregate avoids a
+     * depth-specialized argument list and keeps every runtime row addressable.
+     */
+    struct SpeculativeBatchThresholdParameters
+    {
+        float accept[kSpeculativeBatchMaxRows] = {};
+        float residual[kSpeculativeBatchMaxRows] = {};
+    };
+
+    /**
+     * @brief Value-owned host-token inputs for the diagnostic batch verifier.
+     *
+     * The production GPU path reads sampled draft tokens from device buffers.
+     * This aggregate exists for explicit low-level probes and contains no
+     * pointers whose lifetime could outlive graph capture.
+     */
+    struct SpeculativeBatchHostParameters
+    {
+        int draft_tokens[kSpeculativeBatchMaxRows] = {};
+        SpeculativeBatchThresholdParameters thresholds{};
+    };
 
     enum SpeculativeBatchMetaIndex : int
     {
@@ -37,8 +431,1485 @@ namespace llaminar2::sampling_math
         kSpecBatchMetaStoppedOnOutput = 6,
         kSpecBatchMetaAllSpeculativeAccepted = 7,
         kSpecBatchMetaConsumedVerifierRows = 8,
-        kSpecBatchMetaSampledTerminal = 9
+        kSpecBatchMetaSampledTerminal = 9,
+        kSpecBatchMetaCommitBoundaryClipped = 10,
+        /**
+         * Number of leading compact output rows emitted by an earlier transaction.
+         *
+         * A rejected correction token is returned to the caller immediately, then
+         * carried as row zero of the next verifier transaction so the model can
+         * consume it as the next condition.  The row remains part of the compact
+         * output/state-publication shape, but it must not advance a serial decode
+         * cadence for a second time.
+         */
+        kSpecBatchMetaLeadingCommittedOutputCount = 11
     };
+
+    /**
+     * @brief Publish the canonical byte-stable invalid compact outcome.
+     *
+     * A fused verifier may discover a fatal device-controller violation before
+     * it can enter the ordinary serial-equivalent reducer.  The controller owns
+     * the precise error code, while this compact ABI communicates only whether
+     * an outcome is consumable.  Clearing every metadata word and poisoning
+     * every token slot therefore gives all CUDA, ROCm, and CPU callers the same
+     * deterministic invalid value instead of exposing bytes left by a previous
+     * activation that happened to share the arena allocation.
+     *
+     * The helper tolerates either destination being null so validation paths can
+     * initialize every destination that is structurally available before they
+     * return.  A non-positive token capacity simply means there are no token
+     * slots whose bytes can be made authoritative.
+     *
+     * @param out_tokens Compact token destination, or nullptr when unavailable.
+     * @param out_token_capacity Number of writable token slots.
+     * @param out_meta Fixed-width compact metadata destination, or nullptr.
+     */
+    LLAMINAR_SAMPLING_HD void initialize_invalid_speculative_batch_outcome(
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta)
+    {
+        if (out_tokens && out_token_capacity > 0)
+        {
+            for (int i = 0; i < out_token_capacity; ++i)
+                out_tokens[i] = -1;
+        }
+        if (out_meta)
+        {
+            for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
+                out_meta[i] = 0;
+        }
+    }
+
+    /**
+     * @brief Explicit generation algorithm admitted before captured execution.
+     *
+     * Ordinary is a distinct algorithm, not fixed-depth MTP with zero drafts.
+     * Its tag fits the existing controller policy word; no new arena storage
+     * or per-request allocation is required.
+     */
+    enum class DeviceGenerationPolicyMode : int
+    {
+        Fixed = 0,
+        Observe = 1,
+        Dynamic = 2,
+        Ordinary = 3,
+        /** Consume exactly one admitted token without invoking a sampler. */
+        ForwardOnly = 4,
+    };
+
+    /**
+     * @brief Fixed-width request policy consumed by the resident generation controller.
+     *
+     * Floating-point policy thresholds are converted to parts-per-million by
+     * request admission. Device transitions can consequently compare integer
+     * counters with a fixed arithmetic order on CUDA and ROCm, and CPU tests can
+     * prove the same decisions without backend-specific floating-point drift.
+     */
+    struct DeviceGenerationPolicy
+    {
+        static constexpr int kRateScale = 1'000'000;
+        static constexpr int kMaximumSupportedDraftDepth = 15;
+
+        DeviceGenerationPolicyMode mode =
+            DeviceGenerationPolicyMode::Fixed;
+        int initial_depth = 1;
+        int minimum_depth = 1;
+        int maximum_depth = 1;
+        int window_size = 16;
+        int minimum_samples = 4;
+        int cooldown_steps = 8;
+        int promote_consecutive_windows = 3;
+        int promote_full_accept_rate_ppm = kRateScale;
+        int demote_zero_accept_rate_ppm = 300'000;
+        int demote_acceptance_rate_ppm = 550'000;
+
+        /**
+         * @brief Construct a hard-pinned policy for tests and fixed-depth lanes.
+         */
+        LLAMINAR_SAMPLING_HD static DeviceGenerationPolicy fixed(
+            int depth)
+        {
+            DeviceGenerationPolicy policy;
+            policy.mode = DeviceGenerationPolicyMode::Fixed;
+            policy.initial_depth = depth;
+            policy.minimum_depth = depth;
+            policy.maximum_depth = depth;
+            return policy;
+        }
+
+        /**
+         * @brief Admit ordinary sampling without any draft or verifier capacity.
+         * @return Canonical ordinary policy; fixed(0) remains invalid.
+         *
+         * All speculative-only fields are zero so cache identity cannot vary
+         * with irrelevant MTP defaults. The distinct mode is what permits this
+         * policy, never the mere presence of a zero draft count.
+         */
+        LLAMINAR_SAMPLING_HD static DeviceGenerationPolicy ordinary()
+        {
+            DeviceGenerationPolicy policy;
+            policy.mode = DeviceGenerationPolicyMode::Ordinary;
+            policy.initial_depth = 0;
+            policy.minimum_depth = 0;
+            policy.maximum_depth = 0;
+            policy.window_size = 0;
+            policy.minimum_samples = 0;
+            policy.cooldown_steps = 0;
+            policy.promote_consecutive_windows = 0;
+            policy.promote_full_accept_rate_ppm = 0;
+            policy.demote_zero_accept_rate_ppm = 0;
+            policy.demote_acceptance_rate_ppm = 0;
+            return policy;
+        }
+
+        /** @return Whether this policy selects the non-speculative algorithm. */
+        LLAMINAR_SAMPLING_HD bool isOrdinary() const
+        {
+            return mode == DeviceGenerationPolicyMode::Ordinary;
+        }
+
+        /**
+         * @brief Reuse the ordinary model program for a forward-only call.
+         * @return Explicit no-response operation, not zero-budget generation.
+         *
+         * Prefix restore and forced-token admission need the same model body
+         * without advancing the sampler. The operation occupies the existing
+         * policy word and requires no parallel controller or extra executable.
+         */
+        LLAMINAR_SAMPLING_HD static DeviceGenerationPolicy forwardOnly()
+        {
+            auto policy = ordinary();
+            policy.mode = DeviceGenerationPolicyMode::ForwardOnly;
+            return policy;
+        }
+
+        /** @return Whether the admitted operation has no sampling/response work. */
+        LLAMINAR_SAMPLING_HD bool isForwardOnly() const
+        {
+            return mode == DeviceGenerationPolicyMode::ForwardOnly;
+        }
+
+        /**
+         * @brief Validate all fields without consulting host configuration.
+         */
+        LLAMINAR_SAMPLING_HD bool valid() const
+        {
+            if (isOrdinary() || isForwardOnly())
+            {
+                return initial_depth == 0 && minimum_depth == 0 &&
+                       maximum_depth == 0 && window_size == 0 &&
+                       minimum_samples == 0 && cooldown_steps == 0 &&
+                       promote_consecutive_windows == 0 &&
+                       promote_full_accept_rate_ppm == 0 &&
+                       demote_zero_accept_rate_ppm == 0 &&
+                       demote_acceptance_rate_ppm == 0;
+            }
+            const bool mode_valid =
+                mode == DeviceGenerationPolicyMode::Fixed ||
+                mode == DeviceGenerationPolicyMode::Observe ||
+                mode == DeviceGenerationPolicyMode::Dynamic;
+            const bool rates_valid =
+                promote_full_accept_rate_ppm >= 0 &&
+                promote_full_accept_rate_ppm <= kRateScale &&
+                demote_zero_accept_rate_ppm >= 0 &&
+                demote_zero_accept_rate_ppm <= kRateScale &&
+                demote_acceptance_rate_ppm >= 0 &&
+                demote_acceptance_rate_ppm <= kRateScale;
+            return mode_valid && minimum_depth > 0 &&
+                   maximum_depth >= minimum_depth &&
+                   maximum_depth <= kMaximumSupportedDraftDepth &&
+                   initial_depth >= minimum_depth &&
+                   initial_depth <= maximum_depth && window_size > 0 &&
+                   minimum_samples > 0 && cooldown_steps >= 0 &&
+                   promote_consecutive_windows > 0 && rates_valid &&
+                   (mode != DeviceGenerationPolicyMode::Fixed ||
+                    (minimum_depth == maximum_depth &&
+                     initial_depth == minimum_depth));
+        }
+    };
+
+    /**
+     * @brief Stable control-word layout for a device-owned generation request.
+     *
+     * A speculative verifier transaction produces a compact token row and a
+     * metadata row.  Production GPU generation must be able to consume many of
+     * those transactions without asking the host how many response tokens have
+     * already been emitted, whether a rejected correction row is being carried
+     * into the next verifier, or whether the request has reached its terminal
+     * budget.  These words are the single device-resident authority for those
+     * facts.
+     *
+     * The layout intentionally contains only fixed-width INT32 values.  CUDA and
+     * ROCm kernels can therefore share the exact transition helper below, while
+     * CPU unit tests can exhaustively prove the same state machine without a GPU.
+     * The response-token payload lives in a separate persistent arena row.
+     */
+    enum DeviceGenerationControlIndex : int
+    {
+        kDeviceGenerationControlOk = 0,
+        kDeviceGenerationControlResponseTokenCount = 1,
+        kDeviceGenerationControlRemainingTokenCount = 2,
+        kDeviceGenerationControlModelStopped = 3,
+        kDeviceGenerationControlRequestComplete = 4,
+        kDeviceGenerationControlTransactionCount = 5,
+        kDeviceGenerationControlNextLeadingCommittedOutputCount = 6,
+        kDeviceGenerationControlTransactionCommitBudget = 7,
+        kDeviceGenerationControlAcceptedSpeculativeTokenCount = 8,
+        kDeviceGenerationControlRejectedTransactionCount = 9,
+        kDeviceGenerationControlConsumedVerifierRowCount = 10,
+        kDeviceGenerationControlErrorCode = 11,
+        /** Total main-graph state rows committed across every transaction. */
+        kDeviceGenerationControlPublishedStateCommitCount = 12,
+        /** Active SWITCH selector and number of speculative comparison rows. */
+        kDeviceGenerationControlCurrentDraftDepth = 13,
+        /** Logical verifier width, including the leading condition row. */
+        kDeviceGenerationControlActiveVerifierRowCount = 14,
+        kDeviceGenerationControlMinimumDraftDepth = 15,
+        kDeviceGenerationControlMaximumDraftDepth = 16,
+        kDeviceGenerationControlDepthPolicyMode = 17,
+        kDeviceGenerationControlDepthWindowSize = 18,
+        kDeviceGenerationControlDepthMinimumSamples = 19,
+        kDeviceGenerationControlDepthCooldownSteps = 20,
+        kDeviceGenerationControlDepthPromoteConsecutiveWindows = 21,
+        kDeviceGenerationControlDepthPromoteFullAcceptRatePPM = 22,
+        kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM = 23,
+        kDeviceGenerationControlDepthDemoteAcceptanceRatePPM = 24,
+        kDeviceGenerationControlDepthStepsSinceChange = 25,
+        kDeviceGenerationControlDepthPromotionStreak = 26,
+        kDeviceGenerationControlDepthWindowVerifierRuns = 27,
+        kDeviceGenerationControlDepthWindowAttemptedTokens = 28,
+        kDeviceGenerationControlDepthWindowAcceptedTokens = 29,
+        kDeviceGenerationControlDepthWindowRejectedTokens = 30,
+        kDeviceGenerationControlDepthWindowRollbacks = 31,
+        kDeviceGenerationControlDepthWindowFullAccepts = 32,
+        kDeviceGenerationControlDepthWindowZeroAccepts = 33,
+        kDeviceGenerationControlDepthWindowAcceptedPrefixSum = 34,
+        kDeviceGenerationControlDepthEvaluatedWindows = 35,
+        kDeviceGenerationControlDepthUpdates = 36,
+        kDeviceGenerationControlDepthPromotions = 37,
+        kDeviceGenerationControlDepthDemotions = 38,
+        kDeviceGenerationControlDepthLastRecommendedDepth = 39,
+        /** Sum of device-selected speculative widths across transactions. */
+        kDeviceGenerationControlAttemptedDraftTokenCount = 40,
+        /** Sum of logical verifier widths, including each condition row. */
+        kDeviceGenerationControlVerifierTokenCount = 41,
+        /** Device-selected draft width of the most recently committed transaction. */
+        kDeviceGenerationControlLastTransactionDraftDepth = 42,
+        /** Response tokens appended by the most recently committed transaction. */
+        kDeviceGenerationControlLastTransactionEmittedTokenCount = 43,
+        /** Number of MoE layers that moved current-batch LLEP payloads. */
+        kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount = 44,
+        /** Number of MoE layers that executed rows away from their static owner. */
+        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount = 45,
+        kDeviceGenerationControlCount = 46,
+    };
+
+    /**
+     * @brief Response ownership of verifier row zero at controller admission.
+     *
+     * Every grouped verifier transaction begins with one condition row. At an
+     * ordinary prefill or accepted-token boundary that row has not crossed the
+     * current response boundary and must be appended if it becomes visible. A
+     * rejection boundary is different: its correction token was emitted by the
+     * preceding controller, but the state produced by consuming that token has
+     * not yet been committed. The following verifier therefore consumes the
+     * correction as row zero while excluding it from its new response ledger.
+     *
+     * This enum is shared by host admission, CUDA, ROCm, and the device control
+     * transition helper so the distinction cannot be inferred from token values
+     * or reconstructed independently by a backend.
+     */
+    enum class DeviceGenerationLeadingRowDisposition : int32_t
+    {
+        /** Row zero has not yet been returned to the caller. */
+        PendingResponse = 0,
+        /** Row zero was returned by the immediately preceding controller. */
+        AlreadyEmitted = 1,
+    };
+
+    /** @return true when @p disposition is one legal admission value. */
+    LLAMINAR_SAMPLING_HD bool valid_device_generation_leading_row_disposition(
+        DeviceGenerationLeadingRowDisposition disposition)
+    {
+        return disposition ==
+                   DeviceGenerationLeadingRowDisposition::PendingResponse ||
+               disposition ==
+                   DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+    }
+
+    /** @return Stable control-word value for @p disposition, or `-1` if invalid. */
+    LLAMINAR_SAMPLING_HD int device_generation_leading_committed_output_count(
+        DeviceGenerationLeadingRowDisposition disposition)
+    {
+        return valid_device_generation_leading_row_disposition(disposition)
+                   ? static_cast<int>(disposition)
+                   : -1;
+    }
+
+    /**
+     * @brief Validate operation, response budget and initial frontier together.
+     * @param policy Explicit model-forward or generation operation.
+     * @param max_new_tokens Response budget; zero only for ForwardOnly.
+     * @param disposition Ownership of the initial condition token.
+     * @return Whether admission has an unambiguous device-side lifecycle.
+     */
+    LLAMINAR_SAMPLING_HD bool valid_device_generation_admission(
+        const DeviceGenerationPolicy &policy, int max_new_tokens,
+        DeviceGenerationLeadingRowDisposition disposition)
+    {
+        return policy.valid() && valid_device_generation_leading_row_disposition(disposition) &&
+            (policy.isForwardOnly()
+                ? max_new_tokens == 0 && disposition == DeviceGenerationLeadingRowDisposition::AlreadyEmitted
+                : max_new_tokens > 0);
+    }
+
+    /**
+     * @brief Fatal validation failures reported by the generation controller.
+     *
+     * The controller never repairs or truncates malformed production output.
+     * A non-zero value invalidates the request and is surfaced by the single
+     * terminal materialization.  This prevents a GPU request from limping on
+     * after a stale mailbox, response-budget overrun, or compact-ABI drift.
+     */
+    enum class DeviceGenerationError : int
+    {
+        None = 0,
+        InvalidInitialization = 1,
+        InvalidController = 2,
+        InvalidCompactOutcome = 3,
+        LeadingCommittedRowMismatch = 4,
+        EmptyTransaction = 5,
+        ResponseBudgetExceeded = 6,
+        ResponseCapacityExceeded = 7,
+        InvalidVerifierCounts = 8,
+        InvalidPublicationMetadata = 9,
+        InvalidDepthPolicy = 10,
+        InvalidDepthSelector = 11,
+        InvalidMaintenanceState = 12,
+        InvalidVerifierTransactionIdentity = 13,
+        InvalidOrdinarySample = 14,
+        InvalidOrdinaryTransition = 15,
+    };
+
+    /**
+     * @brief Immutable host-scheduler view of one device-owned transaction.
+     *
+     * HIP graph replay currently has no native conditional-node equivalent.  A
+     * host scheduler consequently needs to know whether another captured graph
+     * transaction is required and which pre-captured depth branch to submit.
+     * It must not receive the generation controller, compact verifier outcome,
+     * response tokens, cache positions, or sampler state.  This fixed-size ABI
+     * is the only intermediate device-to-host payload permitted by that policy.
+     *
+     * The record is a value snapshot, never an authority.  Its lifecycle fields
+     * identify the admitted request and arena generation; its decision fields
+     * are copied from the authoritative controller by a graph-captured device
+     * kernel.  The host may validate and schedule from these words but may never
+     * upload a modified ticket or derive live inference state from it.
+     */
+    struct DeviceGenerationDispatchTicket
+    {
+        static constexpr uint32_t kMagic = 0x4D545044u; // "MTPD"
+        static constexpr uint32_t kABIVersion = 2u;
+        static constexpr uint32_t kWordCount = 13u;
+        static constexpr size_t kWireBytes =
+            static_cast<size_t>(kWordCount) * sizeof(uint32_t);
+
+        uint32_t magic = 0;
+        uint32_t abi_version = 0;
+        uint32_t session_epoch_low = 0;
+        uint32_t session_epoch_high = 0;
+        uint32_t workspace_generation_low = 0;
+        uint32_t workspace_generation_high = 0;
+        int32_t healthy = 0;
+        int32_t complete = 0;
+        int32_t transaction_count = 0;
+        int32_t next_draft_depth = 0;
+        int32_t error_code = 0;
+        int32_t maintenance_due = 0;
+        /**
+         * Cumulative logical response tokens committed by the device owner.
+         *
+         * This is cadence evidence only.  A hosted HIP scheduler may publish
+         * the positive delta to background ExpertOverlay maintenance after it
+         * retires the matching sparse graph sequence.  It must never use this
+         * value to reconstruct response contents or mutate generation state.
+         */
+        int32_t committed_output_tokens = 0;
+
+        /** @brief Reconstruct the request epoch without relying on host layout. */
+        LLAMINAR_SAMPLING_HD uint64_t sessionEpoch() const
+        {
+            return static_cast<uint64_t>(session_epoch_low) |
+                   (static_cast<uint64_t>(session_epoch_high) << 32u);
+        }
+
+        /** @brief Reconstruct the arena generation carried by the ticket. */
+        LLAMINAR_SAMPLING_HD uint64_t workspaceGeneration() const
+        {
+            return static_cast<uint64_t>(workspace_generation_low) |
+                   (static_cast<uint64_t>(workspace_generation_high) << 32u);
+        }
+
+        /** @brief Check only the stable wire-format identity. */
+        LLAMINAR_SAMPLING_HD bool hasValidABI() const
+        {
+            return magic == kMagic && abi_version == kABIVersion;
+        }
+
+        /**
+         * @brief Authenticate this snapshot against the active request owner.
+         *
+         * A transaction count of zero is valid immediately after admission but
+         * is never sufficient to schedule a continuation.  Callers observing a
+         * completed first transaction additionally require a strictly positive
+         * count before choosing a graph branch.
+         */
+        LLAMINAR_SAMPLING_HD bool matchesLifecycle(
+            uint64_t expected_session_epoch,
+            uint64_t expected_workspace_generation) const
+        {
+            return hasValidABI() &&
+                   sessionEpoch() == expected_session_epoch &&
+                   workspaceGeneration() == expected_workspace_generation &&
+                   (healthy == 0 || healthy == 1) &&
+                   (complete == 0 || complete == 1) &&
+                   transaction_count >= 0 && next_draft_depth >= 0 &&
+                   maintenance_due >= 0 && maintenance_due <= 1 &&
+                   committed_output_tokens >= 0;
+        }
+
+        /** @brief Compare only fields that must agree across mirrored ranks. */
+        LLAMINAR_SAMPLING_HD bool hasSameDispatchDecision(
+            const DeviceGenerationDispatchTicket &other) const
+        {
+            return healthy == other.healthy && complete == other.complete &&
+                   transaction_count == other.transaction_count &&
+                   next_draft_depth == other.next_draft_depth &&
+                   error_code == other.error_code &&
+                   maintenance_due == other.maintenance_due &&
+                   committed_output_tokens ==
+                       other.committed_output_tokens;
+        }
+    };
+
+    static_assert(
+        sizeof(DeviceGenerationDispatchTicket) ==
+        DeviceGenerationDispatchTicket::kWireBytes);
+
+    /**
+     * @brief Initialize the stable identity of a host-scheduling ticket.
+     *
+     * This runs in the same admission kernel that initializes the authoritative
+     * generation controller.  No host-side ticket image is uploaded, so a stale
+     * pinned destination can never seed device execution state.
+     */
+    LLAMINAR_SAMPLING_HD bool initialize_device_generation_dispatch_ticket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        DeviceGenerationDispatchTicket *ticket)
+    {
+        if (!ticket || session_epoch == 0 || workspace_generation == 0)
+            return false;
+
+        ticket->magic = DeviceGenerationDispatchTicket::kMagic;
+        ticket->abi_version = DeviceGenerationDispatchTicket::kABIVersion;
+        ticket->session_epoch_low = static_cast<uint32_t>(session_epoch);
+        ticket->session_epoch_high = static_cast<uint32_t>(session_epoch >> 32u);
+        ticket->workspace_generation_low =
+            static_cast<uint32_t>(workspace_generation);
+        ticket->workspace_generation_high =
+            static_cast<uint32_t>(workspace_generation >> 32u);
+        ticket->healthy = 0;
+        ticket->complete = 0;
+        ticket->transaction_count = 0;
+        ticket->next_draft_depth = 0;
+        ticket->error_code =
+            static_cast<int32_t>(DeviceGenerationError::InvalidInitialization);
+        ticket->maintenance_due = 0;
+        ticket->committed_output_tokens = 0;
+        return true;
+    }
+
+    /**
+     * @brief Invalidate a resident generation request after a fatal transition.
+     *
+     * Keeping failure publication in a named host/device helper avoids
+     * compiler-specific device lambdas and gives CUDA, ROCm, and CPU tests one
+     * exact fail-hard state.  A failed request is terminal: later graph replays
+     * observe `Ok == 0`, publish no commit budget, and preserve the first error
+     * code for terminal materialization.
+     *
+     * @param control Mutable controller row, or nullptr when pointer validation
+     *        itself failed.
+     * @param error Stable error code to surface at the request boundary.
+     * @return Always false, allowing callers to return the transition result.
+     */
+    LLAMINAR_SAMPLING_HD bool fail_device_generation_control(
+        int *control,
+        DeviceGenerationError error)
+    {
+        if (control)
+        {
+            control[kDeviceGenerationControlOk] = 0;
+            control[kDeviceGenerationControlRequestComplete] = 1;
+            control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(error);
+        }
+        return false;
+    }
+
+    /**
+     * @brief Validate the verifier row that will identify one controller commit.
+     *
+     * The active depth is device-owned.  Re-deriving it from host configuration
+     * would make dynamic depth ambiguous and could certify a stale suffix from
+     * the reusable verifier bank.  Only the target plus the selected number of
+     * drafts are required to contain real token ids.
+     *
+     * @param verifier_input_tokens Request-local verifier row.
+     * @param verifier_input_token_stride Physical row capacity in INT32 words.
+     * @param control Request-local authoritative generation controller.
+     * @return true when the complete active verifier prefix is materialized.
+     */
+    LLAMINAR_SAMPLING_HD bool valid_committed_verifier_identity_input(
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        const int *control)
+    {
+        if (!verifier_input_tokens || !control)
+            return false;
+        const int draft_depth =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        if (draft_depth <= 0 ||
+            draft_depth > kSpeculativeBatchMaxRows ||
+            verifier_input_token_stride < draft_depth + 1)
+        {
+            return false;
+        }
+        for (int row = 0; row <= draft_depth; ++row)
+        {
+            if (verifier_input_tokens[row] < 0)
+                return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Materialize a complete identity after response/state commit.
+     *
+     * Callers must invoke this only after
+     * append_speculative_outcome_to_device_generation() has advanced the same
+     * controller row. One GPU lane owns both operations, so writing @ref valid
+     * last is sufficient; the producer event supplies the inter-stream and
+     * device-to-host visibility edge.
+     *
+     * @param verifier_input_tokens Request-local verifier row validated before
+     *        the response ledger was mutated.
+     * @param verifier_input_token_stride Physical row capacity in INT32 words.
+     * @param control Committed request-local generation controller.
+     * @param record Request-local persistent identity destination.
+     * @return true when a complete committed identity was published.
+     */
+    LLAMINAR_SAMPLING_HD bool publish_committed_verifier_identity(
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        const int *control,
+        MTPCommittedVerifierIdentityRecord *record)
+    {
+        if (!control)
+            return false;
+
+        /*
+         * Dynamic policy observation may already have selected the *next*
+         * transaction's depth.  The identity belongs to the transaction just
+         * committed, so its immutable last-depth word is the only valid copy
+         * extent here.
+         */
+        const int draft_depth =
+            control[kDeviceGenerationControlLastTransactionDraftDepth];
+        const int transaction_count =
+            control[kDeviceGenerationControlTransactionCount];
+        return materialize_committed_verifier_identity(
+            verifier_input_tokens,
+            verifier_input_token_stride,
+            transaction_count,
+            draft_depth,
+            record);
+    }
+
+    /**
+     * @brief Pack the only host-visible decision from authoritative device state.
+     *
+     * The helper deliberately accepts no response-token, compact-outcome, cache,
+     * or sampler pointers.  This makes the HIP scheduling boundary incapable of
+     * growing into a second inference-state owner.  A malformed maintenance
+     * controller poisons the authoritative generation row before the ticket is
+     * published, so all participants observe one fatal decision instead of
+     * selecting divergent collective graphs.
+     *
+     * @param control Authoritative generation controller row.
+     * @param maintenance_due Optional device-owned MoE maintenance predicate.
+     *        Null means the graph has no maintenance transaction.
+     * @param ticket Admission-initialized persistent ticket destination.
+     * @return true when a structurally valid ticket snapshot was published.
+     */
+    LLAMINAR_SAMPLING_HD bool publish_device_generation_dispatch_ticket(
+        int *control,
+        const uint32_t *maintenance_due,
+        DeviceGenerationDispatchTicket *ticket)
+    {
+        if (!control || !ticket || !ticket->hasValidABI())
+            return false;
+
+        const uint32_t due = maintenance_due ? *maintenance_due : 0u;
+        if (due > 1u)
+        {
+            fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidMaintenanceState);
+        }
+
+        ticket->healthy = control[kDeviceGenerationControlOk];
+        ticket->complete = control[kDeviceGenerationControlRequestComplete];
+        ticket->transaction_count =
+            control[kDeviceGenerationControlTransactionCount];
+        ticket->next_draft_depth =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        ticket->error_code = control[kDeviceGenerationControlErrorCode];
+        ticket->maintenance_due = due <= 1u ? static_cast<int32_t>(due) : 0;
+        ticket->committed_output_tokens =
+            control[kDeviceGenerationControlResponseTokenCount];
+        return true;
+    }
+
+    /**
+     * @brief Initialize one persistent device generation controller row.
+     *
+     * This helper is called by a tiny explicit-stream backend kernel at request
+     * admission.  The host supplies immutable request policy exactly once; all
+     * later transaction counts and boundaries are device-owned.
+     *
+     * @param max_new_tokens Number of response tokens requested by the caller.
+     * @param response_capacity Number of token slots in the persistent response
+     *        row.  It must cover the complete request budget.
+     * @param depth_policy Immutable ordinary or speculative request policy.
+     * @param control Writable row with @ref kDeviceGenerationControlCount words.
+     * @param initial_leading_row_disposition Whether verifier row zero is a new
+     *        response token or an already-emitted correction carried from the
+     *        preceding controller.
+     * @return true when the initialized controller is valid.
+     */
+    LLAMINAR_SAMPLING_HD bool initialize_device_generation_control(
+        int max_new_tokens,
+        int response_capacity,
+        const DeviceGenerationPolicy &depth_policy,
+        int *control,
+        DeviceGenerationLeadingRowDisposition
+            initial_leading_row_disposition =
+                DeviceGenerationLeadingRowDisposition::PendingResponse)
+    {
+        if (!control)
+            return false;
+
+        for (int i = 0; i < kDeviceGenerationControlCount; ++i)
+            control[i] = 0;
+
+        if (max_new_tokens < 0 ||
+            response_capacity <= 0 ||
+            max_new_tokens > response_capacity)
+        {
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(DeviceGenerationError::InvalidInitialization);
+            return false;
+        }
+        if (!depth_policy.valid())
+        {
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(DeviceGenerationError::InvalidDepthPolicy);
+            return false;
+        }
+        const int initial_leading_committed_output_count =
+            device_generation_leading_committed_output_count(
+                initial_leading_row_disposition);
+        if (!valid_device_generation_admission(
+                depth_policy, max_new_tokens, initial_leading_row_disposition))
+        {
+            control[kDeviceGenerationControlErrorCode] =
+                static_cast<int>(DeviceGenerationError::InvalidInitialization);
+            return false;
+        }
+
+        control[kDeviceGenerationControlOk] = 1;
+        control[kDeviceGenerationControlRemainingTokenCount] = max_new_tokens;
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] =
+            initial_leading_committed_output_count;
+        control[kDeviceGenerationControlCurrentDraftDepth] =
+            depth_policy.initial_depth;
+        control[kDeviceGenerationControlActiveVerifierRowCount] =
+            depth_policy.isOrdinary() || depth_policy.isForwardOnly()
+                ? 0 : depth_policy.initial_depth + 1;
+        control[kDeviceGenerationControlMinimumDraftDepth] =
+            depth_policy.minimum_depth;
+        control[kDeviceGenerationControlMaximumDraftDepth] =
+            depth_policy.maximum_depth;
+        control[kDeviceGenerationControlDepthPolicyMode] =
+            static_cast<int>(depth_policy.mode);
+        control[kDeviceGenerationControlDepthWindowSize] =
+            depth_policy.window_size;
+        control[kDeviceGenerationControlDepthMinimumSamples] =
+            depth_policy.minimum_samples;
+        control[kDeviceGenerationControlDepthCooldownSteps] =
+            depth_policy.cooldown_steps;
+        control[kDeviceGenerationControlDepthPromoteConsecutiveWindows] =
+            depth_policy.promote_consecutive_windows;
+        control[kDeviceGenerationControlDepthPromoteFullAcceptRatePPM] =
+            depth_policy.promote_full_accept_rate_ppm;
+        control[kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM] =
+            depth_policy.demote_zero_accept_rate_ppm;
+        control[kDeviceGenerationControlDepthDemoteAcceptanceRatePPM] =
+            depth_policy.demote_acceptance_rate_ppm;
+        control[kDeviceGenerationControlDepthStepsSinceChange] =
+            depth_policy.cooldown_steps;
+        control[kDeviceGenerationControlDepthLastRecommendedDepth] =
+            depth_policy.initial_depth;
+        return true;
+    }
+
+    /**
+     * @brief Close exactly one forward-only model invocation without sampling.
+     * @param control Canonical resident controller row ordered after model writes.
+     * @return True on first completion or absorbing terminal replay.
+     *
+     * The model owns KV/GDN writes. This small terminal records their one-row
+     * commit and consumes the pending condition. No token or response storage
+     * is accessed, so stale sampler scratch cannot influence prefix restoration.
+     */
+    LLAMINAR_SAMPLING_HD bool complete_device_generation_forward(int *control)
+    {
+        if (!control || control[kDeviceGenerationControlOk] == 0)
+            return false;
+        if (control[kDeviceGenerationControlDepthPolicyMode] !=
+                static_cast<int>(DeviceGenerationPolicyMode::ForwardOnly))
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+        if (control[kDeviceGenerationControlNextLeadingCommittedOutputCount] != 1 ||
+            control[kDeviceGenerationControlRemainingTokenCount] != 0 ||
+            control[kDeviceGenerationControlResponseTokenCount] != 0 ||
+            control[kDeviceGenerationControlTransactionCount] != 0 ||
+            control[kDeviceGenerationControlPublishedStateCommitCount] != 0 ||
+            control[kDeviceGenerationControlCurrentDraftDepth] != 0 ||
+            control[kDeviceGenerationControlActiveVerifierRowCount] != 0)
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+        control[kDeviceGenerationControlPublishedStateCommitCount] = 1;
+        control[kDeviceGenerationControlTransactionCount] = 1;
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] = 0;
+        control[kDeviceGenerationControlRequestComplete] = 1;
+        return true;
+    }
+
+    /**
+     * @brief Captured producer of an ordinary sample and its state-commit cost.
+     *
+     * PrefillLogits samples the already-computed prompt frontier without
+     * consuming it again. DecodeLogits follows one ordinary forward consuming
+     * the previously emitted condition token. Keeping those edges explicit
+     * prevents a one-token request from advancing KV or a continuation from
+     * emitting the prefill sample twice.
+     */
+    enum class OrdinaryGenerationSampleSource : int
+    {
+        PrefillLogits = 0,
+        DecodeLogits = 1,
+    };
+
+    /**
+     * @brief Borrowed live-sequence rows consumed by an ordinary generation parent.
+     *
+     * Every pointer names an existing arena row with one INT32 per request.
+     * The descriptor owns no memory and carries no host copy of live token
+     * counts or positions. Stream ownership belongs to IBackend's enqueue API,
+     * not to this arithmetic/geometry contract.
+     */
+    struct OrdinaryGenerationFrontier
+    {
+        int32_t *cached_tokens = nullptr; ///< Live model position, not a response-count mirror.
+        int32_t *next_condition_tokens = nullptr; ///< Last emitted condition, or -1 after forward-only consumption.
+        int32_t *stopped_flags = nullptr; ///< Model stop state consumed by subsequent admission.
+        int32_t *publication_ok_flags = nullptr; ///< First-failure validity of this live sequence publication.
+        int request_capacity = 0; ///< Physical entries in each borrowed arena row.
+        int context_capacity = 0; ///< Exact admitted KV/model position capacity.
+
+        /** @return Whether the immutable view covers every admitted request. */
+        LLAMINAR_SAMPLING_HD bool validFor(int requests) const
+        {
+            return requests > 0 && requests <= request_capacity && context_capacity > 0 &&
+                   cached_tokens && next_condition_tokens && stopped_flags && publication_ok_flags;
+        }
+    };
+
+    /**
+     * @brief One complete response-and-sequence publication on its producer stream.
+     *
+     * The frontier borrows the existing logical-state allocation. It is not a
+     * second owner or ledger. Its four rows may have a larger physical request
+     * capacity than the active request count; control/response retain independent
+     * strides. A valid publication always binds both response and live state.
+     */
+    struct OrdinaryGenerationPublication
+    {
+        int request_count = 0;
+        const int32_t *sampled_tokens = nullptr;
+        const int32_t *stopped_flags = nullptr;
+        OrdinaryGenerationSampleSource source = OrdinaryGenerationSampleSource::PrefillLogits;
+        int32_t *response_tokens = nullptr;
+        int response_token_stride = 0;
+        int *control = nullptr;
+        int control_stride = 0;
+        OrdinaryGenerationFrontier frontier;
+
+        /** @return Whether all immutable bindings describe a complete publication. */
+        LLAMINAR_SAMPLING_HD bool valid() const
+        {
+            return request_count > 0 && sampled_tokens && stopped_flags &&
+                   response_tokens && response_token_stride > 0 && control &&
+                   control_stride >= kDeviceGenerationControlCount &&
+                   frontier.validFor(request_count) &&
+                   (source == OrdinaryGenerationSampleSource::PrefillLogits ||
+                    source == OrdinaryGenerationSampleSource::DecodeLogits);
+        }
+    };
+
+    /**
+     * @brief Append one ordinary sample to the shared resident response ledger.
+     *
+     * One lane per request invokes this after the sampler and, for DecodeLogits,
+     * its main forward. The same stream/event edge publishes the response and
+     * committed-row count. A terminal request is absorbing: replay cannot append
+     * a duplicate token. This is response publication, not a sampler or a KV
+     * writer; those producers retain their own device-owned storage.
+     *
+     * @param sampled_token Device sampler's output, including an EOS token.
+     * @param model_stopped Result of the admitted stop-token policy.
+     * @param source Exact retained graph producer of this sample.
+     * @param response_tokens Persistent response row owned by this controller.
+     * @param response_capacity Physical number of INT32 slots in that row.
+     * @param control Request-local row of kDeviceGenerationControlCount words.
+     * @return Whether the transition is valid, including a terminal no-op.
+     */
+    LLAMINAR_SAMPLING_HD bool append_ordinary_sample_to_device_generation(
+        int sampled_token,
+        bool model_stopped,
+        OrdinaryGenerationSampleSource source,
+        int32_t *response_tokens,
+        int response_capacity,
+        int *control)
+    {
+        if (!control)
+            return false;
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false; // Preserve the first fatal result on a later replay.
+        if (control[kDeviceGenerationControlDepthPolicyMode] !=
+                static_cast<int>(DeviceGenerationPolicyMode::Ordinary) ||
+            control[kDeviceGenerationControlCurrentDraftDepth] != 0 ||
+            control[kDeviceGenerationControlActiveVerifierRowCount] != 0)
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidOrdinaryTransition);
+        }
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+
+        const int count = control[kDeviceGenerationControlResponseTokenCount];
+        const int remaining = control[kDeviceGenerationControlRemainingTokenCount];
+        const int transactions = control[kDeviceGenerationControlTransactionCount];
+        const int published = control[kDeviceGenerationControlPublishedStateCommitCount];
+        const int leading = control[kDeviceGenerationControlNextLeadingCommittedOutputCount];
+        const bool from_prefill = source == OrdinaryGenerationSampleSource::PrefillLogits;
+        const bool from_decode = source == OrdinaryGenerationSampleSource::DecodeLogits;
+        // Only admission with an un-emitted frontier can sample prefill logits.
+        // Every following sample consumes exactly one pending condition row.
+        const bool legal_source = from_prefill
+            ? transactions == 0 && leading == 0
+            : from_decode && leading == 1;
+        if (!legal_source || count < 0 || transactions != count ||
+            published < 0 || published > count || count - published > 1)
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidOrdinaryTransition);
+        }
+        if (!response_tokens || response_capacity <= 0 || sampled_token < 0)
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidOrdinarySample);
+        }
+        if (remaining <= 0)
+            return fail_device_generation_control(
+                control, DeviceGenerationError::ResponseBudgetExceeded);
+        // Subtraction avoids overflow for a malformed INT_MAX-sized ledger.
+        if (count >= response_capacity || remaining > response_capacity - count)
+            return fail_device_generation_control(
+                control, DeviceGenerationError::ResponseCapacityExceeded);
+
+        response_tokens[count] = sampled_token;
+        control[kDeviceGenerationControlResponseTokenCount] = count + 1;
+        control[kDeviceGenerationControlRemainingTokenCount] = remaining - 1;
+        control[kDeviceGenerationControlTransactionCount] = transactions + 1;
+        control[kDeviceGenerationControlPublishedStateCommitCount] =
+            published + (from_decode ? 1 : 0);
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] = 1;
+        control[kDeviceGenerationControlModelStopped] = model_stopped ? 1 : 0;
+        control[kDeviceGenerationControlRequestComplete] =
+            model_stopped || remaining == 1 ? 1 : 0;
+        control[kDeviceGenerationControlLastTransactionEmittedTokenCount] = 1;
+        return true;
+    }
+
+    /**
+     * @brief Commit one ordinary request's response and live continuation together.
+     *
+     * One GPU lane (or one CPU owner) calls this after its forward and sampler.
+     * Every fallible check precedes the response append and frontier mutation.
+     * On failure the controller preserves its first diagnostic and invalidates
+     * the frontier; cached position and next-token bytes are not partially
+     * advanced. Terminal replay is absorbing, including poisoned sampler bytes.
+     *
+     * ForwardOnly consumes a previously emitted condition without reading any
+     * sampler output. It clears that condition, leaving the newly computed
+     * logits as the next legal sampling frontier. PrefillLogits consumes no KV
+     * row; DecodeLogits consumes exactly one. No host state reconstructs either
+     * transition, and no speculative acceptance fields represent ordinary work.
+     *
+     * @param publication Immutable, complete persistent buffer view.
+     * @param request Independent row owned exclusively by this caller.
+     * @return True for a committed or absorbing terminal transition.
+     */
+    LLAMINAR_SAMPLING_HD bool publish_ordinary_generation_request(
+        const OrdinaryGenerationPublication &publication, size_t request)
+    {
+        if (!publication.valid() || request >= static_cast<size_t>(publication.request_count))
+            return false;
+        int *const control = publication.control + request * publication.control_stride;
+        const auto &frontier = publication.frontier;
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false;
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+
+        const int position = frontier.cached_tokens[request];
+        const bool decode = publication.source == OrdinaryGenerationSampleSource::DecodeLogits;
+        // Subtract before incrementing: malformed INT_MAX positions cannot wrap.
+        // The sampler may already write directly into the next-token/stop rows.
+        // The control ledger, not their pre-publication contents, owns whether
+        // a condition was consumed. This permits reuse without staging copies.
+        if (frontier.publication_ok_flags[request] != 1 ||
+            position < 0 || position > frontier.context_capacity ||
+            (decode && position == frontier.context_capacity))
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+        }
+        if (control[kDeviceGenerationControlDepthPolicyMode] ==
+            static_cast<int>(DeviceGenerationPolicyMode::ForwardOnly))
+        {
+            if (!decode || !complete_device_generation_forward(control))
+            {
+                frontier.publication_ok_flags[request] = 0;
+                return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinaryTransition);
+            }
+            frontier.cached_tokens[request] = position + 1;
+            frontier.next_condition_tokens[request] = -1;
+            return true;
+        }
+
+        const int stopped = publication.stopped_flags[request];
+        if (stopped != 0 && stopped != 1)
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinarySample);
+        }
+        const int sampled = publication.sampled_tokens[request];
+        if (!append_ordinary_sample_to_device_generation(
+                sampled, stopped != 0, publication.source,
+                publication.response_tokens + request * publication.response_token_stride,
+                publication.response_token_stride, control))
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return false;
+        }
+        frontier.cached_tokens[request] = position + (decode ? 1 : 0);
+        frontier.next_condition_tokens[request] = sampled;
+        frontier.stopped_flags[request] = stopped;
+        return true;
+    }
+
+    /**
+     * @brief Publish the maximum serial-visible row count for the next verifier.
+     *
+     * The verifier reducer already accepts a device pointer for its commit
+     * boundary.  This transition combines the response budget with the current
+     * device-owned maintenance boundary before any verifier output is reduced.
+     * A completed request publishes zero, allowing a graph-owned conditional or
+     * no-op admission kernel to suppress later work without a host poll.
+     *
+     * @param verifier_row_capacity Static verifier graph row capacity.
+     * @param maintenance_rows_remaining Device MoE maintenance boundary.  Values
+     *        <= 0 are invalid because maintenance must run before another
+     *        serial-visible transaction is admitted.
+     * @param control Mutable generation controller row.
+     * @return Published commit budget, or zero when the request is complete or
+     *         invalid.
+     */
+    LLAMINAR_SAMPLING_HD int prepare_device_generation_transaction_budget(
+        int verifier_row_capacity,
+        int maintenance_rows_remaining,
+        int *control)
+    {
+        if (!control || verifier_row_capacity <= 0 ||
+            maintenance_rows_remaining <= 0)
+        {
+            if (control)
+            {
+                control[kDeviceGenerationControlOk] = 0;
+                control[kDeviceGenerationControlErrorCode] =
+                    static_cast<int>(DeviceGenerationError::InvalidController);
+                control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            }
+            return 0;
+        }
+        if (control[kDeviceGenerationControlOk] == 0 ||
+            control[kDeviceGenerationControlRequestComplete] != 0)
+        {
+            control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            return 0;
+        }
+
+        const int remaining =
+            control[kDeviceGenerationControlRemainingTokenCount];
+        if (remaining <= 0)
+        {
+            control[kDeviceGenerationControlRequestComplete] = 1;
+            control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+            return 0;
+        }
+
+        const int active_verifier_rows =
+            control[kDeviceGenerationControlActiveVerifierRowCount];
+        if (active_verifier_rows <= 1 ||
+            active_verifier_rows > verifier_row_capacity)
+        {
+            fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidDepthSelector);
+            return 0;
+        }
+
+        int budget = remaining < active_verifier_rows
+                         ? remaining
+                         : active_verifier_rows;
+        budget = budget < maintenance_rows_remaining
+                     ? budget
+                     : maintenance_rows_remaining;
+        control[kDeviceGenerationControlTransactionCommitBudget] = budget;
+        return budget;
+    }
+
+    /**
+     * @brief Compare one integer ratio with a PPM threshold without division.
+     */
+    LLAMINAR_SAMPLING_HD bool device_generation_rate_at_least(
+        int numerator,
+        int denominator,
+        int threshold_ppm)
+    {
+        if (numerator < 0 || denominator <= 0 ||
+            threshold_ppm < 0 ||
+            threshold_ppm > DeviceGenerationPolicy::kRateScale)
+        {
+            return false;
+        }
+        return static_cast<int64_t>(numerator) *
+                   DeviceGenerationPolicy::kRateScale >=
+               static_cast<int64_t>(denominator) * threshold_ppm;
+    }
+
+    /**
+     * @brief Record one verifier outcome and publish the next device depth.
+     *
+     * The transition intentionally uses only integer counters. Fixed mode does
+     * no adaptive bookkeeping. Observe mode evaluates the same windows and
+     * records `LastRecommendedDepth` while retaining the active selector.
+     * Dynamic mode applies one-step promotion/demotion with cooldown and
+     * promotion hysteresis. The complete policy state remains in this row and
+     * is consumed by the next native SWITCH iteration without host polling.
+     */
+    LLAMINAR_SAMPLING_HD bool record_device_generation_depth_observation(
+        int accepted_prefix,
+        bool rollback,
+        bool budget_limited,
+        int *control)
+    {
+        if (!control || control[kDeviceGenerationControlOk] == 0)
+            return false;
+
+        const int mode = control[kDeviceGenerationControlDepthPolicyMode];
+        const int current =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        const int minimum =
+            control[kDeviceGenerationControlMinimumDraftDepth];
+        const int maximum =
+            control[kDeviceGenerationControlMaximumDraftDepth];
+        if (current < minimum || current > maximum || minimum <= 0 ||
+            maximum > DeviceGenerationPolicy::kMaximumSupportedDraftDepth ||
+            (mode != static_cast<int>(DeviceGenerationPolicyMode::Fixed) &&
+             mode != static_cast<int>(DeviceGenerationPolicyMode::Observe) &&
+             mode != static_cast<int>(DeviceGenerationPolicyMode::Dynamic)))
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidDepthPolicy);
+        }
+        if (mode == static_cast<int>(DeviceGenerationPolicyMode::Fixed) ||
+            budget_limited)
+        {
+            return true;
+        }
+
+        if (accepted_prefix < 0 || accepted_prefix > current)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidVerifierCounts);
+        }
+
+        ++control[kDeviceGenerationControlDepthWindowVerifierRuns];
+        control[kDeviceGenerationControlDepthWindowAttemptedTokens] += current;
+        control[kDeviceGenerationControlDepthWindowAcceptedTokens] +=
+            accepted_prefix;
+        control[kDeviceGenerationControlDepthWindowRejectedTokens] +=
+            current - accepted_prefix;
+        control[kDeviceGenerationControlDepthWindowAcceptedPrefixSum] +=
+            accepted_prefix;
+        control[kDeviceGenerationControlDepthWindowRollbacks] +=
+            rollback ? 1 : 0;
+        control[kDeviceGenerationControlDepthWindowFullAccepts] +=
+            accepted_prefix == current ? 1 : 0;
+        control[kDeviceGenerationControlDepthWindowZeroAccepts] +=
+            accepted_prefix == 0 ? 1 : 0;
+        ++control[kDeviceGenerationControlDepthStepsSinceChange];
+
+        const int verifier_runs =
+            control[kDeviceGenerationControlDepthWindowVerifierRuns];
+        const int required_samples =
+            control[kDeviceGenerationControlDepthWindowSize] >
+                    control[kDeviceGenerationControlDepthMinimumSamples]
+                ? control[kDeviceGenerationControlDepthWindowSize]
+                : control[kDeviceGenerationControlDepthMinimumSamples];
+        if (verifier_runs < required_samples)
+            return true;
+
+        int recommended = current;
+        int promotion_streak =
+            control[kDeviceGenerationControlDepthPromotionStreak];
+        const bool cooldown_complete =
+            control[kDeviceGenerationControlDepthStepsSinceChange] >=
+            control[kDeviceGenerationControlDepthCooldownSteps];
+        const int attempted =
+            control[kDeviceGenerationControlDepthWindowAttemptedTokens];
+        const int accepted =
+            control[kDeviceGenerationControlDepthWindowAcceptedTokens];
+        const int zero_accepts =
+            control[kDeviceGenerationControlDepthWindowZeroAccepts];
+        const int full_accepts =
+            control[kDeviceGenerationControlDepthWindowFullAccepts];
+
+        if (cooldown_complete && current > minimum &&
+            device_generation_rate_at_least(
+                zero_accepts,
+                verifier_runs,
+                control[
+                    kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM]))
+        {
+            recommended = current - 1;
+            promotion_streak = 0;
+        }
+        else if (cooldown_complete && current > minimum &&
+                 !device_generation_rate_at_least(
+                     accepted,
+                     attempted,
+                     control[
+                         kDeviceGenerationControlDepthDemoteAcceptanceRatePPM]))
+        {
+            recommended = current - 1;
+            promotion_streak = 0;
+        }
+        else if (cooldown_complete && current < maximum &&
+                 zero_accepts == 0 &&
+                 device_generation_rate_at_least(
+                     full_accepts,
+                     verifier_runs,
+                     control[
+                         kDeviceGenerationControlDepthPromoteFullAcceptRatePPM]))
+        {
+            ++promotion_streak;
+            if (promotion_streak >=
+                control[
+                    kDeviceGenerationControlDepthPromoteConsecutiveWindows])
+            {
+                recommended = current + 1;
+                promotion_streak = 0;
+            }
+        }
+        else
+        {
+            promotion_streak = 0;
+        }
+
+        control[kDeviceGenerationControlDepthPromotionStreak] =
+            promotion_streak;
+        control[kDeviceGenerationControlDepthLastRecommendedDepth] =
+            recommended;
+        ++control[kDeviceGenerationControlDepthEvaluatedWindows];
+
+        if (mode == static_cast<int>(DeviceGenerationPolicyMode::Dynamic) &&
+            recommended != current)
+        {
+            control[kDeviceGenerationControlCurrentDraftDepth] = recommended;
+            control[kDeviceGenerationControlActiveVerifierRowCount] =
+                recommended + 1;
+            control[kDeviceGenerationControlDepthStepsSinceChange] = 0;
+            ++control[kDeviceGenerationControlDepthUpdates];
+            if (recommended > current)
+                ++control[kDeviceGenerationControlDepthPromotions];
+            else
+                ++control[kDeviceGenerationControlDepthDemotions];
+        }
+
+        control[kDeviceGenerationControlDepthWindowVerifierRuns] = 0;
+        control[kDeviceGenerationControlDepthWindowAttemptedTokens] = 0;
+        control[kDeviceGenerationControlDepthWindowAcceptedTokens] = 0;
+        control[kDeviceGenerationControlDepthWindowRejectedTokens] = 0;
+        control[kDeviceGenerationControlDepthWindowRollbacks] = 0;
+        control[kDeviceGenerationControlDepthWindowFullAccepts] = 0;
+        control[kDeviceGenerationControlDepthWindowZeroAccepts] = 0;
+        control[kDeviceGenerationControlDepthWindowAcceptedPrefixSum] = 0;
+        return true;
+    }
+
+    /**
+     * @brief Append one compact verifier outcome to a device response ledger.
+     *
+     * The function enforces serial decode response semantics.  A rejected token
+     * may be emitted at the end of transaction N and carried as verifier input
+     * row zero in transaction N+1; the compact ABI marks that row with
+     * `kSpecBatchMetaLeadingCommittedOutputCount`, and this controller refuses to
+     * count it twice.  No malformed or over-budget output is silently clipped.
+     *
+     * @param compact_tokens Compact output-token row for one request.
+     * @param output_token_stride Capacity of @p compact_tokens.
+     * @param compact_meta Compact metadata row for the same request.
+     * @param meta_stride Capacity of @p compact_meta.
+     * @param response_tokens Persistent device response row.
+     * @param response_capacity Capacity of @p response_tokens.
+     * @param control Mutable controller row.
+     * @return true when the transaction was appended, or when the request was
+     *         already complete and therefore required no mutation.
+     */
+    LLAMINAR_SAMPLING_HD bool append_speculative_outcome_to_device_generation(
+        const int32_t *compact_tokens,
+        int output_token_stride,
+        const int *compact_meta,
+        int meta_stride,
+        int32_t *response_tokens,
+        int response_capacity,
+        int *control)
+    {
+        if (!control || !compact_tokens || !compact_meta || !response_tokens ||
+            output_token_stride <= 0 ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            response_capacity <= 0)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidController);
+        }
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false;
+        if (control[kDeviceGenerationControlRequestComplete] != 0)
+            return true;
+        if (control[kDeviceGenerationControlDepthPolicyMode] ==
+            static_cast<int>(DeviceGenerationPolicyMode::Ordinary))
+        {
+            return fail_device_generation_control(
+                control, DeviceGenerationError::InvalidDepthPolicy);
+        }
+        if (compact_meta[kSpecBatchMetaOk] == 0)
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidCompactOutcome);
+
+        const int output_count = compact_meta[kSpecBatchMetaOutputCount];
+        const int leading_count =
+            compact_meta[kSpecBatchMetaLeadingCommittedOutputCount];
+        const int expected_leading_count =
+            control[kDeviceGenerationControlNextLeadingCommittedOutputCount];
+        const int verifier_state_count =
+            compact_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+        const int accepted_prefix =
+            compact_meta[kSpecBatchMetaAcceptedSpeculativePrefix];
+        const int consumed_rows =
+            compact_meta[kSpecBatchMetaConsumedVerifierRows];
+
+        if (output_count <= 0 || output_count > output_token_stride ||
+            leading_count < 0 || leading_count > 1 ||
+            leading_count > output_count)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidCompactOutcome);
+        }
+        if (leading_count != expected_leading_count)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::LeadingCommittedRowMismatch);
+        }
+        if (verifier_state_count < 0 || verifier_state_count > output_count ||
+            accepted_prefix < 0 || consumed_rows < 0)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidVerifierCounts);
+        }
+
+        const int newly_emitted_count = output_count - leading_count;
+        if (newly_emitted_count <= 0)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::EmptyTransaction);
+        }
+
+        const int response_count =
+            control[kDeviceGenerationControlResponseTokenCount];
+        const int remaining_count =
+            control[kDeviceGenerationControlRemainingTokenCount];
+        if (response_count < 0 || remaining_count < newly_emitted_count)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::ResponseBudgetExceeded);
+        }
+        if (response_count + newly_emitted_count > response_capacity)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::ResponseCapacityExceeded);
+        }
+
+        for (int i = 0; i < newly_emitted_count; ++i)
+        {
+            response_tokens[response_count + i] =
+                compact_tokens[leading_count + i];
+        }
+
+        const int next_response_count = response_count + newly_emitted_count;
+        const int next_remaining_count = remaining_count - newly_emitted_count;
+        const bool model_stopped =
+            compact_meta[kSpecBatchMetaStoppedOnOutput] != 0;
+        const int transaction_budget =
+            control[kDeviceGenerationControlTransactionCommitBudget];
+        /*
+         * The compact outcome describes every physically evaluated verifier
+         * row, while the transaction budget describes the serial-visible
+         * prefix that may actually become live state.  Those counts differ at
+         * a maintenance boundary.  In particular, a transaction entered with
+         * a carried row zero may evaluate two physical rows while publishing
+         * only row zero.  Its second output has already been emitted, but is
+         * still the next transaction's condition token and must therefore be
+         * skipped by that transaction's response append.
+         *
+         * Comparing output_count with verifier_state_count loses that carry:
+         * verifier_state_count includes the row beyond the publication
+         * boundary.  Derive the exact publication count from the same budget
+         * consumed by derive_speculative_publication_metadata() so response,
+         * KV, and recurrent-state ownership advance as one transaction.
+         */
+        const int published_state_count =
+            verifier_state_count < transaction_budget
+                ? verifier_state_count
+                : transaction_budget;
+        const bool has_emitted_pending_condition =
+            !model_stopped && output_count > published_state_count;
+        const bool rejected_transaction =
+            !model_stopped &&
+            compact_meta[kSpecBatchMetaAllSpeculativeAccepted] == 0 &&
+            compact_meta[kSpecBatchMetaCommitBoundaryClipped] == 0;
+        const int active_depth =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        const bool budget_limited =
+            transaction_budget < active_depth + 1;
+
+        control[kDeviceGenerationControlResponseTokenCount] =
+            next_response_count;
+        control[kDeviceGenerationControlRemainingTokenCount] =
+            next_remaining_count;
+        control[kDeviceGenerationControlModelStopped] = model_stopped ? 1 : 0;
+        control[kDeviceGenerationControlRequestComplete] =
+            model_stopped || next_remaining_count == 0 ? 1 : 0;
+        control[kDeviceGenerationControlTransactionCount] += 1;
+        control[kDeviceGenerationControlNextLeadingCommittedOutputCount] =
+            has_emitted_pending_condition ? 1 : 0;
+        control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+        control[kDeviceGenerationControlAcceptedSpeculativeTokenCount] +=
+            accepted_prefix;
+        control[kDeviceGenerationControlRejectedTransactionCount] +=
+            rejected_transaction ? 1 : 0;
+        control[kDeviceGenerationControlConsumedVerifierRowCount] +=
+            consumed_rows;
+        control[kDeviceGenerationControlPublishedStateCommitCount] +=
+            published_state_count;
+        control[kDeviceGenerationControlAttemptedDraftTokenCount] +=
+            active_depth;
+        control[kDeviceGenerationControlVerifierTokenCount] +=
+            active_depth + 1;
+        control[kDeviceGenerationControlLastTransactionDraftDepth] =
+            active_depth;
+        control[kDeviceGenerationControlLastTransactionEmittedTokenCount] =
+            newly_emitted_count;
+        control[kDeviceGenerationControlErrorCode] =
+            static_cast<int>(DeviceGenerationError::None);
+        return record_device_generation_depth_observation(
+            accepted_prefix,
+            rejected_transaction,
+            budget_limited,
+            control);
+    }
+
+    /**
+     * @brief Convert compact output rows into newly emitted serial decode rounds.
+     *
+     * The compact ABI permits exactly one leading row from an earlier transaction:
+     * the pending rejection-correction condition.  Returning `-1` makes malformed
+     * metadata fatal to device maintenance instead of silently double-counting it.
+     */
+    LLAMINAR_SAMPLING_HD int speculative_new_commit_count(
+        int output_count,
+        int leading_committed_output_count)
+    {
+        if (output_count <= 0 ||
+            leading_committed_output_count < 0 ||
+            leading_committed_output_count > 1 ||
+            leading_committed_output_count > output_count)
+        {
+            return -1;
+        }
+        return output_count - leading_committed_output_count;
+    }
 
     LLAMINAR_SAMPLING_HD uint64_t splitmix64(uint64_t x)
     {
@@ -598,6 +2469,11 @@ namespace llaminar2::sampling_math
      * a ready token only when every verifier row accepted. The metadata layout
      * is fixed by SpeculativeBatchMetaIndex so host tests and GPU kernels cannot
      * drift.
+     *
+     * @param out_token_capacity Number of writable entries in `out_tokens`.
+     *        The complete declared extent is initialized to `-1`, making the
+     *        compact outcome byte-stable even when request rows share a larger
+     *        configured batch stride.
      */
     LLAMINAR_SAMPLING_HD void summarize_speculative_verify_batch(
         int first_token,
@@ -609,23 +2485,22 @@ namespace llaminar2::sampling_math
         int bonus_ready_token,
         int has_bonus_ready_token,
         int *out_tokens,
-        int *out_meta)
+        int out_token_capacity,
+        int *out_meta,
+        const int *greedy_draft_tokens = nullptr)
     {
+        initialize_invalid_speculative_batch_outcome(
+            out_tokens,
+            out_token_capacity,
+            out_meta);
         if (!out_tokens || !out_meta ||
             row_count < 0 ||
-            row_count > kSpeculativeBatchMaxRows ||
+            out_token_capacity < row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens)
         {
-            if (out_meta)
-                out_meta[kSpecBatchMetaOk] = 0;
             return;
         }
-
-        for (int i = 0; i < kSpeculativeBatchMaxOutputTokens; ++i)
-            out_tokens[i] = -1;
-        for (int i = 0; i < kSpeculativeBatchMetaCount; ++i)
-            out_meta[i] = 0;
 
         if (first_token < 0)
         {
@@ -651,14 +2526,19 @@ namespace llaminar2::sampling_math
 
         for (int row = 0; !stopped && row < row_count; ++row)
         {
-            if (!row_tokens || !row_accepted || row_tokens[row] < 0)
+            if (!row_tokens ||
+                (!row_accepted && !greedy_draft_tokens) ||
+                row_tokens[row] < 0)
             {
                 out_meta[kSpecBatchMetaOk] = 0;
                 return;
             }
 
             const int token = row_tokens[row];
-            const bool accepted = row_accepted[row] != 0;
+            const bool accepted = row_accepted
+                                      ? row_accepted[row] != 0
+                                      : row_tokens[row] ==
+                                            greedy_draft_tokens[row + 1];
             out_tokens[output_count++] = token;
             ++consumed_rows;
 
@@ -715,6 +2595,122 @@ namespace llaminar2::sampling_math
     }
 
     /**
+     * @brief Reduce verifier rows without crossing a device-owned commit boundary.
+     *
+     * Dynamic MoE placement may change only between serial-visible decode
+     * transactions. A grouped verifier can otherwise accept several rows and
+     * carry execution past the exact token at which serial decode would run a
+     * maintenance wave. This helper shortens the semantic transaction while
+     * preserving the already-computed target samples and their logical
+     * positions.
+     *
+     * If @p max_state_commit_rows is smaller than `row_count + 1`, at most
+     * `max_state_commit_rows - 1` speculative rows are compared. The target
+     * sample in the following verifier row becomes the ready condition token.
+     * For example, a one-row commit budget emits only `first_token` and keeps
+     * `row_tokens[0]` as the next condition. No row is resampled and no host
+     * scalar participates in the decision.
+     *
+     * Rejection and stop-token semantics remain unchanged when either occurs
+     * before the boundary. The ordinary terminal bonus is used only when the
+     * complete declared verifier transaction fits inside the commit budget.
+     *
+     * @param max_state_commit_rows Positive number of verifier input states
+     *        that may become visible before the next device maintenance edge.
+     */
+    LLAMINAR_SAMPLING_HD void
+    summarize_speculative_verify_batch_at_commit_boundary(
+        int first_token,
+        const int *row_tokens,
+        const int *row_accepted,
+        int row_count,
+        const int *stop_tokens,
+        int stop_token_count,
+        int bonus_ready_token,
+        int has_bonus_ready_token,
+        int max_state_commit_rows,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        const int *greedy_draft_tokens = nullptr,
+        int leading_committed_output_count = 0)
+    {
+        if (max_state_commit_rows <= 0 ||
+            leading_committed_output_count < 0 ||
+            leading_committed_output_count > 1)
+        {
+            initialize_invalid_speculative_batch_outcome(
+                out_tokens,
+                out_token_capacity,
+                out_meta);
+            return;
+        }
+
+        const int full_commit_rows = row_count + 1;
+        const int physical_commit_budget =
+            max_state_commit_rows >=
+                    full_commit_rows - leading_committed_output_count
+                ? full_commit_rows
+                : max_state_commit_rows + leading_committed_output_count;
+        const int effective_commit_rows =
+            physical_commit_budget < full_commit_rows
+                ? physical_commit_budget
+                : full_commit_rows;
+        const int effective_row_count = effective_commit_rows - 1;
+        const bool stopped_at_commit_boundary =
+            effective_row_count < row_count;
+        const int effective_bonus_ready_token =
+            stopped_at_commit_boundary && row_tokens
+                ? row_tokens[effective_row_count]
+                : bonus_ready_token;
+        const int has_effective_bonus_ready_token =
+            stopped_at_commit_boundary
+                ? (row_tokens && effective_bonus_ready_token >= 0 ? 1 : 0)
+                : has_bonus_ready_token;
+
+        summarize_speculative_verify_batch(
+            first_token,
+            row_tokens,
+            row_accepted,
+            effective_row_count,
+            stop_tokens,
+            stop_token_count,
+            effective_bonus_ready_token,
+            has_effective_bonus_ready_token,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            greedy_draft_tokens);
+
+        if (out_meta && out_meta[kSpecBatchMetaOk] != 0)
+        {
+            out_meta[kSpecBatchMetaLeadingCommittedOutputCount] =
+                leading_committed_output_count;
+        }
+
+        /*
+         * A maintenance boundary is a third successful outcome category.  It
+         * is neither a rejection nor acceptance of the complete physical
+         * verifier batch.  The ordinary reducer above intentionally evaluates
+         * only the serial-visible prefix so it can reuse the exact stop and
+         * rejection semantics.  If that entire prefix accepted, reinterpret
+         * its synthetic "bonus" as the already-sampled condition token at the
+         * maintenance edge and make the distinction explicit in the ABI.
+         */
+        if (stopped_at_commit_boundary &&
+            out_meta &&
+            out_meta[kSpecBatchMetaOk] != 0 &&
+            out_meta[kSpecBatchMetaStoppedOnOutput] == 0 &&
+            out_meta[kSpecBatchMetaAllSpeculativeAccepted] != 0 &&
+            out_meta[kSpecBatchMetaSampledTerminal] != 0)
+        {
+            out_meta[kSpecBatchMetaAllSpeculativeAccepted] = 0;
+            out_meta[kSpecBatchMetaSampledTerminal] = 0;
+            out_meta[kSpecBatchMetaCommitBoundaryClipped] = 1;
+        }
+    }
+
+    /**
      * @brief Derive live-state publication rows from compact verifier metadata.
      *
      * The compact stochastic verifier summary intentionally has two different
@@ -722,12 +2718,16 @@ namespace llaminar2::sampling_math
      *
      * - kSpecBatchMetaAcceptedSpeculativePrefix counts accepted MTP draft rows.
      * - kSpecBatchMetaTargetVerifierStateCommitCount counts verifier input
-     *   rows whose target-model state may be published. This includes row zero,
-     *   the first main-model token.
+     *   rows whose target-model state is mathematically valid. This includes row
+     *   zero, the first main-model token.
      *
-     * Accepted-state publication must use the second count. Keeping this tiny
-     * helper shared between CPU tests and GPU kernels prevents CUDA, ROCm, and
-     * CPU from drifting on the off-by-one boundary after a rejection.
+     * Accepted-state publication starts from the second count, then clamps it to
+     * @p max_state_commit_rows. The clamp represents the serial-visible response
+     * boundary: a terminal all-accepted verifier row can be valid speculative
+     * evidence while its input token must remain the pending condition token.
+     * Keeping this tiny helper shared between CPU tests and GPU kernels prevents
+     * CUDA, ROCm, and CPU from drifting on rejection and response-budget
+     * boundaries.
      */
     LLAMINAR_SAMPLING_HD void derive_speculative_publication_metadata(
         const int *meta,
@@ -778,13 +2778,17 @@ namespace llaminar2::sampling_math
         if (request_meta[kSpecBatchMetaOk] == 0)
             return;
 
-        const int accepted_state_count =
+        const int verifier_state_count =
             request_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
-        if (accepted_state_count < 0 ||
-            accepted_state_count > max_state_commit_rows)
+        if (verifier_state_count < 0 ||
+            verifier_state_count > padded_state_rows_per_request)
         {
             return;
         }
+        const int accepted_state_count =
+            verifier_state_count < max_state_commit_rows
+                ? verifier_state_count
+                : max_state_commit_rows;
 
         if (out_accepted_state_count)
             *out_accepted_state_count = accepted_state_count;
@@ -803,13 +2807,33 @@ namespace llaminar2::sampling_math
                 request_meta[kSpecBatchMetaReadyToken];
             const bool sampled_terminal =
                 request_meta[kSpecBatchMetaSampledTerminal] != 0;
-            if (sampled_terminal && ready_token >= 0)
+            const bool commit_boundary_clipped =
+                request_meta[kSpecBatchMetaCommitBoundaryClipped] != 0;
+            const int output_count =
+                request_meta[kSpecBatchMetaOutputCount];
+            const bool publication_clipped =
+                accepted_state_count < verifier_state_count;
+            if (publication_clipped &&
+                accepted_state_count >= 0 &&
+                accepted_state_count < output_count &&
+                accepted_state_count < output_token_stride)
+            {
+                /*
+                 * The first verifier output beyond the published state prefix is
+                 * the exact serial condition token.  A sampled terminal token is
+                 * one generation farther ahead and must not cross this boundary.
+                 */
+                *out_next_condition_token =
+                    output_tokens[static_cast<size_t>(request_index) *
+                                      static_cast<size_t>(output_token_stride) +
+                                  static_cast<size_t>(accepted_state_count)];
+            }
+            else if ((sampled_terminal || commit_boundary_clipped) &&
+                     ready_token >= 0)
             {
                 *out_next_condition_token = ready_token;
             }
 
-            const int output_count =
-                request_meta[kSpecBatchMetaOutputCount];
             if (*out_next_condition_token < 0 &&
                 output_count > 0 && output_count <= output_token_stride)
             {
@@ -830,22 +2854,185 @@ namespace llaminar2::sampling_math
     }
 
     /**
-     * @brief Derive shifted MTP-KV publication counts from compact metadata.
+     * @brief Commit one compact outcome and derive its live-state publication.
      *
-     * The main verifier publication advances the target model cache to
-     * `base + accepted_state_count`.  Depth `d` of the shifted sidecar cache is
-     * one-or-more rows behind the main model and must instead expose
-     * `max(0, target - d - 1)` rows.  The accepted count passed to a ring cache
-     * is the delta from its prior shifted length so wrapped heads advance by the
-     * same number of newly valid shifted rows as the old host publisher used.
+     * GPU generation used to launch one scalar kernel to append response tokens
+     * and a second scalar kernel to derive the accepted KV/recurrent-state row.
+     * Both operations consume the same compact token/metadata row, run on the
+     * same producer stream, and form one indivisible serial-decode transaction.
+     * Keeping them in separate launches added latency and allowed later callers
+     * to accidentally publish state without first committing the response
+     * ledger.  This shared helper makes that illegal by construction.
+     *
+     * Publication is validated before response bytes are mutated.  Response
+     * append is then all-or-nothing: its helper validates every count and
+     * capacity before copying tokens.  If either half fails, @p out_ok is zero
+     * and the resident controller becomes terminal, so downstream publication
+     * kernels cannot expose a partially committed transaction.
+     *
+     * @param output_tokens Compact output rows for every request.
+     * @param output_token_stride Compact token capacity per request.
+     * @param meta Compact metadata rows for every request.
+     * @param meta_stride Compact metadata capacity per request.
+     * @param request_index Request row owned by this invocation.
+     * @param padded_state_rows_per_request Static verifier graph row capacity.
+     * @param base_cached_tokens Device-owned cache count before verifier replay.
+     * @param response_tokens Persistent response row for this request.
+     * @param response_capacity Persistent response-row capacity.
+     * @param control Persistent generation-controller row.  Its current
+     *        transaction budget is the sole publication limit.
+     * @return true only when response and publication state were both committed.
      */
-    LLAMINAR_SAMPLING_HD void derive_shifted_speculative_publication_metadata(
-        const int *meta,
+    LLAMINAR_SAMPLING_HD bool
+    commit_device_generation_and_derive_speculative_publication_metadata(
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int *meta,
         int meta_stride,
         int request_index,
         int padded_state_rows_per_request,
         int base_cached_tokens,
-        int max_state_commit_rows,
+        int32_t *response_tokens,
+        int response_capacity,
+        int *control,
+        int *out_restore_row,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_count,
+        int *out_ok,
+        int32_t *out_next_condition_token = nullptr,
+        int *out_all_drafts_accepted = nullptr,
+        int *out_stopped = nullptr)
+    {
+        /*
+         * Validate every required address and geometry before either helper can
+         * derive a request-row address.  Backend launchers enforce the same
+         * contract on the host, but this device-side guard is still essential:
+         * graph node parameters are mutable, and a malformed replay must become
+         * a terminal request error instead of performing undefined pointer
+         * arithmetic or publishing stale metadata.
+         */
+        if (!output_tokens ||
+            output_token_stride <= 0 ||
+            !meta ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            request_index < 0 ||
+            padded_state_rows_per_request <= 0 ||
+            base_cached_tokens < 0 ||
+            !response_tokens ||
+            response_capacity <= 0 ||
+            !control ||
+            !out_restore_row ||
+            !out_target_cached_tokens ||
+            !out_accepted_state_count ||
+            !out_ok)
+        {
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidPublicationMetadata);
+        }
+
+        /*
+         * A successfully completed request is an absorbing state.  A static
+         * graph may reach this node again before its device-side loop observes
+         * the terminal predicate, but stale verifier scratch must never turn a
+         * successful terminal controller into an error or republish an old
+         * accepted row.  Publish an explicitly inert state transaction while
+         * preserving the last valid condition-token value: speculative readers
+         * can safely drain already-enqueued work, while every live-state
+         * publisher sees `out_ok == 0` and a negative restore row.
+         *
+         * This check deliberately precedes every compact-metadata read.  Once
+         * terminal, those bytes are outside the request state machine and are
+         * neither trusted nor repaired.
+         */
+        if (control[kDeviceGenerationControlOk] != 0 &&
+            control[kDeviceGenerationControlRequestComplete] != 0)
+        {
+            *out_restore_row = -1;
+            *out_target_cached_tokens = base_cached_tokens;
+            *out_accepted_state_count = 0;
+            *out_ok = 0;
+            if (out_all_drafts_accepted)
+                *out_all_drafts_accepted = 0;
+            if (out_stopped)
+                *out_stopped = 1;
+            return true;
+        }
+
+        *out_ok = 0;
+        if (control[kDeviceGenerationControlOk] == 0)
+            return false;
+
+        int *request_meta =
+            meta + static_cast<size_t>(request_index) *
+                       static_cast<size_t>(meta_stride);
+        const int transaction_commit_budget =
+            control[kDeviceGenerationControlTransactionCommitBudget];
+
+        derive_speculative_publication_metadata(
+            meta,
+            meta_stride,
+            request_index,
+            padded_state_rows_per_request,
+            base_cached_tokens,
+            transaction_commit_budget,
+            out_restore_row,
+            out_target_cached_tokens,
+            out_accepted_state_count,
+            out_ok,
+            output_tokens,
+            output_token_stride,
+            out_next_condition_token,
+            out_all_drafts_accepted,
+            out_stopped);
+
+        if (!out_ok || *out_ok == 0)
+        {
+            request_meta[kSpecBatchMetaOk] = 0;
+            return fail_device_generation_control(
+                control,
+                DeviceGenerationError::InvalidPublicationMetadata);
+        }
+
+        const int32_t *request_output_tokens =
+            output_tokens + static_cast<size_t>(request_index) *
+                                static_cast<size_t>(output_token_stride);
+        if (!append_speculative_outcome_to_device_generation(
+                request_output_tokens,
+                output_token_stride,
+                request_meta,
+                meta_stride,
+                response_tokens,
+                response_capacity,
+                control))
+        {
+            *out_ok = 0;
+            request_meta[kSpecBatchMetaOk] = 0;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Derive shifted MTP-KV counts from canonical primary publication.
+     *
+     * The primary publication transaction has already validated compact
+     * verifier metadata and applied the resident response/maintenance budget.
+     * Re-reading compact metadata here would repeat that policy with another
+     * scalar input and could let main and shifted caches publish different
+     * prefixes.  This helper therefore accepts only the canonical primary
+     * output: base count, committed target count, and publication validity.
+     *
+     * Depth `d` is `d + 1` rows behind the main model.  The shifted target is
+     * `max(0, main_target - d - 1)`, while its accepted count is the delta from
+     * the correspondingly shifted pre-transaction base.  This preserves ring
+     * head movement at short prefixes without inventing a second commit limit.
+     */
+    LLAMINAR_SAMPLING_HD void
+    derive_shifted_speculative_publication_metadata_from_primary(
+        int base_cached_tokens,
+        int main_target_cached_tokens,
+        int main_publication_ok,
         int mtp_depth,
         int *out_target_cached_tokens,
         int *out_accepted_state_count,
@@ -858,26 +3045,10 @@ namespace llaminar2::sampling_math
         if (out_ok)
             *out_ok = 0;
 
-        if (mtp_depth < 0)
-            return;
-
-        int restore_row = -1;
-        int main_target_cached_tokens = base_cached_tokens;
-        int main_accepted_state_count = 0;
-        int ok = 0;
-        derive_speculative_publication_metadata(
-            meta,
-            meta_stride,
-            request_index,
-            padded_state_rows_per_request,
-            base_cached_tokens,
-            max_state_commit_rows,
-            &restore_row,
-            &main_target_cached_tokens,
-            &main_accepted_state_count,
-            &ok);
-
-        if (!ok)
+        if (mtp_depth < 0 ||
+            base_cached_tokens < 0 ||
+            main_target_cached_tokens < base_cached_tokens ||
+            main_publication_ok == 0)
             return;
 
         const int shift = mtp_depth + 1;
@@ -901,6 +3072,91 @@ namespace llaminar2::sampling_math
     }
 
     /**
+     * @brief Prepare valid shifted-MTP suffix tokens without reading metadata on host.
+     *
+     * LocalTP device-resident publication may need to append shifted sidecar KV
+     * rows for accepted verifier outputs after the first sidecar-owned row.  The
+     * accepted-state count is stored in compact device metadata, so GPU callers
+     * use this helper to build a fixed-shape sidecar token rowset while preserving
+     * the exact serial boundary:
+     *
+     * - rows before `accepted_state_count - first_output_token_index` copy the
+     *   matching compact output token,
+     * - rows beyond that boundary receive @p filler_token and are discarded by the
+     *   later shifted-KV publication count,
+     * - invalid metadata never copies speculative output tokens.
+     */
+    LLAMINAR_SAMPLING_HD void prepare_speculative_shifted_kv_tokens(
+        const int *meta,
+        int meta_stride,
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int request_index,
+        int first_output_token_index,
+        int row_count,
+        int32_t filler_token,
+        int32_t *out_tokens)
+    {
+        if (!out_tokens || row_count <= 0)
+            return;
+
+        for (int row = 0; row < row_count; ++row)
+            out_tokens[row] = filler_token;
+
+        if (!meta ||
+            !output_tokens ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            output_token_stride <= first_output_token_index ||
+            request_index < 0 ||
+            first_output_token_index < 0)
+        {
+            return;
+        }
+
+        const int *request_meta =
+            meta + static_cast<size_t>(request_index) *
+                       static_cast<size_t>(meta_stride);
+        if (request_meta[kSpecBatchMetaOk] == 0)
+            return;
+
+        const int accepted_state_count =
+            request_meta[kSpecBatchMetaTargetVerifierStateCommitCount];
+        const int output_count = request_meta[kSpecBatchMetaOutputCount];
+        const int32_t *request_tokens =
+            output_tokens + static_cast<size_t>(request_index) *
+                                static_cast<size_t>(output_token_stride);
+        if (output_count < 0 || output_count > output_token_stride)
+            return;
+        if (output_count > 0)
+        {
+            const int32_t live_filler = request_tokens[0];
+            for (int row = 0; row < row_count; ++row)
+                out_tokens[row] = live_filler;
+        }
+        if (accepted_state_count <= first_output_token_index ||
+            output_count <= first_output_token_index)
+        {
+            return;
+        }
+
+        const int accepted_suffix_rows =
+            accepted_state_count - first_output_token_index;
+        const int output_suffix_rows =
+            output_count - first_output_token_index;
+        const int copy_rows =
+            accepted_suffix_rows < output_suffix_rows
+                ? accepted_suffix_rows
+                : output_suffix_rows;
+        const int bounded_copy_rows =
+            copy_rows < row_count ? copy_rows : row_count;
+        for (int row = 0; row < bounded_copy_rows; ++row)
+        {
+            out_tokens[row] =
+                request_tokens[first_output_token_index + row];
+        }
+    }
+
+    /**
      * @brief Decide whether a speculative batch needs a bonus ready token.
      *
      * GPU lazy verifier kernels use this before sampling the bonus distribution:
@@ -920,7 +3176,6 @@ namespace llaminar2::sampling_math
     {
         if (first_token < 0 ||
             row_count < 0 ||
-            row_count > kSpeculativeBatchMaxRows ||
             stop_token_count < 0 ||
             stop_token_count > kSpeculativeBatchMaxStopTokens)
         {
@@ -969,35 +3224,76 @@ namespace llaminar2::sampling_math
         const int *stop_tokens,
         int stop_token_count,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta)
     {
-        if (!verifier_tokens || !draft_tokens || compare_row_count < 0 ||
-            compare_row_count > kSpeculativeBatchMaxRows)
+        if (!verifier_tokens || !draft_tokens || compare_row_count < 0)
         {
             if (out_meta)
                 out_meta[kSpecBatchMetaOk] = 0;
             return;
         }
 
-        int row_accepted[kSpeculativeBatchMaxRows] = {0, 0, 0, 0};
-        for (int row = 0; row < compare_row_count; ++row)
-        {
-            row_accepted[row] =
-                verifier_tokens[row] == draft_tokens[row + 1] ? 1 : 0;
-        }
-
         const int bonus_ready_token = verifier_tokens[compare_row_count];
         summarize_speculative_verify_batch(
             first_token,
             verifier_tokens,
-            row_accepted,
+            /*row_accepted=*/nullptr,
             compare_row_count,
             stop_tokens,
             stop_token_count,
             bonus_ready_token,
             /*has_bonus_ready_token=*/1,
             out_tokens,
-            out_meta);
+            out_token_capacity,
+            out_meta,
+            draft_tokens);
+    }
+
+    /**
+     * @brief Greedy companion to the device-owned commit-boundary reducer.
+     *
+     * `verifier_tokens[compare_row_count]` remains the ordinary bonus sample.
+     * When the maintenance boundary is earlier, the shared boundary reducer
+     * instead promotes `verifier_tokens[max_state_commit_rows - 1]` to the
+     * ready condition token without changing its value or logical position.
+     */
+    LLAMINAR_SAMPLING_HD void
+    summarize_greedy_speculative_verify_batch_at_commit_boundary(
+        int first_token,
+        const int *verifier_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        const int *stop_tokens,
+        int stop_token_count,
+        int max_state_commit_rows,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        int leading_committed_output_count = 0)
+    {
+        if (!verifier_tokens || !draft_tokens || compare_row_count < 0)
+        {
+            if (out_meta)
+                out_meta[kSpecBatchMetaOk] = 0;
+            return;
+        }
+
+        summarize_speculative_verify_batch_at_commit_boundary(
+            first_token,
+            verifier_tokens,
+            /*row_accepted=*/nullptr,
+            compare_row_count,
+            stop_tokens,
+            stop_token_count,
+            verifier_tokens[compare_row_count],
+            /*has_bonus_ready_token=*/1,
+            max_state_commit_rows,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            draft_tokens,
+            leading_committed_output_count);
     }
 
 } // namespace llaminar2::sampling_math

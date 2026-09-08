@@ -13,6 +13,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../transfer/TransferEngine.h"
 #include <chrono>
 #include <sstream>
 #include <mpi.h>
@@ -151,7 +152,7 @@ namespace llaminar2
         params_.mpi_ctx->recv(data, count, MPI_FLOAT, params_.peer_rank, params_.tag);
 
         // Mark tensor as host-authoritative after receiving new data
-        params_.tensor->mark_host_dirty();
+        TransferEngine::publishHostWrite(params_.tensor);
 
         auto end_time = std::chrono::high_resolution_clock::now();
 

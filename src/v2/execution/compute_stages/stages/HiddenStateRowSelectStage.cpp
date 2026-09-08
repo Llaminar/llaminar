@@ -2,10 +2,12 @@
  * @file HiddenStateRowSelectStage.cpp
  * @brief Implementation of graph-capturable hidden-state row selection.
  *
- * Key algorithm: copy the dynamic last-real-token row into a stable one-row
- * scratch tensor before LM head. On GPU, the selected row lives in a graph
- * workspace scalar that is uploaded before capture/replay; captured execution
- * records only the row-copy kernel.
+ * Key algorithm: copy one hidden-state row into a stable one-row tensor.
+ * Legacy dynamic bucketed-prefill rows live in a graph-workspace scalar
+ * uploaded before capture or replay. Exact-shape diagnostic rows use a fixed
+ * device-only launch argument. Padded diagnostic rows read their real row count
+ * directly from the persistent request-length allocation. Neither diagnostic
+ * policy declares scalar workspace or permits host replay mutation.
  */
 
 #include "HiddenStateRowSelectStage.h"
@@ -14,6 +16,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 
 #ifdef HAVE_CUDA
@@ -80,8 +83,12 @@ namespace llaminar2
         (void)k;
 
         WorkspaceRequirements reqs;
-        if (params_.device_id.is_gpu())
+        if (params_.device_id.is_gpu() &&
+            params_.selection_policy ==
+                SelectionPolicy::DynamicDeviceScalar)
+        {
             reqs.buffers.push_back({selectedRowScalarBufferName(), sizeof(int), alignof(int), true});
+        }
         return reqs;
     }
 
@@ -102,6 +109,9 @@ namespace llaminar2
 
     void HiddenStateRowSelectStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
     {
+        if (params_.selection_policy != SelectionPolicy::DynamicDeviceScalar)
+            return;
+
         // real_seq_len is authoritative for bucketed prefill. If it is absent,
         // fall back to the captured bucket shape so exact legacy paths still use
         // the final bucket row.
@@ -111,7 +121,19 @@ namespace llaminar2
 
     void HiddenStateRowSelectStage::setSelectedRowForReplay(int selected_row_idx)
     {
-        selected_row_idx_ = normalizeSelectedRow(selected_row_idx);
+        const int normalized_row = normalizeSelectedRow(selected_row_idx);
+        if (params_.selection_policy != SelectionPolicy::DynamicDeviceScalar)
+        {
+            if (normalized_row != selected_row_idx_)
+            {
+                LOG_ERROR(
+                    "[HiddenStateRowSelectStage] Cannot mutate a device-owned row policy from "
+                    << selected_row_idx_ << " to " << normalized_row);
+            }
+            return;
+        }
+
+        selected_row_idx_ = normalized_row;
         refreshPinnedSelectedRow();
         if (gpu_state_)
             gpu_state_->device_value_uploaded = false;
@@ -122,14 +144,11 @@ namespace llaminar2
         (void)ctx;
         if (!params_.device_id.is_gpu())
             return true;
+        if (params_.selection_policy != SelectionPolicy::DynamicDeviceScalar)
+            return true;
         if (stream)
             setGPUStream(stream);
-        if (!gpuStream())
-        {
-            LOG_ERROR("[HiddenStateRowSelectStage] Graph launch preparation requires an explicit non-null stream on "
-                      << params_.device_id.toString());
-            return false;
-        }
+        (void)requireGPUStream();
         return uploadGpuSelectedRow();
     }
 
@@ -148,6 +167,19 @@ namespace llaminar2
             LOG_ERROR("[HiddenStateRowSelectStage] Invalid dimensions: seq_len=" << params_.seq_len
                                                                                  << " d_model=" << params_.d_model);
             return false;
+        }
+        if (params_.selection_policy ==
+            SelectionPolicy::DeviceResidentRequestLength)
+        {
+            if (!params_.device_id.is_gpu() ||
+                !params_.request_sequence_length_device)
+            {
+                LOG_ERROR(
+                    "[HiddenStateRowSelectStage] Device-resident request-length "
+                    "selection requires a GPU stage and a non-null resident "
+                    "length pointer");
+                return false;
+            }
         }
 
         auto *resolved_input = const_cast<TensorBase *>(requireTensorBasePtr(params_.input, "input"));
@@ -181,15 +213,43 @@ namespace llaminar2
 
     bool HiddenStateRowSelectStage::execute(IDeviceContext *ctx)
     {
-        (void)ctx;
-
         TensorBase *input_base = nullptr;
         TensorBase *output_base = nullptr;
         if (!validateCommon(&input_base, &output_base))
             return false;
 
         if (params_.device_id.is_gpu())
+        {
+            /*
+             * GPU libraries and collectives are allowed to bind their own
+             * device while they enqueue work. The row checkpoint is an
+             * explicit compute handoff after those stages, so re-establish the
+             * graph node's device before using its stream. Without this
+             * boundary, a valid ROCm:0 stream launched while the calling
+             * thread still names ROCm:1 fails with
+             * hipErrorInvalidResourceHandle.
+             *
+             * Direct kernel integration tests intentionally pass no execution
+             * context because they create and bind their own stream after
+             * selecting its device. Production graph execution always supplies
+             * the context, and a mismatched context is a graph construction
+             * error rather than something this stage may silently repair.
+             */
+            if (ctx)
+            {
+                if (ctx->deviceId() != params_.device_id)
+                {
+                    LOG_ERROR(
+                        "[HiddenStateRowSelectStage] Execution context device "
+                        "does not own the row-selection stage"
+                        << " context=" << ctx->deviceId().toString()
+                        << " stage=" << params_.device_id.toString());
+                    return false;
+                }
+                ctx->activateDevice();
+            }
             return executeGPU(input_base, output_base);
+        }
         return executeCPU(input_base, output_base);
     }
 
@@ -282,11 +342,7 @@ namespace llaminar2
     {
         if (!ensureGpuParamStateInitialized())
             return false;
-        if (!gpuStream())
-        {
-            LOG_ERROR("[HiddenStateRowSelectStage] GPU selected-row upload requires an explicit non-null stream");
-            return false;
-        }
+        (void)requireGPUStream();
 
         refreshPinnedSelectedRow();
 
@@ -332,34 +388,44 @@ namespace llaminar2
 
     bool HiddenStateRowSelectStage::executeGPU(TensorBase *input_base, TensorBase *output_base)
     {
-        if (!ensureGpuParamStateInitialized())
+        const bool fixed_device_row =
+            params_.selection_policy == SelectionPolicy::FixedDeviceRow;
+        const bool resident_request_length =
+            params_.selection_policy ==
+            SelectionPolicy::DeviceResidentRequestLength;
+        if (!fixed_device_row &&
+            !resident_request_length &&
+            !ensureGpuParamStateInitialized())
             return false;
 
-        const bool graph_managed = params_.input_buffer_id.has_value() && params_.output_buffer_id.has_value();
-        if (!graph_managed)
-        {
-            // Direct tests may bypass DeviceGraphExecutor coherence. Use the
-            // explicit stage stream, and allocate outputs without uploading
-            // stale host contents because this kernel overwrites the row.
-            if (!input_base->ensureOnDevice(params_.device_id, gpuStream()) ||
-                !output_base->allocateOnDevice(params_.device_id, gpuStream()))
-            {
-                LOG_ERROR("[HiddenStateRowSelectStage] Failed to prepare direct tensors on "
-                          << params_.device_id.toString());
-                return false;
-            }
-        }
+        /*
+         * DeviceGraphExecutor owns every arena transfer and output allocation.
+         * Direct GPU integration fixtures must perform the same setup before
+         * invoking the stage; executeGPU() never creates graph-visible storage.
+         */
+        /*
+         * Input and output arena ownership are independent. A diagnostic
+         * checkpoint commonly reads an arena activation into an external,
+         * graph-owned observation tensor: the executor must bind the input,
+         * while this stage must still publish the external output itself.
+         */
+        const bool output_graph_managed =
+            params_.output_buffer_id.has_value();
+        const StageGPUExecution execution = gpuExecution();
+        execution.requirePreparedInput(input_base);
+        execution.requirePreparedOutput(output_base);
 
         const auto *input_device = static_cast<const float *>(input_base->gpu_data_ptr());
         auto *output_device = static_cast<float *>(output_base->gpu_data_ptr());
         if (!input_device || !output_device)
         {
-            LOG_ERROR("[HiddenStateRowSelectStage] Missing GPU data pointers"
-                      << (graph_managed ? " after graph-managed arena coherence" : " after direct tensor preparation"));
+            LOG_ERROR("[HiddenStateRowSelectStage] Missing executor-prepared GPU data pointers");
             return false;
         }
 
-        if (!uploadGpuSelectedRow())
+        if (!fixed_device_row &&
+            !resident_request_length &&
+            !uploadGpuSelectedRow())
         {
             LOG_ERROR("[HiddenStateRowSelectStage] Failed to update GPU selected-row scalar");
             return false;
@@ -370,41 +436,102 @@ namespace llaminar2
         {
 #ifdef HAVE_CUDA
             auto stream = gpuStream();
-            launched = cuda::launchRowSelectFP32(
-                input_device,
-                output_device,
-                gpu_state_->device_selected_row,
-                params_.seq_len,
-                params_.d_model,
-                stream);
+            launched =
+                resident_request_length
+                    ? cuda::launchRequestTerminalRowsSelectFP32(
+                          input_device,
+                          output_device,
+                          params_.request_sequence_length_device,
+                          params_.seq_len,
+                          params_.seq_len,
+                          params_.d_model,
+                          /*request_count=*/1,
+                          stream)
+                : fixed_device_row
+                    ? cuda::launchFixedRowSelectFP32(
+                          input_device,
+                          output_device,
+                          selected_row_idx_,
+                          params_.seq_len,
+                          params_.d_model,
+                          stream)
+                    : cuda::launchRowSelectFP32(
+                          input_device,
+                          output_device,
+                          gpu_state_->device_selected_row,
+                          params_.seq_len,
+                          params_.d_model,
+                          stream);
 #endif
         }
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
             auto stream = gpuStream();
-            launched = rocm::launchRowSelectFP32(
-                input_device,
-                output_device,
-                gpu_state_->device_selected_row,
-                params_.seq_len,
-                params_.d_model,
-                stream);
+            launched =
+                resident_request_length
+                    ? rocm::launchRequestTerminalRowsSelectFP32(
+                          input_device,
+                          output_device,
+                          params_.request_sequence_length_device,
+                          params_.seq_len,
+                          params_.seq_len,
+                          params_.d_model,
+                          /*request_count=*/1,
+                          stream)
+                : fixed_device_row
+                    ? rocm::launchFixedRowSelectFP32(
+                          input_device,
+                          output_device,
+                          selected_row_idx_,
+                          params_.seq_len,
+                          params_.d_model,
+                          stream)
+                    : rocm::launchRowSelectFP32(
+                          input_device,
+                          output_device,
+                          gpu_state_->device_selected_row,
+                          params_.seq_len,
+                          params_.d_model,
+                          stream);
 #endif
         }
 
         if (!launched)
         {
-            LOG_ERROR("[HiddenStateRowSelectStage] GPU row-select launch failed on " << params_.device_id.toString());
+            LOG_ERROR(
+                "[HiddenStateRowSelectStage] GPU row-select launch failed"
+                << " device=" << params_.device_id.toString()
+                << " policy=" << static_cast<int>(params_.selection_policy)
+                << " stream=" << gpuStream()
+                << " input=" << static_cast<const void *>(input_device)
+                << " output=" << static_cast<void *>(output_device)
+                << " request_length="
+                << static_cast<const void *>(
+                       params_.request_sequence_length_device)
+                << " seq_len=" << params_.seq_len
+                << " d_model=" << params_.d_model);
             return false;
         }
 
-        if (!graph_managed)
+        if (!output_graph_managed)
         {
-            output_base->transitionToWithEvent(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                params_.device_id,
-                gpuStream());
+            /*
+             * A direct-output row selector can also serve as a graph-captured
+             * device checkpoint. Recording a standalone TensorBase completion
+             * event while capture is active would add a second, host-observed
+             * lifetime mechanism to the graph. The graph launch itself owns
+             * completion in that case, so publish only device authority here.
+             * Ordinary eager execution retains its precise stream event.
+             */
+            if (isGraphCaptureActive())
+            {
+                TransferEngine::publishGraphOwnedDeviceWrite(
+                    output_base,
+                    params_.device_id);
+            }
+            else
+                gpuExecution().publish(output_base);
         }
         return true;
     }
@@ -462,6 +589,9 @@ namespace llaminar2
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("selected_row_idx", selected_row_idx_);
+        info.addScalarInt(
+            "selection_policy",
+            static_cast<int>(params_.selection_policy));
         return info;
     }
 
@@ -481,11 +611,12 @@ namespace llaminar2
 
     StageBufferContract HiddenStateRowSelectStage::bufferContract() const
     {
-        if (!params_.input_buffer_id || !params_.output_buffer_id)
-            return {};
-        return StageBufferContract::build()
-            .addInput(*params_.input_buffer_id, "FP32")
-            .addOutput(*params_.output_buffer_id, "FP32");
+        StageBufferContract contract = StageBufferContract::build();
+        if (params_.input_buffer_id)
+            contract.addInput(*params_.input_buffer_id, "FP32");
+        if (params_.output_buffer_id)
+            contract.addOutput(*params_.output_buffer_id, "FP32");
+        return contract;
     }
 
 } // namespace llaminar2

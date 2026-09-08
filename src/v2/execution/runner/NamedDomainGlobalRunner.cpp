@@ -2,6 +2,11 @@
  * @file NamedDomainGlobalRunner.cpp
  * @brief Implementation of NamedDomainGlobalRunner
  *
+ * Converts named-domain topology into stage-local runners and a coordinated
+ * global execution lifecycle. Runtime policy comes from the canonical rank
+ * plan so model loading, graph admission, and request execution cannot derive
+ * independent hardware defaults from a rank-local primary device.
+ *
  * @author David Sanftenberg
  * @date May 2026
  */
@@ -44,8 +49,20 @@ namespace llaminar2
         if (config.pp_stage_definitions.empty())
             return false;
 
+        // A PP topology can cross ranks even when every individual stage is a
+        // rank-local domain.  The cross-rank edge exists between consecutive
+        // stage owners, so inspect the complete typed pipeline rather than
+        // asking whether one domain spans ranks by itself.
+        std::set<std::string> stage_domains;
+        for (const auto &stage : config.pp_stage_definitions)
+            stage_domains.insert(stage.domain_name);
+
+        std::set<int> pipeline_ranks;
         for (const auto &domain : config.domain_definitions)
         {
+            if (!stage_domains.contains(domain.name))
+                continue;
+
             if (domain.scope == TPScope::NODE_LOCAL || domain.scope == TPScope::GLOBAL)
             {
                 return true;
@@ -54,6 +71,11 @@ namespace llaminar2
             {
                 return true;
             }
+            if (domain.owner_rank)
+                pipeline_ranks.insert(*domain.owner_rank);
+            pipeline_ranks.insert(
+                domain.explicit_ranks.begin(), domain.explicit_ranks.end());
+
             // AUTO scope: check if devices span multiple unique rank-qualified hostnames.
             // Devices with NUMA-qualified addresses like "0:cpu:0" and "1:cpu:0" imply
             // different ranks when the NUMA index equals the rank ordinal.
@@ -68,7 +90,7 @@ namespace llaminar2
                 return true;
             }
         }
-        return false;
+        return pipeline_ranks.size() > 1u;
     }
 
     // =========================================================================
@@ -233,6 +255,9 @@ namespace llaminar2
             // Step 7: Per-rank plan
             // ----------------------------------------------------------
             GlobalPPRankPlan rank_plan = GlobalPPRankPlanBuilder::build(topology, my_rank);
+            RankExecutionPlan lifecycle_plan = plan_builder_->buildPlanForRank(
+                config_, model_config, cluster_inventory, my_rank);
+            config_.mtp.depth_defaults_profile = lifecycle_plan.runtime.mtp.depth_defaults_profile;
 
             // ----------------------------------------------------------
             // Step 8: Model loading + stage runner construction
@@ -244,26 +269,22 @@ namespace llaminar2
                 return setError("NamedDomainGlobalRunner: model_path is required for full initialization");
             }
 
-            // Build InferenceRunnerConfig base
-            auto runtime_cfg = RuntimeConfig::fromOrchestrationConfig(
-                config_.max_seq_len,
-                config_.batch_size,
-                config_.activation_precision,
-                config_.kv_cache_precision,
-                config_.fused_attention_backend,
-                config_.moe_expert_mode,
-                config_.moe_hot_expert_cache,
-                config_.moe_rebalance,
-                config_.prefix_cache,
-                config_.mtp);
+            // Planning already parsed runtime intent and selected domain-owned
+            // defaults. Stage construction consumes that same immutable value.
+            const auto &runtime_cfg = lifecycle_plan.runtime;
             InferenceRunnerConfig base_runner_cfg;
             base_runner_cfg.max_seq_len = runtime_cfg.max_seq_len;
             base_runner_cfg.batch_size = runtime_cfg.batch_size;
             base_runner_cfg.activation_precision = runtime_cfg.activation_precision;
             base_runner_cfg.kv_cache_precision = runtime_cfg.kv_cache_precision;
+            base_runner_cfg.tp_allreduce_precision_override =
+                runtime_cfg.tp_allreduce_precision_override;
             base_runner_cfg.fused_attention_backend = runtime_cfg.fused_attention_backend;
-            base_runner_cfg.moe_expert_mode = runtime_cfg.moe_expert_mode;
+            base_runner_cfg.routed_expert_compute_policy = runtime_cfg.routed_expert_compute_policy;
+            base_runner_cfg.routed_expert_owner_order =
+                runtime_cfg.routed_expert_owner_order;
             base_runner_cfg.moe_hot_expert_cache = runtime_cfg.moe_hot_expert_cache;
+            base_runner_cfg.moe_routed_prefill = runtime_cfg.moe_routed_prefill;
             base_runner_cfg.moe_rebalance = runtime_cfg.moe_rebalance;
             base_runner_cfg.prefix_cache = runtime_cfg.prefix_cache;
             base_runner_cfg.mtp = runtime_cfg.mtp;
@@ -361,7 +382,10 @@ namespace llaminar2
             auto global_orch = std::make_unique<GlobalOrchestrator>(std::move(go_cfg));
 
             // ----------------------------------------------------------
-            // Step 10: Build GlobalOrchestratorRunner and delegate
+            // Step 10: Adopt the physical global runner into the one ordinary
+            // request lifecycle. Prefix restore, forced-token decode, sampling,
+            // reset, and snapshot policy must not be reimplemented by a second
+            // cross-rank wrapper.
             // ----------------------------------------------------------
             std::shared_ptr<ITokenizer> tokenizer;
             if (model_ctx)
@@ -369,19 +393,23 @@ namespace llaminar2
                 tokenizer = createTokenizer(model_ctx);
             }
 
-            GlobalOrchestratorRunner::Config runner_cfg;
-            runner_cfg.orchestration_config = config_;
-            runner_cfg.topology = topology;
-            runner_cfg.mpi_ctx = mpi_ctx;
-            runner_cfg.global_orchestrator = std::move(global_orch);
-            runner_cfg.tokenizer = tokenizer;
+            tokenizer_ = std::move(tokenizer);
+            model_context_ = model_ctx;
+            architecture_name_ = model_ctx ? model_ctx->architecture() : "unknown";
+            inner_ = std::make_unique<OrchestrationRunner>(
+                config_,
+                std::move(lifecycle_plan),
+                std::move(global_orch),
+                mpi_ctx);
 
-            inner_ = std::make_unique<GlobalOrchestratorRunner>(std::move(runner_cfg));
-            if (!inner_->initialize())
-            {
-                return setError("GlobalOrchestratorRunner::initialize() failed: " +
-                                inner_->lastError());
-            }
+            // The public wrapper accepts diagnostic/runtime policy before the
+            // physical graph family exists. Publish it exactly once now that
+            // the common lifecycle and every local stage runner are present.
+            inner_->setSnapshotCaptureFilter(snapshot_capture_filter_);
+            if (snapshot_capture_enabled_)
+                inner_->enableSnapshotCapture(snapshot_output_dir_);
+            inner_->setSamplingParams(active_sampling_params_);
+            inner_->setStopTokens(stop_tokens_);
 
             initialized_ = true;
             LOG_DEBUG("NamedDomainGlobalRunner: initialized on rank " << my_rank);
@@ -398,6 +426,9 @@ namespace llaminar2
         if (inner_)
             inner_->shutdown();
         inner_.reset();
+        tokenizer_.reset();
+        model_context_.reset();
+        architecture_name_.clear();
         initialized_ = false;
     }
 
@@ -462,12 +493,74 @@ namespace llaminar2
 
     const RankExecutionPlan &NamedDomainGlobalRunner::executionPlan() const
     {
-        return empty_plan_;
+        return inner_ ? inner_->executionPlan() : empty_plan_;
     }
 
     const OrchestrationConfig &NamedDomainGlobalRunner::config() const
     {
         return config_;
+    }
+
+    bool NamedDomainGlobalRunner::configureMTPRequestPolicy(
+        const MTPRequestPolicy &policy)
+    {
+        if (!inner_)
+        {
+            last_error_ =
+                "Cannot configure MTP request policy before the named-domain runner is initialized";
+            return false;
+        }
+        if (!inner_->configureMTPRequestPolicy(policy))
+        {
+            last_error_ = inner_->lastError();
+            return false;
+        }
+        return true;
+    }
+
+    MTPRequestPolicy NamedDomainGlobalRunner::mtpRequestPolicy() const
+    {
+        return inner_ ? inner_->mtpRequestPolicy()
+                      : makeMTPRequestPolicy(config_.mtp);
+    }
+
+    void NamedDomainGlobalRunner::runMPIWorkerLoop()
+    {
+        if (inner_)
+            inner_->runMPIWorkerLoop();
+    }
+
+    bool NamedDomainGlobalRunner::yieldMPIWorkersForRetainedRunner()
+    {
+        if (!inner_)
+        {
+            last_error_ =
+                "Cannot yield MPI workers before the named-domain runner is initialized";
+            return false;
+        }
+        if (!inner_->yieldMPIWorkersForRetainedRunner())
+        {
+            last_error_ = inner_->lastError();
+            return false;
+        }
+        return true;
+    }
+
+    void NamedDomainGlobalRunner::shutdownMPIWorkers()
+    {
+        if (inner_)
+            inner_->shutdownMPIWorkers();
+    }
+
+    void NamedDomainGlobalRunner::setMPICoordinatedMode(bool enabled)
+    {
+        if (inner_)
+            inner_->setMPICoordinatedMode(enabled);
+    }
+
+    int NamedDomainGlobalRunner::coordinatedRootRank() const
+    {
+        return inner_ ? inner_->coordinatedRootRank() : 0;
     }
 
     bool NamedDomainGlobalRunner::isInitialized() const
@@ -496,9 +589,24 @@ namespace llaminar2
             inner_->clearCache();
     }
 
+    bool NamedDomainGlobalRunner::purgePrefixCache()
+    {
+        return !inner_ || inner_->purgePrefixCache();
+    }
+
+    RequestRuntimeSummary NamedDomainGlobalRunner::requestRuntimeSummary() const
+    {
+        return inner_ ? inner_->requestRuntimeSummary() : RequestRuntimeSummary{};
+    }
+
     PrefixRuntimeStateSnapshot NamedDomainGlobalRunner::prefixStateProbe() const
     {
         return inner_ ? inner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+    }
+
+    DeviceId NamedDomainGlobalRunner::primaryDeviceId() const
+    {
+        return inner_ ? inner_->primaryDeviceId() : DeviceId::cpu();
     }
 
     const float *NamedDomainGlobalRunner::lastLogits() const
@@ -508,29 +616,59 @@ namespace llaminar2
 
     void NamedDomainGlobalRunner::setStopTokens(const std::vector<int32_t> &stop_tokens)
     {
+        stop_tokens_ = stop_tokens;
         if (inner_)
             inner_->setStopTokens(stop_tokens);
     }
 
+    void NamedDomainGlobalRunner::setSamplingParams(const SamplingParams &params)
+    {
+        active_sampling_params_ = params;
+        if (inner_)
+            inner_->setSamplingParams(params);
+    }
+
+    SamplingParams NamedDomainGlobalRunner::getRecommendedSamplingParams() const
+    {
+        return inner_ ? inner_->getRecommendedSamplingParams()
+                      : SamplingParams{};
+    }
+
     std::shared_ptr<ITokenizer> NamedDomainGlobalRunner::tokenizer() const
     {
-        return inner_ ? inner_->tokenizer() : nullptr;
+        return tokenizer_;
     }
 
     const std::string &NamedDomainGlobalRunner::architecture() const
     {
-        static const std::string empty;
-        return inner_ ? inner_->architecture() : empty;
+        return architecture_name_;
+    }
+
+    const IModelContext *NamedDomainGlobalRunner::modelContextForDiagnostics() const
+    {
+        return model_context_.get();
     }
 
     void NamedDomainGlobalRunner::enableSnapshotCapture(const std::string &output_dir)
     {
+        snapshot_capture_enabled_ = true;
+        snapshot_output_dir_ = output_dir;
         if (inner_)
             inner_->enableSnapshotCapture(output_dir);
     }
 
+    void NamedDomainGlobalRunner::setSnapshotCaptureFilter(
+        const std::vector<std::string> &keys)
+    {
+        snapshot_capture_filter_ = keys;
+        if (inner_)
+            inner_->setSnapshotCaptureFilter(keys);
+    }
+
     void NamedDomainGlobalRunner::disableSnapshotCapture()
     {
+        snapshot_capture_enabled_ = false;
+        snapshot_output_dir_.clear();
         if (inner_)
             inner_->disableSnapshotCapture();
     }

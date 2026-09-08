@@ -1,3 +1,11 @@
+/**
+ * @file Test__PrefixMTPConfig.cpp
+ * @brief Device-free coverage of prefix/MTP configuration and request admission.
+ *
+ * Parser round trips retain user intent independently of topology-selected
+ * defaults. Runtime/device-policy checks prove capacity and threshold values
+ * are sealed consistently without touching models or accelerator state.
+ */
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -8,6 +16,9 @@
 
 #include "config/OrchestrationConfigParser.h"
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "execution/mtp/MTPGraphOwnerPlan.h"
+#include "execution/mtp/MTPDeviceGenerationPolicy.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "models/GraphTypes.h"
 #include "utils/DebugEnv.h"
@@ -72,23 +83,40 @@ namespace
     };
 } // namespace
 
-TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
+TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
 {
     OrchestrationConfig config;
 
-    EXPECT_FALSE(config.prefix_cache.enabled);
+    EXPECT_TRUE(config.prefix_cache.enabled);
     EXPECT_EQ(config.prefix_cache.storage_mode, PrefixCacheStorageMode::Tiered);
     EXPECT_EQ(config.prefix_cache.block_size, 64);
-    EXPECT_EQ(config.prefix_cache.ram_budget_bytes, 4ull * 1024ull * 1024ull * 1024ull);
-    EXPECT_EQ(config.prefix_cache.device_budget_bytes, 256ull * 1024ull * 1024ull);
-    EXPECT_EQ(config.prefix_cache.disk_budget_bytes, 0u);
+    EXPECT_EQ(
+        config.prefix_cache.ram_budget_bytes,
+        kDefaultPrefixCacheRamBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.device_budget_bytes,
+        kDefaultPrefixCacheDeviceBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.disk_budget_bytes,
+        kDefaultPrefixCacheDiskBudgetBytes);
+    const char *home = std::getenv("HOME");
+    ASSERT_NE(home, nullptr);
+    EXPECT_EQ(
+        config.prefix_cache.disk_dir,
+        (std::filesystem::path(home) / ".llaminar" / "kvcache").string());
     EXPECT_EQ(config.prefix_cache.terminal_state, PrefixCacheTerminalStateMode::Auto);
     EXPECT_EQ(config.prefix_cache.moe_policy, PrefixCacheMoEPolicy::PlacementFingerprint);
 
     EXPECT_FALSE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 1);
+    EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 0);
     EXPECT_EQ(config.mtp.max_request_batch, 1);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
+    EXPECT_EQ(
+        config.mtp.terminal_head_policy,
+        MTPTerminalHeadPolicy::MirroredFullVocabulary)
+        << "LocalTP MTP defaults to mirrored verifier heads; disabled MTP "
+           "configurations simply never activate the flag.";
     EXPECT_TRUE(config.mtp.require_terminal_hidden_for_full_hit);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
@@ -99,8 +127,29 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 8);
     EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 3);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 1.0);
-    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.30);
+    EXPECT_FALSE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
+    EXPECT_DOUBLE_EQ(resolveMTPZeroAcceptDemotionRate(config.mtp), 0.30);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
+}
+
+TEST(Test__PrefixMTPConfig, CommandLineCanExplicitlyDisableDefaultPrefixRestore)
+{
+    ArgvHelper args({"llaminar2", "--no-prefix-cache"});
+
+    auto parser = createOrchestrationConfigParser();
+    const auto config = parser->parseArgs(args.argc(), args.argv());
+
+    EXPECT_FALSE(config.prefix_cache.enabled);
+    EXPECT_EQ(config.prefix_cache.storage_mode, PrefixCacheStorageMode::Tiered);
+    EXPECT_EQ(
+        config.prefix_cache.ram_budget_bytes,
+        kDefaultPrefixCacheRamBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.device_budget_bytes,
+        kDefaultPrefixCacheDeviceBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.disk_budget_bytes,
+        kDefaultPrefixCacheDiskBudgetBytes);
 }
 
 TEST(Test__PrefixMTPConfig, ROCmTopKSmallKPartialBlockOverrideIsValidated)
@@ -188,8 +237,10 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
         "--prefix-cache-moe-policy", "invalidate-on-rebalance",
         "--mtp",
         "--mtp-draft-tokens", "2",
+        "--mtp-graph-capacity-draft-tokens", "15",
         "--mtp-max-request-batch", "4",
         "--mtp-verify-mode", "speculative-sampling",
+        "--mtp-terminal-head-policy", "mirrored-full-vocabulary",
         "--mtp-depth-policy", "dynamic",
         "--mtp-min-draft-tokens", "1",
         "--mtp-max-draft-tokens", "3",
@@ -218,8 +269,12 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
 
     EXPECT_TRUE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 2);
+    EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 15);
     EXPECT_EQ(config.mtp.max_request_batch, 4);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
+    EXPECT_EQ(
+        config.mtp.terminal_head_policy,
+        MTPTerminalHeadPolicy::MirroredFullVocabulary);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
     EXPECT_EQ(config.mtp.depth_policy.max_depth, 3);
@@ -229,7 +284,8 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 2);
     EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 3);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.70);
-    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.25);
+    ASSERT_TRUE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
+    EXPECT_DOUBLE_EQ(*config.mtp.depth_policy.demote_zero_accept_rate, 0.25);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.60);
 }
 
@@ -247,6 +303,397 @@ TEST(Test__PrefixMTPConfig, MTPRequestBatchCapacityResolvesRunnerBatchSize)
     mtp.enabled = false;
     EXPECT_EQ(resolveRuntimeBatchSizeForMTP(/*configured_batch_size=*/1, mtp), 1)
         << "Disabled MTP must not quietly inflate normal runner capacity.";
+}
+
+TEST(Test__PrefixMTPConfig, MTPGraphCapacityUsesMaximumPolicyDepthAndRequestCount)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 15;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 15);
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 16)
+        << "A fixed fifteen-draft transaction owns fifteen comparison rows and one bonus row.";
+
+    mtp.draft_tokens = 3;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    mtp.depth_policy.initial_depth = 3;
+    mtp.depth_policy.max_depth = 15;
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 15)
+        << "Graph planning must reserve the promotion ceiling, not only the warm-start depth.";
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 16);
+
+    mtp.max_request_batch = 2;
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 32)
+        << "Request batching flattens one complete target row group per request.";
+
+    mtp.depth_policy.max_depth = 31;
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 31);
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 64)
+        << "Sixteen verifier rows are a certification default, not an architectural maximum.";
+
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    mtp.draft_tokens = 2;
+    mtp.graph_capacity_draft_tokens = 15;
+    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(mtp), 2)
+        << "Retained over-capacity must not widen a fixed execution policy.";
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 15)
+        << "One retained graph family may cover several fixed-depth requests.";
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 32)
+        << "The retained request-batched verifier shape uses graph capacity.";
+}
+
+TEST(Test__PrefixMTPConfig, ValidateRejectsGraphCapacityBelowExecutionPolicy)
+{
+    OrchestrationConfig config;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 3;
+    config.mtp.graph_capacity_draft_tokens = 2;
+
+    const auto errors = config.validate();
+
+    EXPECT_NE(
+        std::find_if(
+            errors.begin(),
+            errors.end(),
+            [](const std::string &error)
+            {
+                return error.find("graph capacity draft tokens must cover") !=
+                       std::string::npos;
+            }),
+        errors.end());
+}
+
+TEST(Test__PrefixMTPConfig, RetainedGraphCapacityCoversPrefillAndMTPShapes)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 15;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 16)
+        << "A small captured-prefill bucket must not truncate depth-fifteen verification.";
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/32, mtp), 32)
+        << "A larger prefill graph already covers the verifier shape.";
+
+    mtp.draft_tokens = 3;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    mtp.depth_policy.initial_depth = 3;
+    mtp.depth_policy.max_depth = 15;
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 16)
+        << "Dynamic planning must reserve the promotion ceiling, not its initial depth.";
+
+    mtp.enabled = false;
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 9)
+        << "Non-MTP retained graphs preserve their selected prefill capacity.";
+}
+
+/**
+ * @brief Execution-off services may retain one explicit MTP setup envelope.
+ *
+ * This is the lifecycle used by a process-resident parity campaign and by a
+ * serving process that changes request policy without changing model
+ * placement. It must reserve capacity without accidentally enabling MTP.
+ */
+TEST(Test__PrefixMTPConfig, DisabledExecutionMayRetainMTPGraphCapacity)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = false;
+    mtp.draft_tokens = 1;
+    mtp.graph_capacity_draft_tokens = 15;
+
+    EXPECT_TRUE(retainsMTPGraphCapacity(mtp));
+    EXPECT_EQ(resolveMTPRetainedDraftCapacity(mtp), 15);
+    EXPECT_EQ(resolveMTPRetainedTargetQueryRows(mtp), 16);
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 16);
+    EXPECT_FALSE(mtp.enabled)
+        << "retained setup capacity must never select an execution policy";
+
+    const MTPGraphOwnerPlan owner_plan(mtp);
+    EXPECT_TRUE(owner_plan.retainsGraphCapacity());
+    EXPECT_EQ(owner_plan.draftDepth(), 15);
+    EXPECT_EQ(owner_plan.requestCapacity(), 1);
+    EXPECT_EQ(owner_plan.verifierRowsPerRequest(), 16);
+    EXPECT_EQ(owner_plan.flattenedTargetRows(), 16);
+    EXPECT_EQ(owner_plan.sidecarGraphSlots(), 21u);
+    EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 35u);
+    EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 15u);
+    EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 32u);
+    EXPECT_EQ(owner_plan.controllerGraphSlots(), 4u);
+    EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 107u);
+    EXPECT_EQ(owner_plan.boundedHelperExecutableSlotCount(), 82u);
+    EXPECT_EQ(owner_plan.generalAuxiliaryExecutableSlotCount(), 25u);
+}
+
+/** @test Every retained depth/request geometry partitions the same owner set. */
+TEST(Test__PrefixMTPConfig, HelperGraphAdmissionTracksRequestScaledVerifierShape)
+{
+    for (const int depth : {1, 2, 3, 15, 31})
+    {
+        for (int requests = 1; requests <= 32; ++requests)
+        {
+            MTPRuntimeConfig config;
+            config.graph_capacity_draft_tokens = depth;
+            config.max_request_batch = requests;
+            const MTPGraphOwnerPlan plan(config);
+            size_t expected_helpers = plan.terminalHiddenGraphSlots() +
+                                      plan.draftPublicationGraphSlots();
+            for (int shape_requests = 1; shape_requests <= requests; ++shape_requests)
+            {
+                const auto executable_class =
+                    MTPGraphOwnerPlan::verifierPreparationExecutableClass(shape_requests);
+                const bool bounded = 4u * static_cast<size_t>(shape_requests) + 2u <=
+                                     GPUGraphMemoryContract::kBoundedFlatHelperMaxNodes;
+                EXPECT_EQ(executable_class == GPUGraphExecutableClass::BoundedFlatHelper,
+                          bounded);
+                if (bounded)
+                    expected_helpers += 2u * static_cast<size_t>(depth + 1);
+            }
+            EXPECT_EQ(plan.boundedHelperExecutableSlotCount(), expected_helpers);
+            EXPECT_EQ(plan.generalAuxiliaryExecutableSlotCount() + expected_helpers,
+                      plan.auxiliaryExecutableSlotCount());
+        }
+    }
+    EXPECT_THROW((void)MTPGraphOwnerPlan::verifierPreparationExecutableClass(0),
+                 std::invalid_argument);
+    EXPECT_EQ(MTPGraphOwnerPlan(MTPRuntimeConfig{}).boundedHelperExecutableSlotCount(), 0u);
+}
+
+TEST(Test__PrefixMTPConfig,
+     TypedRequestPolicyChangesExecutionWithoutChangingPhysicalCapacity)
+{
+    MTPRuntimeConfig retained;
+    retained.enabled = true;
+    retained.draft_tokens = 15;
+    retained.graph_capacity_draft_tokens = 15;
+    retained.max_request_batch = 4;
+    retained.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    retained.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
+
+    MTPRequestPolicy request;
+    request.enabled = true;
+    request.draft_tokens = 2;
+    request.verify_mode = MTPVerifyMode::Greedy;
+    request.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+
+    EXPECT_FALSE(validateMTPRequestPolicy(request, retained).has_value());
+    const MTPRuntimeConfig active =
+        composeMTPRequestConfig(retained, request);
+    EXPECT_TRUE(active.enabled);
+    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(active), 2);
+    EXPECT_EQ(resolveMTPRetainedDraftCapacity(active), 15);
+    EXPECT_EQ(active.max_request_batch, retained.max_request_batch);
+    EXPECT_EQ(active.sidecar_dense_policy, retained.sidecar_dense_policy);
+    EXPECT_EQ(active.terminal_head_policy, retained.terminal_head_policy);
+
+    request.enabled = false;
+    const MTPRuntimeConfig disabled =
+        composeMTPRequestConfig(retained, request);
+    EXPECT_FALSE(disabled.enabled);
+    EXPECT_EQ(resolveMTPRetainedDraftCapacity(disabled), 15)
+        << "Disabling one request must not retire its reusable graph family";
+}
+
+TEST(Test__PrefixMTPConfig,
+     TypedRequestPolicyRejectsDepthBeyondRetainedEnvelope)
+{
+    MTPRuntimeConfig retained;
+    retained.enabled = false;
+    retained.graph_capacity_draft_tokens = 3;
+
+    MTPRequestPolicy fixed;
+    fixed.enabled = true;
+    fixed.draft_tokens = 4;
+    fixed.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    const auto fixed_error =
+        validateMTPRequestPolicy(fixed, retained);
+    ASSERT_TRUE(fixed_error.has_value());
+    EXPECT_NE(fixed_error->find("exceeds"), std::string::npos);
+
+    MTPRequestPolicy dynamic;
+    dynamic.enabled = true;
+    dynamic.draft_tokens = 2;
+    dynamic.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    dynamic.depth_policy.min_depth = 1;
+    dynamic.depth_policy.max_depth = 15;
+    dynamic.depth_policy.initial_depth = 2;
+    const auto dynamic_error =
+        validateMTPRequestPolicy(dynamic, retained);
+    ASSERT_TRUE(dynamic_error.has_value());
+    EXPECT_NE(dynamic_error->find("exceeds"), std::string::npos);
+}
+
+TEST(Test__PrefixMTPConfig,
+     TypedRequestPolicyProjectsAllMutableFieldsRoundTrip)
+{
+    MTPRuntimeConfig source;
+    source.enabled = true;
+    source.draft_tokens = 3;
+    source.verify_mode = MTPVerifyMode::SpeculativeSampling;
+    source.require_terminal_hidden_for_full_hit = false;
+    source.depth_policy.mode = MTPDepthPolicyMode::Observe;
+    source.depth_policy.min_depth = 1;
+    source.depth_policy.max_depth = 3;
+    source.depth_policy.initial_depth = 2;
+
+    const MTPRequestPolicy policy = makeMTPRequestPolicy(source);
+    EXPECT_TRUE(policy.enabled);
+    EXPECT_EQ(policy.draft_tokens, 3);
+    EXPECT_EQ(policy.verify_mode, MTPVerifyMode::SpeculativeSampling);
+    EXPECT_FALSE(policy.require_terminal_hidden_for_full_hit);
+    EXPECT_EQ(policy.depth_policy.mode, MTPDepthPolicyMode::Observe);
+    EXPECT_EQ(policy.depth_policy.min_depth, 1);
+    EXPECT_EQ(policy.depth_policy.max_depth, 3);
+    EXPECT_EQ(policy.depth_policy.initial_depth, 2);
+}
+
+/**
+ * @brief The request/device policy conversion is exact and backend-neutral.
+ */
+TEST(Test__PrefixMTPConfig,
+     TypedRequestPolicySealsExactDynamicDeviceControllerPolicy)
+{
+    MTPRuntimeConfig active;
+    active.enabled = true;
+    active.draft_tokens = 7;
+    active.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    active.depth_policy.min_depth = 1;
+    active.depth_policy.max_depth = 15;
+    active.depth_policy.initial_depth = 7;
+    active.depth_policy.window_size = 19;
+    active.depth_policy.min_samples = 5;
+    active.depth_policy.cooldown_steps = 2;
+    active.depth_policy.promote_consecutive_windows = 4;
+    active.depth_policy.promote_full_accept_rate = 0.987654;
+    active.depth_policy.demote_zero_accept_rate = 0.234567;
+    active.depth_policy.demote_acceptance_rate = 0.543210;
+
+    const auto device = resolveMTPDeviceGenerationDepthPolicy(active);
+    EXPECT_TRUE(device.valid());
+    EXPECT_EQ(
+        device.mode,
+        sampling_math::DeviceGenerationPolicyMode::Dynamic);
+    EXPECT_EQ(device.minimum_depth, 1);
+    EXPECT_EQ(device.maximum_depth, 15);
+    EXPECT_EQ(device.initial_depth, 7);
+    EXPECT_EQ(device.window_size, 19);
+    EXPECT_EQ(device.minimum_samples, 5);
+    EXPECT_EQ(device.cooldown_steps, 2);
+    EXPECT_EQ(device.promote_consecutive_windows, 4);
+    EXPECT_EQ(device.promote_full_accept_rate_ppm, 987654);
+    EXPECT_EQ(device.demote_zero_accept_rate_ppm, 234567);
+    EXPECT_EQ(device.demote_acceptance_rate_ppm, 543210);
+
+    DeviceGenerationAdmissionRequest omitted;
+    omitted.request_count = 1;
+    omitted.max_new_tokens = 32;
+    EXPECT_FALSE(omitted.valid())
+        << "An admission may not infer depth policy from retained setup";
+    omitted.depth_policy = device;
+    EXPECT_TRUE(omitted.valid());
+}
+
+/**
+ * @brief Unknown host modes remain invalid through the device ABI conversion.
+ */
+TEST(Test__PrefixMTPConfig,
+     TypedRequestPolicyDoesNotNormalizeUnknownDeviceControllerMode)
+{
+    MTPRuntimeConfig active;
+    active.enabled = true;
+    active.depth_policy.mode = static_cast<MTPDepthPolicyMode>(99);
+
+    EXPECT_FALSE(resolveMTPDeviceGenerationDepthPolicy(active).valid());
+}
+
+TEST(Test__PrefixMTPConfig,
+     GraphOwnerPlanScalesEveryRequestIndexedDirectory)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 3;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    mtp.max_request_batch = 2;
+
+    const MTPGraphOwnerPlan owner_plan(mtp);
+    EXPECT_EQ(owner_plan.draftDepth(), 3);
+    EXPECT_EQ(owner_plan.requestCapacity(), 2);
+    EXPECT_EQ(owner_plan.verifierRowsPerRequest(), 4);
+    EXPECT_EQ(owner_plan.flattenedTargetRows(), 8);
+    EXPECT_EQ(owner_plan.stochasticTargetRows(), 8);
+    EXPECT_EQ(owner_plan.stochasticDraftRows(), 6);
+    EXPECT_EQ(owner_plan.sidecarKVOnlyBatchGraphSlots(), 7u);
+    EXPECT_EQ(owner_plan.sidecarGraphSlots(), 13u);
+    EXPECT_EQ(owner_plan.genericTerminalHiddenGraphSlots(), 1u);
+    EXPECT_EQ(owner_plan.terminalHiddenContiguousGraphSlots(), 8u);
+    EXPECT_EQ(owner_plan.terminalHiddenDeviceAcceptedGraphSlots(), 2u);
+    EXPECT_EQ(owner_plan.terminalHiddenRequestTerminalGraphSlots(), 2u);
+    EXPECT_EQ(owner_plan.terminalHiddenShiftedPrefillGraphSlots(), 16u);
+    EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 29u);
+    EXPECT_EQ(owner_plan.draftPublicationGraphSlots(), 6u);
+    EXPECT_EQ(owner_plan.verifierPreparationGraphSlots(), 16u);
+    EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 68u);
+}
+
+TEST(Test__PrefixMTPConfig,
+     DisabledGraphOwnerPlanRetainsOnlyNonGraphSamplingGeometry)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = false;
+
+    const MTPGraphOwnerPlan owner_plan(mtp);
+    EXPECT_FALSE(owner_plan.retainsGraphCapacity());
+    EXPECT_EQ(owner_plan.stochasticTargetRows(), 4);
+    EXPECT_EQ(owner_plan.stochasticDraftRows(), 3);
+    EXPECT_EQ(owner_plan.auxiliaryExecutableSlotCount(), 0u);
+    EXPECT_EQ(owner_plan.sidecarKVOnlyBatchGraphSlots(), 0u);
+    EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 0u);
+}
+
+TEST(Test__PrefixMTPConfig, DisabledExecutionRejectsNegativeRetainedCapacity)
+{
+    OrchestrationConfig config;
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = -1;
+
+    const auto errors = config.validate();
+    EXPECT_NE(
+        std::find_if(
+            errors.begin(),
+            errors.end(),
+            [](const std::string &error)
+            {
+                return error.find(
+                           "graph capacity draft tokens must be >= 0") !=
+                       std::string::npos;
+            }),
+        errors.end());
+}
+
+TEST(Test__PrefixMTPConfig, MTPTerminalHiddenArchiveCoversRequestAndVerifierRows)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 3;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    mtp.max_request_batch = 1;
+
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(1, mtp), 4)
+        << "A scalar fixed-d3 request must retain all four verifier target rows.";
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(8, mtp), 8)
+        << "A larger general request batch must still have one terminal row per request.";
+
+    mtp.max_request_batch = 3;
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(8, mtp), 12)
+        << "Flattened grouped-verifier rows win when they exceed request capacity.";
+
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    mtp.depth_policy.max_depth = 15;
+    EXPECT_EQ(resolveMTPTerminalHiddenRowCapacity(8, mtp), 48)
+        << "The archive must reserve dynamic depth's promotion ceiling before capture.";
 }
 
 TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
@@ -331,8 +778,10 @@ prefix_cache:
 mtp:
   enabled: true
   draft_tokens: 3
+  graph_capacity_draft_tokens: 15
   max_request_batch: 2
   verify_mode: greedy
+  terminal_head_policy: mirrored-full-vocabulary
   require_terminal_hidden_for_full_hit: false
   depth_policy: observe
   min_draft_tokens: 1
@@ -362,8 +811,12 @@ mtp:
 
     EXPECT_TRUE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 3);
+    EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 15);
     EXPECT_EQ(config.mtp.max_request_batch, 2);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
+    EXPECT_EQ(
+        config.mtp.terminal_head_policy,
+        MTPTerminalHeadPolicy::MirroredFullVocabulary);
     EXPECT_FALSE(config.mtp.require_terminal_hidden_for_full_hit);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Observe);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
@@ -374,7 +827,8 @@ mtp:
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 3);
     EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 4);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.8);
-    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.2);
+    ASSERT_TRUE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
+    EXPECT_DOUBLE_EQ(*config.mtp.depth_policy.demote_zero_accept_rate, 0.2);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
 }
 
@@ -392,11 +846,14 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     source.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     source.mtp.enabled = true;
     source.mtp.draft_tokens = 2;
+    source.mtp.graph_capacity_draft_tokens = 15;
     source.mtp.max_request_batch = 4;
     source.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
     source.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
     source.mtp.depth_policy.max_depth = 3;
     source.mtp.depth_policy.window_size = 8;
+    source.moe_routed_prefill.assignment_window_tokens = 64;
+    source.moe_routed_prefill.least_loaded_min_routed_rows = 4096;
 
     RuntimeConfig runtime = RuntimeConfig::fromOrchestrationConfig(
         source.max_seq_len,
@@ -404,19 +861,28 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
         source.activation_precision,
         source.kv_cache_precision,
         source.fused_attention_backend,
-        source.moe_expert_mode,
+        source.routed_expert_compute_policy,
         source.moe_hot_expert_cache,
+        source.moe_routed_prefill,
         source.moe_rebalance,
         source.prefix_cache,
         source.mtp);
 
     RankExecutionPlan plan;
     plan.runtime = runtime;
+    plan.runtime.resident_graph_rows = 2048;
     InferenceRunnerConfig runner_config = InferenceRunnerConfig::fromPlan(plan);
+    RankOrchestrator::Config rank_config =
+        RankOrchestrator::Config::fromPlan(plan);
 
     GraphConfig graph_config;
     graph_config.prefix_cache = runner_config.prefix_cache;
     graph_config.mtp = runner_config.mtp;
+
+    EXPECT_EQ(runner_config.moe_routed_prefill.assignment_window_tokens, 64);
+    EXPECT_EQ(runner_config.moe_routed_prefill.least_loaded_min_routed_rows,
+              4096u);
+    EXPECT_EQ(rank_config.moe_routed_prefill.assignment_window_tokens, 64);
 
     EXPECT_TRUE(graph_config.prefix_cache.enabled);
     EXPECT_EQ(graph_config.prefix_cache.storage_mode, PrefixCacheStorageMode::Ram);
@@ -430,6 +896,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
 
     EXPECT_TRUE(graph_config.mtp.enabled);
     EXPECT_EQ(graph_config.mtp.draft_tokens, 2);
+    EXPECT_EQ(graph_config.mtp.graph_capacity_draft_tokens, 15);
     EXPECT_EQ(graph_config.mtp.max_request_batch, 4);
     EXPECT_EQ(graph_config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
     EXPECT_EQ(graph_config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
@@ -437,6 +904,8 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     EXPECT_EQ(graph_config.mtp.depth_policy.window_size, 8);
     EXPECT_EQ(runtime.batch_size, 4);
     EXPECT_EQ(runner_config.batch_size, 4);
+    EXPECT_EQ(runner_config.activation_seq_len, 2048);
+    EXPECT_EQ(rank_config.resident_graph_rows, 2048);
 }
 
 TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings)
@@ -453,8 +922,11 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 2;
+    config.mtp.graph_capacity_draft_tokens = 15;
     config.mtp.max_request_batch = 3;
     config.mtp.verify_mode = MTPVerifyMode::Greedy;
+    config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     config.mtp.require_terminal_hidden_for_full_hit = false;
     config.mtp.depth_policy.mode = MTPDepthPolicyMode::Observe;
     config.mtp.depth_policy.max_depth = 3;
@@ -474,10 +946,67 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     EXPECT_NE(explanation.find("moe_policy: invalidate-on-rebalance"), std::string::npos);
     EXPECT_NE(explanation.find("mtp:"), std::string::npos);
     EXPECT_NE(explanation.find("draft_tokens: 2"), std::string::npos);
+    EXPECT_NE(
+        explanation.find("graph_capacity_draft_tokens: 15"),
+        std::string::npos);
     EXPECT_NE(explanation.find("max_request_batch: 3"), std::string::npos);
     EXPECT_NE(explanation.find("verify_mode: greedy"), std::string::npos);
+    EXPECT_NE(
+        explanation.find("terminal_head_policy: mirrored-full-vocabulary"),
+        std::string::npos);
     EXPECT_NE(explanation.find("depth_policy: observe"), std::string::npos);
     EXPECT_NE(explanation.find("max_draft_tokens: 3"), std::string::npos);
     EXPECT_NE(explanation.find("depth_window: 8"), std::string::npos);
     EXPECT_NE(explanation.find("require_terminal_hidden_for_full_hit: false"), std::string::npos);
+}
+
+/**
+ * @brief Every shape-dependent forward family requires eager publication.
+ *
+ * The serial stochastic oracle intentionally disables MTP while preserving the
+ * production phase-split dense policy. This matrix locks in replicated or
+ * mirrored decode topology and ExpertOverlay graph families; durable MoE
+ * maintenance itself runs through the background RCU authority and does not
+ * install a second graph-side Dynamic family.
+ */
+TEST(Test__PrefixMTPConfig, ShapeDependentForwardPoliciesRequireEagerFamilyManifest)
+{
+    GraphConfig config;
+    config.dense_tp_enabled = true;
+
+    EXPECT_FALSE(config.requiresEagerWorkspaceFamilyManifest());
+
+    config.mtp.enabled = true;
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest())
+        << "CPU stages and captured GPU graphs both retain bound workspace addresses";
+
+    config.mtp.enabled = false;
+    config.mtp.graph_capacity_draft_tokens = 15;
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest())
+        << "A capacity-only model context must declare the same graph family as an enabled lease";
+    EXPECT_FALSE(config.usesMTPGroupedDecodeEquivalentRows());
+    config.compute_all_position_logits = true;
+    EXPECT_TRUE(config.usesMTPGroupedDecodeEquivalentRows())
+        << "A retained verifier declaration must select production grouped arithmetic even when execution is off";
+    config.compute_all_position_logits = false;
+
+    config.mtp.graph_capacity_draft_tokens = 0;
+    config.dense_tp_decode_replicated = true;
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest());
+
+    config.dense_tp_decode_replicated = false;
+    config.dense_tp_decode_mirrored_embedding = true;
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest());
+
+    config.dense_tp_enabled = false;
+    EXPECT_FALSE(config.requiresEagerWorkspaceFamilyManifest())
+        << "A replicated single-device graph has no phase-split TP topology";
+
+    config.moe.routed_expert_plan =
+        std::make_shared<MoERoutedExpertPlacementPlan>();
+    config.moe.routed_expert_plan->enabled = true;
+    config.moe.routed_expert_plan->topology =
+        RoutedExpertPlacementTopology::TieredOverlay;
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest())
+        << "Tiered overlay startup must resolve every participant's initial prepared bank";
 }

@@ -23,6 +23,7 @@
 #include "v2/backends/DeviceId.h"
 #include "v2/backends/BackendManager.h"
 #include "v2/backends/IBackend.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 namespace llaminar2::test
 {
@@ -93,9 +94,15 @@ namespace llaminar2::test
         float rocm_data_1[] = {4.0f, 5.0f, 6.0f};
         float cuda_data_0[] = {10.0f, 20.0f, 30.0f};
 
-        ASSERT_TRUE(rocm_backend_->hostToDevice(rocm_buf_0, rocm_data_0, bytes, 0));
-        ASSERT_TRUE(rocm_backend_->hostToDevice(rocm_buf_1, rocm_data_1, bytes, 1));
-        ASSERT_TRUE(cuda_backend_->hostToDevice(cuda_buf_0, cuda_data_0, bytes, 0));
+        ScopedGPUStream rocm_stream_0(DeviceId::rocm(0));
+        ScopedGPUStream rocm_stream_1(DeviceId::rocm(1));
+        ScopedGPUStream cuda_stream_0(DeviceId::cuda(0));
+        ASSERT_TRUE(rocm_backend_->hostToDevice(
+            rocm_buf_0, rocm_data_0, bytes, 0, rocm_stream_0.get()));
+        ASSERT_TRUE(rocm_backend_->hostToDevice(
+            rocm_buf_1, rocm_data_1, bytes, 1, rocm_stream_1.get()));
+        ASSERT_TRUE(cuda_backend_->hostToDevice(
+            cuda_buf_0, cuda_data_0, bytes, 0, cuda_stream_0.get()));
 
         // Create and initialize HeterogeneousBackend
         HeterogeneousBackend backend;

@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
@@ -19,6 +20,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <algorithm>
 #include <vector>
@@ -183,6 +185,126 @@ TEST_F(MoERoutingStageTest, BasicRouting)
     }
 }
 
+/**
+ * @brief Prove that CPU prefill contributes only its logical routed rows.
+ *
+ * The router computes four physical rows while the evidence contract exposes
+ * only the leading two as request-owned.  Expected counts are derived from the
+ * production routing tensors so this test checks publication boundaries rather
+ * than duplicating the router's numerical implementation.  The total count is
+ * especially important: even when a suffix chooses the same experts as the
+ * prefix, admitting it would double the observed activation total.
+ */
+TEST_F(MoERoutingStageTest, CPUGroupedRoutingEvidenceExcludesPhysicalSuffix)
+{
+    constexpr int kPhysicalRows = 4;
+    constexpr int kLogicalRows = 2;
+
+    auto input = TestTensorFactory::createFP32Random(
+        {kPhysicalRows, D_MODEL}, -0.5f, 0.5f, 150);
+    auto gate_weights = TestTensorFactory::createFP32Random(
+        {NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 151);
+    auto output_indices = TestTensorFactory::createFP32(
+        {kPhysicalRows * TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32(
+        {kPhysicalRows * TOP_K, 1});
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 1;
+    histogram_config.num_experts = NUM_EXPERTS;
+    histogram_config.top_k = TOP_K;
+    histogram_config.window_size = 32;
+    histogram_config.token_boundary_layer_idx = 0;
+    histogram_config.sockets = {DeviceId::cpu()};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 1, std::vector<int>(NUM_EXPERTS, 0));
+    DecodeExpertHistogram histogram(histogram_config);
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = kPhysicalRows;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.norm_topk_prob = true;
+    params.layer_idx = 0;
+    params.decode_histogram = &histogram;
+    params.host_logical_row_count = kLogicalRows;
+
+    MoERoutingStage stage(params);
+    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+
+    std::vector<uint64_t> expected(static_cast<size_t>(NUM_EXPERTS), 0);
+    const float *indices = output_indices->data();
+    for (int route = 0; route < kLogicalRows * TOP_K; ++route)
+    {
+        const int expert = static_cast<int>(indices[route]);
+        ASSERT_GE(expert, 0);
+        ASSERT_LT(expert, NUM_EXPERTS);
+        ++expected[static_cast<size_t>(expert)];
+    }
+
+    uint64_t published_total = 0;
+    for (int expert = 0; expert < NUM_EXPERTS; ++expert)
+    {
+        const uint64_t actual = histogram.activationCount(0, expert);
+        EXPECT_EQ(actual, expected[static_cast<size_t>(expert)]);
+        published_total += actual;
+    }
+    EXPECT_EQ(published_total, static_cast<uint64_t>(kLogicalRows * TOP_K));
+    EXPECT_EQ(histogram.windowTokenCount(), static_cast<uint64_t>(kLogicalRows));
+}
+
+/**
+ * @brief A tracked multi-row CPU graph must declare its logical row prefix.
+ *
+ * Silently treating physical capacity as request geometry would make padding
+ * part of Dynamic placement evidence.  The stage therefore rejects an omitted
+ * contract instead of guessing that every row is live.
+ */
+TEST_F(MoERoutingStageTest, CPUGroupedRoutingEvidenceRequiresLogicalGeometry)
+{
+    auto input = TestTensorFactory::createFP32Random(
+        {SEQ_LEN, D_MODEL}, -0.5f, 0.5f, 160);
+    auto gate_weights = TestTensorFactory::createFP32Random(
+        {NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 161);
+    auto output_indices = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 1;
+    histogram_config.num_experts = NUM_EXPERTS;
+    histogram_config.top_k = TOP_K;
+    histogram_config.window_size = 32;
+    histogram_config.token_boundary_layer_idx = 0;
+    histogram_config.sockets = {DeviceId::cpu()};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 1, std::vector<int>(NUM_EXPERTS, 0));
+    DecodeExpertHistogram histogram(histogram_config);
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.norm_topk_prob = true;
+    params.layer_idx = 0;
+    params.decode_histogram = &histogram;
+
+    MoERoutingStage stage(params);
+    EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
+    EXPECT_EQ(histogram.windowTokenCount(), 0u);
+}
+
 TEST_F(MoERoutingStageTest, SingleToken)
 {
     const int seq = 1;
@@ -224,6 +346,74 @@ TEST_F(MoERoutingStageTest, SingleToken)
     for (int k = 0; k < TOP_K; ++k)
         sum += wt[k];
     EXPECT_NEAR(sum, 1.0f, 0.01f);
+}
+
+/**
+ * @brief Prove that routing workspace follows the graph-family row envelope.
+ *
+ * The live server regression first built a 39-row Qwen3.6 MoE graph and then
+ * admitted a 68-row multi-turn prompt.  The old router ignored the allocator's
+ * family-wide `m` argument, leaving `moe_route_logits` permanently sized for
+ * the first request.  Exercise both GPU backends without launching device work
+ * and verify that a larger planner envelope, as well as a larger concrete
+ * stage, can never be weakened by the other value.
+ */
+TEST_F(MoERoutingStageTest, GPUWorkspaceRowsCoverConcreteAndFamilyEnvelope)
+{
+    constexpr int kConcreteRows = 39;
+    constexpr int kLaterRequestRows = 68;
+    constexpr int kFamilyRows = 4096;
+    constexpr int kModelWidth = 2048;
+    constexpr int kExperts = 256;
+
+    const auto expectedRouteLogitsBytes = [](int rows)
+    {
+        return static_cast<size_t>(rows) *
+               static_cast<size_t>(kExperts) * sizeof(float);
+    };
+
+    const auto verifyBackend = [&](DeviceId device)
+    {
+        MoERoutingStage::Params params;
+        params.device_id = device;
+        params.seq_len = kConcreteRows;
+        params.d_model = kModelWidth;
+        params.num_experts = kExperts;
+        params.top_k = 8;
+
+        MoERoutingStage stage(params);
+
+        const WorkspaceRequirements concrete =
+            stage.getWorkspaceRequirements(/*m=*/1);
+        const WorkspaceDescriptor *concrete_logits =
+            concrete.find(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        ASSERT_NE(concrete_logits, nullptr);
+        EXPECT_EQ(
+            concrete_logits->size_bytes,
+            expectedRouteLogitsBytes(kConcreteRows));
+
+        const WorkspaceRequirements later_request =
+            stage.getWorkspaceRequirements(kLaterRequestRows);
+        const WorkspaceDescriptor *later_logits =
+            later_request.find(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        ASSERT_NE(later_logits, nullptr);
+        EXPECT_EQ(
+            later_logits->size_bytes,
+            expectedRouteLogitsBytes(kLaterRequestRows));
+
+        const WorkspaceRequirements family =
+            stage.getWorkspaceRequirements(kFamilyRows);
+        const WorkspaceDescriptor *family_logits =
+            family.find(MoEWorkspaceBuffers::ROUTE_LOGITS);
+        ASSERT_NE(family_logits, nullptr);
+        EXPECT_EQ(
+            family_logits->size_bytes,
+            expectedRouteLogitsBytes(kFamilyRows));
+        EXPECT_GT(family_logits->size_bytes, later_logits->size_bytes);
+    };
+
+    verifyBackend(DeviceId::cuda(0));
+    verifyBackend(DeviceId::rocm(0));
 }
 
 TEST_F(MoERoutingStageTest, CPUVerifierTwoRowsMatchSplitDecodeRoutes)
@@ -281,14 +471,16 @@ TEST_F(MoERoutingStageTest, CPUVerifierTwoRowsMatchSplitDecodeRoutes)
                     split_weights->mutable_data() + static_cast<size_t>(row) * top_k);
     }
 
-    for (int i = 0; i < seq * top_k; ++i)
-    {
-        EXPECT_EQ(static_cast<int>(multi_indices->data()[i]),
-                  static_cast<int>(split_indices->data()[i]))
-            << "slot " << i;
-        EXPECT_FLOAT_EQ(multi_weights->data()[i], split_weights->data()[i])
-            << "slot " << i;
-    }
+    const size_t route_bytes =
+        static_cast<size_t>(seq) * top_k * sizeof(float);
+    EXPECT_EQ(
+        std::memcmp(multi_indices->data(), split_indices->data(), route_bytes),
+        0)
+        << "grouped router indices must match serial M=1 bytes";
+    EXPECT_EQ(
+        std::memcmp(multi_weights->data(), split_weights->data(), route_bytes),
+        0)
+        << "grouped router weights must match serial M=1 bytes";
 }
 
 TEST_F(MoERoutingStageTest, CPUDecodeEquivalentVerifierFlagSplitsRows)
@@ -348,14 +540,184 @@ TEST_F(MoERoutingStageTest, CPUDecodeEquivalentVerifierFlagSplitsRows)
                     split_weights->mutable_data() + static_cast<size_t>(row) * top_k);
     }
 
-    for (int i = 0; i < seq * top_k; ++i)
+    const size_t route_bytes =
+        static_cast<size_t>(seq) * top_k * sizeof(float);
+    EXPECT_EQ(
+        std::memcmp(flagged_indices->data(), split_indices->data(), route_bytes),
+        0)
+        << "decode-equivalent verifier indices must match serial M=1 bytes";
+    EXPECT_EQ(
+        std::memcmp(flagged_weights->data(), split_weights->data(), route_bytes),
+        0)
+        << "decode-equivalent verifier weights must match serial M=1 bytes";
+}
+
+/**
+ * @brief Prove CPU migration evidence observes only accepted request prefixes.
+ *
+ * The graph routes two padded request groups in one production stage call.
+ * Routing itself must leave the histogram untouched because acceptance is not
+ * known yet.  The accepted-state transaction then admits one row from request
+ * zero and two rows from request one; the rejected rows are deliberately
+ * interleaved between those prefixes in request-major storage, so treating the
+ * complete tensor as one leading prefix would produce a different histogram.
+ */
+TEST_F(MoERoutingStageTest, CPUGroupedVerifierHistogramCommitIsAcceptedPrefixExact)
+{
+    constexpr int kRequestCount = 2;
+    constexpr int kRowsPerRequest = 3;
+    constexpr int kPhysicalRows = kRequestCount * kRowsPerRequest;
+    const int32_t accepted_state_counts[kRequestCount] = {1, 2};
+
+    auto input = TestTensorFactory::createFP32Random(
+        {kPhysicalRows, D_MODEL}, -0.5f, 0.5f, 1220);
+    auto gate_weights = TestTensorFactory::createFP32Random(
+        {NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 1221);
+    auto output_indices = TestTensorFactory::createFP32(
+        {kPhysicalRows, TOP_K});
+    auto output_weights = TestTensorFactory::createFP32(
+        {kPhysicalRows, TOP_K});
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 1;
+    histogram_config.num_experts = NUM_EXPERTS;
+    histogram_config.top_k = TOP_K;
+    histogram_config.window_size = 32;
+    histogram_config.token_boundary_layer_idx = 0;
+    histogram_config.sockets = {DeviceId::cpu()};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 1, std::vector<int>(NUM_EXPERTS, 0));
+    DecodeExpertHistogram histogram(histogram_config);
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = kPhysicalRows;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.norm_topk_prob = true;
+    params.layer_idx = 0;
+    params.decode_histogram = &histogram;
+    params.host_logical_row_count = kPhysicalRows;
+    params.force_decode_equivalent_verifier_prefill = true;
+
+    MoERoutingStage stage(params);
+    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+
+    for (int expert = 0; expert < NUM_EXPERTS; ++expert)
     {
-        EXPECT_EQ(static_cast<int>(flagged_indices->data()[i]),
-                  static_cast<int>(split_indices->data()[i]))
-            << "slot " << i;
-        EXPECT_FLOAT_EQ(flagged_weights->data()[i], split_weights->data()[i])
-            << "slot " << i;
+        EXPECT_EQ(
+            histogram.activationCount(
+                ExpertHistogramSource::GroupedVerifier,
+                0,
+                expert),
+            0u)
+            << "routing must not publish speculative rows before acceptance";
     }
+    EXPECT_EQ(histogram.windowTokenCount(), 0u);
+
+    std::string error;
+    ASSERT_TRUE(stage.validateHostGroupedVerifierHistogramPublication(
+        accepted_state_counts,
+        kRequestCount,
+        kRowsPerRequest,
+        &error)) << error;
+    ASSERT_TRUE(stage.publishHostGroupedVerifierHistograms(
+        accepted_state_counts,
+        kRequestCount,
+        kRowsPerRequest,
+        &error)) << error;
+
+    std::vector<uint64_t> expected(static_cast<size_t>(NUM_EXPERTS), 0);
+    const float *indices = output_indices->data();
+    for (int request = 0; request < kRequestCount; ++request)
+    {
+        for (int row = 0; row < accepted_state_counts[request]; ++row)
+        {
+            const int physical_row = request * kRowsPerRequest + row;
+            for (int slot = 0; slot < TOP_K; ++slot)
+            {
+                const int expert = static_cast<int>(
+                    indices[physical_row * TOP_K + slot]);
+                ASSERT_GE(expert, 0);
+                ASSERT_LT(expert, NUM_EXPERTS);
+                ++expected[static_cast<size_t>(expert)];
+            }
+        }
+    }
+
+    uint64_t total = 0;
+    for (int expert = 0; expert < NUM_EXPERTS; ++expert)
+    {
+        const uint64_t actual = histogram.activationCount(
+            ExpertHistogramSource::GroupedVerifier,
+            0,
+            expert);
+        EXPECT_EQ(actual, expected[static_cast<size_t>(expert)]);
+        total += actual;
+    }
+    EXPECT_EQ(total, 3u * static_cast<uint64_t>(TOP_K));
+    EXPECT_EQ(histogram.windowTokenCount(), 3u);
+}
+
+/**
+ * @brief Reject malformed accepted geometry before any histogram mutation.
+ */
+TEST_F(MoERoutingStageTest, CPUGroupedVerifierHistogramPrevalidationIsAtomic)
+{
+    constexpr int kRows = 2;
+    auto input = TestTensorFactory::createFP32Random(
+        {kRows, D_MODEL}, -0.5f, 0.5f, 1230);
+    auto gate_weights = TestTensorFactory::createFP32Random(
+        {NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 1231);
+    auto output_indices = TestTensorFactory::createFP32({kRows, TOP_K});
+    auto output_weights = TestTensorFactory::createFP32({kRows, TOP_K});
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 1;
+    histogram_config.num_experts = NUM_EXPERTS;
+    histogram_config.top_k = TOP_K;
+    histogram_config.window_size = 32;
+    histogram_config.token_boundary_layer_idx = 0;
+    histogram_config.sockets = {DeviceId::cpu()};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 1, std::vector<int>(NUM_EXPERTS, 0));
+    DecodeExpertHistogram histogram(histogram_config);
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = kRows;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.layer_idx = 0;
+    params.decode_histogram = &histogram;
+    params.host_logical_row_count = kRows;
+    params.force_decode_equivalent_verifier_prefill = true;
+
+    MoERoutingStage stage(params);
+    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+
+    const int32_t invalid_accepted_count[] = {kRows + 1};
+    std::string error;
+    EXPECT_FALSE(stage.validateHostGroupedVerifierHistogramPublication(
+        invalid_accepted_count,
+        1,
+        kRows,
+        &error));
+    EXPECT_NE(error.find("outside its verifier group"), std::string::npos)
+        << error;
+    EXPECT_EQ(histogram.windowTokenCount(), 0u);
+    for (int expert = 0; expert < NUM_EXPERTS; ++expert)
+        EXPECT_EQ(histogram.activationCount(0, expert), 0u);
 }
 
 TEST_F(MoERoutingStageTest, NullInputsReturnError)
@@ -429,6 +791,9 @@ TEST_F(MoERoutingStageTest, GraphCapturableRejectsHistogramWithoutRuntimeTable)
     histogram_config.num_layers = 1;
     histogram_config.num_experts = NUM_EXPERTS;
     histogram_config.top_k = TOP_K;
+    histogram_config.sockets = {DeviceId::rocm(0)};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 1, std::vector<int>(NUM_EXPERTS, 0));
     DecodeExpertHistogram histogram(histogram_config);
 
     MoERoutingStage::Params params;
@@ -460,6 +825,9 @@ TEST_F(MoERoutingStageTest, GraphCapturableAllowsHistogramWithInitializedRuntime
     histogram_config.num_layers = 1;
     histogram_config.num_experts = NUM_EXPERTS;
     histogram_config.top_k = TOP_K;
+    histogram_config.sockets = {DeviceId::rocm(0)};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 1, std::vector<int>(NUM_EXPERTS, 0));
     DecodeExpertHistogram histogram(histogram_config);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
@@ -481,16 +849,14 @@ TEST_F(MoERoutingStageTest, GraphCapturableAllowsHistogramWithInitializedRuntime
     params.moe_runtime_table = &runtime_table;
 
     MoERoutingStage stage(params);
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.isGraphCapturable());
-    EXPECT_TRUE(stage.needsOnGraphReplayed());
 #else
     EXPECT_FALSE(stage.isGraphCapturable());
-    EXPECT_FALSE(stage.needsOnGraphReplayed());
 #endif
 }
 
-TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFlags)
+TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsRuntimeTableFlags)
 {
     auto input = TestTensorFactory::createFP32({1, D_MODEL});
     auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
@@ -526,7 +892,7 @@ TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFl
         params.moe_runtime_table = &runtime_table;
 
         MoERoutingStage runtime_stage(params);
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
         EXPECT_TRUE(runtime_stage.isGraphCapturable());
 #else
         EXPECT_FALSE(runtime_stage.isGraphCapturable());
@@ -560,23 +926,66 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
 
     MoERoutingStage unprepared_stage(params);
     EXPECT_FALSE(unprepared_stage.isGraphCapturable());
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
-    EXPECT_TRUE(unprepared_stage.supportsWarmupDependentGraphCapture());
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(unprepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #else
-    EXPECT_FALSE(unprepared_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(unprepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #endif
 
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
     ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
 
     MoERoutingStage prepared_stage(params);
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(prepared_stage.isGraphCapturable());
-    EXPECT_TRUE(prepared_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_TRUE(prepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #else
     EXPECT_FALSE(prepared_stage.isGraphCapturable());
-    EXPECT_FALSE(prepared_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(prepared_stage.supportsGraphCaptureAfterLaunchPreparation());
 #endif
+}
+
+TEST_F(MoERoutingStageTest, OverlayTicketDecodeIsAColdCaptureContractWithoutRuntimeTable)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
+    auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.layer_idx = 0;
+    params.decode_route_publication =
+        MoEDecodeRoutePublicationPolicy::FixedCapacityOverlayTicket;
+
+    MoERoutingStage stage(params);
+    EXPECT_EQ(stage.decodeRoutePublicationPolicyForTesting(),
+              MoEDecodeRoutePublicationPolicy::FixedCapacityOverlayTicket);
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "Cold preflight must not pretend the backend kernel is prepared";
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsGraphCaptureAfterLaunchPreparation())
+        << "The explicit fixed-capacity ticket is the decode publication owner";
+#else
+    EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+#endif
+
+    MoERuntimeTable conflicting_runtime_table(
+        DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    params.moe_runtime_table = &conflicting_runtime_table;
+    MoERoutingStage conflicting_authorities(params);
+    EXPECT_FALSE(conflicting_authorities.supportsGraphCaptureAfterLaunchPreparation())
+        << "A decode graph cannot publish through both a runtime table and a ticket";
 }
 
 TEST_F(MoERoutingStageTest, OutputDimensions)

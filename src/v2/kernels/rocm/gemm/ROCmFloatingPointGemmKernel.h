@@ -64,9 +64,13 @@ namespace llaminar2
          * - Input activations (A) must be on GPU
          * - Output (C) must be on GPU
          *
-         * **Thread Safety**:
-         * - Single kernel instance should be used from one thread
-         * - hipBLAS handle is per-kernel (not shared)
+         * **Thread Safety and stream ownership**:
+         * - Each weight view retains its own stream/workspace binding. All
+         *   views borrow their persistent worker context's library handles.
+         * - Every launch supplies its exact non-null operation stream.  The
+         *   low-level kernel serializes only handle rebinding plus enqueue, so
+         *   work already submitted on different streams remains concurrent.
+         * - Clearing one wrapper's binding cannot retarget another wrapper.
          */
         class ROCmFloatingPointGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
@@ -159,7 +163,7 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
 
-            bool supports_fused_projection() const override { return precision_ == Precision::FP32; }
+            bool supports_fused_projection() const override { return true; }
 
             bool multiply_fused_tensor(
                 const TensorBase *input,
@@ -173,6 +177,37 @@ namespace llaminar2
                 const std::vector<TensorProjectionDesc> &projections,
                 int m, int k,
                 const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
+             * @brief Fixed-order floating SwiGLU/down for decode-sized rows.
+             *
+             * The current ROCm graph pipeline keeps gate/up activations and
+             * down outputs in FP32.  This method provides the missing
+             * FP32/FP16/BF16 floating down path for runtime M without routing
+             * through hipBLAS or materializing an intermediate SwiGLU tensor.
+             */
+            bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
+             * @brief Grouped verifier SwiGLU/down with serial-decode math order.
+             *
+             * Runtime rows are evaluated by one explicit-stream HIP kernel. The
+             * grouped verifier call and the one-row decode call therefore share
+             * the same K traversal, 16-bit conversion points, and reduction tree.
+             */
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
@@ -207,7 +242,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
-            void setGPUStream(void *stream) override;
+            void bindGPUStream(ExplicitGPUStream stream) override;
+            void clearGPUStreamBinding() override;
 
             // =========================================================================
             // IWorkspaceConsumer interface
@@ -223,6 +259,10 @@ namespace llaminar2
             // =========================================================================
 
             KernelSnapshotInfo getKernelSnapshotInfo() const override;
+
+            /** @brief Export the exact live row-major GPU floating weights. */
+            bool exportContiguousFloatingPointWeights(
+                ContiguousFloatingPointWeightDescriptor &out) const override;
 
             // =========================================================================
             // Accessors
@@ -241,9 +281,8 @@ namespace llaminar2
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
 
-            // hipBLAS kernel - shared across all ROCm GEMM kernels on same device
-            // Owned by DeviceKernelCache, not this kernel instance
-            HipBLASGemmKernel *hipblas_kernel_ = nullptr;
+            // Per-weight submission view, borrowing context-owned library handles.
+            std::unique_ptr<HipBLASGemmKernel> hipblas_kernel_;
 
             // Lifetime owner: keeps VRAM pool alive when constructed from raw pointer
             std::shared_ptr<void> lifetime_owner_;
@@ -269,6 +308,17 @@ namespace llaminar2
                 const std::vector<const float *> &b_ptrs,
                 const std::vector<float *> &c_ptrs,
                 DeviceWorkspaceManager *workspace);
+            bool run_fixed_order_swiglu_down(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m,
+                int n,
+                int k,
+                float alpha,
+                float beta,
+                DeviceWorkspaceManager *workspace,
+                bool verifier_grouped_call);
         };
 
     } // namespace rocm

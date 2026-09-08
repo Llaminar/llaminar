@@ -1,6 +1,11 @@
 /**
  * @file MPIBootstrapPhase.cpp
  * @brief Pre-MPI topology planning, NUMA resolution, and MPI self-launch
+ *
+ * Parsed device declarations first constrain the canonical startup authority.
+ * This precedes every inventory query in both the launcher and its MPI children:
+ * naming a CPU domain must not create foreign CUDA/HIP contexts merely to choose
+ * a NUMA placement. The same intent then selects the CPU MPI tuning profile.
  */
 
 #include "app/MPIBootstrapPhase.h"
@@ -16,9 +21,71 @@
 #include <fstream>
 #include <unordered_map>
 #include <filesystem>
+#include <stdexcept>
 
 namespace llaminar2
 {
+
+    BootstrapDeviceIntent MPIBootstrapPhase::classifyDeviceIntent(
+        const OrchestrationConfig &config)
+    {
+        if ((!config.topology_string.empty() ||
+             !config.topology_file_path.empty()) && !config.topology_tree)
+        {
+            // An unparsed tree is not evidence of a CPU-only deployment.
+            return BootstrapDeviceIntent::Automatic;
+        }
+        BootstrapDeviceIntent intent = config.cpu_global_tp_all_local
+                                          ? BootstrapDeviceIntent::CpuOnly
+                                          : BootstrapDeviceIntent::Automatic;
+        const auto include = [&](const GlobalDeviceAddress &address)
+        {
+            if (!address.isCPU())
+                intent = BootstrapDeviceIntent::Accelerator;
+            else if (intent == BootstrapDeviceIntent::Automatic)
+                intent = BootstrapDeviceIntent::CpuOnly;
+        };
+        if (config.device_for_this_rank)
+            include(*config.device_for_this_rank);
+        for (const auto &[rank, address] : config.device_map)
+            include(address);
+        for (const auto &address : config.tp_devices)
+            include(address);
+        for (const auto &domain : config.domain_definitions)
+            for (const auto &address : domain.devices)
+                include(address);
+        if (config.topology_tree)
+            for (const auto *leaf : config.topology_tree->root.leafDevices())
+                include(leaf->device);
+        if (const auto &overlay = config.moe_routed_expert_plan;
+            overlay && overlay->usesExpertOverlayAuthority())
+        {
+            // Include both ownership axes. Looking only at the continuation
+            // device would accidentally suppress GPU experts in a CPU/GPU tier.
+            for (const auto &domain : overlay->domains)
+                for (const auto &address : domain.participants)
+                    include(address);
+            for (const auto &domain : overlay->dense_domains)
+                for (const auto &address : domain.participants)
+                    include(address);
+        }
+        return intent;
+    }
+
+    BootstrapDeviceIntent MPIBootstrapPhase::installDeviceStartupIntent(
+        const OrchestrationConfig &config)
+    {
+        const auto intent = classifyDeviceIntent(config);
+        if (intent == BootstrapDeviceIntent::CpuOnly)
+        {
+            // Export before self-launch and refresh before in-process discovery.
+            // Never erase a caller's operational exclusions for another mode.
+            if (setenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "1", 1) != 0)
+                throw std::runtime_error("Could not export CPU-only startup intent");
+            mutableDebugEnv().backend_startup.reload();
+        }
+        return intent;
+    }
 
     // =========================================================================
     // Static helpers (extracted from anonymous namespace in Main.cpp)
@@ -331,6 +398,7 @@ namespace llaminar2
     BootstrapResult MPIBootstrapPhase::execute(const OrchestrationConfig &config,
                                                int argc, char *argv[])
     {
+        const auto device_intent = installDeviceStartupIntent(config);
         // Detect CPU topology (needed for both bootstrap and runtime config)
         CPUTopology cpu_topology = MPIBootstrap::detectCPUTopology();
 
@@ -374,19 +442,9 @@ namespace llaminar2
         MPILaunchConfig launch_config = MPIBootstrap::getDefaultConfig(cpu_topology);
 
         const bool cpu_intent_bootstrap =
-            config.cpu_global_tp_all_local ||
-            (config.device_for_this_rank.has_value() && config.device_for_this_rank->isCPU());
+            device_intent == BootstrapDeviceIntent::CpuOnly;
 
         setenv("LLAMINAR_SELF_BOOTSTRAPPED", "1", 1);
-
-        if (cpu_intent_bootstrap)
-        {
-            setenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "1", 1);
-        }
-        else
-        {
-            unsetenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
-        }
 
         const bool use_tuned_mpi_profile =
             (config.mpi_profile == MPIProfile::TUNED) ||

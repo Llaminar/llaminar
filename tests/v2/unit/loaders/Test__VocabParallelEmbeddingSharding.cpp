@@ -14,7 +14,9 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 #include <memory>
 
 #include "config/TensorParallelConfig.h"
@@ -511,6 +513,133 @@ TEST_F(Test__VocabParallelEmbeddingSharding, Slicer_TokenEmbdSlice_Qwen35Schema)
 // ============================================================================
 // EmbedQ8Repack — Vocab-Range Partial Repack
 // ============================================================================
+
+namespace
+{
+    /**
+     * @brief Q8 fixture that records every 256-element grouped-unpack request.
+     *
+     * The production Q8 implementation assumes a grouped request names eight
+     * complete blocks. This fixture deliberately provides a bounded implementation
+     * so a regression that requests a partial group becomes a deterministic count
+     * assertion instead of undefined behavior whose crash depends on heap layout.
+     */
+    class GroupedUnpackObservingQ8Tensor final : public Q8_0Tensor
+    {
+    public:
+        using Q8_0Tensor::Q8_0Tensor;
+
+        /**
+         * @brief Return the number of grouped-unpack operations requested so far.
+         * @return Thread-safe grouped call count.
+         */
+        size_t groupedUnpackCalls() const noexcept
+        {
+            return grouped_unpack_calls_.load(std::memory_order_relaxed);
+        }
+
+        /**
+         * @brief Observe and safely emulate one grouped Q8 unpack.
+         *
+         * Complete source blocks are decoded through the production single-block
+         * methods. Missing tail blocks are zeroed solely to keep a bad caller alive
+         * long enough for the test to report the semantic violation.
+         *
+         * @param row_idx Source row.
+         * @param superblock_idx Eight-block group index within the row.
+         * @param output Destination for 256 unpacked values.
+         * @param scales Optional destination for eight scales.
+         * @param mins Optional destination for eight minima.
+         */
+        void unpack_superblock_to_int8(
+            size_t row_idx,
+            size_t superblock_idx,
+            int8_t *output,
+            float *scales = nullptr,
+            float *mins = nullptr) const override
+        {
+            grouped_unpack_calls_.fetch_add(1, std::memory_order_relaxed);
+
+            constexpr size_t kElementsPerBlock = 32;
+            constexpr size_t kBlocksPerGroup = 8;
+            const size_t blocks_per_row =
+                (shape()[1] + kElementsPerBlock - 1) / kElementsPerBlock;
+            const size_t first_block = superblock_idx * kBlocksPerGroup;
+
+            for (size_t sub_block = 0; sub_block < kBlocksPerGroup; ++sub_block)
+            {
+                const size_t block = first_block + sub_block;
+                int8_t *block_output = output + sub_block * kElementsPerBlock;
+                if (block < blocks_per_row)
+                {
+                    Q8_0Tensor::unpack_block_to_int8(row_idx, block, block_output);
+                    if (scales)
+                        scales[sub_block] = Q8_0Tensor::get_block_scale(row_idx, block);
+                }
+                else
+                {
+                    std::memset(block_output, 0, kElementsPerBlock);
+                    if (scales)
+                        scales[sub_block] = 0.0f;
+                }
+                if (mins)
+                    mins[sub_block] = 0.0f;
+            }
+        }
+
+    private:
+        mutable std::atomic<size_t> grouped_unpack_calls_{0};
+    };
+
+    /**
+     * @brief Construct zero-valued raw Q8 storage for a two-dimensional tensor.
+     * @param rows Number of tensor rows.
+     * @param columns Number of logical values per row.
+     * @return Raw storage containing one valid Q8 block for each 32 values.
+     */
+    std::vector<uint8_t> makeZeroQ8Storage(size_t rows, size_t columns)
+    {
+        constexpr size_t kElementsPerBlock = 32;
+        const size_t blocks_per_row =
+            (columns + kElementsPerBlock - 1) / kElementsPerBlock;
+        return std::vector<uint8_t>(
+            rows * blocks_per_row * sizeof(Q8_0Block),
+            0);
+    }
+} // namespace
+
+TEST_F(Test__VocabParallelEmbeddingSharding, Repack_Sub256WidthNeverUsesGroupedUnpack)
+{
+    constexpr size_t kVocab = 16;
+    constexpr size_t kDModel = 64;
+    GroupedUnpackObservingQ8Tensor tensor(
+        {kVocab, kDModel},
+        makeZeroQ8Storage(kVocab, kDModel));
+
+    const auto full = repackEmbeddingToQ8(&tensor, kDModel);
+    const auto terminal_row =
+        repackEmbeddingToQ8(&tensor, kDModel, kVocab - 1, 1);
+
+    EXPECT_EQ(tensor.groupedUnpackCalls(), 0u)
+        << "A 256-element unpack must never be requested for a two-block row";
+    EXPECT_EQ(full.blocks_per_row, 2u);
+    EXPECT_EQ(terminal_row.blocks_per_row, 2u);
+}
+
+TEST_F(Test__VocabParallelEmbeddingSharding, Repack_Complete256WidthRetainsGroupedUnpack)
+{
+    constexpr size_t kVocab = 16;
+    constexpr size_t kDModel = 256;
+    GroupedUnpackObservingQ8Tensor tensor(
+        {kVocab, kDModel},
+        makeZeroQ8Storage(kVocab, kDModel));
+
+    const auto full = repackEmbeddingToQ8(&tensor, kDModel);
+
+    EXPECT_EQ(tensor.groupedUnpackCalls(), kVocab)
+        << "Complete eight-block rows should retain the economical grouped path";
+    EXPECT_EQ(full.blocks_per_row, 8u);
+}
 
 TEST_F(Test__VocabParallelEmbeddingSharding, Repack_FullVocab_MatchesStandard)
 {

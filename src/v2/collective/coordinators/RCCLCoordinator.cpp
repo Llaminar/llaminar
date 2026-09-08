@@ -19,17 +19,26 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 
+#include <algorithm>
 #include <functional>
 
 #ifdef HAVE_RCCL
 #include <hip/hip_runtime.h>
 #include "../backends/RCCLDynamicLoader.h"
+#include "../../backends/rocm/HipDeviceGuard.h"
 // Use the dynamically loaded RCCL types and functions
 namespace rccl = llaminar2::rccl_dynamic;
 #endif
 
 namespace llaminar2
 {
+
+#ifdef HAVE_RCCL
+    static hipError_t trackedHipSetDevice(int device_ordinal)
+    {
+        return static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_ordinal));
+    }
+#endif
 
     // ============================================================================
     // Helper Macros for Error Checking
@@ -298,30 +307,111 @@ namespace llaminar2
     void RCCLCoordinator::abortCommunicators()
     {
 #ifdef HAVE_RCCL
-        LOG_WARN("[RCCLCoordinator] Aborting all " << comms_.size()
-                                                   << " communicators to unblock pending RCCL operations");
+        std::lock_guard<std::mutex> abort_lock(abort_mutex_);
 
-        for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+        /*
+         * RCCL inherits NCCL's all-active-ranks abort contract. Calling local
+         * ranks serially can strand rank zero waiting for a rank the host has
+         * not entered yet. Close collective admission, detach every handle from
+         * ordinary cleanup, and make all active ranks enter ncclCommAbort before
+         * joining any of them. This mirrors CUDA and keeps backend failure
+         * lifecycles symmetric.
+         *
+         * RCCL communicator cleanup on this hardware is unsafe before the first
+         * collective initializes its internal mappings. In that unused case no
+         * device work exists to unblock, so preserve the established graceful
+         * cleanup path instead of invoking ncclCommAbort.
+         */
+        initialized_.store(false, std::memory_order_release);
+        const bool has_collective_work =
+            collective_performed_.load(std::memory_order_acquire);
+
+        std::vector<void *> communicators;
+        if (has_collective_work)
         {
-            if (comms_[i] != nullptr)
-            {
-                if (i < static_cast<int>(device_ordinals_.size()))
-                {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
-                }
-                rccl::ncclResult_t r = rccl::ncclCommAbort(
-                    static_cast<rccl::ncclComm_t>(comms_[i]));
-                if (r != rccl::ncclSuccess)
-                {
-                    LOG_WARN("[RCCLCoordinator] ncclCommAbort on device "
-                             << i << " returned: " << rccl::ncclGetErrorString(r));
-                }
-                comms_[i] = nullptr; // Prevent double-free in cleanup
-            }
+            communicators = comms_;
+        }
+        else
+        {
+            communicators.assign(comms_.size(), nullptr);
         }
 
-        // Mark as uninitialized so no further collectives are attempted
-        initialized_.store(false);
+        size_t active_count = 0;
+        for (void *communicator : communicators)
+            active_count += communicator != nullptr ? 1U : 0U;
+        LOG_WARN("[RCCLCoordinator] Aborting " << active_count
+                                                << " active communicator ranks concurrently"
+                                                << " collective_performed="
+                                                << has_collective_work);
+
+        std::vector<hipError_t> device_results(
+            communicators.size(), hipSuccess);
+        std::vector<rccl::ncclResult_t> abort_results(
+            communicators.size(), rccl::ncclSuccess);
+        std::vector<std::thread> abort_threads;
+        abort_threads.reserve(active_count);
+
+        for (size_t rank = 0; rank < communicators.size(); ++rank)
+        {
+            if (!communicators[rank])
+                continue;
+            abort_threads.emplace_back([&, rank]()
+            {
+                if (rank >= device_ordinals_.size())
+                {
+                    device_results[rank] = hipErrorInvalidDevice;
+                    abort_results[rank] = rccl::ncclInvalidArgument;
+                    return;
+                }
+                device_results[rank] =
+                    trackedHipSetDevice(device_ordinals_[rank]);
+                if (device_results[rank] != hipSuccess)
+                {
+                    abort_results[rank] = rccl::ncclUnhandledCudaError;
+                    return;
+                }
+                abort_results[rank] = rccl::ncclCommAbort(
+                    static_cast<rccl::ncclComm_t>(communicators[rank]));
+            });
+        }
+
+        /* Every active local rank has entered RCCL before any join occurs. */
+        for (std::thread &thread : abort_threads)
+            thread.join();
+
+        if (has_collective_work)
+        {
+            /*
+             * Preserve stable handles until abort has interrupted every caller
+             * that crossed admission before the fatal flag. Cleanup begins only
+             * after these entries are invalidated.
+             */
+            std::fill(comms_.begin(), comms_.end(), nullptr);
+        }
+
+        for (size_t rank = 0; rank < communicators.size(); ++rank)
+        {
+            if (!communicators[rank])
+                continue;
+            if (device_results[rank] != hipSuccess)
+            {
+                LOG_ERROR("[RCCLCoordinator] Fatal HIP device selection failure while aborting rank "
+                          << rank << " device="
+                          << (rank < device_ordinals_.size()
+                                  ? device_ordinals_[rank]
+                                  : -1)
+                          << " error="
+                          << hipGetErrorString(device_results[rank]));
+                continue;
+            }
+            if (abort_results[rank] != rccl::ncclSuccess)
+            {
+                LOG_ERROR("[RCCLCoordinator] ncclCommAbort failed for rank "
+                          << rank << " device=" << device_ordinals_[rank]
+                          << " error="
+                          << rccl::ncclGetErrorString(abort_results[rank]));
+            }
+        }
 
         // Signal coordinator thread to stop (it may be waiting)
         {
@@ -330,7 +420,7 @@ namespace llaminar2
         }
         queue_cv_.notify_all();
 
-        LOG_WARN("[RCCLCoordinator] All communicators aborted");
+        LOG_WARN("[RCCLCoordinator] Concurrent communicator abort complete");
 #else
         LOG_WARN("[RCCLCoordinator] abortCommunicators() called but RCCL not available");
 #endif
@@ -404,7 +494,7 @@ namespace llaminar2
             {
                 continue; // Already created
             }
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[RCCLCoordinator] setComputeStreams: hipSetDevice failed for device "
@@ -542,7 +632,7 @@ namespace llaminar2
         // Step 1: Create per-device streams and events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed for device ") +
@@ -626,7 +716,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
             }
@@ -652,7 +742,7 @@ namespace llaminar2
             bool alloc_ok = true;
             for (int i = 0; i < num_devices_ && alloc_ok; ++i)
             {
-                HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 if (hipMalloc(&prime_bufs[i], sizeof(float)) != hipSuccess)
                 {
                     LOG_WARN("[RCCLCoordinator] hipMalloc for prime buffer failed on device "
@@ -670,7 +760,7 @@ namespace llaminar2
                     bool ops_ok = true;
                     for (int i = 0; i < num_devices_ && ops_ok; ++i)
                     {
-                        HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                        HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         r = rccl::ncclAllReduce(
                             prime_bufs[i], prime_bufs[i], 1,
                             rccl::ncclFloat, rccl::ncclSum,
@@ -690,7 +780,7 @@ namespace llaminar2
                         // Synchronize all streams to ensure the trivial op completes
                         for (int i = 0; i < num_devices_; ++i)
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                             HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
                         }
                         collective_performed_.store(true);
@@ -704,7 +794,7 @@ namespace llaminar2
             {
                 if (prime_bufs[i] != nullptr)
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                     HIP_CHECK_VOID(hipFree(prime_bufs[i]));
                 }
             }
@@ -735,7 +825,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         }
                         rccl::ncclResult_t r = rccl::ncclCommFinalize(static_cast<rccl::ncclComm_t>(comms_[i]));
                         if (r != rccl::ncclSuccess)
@@ -754,7 +844,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         }
                         HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
                     }
@@ -767,7 +857,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         }
                         rccl::ncclResult_t r = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
                         if (r != rccl::ncclSuccess)
@@ -810,7 +900,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipEventDestroy(static_cast<hipEvent_t>(completion_events_[i])));
                 completion_events_[i] = nullptr;
@@ -825,7 +915,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipStreamDestroy(static_cast<hipStream_t>(streams_[i])));
                 streams_[i] = nullptr;
@@ -913,13 +1003,14 @@ namespace llaminar2
             return false;
         }
 
-        // If compute streams aren't registered, fall back to synchronous path
+        // Compute-stream registration is the ownership contract for this API.
         if (compute_streams_.empty() ||
             static_cast<int>(compute_streams_.size()) != num_devices_)
         {
-            LOG_DEBUG("[RCCLCoordinator] allreduceMultiWithComputeDeps: no compute streams, "
-                      "falling back to synchronous allreduceMultiAndSynchronize");
-            return allreduceMultiAndSynchronize(buffers, count, dtype, op);
+            last_error_ =
+                "allreduceMultiWithComputeDeps requires one registered compute stream per device; "
+                "synchronous fallback is forbidden";
+            return false;
         }
 
         // Direct execution on caller thread — bypasses submitAndWait coordinator
@@ -936,6 +1027,512 @@ namespace llaminar2
             return doInsertComputeStreamDeps();
         }
 #else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allreduceMultiOnStreams(const std::vector<void *> &buffers, size_t count,
+                                                  CollectiveDataType dtype, CollectiveOp op,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i])
+            {
+                last_error_ = "Null allreduce buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null allreduce stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+
+            if (trace_device_state)
+            {
+                int current_device = -1;
+                hipError_t get_device = hipGetDevice(&current_device);
+                if (get_device == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_GROUP_LAUNCH] thread=" << thread_hash
+                                                                   << " slot=" << i
+                                                                   << " target_device=" << device_ordinals_[i]
+                                                                   << " current_device=" << current_device
+                                                                   << " stream=" << streams[i]
+                                                                   << " buffer=" << buffers[i]
+                                                                   << " count=" << count);
+                }
+            }
+
+            rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+            hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+            r = rccl::ncclAllReduce(
+                buffers[i], buffers[i], count,
+                toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
+                comm, stream);
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rcclAllReduce(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allreduceWithSidebandsMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i])
+            {
+                last_error_ = "Null anchor allreduce buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null grouped bundle stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        for (size_t sideband_idx = 0; sideband_idx < sidebands.size(); ++sideband_idx)
+        {
+            const auto &sideband = sidebands[sideband_idx];
+            if (sideband.count == 0)
+            {
+                last_error_ = "Zero-count grouped sideband " + std::to_string(sideband_idx);
+                return false;
+            }
+            if (sideband.kind == CollectiveSidebandOp::Broadcast &&
+                (sideband.root < 0 || sideband.root >= num_devices_))
+            {
+                last_error_ = "Invalid grouped sideband broadcast root " +
+                              std::to_string(sideband.root);
+                return false;
+            }
+            if (sideband.recv_buffers.size() != static_cast<size_t>(num_devices_))
+            {
+                last_error_ = "Grouped sideband recv buffer count mismatch at index " +
+                              std::to_string(sideband_idx);
+                return false;
+            }
+            if ((sideband.kind == CollectiveSidebandOp::Allgather ||
+                 sideband.kind == CollectiveSidebandOp::Broadcast) &&
+                sideband.send_buffers.size() != static_cast<size_t>(num_devices_))
+            {
+                last_error_ = "Grouped sideband send buffer count mismatch at index " +
+                              std::to_string(sideband_idx);
+                return false;
+            }
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                if (!sideband.recv_buffers[static_cast<size_t>(i)])
+                {
+                    last_error_ = "Null grouped sideband recv buffer at sideband " +
+                                  std::to_string(sideband_idx) + " device " + std::to_string(i);
+                    return false;
+                }
+                if ((sideband.kind == CollectiveSidebandOp::Allgather ||
+                     sideband.kind == CollectiveSidebandOp::Broadcast) &&
+                    !sideband.send_buffers[static_cast<size_t>(i)])
+                {
+                    last_error_ = "Null grouped sideband send buffer at sideband " +
+                                  std::to_string(sideband_idx) + " device " + std::to_string(i);
+                    return false;
+                }
+            }
+        }
+
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+
+            if (trace_device_state)
+            {
+                int current_device = -1;
+                hipError_t get_device = hipGetDevice(&current_device);
+                if (get_device == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_GROUP_BUNDLE] thread=" << thread_hash
+                                                                    << " slot=" << i
+                                                                    << " target_device=" << device_ordinals_[i]
+                                                                    << " current_device=" << current_device
+                                                                    << " stream=" << streams[i]
+                                                                    << " buffer=" << buffers[i]
+                                                                    << " count=" << count
+                                                                    << " sidebands=" << sidebands.size());
+                }
+            }
+
+            rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+            hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+            r = rccl::ncclAllReduce(
+                buffers[i], buffers[i], count,
+                toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
+                comm, stream);
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rcclAllReduce(grouped bundle anchor) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        for (size_t sideband_idx = 0; sideband_idx < sidebands.size(); ++sideband_idx)
+        {
+            const auto &sideband = sidebands[sideband_idx];
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+
+                rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+                hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+                const auto rccl_dtype = toRcclDataTypeInt(toDataTypeInt(sideband.dtype));
+                switch (sideband.kind)
+                {
+                case CollectiveSidebandOp::AllreduceSum:
+                    r = rccl::ncclAllReduce(
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        rccl_dtype,
+                        rccl::ncclSum,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Allgather:
+                    r = rccl::ncclAllGather(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        rccl_dtype,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Broadcast:
+                    r = rccl::ncclBroadcast(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        rccl_dtype,
+                        sideband.root,
+                        comm,
+                        stream);
+                    break;
+                }
+
+                if (r != rccl::ncclSuccess)
+                {
+                    last_error_ = std::string("RCCL grouped sideband failed at sideband ") +
+                                  std::to_string(sideband_idx) + " device " +
+                                  std::to_string(device_ordinals_[i]) + ": " +
+                                  rccl::ncclGetErrorString(r);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::collectiveSidebandsMultiOnStreams(
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+        if (sidebands.empty())
+        {
+            last_error_ =
+                "collectiveSidebandsMultiOnStreams requires at least one sideband";
+            return false;
+        }
+        if (streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Stream count does not match device count";
+            return false;
+        }
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!streams[static_cast<size_t>(i)])
+            {
+                last_error_ = "Null grouped sideband stream for device " +
+                              std::to_string(i);
+                return false;
+            }
+        }
+
+        /*
+         * Reject malformed publication contracts before opening the RCCL group.
+         * A participant mismatch discovered after the first launch would leave a
+         * partial collective sequence resident in the communicator.
+         */
+        for (size_t sideband_index = 0;
+             sideband_index < sidebands.size();
+             ++sideband_index)
+        {
+            const auto &sideband = sidebands[sideband_index];
+            if (sideband.count == 0 ||
+                sideband.recv_buffers.size() !=
+                    static_cast<size_t>(num_devices_))
+            {
+                last_error_ =
+                    "Invalid grouped sideband descriptor at index " +
+                    std::to_string(sideband_index);
+                return false;
+            }
+            if (sideband.kind == CollectiveSidebandOp::Broadcast &&
+                (sideband.root < 0 || sideband.root >= num_devices_))
+            {
+                last_error_ = "Invalid grouped sideband broadcast root " +
+                              std::to_string(sideband.root);
+                return false;
+            }
+            const bool requires_send_buffers =
+                sideband.kind == CollectiveSidebandOp::Allgather ||
+                sideband.kind == CollectiveSidebandOp::Broadcast;
+            if (requires_send_buffers &&
+                sideband.send_buffers.size() !=
+                    static_cast<size_t>(num_devices_))
+            {
+                last_error_ =
+                    "Grouped sideband send buffer count mismatch at index " +
+                    std::to_string(sideband_index);
+                return false;
+            }
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                if (!sideband.recv_buffers[static_cast<size_t>(i)] ||
+                    (requires_send_buffers &&
+                     !sideband.send_buffers[static_cast<size_t>(i)]))
+                {
+                    last_error_ =
+                        "Null grouped sideband buffer at sideband " +
+                        std::to_string(sideband_index) + " device " +
+                        std::to_string(i);
+                    return false;
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+        rccl::ncclResult_t result = rccl::ncclGroupStart();
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") +
+                          rccl::ncclGetErrorString(result);
+            return false;
+        }
+
+        for (size_t sideband_index = 0;
+             sideband_index < sidebands.size();
+             ++sideband_index)
+        {
+            const auto &sideband = sidebands[sideband_index];
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                const hipError_t set_device =
+                    trackedHipSetDevice(
+                        device_ordinals_[static_cast<size_t>(i)]);
+                if (set_device != hipSuccess)
+                {
+                    last_error_ = std::string("hipSetDevice failed: ") +
+                                  hipGetErrorString(set_device);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+
+                const auto comm =
+                    static_cast<rccl::ncclComm_t>(
+                        comms_[static_cast<size_t>(i)]);
+                const auto stream =
+                    static_cast<hipStream_t>(
+                        streams[static_cast<size_t>(i)]);
+                const auto dtype =
+                    toRcclDataTypeInt(toDataTypeInt(sideband.dtype));
+                switch (sideband.kind)
+                {
+                case CollectiveSidebandOp::AllreduceSum:
+                    result = rccl::ncclAllReduce(
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        dtype,
+                        rccl::ncclSum,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Allgather:
+                    result = rccl::ncclAllGather(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        dtype,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Broadcast:
+                    result = rccl::ncclBroadcast(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        dtype,
+                        sideband.root,
+                        comm,
+                        stream);
+                    break;
+                }
+                if (result != rccl::ncclSuccess)
+                {
+                    last_error_ =
+                        "RCCL grouped sideband publication failed at sideband " +
+                        std::to_string(sideband_index) + " device " +
+                        std::to_string(device_ordinals_[static_cast<size_t>(i)]) +
+                        ": " + rccl::ncclGetErrorString(result);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+            }
+        }
+
+        result = rccl::ncclGroupEnd();
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") +
+                          rccl::ncclGetErrorString(result);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)sidebands;
+        (void)streams;
         last_error_ = "RCCL not available";
         return false;
 #endif
@@ -985,7 +1582,7 @@ namespace llaminar2
         hipError_t err;
 
         // 1. Set device context
-        err = hipSetDevice(ordinal);
+        err = trackedHipSetDevice(ordinal);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1083,7 +1680,7 @@ namespace llaminar2
         static thread_local int tl_last_hip_device = -1;
         if (tl_last_hip_device != ordinal)
         {
-            hipError_t err = hipSetDevice(ordinal);
+            hipError_t err = trackedHipSetDevice(ordinal);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1141,6 +1738,564 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::reduceSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid reduce root " + std::to_string(root) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (!send_buf || !recv_buf || count == 0)
+        {
+            last_error_ = "Invalid reduce buffer/count for device " +
+                          std::to_string(device_idx);
+            return false;
+        }
+        if (!stream)
+        {
+            last_error_ = "Null reduce stream for device " +
+                          std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        const auto comm =
+            static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        const auto caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_reduce = -1;
+        if (tl_last_hip_device_for_reduce != ordinal)
+        {
+            const hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") +
+                              hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_reduce = ordinal;
+        }
+
+        const rccl::ncclResult_t result = rccl::ncclReduce(
+            send_buf,
+            recv_buf,
+            count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)),
+            toRcclRedOpInt(toOpInt(op)),
+            root,
+            comm,
+            caller_stream);
+        if (result != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclReduce(on-stream) failed: ") +
+                          rccl::ncclGetErrorString(result);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allgatherSingleDeviceOnStream(const void *send_buf,
+                                                        void *recv_buf,
+                                                        size_t send_count,
+                                                        CollectiveDataType dtype,
+                                                        int device_idx,
+                                                        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!send_buf || !recv_buf)
+        {
+            last_error_ = "Null allgather buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        hipStream_t caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_allgather = -1;
+        if (tl_last_hip_device_for_allgather != ordinal)
+        {
+            hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_allgather = ordinal;
+        }
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_allgather_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " send_buf=" << send_buf
+                     << " recv_buf=" << recv_buf
+                     << " count=" << send_count
+                     << " dtype=" << static_cast<int>(dtype)
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
+
+        /*
+         * HIP launch errors are thread-local and sticky.  Attribute producer
+         * and RCCL enqueue failures at this primitive instead of allowing the
+         * next unrelated kernel wrapper to consume and mislabel them.  This
+         * check is fail-fast only: no retry, synchronization, or alternate
+         * transport is permitted.
+         */
+        const hipError_t producer_error = hipGetLastError();
+        if (producer_error != hipSuccess)
+        {
+            last_error_ =
+                std::string("HIP producer launch state failed before rcclAllGather(on-stream): ") +
+                hipGetErrorString(producer_error);
+            return false;
+        }
+
+        rccl::ncclResult_t r = rccl::ncclAllGather(
+            send_buf,
+            recv_buf,
+            send_count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)),
+            comm,
+            caller_stream);
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclAllGather(on-stream) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+        const hipError_t collective_launch_error = hipGetLastError();
+        if (collective_launch_error != hipSuccess)
+        {
+            last_error_ =
+                std::string("HIP runtime rejected rcclAllGather(on-stream) enqueue: ") +
+                hipGetErrorString(collective_launch_error);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)send_count;
+        (void)dtype;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::broadcastSingleDeviceOnStream(const void *send_buf,
+                                                        void *recv_buf,
+                                                        size_t count,
+                                                        CollectiveDataType dtype,
+                                                        int root,
+                                                        int device_idx,
+                                                        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid broadcast root " + std::to_string(root) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!send_buf || !recv_buf)
+        {
+            last_error_ = "Null broadcast buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        hipStream_t caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_broadcast = -1;
+        if (tl_last_hip_device_for_broadcast != ordinal)
+        {
+            hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_broadcast = ordinal;
+        }
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_broadcast_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " send_buf=" << send_buf
+                     << " recv_buf=" << recv_buf
+                     << " count=" << count
+                     << " dtype=" << static_cast<int>(dtype)
+                     << " root=" << root
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
+
+        rccl::ncclResult_t r = rccl::ncclBroadcast(
+            send_buf,
+            recv_buf,
+            count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)),
+            root,
+            comm,
+            caller_stream);
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclBroadcast(on-stream) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::groupedP2PSingleDeviceOnStream(
+        const std::vector<CollectiveP2POp> &ops,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (!stream)
+        {
+            last_error_ = "Null stream for grouped P2P device " + std::to_string(device_idx);
+            return false;
+        }
+        if (ops.empty())
+            return true;
+
+        const int ordinal = device_ordinals_[device_idx];
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        hipStream_t caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_grouped_p2p = -1;
+        if (tl_last_hip_device_for_grouped_p2p != ordinal)
+        {
+            hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_grouped_p2p = ordinal;
+        }
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_grouped_p2p_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " ops=" << ops.size()
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart(grouped P2P) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (const auto &op : ops)
+        {
+            if (op.peer < 0 || op.peer >= num_devices_ || op.peer == device_idx)
+            {
+                last_error_ = "Invalid grouped P2P peer " + std::to_string(op.peer) +
+                              " for device " + std::to_string(device_idx);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+            const auto dtype_int = toRcclDataTypeInt(toDataTypeInt(op.dtype));
+            if (op.kind == CollectiveP2POpKind::Send)
+            {
+                if (!op.send_buffer || op.count == 0)
+                {
+                    last_error_ = "Invalid grouped P2P send buffer/count";
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+                r = rccl::ncclSend(
+                    op.send_buffer,
+                    op.count,
+                    dtype_int,
+                    op.peer,
+                    comm,
+                    caller_stream);
+            }
+            else
+            {
+                if (!op.recv_buffer || op.count == 0)
+                {
+                    last_error_ = "Invalid grouped P2P recv buffer/count";
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+                r = rccl::ncclRecv(
+                    op.recv_buffer,
+                    op.count,
+                    dtype_int,
+                    op.peer,
+                    comm,
+                    caller_stream);
+            }
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rccl grouped P2P op failed: ") +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd(grouped P2P) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)ops;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::broadcastMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                                  const std::vector<void *> &recv_buffers,
+                                                  size_t count,
+                                                  CollectiveDataType dtype,
+                                                  int root,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid broadcast root " + std::to_string(root);
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!send_buffers[i] || !recv_buffers[i])
+            {
+                last_error_ = "Null broadcast buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null broadcast stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+
+            if (trace_device_state)
+            {
+                int current_device = -1;
+                hipError_t get_device = hipGetDevice(&current_device);
+                if (get_device == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_GROUP_BROADCAST] thread=" << thread_hash
+                                                                       << " slot=" << i
+                                                                       << " target_device=" << device_ordinals_[i]
+                                                                       << " current_device=" << current_device
+                                                                       << " stream=" << streams[i]
+                                                                       << " send=" << send_buffers[i]
+                                                                       << " recv=" << recv_buffers[i]
+                                                                       << " count=" << count
+                                                                       << " root=" << root);
+                }
+            }
+
+            rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+            hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+            r = rccl::ncclBroadcast(
+                send_buffers[i],
+                recv_buffers[i],
+                count,
+                toRcclDataTypeInt(toDataTypeInt(dtype)),
+                root,
+                comm,
+                stream);
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rcclBroadcast(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)count;
+        (void)dtype;
+        (void)root;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allgatherMulti(const std::vector<const void *> &send_buffers,
                                          const std::vector<void *> &recv_buffers,
                                          size_t send_count, CollectiveDataType dtype)
@@ -1162,6 +2317,54 @@ namespace llaminar2
         return submitAndWait([&]()
                              { return doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)); });
 #else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allgatherMultiWithComputeDeps(
+        const std::vector<const void *> &send_buffers,
+        const std::vector<void *> &recv_buffers,
+        size_t send_count,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer count doesn't match device count";
+            return false;
+        }
+
+        if (compute_streams_.empty() ||
+            static_cast<int>(compute_streams_.size()) != num_devices_)
+        {
+            LOG_DEBUG("[RCCLCoordinator] allgatherMultiWithComputeDeps: no compute streams, "
+                      "falling back to synchronous allgather");
+            return submitAndWait([&]()
+                                 {
+                if (!doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)))
+                    return false;
+                return doSynchronizeAll(); });
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+            if (!doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)))
+                return false;
+            return doInsertComputeStreamDeps();
+        }
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)send_count;
+        (void)dtype;
         last_error_ = "RCCL not available";
         return false;
 #endif
@@ -1243,7 +2446,7 @@ namespace llaminar2
 
         return submitAndWait([&]()
                              {
-        hipError_t err = hipSetDevice(device_ordinals_[device_idx]);
+        hipError_t err = trackedHipSetDevice(device_ordinals_[device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1300,7 +2503,7 @@ namespace llaminar2
 #ifdef HAVE_RCCL
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1336,7 +2539,7 @@ namespace llaminar2
         // host thread. The host returns immediately after these API calls.
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed in doInsertComputeStreamDeps: ") +
@@ -1400,7 +2603,7 @@ namespace llaminar2
         {
             return submitAndWait([&]()
                                  {
-            hipError_t err = hipSetDevice(device_ordinals_[src_device_idx]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1473,7 +2676,7 @@ namespace llaminar2
         {
             return submitAndWait([&]()
                                  {
-            hipError_t err = hipSetDevice(device_ordinals_[src_device_idx]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1516,6 +2719,61 @@ namespace llaminar2
     // Internal Collective Implementations (called ON coordinator thread)
     // ============================================================================
 
+    bool RCCLCoordinator::doInsertCollectiveInputDeps(const char *operation)
+    {
+#ifdef HAVE_RCCL
+        if (compute_streams_.size() != static_cast<size_t>(num_devices_) ||
+            compute_events_.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = std::string(operation) +
+                          " requires one registered compute stream and event per device";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!compute_streams_[i] || !compute_events_[i] || !streams_[i])
+            {
+                last_error_ = std::string(operation) +
+                              " encountered an uninitialized stream/event slot for device " +
+                              std::to_string(device_ordinals_[i]);
+                return false;
+            }
+
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed before ") +
+                              operation + ": " + hipGetErrorString(err);
+                return false;
+            }
+
+            auto compute_stream =
+                static_cast<hipStream_t>(compute_streams_[i]);
+            auto compute_event =
+                static_cast<hipEvent_t>(compute_events_[i]);
+            auto collective_stream =
+                static_cast<hipStream_t>(streams_[i]);
+            err = hipEventRecord(compute_event, compute_stream);
+            if (err == hipSuccess)
+                err = hipStreamWaitEvent(collective_stream, compute_event, 0);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("HIP event handoff failed before ") +
+                              operation + " on device " +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              hipGetErrorString(err);
+                return false;
+            }
+        }
+        return true;
+#else
+        (void)operation;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::doAllreduceMulti(const std::vector<void *> &buffers, size_t count,
                                            int dtype_int, int op_int)
     {
@@ -1523,90 +2781,8 @@ namespace llaminar2
         const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
         const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
 
-        // Pre-collective sync: ensure compute kernels have finished writing to
-        // the buffers before RCCL reads them.
-        //
-        // Two modes:
-        // (a) Stream-level sync (preferred): Record event on compute stream, then
-        //     hipStreamWaitEvent(rccl_stream, compute_event) — zero host stall.
-        // (b) Device sync (fallback): hipDeviceSynchronize() — stalls host thread
-        //     until all GPU work completes. Used when compute streams aren't registered.
-        const bool use_stream_sync = !compute_streams_.empty() &&
-                                     static_cast<int>(compute_streams_.size()) == num_devices_;
-
-        for (int i = 0; i < num_devices_; ++i)
-        {
-            if (trace_device_state)
-            {
-                int before_dev = -1;
-                hipError_t get_before = hipGetDevice(&before_dev);
-                if (get_before == hipSuccess)
-                {
-                    LOG_DEBUG("[RCCL_DEVICE_STATE] phase=pre_sync thread=" << thread_hash
-                                                                           << " slot=" << i
-                                                                           << " current=" << before_dev
-                                                                           << " target=" << device_ordinals_[i]);
-                }
-            }
-
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed during pre-allreduce sync: ") + hipGetErrorString(err);
-                return false;
-            }
-
-            if (trace_device_state)
-            {
-                int after_dev = -1;
-                hipError_t get_after = hipGetDevice(&after_dev);
-                if (get_after == hipSuccess && after_dev != device_ordinals_[i])
-                {
-                    LOG_ERROR("[RCCL_DEVICE_STATE_MISMATCH] phase=post_set_pre_sync thread=" << thread_hash
-                                                                                             << " slot=" << i
-                                                                                             << " expected=" << device_ordinals_[i]
-                                                                                             << " actual=" << after_dev);
-                    last_error_ = "RCCLCoordinator device mismatch after hipSetDevice (pre-sync)";
-                    return false;
-                }
-            }
-
-            if (use_stream_sync)
-            {
-                // Stream-level pre-sync: record event on compute stream, then
-                // make RCCL stream wait for it. Zero host stall.
-                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
-                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
-                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
-
-                err = hipEventRecord(compute_event, compute_stream);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipEventRecord on compute stream failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-
-                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-            else
-            {
-                // Fallback: full device sync (stalls host)
-                err = hipDeviceSynchronize();
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-        }
+        if (!doInsertCollectiveInputDeps("RCCL allreduce"))
+            return false;
 
         // Start RCCL group for multi-GPU operation
         rccl::ncclResult_t r = rccl::ncclGroupStart();
@@ -1619,7 +2795,7 @@ namespace llaminar2
         // Issue allreduce for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1685,7 +2861,7 @@ namespace llaminar2
         // Record completion events for all devices
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -1715,49 +2891,8 @@ namespace llaminar2
                                            size_t send_count, int dtype_int)
     {
 #ifdef HAVE_RCCL
-        // Pre-collective sync: ensure compute done before RCCL reads.
-        // Uses stream-wait-event if compute streams registered, else device sync.
-        const bool use_stream_sync = !compute_streams_.empty() &&
-                                     static_cast<int>(compute_streams_.size()) == num_devices_;
-        for (int i = 0; i < num_devices_; ++i)
-        {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed during pre-allgather sync: ") + hipGetErrorString(err);
-                return false;
-            }
-            if (use_stream_sync)
-            {
-                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
-                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
-                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
-                err = hipEventRecord(compute_event, compute_stream);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipEventRecord failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-            else
-            {
-                err = hipDeviceSynchronize();
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-        }
+        if (!doInsertCollectiveInputDeps("RCCL allgather"))
+            return false;
 
         // Start RCCL group
         rccl::ncclResult_t r = rccl::ncclGroupStart();
@@ -1770,7 +2905,7 @@ namespace llaminar2
         // Issue allgather for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1803,7 +2938,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -1832,48 +2967,8 @@ namespace llaminar2
                                            int dtype_int, int root)
     {
 #ifdef HAVE_RCCL
-        // Pre-collective sync: ensure compute done before RCCL reads.
-        const bool use_stream_sync = !compute_streams_.empty() &&
-                                     static_cast<int>(compute_streams_.size()) == num_devices_;
-        for (int i = 0; i < num_devices_; ++i)
-        {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed during pre-broadcast sync: ") + hipGetErrorString(err);
-                return false;
-            }
-            if (use_stream_sync)
-            {
-                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
-                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
-                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
-                err = hipEventRecord(compute_event, compute_stream);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipEventRecord failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-            else
-            {
-                err = hipDeviceSynchronize();
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-        }
+        if (!doInsertCollectiveInputDeps("RCCL broadcast"))
+            return false;
 
         // Start RCCL group
         rccl::ncclResult_t r = rccl::ncclGroupStart();
@@ -1886,7 +2981,7 @@ namespace llaminar2
         // Issue broadcast for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1920,7 +3015,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -1950,48 +3045,8 @@ namespace llaminar2
                                                size_t recv_count, int dtype_int, int op_int)
     {
 #ifdef HAVE_RCCL
-        // Pre-collective sync: ensure compute done before RCCL reads.
-        const bool use_stream_sync = !compute_streams_.empty() &&
-                                     static_cast<int>(compute_streams_.size()) == num_devices_;
-        for (int i = 0; i < num_devices_; ++i)
-        {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed during pre-reducescatter sync: ") + hipGetErrorString(err);
-                return false;
-            }
-            if (use_stream_sync)
-            {
-                hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
-                hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[i]);
-                hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[i]);
-                err = hipEventRecord(compute_event, compute_stream);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipEventRecord failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-                err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipStreamWaitEvent failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-            else
-            {
-                err = hipDeviceSynchronize();
-                if (err != hipSuccess)
-                {
-                    last_error_ = std::string("hipDeviceSynchronize failed for device ") +
-                                  std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
-                    return false;
-                }
-            }
-        }
+        if (!doInsertCollectiveInputDeps("RCCL reduce-scatter"))
+            return false;
 
         // Start RCCL group
         rccl::ncclResult_t r = rccl::ncclGroupStart();
@@ -2004,7 +3059,7 @@ namespace llaminar2
         // Issue reduce-scatter for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2038,7 +3093,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -2077,7 +3132,7 @@ namespace llaminar2
         }
 
         // Issue send from source device
-        hipError_t err = hipSetDevice(device_ordinals_[src_device_idx]);
+        hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice (src) failed: ") + hipGetErrorString(err);
@@ -2098,7 +3153,7 @@ namespace llaminar2
         }
 
         // Issue recv on destination device
-        err = hipSetDevice(device_ordinals_[dst_device_idx]);
+        err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice (dst) failed: ") + hipGetErrorString(err);
@@ -2129,7 +3184,7 @@ namespace llaminar2
         if (wait_for_completion)
         {
             // Synchronize both streams to ensure copy is complete
-            err = hipSetDevice(device_ordinals_[src_device_idx]);
+            err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice (sync src) failed: ") + hipGetErrorString(err);
@@ -2142,7 +3197,7 @@ namespace llaminar2
                 return false;
             }
 
-            err = hipSetDevice(device_ordinals_[dst_device_idx]);
+            err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice (sync dst) failed: ") + hipGetErrorString(err);
@@ -2157,7 +3212,7 @@ namespace llaminar2
         }
 
         // Record completion events (for both sync and async paths)
-        err = hipSetDevice(device_ordinals_[src_device_idx]);
+        err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
         if (err == hipSuccess)
         {
             hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[src_device_idx]), src_stream);
@@ -2166,7 +3221,7 @@ namespace llaminar2
                 LOG_WARN("[RCCLCoordinator] hipEventRecord (src) failed: " << hipGetErrorString(evt_err));
             }
         }
-        err = hipSetDevice(device_ordinals_[dst_device_idx]);
+        err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
         if (err == hipSuccess)
         {
             hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[dst_device_idx]), dst_stream);

@@ -7,8 +7,8 @@
  * 2. EmbeddingStage::setStableTokenPointer() contract
  * 3. Prelaunch token upload succeeds under graph capture (ROCm)
  * 4. Missing preload fails under graph capture (ROCm)
- * 5. KVCacheAppendStage replay callback contract
- * 6. ForwardGraphCache replay_callback_stages caching
+ * 5. KVCacheAppendStage canonical device-state binding contract
+ * 6. ForwardGraphCache device replay-parameter caching
  */
 
 #include <gtest/gtest.h>
@@ -46,14 +46,51 @@ using namespace llaminar2::testing;
 
 namespace
 {
+    template <typename T>
+    concept HasHostGraphReplayCallback = requires(T &stage) {
+        stage.onGraphReplayed();
+        stage.needsOnGraphReplayed();
+    };
 
+    static_assert(
+        !HasHostGraphReplayCallback<IComputeStage>,
+        "GPU graph state publication must remain device-owned; do not restore host replay callbacks");
+
+#ifdef HAVE_ROCM
     /**
-     * @brief Minimal KV cache that records host-side replay advancement.
+     * @brief Own one explicit HIP stream for GPU integration cases.
      *
-     * Prefill graph replay tests do not need real K/V storage; they only need to
-     * verify that KVCacheAppendStage calls advanceHead() with the count selected by
-     * its dynamic replay metadata.
+     * GPU kernels in the device-owned execution model never adopt the legacy
+     * null/default stream. Keeping ownership local to the test also guarantees
+     * cleanup when a GoogleTest assertion returns early.
      */
+    class ScopedHipStream final
+    {
+    public:
+        ScopedHipStream()
+            : status_(hipStreamCreate(&stream_))
+        {
+        }
+
+        ~ScopedHipStream()
+        {
+            if (stream_)
+                (void)hipStreamDestroy(stream_);
+        }
+
+        ScopedHipStream(const ScopedHipStream &) = delete;
+        ScopedHipStream &operator=(const ScopedHipStream &) = delete;
+
+        bool valid() const { return status_ == hipSuccess && stream_ != nullptr; }
+        hipStream_t get() const { return stream_; }
+
+    private:
+        hipStream_t stream_ = nullptr;
+        hipError_t status_ = hipErrorUnknown;
+    };
+#endif
+
+    /** @brief Minimal host-only KV cache used to verify fail-closed defaults. */
     class RecordingKVCache : public IKVCache
     {
     public:
@@ -104,56 +141,59 @@ namespace
             return true;
         }
 
-        bool isGraphCaptureReady() const override { return true; }
+        bool isGraphCaptureReady() const override { return false; }
 
-        void advanceHead(int layer, int seq_idx, int num_tokens) override
+        bool resetRequestState(const StateResetContext &) override
         {
-            last_layer_ = layer;
-            last_seq_idx_ = seq_idx;
-            last_advance_tokens_ = num_tokens;
-            advance_calls_++;
-            cached_tokens_ += num_tokens;
+            cached_tokens_ = 0;
+            return true;
         }
-
-        void clear() override { cached_tokens_ = 0; }
-        void clear_sequence(int layer, int seq_idx) override
+        bool resetSequenceState(int seq_idx, const StateResetContext &) override
+        {
+            (void)seq_idx;
+            cached_tokens_ = 0;
+            return true;
+        }
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &) override
         {
             (void)layer;
             (void)seq_idx;
             cached_tokens_ = 0;
+            return true;
         }
-        void clear_layer(int layer) override
+        bool resetLayerState(int layer, const StateResetContext &) override
         {
             (void)layer;
             cached_tokens_ = 0;
+            return true;
         }
-
-        int lastLayer() const { return last_layer_; }
-        int lastSeqIdx() const { return last_seq_idx_; }
-        int lastAdvanceTokens() const { return last_advance_tokens_; }
-        int advanceCalls() const { return advance_calls_; }
 
     private:
         int cached_tokens_ = 0;
-        int last_layer_ = -1;
-        int last_seq_idx_ = -1;
-        int last_advance_tokens_ = 0;
-        int advance_calls_ = 0;
     };
 
     /**
-     * @brief KV cache test double that models CUDA/ROCm dynamic append mailboxes.
+     * @brief KV cache test double that records immutable graph count bindings.
      */
     class DynamicAppendRecordingKVCache final : public RecordingKVCache
     {
     public:
-        bool supportsDynamicAppendState() const override { return true; }
+        bool isGraphCaptureReady() const override { return true; }
 
-        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override
+        bool bindGraphAppendCountSource(
+            int layer,
+            int seq_idx,
+            const int32_t *append_tokens_device,
+            int captured_max_tokens,
+            void *gpu_stream) override
         {
             last_dynamic_layer_ = layer;
             last_dynamic_seq_idx_ = seq_idx;
-            last_dynamic_append_tokens_ = append_tokens;
+            last_dynamic_append_source_ = append_tokens_device;
+            last_captured_max_tokens_ = captured_max_tokens;
             last_dynamic_stream_ = gpu_stream;
             ++dynamic_append_calls_;
             return accept_dynamic_state_;
@@ -163,7 +203,8 @@ namespace
         int dynamicAppendCalls() const { return dynamic_append_calls_; }
         int lastDynamicLayer() const { return last_dynamic_layer_; }
         int lastDynamicSeqIdx() const { return last_dynamic_seq_idx_; }
-        int lastDynamicAppendTokens() const { return last_dynamic_append_tokens_; }
+        const int32_t *lastDynamicAppendSource() const { return last_dynamic_append_source_; }
+        int lastCapturedMaxTokens() const { return last_captured_max_tokens_; }
         void *lastDynamicStream() const { return last_dynamic_stream_; }
 
     private:
@@ -171,30 +212,9 @@ namespace
         int dynamic_append_calls_ = 0;
         int last_dynamic_layer_ = -1;
         int last_dynamic_seq_idx_ = -1;
-        int last_dynamic_append_tokens_ = 0;
+        const int32_t *last_dynamic_append_source_ = nullptr;
+        int last_captured_max_tokens_ = 0;
         void *last_dynamic_stream_ = nullptr;
-    };
-
-    // =========================================================================
-    // Mock stage with configurable needsOnGraphReplayed()
-    // =========================================================================
-
-    class MockReplayCallbackStage : public MockComputeStage
-    {
-    public:
-        explicit MockReplayCallbackStage(bool needs_replay, std::string name = "MockReplay")
-            : MockComputeStage(ComputeStageType::GEMM, std::move(name), DeviceId::cpu()),
-              needs_replay_(needs_replay) {}
-
-        bool needsOnGraphReplayed() const override { return needs_replay_; }
-
-        void onGraphReplayed() override { replay_count_++; }
-
-        int replayCount() const { return replay_count_; }
-
-    private:
-        bool needs_replay_ = false;
-        int replay_count_ = 0;
     };
 
     /**
@@ -455,6 +475,9 @@ namespace
 
         auto params = makeParams(embed_table.get(), tokens.data(), output.get(), 4, DeviceId::rocm(0));
         EmbeddingStage stage(params);
+        ScopedHipStream stream;
+        ASSERT_TRUE(stream.valid());
+        stage.setGPUStream(stream.get());
 
         // getKernelAsWorkspaceConsumer triggers kernel creation without executing
         auto *ws_consumer = stage.getKernelAsWorkspaceConsumer();
@@ -531,6 +554,9 @@ namespace
 
         auto params = makeParams(embed_table.get(), tokens.data(), output.get(), seq_len, DeviceId::rocm(0));
         EmbeddingStage stage(params);
+        ScopedHipStream stream;
+        ASSERT_TRUE(stream.valid());
+        stage.setGPUStream(stream.get());
 
         // Create kernel and bind workspace BEFORE first execute
         auto *ws_consumer = stage.getKernelAsWorkspaceConsumer();
@@ -544,6 +570,7 @@ namespace
 
         // Verify basic execution works
         ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
 
         // Prelaunch: updateDynamicParams uploads token_ids to workspace buffer
         stage.updateDynamicParams(/*pos_offset=*/0, /*seq_len=*/seq_len);
@@ -553,6 +580,7 @@ namespace
             GraphCaptureGuard guard;
             EXPECT_TRUE(stage.execute(nullptr));
         }
+        ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
 #endif
     }
 
@@ -582,6 +610,9 @@ namespace
 
         auto params = makeParams(embed_table.get(), tokens.data(), output.get(), seq_len, DeviceId::rocm(0));
         EmbeddingStage stage(params);
+        ScopedHipStream stream;
+        ASSERT_TRUE(stream.valid());
+        stage.setGPUStream(stream.get());
 
         // Create kernel and bind workspace BEFORE execution
         auto *ws_consumer = stage.getKernelAsWorkspaceConsumer();
@@ -595,6 +626,7 @@ namespace
 
         // Execute once outside capture (succeeds with inline H2D)
         ASSERT_TRUE(stage.execute(nullptr));
+        ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
 
         // Change tokens WITHOUT calling updateDynamicParams — preloaded data won't match
         std::vector<int> new_tokens = {99, 98, 97, 96};
@@ -609,22 +641,10 @@ namespace
     }
 
     // =========================================================================
-    // Test 6: KVCacheAppendStage advertises replay callback need
+    // Test 6: KVCacheAppendStage binds canonical device append geometry
     // =========================================================================
 
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_NeedsReplayCallback)
-    {
-        // KVCacheAppendStage must report needsOnGraphReplayed() == true
-        KVCacheAppendStage::Params kv_params{};
-        kv_params.device_id = DeviceId::cpu();
-        kv_params.layer_idx = 0;
-        kv_params.num_tokens = 1;
-
-        KVCacheAppendStage stage(kv_params);
-        EXPECT_TRUE(stage.needsOnGraphReplayed());
-    }
-
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_DynamicParamsRequireMailboxCapability)
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_DynamicParamsRequireCanonicalDeviceState)
     {
         RecordingKVCache host_only_cache;
         DynamicAppendRecordingKVCache dynamic_cache;
@@ -650,7 +670,7 @@ namespace
 
         KVCacheAppendStage dynamic_stage(dynamic_params);
         EXPECT_TRUE(dynamic_stage.hasDynamicParams())
-            << "CUDA/ROCm KV caches with append-state mailboxes must advertise dynamic params";
+            << "CUDA/ROCm caches with canonical device sequence state must advertise graph bindings";
 
         void *stream = reinterpret_cast<void *>(static_cast<uintptr_t>(0x1234));
         dynamic_stage.setGPUStream(stream);
@@ -659,55 +679,77 @@ namespace
         EXPECT_EQ(dynamic_cache.dynamicAppendCalls(), 1);
         EXPECT_EQ(dynamic_cache.lastDynamicLayer(), 3);
         EXPECT_EQ(dynamic_cache.lastDynamicSeqIdx(), 2);
-        EXPECT_EQ(dynamic_cache.lastDynamicAppendTokens(), 2);
+        EXPECT_EQ(dynamic_cache.lastDynamicAppendSource(), nullptr)
+            << "Exact-shape graphs must use their captured width without a host count";
+        EXPECT_EQ(dynamic_cache.lastCapturedMaxTokens(), 2);
         EXPECT_EQ(dynamic_cache.lastDynamicStream(), stream);
     }
 
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_ReplayAdvancesByRealPrefillTokens)
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_PaddedReplayBindsResidentRequestLength)
     {
-        RecordingKVCache kv_cache;
+        DynamicAppendRecordingKVCache kv_cache;
+        const auto *resident_length = reinterpret_cast<const int32_t *>(
+            static_cast<uintptr_t>(0x2000));
         KVCacheAppendStage::Params kv_params{};
-        kv_params.device_id = DeviceId::cpu();
+        kv_params.device_id = DeviceId::cuda(0);
         kv_params.kv_cache = &kv_cache;
         kv_params.layer_idx = 0;
         kv_params.seq_idx = 0;
         kv_params.num_tokens = 128;
+        kv_params.seq_len = 128;
+        kv_params.request_sequence_lengths_device = resident_length;
 
         KVCacheAppendStage stage(kv_params);
         ASSERT_TRUE(stage.hasPrefillReplayParams());
+        void *stream = reinterpret_cast<void *>(static_cast<uintptr_t>(0x1234));
+        stage.setGPUStream(stream);
 
         stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
             /*real_seq_len=*/37,
             /*bucket_seq_len=*/128,
             /*token_offset=*/0});
-        stage.onGraphReplayed();
+        stage.updateDynamicParams(/*pos_offset=*/0, /*seq_len=*/128);
 
-        EXPECT_EQ(kv_cache.advanceCalls(), 1);
-        EXPECT_EQ(kv_cache.lastLayer(), 0);
-        EXPECT_EQ(kv_cache.lastSeqIdx(), 0);
-        EXPECT_EQ(kv_cache.lastAdvanceTokens(), 37);
-        EXPECT_EQ(kv_cache.get_cached_tokens(0), 37);
+        EXPECT_EQ(kv_cache.dynamicAppendCalls(), 1);
+        EXPECT_EQ(kv_cache.lastDynamicAppendSource(), resident_length);
+        EXPECT_EQ(kv_cache.lastCapturedMaxTokens(), 128);
+        EXPECT_EQ(kv_cache.lastDynamicStream(), stream);
     }
 
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_ReplayFallsBackToCapturedTokenCount)
+    TEST_F(Test__PrefillGraphCaptureDynamicParams,
+           KVCacheAppend_SetupOnlyCaptureBindsResidentRequestLength)
     {
-        RecordingKVCache kv_cache;
-        KVCacheAppendStage::Params kv_params{};
-        kv_params.device_id = DeviceId::cpu();
-        kv_params.kv_cache = &kv_cache;
-        kv_params.layer_idx = 0;
-        kv_params.seq_idx = 0;
-        kv_params.num_tokens = 4;
+        DynamicAppendRecordingKVCache kv_cache;
+        const auto *resident_length = reinterpret_cast<const int32_t *>(
+            static_cast<uintptr_t>(0x2400));
+        KVCacheAppendStage::Params params{};
+        params.device_id = DeviceId::cuda(0);
+        params.kv_cache = &kv_cache;
+        params.layer_idx = 5;
+        params.seq_idx = 0;
+        params.num_tokens = 128;
+        params.batch_size = 1;
+        params.seq_len = 128;
+        params.request_sequence_lengths_device = resident_length;
 
-        KVCacheAppendStage stage(kv_params);
-        stage.onGraphReplayed();
+        KVCacheAppendStage stage(params);
+        EXPECT_EQ(
+            stage.graphLaunchPreparationPolicy(),
+            GraphLaunchPreparationPolicy::CaptureOnly)
+            << "The immutable append-count pointer must be sealed before native capture";
 
-        EXPECT_EQ(kv_cache.advanceCalls(), 1);
-        EXPECT_EQ(kv_cache.lastAdvanceTokens(), 4);
-        EXPECT_EQ(kv_cache.get_cached_tokens(0), 4);
+        void *stream = reinterpret_cast<void *>(static_cast<uintptr_t>(0x5678));
+        ASSERT_TRUE(stage.prepareGraphLaunch(/*ctx=*/nullptr, stream));
+
+        EXPECT_EQ(kv_cache.dynamicAppendCalls(), 1);
+        EXPECT_EQ(kv_cache.lastDynamicLayer(), 5);
+        EXPECT_EQ(kv_cache.lastDynamicSeqIdx(), 0);
+        EXPECT_EQ(kv_cache.lastDynamicAppendSource(), resident_length);
+        EXPECT_EQ(kv_cache.lastCapturedMaxTokens(), 128);
+        EXPECT_EQ(kv_cache.lastDynamicStream(), stream);
     }
 
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_CaptureWithoutHostBookkeepingWaitsForReplay)
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_GraphCaptureNeverMutatesHostState)
     {
         RecordingKVCache kv_cache;
         auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4});
@@ -729,39 +771,8 @@ namespace
             ASSERT_TRUE(stage.execute(nullptr));
         }
 
-        EXPECT_EQ(kv_cache.advanceCalls(), 0);
         EXPECT_EQ(kv_cache.get_cached_tokens(0), 0)
-            << "plain capture (prefill-style) must rely on onGraphReplayed()";
-    }
-
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_SegmentedCaptureHostBookkeepingAdvancesImmediately)
-    {
-        RecordingKVCache kv_cache;
-        auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4});
-        auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4});
-
-        KVCacheAppendStage::Params kv_params{};
-        kv_params.device_id = DeviceId::cpu();
-        kv_params.kv_cache = &kv_cache;
-        kv_params.K = K.get();
-        kv_params.V = V.get();
-        kv_params.layer_idx = 0;
-        kv_params.seq_idx = 0;
-        kv_params.num_tokens = 2;
-
-        KVCacheAppendStage stage(kv_params);
-
-        {
-            GraphCaptureGuard guard(/*host_bookkeeping=*/true);
-            ASSERT_TRUE(stage.execute(nullptr));
-        }
-
-        EXPECT_EQ(kv_cache.advanceCalls(), 1);
-        EXPECT_EQ(kv_cache.lastLayer(), 0);
-        EXPECT_EQ(kv_cache.lastSeqIdx(), 0);
-        EXPECT_EQ(kv_cache.lastAdvanceTokens(), 2);
-        EXPECT_EQ(kv_cache.get_cached_tokens(0), 2)
-            << "segmented capture needs logical metadata before downstream captured attention";
+            << "Graph recording must not establish a host sequence-state owner";
     }
 
     TEST_F(Test__PrefillGraphCaptureDynamicParams, IKVCacheBaseDefaultsFailClosed)
@@ -1075,75 +1086,14 @@ namespace
         }
     }
 
-    // =========================================================================
-    // Test 7: ForwardGraphCache caches replay callback stages
-    // =========================================================================
-
-    TEST_F(Test__PrefillGraphCaptureDynamicParams, ForwardGraphCache_CachesReplayCallbacks)
-    {
-        // Build a compute graph with a mix of stages:
-        // - 2 stages that need replay callbacks
-        // - 2 stages that don't
-        ComputeGraph graph;
-
-        auto replay_stage_1 = std::make_unique<MockReplayCallbackStage>(true, "kv_append_0");
-        auto replay_stage_2 = std::make_unique<MockReplayCallbackStage>(true, "kv_append_1");
-        auto normal_stage_1 = std::make_unique<MockReplayCallbackStage>(false, "gemm_0");
-        auto normal_stage_2 = std::make_unique<MockReplayCallbackStage>(false, "norm_0");
-
-        graph.addNode("kv_append_0", std::move(replay_stage_1));
-        graph.addNode("gemm_0", std::move(normal_stage_1));
-        graph.addNode("kv_append_1", std::move(replay_stage_2));
-        graph.addNode("norm_0", std::move(normal_stage_2));
-
-        // Create ForwardGraphCache and populate replay_callback_stages
-        ForwardGraphCache cache;
-        cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
-        cache.valid = true;
-
-        ASSERT_FALSE(cache.replay_callback_stages_cached);
-
-        // Simulate caching logic (same as ForwardExecutionEngine)
-        {
-            cache.replay_callback_stages.clear();
-            const auto &order = cache.graph->getExecutionOrder();
-            for (const auto &node_name : order)
-            {
-                ComputeNode *node = cache.graph->getNode(node_name);
-                if (node && node->stage && node->stage->needsOnGraphReplayed())
-                    cache.replay_callback_stages.push_back(node->stage.get());
-            }
-            cache.replay_callback_stages_cached = true;
-        }
-
-        EXPECT_TRUE(cache.replay_callback_stages_cached);
-        EXPECT_EQ(cache.replay_callback_stages.size(), 2u);
-
-        // Verify the correct stages were collected
-        for (auto *stage : cache.replay_callback_stages)
-        {
-            EXPECT_TRUE(stage->needsOnGraphReplayed());
-        }
-
-        // Verify onGraphReplayed() can be called
-        for (auto *stage : cache.replay_callback_stages)
-        {
-            stage->onGraphReplayed();
-        }
-
-        // Verify invalidation clears the cache
-        cache.invalidate();
-        EXPECT_FALSE(cache.replay_callback_stages_cached);
-        EXPECT_TRUE(cache.replay_callback_stages.empty());
-    }
-
     TEST_F(Test__PrefillGraphCaptureDynamicParams, ForwardGraphCache_CachesPrefillReplayParamStages)
     {
         ComputeGraph graph;
 
         auto param_stage_1 = std::make_unique<MockPrefillReplayParamStage>("kv_append_0");
         auto param_stage_2 = std::make_unique<MockPrefillReplayParamStage>("kv_append_1");
-        auto normal_stage = std::make_unique<MockReplayCallbackStage>(false, "norm_0");
+        auto normal_stage = std::make_unique<MockComputeStage>(
+            ComputeStageType::GEMM, "norm_0", DeviceId::cpu());
         auto *raw_param_stage_1 = param_stage_1.get();
         auto *raw_param_stage_2 = param_stage_2.get();
 

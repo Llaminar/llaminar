@@ -96,6 +96,17 @@ namespace llaminar2
             return !c.pp_stage_definitions.empty();
         }
 
+        bool hasExplicitPrompt(const OrchestrationConfig &c)
+        {
+            return c.prompt_was_explicitly_provided || !c.prompt.empty();
+        }
+
+        bool hasBenchmarkPromptFile(const OrchestrationConfig &c)
+        {
+            return c.benchmark_prompt_file_was_provided ||
+                   !c.benchmark_prompt_file_path.empty();
+        }
+
     } // anonymous namespace
 
     DeviceSelectionMode detectDeviceSelectionMode(const OrchestrationConfig &config)
@@ -237,14 +248,14 @@ namespace llaminar2
         });
 
         v.addRule({
-            .id = "moe-tensor-parallel-experts-not-implemented",
-            .description = "MoE tensor-parallel expert mode is recognized but not implemented",
-            .fix_hint = "Use --moe-expert-mode expert-parallel for the standard Qwen3.5 MoE path",
+            .id = "moe-routed-tensor-sharding-not-implemented",
+            .description = "Routed-expert tensor sharding is not implemented by the standard Qwen3.5 MoE path",
+            .fix_hint = "Use --moe-routed-expert-compute apportioned for the standard Qwen3.5 MoE path",
             .applies = [](const OrchestrationConfig &c)
-            { return c.moe_expert_mode == MoEExpertMode::TensorParallel; },
+            { return c.routed_expert_compute_policy == RoutedExpertComputePolicy::TensorSharded; },
             .check = [](const OrchestrationConfig &) -> std::optional<std::string>
             {
-                return "MoE expert mode 'tensor-parallel' is recognized but not implemented for the standard Qwen3.5 MoE execution path yet. Use --moe-expert-mode expert-parallel.";
+                return "Routed-expert compute policy 'tensor-sharded' is not implemented for the standard Qwen3.5 MoE execution path. Use --moe-routed-expert-compute apportioned.";
             },
         });
 
@@ -381,6 +392,66 @@ namespace llaminar2
         });
 
         // =====================================================================
+        // BENCHMARK INPUT RULES
+        //
+        // A benchmark must have one unambiguous prompt source. Keeping these
+        // rules in the declarative validator means every CLI entry point sees
+        // the same contract before model loading or MPI work begins.
+        // =====================================================================
+
+        v.addRule({
+            .id = "benchmark-prompt-source-mutex",
+            .description = "--prompt and --prompt-file are mutually exclusive for benchmarks",
+            .fix_hint = "Provide the prompt inline with --prompt or from a file with --prompt-file, not both",
+            .applies = [](const OrchestrationConfig &c)
+            { return hasExplicitPrompt(c) && hasBenchmarkPromptFile(c); },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "Conflicting benchmark prompt sources: --prompt and --prompt-file were both specified.";
+            },
+        });
+
+        v.addRule({
+            .id = "benchmark-prompt-file-requires-benchmark",
+            .description = "--prompt-file is only valid in benchmark mode",
+            .fix_hint = "Use the benchmark subcommand, or use --prompt for a non-benchmark request",
+            .applies = [](const OrchestrationConfig &c)
+            { return hasBenchmarkPromptFile(c) && !c.benchmark_mode; },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "--prompt-file was specified outside benchmark mode.";
+            },
+        });
+
+        v.addRule({
+            .id = "benchmark-inline-prompt-nonempty",
+            .description = "An explicitly supplied benchmark prompt must not be empty",
+            .fix_hint = "Provide non-empty text to --prompt, or omit it to use the built-in benchmark prompt",
+            .applies = [](const OrchestrationConfig &c)
+            { return c.benchmark_mode && c.prompt_was_explicitly_provided && c.prompt.empty(); },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "--prompt was explicitly supplied with an empty value.";
+            },
+        });
+
+        v.addRule({
+            .id = "benchmark-prompt-file-path-nonempty",
+            .description = "An explicitly supplied benchmark prompt file path must not be empty",
+            .fix_hint = "Provide a readable text-file path to --prompt-file",
+            .applies = [](const OrchestrationConfig &c)
+            {
+                return c.benchmark_mode &&
+                       c.benchmark_prompt_file_was_provided &&
+                       c.benchmark_prompt_file_path.empty();
+            },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            {
+                return "--prompt-file was explicitly supplied with an empty path.";
+            },
+        });
+
+        // =====================================================================
         // CO-REQUIREMENT RULES
         //
         // These ensure that dependent options are used together.
@@ -492,7 +563,7 @@ namespace llaminar2
             .description = "--tp-scope global with --tp-devices is contradictory",
             .fix_hint = "--tp-scope global distributes TP across MPI ranks (one device per rank). "
                         "--tp-devices specifies local devices within a rank. "
-                        "Use --tp-scope local with --tp-devices, or --tp-scope global without --tp-devices",
+                        "Use --tp-scope rank_local with --tp-devices, or --tp-scope global without --tp-devices",
             .applies = [](const OrchestrationConfig &c)
             { return c.tp_scope == TPScope::GLOBAL && hasTPDevices(c); },
             .check = [](const OrchestrationConfig &) -> std::optional<std::string>

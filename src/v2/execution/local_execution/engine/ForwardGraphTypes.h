@@ -16,8 +16,11 @@
 #include "../graph/IGraphBuilder.h" // For ForwardOutput
 #include "PrefillGraphCache.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,10 +67,135 @@ namespace llaminar2
     struct GraphCacheConfig
     {
         bool enabled = true;         ///< Enable graph caching (Phase 10)
-        int decode_seq_len = 4;      ///< Max continuation length that can use decode caching.
+        int decode_seq_len = 4;      ///< Ordinary-continuation decode heuristic; typed MTP roles are not bounded by it.
         bool cache_attention = true; ///< Cache attention graphs
         bool cache_ffn = true;       ///< Cache FFN graphs
     };
+
+    /**
+     * @brief Immutable inputs to forward-phase policy resolution.
+     *
+     * Execution role is the authoritative discriminator for internal MTP
+     * graphs. Shape-based continuation detection remains only for the legacy
+     * public MainInference API, whose caller does not yet carry a typed phase.
+     * Keeping those two policies in one value object prevents a future graph
+     * entry point from accidentally applying the ordinary-continuation M
+     * heuristic to grouped verification again.
+     */
+    /**
+     * @brief Typed public-to-graph invocation policy.
+     *
+     * This single discriminator replaces the former pair of force-prefill and
+     * force-decode booleans, whose fourth combination was invalid. The restored
+     * prefix bridge is a decode invocation with an additional graph-owned state
+     * transition; keeping it distinct here makes that topology impossible to
+     * request accidentally through ordinary decode.
+     */
+    enum class ForwardInvocationKind : uint8_t
+    {
+        Automatic = 0, ///< Apply the ordinary public MainInference heuristic.
+        ExplicitPrefill, ///< Require prefill mathematical topology.
+        ExplicitDecode, ///< Require decode mathematical topology.
+        RestoredPrefixMTPDecodeBridge, ///< Decode plus restored-prefix shifted-MTP state bridge.
+    };
+
+    struct ForwardExecutionPhaseRequest
+    {
+        ForwardExecutionRole role = ForwardExecutionRole::MainInference;
+        ForwardInvocationKind invocation =
+            ForwardInvocationKind::Automatic;
+        int seq_len = 0;
+        int batch_size = 0;
+        int decode_max_seq_len = 1;
+        int logical_position = 0;
+    };
+
+    /**
+     * @brief Resolve the mathematical and topology phase for one forward.
+     *
+     * Grouped MTP verification and device-resident MTP condition graphs are
+     * decode-equivalent by contract for every positive row count. Their M may
+     * be 1, the current dynamic-depth range 2..16, or a larger future
+     * speculative batch; none may cross into prefill topology merely because
+     * it exceeds an ordinary-continuation cache heuristic.
+     *
+     * MainInference retains the existing compatibility rule: a scalar row is
+     * decode, and a small continuation with established history is decode.
+     * Explicit phase requests take precedence for that public role.
+     *
+     * @param request Complete typed role, explicit overrides, and legacy
+     *                MainInference shape/history inputs.
+     * @return Prefill or decode topology selected without consulting mutable
+     *         graph-builder state.
+     */
+    [[nodiscard]] inline ForwardExecutionPhase resolveForwardExecutionPhase(
+        const ForwardExecutionPhaseRequest &request) noexcept
+    {
+        if (request.role != ForwardExecutionRole::MainInference)
+            return ForwardExecutionPhase::Decode;
+
+        switch (request.invocation)
+        {
+        case ForwardInvocationKind::ExplicitPrefill:
+            return ForwardExecutionPhase::Prefill;
+        case ForwardInvocationKind::ExplicitDecode:
+        case ForwardInvocationKind::RestoredPrefixMTPDecodeBridge:
+            return ForwardExecutionPhase::Decode;
+        case ForwardInvocationKind::Automatic:
+            break;
+        }
+
+        const bool scalar_decode =
+            request.seq_len == 1 && request.batch_size <= 1;
+        const bool short_continuation_decode =
+            request.batch_size <= 1 &&
+            request.seq_len > 1 &&
+            request.seq_len <= std::max(1, request.decode_max_seq_len) &&
+            request.logical_position > 0;
+        return scalar_decode || short_continuation_decode
+                   ? ForwardExecutionPhase::Decode
+                   : ForwardExecutionPhase::Prefill;
+    }
+
+    /**
+     * @brief Whether one forward owns a graph-integrated shifted-MTP archive.
+     *
+     * Prompt prefill and the one-row restored-prefix bridge have different
+     * mathematical phases, but both append depth-zero shifted KV and archive
+     * the terminal main-model hidden row inside the same captured transaction.
+     * Keeping this classification in one typed predicate prevents callers from
+     * publishing only one of those two legal lifecycle edges.  In particular,
+     * prefix harvest must not run a sidecar refresh after either transaction:
+     * that refresh can overwrite the just-produced main logits before they are
+     * archived.
+     *
+     * @param role Model-graph ownership of the forward.
+     * @param phase Mathematical execution phase.
+     * @param transaction Persistent-state transaction topology.
+     * @param batch_size Logical request count.
+     * @param seq_len Physical rows per request.
+     * @return true only for a complete shifted-MTP producer topology.
+     */
+    [[nodiscard]] constexpr bool isGraphIntegratedShiftedMTPTransaction(
+        ForwardExecutionRole role,
+        ForwardExecutionPhase phase,
+        ForwardStateTransaction transaction,
+        int batch_size,
+        int seq_len) noexcept
+    {
+        const bool main_prefill =
+            role == ForwardExecutionRole::MainInference &&
+            phase == ForwardExecutionPhase::Prefill &&
+            transaction == ForwardStateTransaction::Ordinary &&
+            batch_size > 0 && seq_len > 0;
+        const bool restored_prefix_bridge =
+            role == ForwardExecutionRole::MTPCondition &&
+            phase == ForwardExecutionPhase::Decode &&
+            transaction ==
+                ForwardStateTransaction::RestoredPrefixMTPDecodeBridge &&
+            batch_size == 1 && seq_len == 1;
+        return main_prefill || restored_prefix_bridge;
+    }
 
     /**
      * @brief Signature for caching full forward graphs.
@@ -80,12 +208,24 @@ namespace llaminar2
         int seq_len = 0;
         int batch_size = 0;
         DeviceId device = DeviceId::cpu();
+        ForwardExecutionRole execution_role =
+            ForwardExecutionRole::MainInference; ///< Mathematical owner embedded by this graph.
+        ForwardStateTransaction state_transaction =
+            ForwardStateTransaction::Ordinary; ///< Persistent-state topology embedded by this graph.
         bool decode = false;
         bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
         bool all_position_logits = false;
+        bool live_mtp_request_batch_condition = false; ///< True for one live main-model row per MTP request.
         int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
+        MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::Disabled; ///< Terminal compact outcome topology captured by this graph.
         bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
         bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
+        ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
+        const int32_t *device_sequence_lengths = nullptr; ///< Exact borrowed row-count owner embedded by captured stages.
+        uint64_t device_prefill_chunk_capture_identity = 0; ///< Non-zero when a captured device chunk materializer precedes model roots.
+        uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
+        uint64_t mtp_main_terminal_hidden_capture_identity = 0; ///< Non-zero when main decode publishes its MTP terminal row in-graph.
         bool standard_path = true;
         bool pp_stage_enabled = false;
         int pp_first_layer = -1;
@@ -94,19 +234,42 @@ namespace llaminar2
         bool pp_has_lm_head = false;
         bool is_bucketed_prefill = false;
         int bucket_seq_len = 0;
+        bool rehydrate_prefix_runtime_on_device = false;
         uint64_t moe_placement_epoch = 0;
+        /** Semantic diagnostic-node topology embedded in the native graph. */
+        uint64_t snapshot_configuration_identity = 1;
+
+        /** @return Whether this graph embeds a device-owned request-length source. */
+        [[nodiscard]] bool usesDeviceSequenceLengths() const noexcept
+        {
+            return device_sequence_lengths != nullptr;
+        }
 
         bool operator==(const ForwardGraphSignature &other) const
         {
             return seq_len == other.seq_len &&
                    batch_size == other.batch_size &&
                    device == other.device &&
+                   execution_role == other.execution_role &&
+                   state_transaction == other.state_transaction &&
                    decode == other.decode &&
                    decode_has_history == other.decode_has_history &&
                    all_position_logits == other.all_position_logits &&
+                   live_mtp_request_batch_condition ==
+                       other.live_mtp_request_batch_condition &&
                    all_position_logit_rows == other.all_position_logit_rows &&
+                   mtp_verifier_outcome_graph_mode ==
+                       other.mtp_verifier_outcome_graph_mode &&
                    uses_device_token_ids == other.uses_device_token_ids &&
                    uses_device_position_ids == other.uses_device_position_ids &&
+                   position_policy == other.position_policy &&
+                   device_sequence_lengths == other.device_sequence_lengths &&
+                   device_prefill_chunk_capture_identity ==
+                       other.device_prefill_chunk_capture_identity &&
+                   shifted_mtp_prefill_capture_identity ==
+                       other.shifted_mtp_prefill_capture_identity &&
+                   mtp_main_terminal_hidden_capture_identity ==
+                       other.mtp_main_terminal_hidden_capture_identity &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
                    pp_first_layer == other.pp_first_layer &&
@@ -115,9 +278,68 @@ namespace llaminar2
                    pp_has_lm_head == other.pp_has_lm_head &&
                    is_bucketed_prefill == other.is_bucketed_prefill &&
                    bucket_seq_len == other.bucket_seq_len &&
-                   moe_placement_epoch == other.moe_placement_epoch;
+                   rehydrate_prefix_runtime_on_device ==
+                       other.rehydrate_prefix_runtime_on_device &&
+                   moe_placement_epoch == other.moe_placement_epoch &&
+                   snapshot_configuration_identity ==
+                       other.snapshot_configuration_identity;
         }
     };
+
+    /**
+     * @brief Derive diagnostic-arena sharing solely from captured graph identity.
+     *
+     * The policy deliberately depends on typed execution roles rather than
+     * stage names or allocation sizes. Prefill buckets and grouped-verifier
+     * outcomes share the wide checkpoint lane because prefill publication is
+     * complete before device generation begins. Live/restored-prefix MTP
+     * conditions use another lane because a retained MTP parent can execute a
+     * condition and verifier in the same transaction. Every unproven graph
+     * stays dedicated.
+     *
+     * @param signature Complete forward-cache identity.
+     * @return Reuse class and diagnostic configuration namespace.
+     */
+    inline DeviceGraphExecutor::GraphSnapshotArenaReusePolicy
+    graphSnapshotArenaReusePolicyForSignature(
+        const ForwardGraphSignature &signature) noexcept
+    {
+        using ReuseClass =
+            DeviceGraphExecutor::GraphSnapshotArenaReuseClass;
+        using ReusePolicy =
+            DeviceGraphExecutor::GraphSnapshotArenaReusePolicy;
+
+        if (!signature.device.is_gpu())
+            return ReusePolicy{};
+
+        ReuseClass reuse_class = ReuseClass::Dedicated;
+        if (signature.execution_role ==
+            ForwardExecutionRole::GroupedMTPVerifier)
+        {
+            reuse_class =
+                ReuseClass::PrefillOrMTPVerifierAlternative;
+        }
+        else if (signature.execution_role ==
+                 ForwardExecutionRole::MTPCondition)
+        {
+            reuse_class = ReuseClass::MTPConditionAlternative;
+        }
+        else if (!signature.decode &&
+                 signature.execution_role ==
+                     ForwardExecutionRole::MainInference)
+        {
+            reuse_class =
+                ReuseClass::PrefillOrMTPVerifierAlternative;
+        }
+
+        if (reuse_class == ReuseClass::Dedicated)
+            return ReusePolicy{};
+        return ReusePolicy{
+            .reuse_class = reuse_class,
+            .configuration_identity =
+                signature.snapshot_configuration_identity,
+        };
+    }
 
     struct ForwardGraphSignatureHash
     {
@@ -126,12 +348,35 @@ namespace llaminar2
             size_t h = std::hash<int>{}(sig.seq_len);
             h ^= (std::hash<int>{}(sig.batch_size) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<DeviceId>{}(sig.device) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(
+                      static_cast<uint8_t>(sig.execution_role)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(
+                      static_cast<uint8_t>(sig.state_transaction)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.live_mtp_request_batch_condition) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.all_position_logit_rows) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(
+                      static_cast<uint8_t>(
+                          sig.mtp_verifier_outcome_graph_mode)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<const int32_t *>{}(sig.device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.device_prefill_chunk_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.shifted_mtp_prefill_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.mtp_main_terminal_hidden_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -140,14 +385,61 @@ namespace llaminar2
             h ^= (std::hash<bool>{}(sig.pp_has_lm_head) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.is_bucketed_prefill) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.bucket_seq_len) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.rehydrate_prefix_runtime_on_device) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(sig.moe_placement_epoch) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.snapshot_configuration_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             return h;
         }
     };
 
+    /**
+     * @brief Convert a forward-cache identity into immutable replay telemetry.
+     *
+     * The graph signature is the authoritative source of execution geometry:
+     * cache lookup, graph construction, and replay all use that same value.
+     * Copying its scalar fields into the segment cache prevents asynchronous
+     * GPU-event reclamation from consulting whichever request happens to be
+     * current later.  Invalid or overflowing dimensions produce an invalid
+     * descriptor, causing PerfStats to omit geometry instead of publishing a
+     * plausible but false M value.
+     */
+    inline DeviceGraphExecutor::GraphSegmentCache::ReplayWorkloadGeometry
+    replayWorkloadGeometryForSignature(
+        const ForwardGraphSignature &signature) noexcept
+    {
+        using Geometry =
+            DeviceGraphExecutor::GraphSegmentCache::ReplayWorkloadGeometry;
+
+        Geometry geometry{
+            .seq_len = signature.seq_len,
+            .batch_size = signature.batch_size,
+            .m = 0,
+            .all_position_rows = signature.all_position_logit_rows,
+            .verifier_outcome_mode = static_cast<uint8_t>(
+                signature.mtp_verifier_outcome_graph_mode),
+            .position_policy = static_cast<uint8_t>(signature.position_policy),
+            .moe_placement_epoch = signature.moe_placement_epoch,
+            .decode = signature.decode,
+            .all_position_logits = signature.all_position_logits,
+            .live_mtp_request_batch_condition =
+                signature.live_mtp_request_batch_condition,
+        };
+
+        if (signature.seq_len > 0 && signature.batch_size > 0 &&
+            signature.batch_size <=
+                std::numeric_limits<int>::max() / signature.seq_len)
+        {
+            geometry.m = signature.seq_len * signature.batch_size;
+        }
+        return geometry;
+    }
+
     enum class ForwardReplayStateCacheClass
     {
         Other,
+        ExactPrefill,
         BucketedPrefill,
         OrdinaryDecode,
         SingleTokenOrdinaryDecode,
@@ -158,6 +450,7 @@ namespace llaminar2
     {
         GeneralLiveStateMutation,
         MTPCorrectionReplayBoundary,
+        PrefixCheckpointRestore,
         RequestBoundaryStateReset,
     };
 
@@ -174,7 +467,7 @@ namespace llaminar2
         {
             if (signature.is_bucketed_prefill)
                 return ForwardReplayStateCacheClass::BucketedPrefill;
-            return ForwardReplayStateCacheClass::Other;
+            return ForwardReplayStateCacheClass::ExactPrefill;
         }
         if (signature.all_position_logits)
             return ForwardReplayStateCacheClass::AllPositionVerifier;
@@ -214,7 +507,10 @@ namespace llaminar2
         ForwardReplayStateMutationKind mutation,
         ForwardReplayStateCacheClass cache_class)
     {
-        if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
+        if ((mutation ==
+                 ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+             mutation ==
+                 ForwardReplayStateMutationKind::PrefixCheckpointRestore) &&
             cache_class != ForwardReplayStateCacheClass::OrdinaryDecode)
         {
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
@@ -222,6 +518,7 @@ namespace llaminar2
         if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
             (cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode ||
              cache_class == ForwardReplayStateCacheClass::AllPositionVerifier ||
+             cache_class == ForwardReplayStateCacheClass::ExactPrefill ||
              cache_class == ForwardReplayStateCacheClass::BucketedPrefill))
         {
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
@@ -233,7 +530,10 @@ namespace llaminar2
         ForwardReplayStateMutationKind mutation,
         const ForwardGraphSignature &signature)
     {
-        if ((mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+        if ((mutation ==
+                 ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+             mutation ==
+                 ForwardReplayStateMutationKind::PrefixCheckpointRestore ||
              mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset) &&
             isLiveStateVersionedReplayCache(signature))
         {
@@ -271,6 +571,8 @@ namespace llaminar2
         uint64_t topology_signature = 0;
         std::string capture_phase = "cold";
         std::string recapture_reason = "none";
+        std::string reject_stage_name;
+        std::string reject_stage_type;
     };
 
     /**
@@ -344,12 +646,14 @@ namespace llaminar2
     };
 
     /**
-     * @brief Cached full forward graph for decode mode
+     * @brief Cached full forward topology for exact-shape forward execution.
      *
-     * During decode (seq_len=1), the graph structure is identical between
-     * steps — only token_ids, position_ids, and position_offset change.
-     * Instead of rebuilding hundreds of stage objects every forward() call,
-     * we cache the graph and its stages after the first decode step.
+     * Decode and exact CPU prefill both have stable topology for a matching
+     * signature; only request-owned token, position, and runtime state changes.
+     * Instead of rebuilding hundreds of stage objects and their persistent
+     * kernel scratch every forward call, this object owns the graph after first
+     * materialization. GPU prefill additionally attaches its native captured
+     * executable through @ref prefill_graph_cache.
      *
      * Stable buffers (token_ids, position_ids) are owned here so that
      * cached stages' pointers remain valid across calls.
@@ -387,17 +691,20 @@ namespace llaminar2
         std::vector<IComputeStage *> dynamic_param_stages;
         bool dynamic_param_stages_cached = false;
 
-        // Pre-cached pointers to stages that override onGraphReplayed().
-        // For prefill monolithic graph replay, these must be called after launch
-        // to advance KV cache heads and other host-side bookkeeping.
-        std::vector<IComputeStage *> replay_callback_stages;
-        bool replay_callback_stages_cached = false;
-
         // Pre-cached pointers to stages that consume fixed-bucket prefill replay
-        // metadata. These are updated before prefill capture/replay so callback
-        // stages can advance host state by real tokens instead of padded rows.
+        // metadata. These are updated before prefill capture/replay so device
+        // kernels consume real token counts instead of padded rows.
         std::vector<IComputeStage *> prefill_replay_param_stages;
         bool prefill_replay_param_stages_cached = false;
+
+        /**
+         * Sparse MoE manual boundaries that consume root-authoritative wire
+         * transaction identity. These pointers are cached separately from
+         * ordinary dynamic parameters because capture/replay lifecycle must
+         * never be allowed to alter distributed key ordering.
+         */
+        std::vector<IComputeStage *> moe_overlay_collective_runtime_stages;
+        bool moe_overlay_collective_runtime_stages_cached = false;
 
         // Tracks whether setGPUStream has been applied to all stages.
         // Decode graph replay reapplies the capture stream before dynamic
@@ -415,32 +722,39 @@ namespace llaminar2
         // allowing us to skip the 339-node graph.reset() since flags are already clear.
         bool phase3_active = false;
 
-        /// Live replay-state epoch that the current segmented capture is safe for.
+        /// Live replay-state epoch that the current cached graph capture is safe for.
         /// Multi-token ordinary decode and multi-row all-position verifier graphs
         /// are invalidated when speculative publication advances live state to a
         /// newer epoch. Single-token decode, including MTP condition decode, is
         /// version-safe: it updates token/position metadata before every launch
         /// and reads stable live-state buffer addresses.
-        uint64_t segmented_capture_live_state_epoch = 0;
+        uint64_t graph_replay_live_state_epoch = 0;
 
         bool requiresLiveStateEpochRecapture(bool live_state_versioned_context,
-                                             bool segmented_capture_allowed,
+                                             bool graph_replay_allowed,
                                              uint64_t live_state_epoch) const
         {
             return live_state_versioned_context &&
-                   segmented_capture_allowed &&
+                   graph_replay_allowed &&
                    segment_cache.initialized &&
                    !segment_cache.needs_capture &&
-                   segmented_capture_live_state_epoch != 0 &&
-                   segmented_capture_live_state_epoch != live_state_epoch;
+                   graph_replay_live_state_epoch != 0 &&
+                   graph_replay_live_state_epoch != live_state_epoch;
         }
 
         /// GPU graph capture/replay for eliminating per-kernel launch overhead
         std::unique_ptr<IGPUGraphCapture> gpu_graph;
 
-        /// Segmented GPU graph cache. Capturable stages, including attention
-        /// when its dynamic launch variant is stable, can live inside one
-        /// segment; non-capturable stages and manual boundaries split it.
+        /**
+         * GPU snapshot descriptors and stable D2D destinations owned by this
+         * exact graph geometry. Stage names repeat across cache entries, so this
+         * state must never live in a process-wide executor map.
+         */
+        DeviceGraphExecutor::GraphSnapshotManifest snapshot_manifest;
+        uint64_t snapshot_configuration_epoch = 0;
+
+        /// Cached GPU graph replay plan. A fully capturable graph is replayed as
+        /// one unit; non-capturable stages and manual boundaries split it.
         DeviceGraphExecutor::GraphSegmentCache segment_cache;
 
         /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
@@ -456,11 +770,48 @@ namespace llaminar2
         /// Latest diagnostic metadata for bucketed/chunked prefill graph execution.
         PrefillGraphExecutionObservation last_prefill_graph_observation;
 
-        /// Monotonic engine-level LRU tick for bucketed prefill forward-cache eviction.
-        uint64_t bucketed_prefill_last_access_tick = 0;
+        /// Monotonic engine-level LRU tick for all reusable prefill topology entries.
+        uint64_t prefill_last_access_tick = 0;
 
         /// Explicit stream for prefill warmup/capture/replay.
         CachedGraphStream prefill_capture_stream;
+
+        /** @brief Typed decode launch path used to resolve producer ownership. */
+        enum class DecodeLaunchPath : uint8_t
+        {
+            Direct,          ///< Warmup or ordinary non-replay graph execution.
+            CapturedReplay,  ///< Launch of a retained native graph executable.
+        };
+
+        /**
+         * @brief Resolve the exact stream that produced one cached decode.
+         *
+         * A cached graph owns several stream-shaped fields with different
+         * meanings. `applied_stream` only says which stream was most recently
+         * installed into stage bindings; replay-state maintenance may update
+         * that field without producing the graph output. When a decode
+         * invocation actually replayed its captured graph, the segment cache's
+         * capture stream is therefore the only valid producer provenance.
+         *
+         * Prefill deliberately has no matching resolver here because
+         * heterogeneous segmented and monolithic prefill use different graph
+         * caches. Its state machine returns the concrete launch stream.
+         *
+         * @param launch_path Whether execution was direct or a retained replay.
+         * @return Exact producer stream, or nullptr when the required typed
+         *         stream was not published.
+         */
+        void *decodeOutputProducerStream(
+            DecodeLaunchPath launch_path) const noexcept
+        {
+            if (launch_path == DecodeLaunchPath::CapturedReplay)
+                return segment_cache.capture_stream;
+            if (applied_stream)
+                return applied_stream;
+            if (segment_cache.capture_stream)
+                return segment_cache.capture_stream;
+            return gpu_stream;
+        }
 
         /// Number of consecutive graph update failures (fallback heuristic)
         int gpu_graph_update_failures = 0;
@@ -474,7 +825,7 @@ namespace llaminar2
          * Hard resets preserve graph topology but discard graph executables.
          * Use this after topology/workspace/live-state mutations whose capture
          * safety is not proven. Request-boundary resets that want served-style
-         * capture reuse should use resetSessionStatePreservingSegmentedReplay().
+         * capture reuse should use resetSessionStatePreservingGraphReplay().
          *
          * The capture stream itself is retained because cached stages store that
          * stream pointer internally. Destroying it here would leave dynamic-param
@@ -491,7 +842,7 @@ namespace llaminar2
             segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
             gpu_graph_update_failures = 0;
             phase3_active = false;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
         }
 
         /**
@@ -537,28 +888,28 @@ namespace llaminar2
          */
         void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
         {
-            segmented_capture_live_state_epoch = live_state_epoch;
+            graph_replay_live_state_epoch = live_state_epoch;
         }
 
         /**
-         * @brief Reset request-scoped stage state while preserving safe segmented replay.
+         * @brief Reset request-scoped stage state while preserving safe graph replay.
          *
          * Request boundaries clear KV/GDN/short-conv live state, token metadata,
          * and backend stream bindings, but single-token decode and all-position
          * verifier captures are designed to read stable device buffers whose
-         * contents are refreshed before every launch.  Keeping those segmented
+         * contents are refreshed before every launch.  Keeping those graph
          * executables hot is the served-inference path we want: warmup captures
          * once, later requests replay after device-state reset.
          *
-         * Bucketed prefill graph executables also stay hot across request
-         * boundaries. Ready entries replay the same deterministic prompt mutation
-         * over freshly reset live state with token/position metadata refreshed on
-         * the explicit capture stream before launch. Warmup-only entries are
-         * demoted to Initialized: lazy stage/kernel resources may survive, but
-         * request-local capture arming does not. Capturing or otherwise invalid
-         * entries are still dropped rather than silently reused.
+         * Prefill executables follow the same stable-address contract. Their
+         * kernels read persistent KV, recurrent, routing, and request-input
+         * storage; request reset clears contents but does not replace those
+         * allocations. Ready executables therefore survive, while mutable
+         * request metadata is republished on their exact stream before replay.
+         * Warmup and Initialized entries retain only lazy initialization because
+         * they do not yet own a complete executable.
          */
-        void resetSessionStatePreservingSegmentedReplay()
+        void resetSessionStatePreservingGraphReplay()
         {
             if (gpu_graph)
             {
@@ -567,16 +918,38 @@ namespace llaminar2
             }
             PrefillGraphRequestResetSummary prefill_reset;
             if (prefill_graph_cache)
-                prefill_reset = prefill_graph_cache->prepareEntriesForRequestReset();
-            last_prefill_graph_observation = {};
+            {
+                prefill_reset =
+                    prefill_graph_cache->prepareEntriesForRequestReset(
+                        /*preserve_ready_executables=*/true);
+            }
+            const bool prefill_request_state_was_reset =
+                prefill_reset.ready_demoted > 0 ||
+                prefill_reset.initialized > 0 ||
+                prefill_reset.dropped > 0;
+            const bool captured_replay_preserved =
+                (segment_cache.initialized && !segment_cache.needs_capture) ||
+                prefill_reset.ready_preserved > 0;
+            if (!captured_replay_preserved)
+            {
+                last_prefill_graph_observation = {};
+            }
+            /*
+             * The observation also carries the complete durable cache-key
+             * identity (domain, participant, placement epoch, and topology
+             * signature) used by backend-neutral readiness probes.  When a
+             * Ready executable survives this reset, clearing that identity
+             * would make diagnostics query a synthetic default key and report
+             * the live graph as Cold.  Request-shaped token offsets remain a
+             * historical last-execution observation until the next replay;
+             * current readiness still comes exclusively from PrefillGraphCache.
+             */
 
             if (graph)
             {
-                const bool captured_replay_preserved =
-                    (segment_cache.initialized && !segment_cache.needs_capture) ||
-                    prefill_reset.ready_preserved > 0;
                 const bool lazy_prefill_only =
-                    !captured_replay_preserved && prefill_reset.initialized > 0;
+                    !captured_replay_preserved &&
+                    (prefill_reset.ready_demoted > 0 || prefill_reset.initialized > 0);
 
                 graph->reset();
                 for (const auto &node_name : graph->getExecutionOrder())
@@ -592,10 +965,11 @@ namespace llaminar2
                 }
             }
 
+            (void)prefill_request_state_was_reset;
             markGPUStreamBindingsDirty();
             gpu_graph_update_failures = 0;
             phase3_active = segment_cache.initialized && !segment_cache.needs_capture;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
         }
 
         /**
@@ -606,13 +980,10 @@ namespace llaminar2
          * clears stage/kernels' dynamic metadata and decode replay captures so
          * the next prompt starts from cleared KV/GDN model state.
          *
-         * Monolithic prefill graph captures are dropped here even though the
-         * cached ComputeGraph topology is preserved.  Prefill captures record a
-         * stateful prompt mutation over KV/GDN/short-conv buffers and may embed
-         * backend context/workspace pointers in captured kernel parameters.  A
-         * request clear resets those live buffers, so the next request must warm
-         * or capture prefill against the fresh state instead of replaying the
-         * prior request's executable graph.
+         * Hard request resets use this path for cache classes whose replay is
+         * not proven safe. It keeps the cached ComputeGraph, but discards
+         * prefill graph cache executables and the owned prefill capture stream
+         * while preserving workspace bindings and prepared weights.
          */
         void resetSessionState()
         {
@@ -631,11 +1002,12 @@ namespace llaminar2
                 }
             }
 
+            prefill_capture_stream.reset();
             gpu_stream_applied = false;
             applied_stream = nullptr;
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
         }
 
         void invalidate()
@@ -646,8 +1018,10 @@ namespace llaminar2
                 prefill_graph_cache->invalidateAll();
             last_prefill_graph_observation = {};
             prefill_capture_stream.reset();
-            bucketed_prefill_last_access_tick = 0;
+            prefill_last_access_tick = 0;
             graph.reset();
+            snapshot_manifest.clear();
+            snapshot_configuration_epoch = 0;
             valid = false;
             workspace_generation = 0;
             token_ids.clear();
@@ -655,21 +1029,72 @@ namespace llaminar2
             collective_nodes.clear();
             dynamic_param_stages.clear();
             dynamic_param_stages_cached = false;
-            replay_callback_stages.clear();
-            replay_callback_stages_cached = false;
             prefill_replay_param_stages.clear();
             prefill_replay_param_stages_cached = false;
+            moe_overlay_collective_runtime_stages.clear();
+            moe_overlay_collective_runtime_stages_cached = false;
             gpu_stream_applied = false;
             applied_stream = nullptr;
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
             phase3_active = false;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
             pp_external_hidden_state = nullptr;
             pp_working_buffer = nullptr;
             pp_copy_bytes = 0;
             pp_needs_copy = false;
         }
     };
+
+    /**
+     * @brief Return the flattened row count owned by explicit position IDs.
+     *
+     * ForwardInput::seq_len is the padded row width of one request, while host
+     * and device position arrays are laid out as `[batch_size * seq_len]`.
+     * Dynamic RoPE updates must consume the flattened count or later requests
+     * remain unrotated.  Returning zero for malformed or overflowing geometry
+     * gives cache-miss and replay callers one shared validation contract.
+     *
+     * @param input Current forward invocation and its request geometry.
+     * @return Positive flattened position-row count, or zero when invalid.
+     */
+    inline int forwardPositionRowCount(const ForwardInput &input)
+    {
+        if (input.batch_size <= 0 || input.seq_len <= 0 ||
+            input.seq_len >
+                std::numeric_limits<int>::max() / input.batch_size)
+        {
+            return 0;
+        }
+        return input.batch_size * input.seq_len;
+    }
+
+    /**
+     * @brief Select the host position rows that should refresh a cached forward replay.
+     *
+     * Cached forward graphs keep `position_ids` as stable graph-build storage, but that
+     * storage is not the owner of replay-time absolute positions.  A replay input can
+     * reuse the same bucket shape for a different chunk of the request, so the current
+     * `ForwardInput` must win whenever it provides fresh host rows.  The cache-owned
+     * rows are only a compatibility fallback for callers that have no explicit replay
+     * rows.  When device-resident rows are present, this helper returns null so callers
+     * keep the device pointer as the single source of truth.
+     *
+     * @param forward_cache Cache entry that owns graph-build fallback rows.
+     * @param input Current replay input for this forward invocation.
+     * @return Host position row pointer for dynamic replay, or null when none applies.
+     */
+    inline const int *selectForwardReplayHostPositionIds(
+        const ForwardGraphCache &forward_cache,
+        const ForwardInput &input)
+    {
+        if (input.position_ids_device)
+            return nullptr;
+        if (input.position_ids)
+            return input.position_ids;
+        if (!forward_cache.position_ids.empty())
+            return forward_cache.position_ids.data();
+        return nullptr;
+    }
 
 } // namespace llaminar2

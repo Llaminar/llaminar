@@ -10,33 +10,34 @@
  * unit tests (Test__StreamCoherence.cpp) test via mocks.
  *
  * **Key scenarios tested**:
- * 1. mark_device_dirty_with_event() records an event on the correct stream,
- *    and ensureOnHost() + data() returns post-kernel data
- * 2. transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) does NOT record an event, and
- *    ensureOnHost() falls back to full device synchronization
- * 3. The stale event scenario: event from operation A persists after
- *    flags-only dirty marking from operation B
- * 4. MockBackend event tracking verifies event create/record/wait calls
+ * 1. Event-backed publication records on the exact producer stream and host
+ *    observation waits for that event before D2H.
+ * 2. Graph-owned publication is not independently host-observable until the
+ *    graph controller publishes replay completion.
+ * 3. Repeated producers refresh the event dependency rather than preserving
+ *    stale ordering.
+ * 4. MockBackend event tracking verifies event create/record/wait calls.
  *
  * **Skipping**: These tests require at least one GPU (CUDA or ROCm).
  * They automatically skip on CPU-only machines.
  *
  * @see tests/v2/unit/execution/local_execution/coherence/Test__StreamCoherence.cpp
- * @see src/v2/tensors/TensorBase.cpp (mark_device_dirty_with_event, ensureOnHost)
+ * @see src/v2/transfer/TransferEngine.h
  * @see tests/v2/mocks/MockBackend.h
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 // Project headers
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 #include "backends/ComputeBackend.h"
-#include "execution/local_execution/coherence/StageCoherence.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 
 // Mock for event tracking
 #include "mocks/MockBackend.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 #include <memory>
 #include <vector>
@@ -44,6 +45,7 @@
 #include <cmath>
 #include <numeric>
 #include <iostream>
+#include <stdexcept>
 
 using namespace llaminar2;
 
@@ -93,6 +95,8 @@ protected:
 
         std::cout << "[StreamCoherenceIntegration] Using device: "
                   << gpu_device_.toString() << std::endl;
+        producer_stream_ =
+            std::make_unique<llaminar2::test::ScopedGPUStream>(gpu_device_);
     }
 
     /**
@@ -111,6 +115,7 @@ protected:
     }
 
     DeviceId gpu_device_ = DeviceId::cpu();
+    std::unique_ptr<llaminar2::test::ScopedGPUStream> producer_stream_;
 };
 
 // =============================================================================
@@ -134,7 +139,9 @@ TEST_F(Test__StreamCoherenceIntegration, RoundTrip_HostToDeviceToHost)
 
     // Mark device dirty (the GPU hasn't actually modified data, but this
     // exercises the coherence path: host becomes stale)
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
     // Read back — should trigger D2H transfer
     const float *result = tensor->data();
@@ -149,12 +156,12 @@ TEST_F(Test__StreamCoherenceIntegration, RoundTrip_HostToDeviceToHost)
 }
 
 // =============================================================================
-// Test: mark_device_dirty_with_event Records Correct Event
+// Test: event-backed publication records the correct event
 // =============================================================================
 
 TEST_F(Test__StreamCoherenceIntegration, WithEvent_RecordsAndWaitsCorrectly)
 {
-    // After mark_device_dirty_with_event, calling data() should:
+    // After event-backed publication, calling data() should:
     // 1. Wait on the recorded event
     // 2. Perform D2H transfer
     // 3. Return the correct data
@@ -170,8 +177,10 @@ TEST_F(Test__StreamCoherenceIntegration, WithEvent_RecordsAndWaitsCorrectly)
     // Upload to device
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
-    // Mark dirty WITH event (using default stream / nullptr)
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    // Publish the write on the exact explicit producer stream.
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
     // Host should be stale now
     EXPECT_FALSE(tensor->isOnCPU());
@@ -192,14 +201,13 @@ TEST_F(Test__StreamCoherenceIntegration, WithEvent_RecordsAndWaitsCorrectly)
 }
 
 // =============================================================================
-// Test: mark_device_dirty_flags_only Falls Back to Full Sync
+// Test: explicit-stream publication remains event-backed
 // =============================================================================
 
-TEST_F(Test__StreamCoherenceIntegration, FlagsOnly_FallsBackToFullSync)
+TEST_F(Test__StreamCoherenceIntegration, ExplicitStreamPublicationUsesEventReadback)
 {
-    // transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) does NOT record an event.
-    // When ensureOnHost() is called, it should fall back to full device sync.
-    // This is slower but still correct.
+    // A non-null producer stream records the exact dependency consumed by the
+    // later host readback. Stream zero is intentionally not a legal producer.
 
     constexpr size_t ROWS = 4;
     constexpr size_t COLS = 32;
@@ -212,13 +220,15 @@ TEST_F(Test__StreamCoherenceIntegration, FlagsOnly_FallsBackToFullSync)
     // Upload to device
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
-    // Flags-only dirty marking (no event)
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    // Event-backed publication on the explicit producer stream.
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
     // Host should be stale
     EXPECT_FALSE(tensor->isOnCPU());
 
-    // Reading data should still work (falls back to full sync)
+    // Reading data waits on the tensor's exact publication event.
     const float *result = tensor->data();
     ASSERT_NE(result, nullptr);
 
@@ -231,22 +241,13 @@ TEST_F(Test__StreamCoherenceIntegration, FlagsOnly_FallsBackToFullSync)
 }
 
 // =============================================================================
-// Test: Stale Event Scenario — Event Persists Through Flags-Only Marking
+// Test: repeated event publication refreshes the dependency
 // =============================================================================
 
-TEST_F(Test__StreamCoherenceIntegration, StaleEvent_PersistsThroughFlagsOnlyMarking)
+TEST_F(Test__StreamCoherenceIntegration, RepeatedEventPublicationRefreshesDependency)
 {
-    // Reproduce the Bug 2 scenario on real hardware:
-    //
-    // 1. Upload tensor to GPU
-    // 2. Mark dirty WITH event (simulating a GEMM kernel)
-    // 3. Mark dirty FLAGS ONLY (simulating what executor did for allreduce before fix)
-    // 4. Read data back
-    //
-    // The data should still be correct because the stale event completion
-    // time is BEFORE the flags-only marking (the upload is complete).
-    // But the critical insight is that the event is stale — it doesn't
-    // reflect what happened AFTER step 2.
+    // Reusing a tensor across producers must re-record its event after each
+    // write so the eventual host consumer observes the newest producer.
 
     constexpr size_t ROWS = 4;
     constexpr size_t COLS = 64;
@@ -260,20 +261,19 @@ TEST_F(Test__StreamCoherenceIntegration, StaleEvent_PersistsThroughFlagsOnlyMark
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Step 2: Mark dirty with event (simulates GEMM completing)
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
-    // Step 3: Mark dirty flags-only (simulates executor after "allreduce")
-    // The stale event from step 2 persists
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    // Step 3: A later producer refreshes the same event-backed handoff.
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
-    // Step 4: Read back — ensureOnHost() will wait on the stale event from step 2
+    // Step 4: Readback waits on the latest publication.
     const float *result = tensor->data();
     ASSERT_NE(result, nullptr);
 
-    // Data is correct here because no kernel actually modified it.
-    // In the real bug scenario, step 3 would be an allreduce that MODIFIES
-    // the data on GPU, but the stale event from step 2 would let the D2H
-    // transfer proceed before the allreduce completes.
     for (size_t i = 0; i < ROWS * COLS; ++i)
     {
         EXPECT_FLOAT_EQ(result[i], original[i]);
@@ -281,19 +281,19 @@ TEST_F(Test__StreamCoherenceIntegration, StaleEvent_PersistsThroughFlagsOnlyMark
 }
 
 // =============================================================================
-// Test: Fix Scenario — Stage Calls mark_device_dirty_with_event After Allreduce
+// Test: each stage refreshes event publication after its write
 // =============================================================================
 
 TEST_F(Test__StreamCoherenceIntegration, FixScenario_StageCallsEventAfterAllreduce)
 {
-    // Demonstrates the fix: After the allreduce, the stage calls
-    // mark_device_dirty_with_event() which replaces the stale event.
+    // After the allreduce, the stage publishes its producer stream, replacing
+    // the previous dependency.
     //
     // 1. Upload tensor
     // 2. Mark dirty with event (GEMM)
-    // 3. Mark dirty flags-only (executor, for intermediate pipeline stage)
-    // 4. Mark dirty with event AGAIN (stage-level fix in TPAllreduceStage)
-    // 5. Read data — waits on the NEW event
+    // 3. Publish the next producer on the same default stream
+    // 4. Publish the collective producer after it completes
+    // 5. Read data — waits on the newest event
 
     constexpr size_t ROWS = 4;
     constexpr size_t COLS = 128;
@@ -307,13 +307,19 @@ TEST_F(Test__StreamCoherenceIntegration, FixScenario_StageCallsEventAfterAllredu
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
     // Step 2: GEMM event
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
-    // Step 3: Executor flags-only (intermediate stage)
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    // Step 3: A second event-backed producer
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
     // Step 4: FIX — Stage records new event after allreduce
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        producer_stream_->get());
 
     // Step 5: Read back — waits on the new event from step 4
     const float *result = tensor->data();
@@ -326,13 +332,11 @@ TEST_F(Test__StreamCoherenceIntegration, FixScenario_StageCallsEventAfterAllredu
 }
 
 // =============================================================================
-// Test: StageCoherence markOutputsDirty vs markOutputsDirtyFlagsOnly
+// Test: explicit event-backed and graph-owned publication
 // =============================================================================
 
-TEST_F(Test__StreamCoherenceIntegration, StageCoherence_MarkOutputsDirty_WithRealGPU)
+TEST_F(Test__StreamCoherenceIntegration, PublishDeviceWrite_WithRealGPU)
 {
-    // Verify StageCoherence::markOutputsDirty() works with real GPU tensors
-
     constexpr size_t ROWS = 4;
     constexpr size_t COLS = 64;
 
@@ -343,18 +347,8 @@ TEST_F(Test__StreamCoherenceIntegration, StageCoherence_MarkOutputsDirty_WithRea
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
-    // Use StageCoherence function (event-based)
-    CoherenceBuffer buf;
-    buf.tensor = tensor.get();
-    buf.name = "test_output";
-    buf.data = nullptr; // Not needed for coherence operations
-    buf.rows = ROWS;
-    buf.cols = COLS;
-    buf.dtype = "FP32";
-    buf.is_inout = false;
-
-    std::vector<CoherenceBuffer> outputs = {buf};
-    markOutputsDirty(outputs, nullptr);
+    TransferEngine::publishDeviceWrite(
+        tensor.get(), gpu_device_, producer_stream_->get());
 
     // Host should be stale
     EXPECT_FALSE(tensor->isOnCPU());
@@ -369,10 +363,10 @@ TEST_F(Test__StreamCoherenceIntegration, StageCoherence_MarkOutputsDirty_WithRea
     }
 }
 
-TEST_F(Test__StreamCoherenceIntegration, StageCoherence_FlagsOnly_WithRealGPU)
+TEST_F(Test__StreamCoherenceIntegration, GraphOwnedWriteRequiresControllerEvent)
 {
-    // Verify StageCoherence::markOutputsDirtyFlagsOnly() works with real GPU tensors
-    // (falls back to full sync on ensureOnHost)
+    // Graph-owned publication deliberately carries no per-tensor event. A host
+    // read must fail until the graph controller publishes replay completion.
 
     constexpr size_t ROWS = 4;
     constexpr size_t COLS = 64;
@@ -384,19 +378,20 @@ TEST_F(Test__StreamCoherenceIntegration, StageCoherence_FlagsOnly_WithRealGPU)
 
     ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_));
 
-    CoherenceBuffer buf;
-    buf.tensor = tensor.get();
-    buf.name = "test_output";
-    buf.data = nullptr;
-    buf.rows = ROWS;
-    buf.cols = COLS;
-    buf.dtype = "FP32";
-    buf.is_inout = false;
-
-    std::vector<CoherenceBuffer> outputs = {buf};
-    markOutputsDirtyFlagsOnly(outputs);
+    TransferEngine::publishGraphOwnedDeviceWrite(
+        tensor.get(), gpu_device_);
 
     EXPECT_FALSE(tensor->isOnCPU());
+
+    EXPECT_THROW(
+        static_cast<void>(tensor->data()),
+        std::runtime_error);
+
+    // Model the graph controller's post-launch event publication.
+    TransferEngine::publishDeviceWrite(
+        tensor.get(),
+        gpu_device_,
+        producer_stream_->get());
 
     const float *result = tensor->data();
     ASSERT_NE(result, nullptr);
@@ -429,6 +424,7 @@ TEST_F(Test__StreamCoherenceIntegration, GpuCoherenceHelper_WithRealGPU)
         gpu_device_,
         {input.get()},  // inputs
         {output.get()}, // outputs
+        producer_stream_->get(),
         [&]
         {
             // No actual kernel — just verify the tensors are on device
@@ -461,15 +457,19 @@ TEST_F(Test__StreamCoherenceIntegration, MultipleTensors_CoherenceConsistency)
     ASSERT_TRUE(tensor_a->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(tensor_b->ensureOnDevice(gpu_device_));
 
-    // Mark A with event, B with flags-only
-    tensor_a->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
-    tensor_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    // Publish both tensors on their producer streams.
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor_a,
+        producer_stream_->get());
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor_b,
+        producer_stream_->get());
 
     // Both should be device-authoritative
     EXPECT_FALSE(tensor_a->isOnCPU());
     EXPECT_FALSE(tensor_b->isOnCPU());
 
-    // Read back both — A uses event sync, B uses full sync
+    // Read back both through their exact event dependencies.
     const float *result_a = tensor_a->data();
     const float *result_b = tensor_b->data();
 

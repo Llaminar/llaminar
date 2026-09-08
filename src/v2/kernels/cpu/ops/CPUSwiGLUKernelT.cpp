@@ -18,6 +18,42 @@
 #include "../../../tensors/Tensors.h" // For TensorBase
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
+
+#include <string>
+
+namespace
+{
+    /**
+     * @brief Record one economical CPU grouped SwiGLU production call.
+     *
+     * M=1 serial witnesses intentionally emit no counter. Every supported CPU
+     * format processes the complete runtime-M verifier group in one primitive
+     * invocation; the element schedule identifies whether that invocation
+     * partitions FP values or native Q8 blocks.
+     */
+    void recordCPUGroupedSwiGLUCall(
+        const char *tensor_format,
+        int rows,
+        int cols,
+        const char *element_schedule)
+    {
+        if (rows < 2)
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_swiglu_grouped_verifier_rows_calls",
+            1.0,
+            "verifier",
+            "cpu",
+            {{"tensor_format", tensor_format},
+             {"verifier_rows", std::to_string(rows)},
+             {"cols", std::to_string(cols)},
+             {"element_schedule", element_schedule},
+             {"invocation_policy", "single_grouped_workshare"}});
+    }
+} // namespace
 
 namespace llaminar2
 {
@@ -172,8 +208,12 @@ namespace llaminar2
         const IMPIContext *mpi_ctx,
         int device_idx)
     {
-        (void)add_residual; // Not used in this kernel
         (void)mpi_ctx;      // Not used in this kernel
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<FP32>: add_residual has no residual operand and is unsupported");
+            return false;
+        }
         const int size = rows * cols;
         return apply_typed(gate, up, output, size, device_idx);
     }
@@ -193,6 +233,11 @@ namespace llaminar2
             LOG_ERROR("CPUSwiGLUKernelT<FP32>::apply_tensor: null tensor");
             return false;
         }
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<FP32>::apply_tensor: add_residual is unsupported");
+            return false;
+        }
 
         // Validate all tensors are FP32
         if (gate->native_type() != TensorType::FP32 ||
@@ -204,11 +249,14 @@ namespace llaminar2
         }
 
         // FP32Tensor::data() returns const float*, FP32Tensor::mutable_data() returns float*
-        return apply(
+        const bool ok = apply(
             gate->data(),
             up->data(),
             output->mutable_data(),
             rows, cols, add_residual, mpi_ctx, device_idx);
+        if (ok)
+            recordCPUGroupedSwiGLUCall("FP32", rows, cols, "fp32_row_chunks");
+        return ok;
     }
 
     // ============================================================================
@@ -241,8 +289,12 @@ namespace llaminar2
         const IMPIContext *mpi_ctx,
         int device_idx)
     {
-        (void)add_residual; // Not used in this kernel
         (void)mpi_ctx;      // Not used in this kernel
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<BF16>: add_residual has no residual operand and is unsupported");
+            return false;
+        }
         const int size = rows * cols;
         return apply_typed(gate, up, output, size, device_idx);
     }
@@ -260,6 +312,11 @@ namespace llaminar2
         if (!gate || !up || !output)
         {
             LOG_ERROR("CPUSwiGLUKernelT<BF16>::apply_tensor: null tensor");
+            return false;
+        }
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<BF16>::apply_tensor: add_residual is unsupported");
             return false;
         }
 
@@ -283,11 +340,14 @@ namespace llaminar2
             return false;
         }
 
-        return apply_bf16(
+        const bool ok = apply_bf16(
             gate_bf16->typed_data(),
             up_bf16->typed_data(),
             output_bf16->mutable_typed_data(),
             rows, cols, add_residual, mpi_ctx, device_idx);
+        if (ok)
+            recordCPUGroupedSwiGLUCall("BF16", rows, cols, "native_elements");
+        return ok;
     }
 
     // ============================================================================
@@ -320,8 +380,12 @@ namespace llaminar2
         const IMPIContext *mpi_ctx,
         int device_idx)
     {
-        (void)add_residual; // Not used in this kernel
         (void)mpi_ctx;      // Not used in this kernel
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<FP16>: add_residual has no residual operand and is unsupported");
+            return false;
+        }
         const int size = rows * cols;
         return apply_typed(gate, up, output, size, device_idx);
     }
@@ -339,6 +403,11 @@ namespace llaminar2
         if (!gate || !up || !output)
         {
             LOG_ERROR("CPUSwiGLUKernelT<FP16>::apply_tensor: null tensor");
+            return false;
+        }
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<FP16>::apply_tensor: add_residual is unsupported");
             return false;
         }
 
@@ -362,11 +431,14 @@ namespace llaminar2
             return false;
         }
 
-        return apply_fp16(
+        const bool ok = apply_fp16(
             gate_fp16->typed_data(),
             up_fp16->typed_data(),
             output_fp16->mutable_typed_data(),
             rows, cols, add_residual, mpi_ctx, device_idx);
+        if (ok)
+            recordCPUGroupedSwiGLUCall("FP16", rows, cols, "native_elements");
+        return ok;
     }
 
     // ============================================================================
@@ -399,8 +471,12 @@ namespace llaminar2
         const IMPIContext *mpi_ctx,
         int device_idx)
     {
-        (void)add_residual; // Not used in this kernel
         (void)mpi_ctx;      // Not used in this kernel
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<Q8_1>: add_residual has no residual operand and is unsupported");
+            return false;
+        }
         const int size = rows * cols;
         return apply_typed(
             static_cast<const Q8_1Block *>(gate),
@@ -424,6 +500,11 @@ namespace llaminar2
             LOG_ERROR("CPUSwiGLUKernelT<Q8_1>::apply_tensor: null tensor");
             return false;
         }
+        if (add_residual)
+        {
+            LOG_ERROR("CPUSwiGLUKernelT<Q8_1>::apply_tensor: add_residual is unsupported");
+            return false;
+        }
 
         // Validate all tensors are Q8_1
         if (gate->native_type() != TensorType::Q8_1 ||
@@ -445,11 +526,14 @@ namespace llaminar2
             return false;
         }
 
-        return apply_q8_1(
+        const bool ok = apply_q8_1(
             gate_q8->typed_data(),
             up_q8->typed_data(),
             output_q8->mutable_typed_data(),
             rows, cols, add_residual, mpi_ctx, device_idx);
+        if (ok)
+            recordCPUGroupedSwiGLUCall("Q8_1", rows, cols, "native_q8_blocks");
+        return ok;
     }
 
 } // namespace llaminar2

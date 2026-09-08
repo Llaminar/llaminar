@@ -1,18 +1,108 @@
 /**
  * @file SnapshotCapture.cpp
- * @brief Implementation of snapshot capture logic
+ * @brief Converts concrete graph-stage observations into stable parity keys.
+ *
+ * Snapshot capture is diagnostic-only: graph execution publishes each selected
+ * stage's already-produced tensor through its declared stream/event edge, and
+ * this component copies that host-visible observation into the semantic names
+ * consumed by model parity tests and their CSV evidence.  It deliberately
+ * maps by the real producing graph node rather than by a historical model
+ * convention so optimized, captured, and heterogeneous paths expose the same
+ * numerical checkpoints without changing production arithmetic. Segmented
+ * prefill additionally retains each live bucket under an explicit context and
+ * joins sequence-shaped values back into one full-prompt checkpoint only after
+ * all chunks have published their diagnostic copies.
  *
  * Extracted from DeviceGraphOrchestrator.h (Phase 2 of DGO refactor).
  */
 
 #include "SnapshotCapture.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string_view>
 
 namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Row ownership used when rebuilding a segmented prefill snapshot.
+         *
+         * Most checkpoints publish one row per real token. Canonical routed
+         * expert contributions instead publish one row per `(token, route)`
+         * pair and retain the fixed graph bucket's inactive suffix. Terminal
+         * values, such as last-token logits, do not describe a token sequence.
+         */
+        enum class PrefillSnapshotSequenceLayout : std::uint8_t
+        {
+            LogicalRows,     ///< Exactly one captured row per real token.
+            PackedRouteRows, ///< `top_k` captured rows per real token.
+            Terminal,        ///< Latest observation is the complete value.
+        };
+
+        /** @return True when @p value ends with the exact semantic suffix. */
+        bool hasSemanticSuffix(
+            const std::string &value,
+            const std::string_view suffix) noexcept
+        {
+            return value.size() >= suffix.size() &&
+                   value.compare(
+                       value.size() - suffix.size(),
+                       suffix.size(),
+                       suffix) == 0;
+        }
+
+        /**
+         * @brief Classify the live-row geometry of one semantic checkpoint.
+         *
+         * The packed route contribution is named by its typed graph output.
+         * All other tensors remain sequence-shaped only when their producer
+         * already projected the first fixed bucket down to real token rows.
+         */
+        PrefillSnapshotSequenceLayout prefillSnapshotSequenceLayout(
+            const std::string &semantic_key,
+            const StoredSnapshot &first,
+            const size_t first_logical_rows) noexcept
+        {
+            constexpr std::string_view kRouteContributions =
+                "_MOE_ROUTE_CONTRIBUTIONS";
+            if (hasSemanticSuffix(
+                    semantic_key,
+                    kRouteContributions))
+            {
+                return PrefillSnapshotSequenceLayout::PackedRouteRows;
+            }
+            return first.rows == first_logical_rows
+                       ? PrefillSnapshotSequenceLayout::LogicalRows
+                       : PrefillSnapshotSequenceLayout::Terminal;
+        }
+
+        /**
+         * @brief Name the routing-index companion that owns `top_k` geometry.
+         * @return Companion key, or an empty string for a non-route checkpoint.
+         */
+        std::string routingIndexCompanionKey(
+            const std::string &semantic_key)
+        {
+            constexpr std::string_view kRouteContributions =
+                "_MOE_ROUTE_CONTRIBUTIONS";
+            if (!hasSemanticSuffix(
+                    semantic_key,
+                    kRouteContributions))
+            {
+                return {};
+            }
+            return semantic_key.substr(
+                       0,
+                       semantic_key.size() -
+                       kRouteContributions.size()) +
+                   "_MOE_ROUTING_INDICES";
+        }
+
         std::string snapshotContextPrefix(const std::string &context)
         {
             std::string result;
@@ -36,6 +126,97 @@ namespace llaminar2
                 result.pop_back();
             return result.empty() ? "CONTEXT" : result;
         }
+
+        /**
+         * @brief Name one ordered cumulative ExpertOverlay contribution.
+         *
+         * Each graph-native overlay ticket consume copies the routed-expert
+         * accumulator back to the continuation participant after exactly one
+         * target has returned its sparse rows.  The ordinary
+         * `MOE_EXPERT_OUTPUT` key intentionally keeps only the final consume,
+         * which is the semantic model checkpoint.  This diagnostic key retains
+         * each intermediate cumulative value as well, allowing a parity report
+         * to isolate the participant that first introduces a numerical error.
+         *
+         * @param stage_name Concrete ticket-consume graph node name.
+         * @return Stable semantic key, or an empty string for a malformed name.
+         */
+        std::string overlayTicketCumulativeSnapshotKey(
+            const std::string &stage_name)
+        {
+            constexpr std::string_view kTicketConsume =
+                "_moe_overlay_ticket_consume_";
+            const size_t marker = stage_name.find(kTicketConsume);
+            if (marker == std::string::npos)
+                return {};
+
+            const std::string prefix = stage_name.substr(0, marker);
+            const std::string participant = stage_name.substr(
+                marker + kTicketConsume.size());
+            if (prefix.empty() || participant.empty())
+                return {};
+
+            return prefix + "_MOE_OVERLAY_CUMULATIVE_" +
+                   snapshotContextPrefix(participant);
+        }
+
+        /**
+         * @brief Resolve the model-layer prefix for a pinned route producer.
+         *
+         * A LocalTP continuation publishes this evidence at its ordered route
+         * reducer. A single-participant continuation publishes the identical
+         * views at its final mapped return join, after grouped planning has
+         * finalized the invocation-local domain assignment ledger. Both are
+         * observations of the same runtime-table authority.
+         */
+        std::string pinnedRouteEvidencePrefix(
+            const std::string &stage_name)
+        {
+            constexpr std::string_view kOrderedReduce =
+                "_moe_overlay_continuation_routes_ordered_reduce";
+            constexpr std::string_view kMappedReturn =
+                "_moe_overlay_activation_return_consume";
+            size_t marker = stage_name.find(kOrderedReduce);
+            if (marker == std::string::npos)
+                marker = stage_name.find(kMappedReturn);
+            return marker == std::string::npos
+                       ? std::string{}
+                       : stage_name.substr(0, marker);
+        }
+
+        /**
+         * @brief Map one named device view to its stable parity checkpoint.
+         *
+         * @param prefix Model-layer prefix returned by
+         *        @ref pinnedRouteEvidencePrefix.
+         * @param output_name Typed StageDumpInfo output name.
+         * @return Stable snapshot key, or an empty string for unrelated data.
+         */
+        std::string pinnedRouteEvidenceKey(
+            const std::string &prefix,
+            const std::string &output_name)
+        {
+            if (output_name == "output")
+                return prefix + "_MOE_EXPERT_OUTPUT";
+            if (output_name == "canonical_route_contributions")
+                return prefix + "_MOE_ROUTE_CONTRIBUTIONS";
+            if (output_name == "domain_route_participant_ids")
+                return prefix + "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS";
+            if (output_name == "runtime_route_weights")
+                return prefix + "_MOE_RUNTIME_ROUTE_WEIGHTS";
+            if (output_name == "overlay_route_participants_bank0")
+                return prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0";
+            if (output_name == "overlay_route_bank0_epoch")
+                return prefix + "_MOE_OVERLAY_ROUTE_BANK0_EPOCH";
+            if (output_name == "overlay_route_participants_bank1")
+                return prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1";
+            if (output_name == "overlay_route_bank1_epoch")
+                return prefix + "_MOE_OVERLAY_ROUTE_BANK1_EPOCH";
+            if (output_name == "overlay_route_selected_bank")
+                return prefix + "_MOE_OVERLAY_ROUTE_SELECTED_BANK";
+            return {};
+        }
+
     } // namespace
 
     // =========================================================================
@@ -44,6 +225,8 @@ namespace llaminar2
 
     void SnapshotCapture::captureStage(const std::string &name, const StageDumpInfo &dump)
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+
         if (const size_t context_sep = name.find("::"); context_sep != std::string::npos)
         {
             SnapshotCapture scoped_capture;
@@ -70,6 +253,25 @@ namespace llaminar2
                 storeOutput(prefix + "_Q_PROJECTION", dump.outputs[0]);
                 storeOutput(prefix + "_K_PROJECTION", dump.outputs[1]);
                 storeOutput(prefix + "_V_PROJECTION", dump.outputs[2]);
+            }
+            return;
+        }
+
+        /*
+         * A K/V-only MTP catch-up graph deliberately omits query projection,
+         * but the fused stage still owns two independently meaningful outputs.
+         * Never collapse output K into an ambiguous `KV_PROJ` alias and drop V:
+         * the canonical K/V names retain their column-parallel schema contract
+         * and line up with the same PyTorch checkpoints as the full sidecar.
+         */
+        if (name.find("_kv_proj") != std::string::npos)
+        {
+            const size_t kv_pos = name.find("_kv_proj");
+            const std::string prefix = name.substr(0, kv_pos);
+            if (dump.outputs.size() >= 2)
+            {
+                storeOutput(prefix + "_K_PROJECTION", dump.outputs[0]);
+                storeOutput(prefix + "_V_PROJECTION", dump.outputs[1]);
             }
             return;
         }
@@ -239,6 +441,24 @@ namespace llaminar2
                     storeOutput(prefix + "_ATTENTION_EFFECTIVE_V", output);
                     storeRowsForSmallEffectiveKV(prefix + "_ATTENTION_EFFECTIVE_V", output);
                 }
+                else if (output_name.starts_with("device_kv_count_request_") &&
+                         output.data)
+                {
+                    storeOutput(
+                        prefix + "_ATTENTION_DEVICE_KV_COUNT_REQUEST_" +
+                            output_name.substr(
+                                std::string("device_kv_count_request_").size()),
+                        output);
+                }
+                else if (output_name.starts_with("device_kv_head_request_") &&
+                         output.data)
+                {
+                    storeOutput(
+                        prefix + "_ATTENTION_DEVICE_KV_HEAD_REQUEST_" +
+                            output_name.substr(
+                                std::string("device_kv_head_request_").size()),
+                        output);
+                }
             }
             return;
         }
@@ -252,17 +472,35 @@ namespace llaminar2
                 auto data = extractFp32FromOutput(out);
                 LOG_DEBUG("[Snapshot] lm_head_allgather handler: storing as LM_HEAD (overwriting partial), count=" << data.size());
                 if (!data.empty())
-                    snapshots_["LM_HEAD"] = {std::move(data), out.rows, out.cols};
+                    storeSnapshot("LM_HEAD", std::move(data), out.rows, out.cols);
             }
             return;
         }
 
-        // Handle FusedResidualNormStage — store outputs[1] (norm_output), not outputs[0] (residual)
+        // Handle FusedResidualNormStage. The normalized output keeps the long-standing
+        // semantic key, while residual_out exposes the hidden-state handoff that
+        // happens inside this fused stage. That handoff is essential for grouped
+        // verifier diagnostics because non-terminal FFN residual adds are often
+        // represented by the next layer's fused attention norm rather than by a
+        // standalone ResidualAddStage node.
         if ((name.find("_attn_norm") != std::string::npos ||
              name.find("_ffn_norm") != std::string::npos) &&
             dump.outputs.size() >= 2)
         {
             std::string key = convertStageNameToSnapshotKey(name);
+
+            if (dump.outputs[0].data)
+            {
+                auto data = extractFp32FromOutput(dump.outputs[0]);
+                LOG_DEBUG("[Snapshot] FusedResidualNorm: storing residual_out as key="
+                          << key << "_RESIDUAL_OUT count=" << data.size());
+                if (!data.empty())
+                    storeSnapshot(
+                        key + "_RESIDUAL_OUT",
+                        std::move(data),
+                        dump.outputs[0].rows,
+                        dump.outputs[0].cols);
+            }
 
             if (dump.outputs[1].data)
             {
@@ -270,9 +508,50 @@ namespace llaminar2
                 LOG_DEBUG("[Snapshot] FusedResidualNorm: storing norm_output as key="
                           << key << " count=" << data.size());
                 if (!data.empty())
-                    snapshots_[key] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
+                    storeSnapshot(
+                        key,
+                        std::move(data),
+                        dump.outputs[1].rows,
+                        dump.outputs[1].cols);
             }
             return;
+        }
+
+        /*
+         * The predictor's first RMSNorm publishes its exact read-only input as
+         * a typed diagnostic view.  That stage executes inside the sidecar's
+         * snapshot context, unlike the earlier mailbox publication that made
+         * the row current.  Naming the view here therefore binds the terminal
+         * hidden checkpoint to the precise transaction that consumed it while
+         * preserving one device-owned value and one producer/consumer event
+         * chain.
+         */
+        if (name.find("_norm_hidden") != std::string::npos)
+        {
+            bool published_terminal_hidden = false;
+            bool published_norm = false;
+            const std::string norm_key =
+                convertStageNameToSnapshotKey(name);
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "output" && output.data)
+                {
+                    storeOutput(norm_key, output);
+                    published_norm = true;
+                }
+                else if (output_name == "mtp_terminal_hidden_input" &&
+                         output.data)
+                {
+                    storeOutput(
+                        "MTP_TERMINAL_HIDDEN_ROW_SELECT",
+                        output);
+                    published_terminal_hidden = true;
+                }
+            }
+            if (published_terminal_hidden || published_norm)
+                return;
         }
 
         // Handle fused MoE FFN stage — split into expert output + routing data
@@ -293,6 +572,55 @@ namespace llaminar2
         }
 
         /*
+         * Canonical LocalTP publication owns three semantically distinct values
+         * at one rooted finalizer. Route each named output explicitly so the
+         * snapshot contract follows the graph's real producer rather than a
+         * historical stage-name convention.
+         */
+        if (name.find("_moe_canonical_publication_finalize") !=
+            std::string::npos)
+        {
+            const size_t pos =
+                name.find("_moe_canonical_publication_finalize");
+            const std::string prefix = name.substr(0, pos);
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "routed_output" && output.data)
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
+                else if (output_name == "shared_output" && output.data)
+                    storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
+                else if (output_name == "combined_output" && output.data)
+                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
+            }
+            return;
+        }
+
+        /*
+         * A routed-output finalizer consumes two projections of one pinned
+         * epoch: overlay-wide expert placement and the invocation-local domain
+         * schedule. Capture both only after grouped planning and every required
+         * return are complete, before a later layer reuses route scratch. The
+         * request ticket selects which durable placement bank applied even if
+         * background publication has advanced the newest active bank.
+         */
+        if (const std::string prefix = pinnedRouteEvidencePrefix(name);
+            !prefix.empty())
+        {
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                const std::string key =
+                    pinnedRouteEvidenceKey(prefix, output_name);
+                if (!key.empty() && output.data)
+                    storeOutput(key, output);
+            }
+            return;
+        }
+
+        /*
          * The Qwen3.6 MoE combined shared-verifier path can fuse routed expert
          * and shared expert output inside MoEExpertComputeStage.  The stage name
          * is still `_moe_expert_ffn`, so route by output name before the generic
@@ -302,22 +630,38 @@ namespace llaminar2
         {
             size_t pos = name.find("_moe_expert_ffn");
             std::string prefix = name.substr(0, pos);
+            bool handled_named_output = false;
             for (const auto &output : dump.outputs)
             {
                 const std::string output_name = output.name ? output.name : "";
                 if (output_name == "combined_output" && output.data)
                 {
                     storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
-                    return;
+                    handled_named_output = true;
+                }
+                else if (output_name == "canonical_route_contributions" &&
+                         output.data)
+                {
+                    storeOutput(
+                        prefix + "_MOE_ROUTE_CONTRIBUTIONS",
+                        output);
+                    handled_named_output = true;
+                }
+                else if (output_name == "output" && output.data)
+                {
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
+                    handled_named_output = true;
                 }
             }
+            if (handled_named_output)
+                return;
         }
 
         // Handle shared-expert gate. In the ordinary path the stage has one
         // output, the gated shared contribution. In the fused gate-add path it
-        // publishes both that gated contribution and the final routed+shared
-        // combined row. Route by output name so both paths keep the same
-        // semantic snapshot keys.
+        // publishes the unchanged complete routed input, that gated
+        // contribution, and the final routed+shared combined row. Route by
+        // output name so both paths keep the same semantic snapshot keys.
         if (name.find("_shared_expert_gate") != std::string::npos)
         {
             size_t pos = name.find("_shared_expert_gate");
@@ -328,22 +672,92 @@ namespace llaminar2
                 const std::string output_name = output.name ? output.name : "";
                 if (output_name == "shared_output" && output.data)
                     storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
+                else if (output_name == "routed_output" && output.data)
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
                 else if (output_name == "combined_output" && output.data)
                     storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
             }
             return;
         }
 
-        // Handle standalone MoE routing stage — split router logits, indices, and weights
-        if (name.find("_moe_routing") != std::string::npos && dump.outputs.size() >= 3)
+        // Handle standalone MoE routing stage. Eager snapshot builds may
+        // provide host-stashed router logits plus routing vectors, while
+        // graph-captured runs publish only the tensor-backed routing outputs
+        // after replay. Route by output name so both contracts preserve the
+        // same parity keys without forcing host mirrors into graph capture.
+        if (name.find("_moe_routing") != std::string::npos)
         {
             size_t pos = name.find("_moe_routing");
             std::string prefix = name.substr(0, pos);
 
-            storeOutput(prefix + "_MOE_ROUTER_OUTPUT", dump.outputs[0]);
-            storeOutput(prefix + "_MOE_ROUTING_INDICES", dump.outputs[1]);
-            storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", dump.outputs[2]);
-            return;
+            const StageDumpInfo::OutputBuffer *router_logits = nullptr;
+            const StageDumpInfo::OutputBuffer *routing_indices = nullptr;
+            const StageDumpInfo::OutputBuffer *routing_weights = nullptr;
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "router_logits" || output_name == "logits")
+                    router_logits = &output;
+                else if (output_name == "routing_indices" ||
+                         output_name == "indices" ||
+                         output_name == "output_indices_tensor")
+                    routing_indices = &output;
+                else if (output_name == "routing_weights" ||
+                         output_name == "weights" ||
+                         output_name == "output_weights_tensor")
+                    routing_weights = &output;
+            }
+
+            if (!router_logits && !routing_indices && !routing_weights &&
+                dump.outputs.size() >= 3)
+            {
+                router_logits = &dump.outputs[0];
+                routing_indices = &dump.outputs[1];
+                routing_weights = &dump.outputs[2];
+            }
+
+            if (router_logits && router_logits->data)
+                storeOutput(prefix + "_MOE_ROUTER_OUTPUT", *router_logits);
+            if (routing_indices && routing_indices->data)
+            {
+                LOG_DEBUG("[Snapshot] MoE routing indices stage=" << name
+                                                                     << " shape=["
+                                                                     << routing_indices->rows
+                                                                     << ','
+                                                                     << routing_indices->cols
+                                                                     << "] bytes="
+                                                                     << routing_indices->byte_size);
+                storeOutput(prefix + "_MOE_ROUTING_INDICES", *routing_indices);
+            }
+            if (routing_weights && routing_weights->data)
+            {
+                LOG_DEBUG("[Snapshot] MoE routing weights stage=" << name
+                                                                     << " shape=["
+                                                                     << routing_weights->rows
+                                                                     << ','
+                                                                     << routing_weights->cols
+                                                                     << "] bytes="
+                                                                     << routing_weights->byte_size);
+                storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", *routing_weights);
+            }
+
+            if (router_logits || routing_indices || routing_weights)
+                return;
+        }
+
+        /*
+         * Preserve the real per-target accumulator before the generic mapping
+         * below overwrites `layerN_MOE_EXPERT_OUTPUT` with the final target's
+         * result.  This creates diagnostic-only snapshots; it neither changes
+         * the ticket protocol nor adds a producer-side copy.
+         */
+        if (const std::string cumulative_key =
+                overlayTicketCumulativeSnapshotKey(name);
+            !cumulative_key.empty() && !dump.outputs.empty() &&
+            dump.outputs.front().data)
+        {
+            storeOutput(cumulative_key, dump.outputs.front());
         }
 
         // Standard single-output stages
@@ -365,8 +779,257 @@ namespace llaminar2
             }
 
             if (!data.empty())
-                snapshots_[key] = {std::move(data), out.rows, out.cols};
+                storeSnapshot(key, std::move(data), out.rows, out.cols);
         }
+    }
+
+    /**
+     * @brief Join context-qualified live rows into the prompt-wide parity view.
+     *
+     * The graph executor has already waited on each producing stream before
+     * this diagnostic boundary. We therefore only copy host-visible FP32
+     * values here. The bare semantic key remains the public parity API, while
+     * each qualified key stays available for a CSV/artifact consumer that must
+     * inspect the exact chunk where a numerical divergence began.
+     */
+    SnapshotChunkSequenceAggregation
+    SnapshotCapture::aggregateSequentialChunkSnapshots(
+        const std::vector<SnapshotChunkSequencePart> &chunks)
+    {
+        SnapshotChunkSequenceAggregation result;
+        if (chunks.empty())
+        {
+            result.error = "cannot aggregate an empty prefill chunk sequence";
+            return result;
+        }
+
+        struct SequencePieces
+        {
+            std::vector<StoredSnapshotHandle> snapshots;
+            std::vector<bool> present;
+        };
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> prefixes;
+        prefixes.reserve(chunks.size());
+        for (size_t index = 0; index < chunks.size(); ++index)
+        {
+            const auto &chunk = chunks[index];
+            if (chunk.context.empty() || chunk.logical_rows == 0)
+            {
+                result.error = "prefill chunk snapshot context is incomplete";
+                return result;
+            }
+
+            const std::string prefix = snapshotContextPrefix(chunk.context) + "_";
+            if (std::find(prefixes.begin(), prefixes.end(), prefix) != prefixes.end())
+            {
+                result.error = "prefill chunk snapshot contexts are not unique";
+                return result;
+            }
+            prefixes.push_back(prefix);
+        }
+
+        std::unordered_map<std::string, SequencePieces> sequences;
+        for (const auto &[key, snapshot] : snapshots_)
+        {
+            for (size_t chunk_index = 0;
+                 chunk_index < prefixes.size();
+                 ++chunk_index)
+            {
+                const std::string &prefix = prefixes[chunk_index];
+                if (key.compare(0, prefix.size(), prefix) != 0)
+                    continue;
+
+                const std::string semantic_key = key.substr(prefix.size());
+                if (semantic_key.empty())
+                {
+                    result.error = "prefill chunk snapshot has an empty semantic key";
+                    return result;
+                }
+
+                auto [it, inserted] = sequences.try_emplace(semantic_key);
+                if (inserted)
+                {
+                    it->second.snapshots.resize(chunks.size());
+                    it->second.present.assign(chunks.size(), false);
+                }
+                if (it->second.present[chunk_index])
+                {
+                    result.error = "duplicate prefill chunk snapshot for '" +
+                                   semantic_key + "'";
+                    return result;
+                }
+
+                /*
+                 * Keep a shared immutable publication while we insert final
+                 * bare aggregates below.  That insertion can rehash the map,
+                 * but it cannot invalidate this handle or its FP32 vector.
+                 */
+                it->second.snapshots[chunk_index] = snapshot;
+                it->second.present[chunk_index] = true;
+                break;
+            }
+        }
+
+        for (const auto &[semantic_key, pieces] : sequences)
+        {
+            if (!pieces.present.front())
+            {
+                result.error = "prefill chunk sequence for '" + semantic_key +
+                               "' has no first chunk";
+                return result;
+            }
+
+            const StoredSnapshot &first = *pieces.snapshots.front();
+            const PrefillSnapshotSequenceLayout layout =
+                prefillSnapshotSequenceLayout(
+                    semantic_key,
+                    first,
+                    chunks.front().logical_rows);
+            if (layout == PrefillSnapshotSequenceLayout::Terminal)
+            {
+                /*
+                 * Last-token logits and other terminal-state values are
+                 * legitimately narrower than an input chunk. Publish the
+                 * latest context-qualified observation under the bare key.
+                 * DeviceGraphOrchestrator normally captures an unscoped copy
+                 * too, but making the aggregation self-contained keeps an
+                 * artifact consumer from depending on callback ordering.
+                 */
+                size_t latest_chunk = pieces.present.size();
+                while (latest_chunk > 0 && !pieces.present[latest_chunk - 1])
+                    --latest_chunk;
+                if (latest_chunk == 0)
+                {
+                    result.error = "terminal prefill snapshot for '" +
+                                   semantic_key + "' has no captured chunk";
+                    return result;
+                }
+                snapshots_[semantic_key] = pieces.snapshots[latest_chunk - 1];
+                ++result.terminal_or_nonsequence_keys;
+                continue;
+            }
+
+            size_t rows_per_logical_row = 1;
+            if (layout == PrefillSnapshotSequenceLayout::PackedRouteRows)
+            {
+                const std::string companion_key =
+                    routingIndexCompanionKey(semantic_key);
+                const auto companion = sequences.find(companion_key);
+                if (companion == sequences.end() ||
+                    !companion->second.present.front() ||
+                    !companion->second.snapshots.front() ||
+                    companion->second.snapshots.front()->cols == 0)
+                {
+                    result.error =
+                        "packed prefill snapshot '" + semantic_key +
+                        "' has no routing-index companion geometry";
+                    return result;
+                }
+                rows_per_logical_row =
+                    companion->second.snapshots.front()->cols;
+            }
+
+            if (first.cols == 0 ||
+                first.rows > std::numeric_limits<size_t>::max() / first.cols ||
+                first.data.size() != first.rows * first.cols)
+            {
+                result.error = "prefill chunk sequence for '" + semantic_key +
+                               "' has an invalid first-chunk shape";
+                return result;
+            }
+
+            size_t total_rows = 0;
+            std::vector<float> joined;
+            for (size_t chunk_index = 0;
+                 chunk_index < chunks.size();
+                 ++chunk_index)
+            {
+                if (!pieces.present[chunk_index])
+                {
+                    result.error = "prefill chunk sequence for '" + semantic_key +
+                                   "' is missing chunk " +
+                                   std::to_string(chunk_index);
+                    return result;
+                }
+
+                const StoredSnapshot &piece = *pieces.snapshots[chunk_index];
+                const size_t logical_rows = chunks[chunk_index].logical_rows;
+                if (logical_rows >
+                    std::numeric_limits<size_t>::max() /
+                        rows_per_logical_row)
+                {
+                    result.error = "prefill chunk sequence for '" +
+                                   semantic_key +
+                                   "' overflows its live-row geometry";
+                    return result;
+                }
+                const size_t live_rows =
+                    logical_rows * rows_per_logical_row;
+                const bool row_geometry_valid =
+                    layout == PrefillSnapshotSequenceLayout::LogicalRows
+                        ? piece.rows == live_rows
+                        : piece.rows >= live_rows &&
+                              piece.rows % rows_per_logical_row == 0;
+                if (!row_geometry_valid ||
+                    piece.cols != first.cols ||
+                    piece.rows > std::numeric_limits<size_t>::max() / piece.cols ||
+                    piece.data.size() != piece.rows * piece.cols ||
+                    total_rows > std::numeric_limits<size_t>::max() - live_rows)
+                {
+                    result.error = "prefill chunk sequence for '" + semantic_key +
+                                   "' has inconsistent chunk " +
+                                   std::to_string(chunk_index) +
+                                   " (expected rows=" +
+                                   std::to_string(live_rows) +
+                                   ", cols=" + std::to_string(first.cols) +
+                                   "; got rows=" + std::to_string(piece.rows) +
+                                   ", cols=" + std::to_string(piece.cols) +
+                                   ", elements=" + std::to_string(piece.data.size()) +
+                                   ")";
+                    return result;
+                }
+                total_rows += live_rows;
+
+                if (live_rows >
+                    std::numeric_limits<size_t>::max() / piece.cols)
+                {
+                    result.error = "prefill chunk sequence for '" +
+                                   semantic_key +
+                                   "' overflows its live element count";
+                    return result;
+                }
+                const size_t live_elements = live_rows * piece.cols;
+                if (joined.size() > std::numeric_limits<size_t>::max() -
+                                        live_elements)
+                {
+                    result.error = "prefill chunk sequence for '" + semantic_key +
+                                   "' overflows diagnostic storage";
+                    return result;
+                }
+                /*
+                 * Packed graph tensors retain a fixed-bucket suffix. Routes
+                 * are row-major, so the first `logical_rows * top_k` rows are
+                 * the only production contributions belonging to this chunk.
+                 */
+                joined.insert(
+                    joined.end(),
+                    piece.data.begin(),
+                    piece.data.begin() +
+                        static_cast<std::ptrdiff_t>(live_elements));
+            }
+
+            storeSnapshot(
+                semantic_key,
+                std::move(joined),
+                total_rows,
+                first.cols);
+            ++result.aggregated_sequence_keys;
+        }
+
+        result.ok = true;
+        return result;
     }
 
     // =========================================================================
@@ -393,6 +1056,14 @@ namespace llaminar2
         if (dtype_str == "FP32")
         {
             std::memcpy(data.data(), out.data, count * sizeof(float));
+            return data;
+        }
+
+        if (dtype_str == "INT32")
+        {
+            const auto *int_data = static_cast<const int32_t *>(out.data);
+            for (size_t i = 0; i < count; ++i)
+                data[i] = static_cast<float>(int_data[i]);
             return data;
         }
 
@@ -473,12 +1144,59 @@ namespace llaminar2
             return result;
         }
 
+        if (stage_name.find("_moe_sparse_return_reduce") != std::string::npos &&
+            stage_name.find("_allreduce") != std::string::npos)
+        {
+            const size_t pos = stage_name.find("_moe_sparse_return_reduce");
+            return stage_name.substr(0, pos) + "_MOE_EXPERT_OUTPUT_ALLREDUCED";
+        }
+
+        /*
+         * The MTP graph builder names its embedding collective with the
+         * implementation-facing lower-case prefix `mtp<depth>`, whereas all
+         * other depth-qualified diagnostic keys use the canonical upper-case
+         * `MTP<depth>` grammar.  Normalize this one boundary before the generic
+         * suffix table runs.  Leaving the prefix lower-case makes
+         * extractStageType() correctly reject it as an operational key, so the
+         * post-allreduce embedding silently becomes UNKNOWN during LocalTP
+         * snapshot combination.
+         */
+        constexpr std::string_view kEmbeddingAllreduce =
+            "_embedding_allreduce";
+        if (stage_name.ends_with(kEmbeddingAllreduce))
+        {
+            std::string prefix = stage_name.substr(
+                0, stage_name.size() - kEmbeddingAllreduce.size());
+            if (prefix.starts_with("mtp") && prefix.size() > 3)
+            {
+                const bool numeric_depth = std::all_of(
+                    prefix.begin() + 3,
+                    prefix.end(),
+                    [](unsigned char character)
+                    {
+                        return std::isdigit(character) != 0;
+                    });
+                if (numeric_depth)
+                    prefix.replace(0, 3, "MTP");
+            }
+            return prefix + "_EMBEDDING_ALLREDUCED";
+        }
+
         // Ordered vector: longest/most-specific suffixes FIRST to ensure correct
         // prefix extraction. E.g. "_gdn_wo_allreduce" must match before "_wo_allreduce"
         // so the prefix is "layerN" (not "layerN_gdn").
+        //
+        // Collective stages intentionally publish diagnostic *_ALLREDUCED keys.
+        // Canonical row-parallel keys such as ATTENTION_OUTPUT and FFN_DOWN are
+        // produced by the per-device partial projection stages and combined by
+        // TPSnapshot. This prevents graph-captured collective diagnostics from
+        // overwriting the semantic stage snapshot used by parity tests.
         static const std::vector<std::pair<std::string, std::string>> suffix_map = {
+            // MTP-prefixed embedding collectives retain the same canonical
+            // post-reduction name as the unprefixed model graph.
+            {"_embedding_allreduce", "_EMBEDDING_ALLREDUCED"},
             // GDN (Gated Delta Net) linear attention stages — longest suffixes first
-            {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT"},
+            {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
             {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
             {"_gdn_proj", "_QKV_PROJECTION"},
             {"_short_conv", "_GDN_CONV1D_OUTPUT"},
@@ -487,7 +1205,8 @@ namespace llaminar2
             // Standard attention stages
             {"_attn_norm", "_ATTENTION_NORM"},
             {"_attn_residual", "_ATTENTION_RESIDUAL"},
-            {"_wo_allreduce", "_ATTENTION_OUTPUT"},
+            {"_attn_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
+            {"_wo_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
             {"_wo_proj", "_ATTENTION_OUTPUT"},
             {"_q_norm", "_Q_NORM"},
             {"_k_norm", "_K_NORM"},
@@ -500,7 +1219,7 @@ namespace llaminar2
             {"_attn_output_gate", "_ATTENTION_CONTEXT_GATED"},
             {"_attention", "_ATTENTION_CONTEXT"},
             // FFN stages
-            {"_down_allreduce", "_FFN_DOWN"},
+            {"_down_allreduce", "_FFN_DOWN_ALLREDUCED"},
             {"_ffn_norm", "_FFN_NORM"},
             {"_ffn_gate", "_FFN_GATE"},
             {"_ffn_up", "_FFN_UP"},
@@ -508,10 +1227,36 @@ namespace llaminar2
             {"_down_proj", "_FFN_DOWN"},
             {"_ffn_residual", "_FFN_RESIDUAL"},
             // MoE stages
+            {"_moe_expert_overlay_fast_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
+            {"_moe_overlay_continuation_broadcast", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
+            {"_moe_canonical_publication_finalize", "_MOE_COMBINED_OUTPUT"},
+            /*
+             * A graph-native ExpertOverlay return is accumulated by CPU/MPI
+             * sparse boundaries and copied back to the continuation GPU by a
+             * ticket-consume stage.  The final consume in layer order holds
+             * the complete routed-expert sum, before shared-expert addition.
+             * Mapping it explicitly keeps heterogeneous parity evidence at
+             * the same semantic checkpoint as the ordinary MoE expert stage.
+             */
+            {"_moe_overlay_ticket_consume", "_MOE_EXPERT_OUTPUT"},
+            /*
+             * A heterogeneous ExpertOverlay continuation root receives the
+             * sum of LocalTP shared-expert partials through a rooted
+             * collective.  That publication is not another local
+             * shared-expert projection: it exists on the root only and the
+             * collective stage describes its flat transfer span as
+             * `[1,count]`.  Give it a distinct diagnostic identity before the
+             * generic `_shared_expert` suffix can mistake it for the
+             * row-parallel `[tokens,hidden]` producer and overwrite the root
+             * participant's canonical checkpoint.
+             */
+            {"_shared_expert_reduce_to_overlay_root", "_MOE_SHARED_EXPERT_OUTPUT_REDUCED_TO_OVERLAY_ROOT"},
+            {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"},
+            {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
             {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
-            {"_moe_expert_parallel_reduce", "_MOE_EXPERT_OUTPUT"},
-            {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_routed_expert_partial_reduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_expert_ffn", "_MOE_EXPERT_OUTPUT"},
             {"_moe_combine", "_MOE_COMBINED_OUTPUT"},
             {"_moe_ffn", "_MOE_EXPERT_OUTPUT"},
@@ -521,6 +1266,8 @@ namespace llaminar2
         // Global stages
         if (stage_name == "embedding")
             return "EMBEDDING";
+        if (stage_name == "embedding_allreduce")
+            return "EMBEDDING_ALLREDUCED";
         if (stage_name == "final_norm")
             return "FINAL_NORM";
         if (stage_name == "lm_head")
@@ -545,9 +1292,330 @@ namespace llaminar2
         return result;
     }
 
+    std::vector<std::string> SnapshotCapture::possibleKeysForStageName(const std::string &stage_name)
+    {
+        auto prefixBefore = [&](const std::string &needle) -> std::string
+        {
+            const size_t pos = stage_name.find(needle);
+            return pos == std::string::npos ? stage_name : stage_name.substr(0, pos);
+        };
+
+        if (stage_name.find("_qkv_proj") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_qkv_proj");
+            return {prefix + "_Q_PROJECTION", prefix + "_K_PROJECTION", prefix + "_V_PROJECTION"};
+        }
+        if (stage_name.find("_kv_proj") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_kv_proj");
+            return {prefix + "_K_PROJECTION", prefix + "_V_PROJECTION"};
+        }
+        if (stage_name.find("_gate_up") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_gate_up");
+            return {prefix + "_FFN_GATE", prefix + "_FFN_UP"};
+        }
+        if (stage_name.find("_rope") != std::string::npos &&
+            stage_name.find("_q_rope") == std::string::npos &&
+            stage_name.find("_k_rope") == std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_rope");
+            return {prefix + "_Q_ROPE", prefix + "_K_ROPE"};
+        }
+        if (stage_name.find("_gdn_proj") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_gdn_proj");
+            return {prefix + "_QKV_PROJECTION",
+                    prefix + "_GDN_Z_PROJECTION",
+                    prefix + "_GDN_ALPHA",
+                    prefix + "_GDN_BETA"};
+        }
+        if (stage_name.find("_q_gate_split") != std::string::npos)
+        {
+            return {prefixBefore("_q_gate_split") + "_FA_GATE"};
+        }
+        if (stage_name.find("_kv_append") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_kv_append");
+            return {prefix + "_KV_CACHE_K",
+                    prefix + "_KV_CACHE_V",
+                    prefix + "_KV_APPEND_SOURCE_K",
+                    prefix + "_KV_APPEND_SOURCE_V"};
+        }
+        if (stage_name.find("_attn_output_gate") != std::string::npos)
+        {
+            return {prefixBefore("_attn_output_gate") + "_ATTENTION_CONTEXT_GATED"};
+        }
+        if (stage_name.find("_gdn_wo_allreduce") != std::string::npos)
+        {
+            /*
+             * Filtered captures are used by the grouped-verifier parity suite to
+             * keep long-context diagnostics small.  Collective nodes publish
+             * their own post-reduction keys, so the filter must advertise those
+             * keys explicitly; otherwise the allreduce stage is skipped and the
+             * CSV jumps from a local row-parallel partial to the next replicated
+             * consumer.
+             */
+            return {prefixBefore("_gdn_wo_allreduce") + "_ATTENTION_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_wo_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_wo_allreduce") + "_ATTENTION_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_attn_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_attn_allreduce") + "_ATTENTION_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_down_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_down_allreduce") + "_FFN_DOWN_ALLREDUCED"};
+        }
+        if (stage_name.find("_shared_expert_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_shared_expert_allreduce") + "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_shared_expert_reduce_to_overlay_root") !=
+            std::string::npos)
+        {
+            return {
+                prefixBefore("_shared_expert_reduce_to_overlay_root") +
+                "_MOE_SHARED_EXPERT_OUTPUT_REDUCED_TO_OVERLAY_ROOT"};
+        }
+        if (stage_name.find("_moe_overlay_continuation_broadcast") !=
+            std::string::npos)
+        {
+            return {
+                prefixBefore("_moe_overlay_continuation_broadcast") +
+                "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_moe_expert_overlay_fast_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_moe_expert_overlay_fast_allreduce") + "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_moe_expert_allreduce") != std::string::npos)
+        {
+            return {prefixBefore("_moe_expert_allreduce") + "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_moe_sparse_return_reduce") != std::string::npos &&
+            stage_name.find("_allreduce") != std::string::npos)
+        {
+            const size_t pos = stage_name.find("_moe_sparse_return_reduce");
+            return {stage_name.substr(0, pos) + "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
+        }
+        if (stage_name.find("_attention") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_attention");
+            return {prefix + "_ATTENTION_CONTEXT",
+                    prefix + "_ATTENTION_EFFECTIVE_K",
+                    prefix + "_ATTENTION_EFFECTIVE_V"};
+        }
+        if (stage_name == "lm_head_allgather")
+        {
+            return {"LM_HEAD"};
+        }
+        if ((stage_name.find("_attn_norm") != std::string::npos ||
+             stage_name.find("_ffn_norm") != std::string::npos))
+        {
+            const std::string key = convertStageNameToSnapshotKey(stage_name);
+            return {key, key + "_RESIDUAL_OUT"};
+        }
+        if (stage_name.find("_moe_ffn") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_moe_ffn");
+            return {prefix + "_MOE_EXPERT_OUTPUT",
+                    prefix + "_MOE_ROUTER_OUTPUT",
+                    prefix + "_MOE_ROUTING_INDICES",
+                    prefix + "_MOE_ROUTING_WEIGHTS"};
+        }
+        if (stage_name.find("_moe_expert_ffn") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_moe_expert_ffn");
+            return {prefix + "_MOE_EXPERT_OUTPUT",
+                    prefix + "_MOE_COMBINED_OUTPUT"};
+        }
+        if (stage_name.find("_moe_canonical_publication_finalize") !=
+            std::string::npos)
+        {
+            const std::string prefix =
+                prefixBefore("_moe_canonical_publication_finalize");
+            return {prefix + "_MOE_EXPERT_OUTPUT",
+                    prefix + "_MOE_SHARED_GATE_OUTPUT",
+                    prefix + "_MOE_COMBINED_OUTPUT"};
+        }
+        if (const std::string prefix =
+                pinnedRouteEvidencePrefix(stage_name);
+            !prefix.empty())
+        {
+            std::vector<std::string> keys{
+                prefix + "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+                prefix + "_MOE_RUNTIME_ROUTE_WEIGHTS",
+                prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+                prefix + "_MOE_OVERLAY_ROUTE_BANK0_EPOCH",
+                prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+                prefix + "_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
+                prefix + "_MOE_OVERLAY_ROUTE_SELECTED_BANK"};
+            keys.insert(keys.begin(), prefix + "_MOE_EXPERT_OUTPUT");
+            return keys;
+        }
+        if (stage_name.find("_shared_expert_gate") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_shared_expert_gate");
+            return {prefix + "_MOE_SHARED_GATE_OUTPUT",
+                    prefix + "_MOE_COMBINED_OUTPUT"};
+        }
+        if (const std::string cumulative_key =
+                overlayTicketCumulativeSnapshotKey(stage_name);
+            !cumulative_key.empty())
+        {
+            return {convertStageNameToSnapshotKey(stage_name), cumulative_key};
+        }
+        if (stage_name.find("_moe_routing") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_moe_routing");
+            return {prefix + "_MOE_ROUTER_OUTPUT",
+                    prefix + "_MOE_ROUTING_INDICES",
+                    prefix + "_MOE_ROUTING_WEIGHTS"};
+        }
+
+        return {convertStageNameToSnapshotKey(stage_name)};
+    }
+
+    std::vector<std::string> SnapshotCapture::possibleKeysForStage(
+        const std::string &stage_name,
+        const StageDumpInfo &dump_info)
+    {
+        auto prefixBefore = [&](const std::string &needle) -> std::string
+        {
+            const size_t pos = stage_name.find(needle);
+            return pos == std::string::npos
+                       ? stage_name
+                       : stage_name.substr(0, pos);
+        };
+
+        auto outputNamesToKeys = [&](const std::string &prefix,
+                                     const bool canonical_finalizer)
+        {
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "combined_output")
+                    keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
+                else if (output_name == "canonical_route_contributions")
+                {
+                    keys.push_back(
+                        prefix + "_MOE_ROUTE_CONTRIBUTIONS");
+                }
+                else if (canonical_finalizer &&
+                         output_name == "routed_output")
+                {
+                    keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
+                }
+                else if (canonical_finalizer &&
+                         output_name == "shared_output")
+                {
+                    keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
+                }
+                else if (!canonical_finalizer && output_name == "output")
+                    keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
+            }
+            return keys;
+        };
+
+        if (stage_name.find("_norm_hidden") != std::string::npos)
+        {
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "output")
+                {
+                    keys.push_back(
+                        convertStageNameToSnapshotKey(stage_name));
+                }
+                else if (output_name == "mtp_terminal_hidden_input")
+                {
+                    keys.emplace_back(
+                        "MTP_TERMINAL_HIDDEN_ROW_SELECT");
+                }
+            }
+            if (!keys.empty())
+                return keys;
+        }
+
+        if (stage_name.find("_moe_canonical_publication_finalize") !=
+            std::string::npos)
+        {
+            return outputNamesToKeys(
+                prefixBefore("_moe_canonical_publication_finalize"),
+                /*canonical_finalizer=*/true);
+        }
+        if (const std::string prefix =
+                pinnedRouteEvidencePrefix(stage_name);
+            !prefix.empty())
+        {
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                const std::string key =
+                    pinnedRouteEvidenceKey(prefix, output_name);
+                if (!key.empty())
+                    keys.push_back(key);
+            }
+            return keys;
+        }
+        if (stage_name.find("_moe_expert_ffn") != std::string::npos)
+        {
+            return outputNamesToKeys(
+                prefixBefore("_moe_expert_ffn"),
+                /*canonical_finalizer=*/false);
+        }
+        if (stage_name.find("_shared_expert_gate") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_shared_expert_gate");
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "shared_output" || output_name == "output")
+                    keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
+                else if (output_name == "routed_output")
+                    keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
+                else if (output_name == "combined_output")
+                    keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
+            }
+            return keys;
+        }
+
+        return possibleKeysForStageName(stage_name);
+    }
+
     // =========================================================================
     // Private helpers
     // =========================================================================
+
+    void SnapshotCapture::storeSnapshot(
+        const std::string &key,
+        std::vector<float> data,
+        size_t rows,
+        size_t cols)
+    {
+        snapshots_[key] = std::make_shared<const StoredSnapshot>(
+            StoredSnapshot{
+                .data = std::move(data),
+                .rows = rows,
+                .cols = cols,
+            });
+    }
 
     void SnapshotCapture::storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out)
     {
@@ -555,7 +1623,7 @@ namespace llaminar2
             return;
         auto data = extractFp32FromOutput(out);
         if (!data.empty())
-            snapshots_[key] = {std::move(data), out.rows, out.cols};
+            storeSnapshot(key, std::move(data), out.rows, out.cols);
     }
 
 } // namespace llaminar2

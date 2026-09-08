@@ -1,3 +1,8 @@
+/**
+ * @file WeightIdentity.cpp
+ * @brief Implements semantic model-weight identity and canonical-name inference.
+ */
+
 #include "WeightIdentity.h"
 
 #include <functional>
@@ -17,6 +22,7 @@ namespace llaminar2
         case WeightRole::AttentionWO: return "AttentionWO";
         case WeightRole::FusedQKV: return "FusedQKV";
         case WeightRole::GDNProjection: return "GDNProjection";
+        case WeightRole::GDNAlphaBetaProjection: return "GDNAlphaBetaProjection";
         case WeightRole::GDNSsmParam: return "GDNSsmParam";
         case WeightRole::FFNGate: return "FFNGate";
         case WeightRole::FFNUp: return "FFNUp";
@@ -26,6 +32,7 @@ namespace llaminar2
         case WeightRole::MoEExpertUp: return "MoEExpertUp";
         case WeightRole::MoEExpertDown: return "MoEExpertDown";
         case WeightRole::SharedExpertGate: return "SharedExpertGate";
+        case WeightRole::SharedExpertInputGate: return "SharedExpertInputGate";
         case WeightRole::SharedExpertUp: return "SharedExpertUp";
         case WeightRole::SharedExpertDown: return "SharedExpertDown";
         case WeightRole::Norm: return "Norm";
@@ -106,15 +113,21 @@ namespace llaminar2
         if (name.find("attn_output.weight") != std::string::npos ||
             name.find("attn_o.weight") != std::string::npos)
             return WeightRole::AttentionWO;
+        if (name.find("ssm_alpha.weight") != std::string::npos ||
+            name.find("ssm_beta.weight") != std::string::npos)
+            return WeightRole::GDNAlphaBetaProjection;
         if (name.find("gdn_qkv.weight") != std::string::npos ||
             name.find("ssm.qkv_proj.weight") != std::string::npos)
             return WeightRole::GDNProjection;
+        if (name.find("ssm_conv1d.weight") != std::string::npos ||
+            name.find(".ssm_a") != std::string::npos)
+            return WeightRole::GDNSsmParam;
         if (name.find("ssm.") != std::string::npos) return WeightRole::GDNSsmParam;
         if (name.find("ffn_gate_exps.weight") != std::string::npos) return WeightRole::MoEExpertGate;
         if (name.find("ffn_up_exps.weight") != std::string::npos) return WeightRole::MoEExpertUp;
         if (name.find("ffn_down_exps.weight") != std::string::npos) return WeightRole::MoEExpertDown;
         if (name.find("ffn_gate_inp.weight") != std::string::npos) return WeightRole::MoERouter;
-        if (name.find("ffn_gate_inp_shexp.weight") != std::string::npos) return WeightRole::SharedExpertGate;
+        if (name.find("ffn_gate_inp_shexp.weight") != std::string::npos) return WeightRole::SharedExpertInputGate;
         if (name.find("ffn_gate_shexp.weight") != std::string::npos) return WeightRole::SharedExpertGate;
         if (name.find("ffn_up_shexp.weight") != std::string::npos) return WeightRole::SharedExpertUp;
         if (name.find("ffn_down_shexp.weight") != std::string::npos) return WeightRole::SharedExpertDown;

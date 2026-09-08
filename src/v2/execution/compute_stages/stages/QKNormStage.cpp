@@ -54,7 +54,7 @@ namespace llaminar2
         const int effective_rows = total_tokens * params_.n_heads;
         const int hidden_dim = params_.head_dim;
 
-        LOG_DEBUG("[QKNormStage] Execute: total_tokens=" << total_tokens
+        LOG_TRACE("[QKNormStage] Execute: total_tokens=" << total_tokens
                                                          << " n_heads=" << params_.n_heads
                                                          << " head_dim=" << params_.head_dim
                                                          << " effective_rows=" << effective_rows
@@ -163,7 +163,7 @@ namespace llaminar2
 
         if (params_.gamma)
         {
-            info.addInput("gamma", params_.gamma, 1, params_.head_dim);
+            info.addWeight("gamma", params_.gamma);
         }
 
         info.addOutput("output", params_.output, total_tokens, total_cols);

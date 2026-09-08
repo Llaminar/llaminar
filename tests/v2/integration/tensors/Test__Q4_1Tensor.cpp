@@ -10,7 +10,7 @@
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 using namespace llaminar2;
 

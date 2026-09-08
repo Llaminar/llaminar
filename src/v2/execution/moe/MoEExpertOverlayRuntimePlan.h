@@ -2,14 +2,14 @@
  * @file MoEExpertOverlayRuntimePlan.h
  * @brief Resolved runtime descriptors for same-layer MoE expert overlay domains.
  *
- * The configuration-time MoEExpertParallelPlan names domains and tiers. This
+ * The configuration-time MoERoutedExpertPlacementPlan names domains and tiers. This
  * runtime plan resolves those names to explicit rank/device descriptors and
  * records the current MVP lowering contract for multi-participant domains.
  */
 
 #pragma once
 
-#include "MoEExpertParallelPlan.h"
+#include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
 
 #include <cstddef>
@@ -35,9 +35,16 @@ namespace llaminar2
     struct MoEOverlayRuntimeDomain
     {
         std::string name;
-        ExpertDomainKind kind = ExpertDomainKind::SingleDevice;
+        ExecutionDomainScope scope = ExecutionDomainScope::SINGLE;
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
-        ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        RoutedExpertComputePolicy routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        RoutedExpertPhasePolicy routed_phase_policy =
+            RoutedExpertPhasePolicy::Uniform;
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
 
         std::vector<MoEOverlayDomainParticipant> participants;
         GlobalDeviceAddress primary_participant;
@@ -62,7 +69,7 @@ namespace llaminar2
     struct MoEOverlayRuntimeTier
     {
         int tier_index = -1;
-        ExpertRoutedTier tier;
+        RoutedExpertTier tier;
         std::string domain_name;
         DeviceId primary_device = DeviceId::invalid();
         bool local_reachable_for_mvp = false;
@@ -79,13 +86,13 @@ namespace llaminar2
     {
     public:
         MoEExpertOverlayRuntimePlan(
-            std::shared_ptr<const MoEExpertParallelPlan> source_plan,
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan,
             int current_world_rank,
             std::vector<MoEOverlayRuntimeDomain> domains,
             std::vector<MoEOverlayRuntimeTier> routed_tiers);
 
-        const MoEExpertParallelPlan &sourcePlan() const { return *source_plan_; }
-        std::shared_ptr<const MoEExpertParallelPlan> sourcePlanPtr() const { return source_plan_; }
+        const MoERoutedExpertPlacementPlan &sourcePlan() const { return *source_plan_; }
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> sourcePlanPtr() const { return source_plan_; }
         int currentWorldRank() const { return current_world_rank_; }
 
         const std::vector<MoEOverlayRuntimeDomain> &domains() const { return domains_; }
@@ -106,7 +113,7 @@ namespace llaminar2
     private:
         const MoEOverlayRuntimeDomain &requireDomain(const std::string &domain_name, const char *context) const;
 
-        std::shared_ptr<const MoEExpertParallelPlan> source_plan_;
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan_;
         int current_world_rank_ = 0;
         std::vector<MoEOverlayRuntimeDomain> domains_;
         std::vector<MoEOverlayRuntimeTier> routed_tiers_;
@@ -114,7 +121,7 @@ namespace llaminar2
     };
 
     std::shared_ptr<MoEExpertOverlayRuntimePlan> resolveMoEExpertOverlayRuntimePlan(
-        std::shared_ptr<const MoEExpertParallelPlan> plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> plan,
         const MoEExpertOverlayRuntimeResolverOptions &options = {});
 
 } // namespace llaminar2

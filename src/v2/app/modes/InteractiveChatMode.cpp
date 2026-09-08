@@ -25,7 +25,11 @@ namespace llaminar2
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
 
-        if (mpi_ctx->rank() == 0)
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        const bool is_authority =
+            ctx.coordinatedRequestRole() ==
+            CoordinatedRequestRole::Authority;
+        if (is_authority)
         {
             if (!tokenizer->hasChatTemplate())
             {
@@ -44,16 +48,16 @@ namespace llaminar2
             chat_config.top_k = config.top_k;
             chat_config.top_p = config.top_p;
 
-            // Enable coordinated mode so rank 0 broadcasts to worker ranks
-            if (mpi_ctx->world_size() > 1)
+            // Enable the inventory-resolved authority's command channel.
+            if (mpi_coordinated)
                 runner->setMPICoordinatedMode(true);
 
             auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
             ChatUI chat_ui(tokenizer, adapter, chat_config);
             int result = chat_ui.run();
 
-            // Signal non-root ranks to exit their worker loops
-            if (mpi_ctx->world_size() > 1)
+            // Release followers from the coordinated command loop.
+            if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
 
             runner->shutdown();
@@ -62,9 +66,8 @@ namespace llaminar2
         }
         else
         {
-            // Non-rank-0 processes: enter MPI worker loop to participate
-            // in inference collectives when rank 0 initiates them.
-            if (mpi_ctx->world_size() > 1)
+            // Followers participate only when the authority admits a command.
+            if (mpi_coordinated)
             {
                 runner->setMPICoordinatedMode(true);
                 runner->runMPIWorkerLoop();

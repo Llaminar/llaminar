@@ -105,13 +105,27 @@ namespace llaminar2
      * @brief Get CPU backend
      * @return CPUBackend* or nullptr if not initialized
      *
-     * @note Returns nullptr if initCPUBackend() hasn't been called
+     * @note Returns nullptr if initCPUBackend() has not been called. Access does
+     *       not invent an aggregate backend because doing so would permanently
+     *       erase a later rank-local NUMA declaration.
      */
     IBackend *getCPUBackend();
 
     /**
+     * @brief Return the NUMA node owned by this rank's initialized CPU backend.
+     *
+     * The value comes from the concrete `CPUBackend`, rather than from the
+     * caller's current thread, so asynchronous MPI/progress threads cannot
+     * accidentally redefine where rank-local persistent weights belong.
+     *
+     * @return Non-negative NUMA node for a node-bound CPU rank, or `-1` when
+     *         the CPU backend intentionally spans the aggregate host domain.
+     */
+    int cpuBackendNUMANode();
+
+    /**
      * @brief Check if CPU backend is available
-     * @return true if getCPUBackend() != nullptr
+     * @return true if an explicit initCPUBackend() call has completed
      */
     bool hasCPUBackend();
 

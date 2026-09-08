@@ -9,6 +9,7 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
+#include "../../../kernels/attention/AttentionExecutionPolicy.h"
 #include "../../../memory/BufferId.h"
 
 #include <algorithm>
@@ -69,6 +70,17 @@ namespace llaminar2
             AttentionMode attention_mode = AttentionMode::PREFILL;
             bool auto_detect_mode = true;
 
+            /**
+             * @brief Complete declarative attention policy for this graph node.
+             *
+             * The model graph declares the permitted logical partition axis and
+             * the physical encoding of persistent K cache bytes. Backend
+             * machinery resolves `GeometrySelected` from immutable capture
+             * geometry and must preserve that concrete topology across replay.
+             * Live KV length is not part of this policy.
+             */
+            attention::AttentionExecutionPolicy execution_policy{};
+
             // Workspace buffers
             ITensor *workspace_scores = nullptr;
             ITensor *workspace_context = nullptr;
@@ -78,9 +90,19 @@ namespace llaminar2
             IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
 
-            // When true, read K/V from kv_cache at execution time instead of
-            // using the statically-wired K/V pointers. Enables GPU prefill to
-            // use post-append FP16 cache tensors instead of Q8_1 projections.
+            /**
+             * @brief Device-owned logical query width for a scalar GPU graph.
+             *
+             * A fixed-width grouped-verifier graph can launch more physical
+             * rows than the current MTP transaction owns. Attention derives
+             * serial-equivalent per-row KV horizons from this stable scalar;
+             * no host length participates in capture or replay.
+             */
+            const int32_t *active_query_rows_device = nullptr;
+
+            // When true, read native K/V from kv_cache at execution time instead
+            // of using transient projection tensors. GPU cache-backed attention
+            // requires this path for every phase.
             bool read_kv_from_cache = false;
 
             // Position offset for decode mode causal masking
@@ -100,13 +122,6 @@ namespace llaminar2
             /// output is inverse-rotated after weighted-V accumulation.
             const ActivationRotation *kv_rotation = nullptr;
 
-            // RoPE-on-read: apply RoPE to K inside this attention stage.
-            // When enabled, K in the KV cache is stored pre-RoPE, and position
-            // embeddings are fused into the TQ4 dequant / applied in-place for FP32.
-            bool apply_rope_to_k = false;
-            float rope_theta = 10000.0f;        ///< RoPE frequency base (only used when apply_rope_to_k=true)
-            float partial_rotary_factor = 1.0f; ///< Fraction of head dimensions to rotate (only used when apply_rope_to_k=true)
-
         };
 
         explicit AttentionComputeStage(Params params);
@@ -120,10 +135,9 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override
         {
-            // TQ KV cache dequant runs inside execute() via get_kv_converted() with
-            // iteration-varying arguments (ring_pos, out_offset grow each step).
-            // Device-side dynamic params are pre-uploaded before capture/replay,
-            // so captured execution records kernels only.
+            // Device-owned native or transformed KV views consume replay-varying
+            // ring geometry through persistent device parameters. Capture records
+            // kernels only; no host conversion shadow participates.
             if (params_.kv_cache)
             {
                 const auto kp = params_.kv_cache->k_precision();
@@ -132,19 +146,27 @@ namespace llaminar2
             }
             return true; // Device-side params buffer handles dynamic kv_len/position
         }
-        uint64_t graphCaptureVariantSignature() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
         /// Target device for coherence management
 
-        /// Update position offset for cached graph reuse.
-        /// Also pre-uploads kernel device params so the next graph replay sees
-        /// the new kv_len and position_offset without captured H2D nodes.
-        /// Note: updateDynamicParams is called BEFORE KVCacheAppend runs for
-        /// this step, so get_cached_tokens() returns previous step's count.
-        /// We add seq_len to get the count after appending.
+        /**
+         * @brief Update request-local attention sequence metadata.
+         *
+         * The forward DAG runs KVCacheAppendStage immediately before this stage.
+         * updateDynamicParams() is called before that append, so the KV cache's
+         * host count is the pre-append history length.  This method records that
+         * count as request-local stage state and uploads any host-owned dynamic
+         * attention parameters needed by the next eager execution or graph replay.
+         *
+         * GPU graph-capturable KV caches expose a device-owned cached-token count.
+         * For those caches, attention records a tiny in-graph derivation kernel
+         * instead of relying on a host scalar.  That keeps one reusable prefill
+         * graph valid whether it is captured for the first prompt chunk or later
+         * replayed as a suffix after a prefix-cache restore.
+         */
         bool hasDynamicParams() const override { return true; }
         bool supportsDeviceResidentDynamicPositionReplay() const override;
         void updateDynamicParams(int pos_offset, int seq_len) override;
@@ -158,8 +180,11 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
-            debug_effective_k_snapshot_.clear();
-            debug_effective_v_snapshot_.clear();
+            dynamic_pre_append_cached_tokens_ = -1;
+            dynamic_logical_seq_len_ = 0;
+            dynamic_post_append_kv_len_ = 0;
+            debug_effective_k_tensor_ = nullptr;
+            debug_effective_v_tensor_ = nullptr;
             debug_effective_k_rows_ = 0;
             debug_effective_k_cols_ = 0;
             debug_effective_v_rows_ = 0;
@@ -167,7 +192,7 @@ namespace llaminar2
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
             }
         }
 
@@ -186,14 +211,31 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
-            debug_effective_k_snapshot_.clear();
-            debug_effective_v_snapshot_.clear();
+            dynamic_pre_append_cached_tokens_ = -1;
+            dynamic_logical_seq_len_ = 0;
+            dynamic_post_append_kv_len_ = 0;
+            /*
+             * Effective K/V descriptors describe the source selected by one
+             * execution, not durable graph state. A prior decode can select an
+             * FP16 cache view while the next phase-split prefill intentionally
+             * consumes its FP32 projection buffer. Retaining the old descriptor
+             * makes pre-capture snapshot preparation allocate an FP16 slot for
+             * a capture that records an FP32 source.
+             *
+             * Captured snapshot lifetime belongs exclusively to
+             * DeviceGraphExecutor's immutable D2D slot manifest. Clearing this
+             * stage-local diagnostic mirror cannot invalidate a captured graph;
+             * it only prevents stale request/phase metadata from contaminating
+             * the next warmup or capture preparation pass.
+             */
+            debug_effective_k_tensor_ = nullptr;
+            debug_effective_v_tensor_ = nullptr;
             debug_effective_k_rows_ = 0;
             debug_effective_k_cols_ = 0;
             debug_effective_v_rows_ = 0;
             debug_effective_v_cols_ = 0;
             if (cached_kernel_)
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
         }
 
         /**
@@ -227,15 +269,29 @@ namespace llaminar2
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
 
-        /// Debug-only FP32 copies of the effective K/V tensors passed to the
-        /// attention kernel. Populated only when
-        /// LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is enabled.
-        mutable std::vector<float> debug_effective_k_snapshot_;
-        mutable std::vector<float> debug_effective_v_snapshot_;
+        /// Debug-only effective K/V tensor metadata for graph snapshots. The
+        /// executor performs graph-captured D2D snapshot copies and post-graph
+        /// host materialization; attention execute() never performs D2H reads.
+        mutable const ITensor *debug_effective_k_tensor_ = nullptr;
+        mutable const ITensor *debug_effective_v_tensor_ = nullptr;
         mutable size_t debug_effective_k_rows_ = 0;
         mutable size_t debug_effective_k_cols_ = 0;
         mutable size_t debug_effective_v_rows_ = 0;
         mutable size_t debug_effective_v_cols_ = 0;
+
+        /**
+         * @brief Graph-stable non-owning views of canonical GPU KV metadata.
+         *
+         * These views are constructed with the stage, never during execute().
+         * When effective-KV diagnostics are enabled, SnapshotCapture records
+         * D2D copies of each request's count and ring head on the graph stream.
+         * They make append-state ordering failures observable without a device
+         * synchronization or a host-owned coherence mirror.
+         */
+        std::vector<std::unique_ptr<ITensor>> debug_device_kv_count_views_;
+        std::vector<std::unique_ptr<ITensor>> debug_device_kv_head_views_;
+        std::vector<std::string> debug_device_kv_count_names_;
+        std::vector<std::string> debug_device_kv_head_names_;
 
         /// Real-token metadata for fixed-bucket prefill graph replay. The graph
         /// launch remains bucket-shaped, but dynamic attention/KV metadata must
@@ -243,6 +299,31 @@ namespace llaminar2
         bool prefill_replay_params_set_ = false;
         int prefill_effective_seq_len_ = 0;
         int prefill_bucket_seq_len_ = 0;
+
+        /**
+         * @brief Request geometry for the current dynamic stage pass.
+         *
+         * The admitted request cursor determines fixed host launch geometry; it
+         * is not a cache-state mirror. GPU attention derives every live row
+         * length from canonical device metadata after the captured append.
+         */
+        int dynamic_pre_append_cached_tokens_ = -1;
+        int dynamic_logical_seq_len_ = 0;
+        int dynamic_post_append_kv_len_ = 0;
+
+        /**
+         * @brief Stable per-request CPU KV descriptors for grouped decode.
+         *
+         * Request-batched CPU attention cannot flatten independent cache slots
+         * into one scalar sequence. These vectors are sized with the graph and
+         * reused on every execution so the grouped production path performs no
+         * hot-loop descriptor allocation.
+         */
+        std::vector<const ITensor *> cpu_grouped_k_views_;
+        std::vector<const ITensor *> cpu_grouped_v_views_;
+        std::vector<int> cpu_grouped_kv_lens_;
+        std::vector<attention::AttentionKVLogicalView>
+            cpu_grouped_kv_logical_views_;
 
         /**
          * @brief Get or create the attention kernel

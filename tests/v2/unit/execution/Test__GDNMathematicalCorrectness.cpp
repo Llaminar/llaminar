@@ -22,7 +22,9 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -36,6 +38,9 @@
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
+#include "../../utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
 
@@ -92,6 +97,92 @@ namespace
         for (size_t i = 0; i < a.size(); ++i)
             max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
         return max_diff;
+    }
+
+    /** @brief Enable grouped short-conv route telemetry for one focused test. */
+    class ScopedPerfStatsEnv
+    {
+    public:
+        ScopedPerfStatsEnv()
+        {
+            const char *value = std::getenv("LLAMINAR_PERF_STATS_SUMMARY");
+            if (value)
+            {
+                had_value_ = true;
+                old_value_ = value;
+            }
+            setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+        ~ScopedPerfStatsEnv()
+        {
+            if (had_value_)
+                setenv("LLAMINAR_PERF_STATS_SUMMARY", old_value_.c_str(), 1);
+            else
+                unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+    private:
+        bool had_value_ = false;
+        std::string old_value_;
+    };
+
+    /** @brief Report the first byte-level FP32 mismatch in state or output. */
+    void expectByteExactFP32(const float *actual,
+                             const float *expected,
+                             size_t count,
+                             const std::string &context)
+    {
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+            return;
+        for (size_t index = 0; index < count; ++index)
+        {
+            uint32_t actual_bits = 0;
+            uint32_t expected_bits = 0;
+            std::memcpy(&actual_bits, actual + index, sizeof(actual_bits));
+            std::memcpy(&expected_bits, expected + index, sizeof(expected_bits));
+            if (actual_bits != expected_bits)
+            {
+                ADD_FAILURE() << context << " first byte mismatch at element " << index
+                              << " actual=" << actual[index]
+                              << " expected=" << expected[index]
+                              << " actual_bits=" << actual_bits
+                              << " expected_bits=" << expected_bits;
+                return;
+            }
+        }
+    }
+
+    /** @brief Assert that the grouped channel-block short-conv route ran. */
+    void expectGroupedShortConvCounter(int verifier_rows,
+                                       int channels,
+                                       int kernel_size)
+    {
+        bool found = false;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_shortconv_grouped_verifier_rows_calls"}))
+        {
+            auto tag_equals = [&](const char *name, int expected)
+            {
+                const auto it = record.tags.find(name);
+                return it != record.tags.end() && it->second == std::to_string(expected);
+            };
+            const auto policy = record.tags.find("execution_policy");
+            found = found ||
+                    (tag_equals("verifier_rows", verifier_rows) &&
+                     tag_equals("channels", channels) &&
+                     tag_equals("kernel_size", kernel_size) &&
+                     policy != record.tags.end() &&
+                     policy->second == "channel_block_grouped");
+        }
+        EXPECT_TRUE(found)
+            << "CPU grouped verifier short-conv did not publish its production route counter\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cpu_shortconv_grouped_verifier_rows_calls"}, 20);
     }
 
     // Reference scalar functions (match kernel formulas exactly)
@@ -876,6 +967,53 @@ TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_PerHeadNormDim)
     // Different from per-head result (1.0)
     EXPECT_GT(std::abs(out_full[0] - 1.0f), 0.1f)
         << "Full-dim and per-head normalization should produce different results";
+}
+
+TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_ExplicitFeatureDimAllowsWiderBackingBuffer)
+{
+    // Dense decode can reserve a full-width backing buffer while TP prefill
+    // still packs the local active feature rows contiguously at the front.
+    const int active_dim = 2;
+    const int backing_dim = 4;
+    const int seq_len = 2;
+
+    std::vector<float> input_data = {
+        2.0f, 2.0f,
+        3.0f, 3.0f,
+        99.0f, 99.0f, 99.0f, 99.0f,
+    };
+    std::vector<float> gate_data = {
+        1.0f, 1.0f,
+        1.0f, 1.0f,
+    };
+    auto input = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(backing_dim)}, input_data.data());
+    auto gate = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(active_dim)}, gate_data.data());
+    auto gamma = makeFP32Const({static_cast<size_t>(active_dim)}, 1.0f);
+    auto output = makeFP32Const({static_cast<size_t>(seq_len), static_cast<size_t>(backing_dim)}, 0.0f);
+
+    GatedRMSNormStage::Params params;
+    params.input = input.get();
+    params.gate = gate.get();
+    params.output = output.get();
+    params.gamma = gamma.get();
+    params.eps = 1e-6f;
+    params.seq_len = seq_len;
+    params.feature_dim = active_dim;
+    params.norm_dim = active_dim;
+
+    auto ctx = makeCPUContext();
+    GatedRMSNormStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx.get()));
+
+    const float *out = output->data();
+    for (int i = 0; i < seq_len * active_dim; ++i)
+    {
+        EXPECT_NEAR(out[i], 1.0f, 1e-4f) << "packed active element " << i;
+    }
+    for (int i = seq_len * active_dim; i < seq_len * backing_dim; ++i)
+    {
+        EXPECT_EQ(out[i], 0.0f) << "padding element " << i;
+    }
 }
 
 TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_PerHeadNormDim_WithSiLU)
@@ -2107,8 +2245,10 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_StateSnapshotsRestoreAcceptedVe
     EXPECT_EQ(maxAbsDiff(restored_state, accepted_replay_state), 0.0f);
 }
 
-TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeM2ToM4)
+TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialDecodeAtQwen36ShapeRuntimeM)
 {
+    ScopedPerfStatsEnv perfstats;
+
     constexpr int kChannels = 6144;
     constexpr int kKernelSize = 4;
     constexpr int kStateLen = kKernelSize - 1;
@@ -2129,8 +2269,9 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
     for (auto &x : initial_state)
         x = state_dist(rng);
 
-    for (int rows = 2; rows <= 4; ++rows)
+    for (int rows : test::kGroupedVerifierRuntimeRows)
     {
+        PerfStatsCollector::reset();
         std::vector<float> input(static_cast<size_t>(rows) * kChannels);
         for (auto &x : input)
             x = activation_dist(rng);
@@ -2139,7 +2280,19 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
         std::vector<float> grouped_state = initial_state;
         std::vector<float> grouped_output(static_cast<size_t>(rows) * kChannels);
         std::vector<float> snapshots(static_cast<size_t>(rows) * kStateFloats);
-        ASSERT_TRUE(grouped_kernel.forwardWithStateSnapshots(
+        std::vector<float> speculative_state(kStateFloats);
+
+        /*
+         * Enter through the production binding and forward APIs.  The grouped
+         * verifier must advance a private speculative state, publish every
+         * post-row snapshot, and leave the request's live state untouched
+         * until the transaction selects an accepted row.
+         */
+        grouped_kernel.bindVerifierStateCaptureWorkspace(
+            snapshots.data(), rows, kStateFloats);
+        grouped_kernel.bindSpeculativeStateWorkspace(
+            speculative_state.data(), kStateFloats);
+        ASSERT_TRUE(grouped_kernel.forward(
             input.data(),
             weight.data(),
             bias.data(),
@@ -2148,11 +2301,9 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
             rows,
             kChannels,
             kKernelSize,
-            snapshots.data(),
-            kStateFloats,
-            rows,
             /*apply_silu=*/true))
             << "rows=" << rows;
+        expectGroupedShortConvCounter(rows, kChannels, kKernelSize);
 
         CPUShortConvolution serial_kernel;
         std::vector<float> serial_state = initial_state;
@@ -2172,18 +2323,46 @@ TEST(Test__GDNMathematicalCorrectness, ShortConv_GroupedVerifierRowsMatchSerialD
                 << "rows=" << rows << " row=" << row;
 
             const float *snapshot = snapshots.data() + static_cast<size_t>(row) * kStateFloats;
-            std::vector<float> grouped_snapshot(snapshot, snapshot + kStateFloats);
-            EXPECT_EQ(maxAbsDiff(grouped_snapshot, serial_state), 0.0f)
-                << "rows=" << rows << " row=" << row
-                << " verifier state publication must be serial-decode exact";
+            expectByteExactFP32(
+                snapshot,
+                serial_state.data(),
+                kStateFloats,
+                "CPU grouped short-conv state rows=" + std::to_string(rows) +
+                    " row=" + std::to_string(row));
         }
 
-        EXPECT_EQ(maxAbsDiff(grouped_output, serial_output), 0.0f)
-            << "rows=" << rows
-            << " grouped short-conv verifier output must be serial-decode exact";
-        EXPECT_EQ(maxAbsDiff(grouped_state, serial_state), 0.0f)
-            << "rows=" << rows
-            << " grouped short-conv final state must be serial-decode exact";
+        expectByteExactFP32(
+            grouped_output.data(),
+            serial_output.data(),
+            serial_output.size(),
+            "CPU grouped short-conv output rows=" + std::to_string(rows));
+        expectByteExactFP32(
+            grouped_state.data(),
+            initial_state.data(),
+            initial_state.size(),
+            "CPU grouped short-conv live-state preservation rows=" +
+                std::to_string(rows));
+
+        /*
+         * The production host transaction always uses the grouped publication
+         * API, even when its request batch contains one request.  Restoring the
+         * terminal verifier row must therefore be a valid native snapshot copy,
+         * not a dependency on a request bank that only multi-request execution
+         * happens to initialize.
+         */
+        const int restore_row = rows - 1;
+        ASSERT_TRUE(grouped_kernel.restoreVerifierStateCaptureRows(
+            grouped_state.data(),
+            &restore_row,
+            /*request_count=*/1,
+            /*stream=*/nullptr))
+            << "rows=" << rows;
+        expectByteExactFP32(
+            grouped_state.data(),
+            serial_state.data(),
+            serial_state.size(),
+            "CPU grouped short-conv published state rows=" +
+                std::to_string(rows));
     }
 }
 

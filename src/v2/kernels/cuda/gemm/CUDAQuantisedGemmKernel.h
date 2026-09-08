@@ -93,13 +93,6 @@ namespace llaminar2
         public:
             struct Impl; // Forward declaration for PIMPL (definition in .cpp)
 
-            // Legacy stubs — NativeVNNI is always enabled; CUTLASS fallback removed.
-            // Kept for ABI compatibility with test code; will be removed in a future cleanup.
-            static void setNativeVNNIEnabled(bool enabled);
-            static bool isNativeVNNIEnabled();
-            static void setForceCutlassFallback(bool enabled);
-            static bool isForceCutlassFallback();
-
             /**
              * @brief Release all per-device shared CUDAConcurrentPrefillPool
              *        singletons (CUDA streams, events, and scratch buffers).
@@ -121,6 +114,13 @@ namespace llaminar2
 
             /// @brief Returns true when any CUDA execution context is live.
             bool hasDynamicStateActive() const override;
+
+            bool canReleaseSourceWeightTensor() const override
+            {
+                return packed_ != nullptr ||
+                       lifetime_owner_ != nullptr ||
+                       (weights_converted_ && d_weights_int8_ && d_scales_B_);
+            }
 
             /**
              * @brief Construct kernel for quantized weight tensor (lazy conversion)
@@ -162,12 +162,17 @@ namespace llaminar2
              * @param codebook_id NativeVNNI codebook identifier
              * @param blocks_per_row Number of 32-element blocks per row (K/32)
              * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             * @param source_identity Exact GGUF arithmetic provenance
+             * @param allocation_format Optional reusable-slot capacity; zero
+             *        payload identifies an ordinary immutable allocation
              */
             CUDAQuantisedGemmKernel(
                 int N, int K, int cuda_device_id,
                 uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
                 uint8_t codebook_id, uint32_t blocks_per_row,
-                std::shared_ptr<void> lifetime_owner);
+                std::shared_ptr<void> lifetime_owner,
+                NativeVnniSourceIdentity source_identity,
+                NativeVnniReusableDeviceAllocationFormat allocation_format = {});
 
             ~CUDAQuantisedGemmKernel() override;
 
@@ -183,7 +188,12 @@ namespace llaminar2
             // ITensorGemm interface - Primary entry points
             // =========================================================================
 
-            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope(
+                std::optional<DeviceRowRange> rows = std::nullopt) override;
+            std::unique_ptr<OutputPartitionEquivalenceScope>
+            beginOutputPartitionEquivalenceScope(
+                int actual_output_columns,
+                int serial_partition_columns) override;
 
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
@@ -268,6 +278,15 @@ namespace llaminar2
             bool supports_fused_projection() const override { return true; }
 
             /**
+             * @brief Create the shared CUDA projection stream/event pool before capture.
+             *
+             * The pool is device-scoped and persistent. Calling this method is
+             * idempotent; entering it during an active graph capture is rejected.
+             */
+            bool prepareFusedProjectionGraphCapture(
+                size_t projection_count) override;
+
+            /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
              * CUDAQuantisedGemmKernel is for weight projections only.
@@ -299,7 +318,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // =========================================================================
             // IKernelSnapshotCapable interface
@@ -328,6 +348,27 @@ namespace llaminar2
              */
             WorkspaceRequirements getWorkspaceRequirements(
                 int m, int n = 0, int k = 0) const override;
+
+            /**
+             * @brief Add compact-decode scratch for concurrent grouped projections.
+             *
+             * MTP verifier rows preserve the canonical M=1 reduction order for
+             * every row. Projections assigned to distinct persistent streams
+             * therefore need disjoint K-partial storage, just as ordinary M=1
+             * fused decode does. This declaration reserves only the widest
+             * projection assigned to each side stream; stream zero continues
+             * to use the ordinary `GEMV_KPAR_PARTIALS` arena.
+             *
+             * @param requirements Aggregate fused-stage workspace contract.
+             * @param m Captured grouped-verifier row capacity.
+             * @param projection_columns Ordered output width of each projection.
+             * @param k Shared input width.
+             */
+            void appendFusedProjectionWorkspaceRequirements(
+                WorkspaceRequirements &requirements,
+                int m,
+                std::span<const int> projection_columns,
+                int k) const override;
 
             /**
              * @brief Bind workspace manager for managed mode
@@ -364,6 +405,8 @@ namespace llaminar2
 
             /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
+            bool exportNativeVNNISourceIdentity(
+                NativeVnniSourceIdentity &out) const override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
@@ -371,7 +414,22 @@ namespace llaminar2
              * For CUDA: converts weights to INT8 + uploads to device memory.
              * Call this during weight preloading to avoid first-use overhead.
              */
-            void prepareWeights() override { ensureWeightsConverted(); }
+            void prepareWeights() override;
+
+            /**
+             * @brief Materialize the optional ROWPAR weight view during setup.
+             *
+             * This operation allocates persistent weight storage and launches
+             * transpose kernels. It therefore requires an explicit,
+             * non-capturing setup stream and is forbidden from all multiply
+             * entry points. Production `prepareWeights()` calls it only when
+             * the installed generated policy selects ROWPAR for this shape.
+             *
+             * @param stream Explicit CUDA setup stream.
+             * @throws std::runtime_error for a null/capturing stream or failed
+             *         preparation.
+             */
+            void prepareRowMajorWeights(void *stream);
 
             // =========================================================================
             // Fused Activation+GEMM entry points
@@ -471,10 +529,11 @@ namespace llaminar2
             /**
              * @brief Small-M FP32 activations -> specialized native-VNNI GEMV.
              *
-             * Greedy MTP verifier forwards commonly use M=2..4. The generic
-             * native VNNI prefill path is tuned for larger prefill buckets and
-             * has separate dispatch regimes, so verifier rows stay on the small-M
-             * decode-class GEMV path after one shared activation quantization.
+             * MTP verifier forwards use a runtime row count determined by the
+             * speculative depth. The generic native VNNI prefill path is tuned
+             * for larger prompt buckets and has separate dispatch regimes, so
+             * verifier rows stay on the decode-class GEMV path after one shared
+             * activation quantization.
              */
             bool multiply_fp32_to_fp32_small_m_gemv(
                 const float *d_A, float *d_C, const float *d_bias,
@@ -485,8 +544,16 @@ namespace llaminar2
              * @brief Already-quantized small-M activations -> native-VNNI GEMV.
              *
              * Used by fused activation paths that quantize a derived activation
-             * once, for example silu(gate)*up. Tests may pass false for
-             * use_specialized_small_m_kernel to compare against serial M=1 GEMVs.
+             * once, for example silu(gate)*up. Passing false for
+             * use_specialized_small_m_kernel is no longer a row-replay escape
+             * hatch; grouped specialized NativeVNNI is the only production path.
+             *
+             * @param execution_stream Optional explicit CUDA stream captured by
+             *        the caller at the start of a fused multi-projection launch.
+             *        LocalTP workers may reset request-scoped kernel dynamic
+             *        state concurrently on sibling devices, so decode-equivalent
+             *        publication paths must not depend on this kernel's mutable
+             *        gpu_stream_ member after dispatch begins.
              */
             bool multiply_quantized_small_m_gemv(
                 const int8_t *d_A_int8,
@@ -495,15 +562,34 @@ namespace llaminar2
                 const float *d_bias,
                 int m, int n, int k,
                 float alpha, float beta,
-                bool use_specialized_small_m_kernel = true);
+                bool use_specialized_small_m_kernel = true,
+                void *execution_stream = nullptr);
 
-            bool multiply_quantized_m1_via_small_m_gemv(
+            /**
+             * @brief Already-quantized M=1 activations -> canonical decode GEMV.
+             *
+             * MTP verifier publication compares grouped rows against serial
+             * decode.  This helper is the public serial-decode transaction after
+             * activation quantization: it launches the generated M=1 NativeVNNI
+             * GEMV on the caller's explicit stream, with no padded small-M
+             * detour and no alternate reduction order.  Keeping the call wrapped
+             * in one named helper lets fused QKV/gate-up paths and ordinary GEMM
+             * stages share the same strict oracle.
+             *
+             * @param execution_stream Optional explicit CUDA stream captured by
+             *        the caller at the start of a fused multi-projection launch.
+             *        When omitted, the kernel's bound stage stream is used.  A
+             *        null stream is rejected because verifier publication must
+             *        never enqueue work on CUDA's default stream.
+             */
+            bool multiply_quantized_m1_decode_gemv(
                 const int8_t *d_A_int8,
                 const float *d_scales_A_blockwise,
                 float *d_C,
                 const float *d_bias,
                 int n, int k,
-                float alpha, float beta);
+                float alpha, float beta,
+                void *execution_stream = nullptr);
 
             /**
              * @brief FP32 activations → quantize → INT8 GEMM → Q8_1 output
@@ -560,7 +646,7 @@ namespace llaminar2
              * @brief Rebind NativeVNNI prefill scratch to the per-stream slot used by concurrent fused prefill.
              *
              * validateWorkspace() binds the serial view of the workspace. Concurrent
-             * prefill projections need disjoint split-K/stream-K slices before their
+             * prefill projections need disjoint canonical partial slices before their
              * side-stream launch.
              */
             void bindConcurrentNativePrefillScratch(int m, int n, int k, int stream_idx) const;
@@ -572,9 +658,10 @@ namespace llaminar2
              * projections use the two-phase KPAR GEMV reduction, so each side stream
              * needs a disjoint partials arena before launch.
              *
-             * @param projection_count Number of projections launched by the fused
-             *                         stage. Slot 0 uses GEMV_KPAR_PARTIALS and the
-             *                         remaining projection_count-1 slots use
+             * @param projection_count Number of M=1 projections launched by the
+             *                         fused stage. Slot 0 uses
+             *                         GEMV_KPAR_PARTIALS and the remaining
+             *                         projection_count-1 slots use
              *                         CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS.
              */
             void bindConcurrentNativeDecodeScratch(

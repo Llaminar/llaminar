@@ -13,6 +13,7 @@
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace llaminar2
 {
@@ -38,6 +39,201 @@ namespace llaminar2
         std::sort(normalized.begin(), normalized.end());
         normalized.erase(std::unique(normalized.begin(), normalized.end()), normalized.end());
         return normalized;
+    }
+
+    std::vector<int> residentPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_rows)
+    {
+        if (max_rows <= 0)
+            return {};
+
+        std::vector<int> candidates;
+        for (const int bucket : normalizePrefillGraphBuckets(buckets))
+        {
+            if (bucket <= max_rows)
+                candidates.push_back(bucket);
+        }
+        if (candidates.empty())
+            candidates.push_back(max_rows);
+
+        // Admission tries the throughput-favouring shape first and only
+        // reduces residency when the complete physical BOM cannot cover it.
+        std::reverse(candidates.begin(), candidates.end());
+        return candidates;
+    }
+
+    std::vector<int> segmentedPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_context_rows,
+        int max_segment_rows)
+    {
+        if (max_context_rows <= 0 || max_segment_rows <= 0)
+            return {};
+        return residentPrefillGraphRowCandidates(
+            buckets,
+            std::min(max_context_rows, max_segment_rows));
+    }
+
+    int resolvePrefillScheduleRowCapacity(
+        int admitted_prefill_rows,
+        int configured_segment_rows) noexcept
+    {
+        if (admitted_prefill_rows <= 0 || configured_segment_rows <= 0)
+            return 0;
+        return std::min(admitted_prefill_rows, configured_segment_rows);
+    }
+
+    std::vector<int> prefillGraphBucketsAtOrBelowCapacity(
+        const std::vector<int> &buckets,
+        int resident_graph_rows)
+    {
+        if (resident_graph_rows <= 0)
+            return normalizePrefillGraphBuckets(buckets);
+
+        std::vector<int> bounded;
+        for (int bucket : normalizePrefillGraphBuckets(buckets))
+        {
+            if (bucket <= resident_graph_rows)
+                bounded.push_back(bucket);
+        }
+        bounded.push_back(resident_graph_rows);
+        std::sort(bounded.begin(), bounded.end());
+        bounded.erase(std::unique(bounded.begin(), bounded.end()), bounded.end());
+        return bounded;
+    }
+
+    std::vector<int> retainedPrefillGraphBucketLadder(
+        const std::vector<int> &buckets,
+        int resident_graph_rows,
+        std::size_t maximum_bucket_count)
+    {
+        auto bounded = prefillGraphBucketsAtOrBelowCapacity(
+            buckets, resident_graph_rows);
+        if (resident_graph_rows <= 0 || maximum_bucket_count == 0u ||
+            bounded.empty())
+        {
+            return {};
+        }
+        if (bounded.size() <= maximum_bucket_count)
+            return bounded;
+        if (maximum_bucket_count == 1u)
+            return {bounded.back()};
+
+        struct Score
+        {
+            long double worst_gap =
+                std::numeric_limits<long double>::infinity();
+            long double total_gap =
+                std::numeric_limits<long double>::infinity();
+            std::size_t parent = 0u;
+            bool valid = false;
+        };
+        const std::size_t selected_count = std::min(
+            maximum_bucket_count, bounded.size());
+        std::vector<std::vector<Score>> scores(
+            selected_count,
+            std::vector<Score>(bounded.size()));
+        scores[0][0] = {
+            .worst_gap = 0.0L,
+            .total_gap = 0.0L,
+            .parent = 0u,
+            .valid = true,
+        };
+
+        /* A transition i->j represents every real length just above bucket i
+         * padding to bucket j. The ratio against i+1 is therefore the exact
+         * worst multiplicative padding cost of that interval. */
+        for (std::size_t slot = 1u; slot < selected_count; ++slot)
+        {
+            for (std::size_t target = 1u; target < bounded.size(); ++target)
+            {
+                Score best;
+                for (std::size_t previous = 0u;
+                     previous < target;
+                     ++previous)
+                {
+                    const Score &prefix = scores[slot - 1u][previous];
+                    if (!prefix.valid)
+                        continue;
+                    const long double gap =
+                        static_cast<long double>(bounded[target]) /
+                        static_cast<long double>(bounded[previous] + 1);
+                    const long double worst =
+                        std::max(prefix.worst_gap, gap);
+                    const long double total = prefix.total_gap + gap;
+                    if (!best.valid || worst < best.worst_gap ||
+                        (worst == best.worst_gap &&
+                         total < best.total_gap))
+                    {
+                        best = {
+                            .worst_gap = worst,
+                            .total_gap = total,
+                            .parent = previous,
+                            .valid = true,
+                        };
+                    }
+                }
+                scores[slot][target] = best;
+            }
+        }
+
+        std::vector<int> result(selected_count);
+        std::size_t cursor = bounded.size() - 1u;
+        if (!scores[selected_count - 1u][cursor].valid)
+            return {};
+        for (std::size_t slot = selected_count; slot-- > 0u;)
+        {
+            result[slot] = bounded[cursor];
+            if (slot > 0u)
+                cursor = scores[slot][cursor].parent;
+        }
+        return result;
+    }
+
+    int effectivePrefillGraphMinimumPaddedBucketSeqLen(
+        int configured_floor,
+        int resident_graph_rows) noexcept
+    {
+        const int positive_floor = std::max(1, configured_floor);
+        if (resident_graph_rows <= 0)
+            return positive_floor;
+
+        // Selection and preflight must see the same reachable lower bound.
+        return std::min(positive_floor, resident_graph_rows);
+    }
+
+    std::vector<int> rawPrefillGraphBucketsForResidentCapacity(
+        const std::vector<int> &configured_buckets,
+        int resident_graph_rows,
+        int configured_floor)
+    {
+        auto buckets = prefillGraphBucketsAtOrBelowCapacity(
+            configured_buckets, resident_graph_rows);
+        const int floor =
+            effectivePrefillGraphMinimumPaddedBucketSeqLen(
+                configured_floor, resident_graph_rows);
+        buckets.erase(
+            buckets.begin(),
+            std::lower_bound(buckets.begin(), buckets.end(), floor));
+        return buckets;
+    }
+
+    std::vector<int> retainedRawPrefillGraphBucketLadder(
+        const std::vector<int> &configured_buckets,
+        int resident_graph_rows,
+        int configured_floor,
+        std::size_t maximum_bucket_count)
+    {
+        const auto raw_buckets =
+            rawPrefillGraphBucketsForResidentCapacity(
+                configured_buckets,
+                resident_graph_rows,
+                configured_floor);
+        return retainedPrefillGraphBucketLadder(
+            raw_buckets,
+            resident_graph_rows,
+            maximum_bucket_count);
     }
 
     PrefillBucketSelection selectPrefillGraphBucket(
@@ -159,7 +355,20 @@ namespace llaminar2
         {
             const int remaining = policy.real_token_count - local_offset;
             const int real_count = std::min(remaining, chunk_target);
-            auto selected = selectPrefillGraphBucket(real_count, buckets);
+            /*
+             * An explicit chunk interval is also a fixed physical graph
+             * contract.  In particular, its final short tail must replay the
+             * same captured bucket instead of silently selecting a smaller
+             * graph from a multi-bucket policy.  The live row count remains
+             * `real_count`; only the immutable execution width is selected
+             * from `chunk_target`.
+             */
+            const int bucket_requirement =
+                policy.fixed_chunk_real_tokens > 0
+                    ? chunk_target
+                    : real_count;
+            auto selected =
+                selectPrefillGraphBucket(bucket_requirement, buckets);
             if (!selected)
             {
                 schedule.error = selected.error;

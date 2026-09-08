@@ -1,9 +1,11 @@
-/**
- * @file LMHeadStage.h
+/** @file LMHeadStage.h
  * @brief Language model head projection stage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #pragma once
+
+#include "kernels/common/DeviceRowRange.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -53,6 +55,18 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
             int vocab_size = 0;
+            /**
+             * @brief Serial column-shard width whose arithmetic must be reproduced.
+             *
+             * A mirrored LocalTP MTP head writes the full vocabulary on every
+             * device, but its logits must remain byte-identical to the ordinary
+             * serial graph that projects one vocabulary shard per participant.
+             * Zero means that output ownership and serial arithmetic width are
+             * identical. A positive value activates the backend's explicit
+             * output-partition equivalence contract. The full vocabulary need
+             * not divide by this width: the final typed shard may be shorter.
+             */
+            int serial_equivalent_partition_width = 0;
             int effective_last_row_idx = -1;           ///< Dynamic last real token row for padded prefill replay.
             bool use_prefill_replay_row_offset = true; ///< False when input is already a one-row scratch.
             bool compute_all_positions = false;        ///< Compute logits for every input row instead of only the selected row.
@@ -66,6 +80,8 @@ namespace llaminar2
              * distribution-level equivalence proof.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
 
             // Optional bias tensor [vocab_size] - passed to GEMM for fused addition
             const TensorBase *bias_tensor = nullptr;
@@ -111,6 +127,25 @@ namespace llaminar2
         int activationRowOffsetForLogits() const;
 
         /**
+         * @brief Report whether this stage will use grouped decode-equivalent verifier rows.
+         *
+         * MTP graph-construction tests use this narrow accessor to prove that
+         * compact all-position verifier logits are routed through the same
+         * serial-row-equivalent small-M projection path that CUDA and ROCm
+         * backend regressions validate.  Production execution still goes
+         * through execute() and the immutable Params captured by the stage.
+         */
+        bool usesDecodeEquivalentVerifierPrefillForTesting() const
+        {
+            return params_.force_decode_equivalent_verifier_prefill;
+        }
+
+        int serialEquivalentPartitionWidthForTesting() const
+        {
+            return params_.serial_equivalent_partition_width;
+        }
+
+        /**
          * @brief Return FULL policy - cohere inputs AND allocate output GPU buffers
          *
          * Quantized GEMM kernels (ROCm/CUDA) pack and upload weights internally
@@ -140,8 +175,6 @@ namespace llaminar2
     private:
         Params params_;
         ITensorGemm *cached_gemm_ = nullptr;
-        std::shared_ptr<FP32Tensor> verifier_hidden_row_;
-        std::shared_ptr<FP32Tensor> verifier_logits_row_;
 
         ITensorGemm *resolvePreparedKernel(const char *caller);
         bool executeDecodeEquivalentVerifierPrefill(

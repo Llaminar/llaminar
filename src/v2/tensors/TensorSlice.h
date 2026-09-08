@@ -34,7 +34,7 @@
 
 #include "Tensors.h"
 #include "../backends/DeviceId.h"
-#include "../kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "../utils/Logger.h"
 #include <memory>
 #include <cstring>
@@ -191,7 +191,10 @@ namespace llaminar2
             }
         }
 
-        ~TensorSlice() override = default;
+        ~TensorSlice() override
+        {
+            retireHostTransferLifetimeBeforeStorageDestruction();
+        }
 
         // =======================================================================
         // Slice Metadata Access
@@ -243,6 +246,34 @@ namespace llaminar2
         TensorType native_type() const override { return inner()->native_type(); }
         const std::vector<size_t> &shape() const override { return inner()->shape(); }
         DeviceId home_device() const override { return inner()->home_device(); }
+        std::optional<DeviceId> current_device() const override
+        {
+            return inner()->current_device();
+        }
+        TensorBase *transferStorageOwner() override
+        {
+            return inner()->transferStorageOwner();
+        }
+        const TensorBase *transferStorageOwner() const override
+        {
+            return inner()->transferStorageOwner();
+        }
+        std::optional<DeviceId> getAuthoritativeDevice() const override
+        {
+            return inner()->getAuthoritativeDevice();
+        }
+        TensorCoherenceState coherenceState() const override
+        {
+            return inner()->coherenceState();
+        }
+        MemoryResidency memoryResidency() const override
+        {
+            return inner()->memoryResidency();
+        }
+        bool hasPreparedDeviceState() const override
+        {
+            return inner()->hasPreparedDeviceState();
+        }
         bool is_on_device(DeviceId device) const override { return inner()->is_on_device(device); }
         const float *data() const override { return inner()->data(); }
         float *mutable_data() override { return inner()->mutable_data(); }
@@ -257,6 +288,11 @@ namespace llaminar2
         size_t size_bytes() const override { return inner()->byte_size(); }
 
     protected:
+        void publishPreparedDeviceState() override
+        {
+            inner()->publishPreparedDeviceState();
+        }
+
         /**
          * @brief Get raw host data pointer for GPU transfer
          *
@@ -309,17 +345,35 @@ namespace llaminar2
             return inner()->ensureOnHost(stream);
         }
 
-        void mark_host_dirty() override
+    private:
+        void publishHostWriteState() override
         {
-            inner()->mark_host_dirty();
+            inner()->publishHostWriteState();
         }
 
-        void transitionTo(TensorCoherenceState new_state,
-                          std::optional<DeviceId> authoritative_dev = std::nullopt) override
+        void publishGraphOwnedDeviceWriteState(DeviceId device) override
         {
-            inner()->transitionTo(new_state, authoritative_dev);
+            inner()->publishGraphOwnedDeviceWriteState(device);
         }
 
+        void publishSynchronizedState() override
+        {
+            inner()->publishSynchronizedState();
+        }
+
+        void publishCompletedDeviceWriteState(DeviceId device) override
+        {
+            inner()->publishCompletedDeviceWriteState(device);
+        }
+
+        void publishDeviceWriteStateWithEvent(
+            DeviceId device,
+            void *stream) override
+        {
+            inner()->publishDeviceWriteStateWithEvent(device, stream);
+        }
+
+    public:
         bool isHostValid() const override
         {
             return inner()->isHostValid();
@@ -467,12 +521,16 @@ namespace llaminar2
             return nullptr;
         }
 
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override
+        void packVnniBlock(
+            const VnniPackContext &ctx,
+            int source_n,
+            int destination_n,
+            int b) const override
         {
             auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
             if (unpackable)
             {
-                unpackable->packVnniBlock(ctx, n, b);
+                unpackable->packVnniBlock(ctx, source_n, destination_n, b);
             }
         }
 
@@ -572,10 +630,31 @@ namespace llaminar2
         /**
          * @brief Release raw data from inner tensor after GEMM packing
          *
-         * Forwards to inner tensor's release_raw_data() to free the original
-         * quantized weight data after the GEMM kernel has repacked it.
+         * A slice does not own the registration state associated with its
+         * bytes. Route even the legacy raw-release entry point through the
+         * inner tensor's complete host-release transition so no caller can
+         * free registered storage through the wrapper.
          */
-        void release_raw_data() override { inner()->release_raw_data(); }
+        void release_raw_data() override
+        {
+            inner()->release_host_weight_data();
+        }
+
+        /**
+         * @brief Retire and release host storage through its real inner owner.
+         *
+         * TensorSlice delegates transfers to the inner tensor, so the inner
+         * object owns both the runtime registration and the backing vector.
+         * Running TensorBase's default implementation on this wrapper would
+         * unpin an empty wrapper state and then free the still-registered
+         * inner allocation through release_raw_data(). Delegate the complete
+         * typed lifecycle transition instead.
+         */
+        void release_host_weight_data() override
+        {
+            inner()->release_host_weight_data();
+        }
+
         bool is_raw_data_released() const override { return inner()->is_raw_data_released(); }
 
     private:

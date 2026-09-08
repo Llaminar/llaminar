@@ -11,6 +11,11 @@
 
 #include <gtest/gtest.h>
 
+#include "execution/compute_stages/stages/GDNLinkedLiveStateGeometry.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "kernels/common/GDNLinkedStateLayout.h"
+#include "../../../utils/VerifierRowTestInventory.h"
+
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
 #include "kernels/rocm/gdn/ROCmShortConvolution.h"
@@ -19,7 +24,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
 #include <initializer_list>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -105,6 +115,82 @@ namespace
         }
     };
 
+    /**
+     * @brief Test owner for cache-style persistent ROCm GDN device state.
+     *
+     * The real hybrid cache plans these banks before graph construction.
+     * Direct kernel tests use this owner to preserve that exact ownership and
+     * one-shot binding contract while keeping allocations outside production
+     * kernels and outside every captured region.
+     */
+    struct HipGDNStateOwner
+    {
+        template <typename Kernel>
+        HipGDNStateOwner(
+            Kernel &kernel,
+            int primary_state_floats,
+            int secondary_state_floats = 0,
+            int request_capacity = 2)
+            : primary_(
+                  secondary_state_floats > 0 &&
+                          secondary_state_floats != primary_state_floats
+                      ? std::make_unique<HipFloatBuffer>(
+                            static_cast<size_t>(primary_state_floats), 0.0f)
+                      : nullptr),
+              secondary_(
+                  secondary_state_floats > 0 &&
+                          secondary_state_floats != primary_state_floats
+                      ? std::make_unique<HipFloatBuffer>(
+                            static_cast<size_t>(secondary_state_floats), 0.0f)
+                      : nullptr),
+              requests_(std::make_unique<HipFloatBuffer>(
+                  static_cast<size_t>(request_capacity) *
+                      static_cast<size_t>(std::max(
+                          primary_state_floats,
+                          secondary_state_floats)),
+                  0.0f))
+        {
+            if (primary_state_floats <= 0 || request_capacity <= 0)
+                throw std::invalid_argument(
+                    "HipGDNStateOwner requires positive state and request capacity");
+
+            const GDNDeviceStateBinding binding{
+                .primary_state = primary_ ? primary_->ptr : requests_->ptr,
+                .primary_state_floats = primary_state_floats,
+                .secondary_state = secondary_ ? secondary_->ptr : nullptr,
+                .secondary_state_floats =
+                    secondary_ ? secondary_state_floats : 0,
+                .request_state_bank = requests_->ptr,
+                .request_state_bank_floats = requests_->count,
+                .request_capacity = request_capacity,
+            };
+            if (!kernel.bindDeviceState(binding))
+                throw std::runtime_error(
+                    "ROCm GDN kernel rejected explicit test-owned state");
+        }
+
+        /**
+         * @brief Bind persistent test-owned scratch for in-place short-conv.
+         */
+        template <typename Kernel>
+        void bindScratch(Kernel &kernel, int scratch_floats)
+        {
+            if (scratch_floats <= 0)
+                throw std::invalid_argument(
+                    "ROCm short-conv scratch must be positive");
+            scratch_ = std::make_unique<HipFloatBuffer>(
+                static_cast<size_t>(scratch_floats), 0.0f);
+            kernel.bindScratchWorkspace(
+                scratch_->ptr, static_cast<int>(scratch_->count));
+        }
+
+    private:
+        std::unique_ptr<HipFloatBuffer> primary_;
+        std::unique_ptr<HipFloatBuffer> secondary_;
+        std::unique_ptr<HipFloatBuffer> requests_;
+        std::unique_ptr<HipFloatBuffer> scratch_;
+    };
+
     /// @brief RAII wrapper for int metadata stored on a HIP device.
     struct HipIntBuffer
     {
@@ -152,6 +238,60 @@ namespace
 
         HipStreamHandle(const HipStreamHandle &) = delete;
         HipStreamHandle &operator=(const HipStreamHandle &) = delete;
+    };
+
+    /**
+     * @brief Own a HIP graph executable across device-indexed state publication.
+     *
+     * Production MTP must restore an accepted GDN/short-conv verifier row into
+     * live device state and then reuse the already-captured decode executable.
+     * This helper preserves that executable for the complete regression and
+     * destroys both HIP graph objects at scope exit.
+     */
+    struct HipCapturedGraph
+    {
+        hipGraph_t graph = nullptr;           ///< Captured graph definition.
+        hipGraphExec_t executable = nullptr; ///< Instantiated reusable graph.
+
+        template <typename RecordWork>
+        HipCapturedGraph(hipStream_t stream, RecordWork &&record_work)
+        {
+            checkHip(
+                hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed),
+                "hipStreamBeginCapture(persistent recurrent graph)");
+            bool recorded = false;
+            {
+                GraphCaptureGuard guard;
+                recorded = record_work();
+            }
+            checkHip(
+                hipStreamEndCapture(stream, &graph),
+                "hipStreamEndCapture(persistent recurrent graph)");
+            if (!recorded || !graph)
+                throw std::runtime_error("ROCm recurrent wrapper rejected persistent graph capture");
+            checkHip(
+                hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                "hipGraphInstantiate(persistent recurrent graph)");
+        }
+
+        ~HipCapturedGraph()
+        {
+            if (executable)
+                (void)hipGraphExecDestroy(executable);
+            if (graph)
+                (void)hipGraphDestroy(graph);
+        }
+
+        HipCapturedGraph(const HipCapturedGraph &) = delete;
+        HipCapturedGraph &operator=(const HipCapturedGraph &) = delete;
+
+        /// @brief Enqueue one replay of the original captured executable.
+        void launch(hipStream_t stream) const
+        {
+            checkHip(
+                hipGraphLaunch(executable, stream),
+                "hipGraphLaunch(persistent recurrent graph)");
+        }
     };
 
     /**
@@ -364,22 +504,89 @@ namespace
             << label << " symmetric_kl=" << metrics.symmetric_kl;
     }
 
+    /// @brief Returns the raw IEEE-754 bit pattern for an FP32 value without changing it.
+    uint32_t fp32BitsForByteExactCheck(float value)
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+
     /**
-     * @brief Verifies that verifier publication refreshed the host state mirror.
+     * @brief Asserts byte-for-byte FP32 equality over a grouped verifier slice.
      *
-     * ROCm GDN kernels own the live decode state on device, but graph rebuilds
-     * may consult the hybrid KV cache's host mirror after publication.  The
-     * mirror must receive the same accepted verifier row as the device restore.
+     * Grouped MTP verifier rows are allowed to be faster than serial decode,
+     * but they are not allowed to be merely numerically close.  Publication
+     * copies captured GDN/short-conv state into the live continuation state, so
+     * one changed mantissa bit can become a different routed expert or sampled
+     * token several layers later.  This helper keeps the older metric-based
+     * diagnostics available while making the pass/fail criterion raw equality.
      */
-    void expectHostMirrorMatchesSnapshotRow(
-        const std::vector<float> &host_mirror,
+    void expectByteExactEquivalent(
+        const char *label,
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        size_t offset,
+        size_t count)
+    {
+        ASSERT_LE(offset + count, actual.size()) << label << " actual slice out of range";
+        ASSERT_LE(offset + count, expected.size()) << label << " expected slice out of range";
+        if (count == 0)
+            return;
+
+        const auto *actual_bytes =
+            reinterpret_cast<const unsigned char *>(actual.data() + offset);
+        const auto *expected_bytes =
+            reinterpret_cast<const unsigned char *>(expected.data() + offset);
+        if (std::memcmp(actual_bytes, expected_bytes, count * sizeof(float)) == 0)
+            return;
+
+        const StrictVectorMetrics metrics =
+            strictVectorMetrics(actual, expected, offset, count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const float actual_value = actual[offset + i];
+            const float expected_value = expected[offset + i];
+            if (fp32BitsForByteExactCheck(actual_value) == fp32BitsForByteExactCheck(expected_value))
+                continue;
+
+            std::ostringstream message;
+            message << label
+                    << " first byte mismatch at local_index=" << i
+                    << " absolute_index=" << (offset + i)
+                    << " actual=" << actual_value
+                    << " expected=" << expected_value
+                    << " actual_bits=0x" << std::hex << std::setw(8) << std::setfill('0')
+                    << fp32BitsForByteExactCheck(actual_value)
+                    << " expected_bits=0x" << std::setw(8)
+                    << fp32BitsForByteExactCheck(expected_value)
+                    << std::dec
+                    << " max_abs=" << metrics.max_abs
+                    << " relative_l2=" << metrics.relative_l2
+                    << " cosine=" << metrics.cosine
+                    << " symmetric_kl=" << metrics.symmetric_kl;
+            ADD_FAILURE() << message.str();
+            return;
+        }
+    }
+
+    /**
+     * @brief Compares an observed device-owned live state with one capture row.
+     *
+     * Production publication never writes or consults a host mirror. Tests may
+     * synchronize the explicit stream and export the resident state afterward
+     * as a diagnostic observation. This helper then proves that the device copy
+     * selected exactly the requested post-row snapshot.
+     */
+    void expectPublishedDeviceStateMatchesSnapshotRow(
+        const std::vector<float> &published_device_state,
         const HipFloatBuffer &snapshots,
         int row,
         int state_floats)
     {
         ASSERT_GE(row, 0);
         ASSERT_GT(state_floats, 0);
-        ASSERT_EQ(host_mirror.size(), static_cast<size_t>(state_floats));
+        ASSERT_EQ(published_device_state.size(), static_cast<size_t>(state_floats));
         const std::vector<float> snapshot_host = snapshots.toHost();
         const size_t offset =
             static_cast<size_t>(row) * static_cast<size_t>(state_floats);
@@ -388,7 +595,7 @@ namespace
         for (int i = 0; i < state_floats; ++i)
         {
             EXPECT_FLOAT_EQ(
-                host_mirror[static_cast<size_t>(i)],
+                published_device_state[static_cast<size_t>(i)],
                 snapshot_host[offset + static_cast<size_t>(i)])
                 << "state_float=" << i << " row=" << row;
         }
@@ -402,16 +609,846 @@ namespace
             max_abs = std::max(max_abs, std::abs(values[offset + i]));
         return max_abs;
     }
+
+    /**
+     * @brief Build rank-major collective bytes from a canonical state bank.
+     *
+     * This oracle directly slices semantic groups and is independent of the
+     * production GPU offset arithmetic under test.
+     */
+    std::vector<float> makeRankMajorLinkedState(
+        const std::vector<float> &full,
+        const GDNLinkedLiveStateShape &shape)
+    {
+        std::vector<float> gathered;
+        gathered.reserve(full.size());
+        const int local_key_group = shape.localKeyGroupFloats();
+        const int full_key_group = shape.fullKeyGroupFloats();
+        const int local_value_group = shape.localValueGroupFloats();
+        const int full_value_group = shape.fullValueGroupFloats();
+        const int full_prefix = shape.prefix_group_count * full_key_group;
+
+        for (int participant = 0; participant < shape.degree; ++participant)
+        {
+            for (int group = 0; group < shape.prefix_group_count; ++group)
+            {
+                const auto begin = full.begin() +
+                                   group * full_key_group +
+                                   participant * local_key_group;
+                gathered.insert(
+                    gathered.end(), begin, begin + local_key_group);
+            }
+            for (int repeat = 0; repeat < shape.repeat_factor; ++repeat)
+            {
+                const auto begin = full.begin() + full_prefix +
+                                   repeat * full_value_group +
+                                   participant * local_value_group;
+                gathered.insert(
+                    gathered.end(), begin, begin + local_value_group);
+            }
+        }
+        return gathered;
+    }
 #endif
 } // namespace
 
 #ifdef HAVE_ROCM
+
+/**
+ * @brief Proves captured ROCm reassembly is byte exact for TP=2/4/8.
+ *
+ * Both state kinds and four linked value-head repeats are exercised on the
+ * same retained-graph path used by production graph execution.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, LinkedStateReassemblyTP2ThroughTP8IsCapturedAndByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+    HipStreamHandle stream;
+    const GDNLinkedLiveStateGeometry geometry{
+        .global_key_heads = 8,
+        .global_value_heads = 32,
+        .key_width = 2,
+        .value_width = 3,
+        .conv_history_length = 2,
+    };
+
+    for (const int degree : {2, 4, 8})
+    {
+        for (const auto kind : {
+                 GDNLinkedLiveStateKind::ConvHistory,
+                 GDNLinkedLiveStateKind::Recurrence,
+             })
+        {
+            const auto shape = geometry.resolve(kind, degree);
+            ASSERT_TRUE(shape.has_value()) << "TP=" << degree;
+            std::vector<float> expected(
+                static_cast<size_t>(shape->full_state_floats));
+            for (size_t i = 0; i < expected.size(); ++i)
+                expected[i] = static_cast<float>(i) + 0.25F;
+            const std::vector<float> gathered =
+                makeRankMajorLinkedState(expected, *shape);
+            ASSERT_EQ(gathered.size(), expected.size());
+
+            HipFloatBuffer device_gathered(gathered);
+            HipFloatBuffer device_full(expected.size(), -1.0F);
+            HipCapturedGraph captured(stream.stream, [&]
+            {
+                return rocmGDN_reassemble_modulo_linked_state(
+                    device_gathered.ptr,
+                    device_full.ptr,
+                    degree,
+                    shape->global_key_heads,
+                    geometry.global_value_heads,
+                    shape->key_elements_per_head,
+                    shape->value_elements_per_head,
+                    shape->prefix_group_count,
+                    /*device_idx=*/0,
+                    reinterpret_cast<void *>(stream.stream));
+            });
+            captured.launch(stream.stream);
+            checkHip(
+                hipStreamSynchronize(stream.stream),
+                "hipStreamSynchronize(linked-state graph)");
+            EXPECT_EQ(device_full.toHost(), expected)
+                << "TP=" << degree
+                << " kind=" << static_cast<int>(kind);
+        }
+    }
+}
+
+/**
+ * @brief Proves HIP request batching is byte-identical to independent decode.
+ *
+ * Unequal real lengths and hostile padding exercise the resident length row.
+ * Real prefill outputs must match independent one-request production kernels,
+ * and a following grouped decode row must also match, proving that both
+ * short-conv and GDN committed request-local state at the real terminal row.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, RequestBatchedUnequalLengthsPreserveByteExactContinuation)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+    HipStreamHandle stream;
+
+    constexpr int request_count = 2;
+    constexpr int request_seq_len = 6;
+    constexpr int total_rows = request_count * request_seq_len;
+    constexpr int real_lengths[request_count] = {6, 4};
+
+    auto extract_rows = [](
+                            const std::vector<float> &matrix,
+                            int first_row,
+                            int row_count,
+                            int width)
+    {
+        const size_t begin =
+            static_cast<size_t>(first_row) * static_cast<size_t>(width);
+        const size_t count =
+            static_cast<size_t>(row_count) * static_cast<size_t>(width);
+        return std::vector<float>(
+            matrix.begin() + static_cast<std::ptrdiff_t>(begin),
+            matrix.begin() + static_cast<std::ptrdiff_t>(begin + count));
+    };
+
+    HipIntBuffer request_lengths({real_lengths[0], real_lengths[1]});
+    HipIntBuffer one_row_lengths({1, 1});
+
+    /*
+     * Dense Qwen 3.6 uses 16 source Q/K heads and 48 value heads at width
+     * 128, so the pre-deinterleave ShortConv row is
+     * 16*128 + 16*128 + 48*128 = 10,240 channels.  Keeping the production
+     * width here catches request-offset and scratch-capacity defects hidden by
+     * toy channel counts.
+     */
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    std::vector<float> conv_input(
+        static_cast<size_t>(total_rows) * channels);
+    for (int request = 0; request < request_count; ++request)
+    {
+        for (int row = 0; row < request_seq_len; ++row)
+        {
+            for (int channel = 0; channel < channels; ++channel)
+            {
+                const size_t index =
+                    (static_cast<size_t>(request) * request_seq_len + row) * channels +
+                    channel;
+                conv_input[index] =
+                    row < real_lengths[request]
+                        ? 0.003f * static_cast<float>((request + 1) * (row + 2)) +
+                              0.0002f * static_cast<float>((channel % 13) - 6)
+                        : 500.0f + static_cast<float>(17 * row + channel);
+            }
+        }
+    }
+    std::vector<float> conv_decode(
+        static_cast<size_t>(request_count) * channels);
+    for (int request = 0; request < request_count; ++request)
+    {
+        for (int channel = 0; channel < channels; ++channel)
+        {
+            conv_decode[static_cast<size_t>(request) * channels + channel] =
+                -0.007f * static_cast<float>(request + 1) +
+                0.0003f * static_cast<float>((channel % 9) - 4);
+        }
+    }
+    const std::vector<float> conv_weights =
+        makeShortConvWeights(channels, kernel_size);
+    std::vector<float> conv_bias(channels);
+    for (int channel = 0; channel < channels; ++channel)
+        conv_bias[channel] = 0.001f * static_cast<float>((channel % 7) - 3);
+
+    HipFloatBuffer d_conv_inout(conv_input);
+    HipFloatBuffer d_conv_decode_inout(conv_decode);
+    HipFloatBuffer d_conv_scratch(conv_input.size(), -99.0f);
+    HipFloatBuffer d_conv_weights(conv_weights);
+    HipFloatBuffer d_conv_bias(conv_bias);
+    ROCmShortConvolution grouped_conv(0);
+    HipGDNStateOwner grouped_conv_state_owner(
+        grouped_conv, channels * (kernel_size - 1));
+    grouped_conv.setGPUStream(stream.stream);
+    grouped_conv.bindScratchWorkspace(
+        d_conv_scratch.ptr,
+        static_cast<int>(d_conv_scratch.count));
+
+    ASSERT_TRUE(grouped_conv.forwardBatchedRequestsWithDeviceSeqLens(
+        d_conv_inout.ptr, d_conv_weights.ptr, d_conv_bias.ptr,
+        d_conv_inout.ptr, /*conv_state=*/nullptr,
+        total_rows, request_count, request_seq_len,
+        channels, kernel_size, request_lengths.ptr,
+        /*apply_silu=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(short-conv prefill)");
+    const std::vector<float> grouped_conv_prefill = d_conv_inout.toHost();
+
+    ASSERT_TRUE(grouped_conv.forwardBatchedRequestsWithDeviceSeqLens(
+        d_conv_decode_inout.ptr, d_conv_weights.ptr, d_conv_bias.ptr,
+        d_conv_decode_inout.ptr, /*conv_state=*/nullptr,
+        /*seq_len=*/request_count,
+        request_count, /*request_seq_len=*/1,
+        channels, kernel_size, one_row_lengths.ptr,
+        /*apply_silu=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(short-conv decode)");
+    const std::vector<float> grouped_conv_decode = d_conv_decode_inout.toHost();
+
+    for (int request = 0; request < request_count; ++request)
+    {
+        const std::vector<float> scalar_input = extract_rows(
+            conv_input, request * request_seq_len,
+            real_lengths[request], channels);
+        const std::vector<float> scalar_decode_input = extract_rows(
+            conv_decode, request, /*row_count=*/1, channels);
+        HipFloatBuffer d_scalar_input(scalar_input);
+        HipFloatBuffer d_scalar_output(scalar_input.size(), -77.0f);
+        HipFloatBuffer d_scalar_decode(scalar_decode_input);
+        HipFloatBuffer d_scalar_decode_output(channels, -77.0f);
+        ROCmShortConvolution scalar_conv(0);
+        HipGDNStateOwner scalar_conv_state_owner(
+            scalar_conv, channels * (kernel_size - 1));
+        scalar_conv.setGPUStream(stream.stream);
+
+        ASSERT_TRUE(scalar_conv.forward(
+            d_scalar_input.ptr, d_conv_weights.ptr, d_conv_bias.ptr,
+            d_scalar_output.ptr, /*conv_state=*/nullptr,
+            real_lengths[request], channels, kernel_size,
+            /*apply_silu=*/true));
+        ASSERT_TRUE(scalar_conv.forward(
+            d_scalar_decode.ptr, d_conv_weights.ptr, d_conv_bias.ptr,
+            d_scalar_decode_output.ptr, /*conv_state=*/nullptr,
+            /*seq_len=*/1, channels, kernel_size,
+            /*apply_silu=*/true));
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(short-conv oracle)");
+
+        const std::vector<float> grouped_real = extract_rows(
+            grouped_conv_prefill,
+            request * request_seq_len,
+            real_lengths[request], channels);
+        expectByteExactEquivalent(
+            "ROCm request-batched short-conv prefill",
+            grouped_real, d_scalar_output.toHost(),
+            /*offset=*/0, grouped_real.size());
+        const std::vector<float> grouped_decode_row = extract_rows(
+            grouped_conv_decode, request, /*row_count=*/1, channels);
+        expectByteExactEquivalent(
+            "ROCm request-batched short-conv continuation",
+            grouped_decode_row, d_scalar_decode_output.toHost(),
+            /*offset=*/0, grouped_decode_row.size());
+        const std::vector<float> padded_rows = extract_rows(
+            grouped_conv_prefill,
+            request * request_seq_len + real_lengths[request],
+            request_seq_len - real_lengths[request], channels);
+        EXPECT_EQ(maxAbsSpan(padded_rows, 0, padded_rows.size()), 0.0f)
+            << "ROCm short-conv must zero padded rows for request " << request;
+    }
+
+    constexpr int n_heads = 48;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int qk_width = n_heads * d_k;
+    constexpr int v_width = n_heads * d_v;
+    constexpr int gate_width = n_heads;
+    constexpr int gdn_state_floats = n_heads * d_k * d_v;
+    std::vector<float> Q(static_cast<size_t>(total_rows) * qk_width);
+    std::vector<float> K(Q.size());
+    std::vector<float> V(static_cast<size_t>(total_rows) * v_width);
+    std::vector<float> alpha(static_cast<size_t>(total_rows) * gate_width);
+    std::vector<float> beta(alpha.size());
+    for (int request = 0; request < request_count; ++request)
+    {
+        for (int row = 0; row < request_seq_len; ++row)
+        {
+            const bool real = row < real_lengths[request];
+            const int flat_row = request * request_seq_len + row;
+            for (int col = 0; col < qk_width; ++col)
+            {
+                const float base =
+                    0.0007f * static_cast<float>((flat_row + 1) * ((col % 17) - 8));
+                Q[static_cast<size_t>(flat_row) * qk_width + col] =
+                    real ? base + 0.013f : 300.0f + static_cast<float>(col);
+                K[static_cast<size_t>(flat_row) * qk_width + col] =
+                    real ? base * 0.73f - 0.009f : -400.0f - static_cast<float>(col);
+            }
+            for (int col = 0; col < v_width; ++col)
+            {
+                V[static_cast<size_t>(flat_row) * v_width + col] =
+                    real
+                        ? 0.0011f * static_cast<float>((flat_row + 2) * ((col % 11) - 5))
+                        : 250.0f + static_cast<float>(col);
+            }
+            for (int head = 0; head < n_heads; ++head)
+            {
+                const size_t gate_index =
+                    static_cast<size_t>(flat_row) * gate_width + head;
+                alpha[gate_index] =
+                    real
+                        ? -0.3f + 0.02f * row +
+                              0.0005f * static_cast<float>((head % 7) - 3)
+                        : 20.0f;
+                beta[gate_index] =
+                    real
+                        ? 0.15f - 0.01f * row +
+                              0.0004f * static_cast<float>((head % 5) - 2)
+                        : -20.0f;
+            }
+        }
+    }
+
+    std::vector<float> decode_Q(static_cast<size_t>(request_count) * qk_width);
+    std::vector<float> decode_K(decode_Q.size());
+    std::vector<float> decode_V(static_cast<size_t>(request_count) * v_width);
+    std::vector<float> decode_alpha(
+        static_cast<size_t>(request_count) * gate_width);
+    std::vector<float> decode_beta(
+        static_cast<size_t>(request_count) * gate_width);
+    for (int request = 0; request < request_count; ++request)
+    {
+        for (int col = 0; col < qk_width; ++col)
+        {
+            decode_Q[static_cast<size_t>(request) * qk_width + col] =
+                0.0009f * static_cast<float>((request + 2) * ((col % 19) - 9));
+            decode_K[static_cast<size_t>(request) * qk_width + col] =
+                -0.0008f * static_cast<float>((request + 1) * ((col % 13) - 6));
+        }
+        for (int col = 0; col < v_width; ++col)
+        {
+            decode_V[static_cast<size_t>(request) * v_width + col] =
+                0.0013f * static_cast<float>((request + 1) * ((col % 7) - 3));
+        }
+        for (int head = 0; head < n_heads; ++head)
+        {
+            const size_t gate_index =
+                static_cast<size_t>(request) * gate_width + head;
+            decode_alpha[gate_index] =
+                -0.21f + 0.01f * request +
+                0.0003f * static_cast<float>((head % 7) - 3);
+            decode_beta[gate_index] =
+                0.12f - 0.02f * request +
+                0.0002f * static_cast<float>((head % 5) - 2);
+        }
+    }
+    const std::vector<float> A_log(n_heads, -0.45f);
+    const std::vector<float> dt_bias(n_heads, 0.08f);
+
+    HipFloatBuffer d_Q(Q);
+    HipFloatBuffer d_K(K);
+    HipFloatBuffer d_V(V);
+    HipFloatBuffer d_alpha(alpha);
+    HipFloatBuffer d_beta(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_gdn_output(static_cast<size_t>(total_rows) * v_width, -55.0f);
+    HipFloatBuffer d_decode_Q(decode_Q);
+    HipFloatBuffer d_decode_K(decode_K);
+    HipFloatBuffer d_decode_V(decode_V);
+    HipFloatBuffer d_decode_alpha(decode_alpha);
+    HipFloatBuffer d_decode_beta(decode_beta);
+    HipFloatBuffer d_gdn_decode_output(static_cast<size_t>(request_count) * v_width, -55.0f);
+    ROCmGatedDeltaNet grouped_gdn(0);
+    HipGDNStateOwner grouped_gdn_state_owner(
+        grouped_gdn, gdn_state_floats);
+    grouped_gdn.setGPUStream(stream.stream);
+
+    ASSERT_TRUE(grouped_gdn.chunkForwardBatchedRequestsWithDeviceSeqLens(
+        d_Q.ptr, d_K.ptr, d_V.ptr,
+        d_alpha.ptr, d_beta.ptr,
+        d_A_log.ptr, d_dt_bias.ptr,
+        d_gdn_output.ptr, /*state=*/nullptr,
+        total_rows, request_count, request_seq_len,
+        n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true,
+        request_lengths.ptr));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(GDN prefill)");
+    const std::vector<float> grouped_gdn_prefill = d_gdn_output.toHost();
+    std::vector<float> grouped_gdn_prefill_state(
+        static_cast<size_t>(request_count) * gdn_state_floats);
+    ASSERT_TRUE(grouped_gdn.exportRequestStateBank(
+        grouped_gdn_prefill_state.data(),
+        request_count,
+        gdn_state_floats,
+        stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(GDN request-state observation)");
+
+    ASSERT_TRUE(grouped_gdn.chunkForwardBatchedRequestsWithDeviceSeqLens(
+        d_decode_Q.ptr, d_decode_K.ptr, d_decode_V.ptr,
+        d_decode_alpha.ptr, d_decode_beta.ptr,
+        d_A_log.ptr, d_dt_bias.ptr,
+        d_gdn_decode_output.ptr, /*state=*/nullptr,
+        /*seq_len=*/request_count,
+        request_count, /*request_seq_len=*/1,
+        n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true,
+        one_row_lengths.ptr));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(GDN decode)");
+    const std::vector<float> grouped_gdn_decode = d_gdn_decode_output.toHost();
+
+    for (int request = 0; request < request_count; ++request)
+    {
+        HipFloatBuffer d_scalar_Q(extract_rows(
+            Q, request * request_seq_len, real_lengths[request], qk_width));
+        HipFloatBuffer d_scalar_K(extract_rows(
+            K, request * request_seq_len, real_lengths[request], qk_width));
+        HipFloatBuffer d_scalar_V(extract_rows(
+            V, request * request_seq_len, real_lengths[request], v_width));
+        HipFloatBuffer d_scalar_alpha(extract_rows(
+            alpha, request * request_seq_len, real_lengths[request], gate_width));
+        HipFloatBuffer d_scalar_beta(extract_rows(
+            beta, request * request_seq_len, real_lengths[request], gate_width));
+        HipFloatBuffer d_scalar_output(
+            static_cast<size_t>(real_lengths[request]) * v_width, -33.0f);
+        HipFloatBuffer d_scalar_decode_Q(extract_rows(decode_Q, request, 1, qk_width));
+        HipFloatBuffer d_scalar_decode_K(extract_rows(decode_K, request, 1, qk_width));
+        HipFloatBuffer d_scalar_decode_V(extract_rows(decode_V, request, 1, v_width));
+        HipFloatBuffer d_scalar_decode_alpha(extract_rows(decode_alpha, request, 1, gate_width));
+        HipFloatBuffer d_scalar_decode_beta(extract_rows(decode_beta, request, 1, gate_width));
+        HipFloatBuffer d_scalar_decode_output(v_width, -33.0f);
+        ROCmGatedDeltaNet scalar_gdn(0);
+        HipGDNStateOwner scalar_gdn_state_owner(
+            scalar_gdn, gdn_state_floats);
+        scalar_gdn.setGPUStream(stream.stream);
+
+        ASSERT_TRUE(scalar_gdn.chunk_forward(
+            d_scalar_Q.ptr, d_scalar_K.ptr, d_scalar_V.ptr,
+            d_scalar_alpha.ptr, d_scalar_beta.ptr,
+            d_A_log.ptr, d_dt_bias.ptr,
+            d_scalar_output.ptr, /*state=*/nullptr,
+            real_lengths[request], n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+        std::vector<float> scalar_gdn_prefill_state(gdn_state_floats);
+        ASSERT_TRUE(scalar_gdn.exportState(
+            scalar_gdn_prefill_state.data(),
+            /*dst_device=*/nullptr,
+            stream.stream));
+        ASSERT_TRUE(scalar_gdn.recurrent_step(
+            d_scalar_decode_Q.ptr, d_scalar_decode_K.ptr, d_scalar_decode_V.ptr,
+            d_scalar_decode_alpha.ptr, d_scalar_decode_beta.ptr,
+            d_A_log.ptr, d_dt_bias.ptr,
+            d_scalar_decode_output.ptr, /*state=*/nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(GDN oracle)");
+
+        const size_t grouped_state_begin =
+            static_cast<size_t>(request) * gdn_state_floats;
+        const std::vector<float> grouped_request_prefill_state(
+            grouped_gdn_prefill_state.begin() +
+                static_cast<std::ptrdiff_t>(grouped_state_begin),
+            grouped_gdn_prefill_state.begin() +
+                static_cast<std::ptrdiff_t>(
+                    grouped_state_begin + gdn_state_floats));
+        expectByteExactEquivalent(
+            "ROCm request-batched GDN prefill state",
+            grouped_request_prefill_state,
+            scalar_gdn_prefill_state,
+            /*offset=*/0,
+            static_cast<size_t>(gdn_state_floats));
+
+        /*
+         * Run the grouped decode entry point with one request from the same
+         * imported state.  This separates arithmetic drift in the grouped API
+         * itself from request-offset defects that only appear when grid Z is
+         * larger than one.
+         */
+        HipFloatBuffer d_single_grouped_decode_output(v_width, -31.0f);
+        ROCmGatedDeltaNet single_grouped_gdn(0);
+        single_grouped_gdn.setGPUStream(stream.stream);
+        HipGDNStateOwner single_grouped_gdn_state_owner(single_grouped_gdn, gdn_state_floats);
+        ASSERT_TRUE(single_grouped_gdn.importState(
+            scalar_gdn_prefill_state.data(),
+            /*src_device=*/nullptr,
+            stream.stream));
+        ASSERT_TRUE(single_grouped_gdn.chunkForwardBatchedRequestsWithDeviceSeqLens(
+            d_scalar_decode_Q.ptr, d_scalar_decode_K.ptr, d_scalar_decode_V.ptr,
+            d_scalar_decode_alpha.ptr, d_scalar_decode_beta.ptr,
+            d_A_log.ptr, d_dt_bias.ptr,
+            d_single_grouped_decode_output.ptr, /*state=*/nullptr,
+            /*seq_len=*/1, /*request_count=*/1, /*request_seq_len=*/1,
+            n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true,
+            one_row_lengths.ptr));
+        checkHip(
+            hipStreamSynchronize(stream.stream),
+            "hipStreamSynchronize(single-request grouped GDN decode)");
+        expectByteExactEquivalent(
+            "ROCm single-request grouped GDN continuation",
+            d_single_grouped_decode_output.toHost(),
+            d_scalar_decode_output.toHost(),
+            /*offset=*/0,
+            static_cast<size_t>(v_width));
+
+        const std::vector<float> grouped_real = extract_rows(
+            grouped_gdn_prefill,
+            request * request_seq_len,
+            real_lengths[request], v_width);
+        expectByteExactEquivalent(
+            "ROCm request-batched GDN prefill",
+            grouped_real, d_scalar_output.toHost(),
+            /*offset=*/0, grouped_real.size());
+        const std::vector<float> grouped_decode_row = extract_rows(
+            grouped_gdn_decode, request, /*row_count=*/1, v_width);
+        expectByteExactEquivalent(
+            "ROCm request-batched GDN continuation",
+            grouped_decode_row, d_scalar_decode_output.toHost(),
+            /*offset=*/0, grouped_decode_row.size());
+        const std::vector<float> padded_rows = extract_rows(
+            grouped_gdn_prefill,
+            request * request_seq_len + real_lengths[request],
+            request_seq_len - real_lengths[request], v_width);
+        EXPECT_EQ(maxAbsSpan(padded_rows, 0, padded_rows.size()), 0.0f)
+            << "ROCm GDN must zero padded rows for request " << request;
+    }
+}
+
+TEST(
+    Test__ROCmGDNPaddedRealLength,
+    StateBankGeometryLookupDoesNotMutateStableBindingsUnderCaptureGuard)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    HipStreamHandle stream;
+
+    constexpr int local_heads = 1;
+    constexpr int full_heads = 2;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int seq_len = 2;
+    constexpr int local_recurrence_state = local_heads * d_k * d_v;
+    constexpr int full_recurrence_state = full_heads * d_k * d_v;
+    constexpr int full_qk_stride = full_heads * d_k;
+    constexpr int full_v_stride = full_heads * d_v;
+
+    ROCmGatedDeltaNet recurrence(0);
+    recurrence.setGPUStream(stream.stream);
+    HipGDNStateOwner recurrence_state_owner(
+        recurrence, local_recurrence_state, full_recurrence_state);
+    ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state));
+    ASSERT_TRUE(recurrence.isGPUStateReady(full_recurrence_state));
+    ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state))
+        << "Full decode-state handoff must not discard the local prefill state slot";
+    ASSERT_EQ(recurrence.stateBytes(), static_cast<size_t>(local_recurrence_state) * sizeof(float));
+
+    HipFloatBuffer d_q(static_cast<size_t>(seq_len) * full_qk_stride, 0.01f);
+    HipFloatBuffer d_kbuf(static_cast<size_t>(seq_len) * full_qk_stride, 0.02f);
+    HipFloatBuffer d_vbuf(static_cast<size_t>(seq_len) * full_v_stride, 0.03f);
+    HipFloatBuffer d_alpha(static_cast<size_t>(seq_len) * full_heads, 0.2f);
+    HipFloatBuffer d_beta(static_cast<size_t>(seq_len) * full_heads, -0.1f);
+    HipFloatBuffer d_A_log(static_cast<size_t>(full_heads), -0.5f);
+    HipFloatBuffer d_dt_bias(static_cast<size_t>(full_heads), 0.1f);
+    HipFloatBuffer d_recurrence_out(static_cast<size_t>(seq_len) * full_v_stride, 0.0f);
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(recurrence.chunk_forward(
+            d_q.ptr, d_kbuf.ptr, d_vbuf.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_recurrence_out.ptr, nullptr,
+            seq_len, local_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/false));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(local recurrence slot)");
+    EXPECT_EQ(recurrence.stateBytes(), static_cast<size_t>(local_recurrence_state) * sizeof(float));
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(recurrence.recurrent_step(
+            d_q.ptr, d_kbuf.ptr, d_vbuf.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_recurrence_out.ptr, nullptr,
+            full_heads, d_k, d_v,
+            /*use_qk_l2norm=*/false));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(full recurrence slot)");
+    EXPECT_EQ(
+        recurrence.stateBytes(),
+        static_cast<size_t>(local_recurrence_state) * sizeof(float));
+    EXPECT_EQ(
+        recurrence.largestStateBytes(),
+        static_cast<size_t>(full_recurrence_state) * sizeof(float));
+
+    constexpr int local_channels = 64;
+    constexpr int full_channels = 128;
+    constexpr int kernel_size = 4;
+    constexpr int local_conv_state = local_channels * (kernel_size - 1);
+    constexpr int full_conv_state = full_channels * (kernel_size - 1);
+
+    ROCmShortConvolution conv(0);
+    conv.setGPUStream(stream.stream);
+    HipGDNStateOwner conv_state_owner(
+        conv, local_conv_state, full_conv_state);
+    ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
+    ASSERT_EQ(
+        conv.largestStateBytes(),
+        static_cast<size_t>(full_conv_state) * sizeof(float));
+
+    const auto weights = makeShortConvWeights(full_channels, kernel_size);
+    const auto bias = makeBias(full_channels);
+    HipFloatBuffer d_input(static_cast<size_t>(seq_len) * full_channels, 0.04f);
+    HipFloatBuffer d_weight(weights);
+    HipFloatBuffer d_bias(bias);
+    HipFloatBuffer d_conv_out(static_cast<size_t>(seq_len) * full_channels, 0.0f);
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(conv.forward(
+            d_input.ptr, d_weight.ptr, d_bias.ptr,
+            d_conv_out.ptr, nullptr,
+            seq_len, local_channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(local short-conv slot)");
+    EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(conv.forward(
+            d_input.ptr, d_weight.ptr, d_bias.ptr,
+            d_conv_out.ptr, nullptr,
+            seq_len, full_channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(full short-conv slot)");
+    EXPECT_EQ(
+        conv.stateBytes(),
+        static_cast<size_t>(local_conv_state) * sizeof(float));
+    EXPECT_EQ(
+        conv.largestStateBytes(),
+        static_cast<size_t>(full_conv_state) * sizeof(float));
+}
+
+/**
+ * @brief Proves HIP replay republishes LocalTP full state to request zero.
+ *
+ * The captured executable performs local stateful work followed by a
+ * local-to-full handoff. Resetting all banks and replaying that executable must
+ * rebuild both the full live bank and the packed request view without a host
+ * validity field being updated by the C++ wrappers.
+ */
+TEST(
+    Test__ROCmGDNPaddedRealLength,
+    CapturedLocalToFullHandoffPublishesRequestBanksOnEveryReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    HipStreamHandle stream;
+
+    constexpr int local_heads = 1;
+    constexpr int full_heads = 2;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int seq_len = 2;
+    constexpr int local_qk_stride = local_heads * d_k;
+    constexpr int local_v_stride = local_heads * d_v;
+    constexpr int local_recurrence_state = local_heads * d_k * d_v;
+    constexpr int full_recurrence_state = full_heads * d_k * d_v;
+
+    ROCmGatedDeltaNet recurrence(0);
+    recurrence.setGPUStream(stream.stream);
+    HipGDNStateOwner recurrence_state_owner(
+        recurrence,
+        local_recurrence_state,
+        full_recurrence_state);
+
+    HipFloatBuffer d_q(
+        static_cast<size_t>(seq_len) * local_qk_stride,
+        0.01f);
+    HipFloatBuffer d_kbuf(
+        static_cast<size_t>(seq_len) * local_qk_stride,
+        0.02f);
+    HipFloatBuffer d_vbuf(
+        static_cast<size_t>(seq_len) * local_v_stride,
+        0.03f);
+    HipFloatBuffer d_alpha(
+        static_cast<size_t>(seq_len) * local_heads,
+        0.2f);
+    HipFloatBuffer d_beta(
+        static_cast<size_t>(seq_len) * local_heads,
+        -0.1f);
+    HipFloatBuffer d_A_log(static_cast<size_t>(local_heads), -0.5f);
+    HipFloatBuffer d_dt_bias(static_cast<size_t>(local_heads), 0.1f);
+    HipFloatBuffer d_recurrence_out(
+        static_cast<size_t>(seq_len) * local_v_stride,
+        0.0f);
+    const auto full_recurrence_payload =
+        makeInitialState(static_cast<size_t>(full_recurrence_state), 0.00031f);
+    HipFloatBuffer d_full_recurrence(full_recurrence_payload);
+
+    HipCapturedGraph recurrence_graph(
+        stream.stream,
+        [&]()
+        {
+            return recurrence.chunk_forward(
+                       d_q.ptr,
+                       d_kbuf.ptr,
+                       d_vbuf.ptr,
+                       d_alpha.ptr,
+                       d_beta.ptr,
+                       d_A_log.ptr,
+                       d_dt_bias.ptr,
+                       d_recurrence_out.ptr,
+                       nullptr,
+                       seq_len,
+                       local_heads,
+                       d_k,
+                       d_v,
+                       /*chunk_size=*/64,
+                       /*use_qk_l2norm=*/false) &&
+                   recurrence.importStateForSize(
+                       full_recurrence_state,
+                       /*src_host=*/nullptr,
+                       d_full_recurrence.ptr,
+                       stream.stream);
+        });
+
+    ASSERT_TRUE(recurrence.resetGPUState(stream.stream));
+    recurrence_graph.launch(stream.stream);
+    std::vector<float> recurrence_live(
+        static_cast<size_t>(full_recurrence_state));
+    std::vector<float> recurrence_request(
+        static_cast<size_t>(full_recurrence_state));
+    ASSERT_TRUE(recurrence.exportStateForSize(
+        full_recurrence_state,
+        recurrence_live.data(),
+        /*dst_device=*/nullptr,
+        stream.stream));
+    ASSERT_TRUE(recurrence.exportRequestStateBank(
+        recurrence_request.data(),
+        /*request_count=*/1,
+        full_recurrence_state,
+        stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(replayed recurrence publication)");
+    expectByteExactEquivalent(
+        "captured ROCm recurrence request-state publication",
+        recurrence_request,
+        recurrence_live,
+        /*offset=*/0,
+        recurrence_live.size());
+
+    constexpr int local_channels = 64;
+    constexpr int full_channels = 128;
+    constexpr int kernel_size = 4;
+    constexpr int local_conv_state = local_channels * (kernel_size - 1);
+    constexpr int full_conv_state = full_channels * (kernel_size - 1);
+
+    ROCmShortConvolution conv(0);
+    conv.setGPUStream(stream.stream);
+    HipGDNStateOwner conv_state_owner(
+        conv,
+        local_conv_state,
+        full_conv_state);
+    const auto conv_weights =
+        makeShortConvWeights(local_channels, kernel_size);
+    const auto conv_bias = makeBias(local_channels);
+    HipFloatBuffer d_conv_input(
+        static_cast<size_t>(seq_len) * local_channels,
+        0.04f);
+    HipFloatBuffer d_conv_weight(conv_weights);
+    HipFloatBuffer d_conv_bias(conv_bias);
+    HipFloatBuffer d_conv_out(
+        static_cast<size_t>(seq_len) * local_channels,
+        0.0f);
+    const auto full_conv_payload =
+        makeInitialState(static_cast<size_t>(full_conv_state), 0.0061f);
+    HipFloatBuffer d_full_conv(full_conv_payload);
+
+    HipCapturedGraph conv_graph(
+        stream.stream,
+        [&]()
+        {
+            return conv.forward(
+                       d_conv_input.ptr,
+                       d_conv_weight.ptr,
+                       d_conv_bias.ptr,
+                       d_conv_out.ptr,
+                       nullptr,
+                       seq_len,
+                       local_channels,
+                       kernel_size,
+                       /*apply_silu=*/true) &&
+                   conv.importStateForSize(
+                       full_conv_state,
+                       /*src_host=*/nullptr,
+                       d_full_conv.ptr,
+                       stream.stream);
+        });
+
+    ASSERT_TRUE(conv.resetGPUState(stream.stream));
+    conv_graph.launch(stream.stream);
+    std::vector<float> conv_live(static_cast<size_t>(full_conv_state));
+    std::vector<float> conv_request(static_cast<size_t>(full_conv_state));
+    ASSERT_TRUE(conv.exportStateForSize(
+        full_conv_state,
+        conv_live.data(),
+        /*dst_device=*/nullptr,
+        stream.stream));
+    ASSERT_TRUE(conv.exportRequestStateBank(
+        conv_request.data(),
+        /*request_count=*/1,
+        full_conv_state,
+        stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(replayed short-conv publication)");
+    expectByteExactEquivalent(
+        "captured ROCm short-conv request-state publication",
+        conv_request,
+        conv_live,
+        /*offset=*/0,
+        conv_live.size());
+}
 
 TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDecode)
 {
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm device available";
     checkHip(hipSetDevice(0), "hipSetDevice");
+    HipStreamHandle stream;
 
     constexpr int n_heads = 2;
     constexpr int d_k = 128;
@@ -445,14 +1482,15 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDec
         HipIntBuffer d_effective_len(real_len);
 
         ROCmGatedDeltaNet padded_kernel(0);
-        padded_kernel.allocateGPUState(n_heads * d_k * d_v);
+        HipGDNStateOwner padded_kernel_state_owner(padded_kernel, n_heads * d_k * d_v);
+        padded_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(padded_kernel.chunkForwardWithEffectiveSeqLen(
             d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
             d_padded_out.ptr, nullptr,
             bucket_len, n_heads, d_k, d_v,
             /*chunk_size=*/64, /*use_qk_l2norm=*/true,
             d_effective_len.ptr));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(padded recurrence prefill)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(padded recurrence prefill)");
         ASSERT_TRUE(padded_kernel.recurrent_step(
             d_Q.ptr + static_cast<size_t>(decode_row) * qk_stride,
             d_K.ptr + static_cast<size_t>(decode_row) * qk_stride,
@@ -465,16 +1503,17 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDec
             nullptr,
             n_heads, d_k, d_v,
             /*use_qk_l2norm=*/true));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(padded recurrence decode)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(padded recurrence decode)");
 
         ROCmGatedDeltaNet ref_kernel(0);
-        ref_kernel.allocateGPUState(n_heads * d_k * d_v);
+        HipGDNStateOwner ref_kernel_state_owner(ref_kernel, n_heads * d_k * d_v);
+        ref_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(ref_kernel.chunk_forward(
             d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
             d_ref_out.ptr, nullptr,
             real_len, n_heads, d_k, d_v,
             /*chunk_size=*/64, /*use_qk_l2norm=*/true));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(reference recurrence prefill)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(reference recurrence prefill)");
         ASSERT_TRUE(ref_kernel.recurrent_step(
             d_Q.ptr + static_cast<size_t>(decode_row) * qk_stride,
             d_K.ptr + static_cast<size_t>(decode_row) * qk_stride,
@@ -487,7 +1526,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDec
             nullptr,
             n_heads, d_k, d_v,
             /*use_qk_l2norm=*/true));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(reference recurrence decode)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(reference recurrence decode)");
 
         const auto padded = d_padded_out.toHost();
         const auto ref = d_ref_out.toHost();
@@ -511,6 +1550,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeStat
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm device available";
     checkHip(hipSetDevice(0), "hipSetDevice");
+    HipStreamHandle stream;
 
     constexpr int channels = 32;
     constexpr int kernel_size = 4;
@@ -534,14 +1574,15 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeStat
         HipIntBuffer d_effective_len(real_len);
 
         ROCmShortConvolution padded_kernel(0);
-        padded_kernel.allocateGPUState(channels * (kernel_size - 1));
+        HipGDNStateOwner padded_kernel_state_owner(padded_kernel, channels * (kernel_size - 1));
+        padded_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(padded_kernel.forwardWithEffectiveSeqLen(
             d_input.ptr, d_weight.ptr, d_bias.ptr,
             d_padded_out.ptr, nullptr,
             bucket_len, channels, kernel_size,
             d_effective_len.ptr,
             /*apply_silu=*/true));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(padded short-conv prefill)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(padded short-conv prefill)");
         ASSERT_TRUE(padded_kernel.forward(
             d_input.ptr + static_cast<size_t>(decode_row) * channels,
             d_weight.ptr,
@@ -550,16 +1591,17 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeStat
             nullptr,
             1, channels, kernel_size,
             /*apply_silu=*/true));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(padded short-conv decode)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(padded short-conv decode)");
 
         ROCmShortConvolution ref_kernel(0);
-        ref_kernel.allocateGPUState(channels * (kernel_size - 1));
+        HipGDNStateOwner ref_kernel_state_owner(ref_kernel, channels * (kernel_size - 1));
+        ref_kernel.setGPUStream(stream.stream);
         ASSERT_TRUE(ref_kernel.forward(
             d_input.ptr, d_weight.ptr, d_bias.ptr,
             d_ref_out.ptr, nullptr,
             real_len, channels, kernel_size,
             /*apply_silu=*/true));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(reference short-conv prefill)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(reference short-conv prefill)");
         ASSERT_TRUE(ref_kernel.forward(
             d_input.ptr + static_cast<size_t>(decode_row) * channels,
             d_weight.ptr,
@@ -568,7 +1610,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeStat
             nullptr,
             1, channels, kernel_size,
             /*apply_silu=*/true));
-        checkHip(hipDeviceSynchronize(), "hipDeviceSynchronize(reference short-conv decode)");
+        checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(reference short-conv decode)");
 
         const auto padded = d_padded_out.toHost();
         const auto ref = d_ref_out.toHost();
@@ -638,7 +1680,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     std::vector<float> initial_live_state(static_cast<size_t>(state_floats));
     ASSERT_TRUE(verifier_kernel.exportState(initial_live_state.data(), nullptr, nullptr));
@@ -652,13 +1694,16 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(verifier recurrence capture)");
     std::vector<float> live_state_before_publish(static_cast<size_t>(state_floats));
     ASSERT_TRUE(verifier_kernel.exportState(live_state_before_publish.data(), nullptr, nullptr));
-    std::vector<float> restored_host_mirror(
-        static_cast<size_t>(state_floats),
-        -123.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
-    expectHostMirrorMatchesSnapshotRow(
-        restored_host_mirror,
+        nullptr, accepted_rows - 1, stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(publish recurrence snapshot)");
+    std::vector<float> published_device_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(
+        published_device_state.data(), nullptr, nullptr));
+    expectPublishedDeviceStateMatchesSnapshotRow(
+        published_device_state,
         d_snapshots,
         accepted_rows - 1,
         state_floats);
@@ -679,7 +1724,8 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored recurrence decode)");
 
     ROCmGatedDeltaNet ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
+    ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.chunk_forward(
         d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
         d_ref_prefix.ptr, nullptr,
@@ -766,7 +1812,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiStep
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -776,13 +1822,16 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiStep
         d_verifier_out.ptr, nullptr,
         verifier_len, n_heads, d_k, d_v,
         /*chunk_size=*/64, /*use_qk_l2norm=*/true));
-    std::vector<float> restored_host_mirror(
-        static_cast<size_t>(state_floats),
-        -456.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
-    expectHostMirrorMatchesSnapshotRow(
-        restored_host_mirror,
+        nullptr, accepted_rows - 1, stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(publish multi-row recurrence snapshot)");
+    std::vector<float> published_device_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(
+        published_device_state.data(), nullptr, nullptr));
+    expectPublishedDeviceStateMatchesSnapshotRow(
+        published_device_state,
         d_snapshots,
         accepted_rows - 1,
         state_floats);
@@ -809,7 +1858,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiStep
     ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, stream.stream));
 
     ROCmGatedDeltaNet ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_kernel.chunk_forward(
@@ -888,7 +1937,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.chunk_forward(
@@ -901,7 +1950,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -932,6 +1981,284 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
     EXPECT_LT(state_diff.first, 2e-4f);
     EXPECT_LT(state_diff.second, 1e-4)
         << "ROCm M=4 recurrence must leave the same kernel-owned state as four decode steps";
+}
+
+/**
+ * @brief Proves the optimized Qwen 3.6 MoE long-prefill route is M-total and serial-row exact.
+ *
+ * Widths through eight intentionally use the grouped recurrent kernel, whereas
+ * an ordinary prefill longer than eight rows selects the specialized
+ * `rocm_gdn_chunk_forward_kernel<32, 128, 128, 256>` production route. That
+ * specialization retains recurrent state in VGPR/LDS storage and evaluates all
+ * token-independent gate expressions cooperatively before entering the causal
+ * recurrence. The sweep starts immediately above the dispatch boundary, probes
+ * powers of two on both sides, and includes the live 425-row request plus the
+ * enclosing 512-row capture bucket. Every output row and the terminal state are
+ * compared to ordered M=1 decode launches with raw byte equality: a changed
+ * reduction tree or transcendental expression would otherwise seed divergent
+ * MTP continuation state even when a relaxed numerical tolerance appears safe.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, RecurrenceLongPrefillQwen36MoEStaticChunkMTotalityMatchesSerialDecodeByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_heads = 32;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr int prefill_lengths[] = {
+        9, 16, 31, 32, 63, 64, 127, 128, 425, 512};
+
+    for (const int prefill_len : prefill_lengths)
+    {
+        SCOPED_TRACE("M=" + std::to_string(prefill_len));
+        const size_t output_elems =
+            static_cast<size_t>(prefill_len) * static_cast<size_t>(v_stride);
+
+        const auto Q = makeSequenceRows(
+            prefill_len, qk_stride, prefill_len, prefill_len,
+            0.0037f, 0.0f, 0.0037f);
+        const auto K = makeSequenceRows(
+            prefill_len, qk_stride, prefill_len, prefill_len,
+            -0.0029f, 0.0f, -0.0029f);
+        const auto V = makeSequenceRows(
+            prefill_len, v_stride, prefill_len, prefill_len,
+            0.0043f, 0.0f, 0.0043f);
+        const auto alpha = makeSequenceRows(
+            prefill_len, n_heads, prefill_len, prefill_len,
+            0.037f, 0.0f, 0.037f);
+        const auto beta = makeSequenceRows(
+            prefill_len, n_heads, prefill_len, prefill_len,
+            -0.031f, 0.0f, -0.031f);
+        const auto initial_state = makeInitialState(
+            static_cast<size_t>(state_floats), 0.0017f);
+        const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+        const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+        HipFloatBuffer d_Q(Q);
+        HipFloatBuffer d_K(K);
+        HipFloatBuffer d_V(V);
+        HipFloatBuffer d_alpha(alpha);
+        HipFloatBuffer d_beta(beta);
+        HipFloatBuffer d_A_log(A_log);
+        HipFloatBuffer d_dt_bias(dt_bias);
+        HipFloatBuffer d_chunk_out(output_elems, 0.0f);
+        HipFloatBuffer d_serial_out(output_elems, 0.0f);
+        HipStreamHandle stream;
+
+        ROCmGatedDeltaNet chunk_kernel(0);
+        HipGDNStateOwner chunk_state_owner(chunk_kernel, state_floats);
+        chunk_kernel.setGPUStream(stream.stream);
+        ASSERT_TRUE(chunk_kernel.importState(
+            initial_state.data(), nullptr, stream.stream));
+        ASSERT_TRUE(chunk_kernel.chunk_forward(
+            d_Q.ptr, d_K.ptr, d_V.ptr,
+            d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_chunk_out.ptr, nullptr,
+            prefill_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+
+        ROCmGatedDeltaNet serial_kernel(0);
+        HipGDNStateOwner serial_state_owner(serial_kernel, state_floats);
+        serial_kernel.setGPUStream(stream.stream);
+        ASSERT_TRUE(serial_kernel.importState(
+            initial_state.data(), nullptr, stream.stream));
+        for (int row = 0; row < prefill_len; ++row)
+        {
+            ASSERT_TRUE(serial_kernel.recurrent_step(
+                d_Q.ptr + static_cast<size_t>(row) * qk_stride,
+                d_K.ptr + static_cast<size_t>(row) * qk_stride,
+                d_V.ptr + static_cast<size_t>(row) * v_stride,
+                d_alpha.ptr + static_cast<size_t>(row) * n_heads,
+                d_beta.ptr + static_cast<size_t>(row) * n_heads,
+                d_A_log.ptr,
+                d_dt_bias.ptr,
+                d_serial_out.ptr + static_cast<size_t>(row) * v_stride,
+                nullptr,
+                n_heads, d_k, d_v,
+                /*use_qk_l2norm=*/true));
+        }
+        checkHip(
+            hipStreamSynchronize(stream.stream),
+            "hipStreamSynchronize(static chunk versus serial decode)");
+
+        std::vector<float> chunk_state(static_cast<size_t>(state_floats));
+        std::vector<float> serial_state(static_cast<size_t>(state_floats));
+        ASSERT_TRUE(chunk_kernel.exportState(
+            chunk_state.data(), nullptr, nullptr));
+        ASSERT_TRUE(serial_kernel.exportState(
+            serial_state.data(), nullptr, nullptr));
+
+        const auto chunk_out = d_chunk_out.toHost();
+        const auto serial_out = d_serial_out.toHost();
+        const std::string label =
+            "ROCm Qwen3.6 MoE GDN M" + std::to_string(prefill_len);
+        const std::string output_label = label + " static chunk output";
+        const std::string state_label =
+            label + " static chunk terminal state";
+        expectByteExactEquivalent(
+            output_label.c_str(),
+            chunk_out,
+            serial_out,
+            /*offset=*/0,
+            output_elems);
+        expectByteExactEquivalent(
+            state_label.c_str(),
+            chunk_state,
+            serial_state,
+            /*offset=*/0,
+            chunk_state.size());
+    }
+}
+
+/**
+ * @brief Proves the HIP long-prefill route is byte-total for D_K=64.
+ *
+ * The old generic long kernel unconditionally loaded, updated, snapshotted,
+ * and stored 32 rows for each four-way split. That is valid for D_K=128 but
+ * overruns a D_K=64 state whose split owns only 16 rows. This regression forces
+ * the production long route across every important M boundary and verifies
+ * both normalization policies against ordered scalar decode byte-for-byte.
+ */
+TEST(
+    Test__ROCmGDNPaddedRealLength,
+    RecurrenceLongPrefillDk64MTotalityMatchesSerialDecodeByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_heads = 4;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr int prefill_lengths[] = {
+        9, 16, 31, 32, 63, 64, 127, 128, 425, 512};
+
+    for (const bool use_qk_l2norm : {false, true})
+    {
+        for (const int prefill_len : prefill_lengths)
+        {
+            SCOPED_TRACE(
+                "D_K=64 M=" + std::to_string(prefill_len) +
+                " l2norm=" + std::to_string(use_qk_l2norm));
+            const size_t output_elems =
+                static_cast<size_t>(prefill_len) *
+                static_cast<size_t>(v_stride);
+
+            const auto Q = makeSequenceRows(
+                prefill_len, qk_stride, prefill_len, prefill_len,
+                0.0073f, 0.0f, 0.0073f);
+            const auto K = makeSequenceRows(
+                prefill_len, qk_stride, prefill_len, prefill_len,
+                -0.0061f, 0.0f, -0.0061f);
+            const auto V = makeSequenceRows(
+                prefill_len, v_stride, prefill_len, prefill_len,
+                0.0089f, 0.0f, 0.0089f);
+            const auto alpha = makeSequenceRows(
+                prefill_len, n_heads, prefill_len, prefill_len,
+                0.043f, 0.0f, 0.043f);
+            const auto beta = makeSequenceRows(
+                prefill_len, n_heads, prefill_len, prefill_len,
+                -0.037f, 0.0f, -0.037f);
+            const auto initial_state = makeInitialState(
+                static_cast<size_t>(state_floats), 0.0023f);
+            const std::vector<float> A_log(
+                static_cast<size_t>(n_heads), -0.47f);
+            const std::vector<float> dt_bias(
+                static_cast<size_t>(n_heads), 0.083f);
+
+            HipFloatBuffer d_Q_chunk(Q);
+            HipFloatBuffer d_K_chunk(K);
+            HipFloatBuffer d_V_chunk(V);
+            HipFloatBuffer d_alpha_chunk(alpha);
+            HipFloatBuffer d_beta_chunk(beta);
+            HipFloatBuffer d_Q_serial(Q);
+            HipFloatBuffer d_K_serial(K);
+            HipFloatBuffer d_V_serial(V);
+            HipFloatBuffer d_alpha_serial(alpha);
+            HipFloatBuffer d_beta_serial(beta);
+            HipFloatBuffer d_A_log(A_log);
+            HipFloatBuffer d_dt_bias(dt_bias);
+            HipFloatBuffer d_chunk_out(output_elems, 0.0f);
+            HipFloatBuffer d_serial_out(output_elems, 0.0f);
+            HipStreamHandle stream;
+
+            ROCmGatedDeltaNet chunk_kernel(0);
+            HipGDNStateOwner chunk_state_owner(chunk_kernel, state_floats);
+            chunk_kernel.setGPUStream(stream.stream);
+            ASSERT_TRUE(chunk_kernel.importState(
+                initial_state.data(), nullptr, stream.stream));
+            ASSERT_TRUE(chunk_kernel.chunk_forward(
+                d_Q_chunk.ptr, d_K_chunk.ptr, d_V_chunk.ptr,
+                d_alpha_chunk.ptr, d_beta_chunk.ptr,
+                d_A_log.ptr, d_dt_bias.ptr,
+                d_chunk_out.ptr, nullptr,
+                prefill_len, n_heads, d_k, d_v,
+                /*chunk_size=*/64, use_qk_l2norm));
+
+            ROCmGatedDeltaNet serial_kernel(0);
+            HipGDNStateOwner serial_state_owner(serial_kernel, state_floats);
+            serial_kernel.setGPUStream(stream.stream);
+            ASSERT_TRUE(serial_kernel.importState(
+                initial_state.data(), nullptr, stream.stream));
+            for (int row = 0; row < prefill_len; ++row)
+            {
+                ASSERT_TRUE(serial_kernel.recurrent_step(
+                    d_Q_serial.ptr + static_cast<size_t>(row) * qk_stride,
+                    d_K_serial.ptr + static_cast<size_t>(row) * qk_stride,
+                    d_V_serial.ptr + static_cast<size_t>(row) * v_stride,
+                    d_alpha_serial.ptr + static_cast<size_t>(row) * n_heads,
+                    d_beta_serial.ptr + static_cast<size_t>(row) * n_heads,
+                    d_A_log.ptr,
+                    d_dt_bias.ptr,
+                    d_serial_out.ptr + static_cast<size_t>(row) * v_stride,
+                    nullptr,
+                    n_heads, d_k, d_v,
+                    use_qk_l2norm));
+            }
+            checkHip(
+                hipStreamSynchronize(stream.stream),
+                "hipStreamSynchronize(D_K=64 chunk versus serial decode)");
+
+            std::vector<float> chunk_state(
+                static_cast<size_t>(state_floats));
+            std::vector<float> serial_state(
+                static_cast<size_t>(state_floats));
+            ASSERT_TRUE(chunk_kernel.exportState(
+                chunk_state.data(), nullptr, stream.stream));
+            ASSERT_TRUE(serial_kernel.exportState(
+                serial_state.data(), nullptr, stream.stream));
+            checkHip(
+                hipStreamSynchronize(stream.stream),
+                "hipStreamSynchronize(D_K=64 state observation)");
+
+            const std::string label =
+                "ROCm GDN D_K=64 M" + std::to_string(prefill_len) +
+                (use_qk_l2norm ? " normalized" : " scaled");
+            const std::string output_label = label + " long-prefill output";
+            const std::string state_label =
+                label + " long-prefill terminal state";
+            expectByteExactEquivalent(
+                output_label.c_str(),
+                d_chunk_out.toHost(),
+                d_serial_out.toHost(),
+                /*offset=*/0,
+                output_elems);
+            expectByteExactEquivalent(
+                state_label.c_str(),
+                chunk_state,
+                serial_state,
+                /*offset=*/0,
+                chunk_state.size());
+        }
+    }
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4DV64FinalStateMatchesStepwiseReplay)
@@ -975,7 +2302,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4DV64FinalStateMatchesStepwiseRep
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.chunk_forward(
@@ -988,7 +2315,7 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4DV64FinalStateMatchesStepwiseRep
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -1079,7 +2406,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -1107,7 +2434,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -1215,7 +2542,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
     m4_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -1245,7 +2572,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -1291,36 +2618,24 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeVerifierCaptureIs
         static_cast<size_t>(state_floats),
         final_snapshot.data());
 
-    expectStrictEquivalent(
+    expectByteExactEquivalent(
         "ROCm Qwen3.6 GDN M4 verifier output",
         m4_out,
         step_out,
         0,
-        output_elems,
-        /*max_abs_threshold=*/2e-4f,
-        /*relative_l2_threshold=*/1e-4,
-        /*min_cosine=*/0.999999,
-        /*max_symmetric_kl=*/1e-8);
-    expectStrictEquivalent(
+        output_elems);
+    expectByteExactEquivalent(
         "ROCm Qwen3.6 GDN M4 final state snapshot",
         final_snapshot,
         step_state,
         0,
-        final_snapshot.size(),
-        /*max_abs_threshold=*/2e-4f,
-        /*relative_l2_threshold=*/1e-4,
-        /*min_cosine=*/0.999999,
-        /*max_symmetric_kl=*/1e-8);
-    expectStrictEquivalent(
+        final_snapshot.size());
+    expectByteExactEquivalent(
         "ROCm Qwen3.6 GDN M4 live state remains initial during verifier capture",
         m4_state,
         initial_state,
         0,
-        m4_state.size(),
-        /*max_abs_threshold=*/1e-7f,
-        /*relative_l2_threshold=*/1e-7,
-        /*min_cosine=*/0.9999999,
-        /*max_symmetric_kl=*/1e-10);
+        m4_state.size());
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict)
@@ -1381,7 +2696,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet grouped_kernel(0);
-    grouped_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner grouped_kernel_state_owner(grouped_kernel, state_floats);
     grouped_kernel.setGPUStream(stream.stream);
     grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
     grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -1413,7 +2728,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
     ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -1462,7 +2777,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
     for (int row = 0; row < verifier_len; ++row)
     {
         const size_t output_offset = static_cast<size_t>(row) * static_cast<size_t>(v_dim);
-        expectStrictEquivalent(
+        expectByteExactEquivalent(
             row == 0 ? "GDN M2 row0 output" : "GDN M2 row1 output",
             grouped_out,
             step_out,
@@ -1470,7 +2785,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
             static_cast<size_t>(v_dim));
 
         const size_t state_offset = static_cast<size_t>(row) * static_cast<size_t>(state_floats);
-        expectStrictEquivalent(
+        expectByteExactEquivalent(
             row == 0 ? "GDN M2 row0 state snapshot" : "GDN M2 row1 state snapshot",
             grouped_snapshots,
             step_state_snapshots,
@@ -1478,16 +2793,12 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM2Qwen36DenseShapeVerifierCaptureMa
             static_cast<size_t>(state_floats));
     }
 
-    expectStrictEquivalent(
+    expectByteExactEquivalent(
         "GDN M2 grouped live state remains initial during verifier capture",
         grouped_live_state,
         initial_state,
         0,
-        grouped_live_state.size(),
-        /*max_abs_threshold=*/1e-7f,
-        /*relative_l2_threshold=*/1e-7,
-        /*min_cosine=*/0.9999999,
-        /*max_symmetric_kl=*/1e-10);
+        grouped_live_state.size());
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMatchesStepwiseStrict)
@@ -1553,7 +2864,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
     HipStreamHandle stream;
 
     ROCmGatedDeltaNet grouped_kernel(0);
-    grouped_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner grouped_kernel_state_owner(grouped_kernel, state_floats);
     grouped_kernel.setGPUStream(stream.stream);
     grouped_kernel.bindDeinterleaveWorkspace(d_grouped_scratch.ptr, d_grouped_scratch.count);
     grouped_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
@@ -1585,7 +2896,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
     ASSERT_TRUE(grouped_kernel.exportState(grouped_live_state.data(), nullptr, nullptr));
 
     ROCmGatedDeltaNet step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
@@ -1636,7 +2947,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
         const size_t output_offset = static_cast<size_t>(row) * static_cast<size_t>(v_dim);
         const std::string output_label =
             "ROCm GDN M3 row" + std::to_string(row) + " output";
-        expectStrictEquivalent(
+        expectByteExactEquivalent(
             output_label.c_str(),
             grouped_out,
             step_out,
@@ -1646,7 +2957,7 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
         const size_t state_offset = static_cast<size_t>(row) * static_cast<size_t>(state_floats);
         const std::string state_label =
             "ROCm GDN M3 row" + std::to_string(row) + " state snapshot";
-        expectStrictEquivalent(
+        expectByteExactEquivalent(
             state_label.c_str(),
             grouped_snapshots,
             step_state_snapshots,
@@ -1654,16 +2965,12 @@ TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM3Qwen36DenseShapeVerifierCaptureMa
             static_cast<size_t>(state_floats));
     }
 
-    expectStrictEquivalent(
+    expectByteExactEquivalent(
         "ROCm GDN M3 grouped live state remains initial during verifier capture",
         grouped_live_state,
         initial_state,
         0,
-        grouped_live_state.size(),
-        /*max_abs_threshold=*/1e-7f,
-        /*relative_l2_threshold=*/1e-7,
-        /*min_cosine=*/0.9999999,
-        /*max_symmetric_kl=*/1e-10);
+        grouped_live_state.size());
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcceptedRow)
@@ -1696,7 +3003,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
     HipStreamHandle stream;
 
     ROCmShortConvolution verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -1708,13 +3015,16 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
         nullptr,
         verifier_len, channels, kernel_size,
         /*apply_silu=*/true));
-    std::vector<float> restored_host_mirror(
-        static_cast<size_t>(state_floats),
-        -789.0f);
     ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
-        restored_host_mirror.data(), accepted_rows - 1, stream.stream));
-    expectHostMirrorMatchesSnapshotRow(
-        restored_host_mirror,
+        nullptr, accepted_rows - 1, stream.stream));
+    checkHip(
+        hipStreamSynchronize(stream.stream),
+        "hipStreamSynchronize(publish short-conv snapshot)");
+    std::vector<float> published_device_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(
+        published_device_state.data(), nullptr, nullptr));
+    expectPublishedDeviceStateMatchesSnapshotRow(
+        published_device_state,
         d_snapshots,
         accepted_rows - 1,
         state_floats);
@@ -1731,7 +3041,8 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
     checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored short-conv decode)");
 
     ROCmShortConvolution ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
+    ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.forward(
         d_input.ptr,
         d_weight.ptr,
@@ -1783,7 +3094,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
     HipStreamHandle stream;
 
     ROCmShortConvolution m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.forward(
@@ -1799,7 +3110,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -1826,6 +3137,93 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
     EXPECT_LT(state_diff.first, 1e-5f);
     EXPECT_LT(state_diff.second, 1e-5)
         << "ROCm M=4 short-conv must leave the same kernel-owned state as four decode steps";
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    /*
+     * Depth-2 MTP is the smallest useful grouped verifier shape.  Exercise it
+     * with the full Qwen3.6 short-conv width and in-place QKV buffer contract
+     * so the regression covers raw-history preservation, scratch publication,
+     * and the device-owned live state update in one production-shaped case.
+     */
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 2;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(
+        verifier_len, channels, verifier_len, verifier_len,
+        0.0095f, 0.0f, 0.0095f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state =
+        makeInitialState(static_cast<size_t>(state_floats), 0.0027f);
+
+    HipFloatBuffer d_m2_inout(input);
+    HipFloatBuffer d_step_inout(input);
+    HipFloatBuffer d_weight(weight);
+    HipFloatBuffer d_bias(bias);
+    HipStreamHandle stream;
+
+    ROCmShortConvolution m2_kernel(0);
+    HipGDNStateOwner m2_kernel_state_owner(m2_kernel, state_floats);
+    m2_kernel_state_owner.bindScratch(
+        m2_kernel, static_cast<int>(output_elems));
+    m2_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m2_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m2_kernel.forward(
+        d_m2_inout.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m2_inout.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(Qwen36 M2 in-place short-conv)");
+    std::vector<float> m2_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m2_kernel.exportState(m2_state.data(), nullptr, nullptr));
+
+    ROCmShortConvolution step_kernel(0);
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(Qwen36 stepwise M2 in-place short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m2_out = d_m2_inout.toHost();
+    const auto step_out = d_step_inout.toHost();
+    expectByteExactEquivalent(
+        "ROCm Qwen3.6 short-conv M2 output",
+        m2_out,
+        step_out,
+        0,
+        output_elems);
+    expectByteExactEquivalent(
+        "ROCm Qwen3.6 short-conv M2 state",
+        m2_state,
+        step_state,
+        0,
+        m2_state.size());
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay)
@@ -1861,8 +3259,9 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwise
     HipStreamHandle stream;
 
     ROCmShortConvolution m3_kernel(0);
-    m3_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m3_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    HipGDNStateOwner m3_kernel_state_owner(m3_kernel, state_floats);
+    m3_kernel_state_owner.bindScratch(
+        m3_kernel, static_cast<int>(output_elems));
     m3_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m3_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m3_kernel.forward(
@@ -1878,8 +3277,8 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwise
     ASSERT_TRUE(m3_kernel.exportState(m3_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -1899,26 +3298,18 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M3InPlaceStateMatchesStepwise
 
     const auto m3_out = d_m3_inout.toHost();
     const auto step_out = d_step_inout.toHost();
-    expectStrictEquivalent(
+    expectByteExactEquivalent(
         "ROCm Qwen3.6 short-conv M3 output",
         m3_out,
         step_out,
         0,
-        output_elems,
-        /*max_abs_threshold=*/1e-5f,
-        /*relative_l2_threshold=*/1e-5,
-        /*min_cosine=*/0.9999999,
-        /*max_symmetric_kl=*/1e-10);
-    expectStrictEquivalent(
+        output_elems);
+    expectByteExactEquivalent(
         "ROCm Qwen3.6 short-conv M3 state",
         m3_state,
         step_state,
         0,
-        m3_state.size(),
-        /*max_abs_threshold=*/1e-5f,
-        /*relative_l2_threshold=*/1e-5,
-        /*min_cosine=*/0.9999999,
-        /*max_symmetric_kl=*/1e-10);
+        m3_state.size());
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay)
@@ -1949,8 +3340,9 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwise
     HipStreamHandle stream;
 
     ROCmShortConvolution m4_kernel(0);
-    m4_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(m4_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    HipGDNStateOwner m4_kernel_state_owner(m4_kernel, state_floats);
+    m4_kernel_state_owner.bindScratch(
+        m4_kernel, static_cast<int>(output_elems));
     m4_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(m4_kernel.forward(
@@ -1966,8 +3358,8 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwise
     ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution step_kernel(0);
-    step_kernel.allocateGPUState(state_floats);
-    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    HipGDNStateOwner step_kernel_state_owner(step_kernel, state_floats);
+    step_kernel_state_owner.bindScratch(step_kernel, channels);
     step_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
     for (int row = 0; row < verifier_len; ++row)
@@ -1987,26 +3379,18 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwise
 
     const auto m4_out = d_m4_inout.toHost();
     const auto step_out = d_step_inout.toHost();
-    expectStrictEquivalent(
+    expectByteExactEquivalent(
         "ROCm Qwen3.6 short-conv M4 output",
         m4_out,
         step_out,
         0,
-        output_elems,
-        /*max_abs_threshold=*/1e-5f,
-        /*relative_l2_threshold=*/1e-5,
-        /*min_cosine=*/0.9999999,
-        /*max_symmetric_kl=*/1e-10);
-    expectStrictEquivalent(
+        output_elems);
+    expectByteExactEquivalent(
         "ROCm Qwen3.6 short-conv M4 state",
         m4_state,
         step_state,
         0,
-        m4_state.size(),
-        /*max_abs_threshold=*/1e-5f,
-        /*relative_l2_threshold=*/1e-5,
-        /*min_cosine=*/0.9999999,
-        /*max_symmetric_kl=*/1e-10);
+        m4_state.size());
 }
 
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepReplay)
@@ -2044,7 +3428,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepR
     HipStreamHandle stream;
 
     ROCmShortConvolution verifier_kernel(0);
-    verifier_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner verifier_kernel_state_owner(verifier_kernel, state_floats);
     verifier_kernel.setGPUStream(stream.stream);
     verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
     verifier_kernel.bindSpeculativeStateWorkspace(d_speculative_state_work.ptr, state_floats);
@@ -2078,7 +3462,7 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepR
     ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, nullptr));
 
     ROCmShortConvolution ref_kernel(0);
-    ref_kernel.allocateGPUState(state_floats);
+    HipGDNStateOwner ref_kernel_state_owner(ref_kernel, state_floats);
     ref_kernel.setGPUStream(stream.stream);
     ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
     ASSERT_TRUE(ref_kernel.forward(
@@ -2113,6 +3497,456 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepR
     EXPECT_LT(out_diff.second, 1e-5);
     EXPECT_LT(state_diff.first, 1e-5f);
     EXPECT_LT(state_diff.second, 1e-5);
+}
+
+/**
+ * @brief Prove a captured HIP decode graph observes device-published GDN state.
+ *
+ * The graph is instantiated once before any grouped verifier transaction. For
+ * At M=2..16 and M=31, every possible accepted row is selected by a device
+ * scalar and copied into the kernel-owned live state. Every grouped output row
+ * is also compared directly with scalar M=1 decode. The original graph must
+ * continue from that row byte-for-byte; recreating it in the loop would defeat
+ * the lifetime regression this test is designed to catch.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeRecurrencePublicationRuntimeM)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_heads = 2;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int max_verifier_rows =
+        llaminar2::test::kGroupedVerifierRuntimeRows.back();
+    constexpr int qk_width = n_heads * d_k;
+    constexpr int value_width = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+
+    const auto q_rows = makeSequenceRows(
+        max_verifier_rows, qk_width, max_verifier_rows,
+        max_verifier_rows, 0.0023f, 0.0f, 0.0023f);
+    const auto k_rows = makeSequenceRows(
+        max_verifier_rows, qk_width, max_verifier_rows,
+        max_verifier_rows, -0.0017f, 0.0f, -0.0017f);
+    const auto v_rows = makeSequenceRows(
+        max_verifier_rows, value_width, max_verifier_rows,
+        max_verifier_rows, 0.0029f, 0.0f, 0.0029f);
+    const auto alpha_rows = makeSequenceRows(
+        max_verifier_rows, n_heads, max_verifier_rows,
+        max_verifier_rows, 0.019f, 0.0f, 0.019f);
+    const auto beta_rows = makeSequenceRows(
+        max_verifier_rows, n_heads, max_verifier_rows,
+        max_verifier_rows, -0.017f, 0.0f, -0.017f);
+    const auto continuation_q = makeSequenceRows(1, qk_width, 1, 1, 0.0037f, 0.0f, 0.0037f);
+    const auto continuation_k = makeSequenceRows(1, qk_width, 1, 1, -0.0021f, 0.0f, -0.0021f);
+    const auto continuation_v = makeSequenceRows(1, value_width, 1, 1, 0.0041f, 0.0f, 0.0041f);
+    const auto continuation_alpha = makeSequenceRows(1, n_heads, 1, 1, 0.023f, 0.0f, 0.023f);
+    const auto continuation_beta = makeSequenceRows(1, n_heads, 1, 1, -0.013f, 0.0f, -0.013f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00073f);
+    const std::vector<float> a_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    HipFloatBuffer d_q_rows(q_rows);
+    HipFloatBuffer d_k_rows(k_rows);
+    HipFloatBuffer d_v_rows(v_rows);
+    HipFloatBuffer d_alpha_rows(alpha_rows);
+    HipFloatBuffer d_beta_rows(beta_rows);
+    HipFloatBuffer d_continuation_q(continuation_q);
+    HipFloatBuffer d_continuation_k(continuation_k);
+    HipFloatBuffer d_continuation_v(continuation_v);
+    HipFloatBuffer d_continuation_alpha(continuation_alpha);
+    HipFloatBuffer d_continuation_beta(continuation_beta);
+    HipFloatBuffer d_a_log(a_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_grouped_output(
+        static_cast<size_t>(max_verifier_rows) * value_width, 0.0f);
+    HipFloatBuffer d_replay_output(static_cast<size_t>(value_width), 0.0f);
+    HipFloatBuffer d_oracle_output(static_cast<size_t>(value_width), 0.0f);
+    HipFloatBuffer d_oracle_row_output(static_cast<size_t>(value_width), 0.0f);
+    HipFloatBuffer d_snapshots(
+        static_cast<size_t>(max_verifier_rows) * state_floats, -77.0f);
+    HipFloatBuffer d_speculative_state(static_cast<size_t>(state_floats), 0.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet live_kernel(0);
+    HipGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
+    live_kernel.setGPUStream(stream.stream);
+    live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+
+    HipCapturedGraph captured_decode(
+        stream.stream,
+        [&]()
+        {
+            return live_kernel.recurrent_step(
+                d_continuation_q.ptr,
+                d_continuation_k.ptr,
+                d_continuation_v.ptr,
+                d_continuation_alpha.ptr,
+                d_continuation_beta.ptr,
+                d_a_log.ptr,
+                d_dt_bias.ptr,
+                d_replay_output.ptr,
+                nullptr,
+                n_heads,
+                d_k,
+                d_v,
+                /*use_qk_l2norm=*/true);
+        });
+
+    ROCmGatedDeltaNet oracle_kernel(0);
+    HipGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
+    oracle_kernel.setGPUStream(stream.stream);
+
+    for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)
+    {
+        live_kernel.bindVerifierStateCaptureWorkspace(
+            d_snapshots.ptr, verifier_rows, state_floats);
+        live_kernel.bindSpeculativeStateWorkspace(
+            d_speculative_state.ptr, state_floats);
+        HipCapturedGraph captured_verifier(
+            stream.stream,
+            [&]()
+            {
+                return live_kernel.chunk_forward(
+                    d_q_rows.ptr,
+                    d_k_rows.ptr,
+                    d_v_rows.ptr,
+                    d_alpha_rows.ptr,
+                    d_beta_rows.ptr,
+                    d_a_log.ptr,
+                    d_dt_bias.ptr,
+                    d_grouped_output.ptr,
+                    nullptr,
+                    verifier_rows,
+                    n_heads,
+                    d_k,
+                    d_v,
+                    /*chunk_size=*/64,
+                    /*use_qk_l2norm=*/true);
+            });
+
+        for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
+        {
+            SCOPED_TRACE(
+                "verifier_rows=" + std::to_string(verifier_rows) +
+                " accepted_row=" + std::to_string(accepted_row));
+
+            ASSERT_TRUE(live_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            live_kernel.bindVerifierStateCaptureWorkspace(
+                d_snapshots.ptr, verifier_rows, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(
+                d_speculative_state.ptr, state_floats);
+            captured_verifier.launch(stream.stream);
+
+            HipIntBuffer d_accepted_row(accepted_row);
+            if (accepted_row == verifier_rows - 1)
+            {
+                /*
+                 * Exercise the production grouped publication contract: the
+                 * packed request-zero row and scalar live owner must be
+                 * published together before captured decode replay.
+                 */
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                    nullptr,
+                    state_floats,
+                    d_accepted_row.ptr,
+                    /*request_count=*/1,
+                    /*row_index_stride=*/1,
+                    stream.stream));
+            }
+            else
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                    nullptr, d_accepted_row.ptr, stream.stream));
+            }
+            live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+
+            d_replay_output.fill(0.0f);
+            captured_decode.launch(stream.stream);
+            checkHip(
+                hipStreamSynchronize(stream.stream),
+                "hipStreamSynchronize(persistent GDN decode replay)");
+            std::vector<float> replay_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(live_kernel.exportState(
+                replay_state.data(), nullptr, nullptr));
+
+            ASSERT_TRUE(oracle_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            for (int row = 0; row <= accepted_row; ++row)
+            {
+                ASSERT_TRUE(oracle_kernel.recurrent_step(
+                    d_q_rows.ptr + static_cast<size_t>(row) * qk_width,
+                    d_k_rows.ptr + static_cast<size_t>(row) * qk_width,
+                    d_v_rows.ptr + static_cast<size_t>(row) * value_width,
+                    d_alpha_rows.ptr + static_cast<size_t>(row) * n_heads,
+                    d_beta_rows.ptr + static_cast<size_t>(row) * n_heads,
+                    d_a_log.ptr,
+                    d_dt_bias.ptr,
+                    d_oracle_row_output.ptr,
+                    nullptr,
+                    n_heads,
+                    d_k,
+                    d_v,
+                    /*use_qk_l2norm=*/true));
+            }
+            ASSERT_TRUE(oracle_kernel.recurrent_step(
+                d_continuation_q.ptr,
+                d_continuation_k.ptr,
+                d_continuation_v.ptr,
+                d_continuation_alpha.ptr,
+                d_continuation_beta.ptr,
+                d_a_log.ptr,
+                d_dt_bias.ptr,
+                d_oracle_output.ptr,
+                nullptr,
+                n_heads,
+                d_k,
+                d_v,
+                /*use_qk_l2norm=*/true));
+            checkHip(
+                hipStreamSynchronize(stream.stream),
+                "hipStreamSynchronize(serial GDN continuation oracle)");
+            std::vector<float> oracle_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(oracle_kernel.exportState(
+                oracle_state.data(), nullptr, nullptr));
+
+            const auto grouped_rows = d_grouped_output.toHost();
+            const size_t grouped_row_begin =
+                static_cast<size_t>(accepted_row) * value_width;
+            const std::vector<float> grouped_row(
+                grouped_rows.begin() + grouped_row_begin,
+                grouped_rows.begin() + grouped_row_begin + value_width);
+            expectByteExactEquivalent(
+                "ROCm grouped GDN verifier output row",
+                grouped_row,
+                d_oracle_row_output.toHost(),
+                /*offset=*/0,
+                grouped_row.size());
+
+            const auto replay_output = d_replay_output.toHost();
+            const auto oracle_output = d_oracle_output.toHost();
+            expectByteExactEquivalent(
+                "ROCm captured GDN continuation output",
+                replay_output,
+                oracle_output,
+                0,
+                replay_output.size());
+            expectByteExactEquivalent(
+                "ROCm captured GDN continuation state",
+                replay_state,
+                oracle_state,
+                0,
+                replay_state.size());
+        }
+    }
+}
+
+/**
+ * @brief Prove the captured HIP short-conv graph keeps one stable live-state owner.
+ *
+ * The 10,240-wide in-place graph mirrors Qwen3.6's production QKV convolution.
+ * Device-indexed publication selects each possible accepted row for M=2..16
+ * and M=31. Every grouped output row must equal scalar M=1 decode, and replay
+ * must match serial continuation in both output bytes and the complete live
+ * history buffer without rebuilding the HIP executable.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicationRuntimeM)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int max_verifier_rows =
+        llaminar2::test::kGroupedVerifierRuntimeRows.back();
+    constexpr int state_floats = channels * (kernel_size - 1);
+
+    const auto verifier_input = makeSequenceRows(
+        max_verifier_rows, channels, max_verifier_rows,
+        max_verifier_rows, 0.0095f, 0.0f, 0.0095f);
+    const auto continuation_input = makeSequenceRows(
+        1, channels, 1, 1, 0.0113f, 0.0f, 0.0113f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state = makeInitialState(
+        static_cast<size_t>(state_floats), 0.0027f);
+
+    HipFloatBuffer d_live_verifier(verifier_input);
+    HipFloatBuffer d_oracle_verifier(verifier_input);
+    HipFloatBuffer d_replay_continuation(continuation_input);
+    HipFloatBuffer d_oracle_continuation(continuation_input);
+    HipFloatBuffer d_weight(weight);
+    HipFloatBuffer d_bias(bias);
+    HipFloatBuffer d_snapshots(
+        static_cast<size_t>(max_verifier_rows) * state_floats, -77.0f);
+    HipFloatBuffer d_speculative_state(static_cast<size_t>(state_floats), 0.0f);
+    HipStreamHandle stream;
+
+    ROCmShortConvolution live_kernel(0);
+    HipGDNStateOwner live_kernel_state_owner(live_kernel, state_floats);
+    live_kernel_state_owner.bindScratch(
+        live_kernel, max_verifier_rows * channels);
+    live_kernel.setGPUStream(stream.stream);
+    live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+    live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+
+    HipCapturedGraph captured_decode(
+        stream.stream,
+        [&]()
+        {
+            return live_kernel.forward(
+                d_replay_continuation.ptr,
+                d_weight.ptr,
+                d_bias.ptr,
+                d_replay_continuation.ptr,
+                nullptr,
+                1,
+                channels,
+                kernel_size,
+                /*apply_silu=*/true);
+        });
+
+    ROCmShortConvolution oracle_kernel(0);
+    HipGDNStateOwner oracle_kernel_state_owner(oracle_kernel, state_floats);
+    oracle_kernel_state_owner.bindScratch(
+        oracle_kernel, max_verifier_rows * channels);
+    oracle_kernel.setGPUStream(stream.stream);
+
+    for (const int verifier_rows : llaminar2::test::kGroupedVerifierRuntimeRows)
+    {
+        live_kernel.bindVerifierStateCaptureWorkspace(
+            d_snapshots.ptr, verifier_rows, state_floats);
+        live_kernel.bindSpeculativeStateWorkspace(
+            d_speculative_state.ptr, state_floats);
+        HipCapturedGraph captured_verifier(
+            stream.stream,
+            [&]()
+            {
+                return live_kernel.forward(
+                    d_live_verifier.ptr,
+                    d_weight.ptr,
+                    d_bias.ptr,
+                    d_live_verifier.ptr,
+                    nullptr,
+                    verifier_rows,
+                    channels,
+                    kernel_size,
+                    /*apply_silu=*/true);
+            });
+
+        for (int accepted_row = 0; accepted_row < verifier_rows; ++accepted_row)
+        {
+            SCOPED_TRACE(
+                "verifier_rows=" + std::to_string(verifier_rows) +
+                " accepted_row=" + std::to_string(accepted_row));
+
+            d_live_verifier.copyFrom(verifier_input);
+            d_replay_continuation.copyFrom(continuation_input);
+            ASSERT_TRUE(live_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            live_kernel.bindVerifierStateCaptureWorkspace(
+                d_snapshots.ptr, verifier_rows, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(
+                d_speculative_state.ptr, state_floats);
+            captured_verifier.launch(stream.stream);
+
+            HipIntBuffer d_accepted_row(accepted_row);
+            if (accepted_row == verifier_rows - 1)
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowsFromDeviceIndices(
+                    nullptr,
+                    state_floats,
+                    d_accepted_row.ptr,
+                    /*request_count=*/1,
+                    /*row_index_stride=*/1,
+                    stream.stream));
+            }
+            else
+            {
+                ASSERT_TRUE(live_kernel.restoreVerifierStateCaptureRowFromDeviceIndex(
+                    nullptr, d_accepted_row.ptr, stream.stream));
+            }
+            live_kernel.bindVerifierStateCaptureWorkspace(nullptr, 0, state_floats);
+            live_kernel.bindSpeculativeStateWorkspace(nullptr, state_floats);
+            captured_decode.launch(stream.stream);
+            checkHip(
+                hipStreamSynchronize(stream.stream),
+                "hipStreamSynchronize(persistent short-conv decode replay)");
+            std::vector<float> replay_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(live_kernel.exportState(
+                replay_state.data(), nullptr, nullptr));
+
+            d_oracle_verifier.copyFrom(verifier_input);
+            d_oracle_continuation.copyFrom(continuation_input);
+            ASSERT_TRUE(oracle_kernel.importState(initial_state.data(), nullptr, stream.stream));
+            for (int row = 0; row <= accepted_row; ++row)
+            {
+                float *row_ptr =
+                    d_oracle_verifier.ptr + static_cast<size_t>(row) * channels;
+                ASSERT_TRUE(oracle_kernel.forward(
+                    row_ptr,
+                    d_weight.ptr,
+                    d_bias.ptr,
+                    row_ptr,
+                    nullptr,
+                    1,
+                    channels,
+                    kernel_size,
+                    /*apply_silu=*/true));
+            }
+            ASSERT_TRUE(oracle_kernel.forward(
+                d_oracle_continuation.ptr,
+                d_weight.ptr,
+                d_bias.ptr,
+                d_oracle_continuation.ptr,
+                nullptr,
+                1,
+                channels,
+                kernel_size,
+                /*apply_silu=*/true));
+            checkHip(
+                hipStreamSynchronize(stream.stream),
+                "hipStreamSynchronize(serial short-conv continuation oracle)");
+            std::vector<float> oracle_state(static_cast<size_t>(state_floats));
+            ASSERT_TRUE(oracle_kernel.exportState(
+                oracle_state.data(), nullptr, nullptr));
+
+            const auto grouped_rows = d_live_verifier.toHost();
+            const auto scalar_rows = d_oracle_verifier.toHost();
+            const size_t grouped_row_begin =
+                static_cast<size_t>(accepted_row) * channels;
+            const std::vector<float> grouped_row(
+                grouped_rows.begin() + grouped_row_begin,
+                grouped_rows.begin() + grouped_row_begin + channels);
+            const std::vector<float> scalar_row(
+                scalar_rows.begin() + grouped_row_begin,
+                scalar_rows.begin() + grouped_row_begin + channels);
+            expectByteExactEquivalent(
+                "ROCm grouped short-conv verifier output row",
+                grouped_row,
+                scalar_row,
+                /*offset=*/0,
+                grouped_row.size());
+
+            const auto replay_output = d_replay_continuation.toHost();
+            const auto oracle_output = d_oracle_continuation.toHost();
+            expectByteExactEquivalent(
+                "ROCm captured short-conv continuation output",
+                replay_output,
+                oracle_output,
+                0,
+                replay_output.size());
+            expectByteExactEquivalent(
+                "ROCm captured short-conv continuation state",
+                replay_state,
+                oracle_state,
+                0,
+                replay_state.size());
+        }
+    }
 }
 
 #endif

@@ -6,10 +6,11 @@
  * tensor. This is used by MTP verifier paths to feed one batched LM-head GEMM
  * instead of either projecting every verifier row or looping one-row helpers.
  *
- * Lifecycle: replay setters update host-side intent only. GPU row-index uploads
- * happen from executeGPU(), after DeviceGraphExecutor has rebound the current
- * workspace manager and an explicit non-null stream. This avoids stale workspace
- * handoff bugs when cached graph objects outlive a previous workspace manager.
+ * GPU row ownership is explicit. Ordinary compact graphs upload a stage-owned
+ * row plan, verifier graphs consume an externally produced device plan, and
+ * request-batched prefill derives terminal rows directly from resident request
+ * lengths. Every mode uses a stable device address and an explicit stream, so a
+ * captured graph never adopts mutable host row state.
  */
 
 #pragma once
@@ -41,6 +42,58 @@ namespace llaminar2
     public:
         static constexpr const char *WS_SELECTED_ROWS_ARRAY = "hidden_rows_select_selected_rows_array";
 
+        /**
+         * @brief Selects the authoritative source of GPU row indices.
+         *
+         * The source is part of the graph contract rather than a runtime
+         * fallback. `StageOwnedIndices` is a CPU/direct-fixture policy and is
+         * forbidden for production GPU execution because it requires a pinned
+         * host upload. `FixedContiguousRange` encodes an immutable verifier
+         * suffix directly in a captured D2D node.
+         * `WorkspaceBoundDeviceIndices` reads a named row array from the graph
+         * family's shared workspace when both producer and consumer are members
+         * of that family. `ExternalDeviceIndices` instead records the exact,
+         * stable device address owned by an external producer. These are
+         * deliberately separate policies: a stage may never discover an
+         * external producer by looking up a coincidentally equal buffer name in
+         * whichever workspace the executor bound most recently.
+         * `RequestTerminalLengths` computes one terminal row per padded request
+         * directly in the copy kernel. `ShiftedPrefillKVProgress` computes the
+         * next contiguous shifted-prefill range from canonical device KV counts
+         * and the same resident request geometry. Both policies preserve full
+         * device ownership and remain stable across captured graph replay.
+         * `ShiftedPrefillTransaction` is the production prefill policy: it packs
+         * the complete bucket-wide depth-zero payload and archives each request
+         * terminal in one stage so the following MTP graph can remain part of
+         * the same native capture.
+         */
+        enum class DeviceRowIndexSource
+        {
+            StageOwnedIndices,
+            FixedContiguousRange,
+            WorkspaceBoundDeviceIndices,
+            ExternalDeviceIndices,
+            RequestTerminalLengths,
+            ShiftedPrefillKVProgress,
+            ShiftedPrefillTransaction,
+        };
+
+        /**
+         * @brief Selects the authoritative padded-row-stride owner.
+         *
+         * Main forward graphs have one immutable shape and therefore encode
+         * their stride in graph topology. Reusable MTP publication graphs are
+         * total over prompt widths and read the stride from the same
+         * event-published device record as the request lengths. The two modes
+         * are explicit policies; execution never probes one and falls back to
+         * the other.
+         */
+        enum class RequestRowStrideSource
+        {
+            StaticGraphGeometry,
+            ExternalDeviceScalar,
+        };
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -54,9 +107,33 @@ namespace llaminar2
 
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_buffer_id;
-            std::string workspace_buffer_name;
-            bool declare_selected_rows_workspace = true; ///< Declare row-index workspace when this stage owns it.
-            bool upload_selected_rows_to_workspace = true; ///< Upload host row indices; false means an external metadata producer owns contents.
+            DeviceRowIndexSource device_row_index_source =
+                DeviceRowIndexSource::StageOwnedIndices; ///< Authoritative GPU row-index policy.
+            int fixed_contiguous_row_start = 0; ///< First immutable source row for FixedContiguousRange.
+            std::string workspace_buffer_name; ///< Stable row-index workspace for stage-owned or workspace-bound plans.
+            const int32_t *external_device_row_indices = nullptr; ///< Exact producer-owned row-index address for ExternalDeviceIndices.
+            const int32_t *request_sequence_lengths_device = nullptr; ///< Resident request lengths for RequestTerminalLengths.
+            int request_row_stride = 0; ///< Padded source-row stride between requests.
+            RequestRowStrideSource request_row_stride_source =
+                RequestRowStrideSource::StaticGraphGeometry; ///< Typed owner of request_row_stride.
+            const int32_t *request_row_stride_device = nullptr; ///< Stable device scalar for ExternalDeviceScalar.
+            const int32_t *main_cached_tokens_device = nullptr; ///< Canonical main-KV count for ShiftedPrefillKVProgress.
+            const int32_t *shifted_cached_tokens_device = nullptr; ///< Canonical shifted-MTP KV count for ShiftedPrefillKVProgress.
+            int request_index = -1; ///< Immutable request row selected by ShiftedPrefillKVProgress.
+
+            /** @name Graph-integrated shifted-prefill transaction bindings */
+            ///@{
+            const int32_t *input_token_ids_device = nullptr; ///< Admitted request tokens read after main forward.
+            const int32_t *input_position_ids_device = nullptr; ///< Admitted absolute request positions.
+            int32_t *shifted_token_ids_output_device = nullptr; ///< Packed depth-zero condition tokens.
+            int32_t *shifted_position_ids_output_device = nullptr; ///< Packed positions paired with condition tokens.
+            int32_t *shifted_append_lengths_output_device = nullptr; ///< One real shifted append width per request.
+            TensorBase *terminal_hidden_archive = nullptr; ///< Persistent prior/next terminal row per request.
+            std::vector<const int32_t *> main_cached_tokens_by_request; ///< Canonical main-KV count addresses.
+            std::vector<const int32_t *> shifted_cached_tokens_by_request; ///< Canonical shifted-KV count addresses.
+            int request_count = 0; ///< Fixed request count represented by this graph.
+            std::optional<BufferId> terminal_hidden_archive_buffer_id; ///< Arena identity of terminal_hidden_archive.
+            ///@}
         };
 
         explicit HiddenStateRowsSelectStage(Params params);
@@ -82,7 +159,14 @@ namespace llaminar2
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return params_.device_id.is_gpu() &&
+                           params_.device_row_index_source ==
+                               DeviceRowIndexSource::StageOwnedIndices
+                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
+                       : GraphLaunchPreparationPolicy::None;
+        }
 
         /**
          * @brief Update selected source rows for direct graph replay users.

@@ -142,6 +142,16 @@ namespace llaminar2::test
         EXPECT_FALSE(result.valid);
     }
 
+    TEST_F(Test__TPPPValidator, RankLocalTP4UsesUnevenQueriesAndReplicatedGQAKV)
+    {
+        config_.tp_degree = 4;
+        config_.tp_scope = TPScope::RANK_LOCAL;
+
+        const auto result = TPPPValidator::validate(config_, model_);
+
+        EXPECT_TRUE(result.valid) << result.toString();
+    }
+
     TEST_F(Test__TPPPValidator, TP7_WithQwen05B_InvalidQueryHeads)
     {
         // Qwen2.5-0.5B has 14 Q heads - TP=7 is valid for Q but invalid for KV (2 % 7 != 0)

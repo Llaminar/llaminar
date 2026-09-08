@@ -108,14 +108,15 @@ namespace llaminar2
      * - None: No parallelism, full tensor on each rank
      * - ColumnParallel: Output dimension sharded (QKV, gate/up, LM head)
      * - RowParallel: Input dimension sharded (Wo, down proj)
-     * - ExpertParallel: MoE expert distribution (future)
+     * - RoutedExpertTensorSharded: tensor shards of every routed expert, with
+     *   partial routed outputs combined after the stage
      */
     enum class TPMode
     {
         None,           ///< No tensor parallelism
         ColumnParallel, ///< Shard output dimension, allgather after
         RowParallel,    ///< Shard input dimension, allreduce after
-        ExpertParallel, ///< MoE expert parallelism (future)
+        RoutedExpertTensorSharded, ///< Within-expert tensor sharding
     };
 
     /**
@@ -357,7 +358,7 @@ namespace llaminar2
         ColumnParallel,  ///< Split output dimension (rows of weight) - QKV, Gate/Up, LM head
         RowParallel,     ///< Split output dimension + allreduce - Wo projection
         InputParallel,   ///< Split input dimension (columns of weight) + allreduce - Down proj
-        ExpertParallel   ///< Split expert dimension of 3D MoE tensors across ranks
+        ExpertIdApportioned ///< Split the expert-id axis of 3D MoE tensors
     };
 
     /**
@@ -375,8 +376,8 @@ namespace llaminar2
         FFNHidden,        ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
         Vocab,            ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
         Bias1D,           ///< 1D bias that follows its weight's dimension type
-        FusedQKVHeads,    ///< Fused QKV: 3 equal sub-blocks [Q|K|V] each split by heads
-        ProportionalHeads ///< Proportional slice using head_start/head_count ratio against totalHeads.
+        FusedQKVHeads,    ///< Fused QKV: independently shard [Q|K|V] sub-blocks.
+        ProportionalHeads ///< Proportional contiguous slice using head_start/head_count against totalHeads.
                           ///< For weights whose output dim != n_heads (e.g. GDN ssm_alpha/beta with
                           ///< n_v_heads != n_heads). Computes: start = total_size * head_start / totalHeads,
                           ///< count = total_size * head_count / totalHeads.

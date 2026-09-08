@@ -16,12 +16,14 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 #include <random>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <utility>
 
 #include "execution/compute_stages/ComputeStages.h"
@@ -152,6 +154,14 @@ namespace llaminar2
                 return true;
             }
 
+            bool prepareFusedProjectionGraphCapture(
+                size_t projection_count) override
+            {
+                ++capture_preparation_count;
+                prepared_projection_counts.push_back(projection_count);
+                return capture_preparation_succeeds;
+            }
+
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
             {
                 observed_m.push_back(m);
@@ -179,6 +189,9 @@ namespace llaminar2
             std::vector<int> observed_fused_k;
             std::vector<int> observed_fused_projection_count;
             DeviceWorkspaceManager *last_fused_workspace = nullptr;
+            int capture_preparation_count = 0;
+            std::vector<size_t> prepared_projection_counts;
+            bool capture_preparation_succeeds = true;
 
         private:
             std::string name_;
@@ -496,6 +509,104 @@ namespace llaminar2
         }
     }
 
+    TEST_F(Test__FusedQKVGEMMStage, KeyValueOnlyMatchesQKVProjectionBytes)
+    {
+        FusedQKVGEMMStage::Params qkv_params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .wq = wq_.get(),
+            .output_q = output_q_.get(),
+            .n_q = n_q_,
+            .wk = wk_.get(),
+            .output_k = output_k_.get(),
+            .n_k = n_k_,
+            .wv = wv_.get(),
+            .output_v = output_v_.get(),
+            .n_v = n_v_};
+        attachPreparedRefs(qkv_params);
+        FusedQKVGEMMStage qkv_stage(qkv_params);
+        ASSERT_TRUE(qkv_stage.execute(ctx_.get()));
+
+        auto kv_output_k = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_k_)},
+            DeviceId::cpu());
+        auto kv_output_v = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(m_), static_cast<size_t>(n_v_)},
+            DeviceId::cpu());
+        FusedQKVGEMMStage::Params kv_params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .wk = wk_.get(),
+            .output_k = kv_output_k.get(),
+            .n_k = n_k_,
+            .wv = wv_.get(),
+            .output_v = kv_output_v.get(),
+            .n_v = n_v_,
+            .input_buffer_id = BufferId::NORMALIZED,
+            .output_k_buffer_id = BufferId::K_PROJ,
+            .output_v_buffer_id = BufferId::V_PROJ,
+            .prepared_ref_k = prepared_qkv_->k_ref,
+            .prepared_ref_v = prepared_qkv_->v_ref,
+            .prepared_store = prepared_qkv_->store.get()};
+
+        auto kv_stage = ComputeStageFactory::createFusedKVGEMM(kv_params);
+        ASSERT_NE(kv_stage, nullptr);
+        EXPECT_EQ(kv_stage->type(), ComputeStageType::GEMM_FUSED_KV);
+        ASSERT_TRUE(kv_stage->execute(ctx_.get()));
+
+        EXPECT_EQ(
+            std::memcmp(
+                output_k_->raw_data(),
+                kv_output_k->raw_data(),
+                output_k_->numel() * sizeof(float)),
+            0)
+            << "Dropping Q must not alter a single K output byte";
+        EXPECT_EQ(
+            std::memcmp(
+                output_v_->raw_data(),
+                kv_output_v->raw_data(),
+                output_v_->numel() * sizeof(float)),
+            0)
+            << "Dropping Q must not alter a single V output byte";
+
+        const auto contract = kv_stage->bufferContract();
+        const auto writes = contract.allWrites();
+        const auto writes_buffer = [&](BufferId id)
+        {
+            return std::any_of(
+                writes.begin(),
+                writes.end(),
+                [id](const BufferBinding &binding)
+                {
+                    return binding.id == id;
+                });
+        };
+        EXPECT_TRUE(writes_buffer(BufferId::K_PROJ));
+        EXPECT_TRUE(writes_buffer(BufferId::V_PROJ));
+        EXPECT_FALSE(writes_buffer(BufferId::Q_PROJ));
+    }
+
+    TEST_F(Test__FusedQKVGEMMStage, KeyValueOnlyFactoryRejectsQueryState)
+    {
+        FusedQKVGEMMStage::Params params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .wq = wq_.get(),
+            .wk = wk_.get(),
+            .output_k = output_k_.get(),
+            .n_k = n_k_,
+            .wv = wv_.get(),
+            .output_v = output_v_.get(),
+            .n_v = n_v_};
+
+        EXPECT_THROW(
+            ComputeStageFactory::createFusedKVGEMM(params),
+            std::invalid_argument);
+    }
+
     TEST_F(Test__FusedQKVGEMMStage, PartialBiasOnly_Q)
     {
         // Test that only Q bias is applied when K and V biases are nullptr
@@ -728,6 +839,49 @@ namespace llaminar2
         EXPECT_EQ(q->observed_fused_projection_count, std::vector<int>({3}));
         EXPECT_EQ(k->getWorkspace(), &workspace);
         EXPECT_EQ(v->getWorkspace(), &workspace);
+    }
+
+    TEST_F(Test__FusedQKVGEMMStage, CapturePreparationProvisionsExactProjectionFanout)
+    {
+        const ModelContextId model_id{9916};
+        PreparedWeightStore store(model_id);
+        auto q = std::make_shared<RecordingWorkspaceGemm>("q");
+        auto k = std::make_shared<RecordingWorkspaceGemm>("k");
+        auto v = std::make_shared<RecordingWorkspaceGemm>("v");
+
+        auto q_ref = registerRecordingGemm(store, q, "blk.0.attn_q.weight", model_id);
+        auto k_ref = registerRecordingGemm(store, k, "blk.0.attn_k.weight", model_id);
+        auto v_ref = registerRecordingGemm(store, v, "blk.0.attn_v.weight", model_id);
+
+        FusedQKVGEMMStage::Params params{
+            .m = 1,
+            .k = 128,
+            .n_q = 96,
+            .n_k = 16,
+            .n_v = 16,
+            .prepared_ref_q = q_ref,
+            .prepared_ref_k = k_ref,
+            .prepared_ref_v = v_ref,
+            .prepared_store = &store};
+        FusedQKVGEMMStage stage(params);
+        void *const capture_stream = reinterpret_cast<void *>(0x1234);
+
+        EXPECT_EQ(
+            stage.graphLaunchPreparationPolicy(),
+            GraphLaunchPreparationPolicy::CaptureOnly);
+        ASSERT_TRUE(stage.prepareGraphLaunch(ctx_.get(), capture_stream));
+        EXPECT_EQ(q->capture_preparation_count, 1);
+        EXPECT_EQ(q->prepared_projection_counts, std::vector<size_t>({3}));
+        EXPECT_EQ(k->capture_preparation_count, 1);
+        EXPECT_EQ(k->prepared_projection_counts, std::vector<size_t>({3}));
+        EXPECT_EQ(v->capture_preparation_count, 1);
+        EXPECT_EQ(v->prepared_projection_counts, std::vector<size_t>({3}));
+
+        q->capture_preparation_succeeds = false;
+        EXPECT_FALSE(stage.prepareGraphLaunch(ctx_.get(), capture_stream));
+        EXPECT_EQ(q->capture_preparation_count, 2);
+        EXPECT_EQ(k->capture_preparation_count, 2);
+        EXPECT_EQ(v->capture_preparation_count, 2);
     }
 
     TEST_F(Test__FusedQKVGEMMStage, DecodeEquivalentVerifierPrefillFailsFastWithoutBackendSupport)

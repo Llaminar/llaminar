@@ -55,6 +55,11 @@ def main() -> int:
             if fragment not in text and fragment not in summary_text:
                 raise SystemExit(f"missing expected generated fragment: {fragment}")
 
+        if text.count("CB=19 (Q8_0)") != 1:
+            raise SystemExit(
+                "Q8_0/Q8_1/Q8_K did not collapse to one ROCm runtime branch"
+            )
+
         subprocess.run(
             [sys.executable, str(args.dispatch_validator), str(output)],
             check=True,

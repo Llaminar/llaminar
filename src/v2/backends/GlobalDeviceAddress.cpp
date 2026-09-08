@@ -145,10 +145,26 @@ namespace llaminar2
         {
             if (parts.size() == 2)
             {
-                // Short form: "type:ordinal"
-                // e.g., "cuda:0" -> localhost:<current_numa>:cuda:0
+                // Accelerators use "type:ordinal".  A CPU has no meaningful
+                // device ordinal, so its short index names the NUMA endpoint
+                // instead.  Normalising here gives pre-MPI bootstrap and the
+                // post-MPI inventory binder the same typed address; neither
+                // layer may reinterpret participant order as CPU locality.
                 addr.device_type = parseDeviceType(parts[0]);
-                addr.device_ordinal = std::stoi(parts[1]);
+                const int short_index = std::stoi(parts[1]);
+                if (short_index < 0)
+                {
+                    return std::nullopt;
+                }
+                if (addr.device_type == DeviceType::CPU)
+                {
+                    addr.numa_node = short_index;
+                    addr.device_ordinal = 0;
+                }
+                else
+                {
+                    addr.device_ordinal = short_index;
+                }
             }
             else if (parts.size() == 3)
             {

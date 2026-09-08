@@ -1,6 +1,11 @@
 /**
  * @file CuBLASGemmKernel.cu
- * @brief cuBLAS GEMM kernel implementation
+ * @brief GEMM submission views borrowing the worker context's persistent cuBLAS handles.
+ *
+ * Expert movement may retire these views during unrelated captured inference.
+ * Library creation/destruction therefore belongs exclusively to device-context
+ * initialization/retirement. Each host call locks handle configuration through
+ * submission and binds its own arena workspace after selecting its exact stream.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -8,11 +13,15 @@
 
 #include "CuBLASGemmKernel.h"
 #include "backends/IWorkerGPUContext.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "kernels/common/FloatingPointGemmWorkspaceABI.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 
 #include <iostream>
 #include <stdexcept>
 #include <array>
+#include <cstdlib>
 #include <vector>
 
 #ifdef HAVE_CUDA
@@ -34,6 +43,29 @@ namespace llaminar2
             constexpr const char *kBatchedSameAAArray = "cublas_batched_same_a_a_ptrs";
             constexpr const char *kBatchedSameABArray = "cublas_batched_same_a_b_ptrs";
             constexpr const char *kBatchedSameACArray = "cublas_batched_same_a_c_ptrs";
+            constexpr auto kBiasMatmulWorkspace = floating_gemm_abi::kCudaBlasMatmulWorkspace;
+            constexpr auto kBiasMatmulWorkspaceBytes = floating_gemm_abi::kBlasMatmulWorkspaceBytes;
+
+            /**
+             * @brief Rebind persistent arena scratch after cublasSetStream resets it.
+             *
+             * Ordinary and bias GEMM cannot execute simultaneously through one
+             * stage, so they reuse its already-declared region. Other concurrent
+             * stages retain independent arena bindings; no per-expert buffer or
+             * library-internal allocation is introduced by handle sharing.
+             */
+            bool bindMatmulWorkspace(cublasHandle_t handle,
+                                     DeviceWorkspaceManager *workspace)
+            {
+                if (!workspace ||
+                    workspace->getBufferSize(kBiasMatmulWorkspace) < kBiasMatmulWorkspaceBytes)
+                    throw std::logic_error("cuBLAS submission requires its declared arena workspace");
+                void *buffer = workspace->getBuffer(kBiasMatmulWorkspace);
+                if (!buffer)
+                    throw std::logic_error("cuBLAS arena workspace has not been materialized");
+                return cublasSetWorkspace(handle, buffer, kBiasMatmulWorkspaceBytes) ==
+                       CUBLAS_STATUS_SUCCESS;
+            }
 
             __global__ void prepare_batched_same_a_pointer_arrays_kernel(
                 const float *d_A,
@@ -121,170 +153,27 @@ namespace llaminar2
         // =====================================================================
 
         CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision)
-            : device_id_(device_id), precision_(precision), owns_handle_(true)
+            : CuBLASGemmKernel(
+                  &GPUDeviceContextPool::instance().getNvidiaContext(device_id),
+                  precision)
         {
-            // Set device
-            cudaError_t cuda_err = cudaSetDevice(device_id_);
-            if (cuda_err != cudaSuccess)
-            {
-                throw std::runtime_error(
-                    std::string("[CuBLASGemmKernel] Failed to set CUDA device ") +
-                    std::to_string(device_id_) + ": " + cudaGetErrorString(cuda_err));
-            }
-
-            // Create cuBLAS handle
-            cublasStatus_t cublas_err = cublasCreate(&handle_);
-            if (cublas_err != CUBLAS_STATUS_SUCCESS)
-            {
-                throw std::runtime_error(
-                    std::string("[CuBLASGemmKernel] Failed to create cuBLAS handle: ") +
-                    std::to_string(static_cast<int>(cublas_err)));
-            }
-
-            // Enable Tensor Core math for better performance on compatible GPUs
-            // CUBLAS_TENSOR_OP_MATH enables use of Tensor Cores when available
-            cublasSetMathMode(handle_, CUBLAS_TENSOR_OP_MATH);
-
-            // Create cuBLASLt handle for fused operations (e.g., GEMM + bias)
-            cublasStatus_t lt_err = cublasLtCreate(&lt_handle_);
-            if (lt_err != CUBLAS_STATUS_SUCCESS)
-            {
-                cublasDestroy(handle_);
-                throw std::runtime_error(
-                    std::string("[CuBLASGemmKernel] Failed to create cuBLASLt handle: ") +
-                    std::to_string(static_cast<int>(lt_err)));
-            }
-
-            LOG_DEBUG("[CuBLASGemmKernel] Created on device " << device_id_
-                                                              << " with precision "
-                                                              << static_cast<int>(precision_)
-                                                              << " (owns handle)");
         }
 
         CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision)
-            : precision_(precision), owns_handle_(false)
+            : precision_(precision)
         {
-            if (!ctx)
-            {
-                throw std::runtime_error(
-                    "[CuBLASGemmKernel] Device context is null");
-            }
-
-            if (!ctx->isInitialized())
-            {
-                throw std::runtime_error(
-                    "[CuBLASGemmKernel] Device context is not initialized");
-            }
-
-            // Store the device context (sets device_ctx_ in base class)
+            if (!ctx || !ctx->isInitialized())
+                throw std::invalid_argument("CuBLAS GEMM requires an initialized worker context");
             setDeviceContext(ctx);
             device_id_ = ctx->deviceOrdinal();
-
-            // Get cuBLAS handle from context via submitAndWait
-            // blasHandle() must be called from the worker thread per thread-safety model
-            void *blas_handle = nullptr;
-            std::exception_ptr eptr = nullptr;
-            ctx->submitAndWait([&]()
-                               {
-                try {
-                    blas_handle = ctx->blasHandle();
-                } catch (...) {
-                    eptr = std::current_exception();
-                } });
-            if (eptr)
-            {
-                std::rethrow_exception(eptr);
-            }
-            if (!blas_handle)
-            {
-                throw std::runtime_error(
-                    "[CuBLASGemmKernel] Device context has no cuBLAS handle");
-            }
-            handle_ = static_cast<cublasHandle_t>(blas_handle);
-
-            // Get cuBLASLt handle from context (required for fused operations)
-            void *lt_handle_ptr = nullptr;
-            ctx->submitAndWait([&]()
-                               { lt_handle_ptr = ctx->blasLtHandle(); });
-            if (!lt_handle_ptr)
-            {
-                throw std::runtime_error(
-                    "[CuBLASGemmKernel] Device context has no cuBLASLt handle");
-            }
-            lt_handle_ = static_cast<cublasLtHandle_t>(lt_handle_ptr);
-            owns_lt_handle_ = false;
-
-            LOG_DEBUG("[CuBLASGemmKernel] Created on device " << device_id_
-                                                              << " with precision "
-                                                              << static_cast<int>(precision_)
-                                                              << " (using context handle)");
+            // Validate both borrowed handles without allocating a library or
+            // queueing work behind the context's inference/transfer thread.
+            const auto submission = ctx->acquireBlasSubmission();
         }
 
-        CuBLASGemmKernel::~CuBLASGemmKernel()
-        {
-            // Only destroy lt_handle_ if we own it
-            if (owns_lt_handle_ && lt_handle_)
-            {
-                cublasLtDestroy(lt_handle_);
-                lt_handle_ = nullptr;
-            }
-            // Only destroy cuBLAS handle if we own it
-            if (owns_handle_ && handle_)
-            {
-                cublasDestroy(handle_);
-                handle_ = nullptr;
-            }
-        }
-
-        // Move constructor
-        CuBLASGemmKernel::CuBLASGemmKernel(CuBLASGemmKernel &&other) noexcept
-            : CUDAKernelBase(std::move(other)),
-              handle_(other.handle_),
-              lt_handle_(other.lt_handle_),
-              device_id_(other.device_id_),
-              precision_(other.precision_),
-              owns_handle_(other.owns_handle_),
-              owns_lt_handle_(other.owns_lt_handle_)
-        {
-            other.handle_ = nullptr;
-            other.lt_handle_ = nullptr;
-            other.owns_handle_ = false;    // Moved-from object shouldn't destroy anything
-            other.owns_lt_handle_ = false; // Moved-from object shouldn't destroy anything
-        }
-
-        // Move assignment
-        CuBLASGemmKernel &CuBLASGemmKernel::operator=(CuBLASGemmKernel &&other) noexcept
-        {
-            if (this != &other)
-            {
-                // Destroy our resources if we own them
-                if (owns_lt_handle_ && lt_handle_)
-                {
-                    cublasLtDestroy(lt_handle_);
-                }
-                if (owns_handle_ && handle_)
-                {
-                    cublasDestroy(handle_);
-                }
-
-                // Move base class
-                CUDAKernelBase::operator=(std::move(other));
-
-                // Take ownership of other's resources
-                handle_ = other.handle_;
-                lt_handle_ = other.lt_handle_;
-                device_id_ = other.device_id_;
-                precision_ = other.precision_;
-                owns_handle_ = other.owns_handle_;
-                owns_lt_handle_ = other.owns_lt_handle_;
-
-                other.handle_ = nullptr;
-                other.lt_handle_ = nullptr;
-                other.owns_handle_ = false;
-                other.owns_lt_handle_ = false;
-            }
-            return *this;
-        }
+        CuBLASGemmKernel::~CuBLASGemmKernel() = default;
+        CuBLASGemmKernel::CuBLASGemmKernel(CuBLASGemmKernel &&) noexcept = default;
+        CuBLASGemmKernel &CuBLASGemmKernel::operator=(CuBLASGemmKernel &&) noexcept = default;
 
         // =====================================================================
         // GEMM Implementation
@@ -296,15 +185,39 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            const auto handle_ = static_cast<cublasHandle_t>(submission.handle());
             if (!handle_)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute] cuBLAS handle is null");
                 return false;
             }
 
+            void *exact_stream = nullptr;
+            try
+            {
+                exact_stream = requireStream("CuBLASGemmKernel::execute");
+            }
+            catch (const std::exception &exception)
+            {
+                LOG_ERROR(exception.what());
+                return false;
+            }
+
             // Always set device — stream carries device context but kernel launch
             // uses the runtime's current-device for PTX code lookup.
             CUDA_CHECK(cudaSetDevice(device_id_));
+            const cublasStatus_t stream_status = cublasSetStream(
+                handle_, static_cast<cudaStream_t>(exact_stream));
+            if (stream_status != CUBLAS_STATUS_SUCCESS)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute] cublasSetStream failed: "
+                          << static_cast<int>(stream_status));
+                return false;
+            }
+
+            if (!bindMatmulWorkspace(handle_, workspace_))
+                return false;
 
             // cuBLAS expects column-major. We have row-major data.
             // To compute C = A @ B in row-major:
@@ -392,9 +305,23 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            const auto lt_handle_ = static_cast<cublasLtHandle_t>(submission.ltHandle());
             if (!lt_handle_)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] cuBLASLt handle is null");
+                return false;
+            }
+
+            void *exact_stream = nullptr;
+            try
+            {
+                exact_stream = requireStream(
+                    "CuBLASGemmKernel::execute_with_bias");
+            }
+            catch (const std::exception &exception)
+            {
+                LOG_ERROR(exception.what());
                 return false;
             }
 
@@ -483,10 +410,37 @@ namespace llaminar2
 
             CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&preference));
 
-            // Request workspace (optional, can improve performance)
-            size_t workspaceSize = 4 * 1024 * 1024; // 4MB workspace
-            void *workspace = nullptr;
-            CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
+            /*
+             * The algorithm workspace is an immutable graph resource.  A bias
+             * projection may execute during warmup, capture, and replay, so
+             * allocating it here would make both address ownership and capture
+             * legality depend on the current call.  The graph planner must bind
+             * the declared buffer before this method can be entered.
+             */
+            const size_t workspaceSize = kBiasMatmulWorkspaceBytes;
+            if (!workspace_)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] Required graph workspace is not bound");
+                cublasLtMatmulPreferenceDestroy(preference);
+                cublasLtMatrixLayoutDestroy(Cdesc);
+                cublasLtMatrixLayoutDestroy(Bdesc);
+                cublasLtMatrixLayoutDestroy(Adesc);
+                cublasLtMatmulDescDestroy(operationDesc);
+                return false;
+            }
+            void *workspace = workspace_->getBuffer(kBiasMatmulWorkspace);
+            if (!workspace ||
+                workspace_->getBufferSize(kBiasMatmulWorkspace) < workspaceSize)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] Missing or undersized "
+                          << kBiasMatmulWorkspace << " workspace");
+                cublasLtMatmulPreferenceDestroy(preference);
+                cublasLtMatrixLayoutDestroy(Cdesc);
+                cublasLtMatrixLayoutDestroy(Bdesc);
+                cublasLtMatrixLayoutDestroy(Adesc);
+                cublasLtMatmulDescDestroy(operationDesc);
+                return false;
+            }
 
             CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(preference,
                                                                 CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -504,7 +458,6 @@ namespace llaminar2
             if (returnedResults == 0)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] No suitable algorithm found");
-                cudaFree(workspace);
                 cublasLtMatmulPreferenceDestroy(preference);
                 cublasLtMatrixLayoutDestroy(Cdesc);
                 cublasLtMatrixLayoutDestroy(Bdesc);
@@ -527,10 +480,9 @@ namespace llaminar2
                                                    d_C, Cdesc, // D (output, same as C)
                                                    &heuristicResult.algo,
                                                    workspace, workspaceSize,
-                                                   static_cast<cudaStream_t>(gpu_stream_)); // Use configured stream
+                                                   static_cast<cudaStream_t>(exact_stream));
 
             // Cleanup
-            cudaFree(workspace);
             cublasLtMatmulPreferenceDestroy(preference);
             cublasLtMatrixLayoutDestroy(Cdesc);
             cublasLtMatrixLayoutDestroy(Bdesc);
@@ -552,8 +504,11 @@ namespace llaminar2
             const std::vector<float *> &d_C_matrices,
             int M, int N, int K,
             bool transA, bool transB,
-            float alpha, float beta)
+            float alpha, float beta,
+            DeviceWorkspaceManager *workspace_override)
         {
+            const auto submission = device_ctx_->acquireBlasSubmission();
+            const auto handle_ = static_cast<cublasHandle_t>(submission.handle());
             if (!handle_)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] cuBLAS handle is null");
@@ -592,15 +547,26 @@ namespace llaminar2
             }
 
             CUDA_CHECK(cudaSetDevice(device_id_));
+            cublasStatus_t stream_status =
+                cublasSetStream(handle_, static_cast<cudaStream_t>(gpu_stream_));
+            if (stream_status != CUBLAS_STATUS_SUCCESS)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] cublasSetStream failed: "
+                          << static_cast<int>(stream_status));
+                return false;
+            }
 
-            if (!workspace_)
+            DeviceWorkspaceManager *effective_workspace = workspace_override ? workspace_override : workspace_;
+            if (!bindMatmulWorkspace(handle_, effective_workspace))
+                return false;
+            if (!effective_workspace)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Batched pointer workspace is not bound");
                 return false;
             }
-            auto *d_A_array = static_cast<const float **>(workspace_->getBuffer(kBatchedSameAAArray));
-            auto *d_B_array = static_cast<const float **>(workspace_->getBuffer(kBatchedSameABArray));
-            auto *d_C_array = static_cast<float **>(workspace_->getBuffer(kBatchedSameACArray));
+            auto *d_A_array = static_cast<const float **>(effective_workspace->getBuffer(kBatchedSameAAArray));
+            auto *d_B_array = static_cast<const float **>(effective_workspace->getBuffer(kBatchedSameABArray));
+            auto *d_C_array = static_cast<float **>(effective_workspace->getBuffer(kBatchedSameACArray));
             if (!d_A_array || !d_B_array || !d_C_array)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Missing batched pointer workspace buffers");
@@ -633,7 +599,40 @@ namespace llaminar2
                 d_C_array);
             CUDA_CHECK(cudaGetLastError());
 
-            CUBLAS_CHECK(cublasSgemmBatched(
+            if (DebugEnv::envValue("LLAMINAR_CUBLAS_BSAMEA_DIAG") != nullptr)
+            {
+                cudaStreamCaptureStatus pre_capture_status = cudaStreamCaptureStatusNone;
+                const cudaError_t pre_capture_err =
+                    cudaStreamIsCapturing(static_cast<cudaStream_t>(gpu_stream_), &pre_capture_status);
+                fprintf(stderr,
+                        "[CuBLASGemmKernel::execute_batched_same_a] pre-cublas diag: "
+                        "device_id=%d stream=%p capture_status=%d capture_query=%s "
+                        "M=%d N=%d K=%d batch=%d d_A_array=%p d_B_array=%p d_C_array=%p\n",
+                        device_id_,
+                        gpu_stream_,
+                        static_cast<int>(pre_capture_status),
+                        cudaGetErrorString(pre_capture_err),
+                        M,
+                        N,
+                        K,
+                        batch_count,
+                        static_cast<const void *>(d_A_array),
+                        static_cast<const void *>(d_B_array),
+                        static_cast<void *>(d_C_array));
+                if (pre_capture_err == cudaSuccess &&
+                    pre_capture_status == cudaStreamCaptureStatusNone)
+                {
+                    const cudaError_t pre_sync_err =
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                    fprintf(stderr,
+                            "[CuBLASGemmKernel::execute_batched_same_a] pre-cublas pointer-stage sync: %s\n",
+                            cudaGetErrorString(pre_sync_err));
+                    if (pre_sync_err != cudaSuccess)
+                        return false;
+                }
+            }
+
+            cublasStatus_t status = cublasSgemmBatched(
                 handle_,
                 opB, opA,
                 N, M, K,
@@ -642,7 +641,43 @@ namespace llaminar2
                 d_A_array, lda,
                 &beta,
                 d_C_array, ldc,
-                batch_count));
+                batch_count);
+            if (status != CUBLAS_STATUS_SUCCESS)
+            {
+                int current_device = -1;
+                (void)cudaGetDevice(&current_device);
+                cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+                const cudaError_t capture_err =
+                    cudaStreamIsCapturing(static_cast<cudaStream_t>(gpu_stream_), &capture_status);
+                const cudaError_t sticky_err = cudaPeekAtLastError();
+                fprintf(stderr,
+                        "[CuBLASGemmKernel::execute_batched_same_a] cublasSgemmBatched failed: "
+                        "status=%d device_id=%d current_device=%d stream=%p capture_status=%d "
+                        "capture_query=%s sticky=%s M=%d N=%d K=%d batch=%d "
+                        "d_A=%p d_A_array=%p d_B_array=%p d_C_array=%p "
+                        "B0=%p B1=%p C0=%p C1=%p workspace=%p\n",
+                        static_cast<int>(status),
+                        device_id_,
+                        current_device,
+                        gpu_stream_,
+                        static_cast<int>(capture_status),
+                        cudaGetErrorString(capture_err),
+                        cudaGetErrorString(sticky_err),
+                        M,
+                        N,
+                        K,
+                        batch_count,
+                        static_cast<const void *>(d_A),
+                        static_cast<const void *>(d_A_array),
+                        static_cast<const void *>(d_B_array),
+                        static_cast<void *>(d_C_array),
+                        batch_count > 0 ? static_cast<const void *>(b[0]) : nullptr,
+                        batch_count > 1 ? static_cast<const void *>(b[1]) : nullptr,
+                        batch_count > 0 ? static_cast<void *>(c[0]) : nullptr,
+                        batch_count > 1 ? static_cast<void *>(c[1]) : nullptr,
+                        static_cast<void *>(effective_workspace));
+                return false;
+            }
 
             return true;
         }
@@ -654,6 +689,8 @@ namespace llaminar2
             reqs.buffers.push_back({kBatchedSameAAArray, bytes, 256, true});
             reqs.buffers.push_back({kBatchedSameABArray, bytes, 256, true});
             reqs.buffers.push_back({kBatchedSameACArray, bytes, 256, true});
+            reqs.buffers.push_back(
+                {kBiasMatmulWorkspace, kBiasMatmulWorkspaceBytes, 256, true});
             return reqs;
         }
 
@@ -675,13 +712,15 @@ namespace llaminar2
             return std::make_unique<CuBLASGemmKernel>(ctx, precision);
         }
 
-        void CuBLASGemmKernel::setStream(void *stream)
+        void CuBLASGemmKernel::bindStream(ExplicitGPUStream stream)
         {
-            gpu_stream_ = stream;
-            if (handle_)
-            {
-                cublasSetStream(handle_, static_cast<cudaStream_t>(stream));
-            }
+            CUDAKernelBase::bindGPUStream(stream);
+            /* The exact handle stream is installed and checked at dispatch. */
+        }
+
+        void CuBLASGemmKernel::clearStreamBinding() noexcept
+        {
+            CUDAKernelBase::clearGPUStreamBinding();
         }
 
 #else // !HAVE_CUDA
@@ -689,13 +728,13 @@ namespace llaminar2
         // Stub implementations when CUDA is not available
 
         CuBLASGemmKernel::CuBLASGemmKernel(int device_id, Precision precision)
-            : device_id_(device_id), precision_(precision), owns_handle_(true)
+            : device_id_(device_id), precision_(precision)
         {
             throw std::runtime_error("[CuBLASGemmKernel] CUDA support not compiled");
         }
 
         CuBLASGemmKernel::CuBLASGemmKernel(IWorkerGPUContext * /*ctx*/, Precision precision)
-            : precision_(precision), owns_handle_(false)
+            : precision_(precision)
         {
             throw std::runtime_error("[CuBLASGemmKernel] CUDA support not compiled");
         }
@@ -727,7 +766,8 @@ namespace llaminar2
             const std::vector<const float *> &,
             const std::vector<float *> &,
             int, int, int,
-            bool, bool, float, float)
+            bool, bool, float, float,
+            DeviceWorkspaceManager *)
         {
             return false;
         }
@@ -747,7 +787,8 @@ namespace llaminar2
             return nullptr;
         }
 
-        void CuBLASGemmKernel::setStream(void *) {}
+        void CuBLASGemmKernel::bindStream(ExplicitGPUStream) {}
+        void CuBLASGemmKernel::clearStreamBinding() noexcept {}
 
 #endif // HAVE_CUDA
 

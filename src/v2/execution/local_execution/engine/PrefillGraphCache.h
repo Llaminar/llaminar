@@ -15,9 +15,12 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../backends/DeviceId.h"
 #include "../graph/ComputeGraph.h"
+#include "../graph/GraphCaptureGuard.h"
 #include "../../compute_stages/IComputeStage.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -33,8 +36,8 @@ namespace llaminar2
     {
         int seq_len = 0;                      ///< Bucket/actual seq_len
         DeviceId device_id = DeviceId::cpu(); ///< Target device
-        std::string domain_id = "single";     ///< EP rebalance domain (Tier 1: always "single")
-        int participant_id = 0;               ///< Domain-local participant id for segmented ExpertParallel caches
+        std::string domain_id = "single";     ///< Routed-expert rebalance domain (Tier 1: always "single")
+        int participant_id = 0;               ///< Domain-local participant id for segmented routed-expert caches
         int real_token_count = 0;             ///< Real tokens represented inside a padded bucket (0 means exact/unspecified)
         int first_layer = 0;                  ///< First layer covered by this segment cache key
         int layer_count = 0;                  ///< Number of layers covered by this segment (0 means whole graph/unspecified)
@@ -60,6 +63,20 @@ namespace llaminar2
         Ready        ///< Graph instantiated, ready for replay
     };
 
+    /**
+     * @brief Submission lifecycle of one instantiated prefill executable.
+     *
+     * Capture and instantiation do not execute kernels. The first subsequent
+     * launch is transaction zero and must be distinguishable from steady
+     * replay so setup can seal graphs without pretending inference occurred.
+     */
+    enum class PrefillGraphExecutableSubmissionState
+    {
+        Empty,                  ///< No complete executable is owned.
+        MaterializedUnlaunched, ///< Instantiated executable awaits transaction zero.
+        ReplayReady,            ///< At least one successful launch completed.
+    };
+
     /// Controls how preflight treats padded-bucket stages that warm lazily.
     enum class PrefillGraphPreflightMode
     {
@@ -68,18 +85,32 @@ namespace llaminar2
         CaptureReady       ///< Require strict capture readiness for every stage
     };
 
+    /**
+     * @brief Declares whether active MoE placement is immutable for this graph.
+     *
+     * This is deliberately a scoped type rather than a Boolean.  It precedes
+     * optional diagnostic pointers in `preflight()`, so a caller cannot
+     * accidentally bind a pointer to a newly inserted Boolean policy slot.
+     */
+    enum class PrefillMoEGraphStability : uint8_t
+    {
+        Unstable, ///< Placement may change and padded capture must be rejected.
+        Stable    ///< Placement is graph-stable for the captured transaction.
+    };
+
     /// Reasons a prefill graph capture can be rejected.
     enum class PrefillGraphRejectReason
     {
         None,
         FeatureDisabled,        ///< LLAMINAR_GPU_GRAPHS=0
-        SeqLenBelowMinimum,     ///< seq_len < LLAMINAR_PREFILL_GRAPH_MIN_SEQ
+        PaddedBucketBelowMinimum, ///< Padded physical bucket is below the configured coalescing floor
         NotGPUDevice,           ///< CPU device
-        SnapshotsActive,        ///< ENABLE_PIPELINE_SNAPSHOTS build
-        ActiveMoERebalancing,   ///< Rebalance mode is DYNAMIC or OBSERVE
+        SnapshotsActive,        ///< Obsolete: snapshots are post-graph diagnostics.
+        ActiveMoERebalancing,   ///< Non-graph-stable dynamic MoE rebalance is active for a padded bucket
         CollectiveNodesPresent, ///< Graph has TP/PP collective stages
         StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
+        HostPolicyDisabled,     ///< Host-level graph contract is not proven for this execution mode
         NoGPUContext,           ///< GPU context unavailable
         InvalidatedByPlacement, ///< Expert placement mutation since last capture
         SessionReset,           ///< Legacy name for request/session reset invalidation
@@ -93,11 +124,12 @@ namespace llaminar2
     struct PrefillGraphConfig
     {
         bool enabled = true;                 ///< LLAMINAR_GPU_GRAPHS master flag
-        int min_seq_len = 256;               ///< LLAMINAR_PREFILL_GRAPH_MIN_SEQ
+        int minimum_padded_bucket_seq_len = 256; ///< Minimum padded raw-prompt bucket; exact smaller graphs remain capturable
         bool trace = false;                  ///< LLAMINAR_PREFILL_GRAPH_TRACE
         bool buckets_enabled = true;         ///< Bucketed capture is on by default; LLAMINAR_PREFILL_GRAPH_BUCKETS=0 opts out.
         std::vector<int> bucket_sizes;       ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES
-        size_t max_cached_entries = 10;      ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
+        size_t max_cached_entries =
+            kDefaultPrefillGraphMaxCachedEntries; ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
     };
 
     /// Per-entry state in the prefill graph cache.
@@ -110,6 +142,8 @@ namespace llaminar2
         uint64_t capture_timestamp_ns = 0;         ///< When capture completed
         int replay_count = 0;                      ///< Number of successful replays
         uint64_t last_access_tick = 0;             ///< Monotonic LRU timestamp
+        PrefillGraphExecutableSubmissionState submission_state =
+            PrefillGraphExecutableSubmissionState::Empty; ///< Exact executable launch lifecycle.
     };
 
     /// Lifetime counters for a bucket key, retained even if the graph entry is evicted.
@@ -123,9 +157,10 @@ namespace llaminar2
     /// Summary of request-boundary prefill graph-cache cleanup.
     struct PrefillGraphRequestResetSummary
     {
-        size_t ready_preserved = 0; ///< Ready executable entries kept for replay.
-        size_t initialized = 0;     ///< Entries kept as lazy-initialized, without request capture arming.
-        size_t dropped = 0;         ///< Capturing/invalid entries dropped to Cold.
+        size_t ready_preserved = 0; ///< Ready executable entries retained for replay.
+        size_t ready_demoted = 0; ///< Ready executable entries demoted to lazy-initialized state.
+        size_t initialized = 0;   ///< Warmup/Initialized entries kept without request capture arming.
+        size_t dropped = 0;       ///< Capturing/invalid entries dropped to Cold.
     };
 
     class PrefillGraphCache
@@ -149,25 +184,68 @@ namespace llaminar2
             bool moe_rebalancing_active = false,
             int real_seq_len = 0,
             int bucket_seq_len = 0,
-            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default) const;
+            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
+            bool collectives_graph_capturable = false,
+            bool heterogeneous_segmentation_admitted = false,
+            PrefillMoEGraphStability moe_graph_stability =
+                PrefillMoEGraphStability::Unstable,
+            std::string *reject_stage_name = nullptr,
+            std::string *reject_stage_type = nullptr) const;
 
         /// Mark warmup complete for a key. Transitions Cold → Warmup (arms capture).
         void markWarmedUp(const PrefillGraphCacheKey &key);
 
         /**
-         * @brief Begin graph capture on the given explicit stream.
+         * @brief Arm a cold entry for setup-only capture without eager inference.
+         *
+         * Serving-family setup has already allocated persistent graph storage
+         * and prepared immutable launch descriptors. It therefore transitions
+         * Cold directly to Initialized rather than executing a synthetic model
+         * request merely to enter Warmup.
+         *
+         * Repeating the call for an Initialized entry is idempotent. Any other
+         * state is a lifecycle violation because setup and request execution
+         * would then have competing ownership.
+         *
+         * @param key Exact admitted physical prefill bucket identity.
+         */
+        void markInitializedForSetupMaterialization(
+            const PrefillGraphCacheKey &key);
+
+        /**
+         * @brief Record and instantiate one prefill graph as an indivisible transaction.
          *
          * Warmup entries are armed by a fresh request-local warmup. Initialized
          * entries are accepted only after the caller has run strict capture-ready
-         * preflight and prepared current request metadata. The cache keeps this
-         * method narrow: it validates lifecycle and stream ownership, while the
-         * executor decides whether capture is semantically safe for this request.
+         * preflight and prepared current request metadata. The supplied callback
+         * records the graph body between one backend `beginCapture()` and its
+         * matching `endCapture()`.
+         *
+         * The begin/body/end sequence is deliberately owned by this method.
+         * Callers cannot leave a native CUDA/HIP stream in capture mode by
+         * returning early, forgetting an abort call, or throwing from the graph
+         * body. `ScopedBackendGraphCapture` closes every successfully opened
+         * interval. A backend failure to leave native capture mode terminates the
+         * process because stream ownership is unknowable after that point.
+         *
+         * @param key Capture-cache identity prepared by warmup or request reset.
+         * @param gpu_ctx Worker context that owns the explicit native stream.
+         * @param stream Exact stream on which every graph-body launch is recorded.
+         * @param record_graph_body Callback that records all graph work and
+         *        returns true only when every required launch was accepted.
+         * @param dependency_ledger Optional frozen arena dependency plan. The
+         *        production prefill executor always supplies one; controller unit
+         *        tests without tensors may omit it.
+         * @return true only when recording, capture closure, and graph
+         *         instantiation all succeed. A false body result leaves the entry
+         *         Cold and is never retried through eager execution.
          */
-        bool beginCapture(const PrefillGraphCacheKey &key, IWorkerGPUContext *gpu_ctx, void *stream);
-
-        /// End graph capture, instantiate the executable graph.
-        /// Transitions Capturing → Ready. Returns false on failure.
-        bool endCaptureAndInstantiate(const PrefillGraphCacheKey &key);
+        bool captureAndInstantiate(
+            const PrefillGraphCacheKey &key,
+            IWorkerGPUContext *gpu_ctx,
+            void *stream,
+            const std::function<bool()> &record_graph_body,
+            GraphCaptureDependencyLedger *dependency_ledger = nullptr);
 
         /// Launch (replay) the cached graph.
         /// Returns false if not Ready or launch fails.
@@ -177,26 +255,29 @@ namespace llaminar2
         void invalidateAll(PrefillGraphRejectReason reason = PrefillGraphRejectReason::InvalidatedByPlacement);
 
         /**
-         * @brief Preserve replay-ready entries across a request-boundary reset.
+         * @brief Apply a typed request-boundary policy to prefill executables.
          *
-         * `clear_cache()` resets live KV/GDN/short-conv contents, but replay-ready
-         * bucketed prefill graph entries are designed to read refreshed graph-facing
-         * buffers and then replay the same deterministic mutation sequence.
+         * `clear_cache()` resets live KV/GDN/short-conv contents without changing
+         * their persistent device addresses. A complete Ready graph whose stages
+         * consume those stable addresses can therefore survive the reset: fresh
+         * request inputs and mutable replay metadata are published before its next
+         * launch, while the executable continues to describe the same ownership
+         * graph.
          *
-         * Warmup entries are intentionally not preserved as Warmup. A warmed
-         * entry has observed request-local runtime metadata, but it has also
-         * performed useful lazy stage/kernel initialization. Request reset converts
-         * Warmup to Initialized: the next same-key request may capture only after a
-         * strict capture-ready preflight and fresh metadata preparation, or else it
-         * executes a fresh warmup. This preserves lazy resources without carrying
-         * a request-armed state across `clear_cache()`.
+         * Set @p preserve_ready_executables only for the replay-preserving reset
+         * path. Hard resets leave it false and demote Ready entries to
+         * Initialized. Warmup entries are always request-armed rather than
+         * reusable captures, so they become Initialized and must pass strict
+         * capture-readiness preflight before a later capture. Cold or invalid
+         * entries are dropped.
          *
-         * @return Summary of preserved, initialized, and dropped entries.
+         * @param preserve_ready_executables Keep complete Ready executables bound
+         *        to stable device storage. No partially captured entry is ever
+         *        preserved.
+         * @return Summary of preserved, demoted, initialized, and dropped entries.
          */
-        PrefillGraphRequestResetSummary prepareEntriesForRequestReset();
-
-        /// Compatibility wrapper returning only dropped entries.
-        size_t preserveReadyEntriesAcrossRequestReset();
+        PrefillGraphRequestResetSummary prepareEntriesForRequestReset(
+            bool preserve_ready_executables = false);
 
         /// Invalidate a specific entry.
         void invalidate(const PrefillGraphCacheKey &key);
@@ -212,6 +293,10 @@ namespace llaminar2
 
         /// Get replay count for an entry.
         int replayCount(const PrefillGraphCacheKey &key) const;
+
+        /** @return Whether a sealed executable still awaits transaction zero. */
+        bool materializedTransactionZeroPending(
+            const PrefillGraphCacheKey &key) const;
 
         /// Get number of entries evicted due to the configured cache cap.
         uint64_t evictionCount() const { return eviction_count_; }

@@ -34,7 +34,9 @@ namespace llaminar2
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;
+        bool purgePrefixCache() override;
         int get_position() const override;
+        DeviceId primaryDeviceId() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
 
@@ -51,17 +53,38 @@ namespace llaminar2
         void setDecodeStepTokenBudget(int max_tokens) override;
         DecodeStepOutput decodeStepForBenchmark() override;
         DecodeBatchStepOutput decodeBatchStepForBenchmark(int request_batch) override;
-        bool maybeApplyDecodeBoundaryMaintenance() override;
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override;
+        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
+        bool waitForLastInferenceCompletionForBenchmark() override;
+        InferenceReadiness inferenceReadiness() const override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        uint64_t moeRuntimeMovementEpoch() const override;
+        MoEOptimizationStatus moeOptimizationStatus() const override;
+        /**
+         * @brief Admit stop tokens through the orchestration ownership layer.
+         *
+         * The adapter does not own graph state.  It forwards the complete
+         * request policy to IOrchestrationRunner, whose concrete implementation
+         * publishes it to the underlying graph owners before prefill.
+         */
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override;
+        /**
+         * @brief Admit MTP penalties through orchestration sampling policy.
+         */
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override;
 
     private:
         IOrchestrationRunner *orch_runner_;
         int position_;
+        SamplingParams sampling_params_{};
     };
 
 } // namespace llaminar2

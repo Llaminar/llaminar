@@ -294,6 +294,73 @@ class TestQwen35ModelRegistry:
         assert model.model_name == 'qwen35'
 
 
+class TestQwen36DenseMTPSidecarReference:
+    """Device-free contracts for retaining the real dense nextn oracle."""
+
+    def test_prepare_state_retains_only_first_nextn_layer(self):
+        from python.reference.qwen35 import Qwen35ReferenceModel
+
+        model = Qwen35ReferenceModel(
+            model_name='qwen35', checkpoint_path='dummy.gguf', auto_load=False
+        )
+        state = {
+            'model.layers.63.mlp.down_proj.weight': torch.tensor([63.0]),
+            'blk.64.nextn.eh_proj.weight': torch.tensor([640.0]),
+            'blk.64.nextn.hnorm.weight': torch.tensor([641.0]),
+            'model.layers.64.mlp.down_proj.weight': torch.tensor([642.0]),
+            'blk.65.nextn.eh_proj.weight': torch.tensor([650.0]),
+            'model.layers.65.mlp.down_proj.weight': torch.tensor([652.0]),
+        }
+
+        prepared = model._prepare_gguf_state_dict({}, state)
+
+        assert prepared is state
+        assert model._mtp_sidecar_source_layer == 64
+        assert set(model._mtp_sidecar_state) == {
+            'blk.64.nextn.eh_proj.weight',
+            'blk.64.nextn.hnorm.weight',
+            'model.layers.64.mlp.down_proj.weight',
+        }
+        # The sidecar retains the immutable loader authority without cloning a
+        # multi-gigabyte dense FFN solely for reference generation.
+        assert (
+            model._mtp_sidecar_state['blk.64.nextn.eh_proj.weight'].data_ptr()
+            == state['blk.64.nextn.eh_proj.weight'].data_ptr()
+        )
+
+    def test_manual_nextn_norm_uses_pre_rmsnorm_1p_gamma(self):
+        from python.reference.qwen35 import Qwen35ReferenceModel
+
+        value = torch.tensor([[3.0, 4.0]], dtype=torch.float32)
+        stored_gamma = torch.tensor([-0.5, 0.25], dtype=torch.float32)
+        actual = Qwen35ReferenceModel._mtp_rms_norm(
+            value,
+            stored_gamma,
+            0.0,
+            pre_rmsnorm_1p=True,
+        )
+        normalized = value * torch.rsqrt(
+            value.pow(2).mean(dim=-1, keepdim=True)
+        )
+        expected = normalized * torch.tensor([0.5, 1.25])
+        torch.testing.assert_close(actual, expected)
+
+    def test_missing_nextn_weights_fail_closed(self):
+        from python.reference.qwen35 import Qwen35ReferenceModel
+
+        model = Qwen35ReferenceModel(
+            model_name='qwen35', checkpoint_path='dummy.gguf', auto_load=False
+        )
+        model._capture_mtp_sidecar_state({
+            'model.layers.63.mlp.down_proj.weight': torch.tensor([1.0]),
+        })
+
+        with pytest.raises(RuntimeError, match='no retained.*nextn/MTP'):
+            model.generate_mtp_sidecar_decode_snapshots(
+                'hello', 1, Path('/tmp/unused-qwen36-dense-mtp-reference')
+            )
+
+
 class TestQwen35SnapshotGeneration:
     """Unit tests for snapshot/metadata generation helpers."""
 
@@ -420,9 +487,11 @@ class TestQwen35SnapshotGeneration:
             hf_model = FakeHFModel()
 
         output_dir = tmp_path / "missing" / "qwen36"
+        model_path = tmp_path / "qwen36.gguf"
+        model_path.write_bytes(b"authenticated fixture model")
         write_metadata(
             output_dir,
-            "/models/qwen36.gguf",
+            str(model_path),
             FakeModel(),
             "hello",
             [1, 2],

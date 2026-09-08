@@ -75,7 +75,9 @@ namespace llaminar2
         std::vector<int32_t> rejected_token_counts;
         std::vector<int32_t> token_indices_to_sample;
         std::vector<int32_t> next_condition_tokens;
+        /** No verifier comparison rejected; `stopped_flags` may still truncate the width. */
         std::vector<int32_t> all_drafts_accepted_flags;
+        /** Output encountered a request stop token and cannot publish a bonus continuation. */
         std::vector<int32_t> stopped_flags;
         std::vector<int32_t> query_start_locs;
         std::vector<int32_t> state_indices;
@@ -134,6 +136,29 @@ namespace llaminar2
     };
 
     /**
+     * @brief Physical row layout consumed by the target verifier LM head.
+     *
+     * A single-request verifier commonly projects every physical graph row in
+     * ascending order. In that case the final normalized activation is already
+     * the exact dense LM-head input and neither a row-index workspace upload nor
+     * a row-copy kernel carries useful information. Request-batched verifier
+     * graphs can contain padding gaps, so they retain an explicit row-selection
+     * contract.
+     */
+    enum class MTPSpecDecodeVerifierLogitRowLayout
+    {
+        /**
+         * @brief Project an explicit ordered subset of physical graph rows.
+         */
+        ExplicitSelection,
+
+        /**
+         * @brief Project every physical graph row once, in ascending order.
+         */
+        FullPhysicalIdentity
+    };
+
+    /**
      * @brief Verifier input materialized in graph execution coordinates.
      *
      * `MTPSpecDecodeVerifierInputPlan` stores a compact logical sequence where
@@ -153,6 +178,8 @@ namespace llaminar2
         int request_count = 0;
         int padded_seq_len = 0;
         int total_graph_tokens = 0;
+        MTPSpecDecodeVerifierLogitRowLayout logit_row_layout =
+            MTPSpecDecodeVerifierLogitRowLayout::ExplicitSelection;
 
         std::vector<std::vector<int>> token_batches;
         std::vector<int> sequence_lengths;
@@ -206,7 +233,9 @@ namespace llaminar2
      * `accepted_verifier_input_prefix` count includes the first main-model
      * token at verifier row zero; it is therefore one larger than the number of
      * accepted sidecar draft tokens when at least the first output token was
-     * produced.
+     * produced. A commit-boundary ready token is distinct from an all-accepted
+     * bonus: it conditions the next serial-visible transaction but does not add
+     * another committed output or speculative state row to this transaction.
      */
     struct MTPSpecDecodeAcceptedOutcome
     {
@@ -215,10 +244,12 @@ namespace llaminar2
         int draft_count = 0;
         std::vector<int32_t> committed_output_tokens;
         std::optional<int32_t> bonus_ready_token;
+        std::optional<int32_t> commit_boundary_ready_token;
         int accepted_verifier_input_prefix = 0;
         int target_verifier_state_commit_count = -1;
         bool all_drafts_accepted = false;
         bool stopped_on_output = false;
+        bool commit_boundary_clipped = false;
     };
 
     WorkspaceRequirements buildMTPSpecDecodeWorkspaceRequirements(
@@ -245,12 +276,47 @@ namespace llaminar2
     MTPSpecDecodeVerifierGraphForwardPlan buildMTPSpecDecodeVerifierGraphForwardPlan(
         const MTPSpecDecodeVerifierInputPlan &plan);
 
+    /**
+     * @brief Build transaction metadata with explicit state and control facts.
+     *
+     * The five-argument overload derives acceptance from exact draft/sample
+     * comparison. A verifier catch-up result uses the six-argument overload
+     * because a stop can truncate the compared width without representing a
+     * rejection. The independent stopped vector then prevents bonus-continuation
+     * publication.
+     *
+     * @param shape Padded request/depth capacity of the metadata family.
+     * @param requests Token-visible speculative requests.
+     * @param committed_output_counts Response tokens committed per request.
+     * @param target_verifier_state_commit_counts Verifier input rows whose state is publishable.
+     * @param stopped_flags Per-request stop-token predicates.
+     * @return Validated metadata and publication indices, or a precise failure.
+     */
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
         const MTPSpecDecodeMetadataShape &shape,
         const std::vector<MTPSpecDecodeRequest> &requests,
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &target_verifier_state_commit_counts,
         const std::vector<int32_t> &stopped_flags);
+
+    /**
+     * @brief Build transaction metadata with an explicit no-rejection vector.
+     *
+     * @param shape Padded request/depth capacity of the metadata family.
+     * @param requests Token-visible speculative requests.
+     * @param committed_output_counts Response tokens committed per request.
+     * @param target_verifier_state_commit_counts Verifier input rows whose state is publishable.
+     * @param stopped_flags Per-request stop-token predicates.
+     * @param all_drafts_accepted_flags Explicit per-request no-rejection predicates.
+     * @return Validated metadata and publication indices, or a precise failure.
+     */
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeRequest> &requests,
+        const std::vector<int32_t> &committed_output_counts,
+        const std::vector<int32_t> &target_verifier_state_commit_counts,
+        const std::vector<int32_t> &stopped_flags,
+        const std::vector<int32_t> &all_drafts_accepted_flags);
 
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
         const MTPSpecDecodeMetadataShape &shape,
@@ -344,11 +410,15 @@ namespace llaminar2
     };
 
     /**
-     * Runner-owned workspace consumer for graph-facing spec-decode metadata.
+     * @brief Workspace binding for graph-facing speculative-decode metadata.
      *
-     * The buffers are not a graph stage scratch allocation. They are persistent
-     * per-runner metadata slots that graph-captured MTP verifier/state stages
-     * can read after the runner uploads a new batch on an explicit stream.
+     * These rows are verifier working storage. `WorkspaceAllocator` may replace
+     * their backing allocation whenever a newly materialized graph needs a
+     * different workspace layout, so no request-lifetime owner may retain a raw
+     * pointer from this binding across graph materialization. Published logical
+     * sequence state has a separate arena-owned allocation in
+     * `DeviceGraphOrchestrator`; derivation kernels write those durable output
+     * rows directly instead of treating this binding as a publication mailbox.
      */
     class MTPSpecDecodeMetadataWorkspaceBinding : public IWorkspaceConsumer
     {
@@ -356,8 +426,26 @@ namespace llaminar2
         explicit MTPSpecDecodeMetadataWorkspaceBinding(
             MTPSpecDecodeMetadataShape shape = {});
 
-        void setShape(MTPSpecDecodeMetadataShape shape);
-        const MTPSpecDecodeMetadataShape &shape() const { return shape_; }
+        /**
+         * @brief Ensure that the graph-family workspace can represent a geometry.
+         *
+         * Capacity is setup-owned and monotonic. Request-lifetime verifier plans
+         * may be smaller than this reservation, but they must never shrink it:
+         * captured graphs and publication endpoints retain pointers sized from
+         * the largest declared graph family. Growing an already-bound capacity
+         * refreshes the binding and deliberately leaves it invalid when the
+         * allocator has not reserved enough storage for the new minimum.
+         *
+         * @param minimum_capacity Smallest request/depth geometry to retain.
+         * @throws std::invalid_argument when the requested capacity is invalid.
+         */
+        void ensureCapacity(MTPSpecDecodeMetadataShape minimum_capacity);
+
+        /** @brief Return the setup-owned storage capacity, never active request state. */
+        const MTPSpecDecodeMetadataShape &capacity() const { return shape_; }
+
+        /** @brief Test whether a logical plan fits without rebinding or allocation. */
+        bool covers(MTPSpecDecodeMetadataShape requested_shape) const;
 
         WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const override;

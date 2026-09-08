@@ -1,608 +1,1619 @@
 #!/usr/bin/env python3
-"""Generate ROCm NativeVNNI decode dispatch artifacts from trainer CSVs.
+"""Compile strong ROCm NativeVNNI decode evidence through the common policy core.
 
-Run sweeps with LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 when refreshing
-checked-in tables so AUTO rows do not benchmark the previous table.
+The analyzer deliberately performs no backend-local modal-label learning.
+Every raw row is first adapted into the strict common schema; byte/route
+eligibility, source-alias robustness, eager/captured robustness, and generic
+regret learning then come from the shared NativeVNNI implementation.
+
+Only Fast M=1 candidates encode a KB in the current ROCm runtime ABI.  The
+grouped runtime-M verifier candidate is ``INHERIT_SERIAL_M1`` and is certified as
+an independent execution surface, but it never emits a conflicting split-K
+entry.  Production verifier resolution therefore consumes the exact same
+frozen M=1 policy that defined its serial oracle.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parents[1]
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
 
-from native_vnni_codebooks import CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK  # noqa: E402
+KERNEL_PERF_ROOT = Path(__file__).resolve().parents[1]
+if str(KERNEL_PERF_ROOT) not in sys.path:
+    sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
-
-ASPECT_BUCKETS = (
-    ("very_wide", 16.0),
-    ("wide", 2.0),
-    ("balanced", 0.75),
+from native_vnni_dispatch.adapters.rocm_decode import (  # noqa: E402
+    ROCmDecodeAdapterContext,
+    adapt_rocm_decode_csv,
+    raw_corpus_id,
+)
+from native_vnni_dispatch.candidate_observation import (  # noqa: E402
+    write_observation_csv,
+)
+from native_vnni_dispatch.candidate_registry import (  # noqa: E402
+    candidate_registry_digest,
+    rocm_native_vnni_decode_formula_registry,
+    rocm_native_vnni_decode_registry,
+)
+from native_vnni_dispatch.certification import CertificationReport  # noqa: E402
+from native_vnni_dispatch.compiler import (  # noqa: E402
+    CompiledPolicy,
+    FrozenPolicy,
+    certify_frozen_policy,
+    freeze_policy,
+)
+from native_vnni_dispatch.corpus import ObservationCorpus, RuntimeKey  # noqa: E402
+from native_vnni_dispatch.cpp_predicates import (  # noqa: E402
+    aspect_condition,
+    generic_rule_sort_key,
+    predicate_condition,
+    render_if_header,
+)
+from native_vnni_dispatch.exact_oracle import (  # noqa: E402
+    ExactWinner,
+    build_exact_winners,
+)
+from native_vnni_dispatch.format_registry import FORMAT_SPECS  # noqa: E402
+from native_vnni_dispatch.measurement_plan import (  # noqa: E402
+    MEASUREMENT_PLAN_PATH,
+    NativeVNNIGPUMeasurementPlan,
+    load_gpu_measurement_plan,
+)
+from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
+from native_vnni_dispatch.rocm_shape_resolved import (  # noqa: E402
+    project_rocm_shape_resolved_candidates,
+)
+from native_vnni_dispatch.profiler_model import (  # noqa: E402
+    ProfilerFeatureCatalog,
+    load_profiler_feature_catalog,
+)
+from native_vnni_dispatch.policy_artifact import (  # noqa: E402
+    validate_installable_policy_artifact,
+    validate_frozen_policy_file,
+    write_compiled_policy,
+    write_frozen_policy,
+)
+from native_vnni_dispatch.policy_ir import PolicyIR  # noqa: E402
+from native_vnni_dispatch.schema import (  # noqa: E402
+    Backend,
+    ExecutionMode,
+    SemanticContract,
+)
+from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    DEFAULT_TREE_LEAVES,
+    GenericDispatchRule,
+    PolicyFitCache,
+    fit_generic_policy,
+)
+from native_vnni_dispatch.shape_manifest import (  # noqa: E402
+    MANIFEST_PATH,
+    NativeVNNIShapeManifest,
+    ShapePartition,
+    load_shape_manifest,
+    partition_assignments,
+)
+from native_vnni_dispatch.validation import (  # noqa: E402
+    CANONICAL_VERIFIER_M,
+    require_candidate_matrix_complete,
+    require_canonical_alias_coverage,
+    require_registry_candidate_coverage,
+    require_verifier_m_matrix,
 )
 
-ASPECT_ORDER = ("very_wide", "wide", "balanced", "tall")
 
-ASPECT_CONDITIONS = {
-    "very_wide": "aspect_ratio >= 16.0f",
-    "wide": "aspect_ratio >= 2.0f",
-    "balanced": "aspect_ratio >= 0.75f",
-    "tall": "true",
-}
+CANONICAL_TARGET_WAVES = 4
+OVERLAY_BEGIN = "    // BEGIN COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY"
+OVERLAY_END = "    // END COMMON ROCM NATIVEVNNI DECODE EXACT OVERLAY"
+GENERIC_OVERLAY_BEGIN = (
+    "    // BEGIN COMMON ROCM NATIVEVNNI DECODE GENERIC SUPPLEMENT"
+)
+GENERIC_OVERLAY_END = (
+    "    // END COMMON ROCM NATIVEVNNI DECODE GENERIC SUPPLEMENT"
+)
+BASE_FALLBACK_RETURN = (
+    "    return selectROCmNativeVNNIDecodeAspectFallback("
+    "codebook_id, m, n, k, out);\n"
+)
 
 
-@dataclass(frozen=True)
-class DecodeRow:
-    fmt: str
+@dataclass(frozen=True, order=True)
+class FastEntry:
+    """One alias/mode-robust Fast M=1 exact decision for the ROCm ABI."""
+
     codebook: int
-    shape: str
-    m: int
     n: int
     k: int
-    variant: str
     kb: int
-    target_waves: int
-    min_us: float
-    mean_us: float
-    eff_bw_gbs: float
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", nargs="+", required=True, help="ROCm decode trainer CSV path(s)")
-    parser.add_argument("--output", required=True, help="Generated C++ include path")
-    parser.add_argument("--summary", default=None, help="Human-readable summary path")
-    parser.add_argument(
-        "--base-include",
-        default=None,
-        help=(
-            "Existing generated include to preserve while layering exact "
-            "shape winners from the input CSV. Use this for staged profiles "
-            "such as qwen36-moe so a partial refresh does not discard the "
-            "broader dispatch table."
-        ),
-    )
-    parser.add_argument(
-        "--max-generated-kb",
-        type=int,
-        default=16,
-        help=(
-            "Maximum KB split allowed in generated decode dispatch. Keep this aligned "
-            "with the strict-parity native-VNNI small-M verifier sweep envelope."
-        ),
-    )
-    return parser.parse_args()
-
-
-def canonical_label(codebook: int) -> str:
-    return CODEBOOK_TO_FORMAT.get(codebook, f"CB{codebook}").split("/")[0]
-
-
-def aspect_bucket(n: int, k: int) -> str:
-    ratio = (float(n) / float(k)) if k > 0 else 0.0
-    for name, threshold in ASPECT_BUCKETS:
-        if ratio >= threshold:
-            return name
-    return "tall"
-
-
-def work_items(row: DecodeRow) -> int:
-    return row.n * row.k
-
-
-def dispatch_candidate(row: DecodeRow) -> tuple[int, int]:
-    return row.kb, row.target_waves
+    candidate_id: str
+    shape_name: str
+    max_surface_regret: float
+    max_cv: float
 
 
 def pack_shape_key(m: int, n: int, k: int) -> int:
-    """Pack the verifier-row count with the logical GEMV shape.
-
-    ROCm decode now has two distinct regimes: classic single-token GEMV (M=1)
-    and MTP verifier catch-up rows (M=2..4).  The kernels are templated on M,
-    so a table trained for M=1 can pick a poor split for verifier rows.  Packing
-    M into the key keeps those dispatch choices independent while preserving the
-    compact binary-search table layout used by the generated C++ include.
-    """
+    """Pack the existing ROCm decode exact-key ABI without lossy hashing."""
 
     return ((m & 0xFF) << 56) | ((k & 0xFFFFFF) << 28) | (n & 0x0FFFFFFF)
 
 
-def _to_int(path: Path, row_index: int, column: str, value: str) -> int:
+def _mode_robust_policy_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
+    """Preserve mode timing surfaces while collapsing the ROCm runtime key."""
+
+    if not corpus.distinguishes_execution_mode:
+        return corpus
+    return ObservationCorpus._from_validated(
+        corpus.observations,
+        distinguish_execution_mode=False,
+        revalidate_candidate_identities=False,
+    )
+
+
+def _generic_policy_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
+    """Project total ROCm KB formulas directly into the collapsed mode ABI.
+
+    Formula projection already creates a new immutable corpus. Asking that
+    constructor to build the public mode-collapsed indices avoids immediately
+    scanning the trainer-scale projected rows a second time.
+    """
+
+    return project_rocm_shape_resolved_candidates(
+        corpus,
+        distinguish_execution_mode=False,
+    )
+
+
+def _candidate_kb(candidate_id: str) -> int:
+    """Resolve one concrete or shape-clamped Fast policy's requested KB."""
+
     try:
-        return int(value, 0)
-    except ValueError as exc:
-        raise SystemExit(f"{path}:{row_index}: invalid {column}={value!r}") from exc
+        candidate = rocm_native_vnni_decode_registry().resolve(candidate_id)
+    except ValueError:
+        candidate = rocm_native_vnni_decode_formula_registry().resolve(candidate_id)
+    if not candidate.supports_contract(SemanticContract.FAST):
+        raise ValueError(f"{candidate_id} is not a Fast ROCm decode candidate")
+    return int(candidate.config_json["kb"])
 
 
-def _to_float(path: Path, row_index: int, column: str, value: str) -> float:
-    try:
-        return float(value)
-    except ValueError as exc:
-        raise SystemExit(f"{path}:{row_index}: invalid {column}={value!r}") from exc
+def _serial_hashes(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+) -> dict[RuntimeKey, str]:
+    """Bind every represented verifier key to the frozen M=1 artifact."""
+
+    return {
+        key: serial_m1_policy_hash
+        for key in corpus.runtime_keys()
+        if key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+    }
 
 
-def parse_variant(
-    path: Path,
-    row_index: int,
-    row: dict[str, str],
-    max_generated_kb: int,
-) -> tuple[int, int] | None:
-    variant = (row.get("variant") or "").strip().upper()
-    kb = _to_int(path, row_index, "kb", row.get("kb", ""))
-    target_waves = _to_int(path, row_index, "target_waves", row.get("target_waves", ""))
-    if variant == "AUTO":
-        if kb != 0 or target_waves != 0:
-            raise SystemExit(f"{path}:{row_index}: AUTO rows must use kb=0,target_waves=0")
-        return None
+def select_fast_entries(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+) -> tuple[list[FastEntry], dict[RuntimeKey, ExactWinner]]:
+    """Run the common exact oracle and encode only Fast M=1 KB decisions."""
 
-    match = re.fullmatch(r"KB(?P<kb>\d+)[/_]TW(?P<tw>\d+)", variant)
-    if not match:
-        raise SystemExit(f"{path}:{row_index}: unsupported decode variant {variant!r}")
-    parsed_kb = int(match.group("kb"))
-    parsed_tw = int(match.group("tw"))
-    if parsed_kb != kb or parsed_tw != target_waves:
-        raise SystemExit(
-            f"{path}:{row_index}: variant {variant!r} disagrees with "
-            f"kb={kb},target_waves={target_waves}"
-        )
-    if parsed_kb <= 0 or parsed_tw <= 0:
-        raise SystemExit(f"{path}:{row_index}: generated decode variants need positive kb and target_waves")
-    if parsed_kb > 64:
-        raise SystemExit(f"{path}:{row_index}: decode kb={parsed_kb} exceeds kernel cap 64")
-    if parsed_kb > max_generated_kb:
-        return None
-    return parsed_kb, parsed_tw
-
-
-def load_decode_rows(paths: list[str], max_generated_kb: int) -> list[DecodeRow]:
-    if max_generated_kb <= 0:
-        raise SystemExit("--max-generated-kb must be positive")
-
-    best_by_key: dict[tuple[int, int, int, int], DecodeRow] = {}
-    for raw_path in paths:
-        path = Path(raw_path)
-        with path.open(newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row_index, row in enumerate(reader, start=2):
-                if (row.get("backend") or "").strip() != "rocm":
-                    continue
-                if (row.get("phase") or "").strip() != "decode":
-                    continue
-                if _to_int(path, row_index, "correctness_pass", row.get("correctness_pass", "")) != 1:
-                    continue
-
-                fmt = (row.get("format") or "").strip().upper()
-                expected_codebook = FORMAT_TO_CODEBOOK.get(fmt)
-                if expected_codebook is None:
-                    raise SystemExit(f"{path}:{row_index}: unknown format {fmt!r}")
-                codebook = _to_int(path, row_index, "codebook", row.get("codebook", ""))
-                if codebook != expected_codebook:
-                    raise SystemExit(
-                        f"{path}:{row_index}: codebook mismatch for {fmt}: "
-                        f"expected {expected_codebook}, found {codebook}"
-                    )
-
-                parsed_variant = parse_variant(path, row_index, row, max_generated_kb)
-                if parsed_variant is None:
-                    continue
-                kb, target_waves = parsed_variant
-                m = _to_int(path, row_index, "m", row.get("m", "1"))
-                if m <= 0:
-                    raise SystemExit(f"{path}:{row_index}: decode m must be positive")
-                n = _to_int(path, row_index, "n", row.get("n", ""))
-                k = _to_int(path, row_index, "k", row.get("k", ""))
-                key = (codebook, m, n, k)
-                entry = DecodeRow(
-                    fmt=fmt,
-                    codebook=codebook,
-                    shape=(row.get("shape") or f"{n}x{k}").strip(),
-                    m=m,
-                    n=n,
-                    k=k,
-                    variant=(row.get("variant") or "").strip().upper(),
-                    kb=kb,
-                    target_waves=target_waves,
-                    min_us=_to_float(path, row_index, "min_us", row.get("min_us", "")),
-                    mean_us=_to_float(path, row_index, "mean_us", row.get("mean_us", "0")),
-                    eff_bw_gbs=_to_float(path, row_index, "eff_bw_gbs", row.get("eff_bw_gbs", "0")),
+    policy_corpus = _mode_robust_policy_corpus(corpus)
+    exact = build_exact_winners(
+        policy_corpus,
+        serial_m1_hashes=_serial_hashes(policy_corpus, serial_m1_policy_hash),
+    )
+    entries = []
+    for key, winner in sorted(exact.items()):
+        if key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE:
+            if winner.candidate_id != (
+                "rocm.nvnni.decode.verifier.inherit_serial_m1"
+            ):
+                raise ValueError(
+                    "grouped verifier exact winner does not inherit serial M1"
                 )
-                previous = best_by_key.get(key)
-                if previous is None or entry.min_us < previous.min_us:
-                    best_by_key[key] = entry
-
-    return sorted(best_by_key.values(), key=lambda item: (item.codebook, item.m, item.n, item.k, item.variant))
-
-
-def _modal_candidate(rows: list[DecodeRow]) -> tuple[tuple[int, int], int]:
-    counts: dict[tuple[int, int], int] = {}
-    best_time: dict[tuple[int, int], float] = {}
-    for row in rows:
-        candidate = dispatch_candidate(row)
-        counts[candidate] = counts.get(candidate, 0) + 1
-        best_time[candidate] = min(best_time.get(candidate, row.min_us), row.min_us)
-    return max(
-        counts,
-        key=lambda candidate: (
-            counts[candidate],
-            -best_time[candidate],
-            -candidate[0],
-            -candidate[1],
-        ),
-    ), max(counts.values())
-
-
-def _candidate_cuts(rows: list[DecodeRow]) -> list[int]:
-    works = sorted({work_items(row) for row in rows})
-    return [((left + right) // 2) for left, right in zip(works, works[1:]) if left != right]
-
-
-def _split_rows(rows: list[DecodeRow], cuts: list[int]) -> list[list[DecodeRow]]:
-    segments: list[list[DecodeRow]] = []
-    start = 0
-    for cut in cuts:
-        end = start
-        while end < len(rows) and work_items(rows[end]) <= cut:
-            end += 1
-        segments.append(rows[start:end])
-        start = end
-    segments.append(rows[start:])
-    return segments
-
-
-def _best_segments(rows: list[DecodeRow], max_segments: int = 3, min_size: int = 4) -> list[dict]:
-    """Train a small work-size segmented policy for one codebook/M/aspect bucket.
-
-    The durable ROCm policy must generalize to future models whose matrix sizes
-    are close but not identical to Qwen3.6.  We therefore train on aspect ratio
-    and total work size, keeping exact-shape winners only as an optional overlay.
-    """
-
-    if not rows:
-        return []
-
-    ordered = sorted(rows, key=lambda row: (work_items(row), row.n, row.k, row.shape, row.fmt))
-    cuts = _candidate_cuts(ordered)
-
-    def score_segments(segments: list[list[DecodeRow]]) -> tuple[int, list[dict]] | None:
-        if any(not segment for segment in segments):
-            return None
-        if len(ordered) >= min_size * len(segments) and any(len(segment) < min_size for segment in segments):
-            return None
-
-        score = 0
-        rules: list[dict] = []
-        for segment in segments:
-            candidate, support = _modal_candidate(segment)
-            score += support
-            rules.append(
-                {
-                    "max_work": work_items(segment[-1]),
-                    "candidate": candidate,
-                    "support": support,
-                    "total": len(segment),
-                }
+            continue
+        if key.semantic_contract != SemanticContract.FAST or key.m != 1:
+            raise ValueError(f"unsupported ROCm decode exact policy key {key}")
+        if len(key.projection_n_vector) != 1:
+            raise ValueError("ROCm decode exact entry is not a single projection")
+        rows = policy_corpus.rows_for_runtime_key(key)
+        shape_names = sorted({row.shape_name for row in rows})
+        if len(shape_names) != 1:
+            raise ValueError(
+                f"multiple shape names collapse onto ROCm exact key {key}: {shape_names}"
             )
-        return score, rules
-
-    scored = score_segments([ordered])
-    assert scored is not None
-    best_score, best_rules = scored
-    best_len = 1
-
-    for cut in cuts:
-        scored = score_segments(_split_rows(ordered, [cut]))
-        if scored is None:
-            continue
-        score, rules = scored
-        if score > best_score or (score == best_score and 2 < best_len):
-            best_score, best_rules, best_len = score, rules, 2
-
-    if max_segments >= 3:
-        for index, left in enumerate(cuts):
-            for right in cuts[index + 1:]:
-                scored = score_segments(_split_rows(ordered, [left, right]))
-                if scored is None:
-                    continue
-                score, rules = scored
-                if score > best_score or (score == best_score and 3 < best_len):
-                    best_score, best_rules, best_len = score, rules, 3
-
-    return best_rules
+        entries.append(FastEntry(
+            codebook=key.runtime_codebook_id,
+            n=key.aggregate_n,
+            k=key.k,
+            kb=_candidate_kb(winner.candidate_id),
+            candidate_id=winner.candidate_id,
+            shape_name=shape_names[0],
+            max_surface_regret=winner.max_surface_regret,
+            max_cv=winner.max_cv,
+        ))
+    return entries, exact
 
 
-def build_aspect_fallback_rules(rows: list[DecodeRow]) -> dict[tuple[int, int, str], list[dict]]:
-    grouped: dict[tuple[int, int, str], list[DecodeRow]] = {}
-    for row in rows:
-        grouped.setdefault((row.codebook, row.m, aspect_bucket(row.n, row.k)), []).append(row)
-    return {
-        key: _best_segments(bucket)
-        for key, bucket in sorted(grouped.items(), key=lambda item: item[0])
+def select_fast_generic_rules(
+    corpus: ObservationCorpus,
+    serial_m1_policy_hash: str,
+) -> list[GenericDispatchRule]:
+    """Fit the shared bounded regret learner and retain Fast M=1 domains."""
+
+    policy_corpus = _generic_policy_corpus(corpus)
+    generic = fit_generic_policy(
+        policy_corpus,
+        serial_m1_hashes=_serial_hashes(policy_corpus, serial_m1_policy_hash),
+    )
+    return [
+        rule
+        for rule in generic.rules
+        if rule.domain.semantic_contract == SemanticContract.FAST
+        and rule.domain.m == 1
+    ]
+
+
+def _fast_m1_corpus(corpus: ObservationCorpus) -> ObservationCorpus:
+    """Project one physical transaction onto ROCm public Fast M=1 rows."""
+
+    rows = tuple(
+        row
+        for row in corpus
+        if row.semantic_contract == SemanticContract.FAST and row.m == 1
+    )
+    if not rows:
+        raise ValueError("ROCm policy transaction contains no Fast M=1 evidence")
+    if len(rows) == len(corpus.observations):
+        return corpus
+    return ObservationCorpus._from_validated(
+        rows,
+        distinguish_execution_mode=corpus.distinguishes_execution_mode,
+        distinguish_aspect_bucket=corpus.distinguishes_aspect_bucket,
+        revalidate_candidate_identities=False,
+    )
+
+
+def _fast_partition_surfaces(
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    partition: ShapePartition,
+) -> frozenset[tuple[str, str, ExecutionMode]]:
+    """Return the reviewed ROCm shape/format/mode partition surface."""
+
+    shape_names = (
+        measurement_plan.common_development_shapes
+        if partition == ShapePartition.DEVELOPMENT
+        else manifest.partition_names(
+            verifier=False,
+            partition=ShapePartition.SEALED,
+        )
+    )
+    surfaces = {
+        (shape_name, spec.label, mode)
+        for shape_name in shape_names
+        for spec in FORMAT_SPECS
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED)
     }
+    if partition == ShapePartition.DEVELOPMENT:
+        for extension in measurement_plan.fast_development_extensions:
+            if extension.backend != Backend.ROCM:
+                continue
+            surfaces.update(
+                (shape_name, source_format, mode)
+                for shape_name in extension.shape_names
+                for source_format in extension.source_formats
+                for mode in (
+                    ExecutionMode.EAGER,
+                    ExecutionMode.GRAPH_CAPTURED,
+                )
+            )
+    return frozenset(surfaces)
 
 
-def _pick_fallback_candidate(
-    rules: dict[tuple[int, int, str], list[dict]],
-    row: DecodeRow,
-) -> tuple[int, int] | None:
-    bucket_rules = rules.get((row.codebook, row.m, aspect_bucket(row.n, row.k)))
-    if not bucket_rules:
-        return None
-    row_work = work_items(row)
-    for rule in bucket_rules:
-        if row_work <= rule["max_work"]:
-            return rule["candidate"]
-    return bucket_rules[-1]["candidate"]
+def _require_fast_partition(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    partition: ShapePartition,
+) -> ObservationCorpus:
+    """Reject mixed, incomplete, or dimension-stale ROCm Fast evidence."""
 
-
-def compute_aspect_fallback_metrics(rows: list[DecodeRow], rules: dict[tuple[int, int, str], list[dict]]) -> dict:
-    exact_hits = 0
-    covered = 0
-    for row in rows:
-        predicted = _pick_fallback_candidate(rules, row)
-        if predicted is None:
-            continue
-        covered += 1
-        if predicted == dispatch_candidate(row):
-            exact_hits += 1
-    total = len(rows)
-    return {
-        "total": total,
-        "covered": covered,
-        "coverage_pct": (100.0 * covered / total) if total else 0.0,
-        "exact_hits": exact_hits,
-        "exact_pct": (100.0 * exact_hits / total) if total else 0.0,
+    direct = _fast_m1_corpus(corpus)
+    require_canonical_alias_coverage(
+        direct,
+        required_execution_modes=(
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ),
+    )
+    require_candidate_matrix_complete(direct)
+    require_registry_candidate_coverage(
+        direct,
+        rocm_native_vnni_decode_registry(),
+    )
+    required = _fast_partition_surfaces(manifest, measurement_plan, partition)
+    actual = {
+        (row.shape_name, row.source_format, row.execution_mode)
+        for row in direct
     }
+    if actual != required:
+        order = lambda item: (item[0], item[1], item[2].value)
+        missing = sorted(required - actual, key=order)
+        unexpected = sorted(actual - required, key=order)
+        raise ValueError(
+            "ROCm Fast partition surface is incomplete: "
+            f"missing_count={len(missing)} first_missing={missing[:1]} "
+            f"unexpected_count={len(unexpected)} "
+            f"first_unexpected={unexpected[:1]}"
+        )
+    for row in direct:
+        shape = manifest.by_name(row.shape_name)
+        if (row.aggregate_n, row.k) != (shape.n, shape.k):
+            raise ValueError(
+                f"{row.shape_name}: ROCm evidence dimensions disagree with "
+                "the reviewed shape manifest"
+            )
+    assignments = partition_assignments(
+        ((row.shape_group_id, row.shape_name) for row in direct),
+        verifier=False,
+        manifest=manifest,
+    )
+    if set(assignments.values()) != {partition}:
+        raise ValueError(
+            f"ROCm Fast {partition.value} input crosses a manifest partition"
+        )
+    return direct
 
 
-OVERLAY_BEGIN = "    // BEGIN ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY"
-OVERLAY_END = "    // END ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY"
+def _fast_sealed_commitment(
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+) -> str:
+    """Commit to the untouched ROCm Fast sealed inventory before fitting."""
+
+    payload = {
+        "protocol": "rocm-native-vnni-fast-m1-sealed-v1",
+        "manifest_digest": manifest.digest(),
+        "measurement_plan_digest": measurement_plan.digest(manifest),
+        "shape_names": list(manifest.partition_names(
+            verifier=False,
+            partition=ShapePartition.SEALED,
+        )),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def emit_overlay_block(rows: list[DecodeRow]) -> str:
-    """Return an exact-shape overlay block for a staged ROCm refresh.
+def freeze_fast_policy(
+    development_corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    profiler_feature_catalog: ProfilerFeatureCatalog,
+    development_build_change_audit: str | None = None,
+    fit_cache_directory: Path | None = None,
+    generic_max_leaves: int = DEFAULT_TREE_LEAVES,
+) -> FrozenPolicy:
+    """Fit mode-robust ROCm Fast rules without receiving sealed rows."""
 
-    The broad generated ROCm table is intentionally replaced only by full
-    qwen36/all refreshes.  Staged profiles add known shape winners before the
-    existing binary-search tables, preserving older entries while allowing the
-    verifier pipeline to learn newly added production buckets.
+    direct = _require_fast_partition(
+        development_corpus,
+        manifest,
+        measurement_plan,
+        ShapePartition.DEVELOPMENT,
+    )
+    development = _generic_policy_corpus(direct)
+    metadata = {
+        "backend": "rocm",
+        "semantic_contract": SemanticContract.FAST.value,
+        "shape_manifest_schema": manifest.schema_version,
+        "shape_manifest_digest": manifest.digest(),
+        "measurement_plan_schema": measurement_plan.schema_version,
+        "measurement_plan_digest": measurement_plan.digest(manifest),
+        "execution_mode_policy": "alias_robust_collapsed",
+    }
+    if development_build_change_audit is not None:
+        metadata["development_build_change_audit"] = (
+            development_build_change_audit.strip()
+        )
+    return freeze_policy(
+        development,
+        sealed_commitment=_fast_sealed_commitment(manifest, measurement_plan),
+        split_manifest_digest=measurement_plan.digest(manifest),
+        profiler_feature_catalog=profiler_feature_catalog,
+        max_leaves=generic_max_leaves,
+        fit_cache=(
+            PolicyFitCache(directory=fit_cache_directory)
+            if fit_cache_directory is not None
+            else None
+        ),
+        metadata=metadata,
+    )
+
+
+def certify_fast_policy(
+    frozen: FrozenPolicy,
+    development_corpus: ObservationCorpus,
+    sealed_corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+) -> CompiledPolicy:
+    """Open ROCm sealed rows and certify the already-frozen generic IR."""
+
+    development = _generic_policy_corpus(_require_fast_partition(
+        development_corpus,
+        manifest,
+        measurement_plan,
+        ShapePartition.DEVELOPMENT,
+    ))
+    sealed = _generic_policy_corpus(_require_fast_partition(
+        sealed_corpus,
+        manifest,
+        measurement_plan,
+        ShapePartition.SEALED,
+    ))
+    return certify_frozen_policy(frozen, development, sealed)
+
+
+def validate_emitter_inputs(
+    policy_ir: PolicyIR,
+    entries: list[FastEntry],
+    generic_rules: list[GenericDispatchRule],
+) -> None:
+    """Prove ROCm emission consumes the exact certified common policy IR."""
+
+    ir_exact = {
+        (
+            entry.key.runtime_codebook_id,
+            entry.key.aggregate_n,
+            entry.key.k,
+        ): entry.candidate_id
+        for entry in policy_ir.exact_entries
+    }
+    emitted_exact = {
+        (entry.codebook, entry.n, entry.k): entry.candidate_id
+        for entry in entries
+    }
+    if emitted_exact != ir_exact:
+        raise ValueError("ROCm exact emitter inputs disagree with common IR")
+    if tuple(generic_rules) != policy_ir.generic_rules:
+        raise ValueError("ROCm generic emitter inputs disagree with common IR")
+
+
+def validate_complete(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+    *,
+    require_full_inventory: bool,
+) -> None:
+    """Require every applicable surface, depth, mode, and candidate.
+
+    The bounded measurement plan, rather than the broad supported-shape
+    manifest, owns physical surface applicability. Treating every geometry as
+    both contracts would turn a local M1 refinement into unrelated all-format
+    verifier sweeps.
     """
 
-    lines: list[str] = [OVERLAY_BEGIN]
-    for row in sorted(rows, key=lambda item: (item.codebook, item.m, item.n, item.k)):
-        label = canonical_label(row.codebook)
-        lines.append(
-            f"    if (codebook_id == {row.codebook} && key == "
-            f"0x{pack_shape_key(row.m, row.n, row.k):016x}ULL) "
-            f"{{ out = ROCmNativeVNNIDecodeDispatchConfig{{{row.kb}, {row.target_waves}}}; "
-            f"return true; }} // CB={row.codebook} ({label}) M={row.m} "
-            f"{row.n}x{row.k} {row.variant} {row.shape} {row.min_us:.3f}us"
+    require_canonical_alias_coverage(
+        corpus,
+        required_execution_modes=(
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ),
+    )
+    require_verifier_m_matrix(corpus)
+    require_candidate_matrix_complete(corpus)
+    require_registry_candidate_coverage(
+        corpus,
+        rocm_native_vnni_decode_registry(),
+    )
+
+    by_shape: dict[tuple, set[tuple[SemanticContract, int]]] = {}
+    names_by_shape: dict[tuple, str] = {}
+    for row in corpus:
+        identity = (
+            row.runtime_codebook_id,
+            row.source_format,
+            row.execution_mode,
+            row.shape_group_id,
         )
-    lines.append(OVERLAY_END)
+        previous_name = names_by_shape.setdefault(identity, row.shape_name)
+        if previous_name != row.shape_name:
+            raise ValueError(
+                f"ROCm shape group maps to multiple manifest names: {identity}"
+            )
+        by_shape.setdefault(identity, set()).add((row.semantic_contract, row.m))
+
+    failures = []
+    for identity, represented in by_shape.items():
+        shape_name = names_by_shape[identity]
+        manifest.by_name(shape_name)
+        source_format = identity[1]
+        required: set[tuple[SemanticContract, int]] = set()
+        if measurement_plan.fast_shape_applies(
+            manifest,
+            backend=Backend.ROCM,
+            source_format=source_format,
+            shape_name=shape_name,
+        ):
+            required.add((SemanticContract.FAST, 1))
+        if measurement_plan.verifier_shape_applies(
+            manifest,
+            shape_name=shape_name,
+        ):
+            required.update(
+                (SemanticContract.VERIFIER_SERIAL_M1_BITWISE, m)
+                for m in CANONICAL_VERIFIER_M
+            )
+        missing = required - represented
+        unexpected = represented - required
+        if missing or unexpected:
+            order_key = lambda item: (item[0].value, item[1])
+            failures.append((
+                identity,
+                sorted(missing, key=order_key),
+                sorted(unexpected, key=order_key),
+            ))
+    if failures:
+        raise ValueError(
+            "ROCm decode shape applicability/depth matrix is invalid for "
+            f"{len(failures)} surface(s); first={failures[0]}"
+        )
+
+    if require_full_inventory:
+        expected = measurement_plan.expected_decode_surfaces(
+            manifest,
+            backend=Backend.ROCM,
+            source_formats=tuple(spec.label for spec in FORMAT_SPECS),
+            execution_modes=(
+                ExecutionMode.EAGER,
+                ExecutionMode.GRAPH_CAPTURED,
+            ),
+            verifier_m_values=CANONICAL_VERIFIER_M,
+        )
+        actual = {
+            (
+                row.semantic_contract,
+                row.m,
+                row.shape_name,
+                row.source_format,
+                row.execution_mode,
+            )
+            for row in corpus
+        }
+        if actual != expected:
+            order_key = lambda item: (
+                item[2], item[3], item[4].value, item[0].value, item[1]
+            )
+            missing = sorted(expected - actual, key=order_key)
+            unexpected = sorted(actual - expected, key=order_key)
+            raise ValueError(
+                "ROCm production physical surface inventory is incomplete: "
+                f"missing_count={len(missing)} first_missing={missing[:1]} "
+                f"unexpected_count={len(unexpected)} "
+                f"first_unexpected={unexpected[:1]}"
+            )
+
+
+def validate_verifier_complete(
+    corpus: ObservationCorpus,
+    manifest: NativeVNNIShapeManifest,
+    measurement_plan: NativeVNNIGPUMeasurementPlan,
+) -> None:
+    """Validate the staged-policy grouped verifier transaction by itself."""
+
+    if any(
+        row.semantic_contract != SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        for row in corpus
+    ):
+        raise ValueError("ROCm verifier transaction contains Fast observations")
+    require_canonical_alias_coverage(
+        corpus,
+        required_execution_modes=(
+            ExecutionMode.EAGER,
+            ExecutionMode.GRAPH_CAPTURED,
+        ),
+    )
+    require_verifier_m_matrix(corpus)
+    require_candidate_matrix_complete(corpus)
+    expected = {
+        surface
+        for surface in measurement_plan.expected_decode_surfaces(
+            manifest,
+            backend=Backend.ROCM,
+            source_formats=tuple(spec.label for spec in FORMAT_SPECS),
+            execution_modes=(
+                ExecutionMode.EAGER,
+                ExecutionMode.GRAPH_CAPTURED,
+            ),
+            verifier_m_values=CANONICAL_VERIFIER_M,
+        )
+        if surface[0] == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+    }
+    actual = {
+        (
+            row.semantic_contract,
+            row.m,
+            row.shape_name,
+            row.source_format,
+            row.execution_mode,
+        )
+        for row in corpus
+    }
+    if actual != expected:
+        raise ValueError(
+            "ROCm verifier physical surface inventory is incomplete: "
+            f"missing_count={len(expected - actual)} "
+            f"unexpected_count={len(actual - expected)}"
+        )
+
+
+def _entry_line(entry: FastEntry, *, indent: str) -> str:
+    """Render one current-ABI exact entry with common provenance."""
+
+    return (
+        f"{indent}{{0x{pack_shape_key(1, entry.n, entry.k):016x}ULL, "
+        f"{{{entry.kb}, {CANONICAL_TARGET_WAVES}}}}}, "
+        f"// CB={entry.codebook} M=1 {entry.n}x{entry.k} "
+        f"{entry.candidate_id} {entry.shape_name} "
+        f"max-regret={entry.max_surface_regret:.4%} max-cv={entry.max_cv:.4%}"
+    )
+
+
+def generate_include(
+    entries: list[FastEntry],
+    generic_rules: list[GenericDispatchRule],
+    *,
+    corpus_digest: str,
+    registry_digest: str,
+    profile: MeasurementProfile,
+    policy_digest: str = "",
+    certification: CertificationReport | None = None,
+) -> str:
+    """Render exact and common-regret generic decisions into the current ABI."""
+
+    entries_by_codebook: dict[int, list[FastEntry]] = {}
+    for entry in entries:
+        entries_by_codebook.setdefault(entry.codebook, []).append(entry)
+    for rows in entries_by_codebook.values():
+        rows.sort(key=lambda item: pack_shape_key(1, item.n, item.k))
+
+    rules_by_codebook: dict[int, list[GenericDispatchRule]] = {}
+    for rule in generic_rules:
+        rules_by_codebook.setdefault(rule.domain.runtime_codebook_id, []).append(rule)
+
+    decision_comment = (
+        "// Decisions: common alias/mode-robust exact oracle plus frozen "
+        "development policy with generic-only sealed certification."
+        if certification is not None
+        else "// Decisions: development-only common alias/mode-robust exact "
+        "oracle and profiler-informed generic policy; this artifact is not "
+        "installable."
+    )
+    lines = [
+        "// Auto-generated by analyze_rocm_native_vnni_decode_trainer.py. DO NOT EDIT.",
+        decision_comment,
+        "// Runtime-M verifier rows inherit this serial M=1 policy; no independent verifier KB is emitted.",
+        f"// Measurement profile: {profile.value}",
+        f"// Common corpus digest: {corpus_digest}",
+        f"// Candidate registry digest: {registry_digest}",
+        "#pragma once",
+        "",
+        "#include <cstddef>",
+        "#include <cstdint>",
+        "",
+        "namespace llaminar2::rocm::generated",
+        "{",
+        "struct ROCmNativeVNNIDecodeDispatchConfig",
+        "{",
+        "    uint8_t kb = 0;",
+        "    // ABI compatibility only: explicit KB fully determines the launch.",
+        "    uint8_t target_waves_per_cu = 0;",
+        "};",
+        "",
+        "struct ROCmNativeVNNIDecodeTuningEntry",
+        "{",
+        "    uint64_t key;",
+        "    ROCmNativeVNNIDecodeDispatchConfig config;",
+        "};",
+        "",
+        "inline constexpr uint64_t packROCmNativeVNNIDecodeDispatchKey(int m, int n, int k)",
+        "{",
+        "    return (static_cast<uint64_t>(m & 0xFF) << 56) |",
+        "           (static_cast<uint64_t>(k & 0xFFFFFF) << 28) |",
+        "           static_cast<uint64_t>(n & 0x0FFFFFFF);",
+        "}",
+        "",
+        "template <size_t Count>",
+        "inline bool findROCmNativeVNNIDecodeDispatchEntry(",
+        "    const ROCmNativeVNNIDecodeTuningEntry (&table)[Count],",
+        "    uint64_t key,",
+        "    ROCmNativeVNNIDecodeDispatchConfig &out)",
+        "{",
+        "    size_t lo = 0;",
+        "    size_t hi = Count;",
+        "    while (lo < hi)",
+        "    {",
+        "        const size_t mid = lo + ((hi - lo) / 2);",
+        "        if (table[mid].key == key)",
+        "        {",
+        "            out = table[mid].config;",
+        "            return true;",
+        "        }",
+        "        if (table[mid].key < key)",
+        "            lo = mid + 1;",
+        "        else",
+        "            hi = mid;",
+        "    }",
+        "    return false;",
+        "}",
+        "",
+        "inline bool selectROCmNativeVNNIDecodeGenerated(",
+        "    uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)",
+        "{",
+        "    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);",
+    ]
+    if certification is not None:
+        lines[6:6] = [
+            f"// Common policy digest: {policy_digest}",
+            (
+                "// Frozen generic policy digest: "
+                f"{certification.frozen_generic_policy_digest}"
+            ),
+            (
+                "// Sealed generic certificate: coverage="
+                f"{certification.covered_cell_count}/"
+                f"{certification.required_cell_count} max-regret="
+                f"{certification.max_observed_regret:.6%} "
+                "max-simultaneous-ucb="
+                f"{certification.max_simultaneous_95pct_upper_regret:.6%}"
+            ),
+        ]
+
+    for codebook in sorted(entries_by_codebook):
+        lines.extend([
+            f"    if (codebook_id == {codebook})",
+            "    {",
+            "        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {",
+        ])
+        lines.extend(_entry_line(entry, indent="            ") for entry in entries_by_codebook[codebook])
+        lines.extend([
+            "        };",
+            "        if (findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out))",
+            "            return true;",
+            "    }",
+        ])
+
+    lines.extend([
+        "",
+        "    if (m != 1)",
+        "        return false;",
+    ])
+    if rules_by_codebook:
+        lines.extend([
+            "    const long long work_items =",
+            "        static_cast<long long>(n) * static_cast<long long>(k);",
+        ])
+    for codebook in sorted(rules_by_codebook):
+        lines.append(f"    if (codebook_id == {codebook})")
+        lines.append("    {")
+        for rule in sorted(
+            rules_by_codebook[codebook],
+            key=generic_rule_sort_key,
+        ):
+            kb = _candidate_kb(rule.candidate_id)
+            conditions = [
+                aspect_condition(rule.domain.aspect_bucket),
+                *(predicate_condition(predicate) for predicate in rule.predicates),
+            ]
+            lines.extend(render_if_header(conditions, indent="        "))
+            lines.extend([
+                "        {",
+                f"            out = ROCmNativeVNNIDecodeDispatchConfig{{{kb}, {CANONICAL_TARGET_WAVES}}};",
+                "            return true;",
+                "        }",
+            ])
+        lines.append("    }")
+    lines.extend([
+        "    return false;",
+        "}",
+        "",
+        "} // namespace llaminar2::rocm::generated",
+        "",
+    ])
     return "\n".join(lines)
 
 
-def strip_existing_overlay(text: str) -> str:
+def _strip_existing_overlay(text: str) -> str:
+    """Remove previous exact and generic supplements before one refresh."""
+
     begin = text.find(OVERLAY_BEGIN)
-    if begin < 0:
-        return text
-    end = text.find(OVERLAY_END, begin)
-    if end < 0:
-        raise SystemExit("base include contains overlay begin marker without end marker")
-    end += len(OVERLAY_END)
-    if end < len(text) and text[end] == "\n":
-        end += 1
-    return text[:begin] + text[end:]
+    if begin >= 0:
+        end = text.find(OVERLAY_END, begin)
+        if end < 0:
+            raise ValueError("base include has an unterminated common exact overlay")
+        end += len(OVERLAY_END)
+        if end < len(text) and text[end] == "\n":
+            end += 1
+        text = text[:begin] + text[end:]
 
-
-def emit_cpp_overlay(rows: list[DecodeRow], output: Path, base_include: Path) -> None:
-    if not base_include.is_file():
-        raise SystemExit(f"base include not found: {base_include}")
-    text = strip_existing_overlay(base_include.read_text())
-    marker = "    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);\n"
-    marker_index = text.find(marker)
-    if marker_index < 0:
-        raise SystemExit("base include does not contain ROCm NativeVNNI selector key marker")
-    insert_at = marker_index + len(marker)
-    updated = text[:insert_at] + emit_overlay_block(rows) + "\n" + text[insert_at:]
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(updated)
-
-
-def emit_cpp(rows: list[DecodeRow], output: Path) -> None:
-    rows_by_codebook: dict[int, list[DecodeRow]] = {}
-    for row in rows:
-        rows_by_codebook.setdefault(row.codebook, []).append(row)
-    for codebook_rows in rows_by_codebook.values():
-        codebook_rows.sort(key=lambda item: pack_shape_key(item.m, item.n, item.k))
-    aspect_rules = build_aspect_fallback_rules(rows)
-    fallback_metrics = compute_aspect_fallback_metrics(rows, aspect_rules)
-
-    lines: list[str] = []
-    lines.append("// Generated by tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py.")
-    lines.append("// Do not edit by hand; regenerate from ROCm NativeVNNI decode trainer CSVs.")
-    lines.append(
-        f"// Aspect fallback exact hit rate: {fallback_metrics['exact_hits']}/{fallback_metrics['total']} "
-        f"({fallback_metrics['exact_pct']:.2f}%), coverage {fallback_metrics['covered']}/{fallback_metrics['total']} "
-        f"({fallback_metrics['coverage_pct']:.2f}%)."
-    )
-    lines.append("#pragma once")
-    lines.append("")
-    lines.append("#include <cstddef>")
-    lines.append("#include <cstdint>")
-    lines.append("")
-    lines.append("namespace llaminar2::rocm::generated")
-    lines.append("{")
-    lines.append("struct ROCmNativeVNNIDecodeDispatchConfig")
-    lines.append("{")
-    lines.append("    uint8_t kb = 0;")
-    lines.append("    uint8_t target_waves_per_cu = 0;")
-    lines.append("};")
-    lines.append("")
-    lines.append("struct ROCmNativeVNNIDecodeTuningEntry")
-    lines.append("{")
-    lines.append("    uint64_t key;")
-    lines.append("    ROCmNativeVNNIDecodeDispatchConfig config;")
-    lines.append("};")
-    lines.append("")
-    lines.append("struct ROCmNativeVNNIDecodeAspectRule")
-    lines.append("{")
-    lines.append("    long long max_work_items;")
-    lines.append("    ROCmNativeVNNIDecodeDispatchConfig config;")
-    lines.append("};")
-    lines.append("")
-    lines.append("inline constexpr uint64_t packROCmNativeVNNIDecodeDispatchKey(int m, int n, int k)")
-    lines.append("{")
-    lines.append("    return (static_cast<uint64_t>(m & 0xFF) << 56) |")
-    lines.append("           (static_cast<uint64_t>(k & 0xFFFFFF) << 28) |")
-    lines.append("           static_cast<uint64_t>(n & 0x0FFFFFFF);")
-    lines.append("}")
-    lines.append("")
-    lines.append("template <size_t Count>")
-    lines.append("inline bool findROCmNativeVNNIDecodeDispatchEntry(")
-    lines.append("    const ROCmNativeVNNIDecodeTuningEntry (&table)[Count],")
-    lines.append("    uint64_t key,")
-    lines.append("    ROCmNativeVNNIDecodeDispatchConfig &out)")
-    lines.append("{")
-    lines.append("    size_t lo = 0;")
-    lines.append("    size_t hi = Count;")
-    lines.append("    while (lo < hi)")
-    lines.append("    {")
-    lines.append("        const size_t mid = lo + ((hi - lo) / 2);")
-    lines.append("        const uint64_t candidate = table[mid].key;")
-    lines.append("        if (candidate == key)")
-    lines.append("        {")
-    lines.append("            out = table[mid].config;")
-    lines.append("            return true;")
-    lines.append("        }")
-    lines.append("        if (candidate < key)")
-    lines.append("            lo = mid + 1;")
-    lines.append("        else")
-    lines.append("            hi = mid;")
-    lines.append("    }")
-    lines.append("    return false;")
-    lines.append("}")
-    lines.append("")
-    lines.append("template <size_t Count>")
-    lines.append("inline ROCmNativeVNNIDecodeDispatchConfig pickROCmNativeVNNIDecodeAspectRule(")
-    lines.append("    const ROCmNativeVNNIDecodeAspectRule (&rules)[Count],")
-    lines.append("    long long work_items)")
-    lines.append("{")
-    lines.append("    for (size_t i = 0; i < Count; ++i)")
-    lines.append("    {")
-    lines.append("        if (work_items <= rules[i].max_work_items || i + 1 == Count)")
-    lines.append("            return rules[i].config;")
-    lines.append("    }")
-    lines.append("    return ROCmNativeVNNIDecodeDispatchConfig{};")
-    lines.append("}")
-    lines.append("")
-    lines.append("inline bool selectROCmNativeVNNIDecodeAspectFallback(")
-    lines.append("    uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)")
-    lines.append("{")
-    lines.append("    const float aspect_ratio = (k > 0) ? (static_cast<float>(n) / static_cast<float>(k)) : 0.0f;")
-    lines.append("    const long long work_items = static_cast<long long>(n) * static_cast<long long>(k);")
-    for codebook in sorted({key[0] for key in aspect_rules}):
-        label = canonical_label(codebook)
-        lines.append(f"    if (codebook_id == {codebook}) {{ // CB={codebook} ({label})")
-        first_m = True
-        for m in sorted({key[1] for key in aspect_rules if key[0] == codebook}):
-            m_prefix = "if" if first_m else "else if"
-            first_m = False
-            lines.append(f"        {m_prefix} (m == {m}) {{")
-            first_aspect = True
-            for aspect in ASPECT_ORDER:
-                rules = aspect_rules.get((codebook, m, aspect))
-                if not rules:
-                    continue
-                aspect_prefix = "if" if first_aspect else "else if"
-                first_aspect = False
-                lines.append(f"            {aspect_prefix} ({ASPECT_CONDITIONS[aspect]}) {{")
-                lines.append("                static constexpr ROCmNativeVNNIDecodeAspectRule kRules[] = {")
-                for rule in rules:
-                    kb, target_waves = rule["candidate"]
-                    lines.append(
-                        f"                    {{{rule['max_work']}LL, {{{kb}, {target_waves}}}}}, "
-                        f"// {rule['support']}/{rule['total']}"
-                    )
-                lines.append("                };")
-                lines.append("                out = pickROCmNativeVNNIDecodeAspectRule(kRules, work_items);")
-                lines.append("                return true;")
-                lines.append("            }")
-            lines.append("        }")
-        lines.append("    }")
-    lines.append("    return false;")
-    lines.append("}")
-    lines.append("")
-    lines.append("inline bool selectROCmNativeVNNIDecodeGenerated(")
-    lines.append("    uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)")
-    lines.append("{")
-    lines.append("    const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);")
-
-    for codebook in sorted(rows_by_codebook):
-        label = canonical_label(codebook)
-        lines.append(f"    if (codebook_id == {codebook}) {{ // CB={codebook} ({label})")
-        lines.append("        static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {")
-        for row in rows_by_codebook[codebook]:
-            lines.append(
-                f"            {{0x{pack_shape_key(row.m, row.n, row.k):016x}ULL, "
-                f"{{{row.kb}, {row.target_waves}}}}}, // CB={codebook} ({label}) "
-                f"M={row.m} {row.n}x{row.k} {row.variant} {row.shape} {row.min_us:.3f}us"
+    begin = text.find(GENERIC_OVERLAY_BEGIN)
+    if begin >= 0:
+        end = text.find(GENERIC_OVERLAY_END, begin)
+        if end < 0:
+            raise ValueError(
+                "base include has an unterminated common generic supplement"
             )
-        lines.append("        };")
-        lines.append("        if (findROCmNativeVNNIDecodeDispatchEntry(kTable, key, out))")
-        lines.append("            return true;")
-        lines.append("    }")
-
-    lines.append("    return selectROCmNativeVNNIDecodeAspectFallback(codebook_id, m, n, k, out);")
-    lines.append("}")
-    lines.append("")
-    lines.append("} // namespace llaminar2::rocm::generated")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("\n".join(lines) + "\n")
+        end += len(GENERIC_OVERLAY_END)
+        if end < len(text) and text[end] == "\n":
+            end += 1
+        text = text[:begin] + BASE_FALLBACK_RETURN + text[end:]
+    return text
 
 
-def emit_summary(rows: list[DecodeRow], summary_path: Path) -> None:
-    aspect_rules = build_aspect_fallback_rules(rows)
-    fallback_metrics = compute_aspect_fallback_metrics(rows, aspect_rules)
-    lines = [
-        f"ROCm NativeVNNI decode generated entries: {len(rows)}",
-        (
-            "Aspect fallback exact hit rate: "
-            f"{fallback_metrics['exact_hits']}/{fallback_metrics['total']} "
-            f"({fallback_metrics['exact_pct']:.2f}%), coverage "
-            f"{fallback_metrics['covered']}/{fallback_metrics['total']} "
-            f"({fallback_metrics['coverage_pct']:.2f}%)"
-        ),
-        "codebook,format,shape,m,n,k,variant,kb,target_waves,min_us,eff_bw_gbs",
-    ]
-    for row in rows:
-        lines.append(
-            f"{row.codebook},{canonical_label(row.codebook)},{row.shape},"
-            f"{row.m},{row.n},{row.k},{row.variant},{row.kb},{row.target_waves},"
-            f"{row.min_us:.3f},{row.eff_bw_gbs:.3f}"
+def _base_generic_codebooks(text: str) -> frozenset[int]:
+    """Return codebooks already totalized by either generated base ABI.
+
+    Older partial-profile artifacts placed their generic rules in a separate
+    aspect selector. Certified common-policy artifacts place them after the
+    exact tables in the sole generated selector. Additive exact-overlay refresh
+    must understand both layouts so installing the modern target state does not
+    make a later overlay transaction depend on the retired fallback function.
+    """
+
+    begin = text.find(
+        "inline bool selectROCmNativeVNNIDecodeAspectFallback("
+    )
+    if begin >= 0:
+        end = text.find(
+            "inline bool selectROCmNativeVNNIDecodeGenerated(",
+            begin,
         )
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text("\n".join(lines) + "\n")
+    else:
+        selector = text.find(
+            "inline bool selectROCmNativeVNNIDecodeGenerated("
+        )
+        begin = text.find("    if (m != 1)", selector)
+        end = text.find("    return false;\n}", begin)
+    if begin < 0 or end < 0:
+        raise ValueError("base include lacks the ROCm generic selector surface")
+    return frozenset(
+        int(value)
+        for value in re.findall(
+            r"if \(codebook_id == ([0-9]+)\)",
+            text[begin:end],
+        )
+    )
+
+
+def _entry_aspect_bucket(entry: FastEntry) -> str:
+    """Classify an exact winner using runtime's integer aspect boundaries."""
+
+    if entry.n >= 16 * entry.k:
+        return "very_wide"
+    if entry.n >= 2 * entry.k:
+        return "wide"
+    if 4 * entry.n >= 3 * entry.k:
+        return "balanced"
+    return "tall"
+
+
+def _compress_totalizing_rules(
+    entries: list[FastEntry],
+) -> list[tuple[int, int]]:
+    """Build a deterministic upper-neighbor work-size model from winners.
+
+    Exact overlays continue to own measured points. These rules cover unseen
+    work sizes for a codebook absent from the older base policy. Adjacent
+    winners with the same launch are coalesced; the final rule intentionally
+    covers positive infinity through the base picker's last-entry contract.
+    """
+
+    ordered = sorted(
+        entries,
+        key=lambda entry: (
+            entry.n * entry.k,
+            entry.max_surface_regret,
+            entry.candidate_id,
+        ),
+    )
+    rules: list[tuple[int, int]] = []
+    for entry in ordered:
+        work_items = entry.n * entry.k
+        if rules and rules[-1][0] == work_items:
+            # Ordering already placed the lowest-regret winner first. Exact
+            # overlays disambiguate measured N/K pairs; a generic work-size
+            # predicate cannot represent two launches at the same boundary.
+            continue
+        if rules and rules[-1][1] == entry.kb:
+            rules[-1] = (work_items, entry.kb)
+        else:
+            rules.append((work_items, entry.kb))
+    return rules
+
+
+def _render_generic_supplement(
+    entries: list[FastEntry],
+    missing_codebooks: frozenset[int],
+) -> str:
+    """Render total generic rules for codebooks absent from the base policy."""
+
+    grouped: dict[int, dict[str, list[FastEntry]]] = {}
+    for entry in entries:
+        if entry.codebook not in missing_codebooks:
+            continue
+        grouped.setdefault(entry.codebook, {}).setdefault(
+            _entry_aspect_bucket(entry), []
+        ).append(entry)
+
+    lines = [GENERIC_OVERLAY_BEGIN]
+    lines.extend([
+        "    if (selectROCmNativeVNNIDecodeAspectFallback(",
+        "            codebook_id, m, n, k, out))",
+        "        return true;",
+        "    if (m == 1 && n > 0 && k > 0 && (k % 32) == 0)",
+        "    {",
+        "        const long long supplement_work_items =",
+        "            static_cast<long long>(n) * static_cast<long long>(k);",
+    ])
+    conditions = {
+        "very_wide": "n >= 16LL * k",
+        "wide": "n >= 2LL * k",
+        "balanced": "4LL * n >= 3LL * k",
+        "tall": "true",
+    }
+    bucket_order = ("very_wide", "wide", "balanced", "tall")
+    for codebook in sorted(grouped):
+        available = [
+            entry
+            for bucket_entries in grouped[codebook].values()
+            for entry in bucket_entries
+        ]
+        if not available:
+            continue
+        lines.append(f"        if (codebook_id == {codebook})")
+        lines.append("        {")
+        for index, bucket in enumerate(bucket_order):
+            bucket_entries = grouped[codebook].get(bucket, available)
+            keyword = "if" if index == 0 else "else if"
+            lines.append(
+                f"            {keyword} ({conditions[bucket]})"
+            )
+            lines.append("            {")
+            lines.append(
+                "                static constexpr "
+                "ROCmNativeVNNIDecodeAspectRule kRules[] = {"
+            )
+            for work_items, kb in _compress_totalizing_rules(bucket_entries):
+                lines.append(
+                    f"                    {{{work_items}LL, "
+                    f"{{{kb}, {CANONICAL_TARGET_WAVES}}}}},"
+                )
+            lines.extend([
+                "                };",
+                "                out = pickROCmNativeVNNIDecodeAspectRule(",
+                "                    kRules, supplement_work_items);",
+                "                return true;",
+                "            }",
+            ])
+        lines.append("        }")
+    lines.extend([
+        "    }",
+        GENERIC_OVERLAY_END,
+        "    return false;",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def emit_overlay(entries: list[FastEntry], output: Path, base: Path) -> None:
+    """Layer exact winners and missing-codebook generic rules over a base."""
+
+    if not base.is_file():
+        raise ValueError(f"base include not found: {base}")
+    text = _strip_existing_overlay(base.read_text(encoding="utf-8"))
+    marker = (
+        "    const uint64_t key = "
+        "packROCmNativeVNNIDecodeDispatchKey(m, n, k);\n"
+    )
+    location = text.find(marker)
+    if location < 0:
+        raise ValueError("base include lacks the ROCm selector key marker")
+    insert_at = location + len(marker)
+    overlay = [OVERLAY_BEGIN]
+    entries_by_codebook: dict[int, list[FastEntry]] = {}
+    for entry in entries:
+        entries_by_codebook.setdefault(entry.codebook, []).append(entry)
+    for codebook in sorted(entries_by_codebook):
+        overlay.extend([
+            f"    if (codebook_id == {codebook})",
+            "    {",
+            "        static constexpr ROCmNativeVNNIDecodeTuningEntry "
+            "kCommonExactOverlay[] = {",
+        ])
+        overlay.extend(
+            _entry_line(entry, indent="            ")
+            for entry in sorted(
+                entries_by_codebook[codebook],
+                key=lambda item: pack_shape_key(1, item.n, item.k),
+            )
+        )
+        overlay.extend([
+            "        };",
+            "        if (findROCmNativeVNNIDecodeDispatchEntry(",
+            "                kCommonExactOverlay, key, out))",
+            "            return true;",
+            "    }",
+        ])
+    overlay.append(OVERLAY_END)
+    updated = text[:insert_at] + "\n".join(overlay) + "\n" + text[insert_at:]
+    missing_codebooks = frozenset(
+        {entry.codebook for entry in entries} - _base_generic_codebooks(text)
+    )
+    if missing_codebooks:
+        if BASE_FALLBACK_RETURN not in updated:
+            raise ValueError("base include lacks the ROCm fallback return marker")
+        updated = updated.replace(
+            BASE_FALLBACK_RETURN,
+            _render_generic_supplement(entries, missing_codebooks),
+            1,
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(updated, encoding="utf-8")
+
+
+def write_summary(
+    path: Path,
+    entries: list[FastEntry],
+    exact: dict[RuntimeKey, ExactWinner],
+) -> None:
+    """Write selected Fast entries plus verifier certification counts."""
+
+    verifier_count = sum(
+        key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE
+        for key in exact
+    )
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "execution_codebook", "m", "n", "k", "candidate_id", "kb",
+            "target_waves", "shape", "max_surface_regret", "max_cv",
+            "certified_verifier_key_count",
+        ])
+        for entry in sorted(entries):
+            writer.writerow([
+                entry.codebook,
+                1,
+                entry.n,
+                entry.k,
+                entry.candidate_id,
+                entry.kb,
+                CANONICAL_TARGET_WAVES,
+                entry.shape_name,
+                f"{entry.max_surface_regret:.9f}",
+                f"{entry.max_cv:.9f}",
+                verifier_count,
+            ])
+
+
+def _context_from_args(
+    args: argparse.Namespace,
+    inputs: tuple[Path, ...],
+    timing_sidecars: tuple[Path, ...],
+    *,
+    run_id: str | None = None,
+    sealed: bool = False,
+) -> ROCmDecodeAdapterContext:
+    """Build conspicuous smoke provenance or strict installable provenance."""
+
+    corpus_id = raw_corpus_id((*inputs, *timing_sidecars))
+    profile = MeasurementProfile(args.profile)
+    if not profile.installable:
+        return ROCmDecodeAdapterContext.workflow_smoke(corpus_id=corpus_id)
+    prefix = "sealed_" if sealed else ""
+
+    def provenance(name: str) -> str:
+        """Read one complete sealed override or the development default."""
+
+        value = getattr(args, prefix + name, None)
+        return value if value is not None else getattr(args, name)
+
+    return ROCmDecodeAdapterContext(
+        profile=profile,
+        run_id=run_id or provenance("run_id"),
+        corpus_id=corpus_id,
+        git_revision=provenance("git_revision"),
+        build_id=provenance("build_id"),
+        compiler_id=provenance("compiler_id"),
+        architecture_class=provenance("architecture_class"),
+        device_name=provenance("device_name"),
+        driver_runtime=provenance("driver_runtime"),
+        serial_m1_policy_hash=provenance("serial_m1_policy_hash"),
+        raw_timing_sidecar_retained=bool(timing_sidecars),
+    )
 
 
 def main() -> int:
-    args = parse_args()
-    rows = load_decode_rows(args.input, args.max_generated_kb)
-    if not rows:
-        raise SystemExit("no generated ROCm NativeVNNI decode rows; no correct rows fit the generated KB cap")
-    output = Path(args.output)
+    """CLI entry point for common adaptation and current-ABI ROCm emission."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("inputs", nargs="*", type=Path)
+    parser.add_argument(
+        "--input", nargs="+", type=Path, dest="input_options",
+        help="Legacy spelling for strong trainer CSV shard(s)",
+    )
+    parser.add_argument(
+        "--timing-sidecar", action="append", type=Path, default=[],
+        help="Raw timing CSV shard; repeat for every aggregate shard",
+    )
+    parser.add_argument(
+        "--development-input", action="append", type=Path, default=[]
+    )
+    parser.add_argument(
+        "--development-timing-sidecar", action="append", type=Path, default=[]
+    )
+    parser.add_argument("--sealed-input", action="append", type=Path, default=[])
+    parser.add_argument(
+        "--sealed-timing-sidecar", action="append", type=Path, default=[]
+    )
+    parser.add_argument("--freeze-generic", action="store_true")
+    parser.add_argument("--certify-generic", action="store_true")
+    parser.add_argument("--adapt-only", action="store_true")
+    parser.add_argument("--frozen-policy-json", type=Path)
+    parser.add_argument("--policy-json", type=Path)
+    parser.add_argument("--development-profiler-requests", type=Path)
+    parser.add_argument("--development-profiler-evidence", type=Path)
+    parser.add_argument(
+        "--fit-cache-dir",
+        type=Path,
+        help="Persistent content-addressed candidate-cost and CV cache",
+    )
+    parser.add_argument(
+        "--generic-max-leaves",
+        type=int,
+        default=DEFAULT_TREE_LEAVES,
+        help="Maximum leaves in each ROCm Fast generic dispatch tree",
+    )
+    parser.add_argument(
+        "--development-build-change-audit",
+        help=(
+            "Reviewed explanation for profiling retained development rows "
+            "with a harness-only rebuilt executable"
+        ),
+    )
+    parser.add_argument(
+        "--development-profiler-observations",
+        type=Path,
+        help="Original common CSV bound to reusable profiler sidecars",
+    )
+    parser.add_argument("--certified-policy-include", type=Path)
+    parser.add_argument("--certified-policy-json", type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--summary", "--summary-csv", dest="summary", type=Path)
+    parser.add_argument("--common-observations", type=Path)
+    parser.add_argument("--base-include", type=Path)
+    parser.add_argument(
+        "--max-generated-kb", type=int, default=64,
+        help="Current ABI guard; values below the graph-safe cap are rejected",
+    )
+    parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument(
+        "--profile", choices=[profile.value for profile in MeasurementProfile],
+        default=MeasurementProfile.QUICK.value,
+    )
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--git-revision", default="")
+    parser.add_argument("--build-id", default="")
+    parser.add_argument("--compiler-id", default="")
+    parser.add_argument("--architecture-class", default="")
+    parser.add_argument("--device-name", default="")
+    parser.add_argument("--driver-runtime", default="")
+    parser.add_argument("--serial-m1-policy-hash", default="")
+    parser.add_argument("--sealed-run-id")
+    parser.add_argument("--sealed-git-revision")
+    parser.add_argument("--sealed-build-id")
+    parser.add_argument("--sealed-compiler-id")
+    parser.add_argument("--sealed-architecture-class")
+    parser.add_argument("--sealed-device-name")
+    parser.add_argument("--sealed-driver-runtime")
+    parser.add_argument("--sealed-serial-m1-policy-hash")
+    parser.add_argument(
+        "--shape-manifest",
+        type=Path,
+        default=MANIFEST_PATH,
+        help="Reviewed shape partitions and semantic-surface applicability",
+    )
+    parser.add_argument(
+        "--measurement-plan",
+        type=Path,
+        default=MEASUREMENT_PLAN_PATH,
+        help="Reviewed bounded and backend-scoped GPU timing plan",
+    )
+    args = parser.parse_args()
+    if not 1 <= args.generic_max_leaves <= 32:
+        parser.error("--generic-max-leaves must be in [1, 32]")
+
+    positional = tuple(args.inputs)
+    optional = tuple(args.input_options or ())
+    if positional and optional:
+        parser.error("use positional inputs or --input, not both")
+    inputs = positional or optional
+    if args.max_generated_kb != 64:
+        parser.error(
+            "--max-generated-kb must remain 64; silently dropping forceable "
+            "candidates makes the common matrix incomplete"
+        )
+    if args.freeze_generic and args.certify_generic:
+        parser.error("--freeze-generic and --certify-generic are mutually exclusive")
+    if (
+        args.development_build_change_audit is not None
+        and not args.development_build_change_audit.strip()
+    ):
+        parser.error("--development-build-change-audit must not be empty")
+    sealed_provenance = (
+        args.sealed_run_id,
+        args.sealed_git_revision,
+        args.sealed_build_id,
+        args.sealed_compiler_id,
+        args.sealed_architecture_class,
+        args.sealed_device_name,
+        args.sealed_driver_runtime,
+        args.sealed_serial_m1_policy_hash,
+    )
+    if any(value is not None for value in sealed_provenance):
+        if not args.certify_generic:
+            parser.error("sealed provenance overrides require --certify-generic")
+        if not all(value is not None and value.strip() for value in sealed_provenance):
+            parser.error("sealed provenance overrides must be supplied together")
+    if args.adapt_only and (args.freeze_generic or args.certify_generic):
+        parser.error("--adapt-only cannot freeze or certify a policy")
+    certified_replay = bool(
+        args.certified_policy_include or args.certified_policy_json
+    )
+    if bool(args.certified_policy_include) != bool(args.certified_policy_json):
+        parser.error(
+            "certified policy include and JSON are required together"
+        )
+    if certified_replay and (
+        args.adapt_only or args.freeze_generic or args.certify_generic
+    ):
+        parser.error("certified verifier replay is a separate transaction")
+    if bool(args.development_profiler_requests) != bool(
+        args.development_profiler_evidence
+    ):
+        parser.error(
+            "development profiler requests and evidence are required together"
+        )
+    if args.development_profiler_observations and not (
+        args.development_profiler_requests
+        and args.development_profiler_evidence
+    ):
+        parser.error(
+            "development profiler observations require requests and evidence"
+        )
+    if (args.freeze_generic or args.certify_generic) and not (
+        args.development_profiler_requests
+        and args.development_profiler_evidence
+    ):
+        parser.error(
+            "production ROCm freeze/certification requires complete "
+            "development profiler evidence"
+        )
+    separate_certification = bool(
+        args.development_input
+        or args.development_timing_sidecar
+        or args.sealed_input
+        or args.sealed_timing_sidecar
+        or args.frozen_policy_json
+    )
+    if args.freeze_generic:
+        if not inputs or separate_certification:
+            parser.error("--freeze-generic accepts development --input only")
+        if not args.policy_json:
+            parser.error("--freeze-generic requires --policy-json")
+    elif args.certify_generic:
+        if inputs or args.timing_sidecar:
+            parser.error("--certify-generic accepts separate partition inputs only")
+        if not args.development_input or not args.sealed_input:
+            parser.error("certification requires development and sealed inputs")
+        if not args.frozen_policy_json or not args.policy_json:
+            parser.error("certification requires frozen and compiled policy JSON")
+    elif separate_certification:
+        parser.error("separate partition inputs require --certify-generic")
+    elif not inputs:
+        parser.error("at least one strong trainer CSV is required")
+    if (
+        MeasurementProfile(args.profile) == MeasurementProfile.PRODUCTION
+        and not args.freeze_generic
+        and not args.certify_generic
+        and not args.adapt_only
+        and not certified_replay
+    ):
+        parser.error(
+            "production ROCm policy emission requires development freeze and "
+            "separate sealed certification"
+        )
+
+    manifest = load_shape_manifest(args.shape_manifest)
+    measurement_plan = load_gpu_measurement_plan(
+        args.measurement_plan,
+        manifest=manifest,
+    )
+
+    if args.adapt_only:
+        if not inputs or separate_certification:
+            parser.error("--adapt-only accepts development --input only")
+        timing = tuple(args.timing_sidecar)
+        context = _context_from_args(args, inputs, timing)
+        corpus = adapt_rocm_decode_csv(inputs, context, timing_sidecars=timing)
+        direct = _require_fast_partition(
+            corpus,
+            manifest,
+            measurement_plan,
+            ShapePartition.DEVELOPMENT,
+        )
+        policy_corpus = _mode_robust_policy_corpus(direct)
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(generate_include(
+            entries,
+            [],
+            corpus_digest=policy_corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+            profile=context.profile,
+        ), encoding="utf-8")
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, corpus)
+        print(
+            f"adapted {len(corpus)} ROCm Fast development observations "
+            f"without fitting -> {args.output}"
+        )
+        return 0
+
+    if args.freeze_generic:
+        timing = tuple(args.timing_sidecar)
+        context = _context_from_args(args, inputs, timing)
+        corpus = adapt_rocm_decode_csv(inputs, context, timing_sidecars=timing)
+        profiler_catalog = load_profiler_feature_catalog(
+            corpus,
+            args.development_profiler_requests,
+            args.development_profiler_evidence,
+            source_corpus_path=args.development_profiler_observations,
+        )
+        frozen = freeze_fast_policy(
+            corpus,
+            manifest,
+            measurement_plan,
+            profiler_catalog,
+            args.development_build_change_audit,
+            args.fit_cache_dir,
+            args.generic_max_leaves,
+        )
+        policy_corpus = _mode_robust_policy_corpus(_fast_m1_corpus(corpus))
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
+        generic_rules = list(frozen.policy_ir.generic_rules)
+        validate_emitter_inputs(frozen.policy_ir, entries, generic_rules)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(generate_include(
+            entries,
+            generic_rules,
+            corpus_digest=policy_corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+            profile=context.profile,
+            policy_digest=frozen.policy_ir.digest(),
+        ), encoding="utf-8")
+        write_frozen_policy(args.policy_json, frozen)
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, corpus)
+        print(
+            f"froze {len(corpus)} ROCm development observations as "
+            f"{frozen.generic_digest} -> {args.output}"
+        )
+        return 0
+
+    if args.certify_generic:
+        development_inputs = tuple(args.development_input)
+        development_timing = tuple(args.development_timing_sidecar)
+        development_context = _context_from_args(
+            args,
+            development_inputs,
+            development_timing,
+        )
+        development = adapt_rocm_decode_csv(
+            development_inputs,
+            development_context,
+            timing_sidecars=development_timing,
+        )
+        profiler_catalog = load_profiler_feature_catalog(
+            development,
+            args.development_profiler_requests,
+            args.development_profiler_evidence,
+            source_corpus_path=args.development_profiler_observations,
+        )
+        frozen = freeze_fast_policy(
+            development,
+            manifest,
+            measurement_plan,
+            profiler_catalog,
+            args.development_build_change_audit,
+            args.fit_cache_dir,
+            args.generic_max_leaves,
+        )
+        # This complete byte comparison precedes the first sealed file read.
+        validate_frozen_policy_file(args.frozen_policy_json, frozen)
+
+        sealed_inputs = tuple(args.sealed_input)
+        sealed_timing = tuple(args.sealed_timing_sidecar)
+        sealed_context = _context_from_args(
+            args,
+            sealed_inputs,
+            sealed_timing,
+            run_id=(
+                args.sealed_run_id
+                if args.sealed_run_id is not None
+                else f"{args.run_id}-sealed"
+            ),
+            sealed=True,
+        )
+        sealed = adapt_rocm_decode_csv(
+            sealed_inputs,
+            sealed_context,
+            timing_sidecars=sealed_timing,
+        )
+        compiled = certify_fast_policy(
+            frozen,
+            development,
+            sealed,
+            manifest,
+            measurement_plan,
+        )
+        development_fast = _fast_m1_corpus(development)
+        sealed_fast = _fast_m1_corpus(sealed)
+        policy_corpus = _mode_robust_policy_corpus(ObservationCorpus._from_validated((
+            *development_fast.observations,
+            *sealed_fast.observations,
+        ), revalidate_candidate_identities=True))
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            development_context.serial_m1_policy_hash,
+        )
+        generic_rules = list(compiled.policy_ir.generic_rules)
+        validate_emitter_inputs(compiled.policy_ir, entries, generic_rules)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(generate_include(
+            entries,
+            generic_rules,
+            corpus_digest=policy_corpus.digest(),
+            registry_digest=candidate_registry_digest(),
+            profile=development_context.profile,
+            policy_digest=compiled.policy_ir.digest(),
+            certification=compiled.certification,
+        ), encoding="utf-8")
+        write_compiled_policy(args.policy_json, compiled)
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            combined = ObservationCorpus._from_validated((
+                *development.observations,
+                *sealed.observations,
+            ), revalidate_candidate_identities=True)
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, combined)
+        print(
+            f"certified frozen ROCm policy {frozen.generic_digest} against "
+            f"{len(sealed)} sealed observations -> {args.output}"
+        )
+        return 0
+
+    timing = tuple(args.timing_sidecar)
+    context = _context_from_args(args, inputs, timing)
+    corpus = adapt_rocm_decode_csv(
+        inputs,
+        context,
+        timing_sidecars=timing,
+    )
+    if certified_replay:
+        validate_verifier_complete(corpus, manifest, measurement_plan)
+        policy_corpus = _mode_robust_policy_corpus(corpus)
+        entries, exact = select_fast_entries(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
+        if entries:
+            raise ValueError("ROCm verifier replay unexpectedly emitted Fast entries")
+        validate_installable_policy_artifact(
+            args.certified_policy_json,
+            include_path=args.certified_policy_include,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            args.certified_policy_include.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        if args.summary:
+            args.summary.parent.mkdir(parents=True, exist_ok=True)
+            write_summary(args.summary, entries, exact)
+        if args.common_observations:
+            args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+            write_observation_csv(args.common_observations, corpus)
+        print(
+            f"validated {len(corpus)} ROCm grouped verifier observations "
+            f"against certified M1 policy -> {args.output}"
+        )
+        return 0
+    policy_corpus = _mode_robust_policy_corpus(corpus)
+    entries, exact = select_fast_entries(
+        policy_corpus,
+        context.serial_m1_policy_hash,
+    )
+    generic_rules = []
+    if not args.base_include:
+        generic_rules = select_fast_generic_rules(
+            policy_corpus,
+            context.serial_m1_policy_hash,
+        )
+    if args.require_complete:
+        manifest = load_shape_manifest(args.shape_manifest)
+        validate_complete(
+            corpus,
+            manifest,
+            load_gpu_measurement_plan(
+                args.measurement_plan,
+                manifest=manifest,
+            ),
+            require_full_inventory=(
+                args.profile == MeasurementProfile.PRODUCTION.value
+            ),
+        )
+
     if args.base_include:
-        emit_cpp_overlay(rows, output, Path(args.base_include))
+        emit_overlay(entries, args.output, args.base_include)
     else:
-        emit_cpp(rows, output)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            generate_include(
+                entries,
+                generic_rules,
+                corpus_digest=policy_corpus.digest(),
+                registry_digest=candidate_registry_digest(),
+                profile=context.profile,
+            ),
+            encoding="utf-8",
+        )
     if args.summary:
-        emit_summary(rows, Path(args.summary))
-    print(f"generated {len(rows)} ROCm NativeVNNI decode dispatch entries -> {output}")
+        args.summary.parent.mkdir(parents=True, exist_ok=True)
+        write_summary(args.summary, entries, exact)
+    if args.common_observations:
+        args.common_observations.parent.mkdir(parents=True, exist_ok=True)
+        write_observation_csv(args.common_observations, corpus)
+    print(
+        f"adapted {len(corpus)} strong observations; selected {len(entries)} "
+        f"Fast M=1 exact entries and certified "
+        f"{sum(key.semantic_contract == SemanticContract.VERIFIER_SERIAL_M1_BITWISE for key in exact)} "
+        f"verifier keys -> {args.output}"
+    )
     return 0
 
 

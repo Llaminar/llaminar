@@ -1,3 +1,9 @@
+/**
+ * @file Test__MTPSpecStateContract.cpp
+ * @brief Verifies speculative-decode metadata, state publication, and
+ *        transaction contracts for CPU and device-resident GPU paths.
+ */
+
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
@@ -6,6 +12,12 @@
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "execution/mtp/MTPSpecStatePublisher.h"
 #include "execution/mtp/MTPSpecTransactionDriver.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace testing;
@@ -82,6 +94,26 @@ namespace
             return restore_ok_;
         }
 
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream) override
+        {
+            if (!host_row_indices || request_count <= 0)
+                return false;
+            batch_host_restored_rows.emplace_back(
+                host_row_indices,
+                host_row_indices + request_count);
+            batch_host_request_counts.push_back(request_count);
+            batch_host_streams.push_back(stream);
+            return restore_ok_;
+        }
+
+        void clearVerifierStateCaptureBindingAfterPublication() override
+        {
+            ++capture_binding_clear_calls;
+        }
+
         StageDumpInfo buildDumpInfoImpl() const override
         {
             return {};
@@ -95,11 +127,137 @@ namespace
         std::vector<int> batch_request_counts;
         std::vector<int> batch_row_index_strides;
         std::vector<void *> batch_streams;
+        std::vector<std::vector<int>> batch_host_restored_rows;
+        std::vector<int> batch_host_request_counts;
+        std::vector<void *> batch_host_streams;
+        int capture_binding_clear_calls = 0;
 
     private:
         bool captures_ = false;
         bool restore_ok_ = true;
         bool required_for_publication_ = false;
+    };
+
+    /**
+     * @brief CPU capture stage exposing immutable row-copy plans to the publisher.
+     *
+     * The fake deliberately rejects the older grouped callback so the focused
+     * tests prove that a single-request transaction uses the validated parallel
+     * restore contract and not a hidden serial publication path.
+     */
+    class FakePlannedCPUVerifierStateStage final : public IComputeStage
+    {
+    public:
+        FakePlannedCPUVerifierStateStage(
+            size_t bytes_per_row,
+            uint8_t seed,
+            CPUVerifierStateRestorePlanStatus plan_status =
+                CPUVerifierStateRestorePlanStatus::Ready)
+            : IComputeStage(DeviceId::cpu()),
+              bytes_per_row_(bytes_per_row),
+              snapshots_(bytes_per_row * 3),
+              live_(bytes_per_row, 0),
+              plan_status_(plan_status)
+        {
+            for (size_t row = 0; row < 3; ++row)
+            {
+                for (size_t byte = 0; byte < bytes_per_row_; ++byte)
+                {
+                    snapshots_[row * bytes_per_row_ + byte] =
+                        static_cast<uint8_t>(seed + row * 17 + byte);
+                }
+            }
+        }
+
+        bool execute(IDeviceContext *ctx) override
+        {
+            (void)ctx;
+            return true;
+        }
+
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            (void)backend;
+            return true;
+        }
+
+        bool hasVerifierStateCapture() const override { return true; }
+
+        bool requiresVerifierStateCaptureForPublication() const override
+        {
+            return true;
+        }
+
+        CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override
+        {
+            planned_rows.push_back(row);
+            if (plan_status_ != CPUVerifierStateRestorePlanStatus::Ready)
+            {
+                return {
+                    .status = plan_status_,
+                };
+            }
+            if (row < 0)
+            {
+                return {
+                    .status = CPUVerifierStateRestorePlanStatus::NoOp,
+                };
+            }
+            if (row >= 3 || bytes_per_row_ == 0)
+            {
+                return {
+                    .status = CPUVerifierStateRestorePlanStatus::Invalid,
+                };
+            }
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Ready,
+                .destination = live_.data(),
+                .source = snapshots_.data() +
+                          static_cast<size_t>(row) * bytes_per_row_,
+                .bytes = bytes_per_row_,
+            };
+        }
+
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream) override
+        {
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            ++legacy_restore_calls;
+            return false;
+        }
+
+        void clearVerifierStateCaptureBindingAfterPublication() override
+        {
+            ++capture_binding_clear_calls;
+        }
+
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        [[nodiscard]] std::vector<uint8_t> expectedRow(int row) const
+        {
+            return std::vector<uint8_t>(
+                snapshots_.begin() + static_cast<size_t>(row) * bytes_per_row_,
+                snapshots_.begin() + static_cast<size_t>(row + 1) * bytes_per_row_);
+        }
+
+        [[nodiscard]] const std::vector<uint8_t> &live() const { return live_; }
+
+        std::vector<int> planned_rows;
+        int legacy_restore_calls = 0;
+        int capture_binding_clear_calls = 0;
+
+    private:
+        size_t bytes_per_row_ = 0;
+        std::vector<uint8_t> snapshots_;
+        std::vector<uint8_t> live_;
+        CPUVerifierStateRestorePlanStatus plan_status_ =
+            CPUVerifierStateRestorePlanStatus::Unsupported;
     };
 
     MTPSpecDecodeMetadataShape shapeFor(int requests = 1, int draft_tokens = 3)
@@ -118,6 +276,17 @@ namespace
         plan.target_rows = 4;
         plan.accepted_count = accepted_count;
         return plan;
+    }
+
+    MTPDeviceVerifierStatePublicationShape devicePublicationShape(
+        int request_count = 1,
+        int target_rows = 4)
+    {
+        MTPDeviceVerifierStatePublicationShape shape;
+        shape.request_count = request_count;
+        shape.target_rows = target_rows;
+        shape.request_id = 9;
+        return shape;
     }
 
     MTPSpecStepPlan participantPlan(int participant_id, int accepted_count)
@@ -198,6 +367,11 @@ TEST(Test__MTPSpecStateContract, BuildsAcceptAllPlanWithBonusReadyRow)
     EXPECT_EQ(step.bonus_ready_token_row, 3);
     EXPECT_EQ(step.bonus_ready_token_index, 3);
     EXPECT_EQ(step.bonus_ready_state_slot_index, 3);
+    ASSERT_TRUE(step.verifier_input_identity.has_value());
+    EXPECT_EQ(step.verifier_input_identity->draft_depth, 2);
+    EXPECT_THAT(
+        step.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(7, 9, 8));
 }
 
 TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixLeavesMatchingParticipantsDirect)
@@ -213,7 +387,7 @@ TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixLeavesMatchingParticipantsD
     ASSERT_TRUE(common.ok) << common.error;
     EXPECT_EQ(common.common_accepted_count, 3);
     EXPECT_TRUE(common.all_participants_direct);
-    EXPECT_FALSE(common.requires_common_fallback_replay);
+    EXPECT_FALSE(common.clamped_participant_suffix);
     ASSERT_THAT(common.clamped_steps, SizeIs(2));
     EXPECT_EQ(common.clamped_steps[0].accepted_count, 3);
     EXPECT_EQ(common.clamped_steps[1].accepted_count, 3);
@@ -228,9 +402,9 @@ TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixClampsLongerParticipant)
     };
     /*
      * Participant 1 is already at the common prefix, but it still carries a
-     * participant-local correction suffix.  Once any other participant is
-     * shortened, the topology owner must replay from the shared prefix, so that
-     * local suffix is no longer safe to publish either.
+     * participant-local correction suffix. Once any other participant is
+     * shortened, the grouped publisher must clear every unshared suffix and
+     * publish only the shared serial-decode prefix.
      */
     participants[1].correction_replay_start_index = 1;
     participants[1].correction_replay_count = 1;
@@ -241,7 +415,7 @@ TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixClampsLongerParticipant)
     ASSERT_TRUE(common.ok) << common.error;
     EXPECT_EQ(common.common_accepted_count, 1);
     EXPECT_FALSE(common.all_participants_direct);
-    EXPECT_TRUE(common.requires_common_fallback_replay);
+    EXPECT_TRUE(common.clamped_participant_suffix);
     ASSERT_THAT(common.clamped_steps, SizeIs(2));
 
     for (const MTPSpecStepPlan &step : common.clamped_steps)
@@ -565,7 +739,7 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedDeviceRejectionOu
     EXPECT_TRUE(second.requiresCorrectionReplay());
 }
 
-TEST(Test__MTPSpecStateContract, TransactionDriverMarksGroupedOutcomeReplayPublication)
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGroupedOutcomePublicationPlan)
 {
     MTPDecodeCatchupGreedyRequest request;
     request.draft_tokens = {7, 9, 8};
@@ -584,7 +758,7 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGroupedOutcomeReplayPubli
     outcome.sampled_terminal = true;
 
     MTPSpecTransactionBatchPlan plan =
-        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomesForReplayPublication(
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
             shapeFor(/*requests=*/1, /*draft_tokens=*/3),
             /*request_ids=*/{10},
             /*vocab_size=*/100,
@@ -593,15 +767,175 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGroupedOutcomeReplayPubli
             /*base_cached_tokens=*/{100});
 
     ASSERT_TRUE(plan.ok) << plan.error;
-    EXPECT_TRUE(plan.requiresDecodeEquivalentReplayPublication());
-    EXPECT_EQ(plan.publication_contract,
-              MTPSpecTransactionPublicationContract::
-                  DecodeEquivalentReplayPublicationRequired);
-    EXPECT_THAT(plan.publication_contract_reason,
-                HasSubstr("replay_publication"));
     ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
     EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 3);
     EXPECT_EQ(plan.step_plans.steps.front().accepted_state_slot_index, 2);
+}
+
+TEST(Test__MTPSpecStateContract,
+     TransactionDriverUsesDeviceSelectedWidthForDynamicDepthFullAcceptance)
+{
+    /*
+     * The graph is captured for six verifier inputs, while the resident depth
+     * controller selects four comparison rows for this replay.  Full acceptance
+     * therefore describes five verifier input states, plus one ready-token row.
+     * Treating all six capacity rows as active reproduces the long-context HTTP
+     * failure caught by the CUDA2 LLEP dynamic-depth E2E lane.
+     */
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8, 6, 5, 4};
+
+    MTPDeviceRejectionBatchOutcome outcome;
+    outcome.ok = true;
+    outcome.output_tokens[0] = 7;
+    outcome.output_tokens[1] = 9;
+    outcome.output_tokens[2] = 8;
+    outcome.output_tokens[3] = 6;
+    outcome.output_tokens[4] = 5;
+    outcome.output_token_count = 5;
+    outcome.accepted_speculative_prefix = 4;
+    outcome.target_verifier_state_commit_count = 5;
+    outcome.ready_token = 3;
+    outcome.rejected_verified_token = -1;
+    outcome.all_speculative_accepted = true;
+    outcome.consumed_verifier_rows = 4;
+    outcome.sampled_terminal = true;
+
+    MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+            shapeFor(/*requests=*/1, /*draft_tokens=*/6),
+            /*request_ids=*/{10},
+            /*vocab_size=*/100,
+            {request},
+            {outcome},
+            /*base_cached_tokens=*/{100});
+
+    ASSERT_TRUE(plan.ok) << plan.error;
+    ASSERT_THAT(plan.metadata.transactions, SizeIs(1));
+    EXPECT_EQ(plan.metadata.transactions.front().target_query_len, 6);
+    EXPECT_THAT(plan.metadata.accepted_draft_prefixes, ElementsAre(5));
+    EXPECT_THAT(plan.metadata.valid_sampled_counts, ElementsAre(6));
+    EXPECT_THAT(plan.metadata.next_condition_tokens, ElementsAre(3));
+    ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
+    EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 5);
+    EXPECT_TRUE(plan.step_plans.steps.front().all_drafts_accepted);
+}
+
+TEST(Test__MTPSpecStateContract,
+     TransactionDriverRejectsMalformedDynamicDepthFullAcceptance)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8, 6, 5, 4};
+
+    MTPDeviceRejectionBatchOutcome outcome;
+    outcome.ok = true;
+    outcome.output_tokens[0] = 7;
+    outcome.output_tokens[1] = 9;
+    outcome.output_tokens[2] = 8;
+    outcome.output_token_count = 3;
+    outcome.accepted_speculative_prefix = 4;
+    outcome.target_verifier_state_commit_count = 5;
+    outcome.ready_token = 3;
+    outcome.all_speculative_accepted = true;
+    outcome.consumed_verifier_rows = 4;
+    outcome.sampled_terminal = true;
+
+    const MTPSpecTransactionBatchPlan plan =
+        buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+            shapeFor(/*requests=*/1, /*draft_tokens=*/6),
+            /*request_ids=*/{10},
+            /*vocab_size=*/100,
+            {request},
+            {outcome},
+            /*base_cached_tokens=*/{100});
+
+    EXPECT_FALSE(plan.ok);
+    EXPECT_THAT(plan.error, HasSubstr("all-accepted active-width outcome"));
+}
+
+TEST(Test__MTPSpecStateContract,
+     TransactionDriverPreservesEveryGroupedCommitBoundary)
+{
+    using namespace sampling_math;
+
+    /*
+     * Exercise the complete runtime-M inventory rather than one model depth.
+     * Every interior boundary is a successful serial-visible transaction with
+     * a pending condition token, not a rejection and not a full-batch bonus.
+     */
+    for (int draft_count = 2;
+         draft_count <= kSpeculativeBatchMaxRows;
+         ++draft_count)
+    {
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens.resize(static_cast<size_t>(draft_count));
+        for (int row = 0; row < draft_count; ++row)
+            request.draft_tokens[static_cast<size_t>(row)] = 1000 + row;
+
+        for (int commit_count = 1;
+             commit_count < draft_count;
+             ++commit_count)
+        {
+            SCOPED_TRACE(::testing::Message()
+                         << "draft_count=" << draft_count
+                         << " commit_count=" << commit_count);
+
+            MTPDeviceRejectionBatchOutcome outcome;
+            outcome.ok = true;
+            outcome.output_token_count = commit_count;
+            for (int row = 0; row < commit_count; ++row)
+            {
+                outcome.output_tokens[static_cast<size_t>(row)] =
+                    request.draft_tokens[static_cast<size_t>(row)];
+            }
+            outcome.accepted_speculative_prefix = commit_count - 1;
+            outcome.target_verifier_state_commit_count = commit_count;
+            outcome.ready_token = 2000 + commit_count;
+            outcome.rejected_verified_token = -1;
+            outcome.stopped_on_output = false;
+            outcome.all_speculative_accepted = false;
+            outcome.consumed_verifier_rows = commit_count - 1;
+            outcome.sampled_terminal = false;
+            outcome.commit_boundary_clipped = true;
+
+            MTPSpecTransactionBatchPlan plan =
+                buildMTPSpecTransactionBatchPlanFromDeviceRejectionOutcomes(
+                    shapeFor(/*requests=*/1, draft_count),
+                    /*request_ids=*/{10},
+                    /*vocab_size=*/10000,
+                    {request},
+                    {outcome},
+                    /*base_cached_tokens=*/{100});
+
+            ASSERT_TRUE(plan.ok) << plan.error;
+            EXPECT_THAT(plan.metadata.valid_sampled_counts,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.accepted_draft_prefixes,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.committed_output_counts,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.target_verifier_state_commit_counts,
+                        ElementsAre(commit_count));
+            EXPECT_THAT(plan.metadata.next_condition_tokens,
+                        ElementsAre(outcome.ready_token));
+            EXPECT_THAT(plan.metadata.all_drafts_accepted_flags,
+                        ElementsAre(0));
+            EXPECT_THAT(plan.metadata.bonus_ready_token_rows,
+                        ElementsAre(kMTPSpecDecodeInvalidToken));
+            EXPECT_THAT(plan.publication_plan.target_cached_tokens,
+                        ElementsAre(100 + commit_count));
+
+            ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
+            const MTPSpecStepPlan &step = plan.step_plans.steps.front();
+            EXPECT_EQ(step.accepted_count, commit_count);
+            EXPECT_EQ(step.next_condition_token, outcome.ready_token);
+            EXPECT_FALSE(step.all_drafts_accepted);
+            EXPECT_FALSE(step.stopped);
+            EXPECT_FALSE(step.requiresCorrectionReplay());
+            EXPECT_EQ(step.bonus_ready_state_slot_index,
+                      kMTPSpecDecodeInvalidToken);
+        }
+    }
 }
 
 TEST(Test__MTPSpecStateContract, TransactionDriverRejectsInvalidDeviceRejectionOutcome)
@@ -689,6 +1023,11 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGreedyCatchupPlan)
     EXPECT_EQ(step.accepted_state_slot_index, 1);
     EXPECT_EQ(step.correction_replay_start_index, 2);
     EXPECT_EQ(step.correction_replay_count, 1);
+    ASSERT_TRUE(step.verifier_input_identity.has_value());
+    EXPECT_EQ(step.verifier_input_identity->draft_depth, 2);
+    EXPECT_THAT(
+        step.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(7, 9, 8));
 }
 
 TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan)
@@ -730,6 +1069,10 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan
     EXPECT_EQ(first.accepted_state_slot_index, 2);
     EXPECT_EQ(first.bonus_ready_state_slot_index, 3);
     EXPECT_FALSE(first.requiresCorrectionReplay());
+    ASSERT_TRUE(first.verifier_input_identity.has_value());
+    EXPECT_THAT(
+        first.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(7, 9, 8));
 
     const MTPSpecStepPlan &second = plan.step_plans.steps[1];
     EXPECT_EQ(second.request_id, 11);
@@ -739,9 +1082,13 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan
     EXPECT_EQ(second.correction_replay_start_index, 1);
     EXPECT_EQ(second.correction_replay_count, 1);
     EXPECT_TRUE(second.requiresCorrectionReplay());
+    ASSERT_TRUE(second.verifier_input_identity.has_value());
+    EXPECT_THAT(
+        second.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(11, 12, 13));
 }
 
-TEST(Test__MTPSpecStateContract, TransactionDriverMarksGreedyGroupedOutcomeReplayPublication)
+TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGreedyGroupedOutcomePublicationPlan)
 {
     MTPDecodeCatchupGreedyRequest request;
     request.draft_tokens = {7, 9, 8};
@@ -752,7 +1099,7 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGreedyGroupedOutcomeRepla
     ASSERT_TRUE(result.ok) << result.error;
 
     MTPSpecTransactionBatchPlan plan =
-        buildMTPSpecTransactionBatchPlanFromGreedyCatchupForReplayPublication(
+        buildMTPSpecTransactionBatchPlanFromGreedyCatchup(
             shapeFor(/*requests=*/1, /*draft_tokens=*/3),
             /*request_id=*/23,
             /*vocab_size=*/100,
@@ -761,12 +1108,6 @@ TEST(Test__MTPSpecStateContract, TransactionDriverMarksGreedyGroupedOutcomeRepla
             /*base_cached_tokens=*/64);
 
     ASSERT_TRUE(plan.ok) << plan.error;
-    EXPECT_TRUE(plan.requiresDecodeEquivalentReplayPublication());
-    EXPECT_EQ(plan.publication_contract,
-              MTPSpecTransactionPublicationContract::
-                  DecodeEquivalentReplayPublicationRequired);
-    EXPECT_THAT(plan.publication_contract_reason,
-                HasSubstr("replay_publication"));
     ASSERT_THAT(plan.step_plans.steps, SizeIs(1));
     EXPECT_EQ(plan.step_plans.steps.front().request_id, 23);
     EXPECT_EQ(plan.step_plans.steps.front().accepted_count, 3);
@@ -821,6 +1162,7 @@ TEST(Test__MTPSpecStateContract, PublisherRestoresAcceptedRowOnCapturedStages)
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 2);
     EXPECT_EQ(result.restored_stage_count, 2);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_THAT(captured0.restored_rows, ElementsAre(1));
@@ -845,6 +1187,128 @@ TEST(Test__MTPSpecStateContract, PublisherAllowsZeroAcceptedWithoutStageRestore)
     EXPECT_EQ(result.restored_stage_count, 0);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_TRUE(captured.restored_rows.empty());
+}
+
+/**
+ * @brief Host request batches publish each captured stage exactly once.
+ *
+ * A rejected request carries a negative row and remains on its prior live
+ * state.  The publisher forwards the entire vector to the request-aware stage
+ * ABI instead of replaying the scalar restore against one shared state slot.
+ */
+TEST(Test__MTPSpecStateContract, BatchedHostPublisherUsesOneGroupedRestorePerStage)
+{
+    FakeVerifierStateStage captured0(/*captures=*/true);
+    FakeVerifierStateStage skipped(/*captures=*/false);
+    FakeVerifierStateStage captured1(/*captures=*/true);
+    const int restore_rows[3] = {1, -1, 8};
+
+    MTPSpecStepPlan first =
+        participantPlan(/*participant_id=*/0, /*accepted_count=*/2);
+    MTPSpecStepPlan second =
+        participantPlan(/*participant_id=*/1, /*accepted_count=*/0);
+    MTPSpecStepPlan third =
+        participantPlan(/*participant_id=*/2, /*accepted_count=*/1);
+    MTPSpecStepPlanBatch batch = planBatch({first, second, third});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRows(
+            batch,
+            restore_rows,
+            {&captured0, &skipped, &captured1},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 3);
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(result.skipped_stage_count, 1);
+    EXPECT_TRUE(captured0.restored_rows.empty());
+    EXPECT_TRUE(captured1.restored_rows.empty());
+    EXPECT_THAT(captured0.batch_host_restored_rows,
+                ElementsAre(ElementsAre(1, -1, 8)));
+    EXPECT_THAT(captured1.batch_host_restored_rows,
+                ElementsAre(ElementsAre(1, -1, 8)));
+    EXPECT_THAT(captured0.batch_host_request_counts, ElementsAre(3));
+    EXPECT_THAT(captured1.batch_host_request_counts, ElementsAre(3));
+    EXPECT_THAT(captured0.batch_host_streams, ElementsAre(nullptr));
+    EXPECT_THAT(captured1.batch_host_streams, ElementsAre(nullptr));
+    EXPECT_EQ(captured0.capture_binding_clear_calls, 1);
+    EXPECT_EQ(captured1.capture_binding_clear_calls, 1);
+    EXPECT_TRUE(skipped.batch_host_restored_rows.empty());
+}
+
+/**
+ * @brief Single-request CPU publication commits every independent stage in one plan.
+ *
+ * Different span sizes exercise the OpenMP worksharing loop while byte equality
+ * proves that parallel publication selects the exact accepted verifier row.
+ */
+TEST(Test__MTPSpecStateContract, SingleRequestCPUStatePublicationUsesByteExactParallelPlans)
+{
+    FakePlannedCPUVerifierStateStage recurrence(
+        /*bytes_per_row=*/256 * 1024,
+        /*seed=*/11);
+    FakePlannedCPUVerifierStateStage short_conv(
+        /*bytes_per_row=*/4093,
+        /*seed=*/73);
+    FakeVerifierStateStage skipped(/*captures=*/false);
+    const int restore_rows[1] = {1};
+    MTPSpecStepPlanBatch batch = planBatch(
+        {participantPlan(/*participant_id=*/0, /*accepted_count=*/2)});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRows(
+            batch,
+            restore_rows,
+            {&recurrence, &skipped, &short_conv},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(result.skipped_stage_count, 1);
+    EXPECT_EQ(recurrence.live(), recurrence.expectedRow(1));
+    EXPECT_EQ(short_conv.live(), short_conv.expectedRow(1));
+    EXPECT_THAT(recurrence.planned_rows, ElementsAre(1));
+    EXPECT_THAT(short_conv.planned_rows, ElementsAre(1));
+    EXPECT_EQ(recurrence.legacy_restore_calls, 0);
+    EXPECT_EQ(short_conv.legacy_restore_calls, 0);
+    EXPECT_EQ(recurrence.capture_binding_clear_calls, 1);
+    EXPECT_EQ(short_conv.capture_binding_clear_calls, 1);
+}
+
+TEST(Test__MTPSpecStateContract, SingleRequestCPUStatePublicationValidatesAllPlansBeforeCopy)
+{
+    FakePlannedCPUVerifierStateStage valid(
+        /*bytes_per_row=*/4096,
+        /*seed=*/19);
+    FakePlannedCPUVerifierStateStage invalid(
+        /*bytes_per_row=*/4096,
+        /*seed=*/37,
+        CPUVerifierStateRestorePlanStatus::Invalid);
+    const std::vector<uint8_t> original_live = valid.live();
+    const int restore_rows[1] = {1};
+    MTPSpecStepPlanBatch batch = planBatch(
+        {participantPlan(/*participant_id=*/0, /*accepted_count=*/2)});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRows(
+            batch,
+            restore_rows,
+            {&valid, &invalid},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("could not plan a native restore"));
+    EXPECT_EQ(valid.live(), original_live)
+        << "A later invalid stage must fail before any earlier live state changes.";
+    EXPECT_EQ(valid.capture_binding_clear_calls, 0);
+    EXPECT_EQ(invalid.capture_binding_clear_calls, 0);
 }
 
 TEST(Test__MTPSpecStateContract, PublisherRejectsGpuNullStream)
@@ -942,6 +1406,8 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRestoresCapturedStagesOnE
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 3)
+        << "Legacy plan-shaped device publication should preserve plan accounting.";
     EXPECT_EQ(result.restored_stage_count, 2);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_TRUE(captured0.restored_rows.empty())
@@ -953,6 +1419,30 @@ TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRestoresCapturedStagesOnE
     EXPECT_THAT(captured1.device_restored_rows, ElementsAre(&device_row));
     EXPECT_THAT(captured0.device_streams, ElementsAre(&explicit_stream));
     EXPECT_THAT(captured1.device_streams, ElementsAre(&explicit_stream));
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherAcceptsShapeWithoutHostPlan)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_row = 2;
+    int explicit_stream = 0;
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            devicePublicationShape(),
+            &device_row,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.request_id, 9);
+    EXPECT_EQ(result.accepted_count, 0)
+        << "Device-resident publication must not report a host-plan accepted count.";
+    EXPECT_TRUE(captured.restored_rows.empty());
+    EXPECT_THAT(captured.device_restored_rows, ElementsAre(&device_row));
+    EXPECT_THAT(captured.device_streams, ElementsAre(&explicit_stream));
 }
 
 TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsMissingMandatoryVerifierStateStage)
@@ -1053,6 +1543,8 @@ TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherUsesBatchRestoreHo
             /*require_captured_stage=*/true);
 
     ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 2)
+        << "Legacy batched device publication should preserve plan accounting.";
     EXPECT_EQ(result.restored_stage_count, 2);
     EXPECT_EQ(result.skipped_stage_count, 1);
     EXPECT_TRUE(captured0.device_restored_rows.empty())
@@ -1068,6 +1560,69 @@ TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherUsesBatchRestoreHo
     EXPECT_THAT(captured0.batch_streams, ElementsAre(&explicit_stream));
     EXPECT_THAT(captured1.batch_streams, ElementsAre(&explicit_stream));
     EXPECT_TRUE(skipped.batch_device_restored_rows.empty());
+}
+
+TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherAcceptsShapeWithoutHostPlans)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_rows[4] = {0, -1, 2, 3};
+    int explicit_stream = 0;
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            devicePublicationShape(/*request_count=*/2, /*target_rows=*/4),
+            device_rows,
+            /*row_index_stride=*/2,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.accepted_count, 0)
+        << "Accepted counts stay in compact device metadata for the resident path.";
+    EXPECT_TRUE(captured.device_restored_rows.empty());
+    EXPECT_THAT(captured.batch_device_restored_rows, ElementsAre(device_rows));
+    EXPECT_THAT(captured.batch_request_counts, ElementsAre(2));
+    EXPECT_THAT(captured.batch_row_index_strides, ElementsAre(2));
+    EXPECT_THAT(captured.batch_streams, ElementsAre(&explicit_stream));
+}
+
+TEST(Test__MTPSpecStateContract, DeviceIndexedPublisherRejectsInvalidShapes)
+{
+    FakeVerifierStateStage captured(/*captures=*/true);
+    int device_row = 0;
+    int explicit_stream = 0;
+
+    MTPDeviceVerifierStatePublicationShape scalar_shape =
+        devicePublicationShape();
+    scalar_shape.target_rows = 0;
+    MTPSpecStatePublicationResult scalar_result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+            scalar_shape,
+            &device_row,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(scalar_result.ok);
+    EXPECT_THAT(scalar_result.error, HasSubstr("invalid scalar request shape"));
+
+    MTPDeviceVerifierStatePublicationShape batch_shape =
+        devicePublicationShape(/*request_count=*/0, /*target_rows=*/4);
+    MTPSpecStatePublicationResult batch_result =
+        publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+            batch_shape,
+            &device_row,
+            /*row_index_stride=*/1,
+            {&captured},
+            DeviceId::cuda(0),
+            &explicit_stream,
+            /*require_captured_stage=*/true);
+    EXPECT_FALSE(batch_result.ok);
+    EXPECT_THAT(batch_result.error, HasSubstr("invalid request shape"));
+    EXPECT_TRUE(captured.device_restored_rows.empty());
+    EXPECT_TRUE(captured.batch_device_restored_rows.empty());
 }
 
 TEST(Test__MTPSpecStateContract, BatchedDeviceIndexedPublisherRejectsCpuAndNullStream)
@@ -1247,5 +1802,5 @@ TEST(Test__MTPSpecStateContract, GraphPublisherRejectsMissingStage)
             /*require_captured_stage=*/true);
 
     EXPECT_FALSE(result.ok);
-    EXPECT_THAT(result.error, HasSubstr("without a stage"));
+    EXPECT_THAT(result.error, HasSubstr("null stage at index"));
 }

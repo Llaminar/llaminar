@@ -1,3 +1,12 @@
+/**
+ * @file WeightLoadProgressAggregator.h
+ * @brief Explicit MPI RMA lifecycle for cross-rank model-load progress.
+ *
+ * The aggregator owns one collective MPI window and, on rank zero, one polling
+ * thread. Setup code must stop polling, synchronize every participant, and
+ * release the window before propagating either success or failure.
+ */
+
 #pragma once
 
 #include <atomic>
@@ -76,7 +85,8 @@ namespace llaminar2
         /// @param comm   Communicator (typically MPI_COMM_WORLD or intra-node)
         /// @param rank   This process's rank
         /// @param world_size  Total ranks in comm
-        /// @return shared_ptr to aggregator (or nullptr if MPI window creation fails)
+        /// @return Shared aggregator, or nullptr only for a single-rank communicator.
+        /// @throws std::runtime_error when a required multi-rank MPI window cannot be created.
         static std::shared_ptr<WeightLoadProgressAggregator>
         create(MPI_Comm comm, int rank, int world_size);
 
@@ -103,7 +113,8 @@ namespace llaminar2
         /// The thread polls remote windows and updates the renderer.
         void startPolling(std::shared_ptr<WeightLoadProgress> renderer);
 
-        /// Stop polling thread and perform final poll. Call before finalize().
+        /// Stop and join the polling thread without issuing another MPI read.
+        /// The synchronized final read belongs to barrier().
         void stopPolling();
 
         /// Collective barrier — ensures all ranks are done loading.

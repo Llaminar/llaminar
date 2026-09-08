@@ -1,0 +1,231 @@
+/**
+ * @file MoEOverlayLocalCapacityPlanner.h
+ * @brief Rank-local fixed-memory BOM builder for ExpertOverlay admission.
+ *
+ * Live routed experts are deliberately excluded here because the global
+ * capacity resolver decides their quotas.  This planner prices everything
+ * already fixed by one rank's production execution plan—dense/shared/global
+ * weights, KV and recurrent state, graph activations, workspaces, and the
+ * host-memory authority needed by background transport—against the same typed
+ * `(world rank, device)` resources later consumed by capacity admission.
+ */
+
+#pragma once
+
+#include "MoEOverlayActivationChannelPlan.h"
+#include "MoEOverlayCapacityAdmission.h"
+#include "MoEExpertOverlayExecutionPlan.h"
+#include "execution/mpi_orchestration/DeviceInventory.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "loaders/GPUVramPreflight.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
+#include "planning/GraphSnapshotMemoryCapacity.h"
+#include "planning/MemoryPlan.h"
+#include "planning/ModelMemoryProfile.h"
+
+#include <cstddef>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace llaminar2
+{
+    /**
+     * @brief Model-specific GPU upload contract priced during auto-capacity.
+     *
+     * Policy alone is insufficient because a bounded ring may shrink when all
+     * source tensors are smaller than one configured slot. Bundling the largest
+     * source transaction with the policy prevents a partially specified load
+     * reservation from reaching the planner.
+     */
+    struct MoEOverlayGPUWeightLoadCapacityInput
+    {
+        GPUWeightLoadMemoryPolicy policy;
+        size_t maximum_source_bytes = 0;
+    };
+
+    /**
+     * @brief Captured-graph topology with disjoint compile and residency facts.
+     *
+     * Heterogeneous execution records one child per authenticated model-layer
+     * frontier and then imports them into a single retained parent. Keeping the
+     * two inventories in separate types prevents compile cost from becoming a
+     * fictitious VRAM charge.
+     */
+    struct MoEOverlayCapturedGraphPlan
+    {
+        /** Physical executable owners consumed by memory admission. */
+        CapturedGraphExecutableInventory resident_executables;
+        /** Diagnostic-only recording topology; never converted to bytes. */
+        CapturedGraphCompilationInventory compilation;
+
+        /** @return Whether both views describe the same logical graph family. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return resident_executables.valid() && compilation.valid() &&
+                   resident_executables.model_graph_identity_count ==
+                       compilation.model_graph_identity_count &&
+                   resident_executables
+                           .model_graph_topology_variant_count ==
+                       compilation.model_graph_topology_variant_count;
+        }
+    };
+
+    /**
+     * @brief Resolve compile and resident graph inventories for ExpertOverlay.
+     * @param model_layer_count Number of main-model routed layers.
+     * @param authority_execution Frozen host/device authority topology.
+     * @param model_graph_identity_count Complete graphs in one topology variant.
+     * @param model_graph_topology_variant_count Simultaneously retained
+     *        snapshot/launch-topology variants.
+     * @param auxiliary_executable_count Retained helper/controller executable
+     *        owners in the general class; semantic branch descriptors are excluded.
+     * @param bounded_helper_executable_count Separately certified flat helpers.
+     * @return Valid plan whose resident view is consumed by memory admission.
+     * @throws std::invalid_argument for unresolved authority or bad geometry.
+     * @throws std::overflow_error when the segment count exceeds size_t.
+     *
+     * Host-resident overlays contain an intentional CPU ticket boundary at
+     * every routed layer, so they compile one unit before each frontier plus a
+     * terminal unit. The retained-parent composer still produces exactly one
+     * executable per complete graph identity. All-GPU device-owned timelines
+     * both compile and retain one unit per complete graph identity.
+     */
+    [[nodiscard]] MoEOverlayCapturedGraphPlan
+    resolveMoEOverlayCapturedGraphPlan(
+        int model_layer_count,
+        MoEOverlayAuthorityExecutionKind authority_execution,
+        std::size_t model_graph_identity_count,
+        std::size_t model_graph_topology_variant_count,
+        std::size_t auxiliary_executable_count,
+        std::size_t bounded_helper_executable_count = 0u);
+
+    /** @brief Complete immutable input for one rank's zero-routed-expert BOM. */
+    struct MoEOverlayLocalCapacityPlannerInput
+    {
+        const ModelMemoryProfile *model_profile = nullptr;
+        const RankExecutionPlan *rank_plan = nullptr;
+        const MoERoutedExpertPlacementPlan *overlay_plan = nullptr;
+        const RankInventory *rank_inventory = nullptr;
+        /** Complete physical-node authority for distributed activation lanes. */
+        const ClusterInventory *cluster_inventory = nullptr;
+        /** Exclusive graph/command lifecycle assigned by overlay planning. */
+        OverlayRankExecutionKind rank_execution_kind =
+            OverlayRankExecutionKind::RelayOnly;
+        /** Include CPU authority even when no tier participant computes on CPU. */
+        bool require_host_memory_authority = false;
+        /** Optional hard physical limits; absent means inventory capacity. */
+        std::optional<std::size_t> max_gpu_memory_bytes;
+        std::optional<std::size_t> max_cpu_memory_bytes;
+        /** Candidate graph rows; zero selects the configured maximum shape. */
+        int resident_graph_rows = 0;
+        /** Exact max rows embedded by every retained activation transaction. */
+        int activation_channel_row_capacity = 0;
+        /** Main plus routed MTP graph families sharing each channel. */
+        std::size_t activation_graph_family_count = 0;
+        /** Exact compile/resident graph topology retained per GPU. */
+        MoEOverlayCapturedGraphPlan captured_graph_plan;
+        /** Graph-resident diagnostic checkpoint capacity per accelerator. */
+        GraphSnapshotMemoryCapacity graph_snapshot_memory;
+        /** Required whenever this rank's physical resources include a GPU. */
+        std::optional<MoEOverlayGPUWeightLoadCapacityInput>
+            gpu_weight_load;
+    };
+
+    /** @brief Rank-local fixed BOM plus the exact graph-row shape it priced. */
+    struct MoEOverlayLocalCapacityPlannerResult
+    {
+        int resident_graph_rows = 0;
+        MemoryPlan fixed_memory_plan;
+        /** Shared pure topology/BOM also consumed by transport preflight. */
+        MoEOverlayActivationChannelPlan activation_channel_plan;
+        /** Sole admitted aggregate behind every per-resource capacity view. */
+        std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>
+            physical_memory_admission;
+        std::vector<MoEOverlayBoundPhysicalMemoryBudget> physical_budgets;
+    };
+
+    /** @brief One continuation graph shard physically built by this rank. */
+    struct MoEOverlayContinuationShard
+    {
+        DeviceId device = DeviceId::invalid();
+        int shard_index = 0;
+        int total_shards = 1;
+        int first_layer = 0;
+        int last_layer = -1;
+    };
+
+    /**
+     * @brief Replace discovery-time GPU memory with a runtime-stable observation.
+     *
+     * CUDA and ROCm discovery may run before the production device context,
+     * BLAS handles, streams, and collective resources exist. Expert capacity
+     * must therefore use a second observation after those fixed runtime owners
+     * have been created. This helper is the single typed mutation point for
+     * that observation and deliberately treats both GPU backends identically.
+     *
+     * @param inventory Rank-local hardware inventory to update.
+     * @param device Exact CUDA or ROCm device whose production context is live.
+     * @param total_bytes Physical device memory reported by the live backend.
+     * @param free_bytes Free memory after fixed runtime initialization.
+     * @throws std::invalid_argument for a non-GPU device, invalid byte counts,
+     *         or a device absent from the rank inventory.
+     */
+    void installMoEOverlayRuntimeGPUCapacityObservation(
+        RankInventory &inventory,
+        DeviceId device,
+        std::size_t total_bytes,
+        std::size_t free_bytes);
+
+    /**
+     * @brief Build exact fixed setup charges without assigning a live expert.
+     *
+     * The result is deterministic and performs no allocation. Every endpoint
+     * device physically owned by this rank receives one resource authority.
+     * Continuation devices use the real TP/PP/shard configuration; auxiliary
+     * devices use the routed-participant execution role. Multiple logical
+     * participants sharing a device remain one physical budget.
+     */
+    class MoEOverlayLocalCapacityPlanner final
+    {
+    public:
+        /**
+         * @brief Resolve exact continuation devices and tensor-shard identity.
+         *
+         * Both early capacity admission and final graph-memory validation use
+         * this method. Keeping the translation in one authority prevents an
+         * ExpertOverlay LocalTP continuation from being priced as one dense
+         * device plus several expert-only devices.
+         *
+         * @param rank_plan Fully resolved production rank plan.
+         * @param execution_kind Exclusive overlay rank lifecycle. Authority and
+         *        peer kinds own continuation shards; follower/relay kinds do not.
+         * @return Participant-local continuation shard descriptors.
+         * @throws std::invalid_argument for malformed LocalPP boundaries.
+         */
+        [[nodiscard]] static std::vector<MoEOverlayContinuationShard>
+        continuationShards(
+            const RankExecutionPlan &rank_plan,
+            OverlayRankExecutionKind execution_kind);
+
+        /**
+         * @brief Create a stable diagnostic identity for one physical resource.
+         * @param world_rank Owning MPI rank.
+         * @param device Rank-local CPU/CUDA/ROCm identity.
+         * @return Opaque resource id used only for joins and diagnostics.
+         */
+        [[nodiscard]] static std::string physicalResourceId(
+            int world_rank,
+            DeviceId device);
+
+        /**
+         * @brief Price one rank's fixed production memory contract.
+         * @param input Model, rank plan, bound topology, inventory, and limits.
+         * @return Fixed MemoryPlanner BOM grouped by physical resource.
+         * @throws std::invalid_argument for incomplete/mismatched topology.
+         * @throws std::overflow_error when grouped byte arithmetic overflows.
+         */
+        [[nodiscard]] static MoEOverlayLocalCapacityPlannerResult plan(
+            const MoEOverlayLocalCapacityPlannerInput &input);
+    };
+} // namespace llaminar2

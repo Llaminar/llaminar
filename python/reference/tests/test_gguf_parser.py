@@ -25,6 +25,128 @@ from python.reference.loaders.gguf_parser import (
 )
 
 
+def _write_gguf_string(handle, value: str) -> None:
+    """Write one GGUF length-prefixed UTF-8 string."""
+    encoded = value.encode("utf-8")
+    handle.write(struct.pack("<Q", len(encoded)))
+    handle.write(encoded)
+
+
+def _write_synthetic_split_shard(
+    path: Path,
+    *,
+    split_no: int,
+    split_count: int,
+    tensor_name: str,
+    tensor_shape: tuple[int, ...],
+    tensor_values: tuple[float, ...],
+) -> None:
+    """Write a minimal standards-shaped split GGUF shard for parser tests."""
+    metadata = (
+        ("general.architecture", GGUFValueType.STRING, "qwen35moe"),
+        ("qwen35moe.block_count", GGUFValueType.UINT32, 2),
+        ("qwen35moe.nextn_predict_layers", GGUFValueType.UINT32, 1),
+        ("split.no", GGUFValueType.UINT16, split_no),
+        ("split.count", GGUFValueType.UINT16, split_count),
+        ("split.tensors.count", GGUFValueType.INT32, split_count),
+    )
+    with path.open("wb") as handle:
+        handle.write(b"GGUF")
+        handle.write(struct.pack("<IQQ", 3, 1, len(metadata)))
+        for key, value_type, value in metadata:
+            _write_gguf_string(handle, key)
+            handle.write(struct.pack("<I", int(value_type)))
+            if value_type == GGUFValueType.STRING:
+                _write_gguf_string(handle, value)
+            elif value_type == GGUFValueType.UINT16:
+                handle.write(struct.pack("<H", value))
+            elif value_type == GGUFValueType.UINT32:
+                handle.write(struct.pack("<I", value))
+            elif value_type == GGUFValueType.INT32:
+                handle.write(struct.pack("<i", value))
+            else:  # pragma: no cover - the fixture owns the metadata schema.
+                raise AssertionError(f"unsupported synthetic type: {value_type}")
+
+        _write_gguf_string(handle, tensor_name)
+        handle.write(struct.pack("<I", len(tensor_shape)))
+        # GGUF persists dimensions in the reverse of NumPy/PyTorch order.
+        for dimension in reversed(tensor_shape):
+            handle.write(struct.pack("<Q", dimension))
+        handle.write(struct.pack("<IQ", int(GGUFTensorType.F32), 0))
+
+        padding = (-handle.tell()) % GGUFParser.ALIGNMENT
+        handle.write(b"\0" * padding)
+        handle.write(struct.pack(f"<{len(tensor_values)}f", *tensor_values))
+
+
+class TestGGUFSplitSet(unittest.TestCase):
+    """Lock down aggregate inventory and shard-local byte ownership."""
+
+    def _write_pair(self, directory: Path) -> tuple[Path, Path]:
+        first = directory / "tiny-00001-of-00002.gguf"
+        second = directory / "tiny-00002-of-00002.gguf"
+        _write_synthetic_split_shard(
+            first,
+            split_no=0,
+            split_count=2,
+            tensor_name="output_norm.weight",
+            tensor_shape=(2,),
+            tensor_values=(1.25, -2.5),
+        )
+        _write_synthetic_split_shard(
+            second,
+            split_no=1,
+            split_count=2,
+            tensor_name="blk.1.nextn.eh_proj.weight",
+            tensor_shape=(2, 2),
+            tensor_values=(3.0, 4.0, 5.0, 6.0),
+        )
+        return first, second
+
+    def test_split_root_exposes_all_tensors_and_routes_reads(self):
+        """A metadata-only-style first shard must not hide later tensors."""
+        with tempfile.TemporaryDirectory() as raw_directory:
+            first, _ = self._write_pair(Path(raw_directory))
+            with GGUFParser(first) as parser:
+                parser.parse()
+                self.assertEqual(parser.tensor_count, 2)
+                self.assertEqual(
+                    [tensor.name for tensor in parser.tensors],
+                    ["output_norm.weight", "blk.1.nextn.eh_proj.weight"],
+                )
+                self.assertEqual(parser.get_config_dict()["num_hidden_layers"], 1)
+                sidecar = parser.tensors[1]
+                values = struct.unpack("<4f", parser.read_tensor_data(sidecar))
+                self.assertEqual(values, (3.0, 4.0, 5.0, 6.0))
+
+    def test_split_inventory_is_deterministic_from_any_shard(self):
+        """Opening shard two still produces canonical shard-order iteration."""
+        with tempfile.TemporaryDirectory() as raw_directory:
+            _, second = self._write_pair(Path(raw_directory))
+            with GGUFParser(second) as parser:
+                parser.parse()
+                self.assertEqual(
+                    [tensor.name for tensor in parser.tensors],
+                    ["output_norm.weight", "blk.1.nextn.eh_proj.weight"],
+                )
+
+    def test_missing_split_fails_closed(self):
+        """A declared split set cannot silently degrade to one shard."""
+        with tempfile.TemporaryDirectory() as raw_directory:
+            first = Path(raw_directory) / "tiny-00001-of-00002.gguf"
+            _write_synthetic_split_shard(
+                first,
+                split_no=0,
+                split_count=2,
+                tensor_name="output_norm.weight",
+                tensor_shape=(1,),
+                tensor_values=(1.0,),
+            )
+            with GGUFParser(first) as parser:
+                with self.assertRaisesRegex(FileNotFoundError, "missing shard"):
+                    parser.parse()
+
+
 class TestGGUFRealFile(unittest.TestCase):
     """Test parsing real GGUF files (integration tests)."""
     

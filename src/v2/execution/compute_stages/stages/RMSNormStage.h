@@ -1,6 +1,12 @@
 /**
  * @file RMSNormStage.h
- * @brief RMS normalization stage
+ * @brief Typed RMS-normalization stage and its diagnostic publication policy.
+ *
+ * The stage owns no activation storage: callers bind stable input, output, and
+ * gamma tensors, and execution dispatches the matching CPU/CUDA/ROCm kernel on
+ * the stage's exact stream.  Its optional diagnostic publication policy makes
+ * a read-only input visible to graph-stable snapshot capture without changing
+ * the arithmetic or introducing a second host-owned copy of live model state.
  */
 
 #pragma once
@@ -9,6 +15,7 @@
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 
+#include <cstdint>
 #include <optional>
 #include <memory>
 
@@ -30,6 +37,23 @@ namespace llaminar2
     class RMSNormStage : public IComputeStage
     {
     public:
+        /**
+         * @brief Select an additional read-only input view published for diagnostics.
+         *
+         * Snapshot capture ordinarily observes only values produced by a
+         * stage.  The MTP predictor's first normalization is also the exact
+         * transaction boundary at which its terminal-hidden input is consumed.
+         * Publishing that already-resident input as a diagnostic output lets
+         * parity prove the transaction without an identity kernel, host copy,
+         * or a second authority for the value.
+         */
+        enum class DiagnosticInputPublication : std::uint8_t
+        {
+            None,              ///< Publish only the normalized output.
+            MTPTerminalHidden, ///< Also publish the exact MTP terminal-hidden input.
+        };
+
+        /** @brief Complete immutable bindings and policies for one RMSNorm stage. */
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -54,6 +78,10 @@ namespace llaminar2
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_buffer_id;
+
+            /// Optional read-only input view exposed to graph-stable diagnostics.
+            DiagnosticInputPublication diagnostic_input_publication =
+                DiagnosticInputPublication::None;
         };
 
         explicit RMSNormStage(Params params);

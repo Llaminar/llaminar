@@ -6,11 +6,26 @@
  */
 
 #include "TPAllreduceStage.h"
+#include "../../../collective/AllreducePrecisionPolicy.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../memory/StageBufferContract.h"
+#include "../../../execution/moe/MoEOverlayNodeLocalRouteExchange.h"
+#include "../../../kernels/IMoEKernel.h"
+#include "../../../kernels/KernelFactory.h"
+#include "../../../kernels/common/TPRankOrderedReductionKernels.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/PerfStatsCollector.h"
+
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -18,6 +33,350 @@
 
 namespace llaminar2
 {
+    using KernelFactory = llaminar::v2::kernels::KernelFactory;
+
+    const char *toString(TPLocalRootedCollectiveOperation operation) noexcept
+    {
+        switch (operation)
+        {
+        case TPLocalRootedCollectiveOperation::ReduceSum:
+            return "reduce_sum";
+        case TPLocalRootedCollectiveOperation::Broadcast:
+            return "broadcast";
+        }
+        return "unknown";
+    }
+
+    const char *toString(TPLocalRootedCollectiveTensorRole role) noexcept
+    {
+        switch (role)
+        {
+        case TPLocalRootedCollectiveTensorRole::ReduceRootInOut:
+            return "reduce-root-inout";
+        case TPLocalRootedCollectiveTensorRole::ReduceContributorInput:
+            return "reduce-contributor-input";
+        case TPLocalRootedCollectiveTensorRole::BroadcastRootInput:
+            return "broadcast-root-input";
+        case TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput:
+            return "broadcast-receiver-output";
+        }
+        return "unknown";
+    }
+
+    const char *toString(TPAllreduceArithmeticPolicy policy) noexcept
+    {
+        switch (policy)
+        {
+        case TPAllreduceArithmeticPolicy::NativeCollective:
+            return "native-collective";
+        case TPAllreduceArithmeticPolicy::CanonicalRankOrder:
+            return "canonical-rank-order";
+        }
+        return "unknown";
+    }
+
+    namespace
+    {
+        constexpr const char *kDefaultAllreducePrecision = "fp32";
+        constexpr const char *kCanonicalRankBankWorkspace =
+            "tp_allreduce_canonical_rank_banks";
+
+        const char *allreduceRoleForStage(const std::string &stage_name)
+        {
+            if (stage_name.find("embedding") != std::string::npos)
+                return "embedding";
+            if (stage_name.find("shared_expert") != std::string::npos)
+                return "moe_shared_expert";
+            if (stage_name.find("moe_combined") != std::string::npos)
+                return "moe_combined";
+            if (stage_name.find("moe_expert") != std::string::npos ||
+                stage_name.find("sparse_return") != std::string::npos)
+                return "moe_routed_expert";
+            if (stage_name.find("gdn_wo") != std::string::npos ||
+                stage_name.find("wo_allreduce") != std::string::npos)
+                return "attention_output";
+            if (stage_name.find("down_allreduce") != std::string::npos)
+                return "ffn_down";
+            return "unknown";
+        }
+
+        std::string allreduceScopeString(const ITPContext *tp_ctx)
+        {
+            if (!tp_ctx)
+                return "none";
+            // PerfStats must use the same canonical taxonomy as configuration
+            // and topology planning; private aliases make cross-gate evidence
+            // impossible to compare reliably.
+            return tpScopeToString(tp_ctx->scope());
+        }
+
+        std::string requestedTransportPrecision(const TPAllreduceParams &params)
+        {
+            return params.precision.empty() ? std::string(kDefaultAllreducePrecision) : params.precision;
+        }
+
+        std::string effectiveTransportPrecision(
+            const TPAllreduceParams &params,
+            size_t effective_count)
+        {
+            const std::string requested_precision = requestedTransportPrecision(params);
+            const size_t logical_row_elements =
+                params.tensor ? params.tensor->cols() : 0;
+            const size_t decision_elements =
+                batchInvariantAllreduceDecisionElements(
+                    effective_count, logical_row_elements);
+            if (requested_precision == "fp16" &&
+                params.tensor &&
+                params.tensor->native_type() == TensorType::FP32 &&
+                decision_elements < debugEnv().allreduce_fp16_min_elements)
+            {
+                return "fp32";
+            }
+            return requested_precision;
+        }
+
+        size_t effectiveTransportElementBytes(
+            const TPAllreduceParams &params,
+            size_t effective_count,
+            size_t tensor_element_bytes)
+        {
+            const std::string transport_precision =
+                effectiveTransportPrecision(params, effective_count);
+            if (transport_precision == "fp16" && params.tensor &&
+                params.tensor->native_type() == TensorType::FP32)
+            {
+                return sizeof(uint16_t);
+            }
+            if (transport_precision == "bf16" && params.tensor &&
+                params.tensor->native_type() == TensorType::FP32)
+            {
+                return sizeof(uint16_t);
+            }
+            return tensor_element_bytes;
+        }
+
+        const char *collectiveDataTypeNameForStats(CollectiveDataType dtype)
+        {
+            switch (dtype)
+            {
+            case CollectiveDataType::FLOAT32:
+                return "fp32";
+            case CollectiveDataType::FLOAT16:
+                return "fp16";
+            case CollectiveDataType::BFLOAT16:
+                return "bf16";
+            case CollectiveDataType::INT32:
+                return "int32";
+            case CollectiveDataType::INT8:
+                return "int8";
+            }
+            return "unknown";
+        }
+
+        size_t collectiveDataTypeBytesForStats(CollectiveDataType dtype)
+        {
+            switch (dtype)
+            {
+            case CollectiveDataType::FLOAT32:
+            case CollectiveDataType::INT32:
+                return sizeof(std::uint32_t);
+            case CollectiveDataType::FLOAT16:
+            case CollectiveDataType::BFLOAT16:
+                return sizeof(std::uint16_t);
+            case CollectiveDataType::INT8:
+                return sizeof(std::uint8_t);
+            }
+            return 0;
+        }
+
+        size_t sidebandResultElements(
+            LocalTPCollectiveSidebandKind kind,
+            size_t element_count,
+            size_t degree)
+        {
+            if (kind == LocalTPCollectiveSidebandKind::Allgather)
+                return element_count * degree;
+            return element_count;
+        }
+
+        void recordAllreduceSidebandBillOfMaterialsEntry(
+            const TPAllreduceParams &params,
+            LocalTPCollectiveSidebandKind kind,
+            size_t element_count,
+            CollectiveDataType dtype,
+            int root_device_index,
+            const std::string &sideband_name,
+            const std::string &source,
+            bool grouped_with_anchor)
+        {
+            if (!PerfStatsCollector::isDomainEnabled("tp_allreduce_bom"))
+                return;
+
+            const size_t degree = params.tp_ctx ? static_cast<size_t>(params.tp_ctx->degree()) : 0;
+            const size_t element_bytes = collectiveDataTypeBytesForStats(dtype);
+            const size_t local_bytes = element_count * element_bytes;
+            const size_t result_bytes =
+                sidebandResultElements(kind, element_count, degree) * element_bytes;
+
+            PerfStatsCollector::Tags tags{
+                {"stage", params.stage_name.empty() ? "unnamed" : params.stage_name},
+                {"role", allreduceRoleForStage(params.stage_name)},
+                {"anchor_stage", params.stage_name.empty() ? "unnamed" : params.stage_name},
+                {"anchor_collective", "allreduce"},
+                {"backend", params.tp_ctx ? collectiveBackendTypeToString(params.tp_ctx->backend()) : "none"},
+                {"scope", allreduceScopeString(params.tp_ctx)},
+                {"degree", std::to_string(degree)},
+                {"sideband", sideband_name.empty() ? "unnamed" : sideband_name},
+                {"kind", toString(kind)},
+                {"dtype", collectiveDataTypeNameForStats(dtype)},
+                {"element_bytes", std::to_string(element_bytes)},
+                {"elements", std::to_string(element_count)},
+                {"result_elements", std::to_string(sidebandResultElements(kind, element_count, degree))},
+                {"root_device_index", std::to_string(root_device_index)},
+                {"source", source},
+                {"attachment", "tp_allreduce_stage_sideband"},
+                {"accounting", "graph_template_or_eager_launch"},
+                {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"},
+                {"launch_relation", grouped_with_anchor ? "same_group_as_anchor" : "same_stream_after_anchor"},
+                {"fused_with_anchor", grouped_with_anchor ? "true" : "false"},
+                {"physical_fusion", grouped_with_anchor ? "grouped_with_anchor_collective" : "separate_backend_collective"}};
+
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "sideband_collective_calls",
+                1.0,
+                {},
+                params.device_id.toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                grouped_with_anchor
+                    ? "sideband_grouped_with_anchor_collective_calls"
+                    : "sideband_separate_backend_collective_calls",
+                1.0,
+                {},
+                params.device_id.toString(),
+                tags);
+
+            PerfStatsCollector::Tags local_byte_tags = tags;
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "sideband_local_bytes",
+                static_cast<double>(local_bytes),
+                {},
+                params.device_id.toString(),
+                std::move(local_byte_tags));
+
+            PerfStatsCollector::Tags result_byte_tags = tags;
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "sideband_result_bytes",
+                static_cast<double>(result_bytes),
+                {},
+                params.device_id.toString(),
+                std::move(result_byte_tags));
+        }
+
+        void recordAllreduceSidebandBillOfMaterials(
+            const TPAllreduceParams &params,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            bool grouped_with_anchor)
+        {
+            for (const auto &sideband : sidebands)
+            {
+                recordAllreduceSidebandBillOfMaterialsEntry(
+                    params,
+                    sideband.kind,
+                    sideband.element_count,
+                    sideband.dtype,
+                    sideband.root_device_index,
+                    sideband.name,
+                    "raw_buffer",
+                    grouped_with_anchor);
+            }
+        }
+
+        void recordAllreduceWorkspaceSidebandBillOfMaterials(
+            const TPAllreduceParams &params,
+            bool grouped_with_anchor)
+        {
+            for (const auto &binding : params.sideband_workspace_bindings)
+            {
+                recordAllreduceSidebandBillOfMaterialsEntry(
+                    params,
+                    binding.kind,
+                    binding.element_count,
+                    binding.dtype,
+                    binding.root_device_index,
+                    binding.name.empty()
+                        ? (binding.recv_buffer_name.empty()
+                               ? binding.send_buffer_name
+                                           : binding.recv_buffer_name)
+                        : binding.name,
+                    "workspace_binding",
+                    grouped_with_anchor);
+            }
+        }
+
+        void recordAllreduceBillOfMaterials(
+            const TPAllreduceParams &params,
+            size_t effective_count,
+            bool no_op)
+        {
+            if (!PerfStatsCollector::isDomainEnabled("tp_allreduce_bom") ||
+                !params.tensor)
+                return;
+
+            const size_t tensor_numel = params.tensor->numel();
+            const size_t tensor_element_bytes =
+                tensor_numel > 0 ? (params.tensor->size_bytes() / tensor_numel) : 0;
+            const size_t element_bytes =
+                effectiveTransportElementBytes(params, effective_count, tensor_element_bytes);
+            const size_t reduced_bytes = effective_count * element_bytes;
+            PerfStatsCollector::Tags common_tags{
+                {"stage", params.stage_name.empty() ? "unnamed" : params.stage_name},
+                {"role", allreduceRoleForStage(params.stage_name)},
+                {"backend", params.tp_ctx ? collectiveBackendTypeToString(params.tp_ctx->backend()) : "none"},
+                {"scope", allreduceScopeString(params.tp_ctx)},
+                {"degree", params.tp_ctx ? std::to_string(params.tp_ctx->degree()) : "0"},
+                {"no_op", no_op ? "true" : "false"},
+                {"accounting", "graph_template_or_eager_launch"},
+                {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
+            common_tags.emplace("elements", std::to_string(effective_count));
+            const size_t logical_row_elements = params.tensor->cols();
+            common_tags.emplace(
+                "logical_row_elements", std::to_string(logical_row_elements));
+            common_tags.emplace(
+                "precision_decision_elements",
+                std::to_string(batchInvariantAllreduceDecisionElements(
+                    effective_count, logical_row_elements)));
+            common_tags.emplace("precision", params.precision.empty() ? "default" : params.precision);
+            common_tags.emplace("arithmetic_policy", toString(params.arithmetic_policy));
+            common_tags.emplace("requested_transport_precision", requestedTransportPrecision(params));
+            common_tags.emplace("transport_precision", effectiveTransportPrecision(params, effective_count));
+            PerfStatsCollector::Tags byte_tags = common_tags;
+            byte_tags.emplace("element_bytes", std::to_string(element_bytes));
+            byte_tags.emplace("tensor_element_bytes", std::to_string(tensor_element_bytes));
+            byte_tags.emplace("tensor_numel", std::to_string(tensor_numel));
+            byte_tags.emplace("tensor_type", params.tensor->dtype_name());
+
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "bytes",
+                static_cast<double>(reduced_bytes),
+                {},
+                params.device_id.toString(),
+                std::move(byte_tags));
+
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "stages",
+                1.0,
+                {},
+                params.device_id.toString(),
+                common_tags);
+        }
+    } // namespace
 
     // =========================================================================
     // Construction
@@ -52,10 +411,15 @@ namespace llaminar2
             return false;
         }
 
+        // Resolve count: 0 means use tensor->numel()
+        const size_t effective_count = (params_.count > 0) ? params_.count : params_.tensor->numel();
+        const bool no_op_allreduce = params_.tp_ctx->degree() == 1 || debugEnv().skip_allreduce;
+        recordAllreduceBillOfMaterials(params_, effective_count, no_op_allreduce);
+
         // Single-device context - no-op
         if (params_.tp_ctx->degree() == 1)
         {
-            LOG_DEBUG("TPAllreduceStage: single device, no-op");
+            LOG_TRACE("TPAllreduceStage: single device, no-op");
             return true;
         }
 
@@ -66,10 +430,7 @@ namespace llaminar2
             return true;
         }
 
-        // Resolve count: 0 means use tensor->numel()
-        const size_t effective_count = (params_.count > 0) ? params_.count : params_.tensor->numel();
-
-        LOG_DEBUG("TPAllreduceStage: tensor diagnostics"
+        LOG_TRACE("TPAllreduceStage: tensor diagnostics"
                       << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
                       << " tensor=" << static_cast<void *>(params_.tensor)
                       << " tensor_name=" << (params_.tensor->debugName().empty() ? "(unnamed)" : params_.tensor->debugName())
@@ -93,18 +454,158 @@ namespace llaminar2
 
         // Log scope-aware message
         const char *scope_str = params_.tp_ctx->isLocal() ? "LOCAL" : (params_.tp_ctx->isNodeLocal() ? "NODE_LOCAL" : "GLOBAL");
-        LOG_DEBUG("TPAllreduceStage (" << scope_str << "): all-reduce across " << params_.tp_ctx->degree()
+        LOG_TRACE("TPAllreduceStage (" << scope_str << "): all-reduce across " << params_.tp_ctx->degree()
                                        << " devices using " << collectiveBackendTypeToString(params_.tp_ctx->backend())
                                        << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
                                        << " count=" << effective_count
                                        << " (params_.count=" << params_.count
                                        << ", tensor numel=" << params_.tensor->numel() << ")");
 
-        // Use stage_name overload with count parameter
-        // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size)
-        bool success;
         void *stage_stream = gpuStream();
-        if (!params_.stage_name.empty())
+        // Resolve the schema request once at the stage boundary.  The LocalTP
+        // context receives the actual transport precision, so graph capture,
+        // eager execution, sideband bundles, and perf telemetry all obey the
+        // same per-row batch-invariant decision.
+        const std::string transport_precision =
+            effectiveTransportPrecision(params_, effective_count);
+        const bool gpu_stage =
+            params_.device_id.is_gpu() || (ctx && ctx->isGPU());
+
+        std::vector<LocalTPCollectiveSidebandBuffer> sidebands = params_.sidebands;
+        if (!params_.sideband_workspace_bindings.empty())
+        {
+            if (!bound_workspace_)
+            {
+                LOG_ERROR("TPAllreduceStage: workspace sidebands require a bound workspace"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " binding_count=" << params_.sideband_workspace_bindings.size());
+                return false;
+            }
+
+            for (const auto &binding : params_.sideband_workspace_bindings)
+            {
+                auto resolveBuffer = [&](const std::string &buffer_name) -> void *
+                {
+                    if (buffer_name.empty())
+                        return nullptr;
+                    return bound_workspace_->getBuffer(buffer_name);
+                };
+
+                void *send_buffer = resolveBuffer(binding.send_buffer_name);
+                void *recv_buffer = resolveBuffer(binding.recv_buffer_name);
+                if (!binding.send_buffer_name.empty() && !send_buffer)
+                {
+                    LOG_ERROR("TPAllreduceStage: missing sideband send workspace buffer"
+                              << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                              << " sideband=" << (binding.name.empty() ? "(unnamed)" : binding.name)
+                              << " buffer=" << binding.send_buffer_name);
+                    return false;
+                }
+                if (!binding.recv_buffer_name.empty() && !recv_buffer)
+                {
+                    LOG_ERROR("TPAllreduceStage: missing sideband recv workspace buffer"
+                              << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                              << " sideband=" << (binding.name.empty() ? "(unnamed)" : binding.name)
+                              << " buffer=" << binding.recv_buffer_name);
+                    return false;
+                }
+
+                LocalTPCollectiveSidebandBuffer sideband;
+                sideband.kind = binding.kind;
+                sideband.send_buffer = send_buffer;
+                sideband.recv_buffer = recv_buffer;
+                sideband.element_count = binding.element_count;
+                sideband.dtype = binding.dtype;
+                sideband.root_device_index = binding.root_device_index;
+                sideband.name = binding.name.empty()
+                                    ? (binding.recv_buffer_name.empty()
+                                           ? binding.send_buffer_name
+                                           : binding.recv_buffer_name)
+                                    : binding.name;
+                sidebands.push_back(std::move(sideband));
+            }
+        }
+
+        if (params_.arithmetic_policy ==
+            TPAllreduceArithmeticPolicy::CanonicalRankOrder)
+        {
+            auto *local_tp = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
+            if (!local_tp)
+            {
+                LOG_ERROR("TPAllreduceStage: canonical rank-order reduction requires LocalTP"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+            if (transport_precision != "fp32")
+            {
+                LOG_ERROR("TPAllreduceStage: canonical rank-order reduction requires FP32 transport"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " transport_precision=" << transport_precision);
+                return false;
+            }
+            return executeCanonicalRankOrder(
+                local_tp,
+                effective_count,
+                stage_stream,
+                sidebands);
+        }
+
+        // Use stage_name overload with count parameter.
+        // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size).
+        bool success;
+        if (!sidebands.empty())
+        {
+            if (!stage_stream)
+            {
+                LOG_ERROR("TPAllreduceStage: sidebands require an explicit non-null stream"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+            auto *local_tp = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
+            if (!local_tp)
+            {
+                LOG_ERROR("TPAllreduceStage: sidebands require a LocalTP context"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+            if (params_.sideband_device_index < 0)
+            {
+                LOG_ERROR("TPAllreduceStage: sidebands require a valid LocalTP participant index"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " sideband_device_index=" << params_.sideband_device_index);
+                return false;
+            }
+            recordAllreduceSidebandBillOfMaterials(params_, sidebands, true);
+            success = local_tp->allreduceWithSidebandsOnStream(
+                params_.tensor,
+                params_.stage_name,
+                effective_count,
+                stage_stream,
+                transport_precision,
+                sidebands,
+                params_.sideband_device_index);
+            if (!success)
+            {
+                LOG_ERROR("TPAllreduceStage: LocalTP grouped allreduce sideband bundle failed"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " sideband_count=" << sidebands.size());
+                return false;
+            }
+        }
+        else if (gpu_stage)
+        {
+            if (!stage_stream)
+            {
+                LOG_ERROR("TPAllreduceStage: GPU allreduce requires an explicit non-null stream"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " device=" << params_.device_id.toString());
+                return false;
+            }
+            success = params_.tp_ctx->allreduceOnStream(
+                params_.tensor, params_.stage_name, effective_count, stage_stream,
+                transport_precision);
+        }
+        else if (!params_.stage_name.empty())
         {
             // When a GPU stream is set (e.g., from graph capture), route through
             // the on-stream path so the allreduce kernel is recorded into the graph.
@@ -112,7 +613,7 @@ namespace llaminar2
             {
                 success = params_.tp_ctx->allreduceOnStream(
                     params_.tensor, params_.stage_name, effective_count, stage_stream,
-                    params_.precision);
+                    transport_precision);
             }
             else
             {
@@ -128,13 +629,56 @@ namespace llaminar2
         if (!success)
         {
             LOG_ERROR("TPAllreduceStage (" << scope_str << "): allreduce failed");
+            return false;
         }
 
-        // Dirty-marking is handled by LocalTPContext::allreduceOnStream() which
-        // calls transitionToWithEvent(DEVICE_AUTHORITATIVE, ..., stream) to record a completion event.
-        // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
+        // LocalTPContext publishes the allreduce write through TransferEngine
+        // on the exact collective stream. This ensures ensureOnHost() waits for
+        // collective completion before D2H.
 
-        return success;
+        return true;
+    }
+
+    WorkspaceRequirements TPAllreduceStage::getWorkspaceRequirements(
+        int m, int n, int k) const
+    {
+        (void)m;
+        (void)n;
+        (void)k;
+        WorkspaceRequirements requirements;
+        if (params_.arithmetic_policy !=
+                TPAllreduceArithmeticPolicy::CanonicalRankOrder ||
+            !params_.tp_ctx || !params_.tensor)
+        {
+            return requirements;
+        }
+
+        const size_t effective_count =
+            params_.count > 0 ? params_.count : params_.tensor->numel();
+        const size_t degree = static_cast<size_t>(params_.tp_ctx->degree());
+        if (effective_count == 0 || degree < 2 ||
+            effective_count >
+                std::numeric_limits<size_t>::max() / degree / sizeof(float))
+        {
+            return requirements;
+        }
+        requirements.buffers.push_back(
+            {kCanonicalRankBankWorkspace,
+             effective_count * degree * sizeof(float),
+             256u,
+             true,
+             WorkspaceExecutionRegime::CompactDecodeOnly});
+        return requirements;
+    }
+
+    void TPAllreduceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+    }
+
+    void TPAllreduceStage::unbindWorkspace()
+    {
+        bound_workspace_ = nullptr;
     }
 
     bool TPAllreduceStage::supportsBackend(ComputeBackendType backend) const
@@ -181,6 +725,9 @@ namespace llaminar2
             info.addScalarInt("backend", static_cast<int>(params_.tp_ctx->backend()));
             info.addScalarInt("tp_scope", static_cast<int>(params_.tp_ctx->scope()));
         }
+        info.addScalarInt(
+            "arithmetic_policy",
+            static_cast<int>(params_.arithmetic_policy));
 
         return info;
     }
@@ -191,7 +738,7 @@ namespace llaminar2
             return {};
 
         return StageBufferContract::build()
-            .addInOut(*params_.tensor_buffer_id);
+            .addPreallocatedInOut(*params_.tensor_buffer_id);
     }
 
     void TPAllreduceStage::setParams(const Params &params)
@@ -200,6 +747,740 @@ namespace llaminar2
         // Update base class device
         // Note: IComputeStage doesn't expose setDevice() publicly, so device
         // is fixed at construction. For reuse, create a new stage.
+    }
+
+    bool TPAllreduceStage::executeCanonicalRankOrder(
+        ILocalTPContext *local_tp,
+        size_t effective_count,
+        void *stage_stream,
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands)
+    {
+        if (!local_tp || !stage_stream || !params_.tensor ||
+            params_.sideband_device_index < 0 || !bound_workspace_)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction has incomplete bindings"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " local_tp=" << (local_tp != nullptr)
+                      << " stream=" << stage_stream
+                      << " tensor=" << (params_.tensor != nullptr)
+                      << " participant=" << params_.sideband_device_index
+                      << " workspace=" << (bound_workspace_ != nullptr));
+            return false;
+        }
+        if (params_.tensor->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction currently owns FP32 tensors only"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " tensor_type=" << params_.tensor->dtype_name());
+            return false;
+        }
+
+        const int degree = local_tp->degree();
+        if (degree < 2 || params_.sideband_device_index >= degree ||
+            effective_count == 0 ||
+            effective_count >
+                std::numeric_limits<size_t>::max() /
+                    static_cast<size_t>(degree) / sizeof(float))
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction rejected geometry"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " count=" << effective_count
+                      << " degree=" << degree
+                      << " participant=" << params_.sideband_device_index);
+            return false;
+        }
+
+        auto *rank_banks = static_cast<float *>(
+            bound_workspace_->getBuffer(kCanonicalRankBankWorkspace));
+        const size_t required_bytes =
+            effective_count * static_cast<size_t>(degree) * sizeof(float);
+        if (!rank_banks ||
+            bound_workspace_->getBufferSize(kCanonicalRankBankWorkspace) <
+                required_bytes)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-bank workspace is missing or undersized"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " required_bytes=" << required_bytes);
+            return false;
+        }
+
+        auto *tensor_data = static_cast<float *>(params_.tensor->gpu_data_ptr());
+        if (!tensor_data)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order reduction requires device-resident tensor data"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+            return false;
+        }
+
+        const std::string collective_name =
+            params_.stage_name + "_canonical_rank_banks";
+        if (!local_tp->allgatherRawOnStream(
+                tensor_data,
+                rank_banks,
+                effective_count,
+                CollectiveDataType::FLOAT32,
+                params_.sideband_device_index,
+                stage_stream,
+                collective_name))
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-bank allgather failed"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+            return false;
+        }
+
+        if (!sidebands.empty())
+        {
+            recordAllreduceSidebandBillOfMaterials(params_, sidebands, false);
+            if (!local_tp->collectiveSidebandOnStream(
+                    sidebands,
+                    params_.sideband_device_index,
+                    stage_stream,
+                    params_.stage_name + "_canonical_sidebands"))
+            {
+                LOG_ERROR("TPAllreduceStage: canonical rank-order sideband publication failed"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+        }
+
+        bool folded = false;
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            folded = launchCUDATPRankOrderedSumFP32(
+                rank_banks,
+                tensor_data,
+                effective_count,
+                degree,
+                params_.device_id.toKernelDeviceIndex(),
+                stage_stream);
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            folded = launchROCmTPRankOrderedSumFP32(
+                rank_banks,
+                tensor_data,
+                effective_count,
+                degree,
+                params_.device_id.toKernelDeviceIndex(),
+                stage_stream);
+#endif
+        }
+        if (!folded)
+        {
+            LOG_ERROR("TPAllreduceStage: canonical rank-order device fold failed"
+                      << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                      << " device=" << params_.device_id.toString());
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "tp_allreduce",
+            "canonical_rank_order_reductions",
+            1.0,
+            "collective",
+            params_.device_id.toString(),
+            {{"stage", params_.stage_name.empty() ? "unnamed" : params_.stage_name},
+             {"degree", std::to_string(degree)},
+             {"elements", std::to_string(effective_count)},
+             {"transport", "native_allgather"},
+             {"arithmetic", "device_rank_order"},
+             {"capture_mode", isGraphCaptureActive() ? "graph_capture" : "direct"}});
+        return true;
+    }
+
+    // =========================================================================
+    // TPLocalRootedCollectiveStage
+    // =========================================================================
+
+    TPLocalRootedCollectiveStage::TPLocalRootedCollectiveStage(Params params)
+        : IComputeStage(params.device_id),
+          params_(std::move(params))
+    {
+        /*
+         * This is graph-construction time, not execution time. Reserve the full
+         * descriptor count now so rebinding cannot allocate while a graph is
+         * being captured or replayed.
+         */
+        bound_sidebands_.reserve(
+            params_.sideband_workspace_bindings.size());
+
+        if (params_.mapped_dense_publication_exchange)
+        {
+            if (params_.operation !=
+                    TPLocalRootedCollectiveOperation::Broadcast ||
+                params_.dtype != CollectiveDataType::FLOAT32 ||
+                !params_.sideband_workspace_bindings.empty())
+            {
+                throw std::invalid_argument(
+                    "mapped dense LocalTP publication supports only an FP32 broadcast without collective sidebands");
+            }
+            if (!params_.mapped_dense_publication_exchange->materialized())
+            {
+                throw std::invalid_argument(
+                    "mapped dense LocalTP publication requires a materialized node-local exchange");
+            }
+            mapped_dense_publication_binding_ =
+                params_.mapped_dense_publication_exchange
+                    ->densePublicationBinding(params_.device_id);
+            mapped_dense_publication_region_ =
+                params_.mapped_dense_publication_exchange->mappedRegion();
+            mapped_dense_publication_payload_offset_ =
+                params_.mapped_dense_publication_exchange
+                    ->densePublicationPayloadOffset();
+            mapped_dense_publication_kernel_ =
+                KernelFactory::createMoEKernel(params_.device_id);
+            if (!mapped_dense_publication_binding_.valid() ||
+                !mapped_dense_publication_region_ ||
+                !mapped_dense_publication_kernel_ ||
+                params_.count >
+                    mapped_dense_publication_binding_.element_capacity)
+            {
+                throw std::invalid_argument(
+                    "mapped dense LocalTP publication has incomplete endpoint bindings or insufficient capacity");
+            }
+        }
+    }
+
+    TPLocalRootedCollectiveStage::~TPLocalRootedCollectiveStage() = default;
+
+    TPLocalRootedCollectiveTensorRole
+    TPLocalRootedCollectiveStage::tensorRole() const noexcept
+    {
+        const bool is_root =
+            params_.participant_device_index == params_.root_device_index;
+        if (params_.operation ==
+            TPLocalRootedCollectiveOperation::ReduceSum)
+        {
+            return is_root
+                       ? TPLocalRootedCollectiveTensorRole::ReduceRootInOut
+                       : TPLocalRootedCollectiveTensorRole::ReduceContributorInput;
+        }
+        return is_root
+                   ? TPLocalRootedCollectiveTensorRole::BroadcastRootInput
+                   : TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput;
+    }
+
+    bool TPLocalRootedCollectiveStage::execute(IDeviceContext *ctx)
+    {
+        KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE);
+
+        if (!ctx || !params_.tp_ctx || !params_.tensor || params_.count == 0 ||
+            params_.participant_device_index < 0 ||
+            params_.participant_device_index >= params_.tp_ctx->degree() ||
+            params_.root_device_index < 0 ||
+            params_.root_device_index >= params_.tp_ctx->degree())
+        {
+            LOG_ERROR("TPLocalRootedCollectiveStage: invalid execution contract"
+                      << " ctx=" << (ctx != nullptr)
+                      << " tp_ctx=" << (params_.tp_ctx != nullptr)
+                      << " tensor=" << (params_.tensor != nullptr)
+                      << " count=" << params_.count
+                      << " participant=" << params_.participant_device_index
+                      << " root=" << params_.root_device_index);
+            return false;
+        }
+        if (params_.tp_ctx->degree() <= 1)
+        {
+            LOG_ERROR("TPLocalRootedCollectiveStage: rooted collective requires degree > 1"
+                      << " stage=" << (params_.stage_name.empty()
+                                             ? "(none)"
+                                             : params_.stage_name));
+            return false;
+        }
+
+        const StageGPUExecution execution = gpuExecution();
+        void *const stream = execution.nativeStream();
+        void *const buffer = params_.tensor->gpu_data_ptr();
+        if (!stream || !buffer)
+        {
+            LOG_ERROR("TPLocalRootedCollectiveStage: explicit stream and resident device buffer are required"
+                      << " stage=" << (params_.stage_name.empty()
+                                             ? "(none)"
+                                             : params_.stage_name)
+                      << " role=" << toString(tensorRole())
+                      << " stream=" << stream
+                      << " buffer=" << buffer);
+            return false;
+        }
+
+        if (params_.mapped_dense_publication_exchange)
+        {
+            const bool graph_role_is_root =
+                params_.participant_device_index ==
+                params_.root_device_index;
+            if (!mapped_dense_publication_binding_.valid() ||
+                !mapped_dense_publication_region_ ||
+                !mapped_dense_publication_kernel_ ||
+                mapped_dense_publication_binding_.isRoot() !=
+                    graph_role_is_root ||
+                params_.tensor->native_type() != TensorType::FP32 ||
+                params_.count >
+                    mapped_dense_publication_binding_.element_capacity)
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: mapped dense publication role, type, or capacity disagrees with the graph"
+                          << " stage="
+                          << (params_.stage_name.empty()
+                                  ? "(none)"
+                                  : params_.stage_name)
+                          << " graph_root=" << graph_role_is_root
+                          << " binding_root="
+                          << mapped_dense_publication_binding_.isRoot()
+                          << " count=" << params_.count
+                          << " capacity="
+                          << mapped_dense_publication_binding_.element_capacity);
+                return false;
+            }
+
+            IMoEKernel *const kernel =
+                bindStageStream(mapped_dense_publication_kernel_.get());
+            if (!kernel)
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: mapped dense publication could not bind its exact stream");
+                return false;
+            }
+            const MoEKernelLaunchContext launch_context{
+                .stream = stream,
+            };
+            const MoENodeLocalDensePublicationLaunch publication{
+                .binding = mapped_dense_publication_binding_,
+                .element_count = params_.count,
+            };
+            try
+            {
+                if (graph_role_is_root)
+                {
+                    if (!kernel->beginNodeLocalDensePublication(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                    TransferEngine::instance().enqueueDeviceToMappedHost(
+                        params_.tensor,
+                        0u,
+                        *mapped_dense_publication_region_,
+                        mapped_dense_publication_payload_offset_,
+                        params_.count * sizeof(float),
+                        params_.device_id,
+                        stream);
+                    if (!kernel->finishNodeLocalDensePublication(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!kernel->beginNodeLocalDensePublicationConsume(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                    TransferEngine::instance().enqueueMappedHostToDevice(
+                        *mapped_dense_publication_region_,
+                        mapped_dense_publication_payload_offset_,
+                        params_.tensor,
+                        0u,
+                        params_.count * sizeof(float),
+                        params_.device_id,
+                        stream);
+                    if (!kernel->finishNodeLocalDensePublicationConsume(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                }
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: mapped dense publication transfer failed"
+                          << " stage="
+                          << (params_.stage_name.empty()
+                                  ? "(none)"
+                                  : params_.stage_name)
+                          << " error=" << error.what());
+                return false;
+            }
+            recordBillOfMaterials();
+            return true;
+        }
+
+        bool success = false;
+        switch (params_.operation)
+        {
+        case TPLocalRootedCollectiveOperation::ReduceSum:
+            success = params_.tp_ctx->reduceRawOnStream(
+                buffer,
+                buffer,
+                params_.count,
+                params_.dtype,
+                CollectiveOp::ALLREDUCE_SUM,
+                params_.root_device_index,
+                params_.participant_device_index,
+                stream,
+                params_.stage_name);
+            break;
+        case TPLocalRootedCollectiveOperation::Broadcast:
+            success = params_.tp_ctx->broadcastRawOnStream(
+                buffer,
+                buffer,
+                params_.count,
+                params_.dtype,
+                params_.root_device_index,
+                params_.participant_device_index,
+                stream,
+                params_.stage_name);
+            break;
+        }
+
+        if (!success)
+        {
+            LOG_ERROR("TPLocalRootedCollectiveStage: native rooted collective failed"
+                      << " stage=" << (params_.stage_name.empty()
+                                             ? "(none)"
+                                             : params_.stage_name)
+                      << " operation=" << toString(params_.operation)
+                      << " participant=" << params_.participant_device_index
+                      << " root=" << params_.root_device_index);
+            return false;
+        }
+
+        /*
+         * Rebalance control traffic is part of the same declarative stream
+         * transaction as the activation collective. Workspace binding has
+         * already converted every symbolic name into a stable device pointer,
+         * so this hot path only submits the fixed descriptor span. There is no
+         * allocation, lookup, host rendezvous, or alternate transport path.
+         */
+        if (!params_.sideband_workspace_bindings.empty())
+        {
+            if (!bound_workspace_ ||
+                bound_sidebands_.size() !=
+                    params_.sideband_workspace_bindings.size())
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: workspace sidebands require complete prebinding"
+                          << " stage=" << (params_.stage_name.empty()
+                                                  ? "(none)"
+                                                  : params_.stage_name)
+                          << " binding_count="
+                          << params_.sideband_workspace_bindings.size()
+                          << " bound_count=" << bound_sidebands_.size());
+                return false;
+            }
+
+            if (!params_.tp_ctx->collectiveSidebandSpanOnStream(
+                    bound_sidebands_,
+                    params_.participant_device_index,
+                    stream,
+                    params_.stage_name))
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: same-stream sideband transaction failed"
+                          << " stage=" << (params_.stage_name.empty()
+                                                  ? "(none)"
+                                                  : params_.stage_name)
+                          << " sideband_count=" << bound_sidebands_.size());
+                return false;
+            }
+        }
+
+        const auto role = tensorRole();
+        if (role == TPLocalRootedCollectiveTensorRole::ReduceRootInOut ||
+            role ==
+                TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput)
+        {
+            execution.publish(params_.tensor);
+        }
+        recordBillOfMaterials();
+        return true;
+    }
+
+    bool TPLocalRootedCollectiveStage::supportsBackend(
+        ComputeBackendType backend) const
+    {
+        switch (backend)
+        {
+#if defined(HAVE_CUDA)
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#if defined(HAVE_ROCM)
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
+    }
+
+    bool TPLocalRootedCollectiveStage::isGraphCapturable() const
+    {
+        const bool mapped_contract_complete =
+            !params_.mapped_dense_publication_exchange ||
+            (params_.operation ==
+                 TPLocalRootedCollectiveOperation::Broadcast &&
+             params_.dtype == CollectiveDataType::FLOAT32 &&
+             mapped_dense_publication_binding_.valid() &&
+             mapped_dense_publication_region_ &&
+             mapped_dense_publication_kernel_ &&
+             params_.count <=
+                 mapped_dense_publication_binding_.element_capacity);
+        return mapped_contract_complete && params_.device_id.is_gpu() &&
+               params_.tp_ctx &&
+               params_.tp_ctx->degree() > 1 && params_.tensor &&
+               params_.count > 0 && params_.participant_device_index >= 0 &&
+               params_.participant_device_index < params_.tp_ctx->degree() &&
+               params_.root_device_index >= 0 &&
+               params_.root_device_index < params_.tp_ctx->degree() &&
+               (params_.sideband_workspace_bindings.empty() ||
+                params_.tp_ctx
+                    ->supportsCollectiveSidebandOnStreamGraphCapture());
+    }
+
+    StageBufferRequirements
+    TPLocalRootedCollectiveStage::getBufferRequirements() const
+    {
+        StageBufferRequirements requirements;
+        if (params_.tensor)
+        {
+            const auto shape = params_.tensor->shape();
+            const auto type =
+                toBufferTensorType(params_.tensor->native_type());
+            switch (tensorRole())
+            {
+            case TPLocalRootedCollectiveTensorRole::ReduceRootInOut:
+                requirements.addInout("tensor", shape, type);
+                break;
+            case TPLocalRootedCollectiveTensorRole::ReduceContributorInput:
+            case TPLocalRootedCollectiveTensorRole::BroadcastRootInput:
+                requirements.addInput("tensor", shape, type);
+                break;
+            case TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput:
+                requirements.addOutput("tensor", shape, type);
+                break;
+            }
+        }
+        return requirements;
+    }
+
+    StageBufferContract TPLocalRootedCollectiveStage::bufferContract() const
+    {
+        if (!params_.tensor_buffer_id)
+            return {};
+
+        StageBufferContract contract = StageBufferContract::build();
+        switch (tensorRole())
+        {
+        case TPLocalRootedCollectiveTensorRole::ReduceRootInOut:
+            contract.addPreallocatedInOut(*params_.tensor_buffer_id);
+            break;
+        case TPLocalRootedCollectiveTensorRole::ReduceContributorInput:
+        case TPLocalRootedCollectiveTensorRole::BroadcastRootInput:
+            contract.addInput(*params_.tensor_buffer_id);
+            break;
+        case TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput:
+            contract.addOutput(*params_.tensor_buffer_id);
+            break;
+        }
+        return contract;
+    }
+
+    StageDumpInfo TPLocalRootedCollectiveStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        if (params_.tensor)
+        {
+            const auto role = tensorRole();
+            if (role !=
+                TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput)
+            {
+                info.addInput(
+                    "tensor",
+                    params_.tensor,
+                    1,
+                    params_.count);
+            }
+            if (role ==
+                    TPLocalRootedCollectiveTensorRole::ReduceRootInOut ||
+                role ==
+                    TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput)
+            {
+                info.addOutput(
+                    "tensor",
+                    params_.tensor,
+                    1,
+                    params_.count);
+            }
+        }
+        info.addScalarInt("operation", static_cast<int>(params_.operation));
+        info.addScalarInt("tensor_role", static_cast<int>(tensorRole()));
+        info.addScalarInt("root_device_index", params_.root_device_index);
+        info.addScalarInt(
+            "participant_device_index",
+            params_.participant_device_index);
+        info.addScalarInt(
+            "sideband_count",
+            static_cast<int64_t>(
+                params_.sideband_workspace_bindings.size()));
+        return info;
+    }
+
+    WorkspaceRequirements
+    TPLocalRootedCollectiveStage::getWorkspaceRequirements(
+        int m,
+        int n,
+        int k) const
+    {
+        (void)m;
+        (void)n;
+        (void)k;
+        /* Sideband storage is declared and owned by its producer stage. */
+        return {};
+    }
+
+    void TPLocalRootedCollectiveStage::bindWorkspace(
+        DeviceWorkspaceManager *workspace)
+    {
+        bound_sidebands_.clear();
+        bound_workspace_ = workspace;
+        if (params_.sideband_workspace_bindings.empty())
+            return;
+        if (!bound_workspace_)
+        {
+            throw std::invalid_argument(
+                "TPLocalRootedCollectiveStage::bindWorkspace requires a "
+                "workspace when sidebands are declared");
+        }
+
+        /*
+         * Resolve every symbolic binding before execution begins. If any name
+         * is wrong, clear the partial table and fail graph setup immediately;
+         * launching the activation reduce and discovering the error afterward
+         * would leave participants with mismatched collective order.
+         */
+        for (const auto &binding : params_.sideband_workspace_bindings)
+        {
+            auto resolveBuffer = [&](const std::string &buffer_name) -> void *
+            {
+                return buffer_name.empty()
+                           ? nullptr
+                           : bound_workspace_->getBuffer(buffer_name);
+            };
+
+            void *const send_buffer = resolveBuffer(binding.send_buffer_name);
+            void *const recv_buffer = resolveBuffer(binding.recv_buffer_name);
+            if ((!binding.send_buffer_name.empty() && !send_buffer) ||
+                (!binding.recv_buffer_name.empty() && !recv_buffer))
+            {
+                bound_sidebands_.clear();
+                throw std::runtime_error(
+                    "TPLocalRootedCollectiveStage could not resolve sideband "
+                    "workspace binding '" +
+                    (binding.name.empty() ? std::string("unnamed")
+                                          : binding.name) +
+                    "'");
+            }
+
+            bound_sidebands_.push_back(LocalTPCollectiveSidebandBuffer{
+                .kind = binding.kind,
+                .send_buffer = send_buffer,
+                .recv_buffer = recv_buffer,
+                .element_count = binding.element_count,
+                .dtype = binding.dtype,
+                .root_device_index = binding.root_device_index,
+                .name = binding.name.empty()
+                            ? (binding.recv_buffer_name.empty()
+                                   ? binding.send_buffer_name
+                                   : binding.recv_buffer_name)
+                            : binding.name});
+        }
+    }
+
+    void TPLocalRootedCollectiveStage::unbindWorkspace()
+    {
+        bound_sidebands_.clear();
+        bound_workspace_ = nullptr;
+    }
+
+    void TPLocalRootedCollectiveStage::recordBillOfMaterials() const
+    {
+        if (!PerfStatsCollector::isDomainEnabled(
+                "tp_rooted_collective_bom"))
+            return;
+
+        const size_t element_bytes =
+            collectiveDataTypeBytesForStats(params_.dtype);
+        const PerfStatsCollector::Tags tags{
+            {"stage", params_.stage_name.empty()
+                          ? "unnamed"
+                          : params_.stage_name},
+            {"operation", toString(params_.operation)},
+            {"root_device_index", std::to_string(params_.root_device_index)},
+            {"participant_device_index",
+             std::to_string(params_.participant_device_index)},
+            {"elements", std::to_string(params_.count)},
+            {"element_bytes", std::to_string(element_bytes)},
+            {"transport",
+             params_.mapped_dense_publication_exchange
+                 ? "mapped_dense_publication"
+                 : "native_collective"},
+            {"host_rendezvous", "false"},
+            {"graph_capturable", "true"},
+            {"accounting", "graph_template_or_eager_launch"},
+            {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
+        PerfStatsCollector::addCounter(
+            "tp_rooted_collective_bom",
+            "calls",
+            1.0,
+            {},
+            params_.device_id.toString(),
+            tags);
+
+        for (const auto &sideband : params_.sideband_workspace_bindings)
+        {
+            const size_t sideband_element_bytes =
+                collectiveDataTypeBytesForStats(sideband.dtype);
+            PerfStatsCollector::Tags sideband_tags{
+                {"stage", params_.stage_name.empty()
+                              ? "unnamed"
+                              : params_.stage_name},
+                {"operation", toString(params_.operation)},
+                {"sideband", sideband.name.empty()
+                                 ? "unnamed"
+                                 : sideband.name},
+                {"kind", toString(sideband.kind)},
+                {"elements", std::to_string(sideband.element_count)},
+                {"element_bytes",
+                 std::to_string(sideband_element_bytes)},
+                {"launch_relation", "same_stream_after_rooted_collective"},
+                {"host_rendezvous", "false"},
+                {"graph_capturable", "true"},
+                {"accounting", "graph_template_or_eager_launch"},
+                {"device_loop_multiplier", "mtp.device_generation_terminal_transactions"}};
+            PerfStatsCollector::addCounter(
+                "tp_rooted_collective_bom",
+                "sideband_calls",
+                1.0,
+                {},
+                params_.device_id.toString(),
+                sideband_tags);
+            PerfStatsCollector::addCounter(
+                "tp_rooted_collective_bom",
+                "sideband_bytes",
+                static_cast<double>(
+                    sideband.element_count * sideband_element_bytes),
+                {},
+                params_.device_id.toString(),
+                std::move(sideband_tags));
+        }
+        PerfStatsCollector::addCounter(
+            "tp_rooted_collective_bom",
+            "bytes",
+            static_cast<double>(params_.count * element_bytes),
+            {},
+            params_.device_id.toString(),
+            tags);
     }
 
 } // namespace llaminar2

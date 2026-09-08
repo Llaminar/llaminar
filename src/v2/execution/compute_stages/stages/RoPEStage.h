@@ -1,6 +1,11 @@
 /**
  * @file RoPEStage.h
- * @brief Rotary position encoding stage
+ * @brief Typed query/key rotary-position execution stage.
+ *
+ * Normal attention rotates Q and, unless RoPE-on-read is active, K. Shifted
+ * MTP cache publication has no query at all and may need to rotate only K.
+ * This interface represents those operands explicitly so graph builders never
+ * manufacture a dummy query or mutate a K tensor through a query-shaped API.
  */
 
 #pragma once
@@ -16,6 +21,15 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Semantic operand set consumed by one RoPE stage.
+     */
+    enum class RoPEOperandSet
+    {
+        QueryAndOptionalKey, ///< Q is required; K may be rotated alongside it.
+        KeyOnly,             ///< K is the sole operand for cache publication.
+    };
+
     // Forward declarations
     class ITensorRoPE;
     /**
@@ -31,6 +45,9 @@ namespace llaminar2
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
+
+            /** Exact semantic operands represented by this stage. */
+            RoPEOperandSet operand_set = RoPEOperandSet::QueryAndOptionalKey;
 
             // Type-safe tensor pointers (required)
             ITensor *Q = nullptr; ///< Query tensor (IActivationTensor*, modified in-place)
@@ -106,14 +123,23 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return true; }
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
-        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            if (!params_.device_id.is_gpu())
+                return GraphLaunchPreparationPolicy::None;
+            return params_.position_ids_device
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::CaptureAndReplay;
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
-        /// Update position offset for cached graph reuse.
-        /// Also pre-uploads the kernel's device params on the explicit stage
-        /// stream so captured RoPE execution records kernels only.
+        /// Record the position offset consumed by the next graph preparation.
+        ///
+        /// Device publication is deliberately centralized in
+        /// prepareGraphLaunch(), where the executor supplies the exact stream
+        /// that will launch or capture the graph.
         bool hasDynamicParams() const override { return true; }
         bool supportsDeviceResidentDynamicPositionReplay() const override
         {
@@ -126,13 +152,6 @@ namespace llaminar2
             params_.position_ids = nullptr;
             params_.position_ids_device = nullptr;
             position_ids_cache_.clear();
-            if (cached_kernel_)
-            {
-                // Propagate current stage stream so setDynamicPosOffset can
-                // pre-upload device params before capture/replay.
-                cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicPosOffset(pos_offset);
-            }
         }
 
         /**
@@ -142,8 +161,8 @@ namespace llaminar2
          * one tiny graph.  Rows can therefore share the same absolute position
          * (for example `[595, 595]` for two requests), which is not equivalent
          * to the contiguous scalar range `[595, 596]`.  This method keeps the
-         * stable host copy alive for CPU/eager execution and asks GPU kernels
-         * to pre-upload the workspace-owned device copy before graph capture.
+         * stable host copy alive for CPU/eager execution. GPU publication, when
+         * permitted by the caller's policy, occurs only in prepareGraphLaunch().
          */
         void updateDynamicPositionIds(const int *position_ids, int seq_len) override
         {
@@ -162,12 +181,6 @@ namespace llaminar2
                 params_.position_ids_device = nullptr;
                 params_.pos_offset = 0;
             }
-
-            if (cached_kernel_)
-            {
-                cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicPositionIds(params_.position_ids, seq_len);
-            }
         }
 
         /**
@@ -184,12 +197,6 @@ namespace llaminar2
             params_.position_ids = nullptr;
             params_.position_ids_device = position_ids_device;
             position_ids_cache_.clear();
-
-            if (cached_kernel_)
-            {
-                cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicDevicePositionIds(position_ids_device, seq_len);
-            }
         }
 
         void resetSessionState() override
@@ -203,7 +210,7 @@ namespace llaminar2
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
             }
         }
 
@@ -224,7 +231,7 @@ namespace llaminar2
             params_.position_ids_device = nullptr;
             position_ids_cache_.clear();
             if (cached_kernel_)
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
         }
 
         /**
@@ -241,6 +248,9 @@ namespace llaminar2
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
     private:
+        bool isKeyOnly() const noexcept;
+        ITensor *primaryOperand() const noexcept;
+        int primaryHeadCount() const noexcept;
         ITensorRoPE *getOrCreateStageKernel(TensorBase *Q_base);
 
         Params params_;

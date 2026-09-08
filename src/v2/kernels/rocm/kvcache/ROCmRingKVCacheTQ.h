@@ -3,14 +3,17 @@
  * @brief ROCm/HIP ring buffer KV cache with TurboQuant compression
  * @author David Sanftenberg
  *
- * HIP mirror of CUDARingKVCacheTQ. Uses TQ8 for Keys and TQ4 for Values.
- * Memory savings: 56% vs FP16 (for D=64 with 2 KV heads).
+ * HIP mirror of CUDARingKVCacheTQ with immutable AQ8-K/TQ4-V or
+ * AQ8-K/TQ8-V storage selected before graph capture.
  */
 
 #pragma once
 
 #include "ROCmRingKVCacheBase.h"
+#include "../../kvcache/KVCacheWorkspaceBuffers.h"
+#include "../../kvcache/TurboQuantKVMode.h"
 #include "ROCmTurboQuantKernels.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/GpuTensorView.h"
 #include <hip/hip_runtime.h>
@@ -22,13 +25,28 @@ namespace llaminar2
 {
     class TurboQuantContext;
 
-    class ROCmRingKVCacheTQ : public ROCmRingKVCacheBase
+    class ROCmRingKVCacheTQ : public ROCmRingKVCacheBase,
+                              public IWorkspaceConsumer
     {
     public:
         ROCmRingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
                           int n_kv_heads, int head_dim,
                           const TurboQuantContext *tq_ctx,
-                          int device_id);
+                          int device_id,
+                           TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
+
+        /**
+         * @brief Construct a LocalTP AQ8-K/TQ4-or-TQ8-V cache shard.
+         *
+         * The local cache stores only `local_n_kv_heads` and builds rotations
+         * for their global head IDs, preserving replicated-cache mathematics
+         * without allocating or publishing non-local heads.
+         */
+        ROCmRingKVCacheTQ(int n_layers, int batch_size, int max_seq_len,
+                          int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+                          int head_dim, const TurboQuantContext *tq_ctx,
+                          int device_id,
+                           TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
 
         ~ROCmRingKVCacheTQ() override;
 
@@ -40,8 +58,11 @@ namespace llaminar2
         // IKVCache Interface
         // =====================================================================
 
-        ActivationPrecision k_precision() const override { return ActivationPrecision::TQ8; }
-        ActivationPrecision v_precision() const override { return ActivationPrecision::TQ4; }
+        ActivationPrecision k_precision() const override { return ActivationPrecision::AQ8; }
+        ActivationPrecision v_precision() const override
+        {
+            return turboQuantValuePrecision(mode_);
+        }
 
         // ITensor-based access (returns FP32 shadow tensors)
         ITensor *get_k(int layer, int seq_idx = 0) override;
@@ -57,6 +78,31 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
 
+        /**
+         * @brief Dequantize independent TQ rings from device-owned metadata.
+         *
+         * Grouped TQ8-K and TQ4-V HIP kernels read immutable cache-owned entry
+         * pointers together with the live device head/count scalars. They emit
+         * one compact request-major FP16 view for attention without host state,
+         * compressed staging, or serial request replay.
+         */
+        bool get_kv_batched_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            ITensor **out_k,
+            ITensor **out_v,
+            void *gpu_stream) override;
+
+        bool get_kv_batched_converted_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            ActivationPrecision target,
+            ITensor **out_k,
+            ITensor **out_v,
+            const KVReadParams &read) override;
+
         // Append (quantizes FP32 input to TQ8/TQ4 on GPU)
         bool append(int layer, int seq_idx,
                     const ITensor *K, const ITensor *V,
@@ -67,22 +113,25 @@ namespace llaminar2
                               int num_tokens, void *gpu_stream) override;
 
         /**
-         * @brief Clear all TQ ring entries, scratch views, and device storage.
+         * @brief Quantize and publish all verifier rows in one HIP grid.
          *
-         * The common ROCm base resets host ring metadata, but TQ owns compressed
-         * ring buffers and FP16 dequant scratch that can otherwise retain rows
-         * across request boundaries.
+         * The grouped grid uses the same per-head reduction and rotation order
+         * as serial decode and supports both position-major and verifier
+         * head-major FP32 source tensors.
          */
-        void clear() override;
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream) override;
 
-        /// @brief Clear one layer's TQ ring entries and per-layer scratch storage.
-        void clear_layer(int layer) override;
-
-        /// @brief Clear one sequence across all TQ cache layers.
-        void clear_sequence(int seq_idx) override;
-
-        /// @brief Clear one sequence entry and invalidate this layer's shared scratch.
-        void clear_sequence(int layer, int seq_idx) override;
+        KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override;
+        KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc,
+                                void *dst_k, void *dst_v) const override;
+        bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc,
+                                const void *src_k, const void *src_v) override;
 
         // Converted read (dequant + optional RoPE)
         bool get_kv_converted(int layer, int seq_idx,
@@ -91,35 +140,63 @@ namespace llaminar2
                               int *out_kv_len,
                               const KVReadParams *rope = nullptr) override;
 
-        // Sharding
-        bool is_sharded() const override { return false; }
-        int local_n_kv_heads() const override { return n_kv_heads_; }
-        int kv_head_start() const override { return 0; }
-        int local_kv_dim() const override { return kv_dim_; }
-
         // =====================================================================
-        // Graph Capture Support
+        // IWorkspaceConsumer Interface
         // =====================================================================
-
-        bool isGraphCaptureReady() const override
-        {
-            return ROCmRingKVCacheBase::isGraphCaptureReady() && d_dequant_params_ != nullptr;
-        }
 
         /**
-         * @brief Set dynamic dequant params for graph capture.
-         * Kept for legacy append-position setup; dequant metadata is prepared
-         * through setDynamicDequantParams().
+         * @brief Declare full-horizon FP16 conversion buffers for graph replay.
          */
-        void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m, int n = 0, int k = 0) const override;
 
-        void setDynamicDequantParams(int layer, int seq_idx,
-                                     float rope_theta, int position_start,
-                                     void *gpu_stream) override;
+        /**
+         * @brief Bind planner-owned conversion storage before HIP graph capture.
+         *
+         * No private scratch is allocated when the workspace is absent.
+         */
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        bool hasWorkspace() const override { return workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
+        // LocalTP sharding metadata.
+        bool is_sharded() const override { return local_n_kv_heads_ != n_kv_heads_; }
+        int local_n_kv_heads() const override { return local_n_kv_heads_; }
+        int kv_head_start() const override { return kv_head_start_; }
+        int local_kv_dim() const override { return kv_dim_; }
 
         // =====================================================================
         // ROCm-Specific Accessors
         // =====================================================================
+
+        /**
+         * @brief Return the immutable physical AQ8 key ring for diagnostics and fused attention.
+         * @param layer Local layer index.
+         * @param seq_idx Request slot within the cache batch.
+         * @return Device pointer to the first compressed key block.
+         *
+         * The pointer remains stable for the cache lifetime. Callers must use
+         * the exact stream/event that published the corresponding cache data;
+         * this accessor does not introduce an ordering edge.
+         */
+        const void *raw_k_cache(int layer, int seq_idx = 0) const
+        {
+            return entries_[layer][seq_idx].d_K;
+        }
+
+        /**
+         * @brief Return the immutable physical compressed-value ring.
+         * @param layer Local layer index.
+         * @param seq_idx Request slot within the cache batch.
+         * @return Device pointer to TQ4, TQ8, or Q8_1 blocks selected by `mode_`.
+         *
+         * This diagnostic/fused-kernel view exposes storage without
+         * materializing a host shadow. The cache retains ownership.
+         */
+        const void *raw_v_cache(int layer, int seq_idx = 0) const
+        {
+            return entries_[layer][seq_idx].d_V;
+        }
 
         const ROCmTurboQuantRotations &rotations() const { return rotations_; }
 
@@ -131,58 +208,18 @@ namespace llaminar2
         }
 
     protected:
-        // =====================================================================
-        // ROCmRingKVCacheBase entry accessor overrides
-        // =====================================================================
-
-        int entryHead(int layer, int seq_idx) const override
-        {
-            return entries_[layer][seq_idx].head;
-        }
-        int entryCount(int layer, int seq_idx) const override
-        {
-            return entries_[layer][seq_idx].count;
-        }
-        void setEntryHead(int layer, int seq_idx, int value) override
-        {
-            entries_[layer][seq_idx].head = value;
-        }
-        void setEntryCount(int layer, int seq_idx, int value) override
-        {
-            entries_[layer][seq_idx].count = value;
-        }
-        void resetEntry(int layer, int seq_idx) override
-        {
-            entries_[layer][seq_idx].head = 0;
-            entries_[layer][seq_idx].count = 0;
-        }
-
-        void onClearSequence(int layer, int seq_idx) override
+        void onResetLayerSequenceState(int layer, int seq_idx) override
         {
             (void)seq_idx;
             layer_scratch_[layer].invalidate();
             cached_stream_ = nullptr;
         }
-        void onAdvanceComplete(int layer, int seq_idx) override
-        {
-            // TQ intentionally does NOT invalidate scratch here — the incremental
-            // dequant path in dequant_to_scratch() handles count+1 efficiently.
-            (void)layer;
-            (void)seq_idx;
-        }
-
     private:
         struct TQEntry
         {
-            void *d_K = nullptr; // TQ8Block ring buffer
+            void *d_K = nullptr; // AttentionKeyQ8Block ring buffer
             void *d_V = nullptr; // TQ4Block ring buffer
-            int head = 0;
-            int count = 0;
-
-            int tail(int max_seq_len) const
-            {
-                return (count >= max_seq_len) ? head : 0;
-            }
+            float *d_K_anchor = nullptr; ///< Exact first-key basis for AQ8 residuals.
         };
 
         struct ScratchBuffer
@@ -192,80 +229,61 @@ namespace llaminar2
             std::unique_ptr<ITensor> k_view;
             std::unique_ptr<ITensor> v_view;
 
-            int cached_layer = -1;
-            int cached_seq = -1;
-            int cached_count = 0;
-            int cached_head = -1;
-            int cached_tail = -1;
-            float cached_rope_theta = 0.0f;
-            int cached_position_start = -1;
-
             void invalidate()
             {
-                cached_layer = -1;
-                cached_seq = -1;
-                cached_count = 0;
-                cached_head = -1;
-                cached_tail = -1;
-                cached_rope_theta = 0.0f;
-                cached_position_start = -1;
-            }
-
-            bool is_current_for(int layer, int seq, int count, int head,
-                                float rope_theta, int pos_start) const
-            {
-                return cached_layer == layer && cached_seq == seq &&
-                       cached_count == count && cached_head == head &&
-                       cached_rope_theta == rope_theta &&
-                       (rope_theta <= 0.0f || cached_position_start == pos_start);
-            }
-
-            /// Check if we can do incremental dequant (only 1 new position)
-            bool can_incremental(int layer, int seq, int count, int tail,
-                                 float rope_theta, int pos_start) const
-            {
-                return cached_layer == layer && cached_seq == seq &&
-                       cached_count > 0 && count == cached_count + 1 &&
-                       cached_tail == tail &&
-                       cached_rope_theta == rope_theta &&
-                       (rope_theta <= 0.0f || cached_position_start == pos_start);
+                k_view.reset();
+                v_view.reset();
             }
         };
 
-        bool dequant_to_scratch(int layer, int seq_idx, float rope_theta, int position_start, hipStream_t stream) const;
+        /** @brief Full scalar materialization from one temporary device-state observation. */
+        bool dequant_to_scratch(
+            int layer, int seq_idx, float rope_theta, int position_start,
+            int rope_dim, hipStream_t stream, int *out_count) const;
 
-        /// @brief Return the stream used for clear-time memset operations.
+        /// @brief Resolve the last explicit stream for diagnostic-only reads.
         hipStream_t clearStream() const;
 
-        /// @brief Zero the compressed TQ ring storage for one layer/sequence entry.
-        void clearEntryStorage(int layer, int seq_idx, hipStream_t stream);
+        size_t k_block_size_; ///< sizeof(AttentionKeyQ8Block<head_dim>)
+        size_t v_block_size_;
 
-        /// @brief Zero and invalidate the FP16 dequant scratch owned by one layer.
-        void clearScratchStorage(int layer, hipStream_t stream);
-
-        /// @brief Reset graph-capture sidecar params for one layer/sequence entry.
-        void clearDynamicParams(int layer, int seq_idx, hipStream_t stream);
-
-        size_t tq8_block_size_;
-        size_t tq4_block_size_;
+        int local_n_kv_heads_; ///< Heads physically stored by this ROCm shard.
+        int kv_head_start_;    ///< First global head represented by local head zero.
+        TurboQuantKVMode mode_; ///< Immutable storage policy resolved before capture.
 
         ROCmTurboQuantRotations rotations_;
 
         std::vector<std::vector<TQEntry>> entries_;
 
-        // Per-layer FP16 scratch buffers (eliminates cross-layer invalidation)
+        /// Cache-owned immutable `[layer, request]` compressed-ring topology.
+        void **d_batched_k_entry_table_ = nullptr;
+        void **d_batched_v_entry_table_ = nullptr;
+        void **d_batched_k_anchor_table_ = nullptr;
+        /// Stable wrappers over grouped FP16 layer scratch.
+        std::unique_ptr<ITensor> batched_k_view_;
+        std::unique_ptr<ITensor> batched_v_view_;
+
+        // Per-layer wrappers over one graph-planned producer/consumer buffer.
         mutable std::vector<ScratchBuffer> layer_scratch_;
-
-        // Pre-allocated temp buffers for GPU-side quantization
-        void *d_quantize_k_temp_ = nullptr;
-        void *d_quantize_v_temp_ = nullptr;
-
-        // Graph capture dynamic params (per-layer)
-        HIPTQDequantDynamicParams *d_dequant_params_ = nullptr; ///< Device array [n_layers_]
-        HIPTQDequantDynamicParams *h_dequant_params_ = nullptr; ///< Pinned host array [n_layers_]
-        mutable std::vector<uint8_t> dequant_params_device_valid_; ///< Per-layer pre-upload readiness
+        DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound graph workspace, not owned.
+        size_t scratch_capacity_bytes_ = 0;           ///< Capacity of each K/V buffer.
 
         mutable hipStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
+
+        /**
+         * @brief Publish every compressed ring pointer on the initialization stream.
+         * @return true when both cache-owned device tables are ready.
+         */
+        bool publishBatchedEntryTables(hipStream_t stream);
+
+        /**
+         * @brief Release all ROCm allocations owned by this cache instance.
+         *
+         * Both the constructor transaction guard and the destructor call this
+         * method. That keeps partial initialization from leaking compressed
+         * entries, grouped pointer tables, layer scratch, or rotations.
+         */
+        void releaseOwnedDeviceStorage() noexcept;
     };
 
 } // namespace llaminar2

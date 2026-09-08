@@ -1,29 +1,53 @@
 /**
  * @file FusedQKVGEMMStage.h
- * @brief Fused Q/K/V projection stage
+ * @brief Shared-quantization attention projection stage for Q/K/V or K/V.
+ *
+ * Attention and MTP cache-publication graphs consume the same prepared query,
+ * key, and value weights but do not always need the same projections. Normal
+ * attention requires Q/K/V. Shifted MTP prefill only publishes K/V cache bytes
+ * and must not spend bandwidth, workspace, or launches producing an unused
+ * query and query gate. This file makes that distinction a typed stage policy
+ * while retaining one backend-neutral shared-input quantization transaction.
  */
 
 #pragma once
+
+#include "kernels/common/DeviceRowRange.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 #include "../../../loaders/WeightPlan.h"
+#include "../../../tensors/TensorKernels.h"
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
 
+    /**
+     * @brief Exact set of attention projections produced by a fused stage.
+     *
+     * This is deliberately not a bit mask. The graph has two supported,
+     * semantically meaningful transactions and callers must select one of them
+     * explicitly. Arbitrary nullable combinations would make weight, workspace,
+     * and buffer ownership contracts ambiguous.
+     */
+    enum class AttentionProjectionSet
+    {
+        QueryKeyValue, ///< Produce Q, K, and V for an attention calculation.
+        KeyValueOnly,  ///< Produce only K and V for cache publication.
+    };
+
     // Forward declarations for cached kernel pointers
-    class ITensorGemm;
     class FP32Tensor;
     class PreparedWeightStore;
 
     /**
-     * @brief Fused Q/K/V projection stage
+     * @brief Shared-quantization Q/K/V or K/V projection stage.
      *
      * Efficiently computes multiple linear projections (Q, K, V) from a shared
      * input. Uses individual ITensorGemm kernels with multiply_fused() for shared
@@ -38,6 +62,10 @@ namespace llaminar2
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
+
+            /** Exact projection transaction represented by this stage. */
+            AttentionProjectionSet projection_set =
+                AttentionProjectionSet::QueryKeyValue;
 
             // Type-safe tensor pointers (required)
             const ITensor *input = nullptr; ///< Input activation tensor [m, k]
@@ -69,18 +97,18 @@ namespace llaminar2
             std::optional<BufferId> output_v_buffer_id;
 
             /**
-             * @brief Execute tiny verifier batches with grouped decode-equivalent Q/K/V projections.
+             * @brief Require grouped rows to preserve serial-decode arithmetic.
              *
-             * MTP publication compares the state produced by an all-position verifier
-             * pass against the state that would have been produced by accepting the
-             * same rows through normal decode. Quantized GEMM kernels can choose
-             * different small-M routes for m=2..4 than they do for m=1. When this
-             * flag is set the stage preserves the single graph node contract while
-             * requiring a grouped M=2..4 path whose numerical contract has been
-             * proven equivalent to serial decode with cosine, L2, KLD, max-abs, and
-             * token gates.
+             * MTP publication compares a grouped transaction against accepting
+             * the same rows one at a time. Quantized GEMM kernels may otherwise
+             * select an M-dependent reduction order. This flag requires the real
+             * grouped implementation for every represented M to produce bytes
+             * identical to serial decode; row replay and relaxed numerical gates
+             * are not production substitutes.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -95,7 +123,12 @@ namespace llaminar2
 
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
-        ComputeStageType type() const override { return ComputeStageType::GEMM_FUSED_QKV; }
+        ComputeStageType type() const override
+        {
+            return includesQuery()
+                       ? ComputeStageType::GEMM_FUSED_QKV
+                       : ComputeStageType::GEMM_FUSED_KV;
+        }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
@@ -110,15 +143,15 @@ namespace llaminar2
         /**
          * @brief Get a GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Returns the Q projection kernel from PreparedWeightStore. Used for
-         * single-kernel operations (e.g., hasWorkspace checks).
+         * Returns the transaction anchor kernel from PreparedWeightStore. Q is
+         * the anchor for Q/K/V; K is the anchor for K/V-only publication.
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
          */
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
         /**
-         * @brief Get workspace requirements from ALL THREE GEMM kernels (Q, K, V)
+         * @brief Merge workspace requirements from every active projection.
          *
          * Override the default single-kernel delegation so projection-specific
          * dimensions are represented before workspace requirements are merged.
@@ -126,17 +159,34 @@ namespace llaminar2
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
         /**
-         * @brief Bind workspace to ALL THREE underlying GEMM kernels (Q, K, V)
+         * @brief Bind workspace to every active projection kernel.
          *
-         * Override the default single-kernel binding to bind all three projection
-         * kernels since they each need workspace for GPU execution.
+         * Override the default single-kernel binding to bind every active
+         * projection kernel since each needs workspace for GPU execution.
          */
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
 
         /**
-         * @brief Unbind workspace from all three kernels
+         * @brief Unbind workspace from every active projection kernel.
          */
         void unbindWorkspace() override;
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
+
+        /**
+         * @brief Provision fused-projection backend resources before graph capture.
+         *
+         * Exact-shape prefill can legitimately avoid the concurrent projection
+         * route even when decode uses it. This capture-only preparation makes
+         * decode independent of whether an earlier warmup happened to create
+         * the shared stream/event pool.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
 
     private:
         Params params_;
@@ -147,23 +197,22 @@ namespace llaminar2
         ITensorGemm *cached_gemm_v_ = nullptr;
         bool cache_resolved_individual_ = false;
 
+        /**
+         * Stable descriptors consumed during capture/eager execution. Building
+         * this vector while resolving prepared kernels keeps allocation and
+         * container growth out of the graph execution path.
+         */
+        std::vector<ITensorGemm::TensorProjectionDesc> cached_projections_;
+
+        bool includesQuery() const noexcept;
+        size_t projectionCount() const noexcept;
+        ITensorGemm *anchorKernel() const noexcept;
         bool resolveIndividualKernels(const char *caller);
         bool executeDecodeEquivalentVerifierPrefill(
-            TensorBase *input_base,
-            TensorBase *output_q_base,
-            TensorBase *output_k_base,
-            TensorBase *output_v_base,
-            ITensorGemm *gemm_q,
-            ITensorGemm *gemm_k,
-            ITensorGemm *gemm_v);
+            TensorBase *input_base);
+        void rebuildProjectionDescriptors();
+        void clearCachedGemmStreams();
 
-        // Reused tiny row tensors for device-side verifier publication.  They are
-        // deliberately owned by the stage so repeated decode steps do not allocate
-        // a fresh scratch tensor for every verifier row.
-        std::shared_ptr<FP32Tensor> verifier_input_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_q_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_k_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_v_row_;
     };
 
 } // namespace llaminar2

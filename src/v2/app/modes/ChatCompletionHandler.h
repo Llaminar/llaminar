@@ -100,12 +100,14 @@ namespace llaminar2
      *
      * During streaming, tokens are emitted one at a time. This class tracks whether
      * we're inside a <think> block and buffers partial end-tag matches to avoid
-     * splitting tags across chunks.
+     * splitting tags across chunks. This is a field-framing authority only:
+     * reasoning delimiters never terminate generation, including when the model
+     * emits a natural close after a budget-injected close.
      */
     class StreamingThinkSplitter
     {
     public:
-        /// Construct with the thinking end tag (e.g., "</think>")
+        /** @brief Start the reasoning phase with the model's exact closing marker. */
         explicit StreamingThinkSplitter(const std::string &end_tag);
 
         /// Construct a no-op splitter (no thinking support)
@@ -117,27 +119,34 @@ namespace llaminar2
         {
             std::string field; ///< "reasoning_content" or "content"
             std::string text;  ///< Text to emit (may be empty if buffering)
-            /**
-             * @brief True when a structural thinking marker was seen after
-             *        the reasoning block had already been closed.
-             *
-             * Thinking tags are protocol markers, not user-visible answer
-             * text.  A second end tag means generation has entered a malformed
-             * answer loop, so callers should stop without emitting the tag.
-             */
-            bool stop_generation{false};
         };
+        /** @brief Consume one tokenizer piece, retaining a possible partial marker. */
         SplitResult process(const std::string &token_text);
 
         /// Flush any buffered partial tag match (call at end of generation)
         SplitResult flush();
 
         /// Whether we're currently in the thinking phase
-        bool inThinking() const { return in_thinking_; }
+        bool inThinking() const { return phase_ == Phase::Reasoning; }
 
     private:
+        /** @brief The same reasoning/answer lifecycle governs HTTP and SSE output. */
+        enum class Phase
+        {
+            Reasoning,      ///< Before the first complete close marker.
+            AwaitingAnswer, ///< Closed reasoning, but no visible answer yet.
+            Content,        ///< Answer text has begun (or reasoning is disabled).
+        };
+
+        /**
+         * @brief Drain answer text without exposing structural closing markers.
+         * @param terminal True only when flushing the final buffered fragment.
+         * @return Content with complete structural markers removed, never a stop decision.
+         */
+        SplitResult drainContent(bool terminal);
+
         std::string end_tag_;
-        bool in_thinking_{true}; ///< Start in thinking mode (model begins with <think>)
+        Phase phase_{Phase::Reasoning}; ///< Single authority for output transitions.
         std::string buffer_;     ///< Buffer for partial end-tag matches
     };
 

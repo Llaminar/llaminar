@@ -27,13 +27,18 @@
 #include "../config/OrchestrationConfig.h" // For CollectiveBackendType (canonical definition)
 #include "DeviceGroup.h"
 #include "IBufferRegistration.h"
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace llaminar2
 {
+
+    class ICollectiveBackend;
 
     // CollectiveBackendType is now defined in OrchestrationConfig.h
     // to avoid duplicate definitions. See config/OrchestrationConfig.h.
@@ -61,6 +66,185 @@ namespace llaminar2
         BFLOAT16,
         INT32,
         INT8
+    };
+
+    enum class CollectiveP2POpKind
+    {
+        Send,
+        Recv
+    };
+
+    struct CollectiveP2POp
+    {
+        CollectiveP2POpKind kind = CollectiveP2POpKind::Send;
+        const void *send_buffer = nullptr;
+        void *recv_buffer = nullptr;
+        size_t count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT8;
+        int peer = -1;
+    };
+
+    /**
+     * @brief Sideband collective operation inside a grouped backend bundle.
+     *
+     * These descriptors are backend-facing. Higher layers keep semantic names
+     * such as LocalTPCollectiveSidebandKind, then lower them to this compact
+     * representation when the sideband can be grouped with its anchor
+     * collective.
+     */
+    enum class CollectiveSidebandOp
+    {
+        AllreduceSum,
+        Allgather,
+        Broadcast
+    };
+
+    struct CollectiveSidebandMultiOnStreamsOp
+    {
+        CollectiveSidebandOp kind = CollectiveSidebandOp::AllreduceSum;
+        std::vector<const void *> send_buffers;
+        std::vector<void *> recv_buffers;
+        size_t count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT32;
+        int root = 0;
+    };
+
+    /**
+     * @brief Completion contract for one successful single-buffer collective.
+     *
+     * A tensor owner must know whether it can publish a completed device write
+     * immediately or must record an event on an asynchronous producer stream.
+     * Encoding that distinction as a tagged receipt prevents a null stream from
+     * ambiguously meaning either "synchronous" or "backend forgot to report
+     * ordering."
+     */
+    struct CollectiveSubmissionReceipt
+    {
+        enum class Kind
+        {
+            Unknown,
+            AlreadyComplete,
+            DeviceStream
+        };
+
+        Kind kind = Kind::Unknown;
+        void *producer_stream = nullptr;
+
+        /**
+         * @brief Describe a backend call that returned after all writes completed.
+         */
+        [[nodiscard]] static constexpr CollectiveSubmissionReceipt alreadyComplete() noexcept
+        {
+            return {Kind::AlreadyComplete, nullptr};
+        }
+
+        /**
+         * @brief Describe an asynchronous write ordered on an exact GPU stream.
+         *
+         * Null remains representable in the receipt so this factory can remain
+         * noexcept across CUDA/HIP compilation units. The consuming
+         * CollectiveContext validates it and treats null as a fatal backend
+         * contract violation.
+         */
+        [[nodiscard]] static constexpr CollectiveSubmissionReceipt onDeviceStream(
+            void *stream) noexcept
+        {
+            return {Kind::DeviceStream, stream};
+        }
+    };
+
+    /**
+     * @brief Opaque authority for one host-observed background collective.
+     *
+     * A heterogeneous CUDA/ROCm collective cannot safely put a future memory
+     * wait on each compute stream: HIP streams from independent pools may share
+     * an HSA hardware queue, allowing the wait to block the transfer stream that
+     * must satisfy it.  This ticket instead names one preallocated background
+     * transaction.  The explicit segmented-graph boundary authenticates the
+     * ticket and waits for terminal H2D events before launching its consumer.
+     *
+     * Tickets are bound to one backend instance and lifecycle epoch.  A ticket
+     * from a shut-down or reinitialized backend therefore cannot accidentally
+     * authorize a reused descriptor with the same ring index.
+     */
+    class CollectiveCompletionTicket final
+    {
+    public:
+        /** @brief Completion authority encoded by this ticket. */
+        enum class Authority : uint8_t
+        {
+            HostObservedBackgroundTransfer, ///< Host proves all terminal DMA events.
+        };
+
+        /**
+         * @brief Construct a ticket for a host-observed background transfer.
+         * @param owner Backend instance that owns the descriptor ring.
+         * @param lifecycle_epoch Backend resource lifecycle that issued it.
+         * @param generation Monotonic transaction generation in that lifecycle.
+         * @param descriptor_index Preallocated descriptor-ring index.
+         * @return Authenticated opaque ticket for the matching backend.
+         */
+        [[nodiscard]] static CollectiveCompletionTicket hostObservedBackgroundTransfer(
+            const ICollectiveBackend *owner,
+            uint64_t lifecycle_epoch,
+            uint64_t generation,
+            size_t descriptor_index) noexcept
+        {
+            return CollectiveCompletionTicket(
+                owner,
+                lifecycle_epoch,
+                generation,
+                descriptor_index);
+        }
+
+        /** @brief Return the completion authority represented by this ticket. */
+        [[nodiscard]] constexpr Authority authority() const noexcept
+        {
+            return Authority::HostObservedBackgroundTransfer;
+        }
+
+        /** @brief Return the backend instance that issued the ticket. */
+        [[nodiscard]] constexpr const ICollectiveBackend *owner() const noexcept
+        {
+            return owner_;
+        }
+
+        /** @brief Return the issuing resource-lifecycle epoch. */
+        [[nodiscard]] constexpr uint64_t lifecycleEpoch() const noexcept
+        {
+            return lifecycle_epoch_;
+        }
+
+        /** @brief Return the monotonic transaction generation. */
+        [[nodiscard]] constexpr uint64_t generation() const noexcept
+        {
+            return generation_;
+        }
+
+        /** @brief Return the preallocated transaction-descriptor index. */
+        [[nodiscard]] constexpr size_t descriptorIndex() const noexcept
+        {
+            return descriptor_index_;
+        }
+
+    private:
+        /** @brief Build one fully specified, non-default-constructible ticket. */
+        constexpr CollectiveCompletionTicket(
+            const ICollectiveBackend *owner,
+            uint64_t lifecycle_epoch,
+            uint64_t generation,
+            size_t descriptor_index) noexcept
+            : owner_(owner),
+              lifecycle_epoch_(lifecycle_epoch),
+              generation_(generation),
+              descriptor_index_(descriptor_index)
+        {
+        }
+
+        const ICollectiveBackend *owner_; ///< Issuing backend identity.
+        uint64_t lifecycle_epoch_;        ///< Issuing resource lifecycle.
+        uint64_t generation_;             ///< Transaction generation.
+        size_t descriptor_index_;         ///< Descriptor ring location.
     };
 
     /**
@@ -249,6 +433,29 @@ namespace llaminar2
         virtual void setComputeStreams(const std::vector<void *> &compute_streams)
         {
             (void)compute_streams;
+        }
+
+        /**
+         * @brief Describe completion of the most recent single-buffer operation.
+         *
+         * Asynchronous GPU backends return DeviceStream with the exact stream
+         * used for submission. Explicitly synchronous host-staged backends
+         * return AlreadyComplete. The default Unknown receipt fails closed when
+         * a GPU tensor owner attempts publication, forcing every viable backend
+         * to declare its ordering semantics.
+         *
+         * Multi-device APIs whose completion is represented by per-device event
+         * vectors publish those events through their own typed result contracts
+         * and do not use this accessor.
+         *
+         * @param device Device whose tensor buffer was submitted.
+         * @return Tagged completion receipt for the successful operation.
+         */
+        [[nodiscard]] virtual CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const
+        {
+            (void)device;
+            return {};
         }
 
         // =====================================================================
@@ -687,6 +894,167 @@ namespace llaminar2
         }
 
         /**
+         * @brief Multi-GPU AllReduce on caller-provided producer streams.
+         *
+         * Each buffers[i] is reduced in-place on streams[i], where streams[i]
+         * is the explicit producer stream for device i. Implementations should
+         * enqueue one grouped backend collective covering all participants and
+         * return after launch, without synchronizing the host.
+         *
+         * This is the eager LocalTP path for homogeneous single-process GPU
+         * domains. GPU graph capture still uses per-device on-stream collectives
+         * because capture records participant-local work on each thread.
+         *
+         * @return true if the grouped collective was enqueued
+         */
+        virtual bool allreduceMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether allreduceMultiOnStreams is available.
+         */
+        virtual bool supportsAllreduceMultiOnStreams() const { return false; }
+
+        /**
+         * @brief Submit a grouped allreduce completed by a host-observed ticket.
+         *
+         * This contract is reserved for explicit heterogeneous graph boundaries
+         * whose background transfer cannot safely publish a future wait onto a
+         * GPU compute stream. Implementations record the exact producer streams,
+         * enqueue allocation-free background progress, and return immediately
+         * with a ticket. The caller must pass that ticket to
+         * awaitHostCompletionTicket() before any consumer is submitted.
+         *
+         * The default is deliberately unsupported. A backend must never map this
+         * operation to a synchronous collective or an ordinary stream-ordered
+         * receipt because those completion authorities are not equivalent.
+         *
+         * @param buffers One in-place device buffer per participant.
+         * @param count Logical element count in each buffer.
+         * @param dtype Shared element representation.
+         * @param op Reduction operation.
+         * @param streams Exact non-null producer stream per participant.
+         * @return A backend-bound ticket on successful asynchronous submission;
+         *         std::nullopt when unsupported or rejected.
+         */
+        virtual std::optional<CollectiveCompletionTicket>
+        allreduceMultiOnStreamsWithHostCompletionTicket(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)streams;
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Whether host-ticket grouped allreduce submission is available.
+         */
+        virtual bool supportsAllreduceMultiOnStreamsWithHostCompletionTicket() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Observe terminal completion for a background collective ticket.
+         *
+         * Success means every output byte has reached its destination device and
+         * the caller may publish a completed device write without recording an
+         * event on an unrelated compute stream.
+         *
+         * @param ticket Ticket returned by this backend instance.
+         * @param timeout_ms Positive bounded observation timeout in milliseconds.
+         * @return true only when the authenticated transaction completed.
+         */
+        virtual bool awaitHostCompletionTicket(
+            const CollectiveCompletionTicket &ticket,
+            int timeout_ms)
+        {
+            (void)ticket;
+            (void)timeout_ms;
+            return false;
+        }
+
+        /**
+         * @brief Group one anchor allreduce and compact sideband collectives.
+         *
+         * Implementations must enqueue the anchor allreduce and every sideband
+         * descriptor inside one backend group region over the supplied streams.
+         * This is the required path for MoE rebalance control traffic that is
+         * intended to ride an existing LocalTP allreduce, rather than launch
+         * separate rebalance-specific collectives.
+         */
+        virtual bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)sidebands;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether grouped anchor+sideband bundles are available.
+         */
+        virtual bool supportsAllreduceWithSidebandsMultiOnStreams() const { return false; }
+
+        /**
+         * @brief Group compact sideband collectives across explicit device streams.
+         *
+         * Unlike allreduceWithSidebandsMultiOnStreams(), this operation has no
+         * synthetic activation allreduce anchor. It is intended for compact
+         * device-resident publication edges, such as publishing one mirrored MTP
+         * verifier outcome to every LocalTP participant. Implementations must
+         * enqueue every sideband and every participant inside one NCCL/RCCL group
+         * and return immediately after launch. They must not synchronize a stream,
+         * wait for device completion on the host, or allocate temporary storage.
+         *
+         * @param sidebands Backend-ready operations containing one buffer address
+         *        per participant.
+         * @param streams Exact producer/consumer stream for each participant.
+         * @return true only when the complete grouped bundle was enqueued.
+         */
+        virtual bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams)
+        {
+            (void)sidebands;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether anchor-free grouped sideband publication is available.
+         */
+        virtual bool supportsCollectiveSidebandsMultiOnStreams() const { return false; }
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Called independently by each device thread. RCCL/NCCL internally
@@ -749,6 +1117,244 @@ namespace llaminar2
         }
 
         /**
+         * @brief Whether participant-local on-stream allreduce is available.
+         */
+        virtual bool supportsAllreduceSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Whether this backend can publish bounded host-observed stream tickets.
+         *
+         * The capability exists for heterogeneous graph lifecycle boundaries,
+         * where CUDA and ROCm cannot participate in one native device
+         * collective.  It is deliberately not a collective-data fallback and
+         * must never be used during ordinary captured replay.
+         *
+         * @return true only when one persistent ticket exists per participant.
+         */
+        virtual bool supportsGraphCaptureLifecycleTickets() const { return false; }
+
+        /**
+         * @brief Record one persistent graph-lifecycle ticket on an exact stream.
+         *
+         * The successful call publishes an event after all work previously
+         * queued on @p stream.  No host wait, allocation, transfer, or default
+         * stream substitution is permitted.  LocalTP coordinates every
+         * participant into the same named generation before calling this
+         * method.
+         *
+         * @param device_idx Participant slot in the backend's DeviceGroup.
+         * @param stream Exact non-null CUDA/HIP stream approaching capture.
+         * @return true when event publication was accepted by the device runtime.
+         */
+        virtual bool recordGraphCaptureLifecycleTicket(
+            int device_idx,
+            void *stream)
+        {
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Observe one graph-lifecycle ticket with a bounded nonblocking poll.
+         *
+         * Implementations repeatedly query only the participant's persistent
+         * event.  They must not synchronize a stream/device or stage device
+         * state through host memory.  This host ownership transition is legal
+         * only while materializing a heterogeneous captured segment; steady
+         * state graph replay never invokes it.
+         *
+         * @param device_idx Participant slot whose event was recorded.
+         * @param timeout_ms Maximum observation interval; zero means unbounded.
+         * @return true only after the exact recorded stream point completed.
+         */
+        virtual bool awaitGraphCaptureLifecycleTicket(
+            int device_idx,
+            int timeout_ms)
+        {
+            (void)device_idx;
+            (void)timeout_ms;
+            return false;
+        }
+
+        /**
+         * @brief Per-device rooted reduction on a caller-provided stream.
+         *
+         * Every participant contributes @p count elements. Only @p root owns
+         * the reduced result in @p recv_buf. Implementations must enqueue the
+         * collective directly on @p stream so the operation remains compatible
+         * with participant-local GPU graph capture. No allocation, transfer,
+         * host rendezvous, or completion synchronization is permitted.
+         *
+         * @param send_buf Participant-local device input.
+         * @param recv_buf Root result buffer; ignored by non-root transports.
+         * @param count Number of elements contributed by every participant.
+         * @param dtype Collective element type.
+         * @param op Reduction operation.
+         * @param root Communicator-local root participant index.
+         * @param device_idx Calling participant index.
+         * @param stream Exact non-null CUDA/HIP stream.
+         * @return true when the backend accepted the asynchronous operation.
+         */
+        virtual bool reduceSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root,
+            int device_idx,
+            void *stream)
+        {
+            (void)send_buf;
+            (void)recv_buf;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)root;
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /** @brief Whether graph-capturable participant-local reduce is implemented. */
+        virtual bool supportsReduceSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Per-device all-gather on a caller-provided stream (graph-capturable)
+         *
+         * Like allreduceSingleDeviceOnStream(), this records the collective
+         * directly onto the caller's explicit GPU stream. Each participant calls
+         * independently with its own send/recv buffers; the NCCL/RCCL backend
+         * matches the collective across devices. No host-side stream sync or
+         * completion wait is performed.
+         *
+         * @param send_buf Local contribution on device_idx.
+         * @param recv_buf Full receive buffer on device_idx.
+         * @param send_count Elements contributed by each participant.
+         * @param dtype Element type.
+         * @param device_idx Device index (0 to num_gpus-1).
+         * @param stream GPU stream (cudaStream_t/hipStream_t cast to void*).
+         * @return true on success, false if not supported.
+         */
+        virtual bool allgatherSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_idx,
+            void *stream)
+        {
+            (void)send_buf;
+            (void)recv_buf;
+            (void)send_count;
+            (void)dtype;
+            (void)device_idx;
+            (void)stream;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Whether allgatherSingleDeviceOnStream is implemented for the
+         * current backend instance.
+         */
+        virtual bool supportsAllgatherSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Per-device broadcast on a caller-provided stream (graph-capturable).
+         *
+         * Each participant calls independently with its own send/recv buffers.
+         * The root participant provides the source bytes in send_buf; non-root
+         * participants may pass recv_buf for send_buf because NCCL/RCCL ignore
+         * non-root send buffers. The result is written to recv_buf on every
+         * participant. No host-side synchronization is performed.
+         *
+         * @param send_buf Source buffer on root, ignored on non-root.
+         * @param recv_buf Receive buffer on every participant.
+         * @param count Elements to broadcast.
+         * @param dtype Element type.
+         * @param root Root participant index.
+         * @param device_idx Device index (0 to num_gpus-1).
+         * @param stream GPU stream (cudaStream_t/hipStream_t cast to void*).
+         * @return true on success, false if unsupported.
+         */
+        virtual bool broadcastSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            int device_idx,
+            void *stream)
+        {
+            (void)send_buf;
+            (void)recv_buf;
+            (void)count;
+            (void)dtype;
+            (void)root;
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Whether broadcastSingleDeviceOnStream is implemented.
+         */
+        virtual bool supportsBroadcastSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Per-device grouped P2P send/recv on a caller-provided stream.
+         *
+         * Each participant records the send and recv operations that involve
+         * its device. Matching peer participants record the complementary
+         * operations in their own per-device graph. NCCL/RCCL choose the
+         * transport path; callers must not special-case peer copies here.
+         */
+        virtual bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream)
+        {
+            (void)ops;
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Whether groupedP2PSingleDeviceOnStream is implemented.
+         */
+        virtual bool supportsGroupedP2PSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Multi-GPU Broadcast on caller-provided producer streams.
+         *
+         * Enqueues one grouped backend broadcast over streams[i]. This is the
+         * eager counterpart to broadcastSingleDeviceOnStream().
+         */
+        virtual bool broadcastMultiOnStreams(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            const std::vector<void *> &streams)
+        {
+            (void)send_bufs;
+            (void)recv_bufs;
+            (void)count;
+            (void)dtype;
+            (void)root;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether broadcastMultiOnStreams is available.
+         */
+        virtual bool supportsBroadcastMultiOnStreams() const { return false; }
+
+        /**
          * @brief Multi-GPU AllGather (single process)
          *
          * Each send_bufs[i] on GPU i contributes send_count elements.
@@ -771,6 +1377,25 @@ namespace llaminar2
             (void)send_count;
             (void)dtype;
             return false; // Not supported by default
+        }
+
+        /**
+         * @brief Multi-GPU AllGather with compute stream dependency insertion.
+         *
+         * Queues the allgather and makes each registered compute stream wait for
+         * the collective completion event before subsequent kernels consume the
+         * receive buffers. NCCL/RCCL override this with GPU-side event waits.
+         * Backends without event handoff fall back to a conservative synchronize.
+         */
+        virtual bool allgatherMultiWithComputeDeps(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype)
+        {
+            if (!allgatherMulti(send_bufs, recv_bufs, send_count, dtype))
+                return false;
+            return synchronize();
         }
 
         /**

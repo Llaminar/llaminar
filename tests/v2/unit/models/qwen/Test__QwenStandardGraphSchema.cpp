@@ -896,6 +896,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolvesSingleBuffer)
  */
 TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolvesAllBuffers)
 {
+    constexpr size_t kVerifierRowCapacity = 31;
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
 
@@ -912,6 +913,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolvesAllBuffers)
     config.local_n_kv_heads = 2;
     config.local_d_ff = 4864;
     config.local_vocab = 151936;
+    config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
 
     // Resolve all buffers
     auto resolved = BufferAllocator::resolveAll(schema, config);
@@ -938,6 +940,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolvesAllBuffers)
  */
 TEST(Test__QwenStandardGraphSchema, BufferAllocator_EstimatesMemorySavings)
 {
+    constexpr size_t kVerifierRowCapacity = 31;
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
 
@@ -954,6 +957,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_EstimatesMemorySavings)
     config.local_n_kv_heads = 2;
     config.local_d_ff = 4864;
     config.local_vocab = 151936;
+    config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
 
     auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, config);
 
@@ -997,6 +1001,7 @@ TEST(Test__QwenStandardGraphSchema, ResolvedBufferSpec_CalculatesTotalBytes)
  */
 TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
 {
+    constexpr size_t kVerifierRowCapacity = 31;
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
 
@@ -1011,6 +1016,7 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
     config.local_n_heads = 14;
     config.local_n_kv_heads = 2;
     config.local_d_ff = 4864;
+    config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -1128,11 +1134,11 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
     EXPECT_EQ(lm_head_input_row->shape[0], 1u);
     EXPECT_EQ(lm_head_input_row->shape[1], 896u);
 
-    // lm_head_input_rows: [4, d_model] compact verifier rows for MTP target logits.
+    // lm_head_input_rows uses the caller-declared runtime verifier capacity.
     auto *lm_head_input_rows = findBuf("lm_head_input_rows");
     ASSERT_NE(lm_head_input_rows, nullptr);
     ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
-    EXPECT_EQ(lm_head_input_rows->shape[0], 4u);
+    EXPECT_EQ(lm_head_input_rows->shape[0], kVerifierRowCapacity);
     EXPECT_EQ(lm_head_input_rows->shape[1], 896u);
 
     // Conditional buffers should NOT be present at default precision

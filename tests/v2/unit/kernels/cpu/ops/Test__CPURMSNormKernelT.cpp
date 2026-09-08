@@ -17,9 +17,15 @@
 #include "v2/kernels/cpu/primitives/RMSNormPrimitives.h"
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/tensors/BlockStructures.h"
+#include "v2/utils/DebugEnv.h"
+#include "v2/utils/PerfStatsCollector.h"
+#include "../../../../utils/VerifierRowTestInventory.h"
 
 #include <vector>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
 #include <numeric>
 #include <algorithm>
 #include <random>
@@ -109,6 +115,100 @@ namespace llaminar2
                 sum += std::abs(a[i] - b[i]);
             }
             return sum / count;
+        }
+
+        /** @brief Enable perfstats for the all-precision grouped RMSNorm proof. */
+        class ScopedPerfStats
+        {
+        public:
+            ScopedPerfStats()
+            {
+                const char *old_value = std::getenv("LLAMINAR_PERF_STATS_SUMMARY");
+                if (old_value)
+                {
+                    had_old_value_ = true;
+                    old_value_ = old_value;
+                }
+                setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+                mutableDebugEnv().reload();
+                PerfStatsCollector::reset();
+            }
+
+            ~ScopedPerfStats()
+            {
+                if (had_old_value_)
+                    setenv("LLAMINAR_PERF_STATS_SUMMARY", old_value_.c_str(), 1);
+                else
+                    unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+                mutableDebugEnv().reload();
+                PerfStatsCollector::reset();
+            }
+
+        private:
+            bool had_old_value_ = false;
+            std::string old_value_;
+        };
+
+        /** @brief Report the first native-storage byte mismatch. */
+        void expect_byte_exact(const void *actual,
+                               const void *expected,
+                               size_t byte_count,
+                               const std::string &context)
+        {
+            if (std::memcmp(actual, expected, byte_count) == 0)
+                return;
+
+            const auto *actual_bytes = static_cast<const uint8_t *>(actual);
+            const auto *expected_bytes = static_cast<const uint8_t *>(expected);
+            for (size_t index = 0; index < byte_count; ++index)
+            {
+                if (actual_bytes[index] != expected_bytes[index])
+                {
+                    ADD_FAILURE() << context << " first mismatch at byte " << index
+                                  << " actual=" << static_cast<unsigned>(actual_bytes[index])
+                                  << " expected=" << static_cast<unsigned>(expected_bytes[index]);
+                    return;
+                }
+            }
+        }
+
+        /** @brief Assert one economical grouped RMSNorm call for the requested format. */
+        void expect_grouped_rmsnorm_counter(const char *input_format,
+                                            const char *output_format,
+                                            int verifier_rows,
+                                            int hidden_dim)
+        {
+            // The production policy keeps tiny groups cache-serial and opens one
+            // row-parallel workshare once there are enough independent rows to
+            // amortize OpenMP coordination. Keep this assertion explicit so a
+            // future dispatch regression cannot masquerade as mere byte parity.
+            const char *expected_row_schedule =
+                verifier_rows >= 8 ||
+                        static_cast<size_t>(verifier_rows) * hidden_dim >= 65536u
+                    ? "openmp_rows"
+                    : "cache_serial_rows";
+            bool found = false;
+            for (const auto &record : PerfStatsCollector::snapshot(
+                     {"kernel.cpu_rmsnorm_grouped_verifier_rows_calls"}))
+            {
+                auto tag_equals = [&](const char *name, const std::string &expected)
+                {
+                    const auto it = record.tags.find(name);
+                    return it != record.tags.end() && it->second == expected;
+                };
+                found = found ||
+                        (tag_equals("input_format", input_format) &&
+                         tag_equals("output_format", output_format) &&
+                         tag_equals("verifier_rows", std::to_string(verifier_rows)) &&
+                         tag_equals("hidden_dim", std::to_string(hidden_dim)) &&
+                         tag_equals("row_schedule", expected_row_schedule) &&
+                         tag_equals("invocation_policy", "single_grouped_call"));
+            }
+            EXPECT_TRUE(found)
+                << "Grouped RMSNorm did not publish the expected economical route for "
+                << input_format << " M=" << verifier_rows << "\n"
+                << PerfStatsCollector::summaryString(
+                       {"kernel.cpu_rmsnorm_grouped_verifier_rows_calls"}, 20);
         }
 
     } // anonymous namespace
@@ -466,6 +566,152 @@ namespace llaminar2
         EXPECT_EQ(kernel.precision(), ActivationPrecision::Q8_1);
         EXPECT_STREQ(kernel.precision_name(), "Q8_1");
         EXPECT_NEAR(kernel.compression_ratio(), 3.556f, 0.01f);
+    }
+
+    /**
+     * @brief Prove all CPU RMSNorm activation formats are batch invariant for runtime M.
+     *
+     * The grouped side calls each production typed kernel once over all verifier
+     * rows. The serial witness calls the same typed kernel on one row at a time.
+     * Native output storage is compared byte-for-byte so BF16, FP16, and Q8_1
+     * cannot hide a difference behind dequantization tolerances; Q16_1 verifies
+     * its production Q16-input/FP32-output contract, which previously had no
+     * coverage in this test file at all.
+     */
+    TEST_F(CPURMSNormKernelTTest, GroupedVerifierRowsAllActivationFormatsMatchSerialDecodeByteExact)
+    {
+        ScopedPerfStats perfstats;
+
+        constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
+        constexpr int cols = 4096;
+        constexpr size_t elements_per_row = static_cast<size_t>(cols);
+        constexpr size_t blocks_per_row = elements_per_row / Q8_1Block::BLOCK_SIZE;
+
+        auto fp32_input = generate_random_fp32(max_rows * cols, -1.25f, 1.25f);
+        auto gamma = generate_random_fp32(cols, 0.5f, 1.5f);
+
+        std::vector<uint16_t> bf16_input(fp32_input.size());
+        std::vector<uint16_t> fp16_input(fp32_input.size());
+        simd::convert_fp32_to_bf16(fp32_input.data(), bf16_input.data(), fp32_input.size());
+        simd::convert_fp32_to_fp16(fp32_input.data(), fp16_input.data(), fp32_input.size());
+
+        std::vector<Q8_1Block> q8_input(static_cast<size_t>(max_rows) * blocks_per_row);
+        simd::quantize_fp32_to_q8_1_blocks(
+            fp32_input.data(), q8_input.data(), fp32_input.size());
+
+        std::vector<Q16_1Block> q16_input(static_cast<size_t>(max_rows) * blocks_per_row);
+        for (size_t block = 0; block < q16_input.size(); ++block)
+        {
+            simd::quantize_fp32_to_q16_1_block(
+                fp32_input.data() + block * Q16_1Block::BLOCK_SIZE,
+                q16_input[block]);
+        }
+
+        for (int rows : test::kGroupedVerifierRuntimeRows)
+        {
+            SCOPED_TRACE("rows=" + std::to_string(rows));
+
+            {
+                CPURMSNormKernelT<ActivationPrecision::FP32> kernel;
+                std::vector<float> grouped(static_cast<size_t>(rows) * cols);
+                std::vector<float> serial(grouped.size());
+                PerfStatsCollector::reset();
+                ASSERT_TRUE(kernel.apply_typed(
+                    fp32_input.data(), gamma.data(), grouped.data(), rows, cols, EPSILON));
+                expect_grouped_rmsnorm_counter("fp32", "fp32", rows, cols);
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(kernel.apply_typed(
+                        fp32_input.data() + static_cast<size_t>(row) * cols,
+                        gamma.data(),
+                        serial.data() + static_cast<size_t>(row) * cols,
+                        1, cols, EPSILON));
+                }
+                expect_byte_exact(grouped.data(), serial.data(), grouped.size() * sizeof(float),
+                                  "FP32 grouped RMSNorm M=" + std::to_string(rows));
+            }
+
+            {
+                CPURMSNormKernelT<ActivationPrecision::BF16> kernel;
+                std::vector<uint16_t> grouped(static_cast<size_t>(rows) * cols);
+                std::vector<uint16_t> serial(grouped.size());
+                PerfStatsCollector::reset();
+                ASSERT_TRUE(kernel.apply_typed(
+                    bf16_input.data(), gamma.data(), grouped.data(), rows, cols, EPSILON));
+                expect_grouped_rmsnorm_counter("bf16", "bf16", rows, cols);
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(kernel.apply_typed(
+                        bf16_input.data() + static_cast<size_t>(row) * cols,
+                        gamma.data(),
+                        serial.data() + static_cast<size_t>(row) * cols,
+                        1, cols, EPSILON));
+                }
+                expect_byte_exact(grouped.data(), serial.data(), grouped.size() * sizeof(uint16_t),
+                                  "BF16 grouped RMSNorm M=" + std::to_string(rows));
+            }
+
+            {
+                CPURMSNormKernelT<ActivationPrecision::FP16> kernel;
+                std::vector<uint16_t> grouped(static_cast<size_t>(rows) * cols);
+                std::vector<uint16_t> serial(grouped.size());
+                PerfStatsCollector::reset();
+                ASSERT_TRUE(kernel.apply_typed(
+                    fp16_input.data(), gamma.data(), grouped.data(), rows, cols, EPSILON));
+                expect_grouped_rmsnorm_counter("fp16", "fp16", rows, cols);
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(kernel.apply_typed(
+                        fp16_input.data() + static_cast<size_t>(row) * cols,
+                        gamma.data(),
+                        serial.data() + static_cast<size_t>(row) * cols,
+                        1, cols, EPSILON));
+                }
+                expect_byte_exact(grouped.data(), serial.data(), grouped.size() * sizeof(uint16_t),
+                                  "FP16 grouped RMSNorm M=" + std::to_string(rows));
+            }
+
+            {
+                CPURMSNormKernelT<ActivationPrecision::Q8_1> kernel;
+                const size_t block_count = static_cast<size_t>(rows) * blocks_per_row;
+                std::vector<Q8_1Block> grouped(block_count);
+                std::vector<Q8_1Block> serial(block_count);
+                PerfStatsCollector::reset();
+                ASSERT_TRUE(kernel.apply_typed(
+                    q8_input.data(), gamma.data(), grouped.data(), rows, cols, EPSILON));
+                expect_grouped_rmsnorm_counter("q8_1", "q8_1", rows, cols);
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(kernel.apply_typed(
+                        q8_input.data() + static_cast<size_t>(row) * blocks_per_row,
+                        gamma.data(),
+                        serial.data() + static_cast<size_t>(row) * blocks_per_row,
+                        1, cols, EPSILON));
+                }
+                expect_byte_exact(grouped.data(), serial.data(), grouped.size() * sizeof(Q8_1Block),
+                                  "Q8_1 grouped RMSNorm M=" + std::to_string(rows));
+            }
+
+            {
+                CPURMSNormKernelT<ActivationPrecision::Q16_1> kernel;
+                std::vector<float> grouped(static_cast<size_t>(rows) * cols);
+                std::vector<float> serial(grouped.size());
+                PerfStatsCollector::reset();
+                ASSERT_TRUE(kernel.apply_typed(
+                    q16_input.data(), gamma.data(), grouped.data(), rows, cols, EPSILON));
+                expect_grouped_rmsnorm_counter("q16_1", "fp32", rows, cols);
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(kernel.apply_typed(
+                        q16_input.data() + static_cast<size_t>(row) * blocks_per_row,
+                        gamma.data(),
+                        serial.data() + static_cast<size_t>(row) * cols,
+                        1, cols, EPSILON));
+                }
+                expect_byte_exact(grouped.data(), serial.data(), grouped.size() * sizeof(float),
+                                  "Q16_1 grouped RMSNorm M=" + std::to_string(rows));
+            }
+        }
     }
 
     // =========================================================================

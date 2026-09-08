@@ -261,7 +261,7 @@ namespace llaminar2
 
             for (const auto &weight : dump_info.weights)
             {
-                if (!weight.tensor)
+                if (!weight.tensor && !weight.raw_data)
                     continue;
 
                 TensorDumpMeta meta;
@@ -381,8 +381,8 @@ namespace llaminar2
 
             ctx.inputs_dumped = true;
 
-            // Get dump info from stage
-            StageDumpInfo dump_info = stage->getDumpInfo();
+            // Get a stable dump-info copy for the duration of this dump.
+            StageDumpInfo dump_info = stage->getDumpInfoSnapshot();
 
             // Dump inputs
             if (cfg.dump_inputs)
@@ -454,9 +454,8 @@ namespace llaminar2
 
             // Get fresh dump info from stage so post-execute diagnostics and
             // tensors populated during execute() are represented in the dump.
-            stage->invalidateDumpInfoCache();
-            StageDumpInfo dump_info = stage->getDumpInfo();
-            dump_info.ensureOutputsOnHost();
+            StageDumpInfo dump_info = stage->refreshDumpInfoSnapshot();
+            dump_info.ensureOutputsOnHost(stage ? stage->gpuStream() : nullptr);
 
             for (const auto &output : dump_info.outputs)
             {

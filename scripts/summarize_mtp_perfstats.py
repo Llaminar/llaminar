@@ -16,8 +16,6 @@ FIELDS = (
     "stochastic_semantic_verify_rows",
     "stochastic_post_reject_rows",
     "stochastic_seeded_device_threshold_rows",
-    "verifier_economy_dense",
-    "verifier_economy_moe",
     "condition_ms",
     "condition_count",
     "condition_skipped_ready",
@@ -238,48 +236,6 @@ def _sum_tagged_int(
             tagged_value = 0
         total += tagged_value * int(record.get("count", 0) or 0)
     return total
-
-
-def _verifier_economy_lane_status(
-    records: Iterable[dict[str, Any]],
-    lane: str,
-) -> str:
-    for record in records:
-        if not _matches(
-            record,
-            domain="mtp",
-            name="verifier_economy_capability",
-            phase="decode",
-            tags={"lane": lane},
-        ):
-            continue
-
-        tags = _tags(record)
-        rows = tags.get("max_rows")
-        if rows is None:
-            rows = str(int(float(record.get("value", 0.0) or 0.0)))
-        return ";".join(
-            (
-                f"status={tags.get('perf_gate_status', 'unknown')}",
-                f"rows={rows}",
-                f"serial={tags.get('serial_decode_equivalent_fallback', 'false')}",
-                f"grouped={tags.get('grouped_decode_equivalent', 'false')}",
-                f"row_lm={tags.get('row_indexed_lm_head', 'false')}",
-                "resident="
-                + "/".join(
-                    (
-                        tags.get("device_resident_input", "false"),
-                        tags.get("device_resident_outcome", "false"),
-                        tags.get("device_resident_publication", "false"),
-                    )
-                ),
-                f"bridge_free={tags.get('host_bridge_free_hot_path', 'false')}",
-                f"graph={tags.get('graph_capturable', 'false')}",
-                f"greedy={tags.get('greedy', 'false')}",
-                f"stochastic={tags.get('stochastic', 'false')}",
-            )
-        )
-    return "0"
 
 
 def _sum_graph_replay_gpu_ms(
@@ -603,14 +559,6 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
             "stochastic_seeded_device_threshold_rows",
             phase="decode",
         ),
-        "verifier_economy_dense": _verifier_economy_lane_status(
-            records,
-            "dense",
-        ),
-        "verifier_economy_moe": _verifier_economy_lane_status(
-            records,
-            "moe",
-        ),
         "condition_ms": _sum_total_ms(records, "mtp", "condition_forward"),
         "condition_count": _sum_count(records, "mtp", "condition_forward"),
         "condition_skipped_ready": _sum_count(
@@ -903,42 +851,42 @@ def summarize(path: Path | None) -> dict[str, float | int | str]:
         "main_decode_warmup": _sum_count(
             records,
             "forward_graph",
-            "decode_segmented_phase",
+            "decode_graph_phase",
             phase="decode",
             tags={"context": "main_decode", "phase": "warmup"},
         ),
         "main_decode_capture": _sum_count(
             records,
             "forward_graph",
-            "decode_segmented_phase",
+            "decode_graph_phase",
             phase="decode",
             tags={"context": "main_decode", "phase": "capture"},
         ),
         "main_decode_replay": _sum_count(
             records,
             "forward_graph",
-            "decode_segmented_phase",
+            "decode_graph_phase",
             phase="decode",
             tags={"context": "main_decode", "phase": "replay"},
         ),
         "main_verifier_warmup": _sum_count(
             records,
             "forward_graph",
-            "decode_segmented_phase",
+            "decode_graph_phase",
             phase="decode",
             tags={"context": "main_verifier", "phase": "warmup"},
         ),
         "main_verifier_capture": _sum_count(
             records,
             "forward_graph",
-            "decode_segmented_phase",
+            "decode_graph_phase",
             phase="decode",
             tags={"context": "main_verifier", "phase": "capture"},
         ),
         "main_verifier_replay": _sum_count(
             records,
             "forward_graph",
-            "decode_segmented_phase",
+            "decode_graph_phase",
             phase="decode",
             tags={"context": "main_verifier", "phase": "replay"},
         ),

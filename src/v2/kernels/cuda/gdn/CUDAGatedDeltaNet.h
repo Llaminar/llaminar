@@ -3,7 +3,7 @@
  * @brief CUDA implementation of ITensorGatedDeltaNet
  *
  * Wraps CUDA kernels for GDN delta-rule recurrence.
- * Manages GPU-resident recurrence state internally.
+ * Consumes cache-owned, persistently bound GPU recurrence state.
  *
  * Device-pointer design: All input/output pointers passed to chunk_forward()
  * and recurrent_step() are expected to be DEVICE pointers (already on GPU).
@@ -16,11 +16,14 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
-#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 // Forward declarations of extern "C" kernel wrappers
 extern "C"
@@ -29,7 +32,7 @@ extern "C"
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         int device_idx, void *stream);
@@ -38,7 +41,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         float *state_snapshots,
@@ -50,7 +53,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
@@ -59,9 +62,21 @@ extern "C"
         int max_snapshot_rows,
         int device_idx, void *stream);
 
+    bool cudaGDN_chunk_forward_batched_effective(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, const float *initial_state, float *updated_state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        const int *device_effective_seq_lens,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream);
+
     // GPU memory helpers (implemented in CUDAGatedDeltaNetKernels.cu)
-    bool cudaGDN_gpu_malloc(float **ptr, size_t count);
-    void cudaGDN_gpu_free(float *ptr);
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count);
     void cudaGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream);
     void cudaGDN_gpu_memcpy(float *dst, const float *src, size_t count);
@@ -88,6 +103,16 @@ extern "C"
         int state_size,
         int device_idx,
         void *stream);
+    bool cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+        float *dst,
+        const float *capture,
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream);
     // QKV deinterleave on device
     bool cudaGDN_deinterleave_qkv(
         const float *merged, float *out_q, float *out_k, float *out_v,
@@ -103,22 +128,36 @@ namespace llaminar2
     {
     public:
         /// Well-known workspace buffer names for GDN
-        static constexpr const char *WS_GDN_STATE = "gdn_state";
         static constexpr const char *WS_GDN_DEINTERLEAVE = "gdn_deinterleave_scratch";
 
         explicit CUDAGatedDeltaNet(int device_ordinal)
             : device_ordinal_(device_ordinal) {}
 
-        ~CUDAGatedDeltaNet()
+        ~CUDAGatedDeltaNet() override = default;
+
+        /**
+         * @brief Adopt one cache-owned persistent state binding.
+         *
+         * Rebinding would let a captured kernel silently change addresses, so
+         * even an otherwise valid second binding is rejected.
+         */
+        bool bindDeviceState(const GDNDeviceStateBinding &binding) override
         {
-            cudaGDN_gpu_set_device(device_ordinal_);
-            cudaGDN_gpu_free(gpu_state_);
-            cudaGDN_gpu_free(request_state_bank_);
-            cudaGDN_gpu_free(deinterleave_scratch_);
+            if (device_state_bound_ || !binding.valid())
+                return false;
+
+            gpu_state_ = binding.primary_state;
+            state_size_ = binding.primary_state_floats;
+            secondary_gpu_state_ = binding.secondary_state;
+            secondary_state_size_ = binding.secondary_state_floats;
+            request_state_bank_ = binding.request_state_bank;
+            request_state_bank_floats_ = binding.request_state_bank_floats;
+            request_state_bank_capacity_ = binding.request_capacity;
+            device_state_bound_ = true;
+            return true;
         }
 
-        void allocateGPUState(int state_size) override { allocateState(state_size); }
-        void resetGPUState() override { resetState(); }
+        bool resetGPUState(void *stream) override { return resetState(stream); }
         void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
         {
             verifier_state_capture_ = workspace;
@@ -133,9 +172,13 @@ namespace llaminar2
 
         bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
         {
-            if (!gpu_state_ || !verifier_state_capture_ ||
+            // GPU kernels own the only live state. The generic destination is a
+            // CPU-backend concern and is intentionally ignored here.
+            (void)dst_state;
+            float *live_state = stateForSize(verifier_state_capture_size_);
+            if (!live_state || !verifier_state_capture_ ||
                 row < 0 || row >= verifier_state_capture_rows_ ||
-                verifier_state_capture_size_ != state_size_)
+                verifier_state_capture_size_ <= 0)
             {
                 return false;
             }
@@ -146,28 +189,23 @@ namespace llaminar2
                 static_cast<size_t>(row) * static_cast<size_t>(verifier_state_capture_size_);
             if (stream)
             {
-                cudaGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
-                if (dst_state)
-                {
-                    /*
-                     * The CUDA recurrence state has two mirrors: gpu_state_ is
-                     * consumed by captured graph replay, while dst_state points
-                     * at the hybrid cache's host mirror used when a later
-                     * mutation forces graph setup/rebuild.  Publication must
-                     * advance both mirrors to the accepted verifier row or the
-                     * next decode can rebuild from stale host state.
-                     */
-                    cudaGDN_gpu_memcpy_d2h_async(dst_state, src, static_cast<size_t>(state_size_), stream);
-                    cudaGDN_stream_synchronize(stream);
-                }
+                cudaGDN_gpu_memcpy_async(
+                    live_state,
+                    src,
+                    static_cast<size_t>(verifier_state_capture_size_),
+                    stream);
             }
             else
             {
-                cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
-                if (dst_state)
-                    cudaGDN_gpu_memcpy_d2h(dst_state, src, static_cast<size_t>(state_size_));
+                cudaGDN_gpu_memcpy(
+                    live_state,
+                    src,
+                    static_cast<size_t>(verifier_state_capture_size_));
             }
-            return true;
+            return publishLiveStateToRequestZero(
+                live_state,
+                verifier_state_capture_size_,
+                stream);
         }
 
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -175,31 +213,33 @@ namespace llaminar2
             const int *device_row_index,
             void *stream) override
         {
-            /*
-             * Device-indexed publication is intentionally device-only. The
-             * accepted row pointer is GPU-resident, so this method must not
-             * refresh dst_state or synchronize for host visibility. Host mirror
-             * adoption, when required for diagnostics/export, must be an
-             * explicit operation outside the replay hot path.
-             */
+            // Accepted-row metadata and live recurrent state remain on device.
             (void)dst_state;
-            if (!gpu_state_ || !verifier_state_capture_ || !device_row_index ||
+            float *live_state = stateForSize(verifier_state_capture_size_);
+            if (!live_state || !verifier_state_capture_ || !device_row_index ||
                 !stream ||
-                verifier_state_capture_size_ != state_size_)
+                verifier_state_capture_size_ <= 0)
             {
                 return false;
             }
 
             const bool ok = cudaGDN_gpu_copy_capture_row_from_device_index(
-                gpu_state_,
+                live_state,
                 verifier_state_capture_,
                 device_row_index,
                 verifier_state_capture_rows_,
-                state_size_,
+                verifier_state_capture_size_,
                 device_ordinal_,
                 stream);
             if (!ok)
                 return false;
+            if (!publishLiveStateToRequestZero(
+                    live_state,
+                    verifier_state_capture_size_,
+                    stream))
+            {
+                return false;
+            }
             return true;
         }
 
@@ -214,91 +254,126 @@ namespace llaminar2
             (void)dst_states;
             (void)dst_state_stride_floats;
             if (!request_state_bank_ ||
-                request_state_bank_state_size_ <= 0 ||
                 request_state_bank_capacity_ < request_count ||
                 !verifier_state_capture_ ||
                 !device_row_indices ||
                 request_count <= 0 ||
                 row_index_stride <= 0 ||
                 !stream ||
-                verifier_state_capture_size_ != request_state_bank_state_size_)
+                verifier_state_capture_size_ <= 0 ||
+                !hasState(verifier_state_capture_size_) ||
+                request_state_bank_floats_ <
+                    static_cast<size_t>(request_count) *
+                        static_cast<size_t>(verifier_state_capture_size_))
             {
                 return false;
             }
 
-            return cudaGDN_gpu_copy_capture_rows_from_device_indices(
-                request_state_bank_,
-                verifier_state_capture_,
-                device_row_indices,
-                request_count,
-                row_index_stride,
-                verifier_state_capture_rows_,
-                request_state_bank_state_size_,
-                device_ordinal_,
+            if (!cudaGDN_gpu_copy_capture_rows_from_device_indices(
+                    request_state_bank_,
+                    verifier_state_capture_,
+                    device_row_indices,
+                    request_count,
+                    row_index_stride,
+                    verifier_state_capture_rows_,
+                    verifier_state_capture_size_,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+            return publishRequestZeroToLiveState(
+                verifier_state_capture_size_,
+                stream);
+        }
+
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            float *dst_states,
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override
+        {
+            (void)dst_states;
+            if (!request_state_bank_ ||
+                request_state_bank_capacity_ < request_count ||
+                !verifier_state_capture_ ||
+                !device_request_seq_lens ||
+                !stream ||
+                verifier_state_capture_size_ <= 0 ||
+                !hasState(verifier_state_capture_size_) ||
+                request_state_bank_floats_ <
+                    static_cast<size_t>(request_count) *
+                        static_cast<size_t>(verifier_state_capture_size_))
+            {
+                return false;
+            }
+            if (!cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+                    request_state_bank_,
+                    verifier_state_capture_,
+                    device_request_seq_lens,
+                    request_count,
+                    request_row_width,
+                    verifier_state_capture_rows_,
+                    verifier_state_capture_size_,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+            return publishRequestZeroToLiveState(
+                verifier_state_capture_size_,
                 stream);
         }
 
         bool isGPUStateReady(int required_state_size) const override
         {
-            return gpu_state_ != nullptr && state_size_ == required_state_size;
+            return hasState(required_state_size);
         }
         bool supportsPaddedPrefillRealLength() const override { return true; }
         bool supportsRequestLiveStateBank(int request_count, int state_size) const override
         {
-            return request_count > 0 && state_size > 0;
+            return device_state_bound_ &&
+                   request_count > 0 &&
+                   request_count <= request_state_bank_capacity_ &&
+                   state_size > 0 &&
+                   hasState(state_size) &&
+                   request_state_bank_floats_ >=
+                       static_cast<size_t>(request_count) *
+                           static_cast<size_t>(state_size);
         }
         size_t stateBytes() const override
         {
             return state_size_ > 0 ? static_cast<size_t>(state_size_) * sizeof(float) : 0;
         }
 
-        /// Allocate GPU state buffer for the recurrence state [n_heads * d_k * d_v]
-        void allocateState(int state_size)
+        size_t largestStateBytes() const override
         {
-            if (gpu_state_ && state_size_ == state_size)
-                return;
-            if (isGraphCaptureActive())
-            {
-                LOG_ERROR("[CUDAGatedDeltaNet] GPU state allocation during graph capture "
-                          "(need "
-                          << state_size << " floats, have " << state_size_ << ")");
-                return;
-            }
-            if (gpu_state_)
-            {
-                cudaGDN_gpu_set_device(device_ordinal_);
-                cudaGDN_gpu_free(gpu_state_);
-            }
-            state_size_ = state_size;
-            cudaGDN_gpu_set_device(device_ordinal_);
-            if (!cudaGDN_gpu_malloc(&gpu_state_, state_size))
-            {
-                LOG_ERROR("[CUDAGatedDeltaNet] GPU malloc failed for state");
-                gpu_state_ = nullptr;
-                return;
-            }
-            void *stream = GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal_).defaultStream();
-            cudaGDN_gpu_memset_zero_async(gpu_state_, state_size, stream);
-            cudaGDN_stream_synchronize(stream);
-            LOG_DEBUG("[CUDAGatedDeltaNet] Allocated GPU state: " << state_size << " floats on device " << device_ordinal_);
+            const int largest_state_size = std::max(state_size_, secondary_state_size_);
+            return largest_state_size > 0 ? static_cast<size_t>(largest_state_size) * sizeof(float) : 0;
         }
 
-        /// Reset GPU state to zero
-        void resetState()
+        /// Reset every cache-owned GPU state bank on the producer stream.
+        bool resetState(void *stream)
         {
-            if (gpu_state_ && state_size_ > 0)
-            {
-                cudaGDN_gpu_set_device(device_ordinal_);
-                void *stream = GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal_).defaultStream();
+            if (!device_state_bound_ || !stream)
+                return false;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (gpu_state_ != request_state_bank_)
                 cudaGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
-                if (request_state_bank_ && request_state_bank_capacity_ > 0)
-                    cudaGDN_gpu_memset_zero_async(
-                        request_state_bank_,
-                        static_cast<size_t>(request_state_bank_capacity_) *
-                            static_cast<size_t>(request_state_bank_state_size_),
-                        stream);
-                cudaGDN_stream_synchronize(stream);
+            if (secondary_gpu_state_ && secondary_state_size_ > 0 &&
+                secondary_gpu_state_ != request_state_bank_)
+                cudaGDN_gpu_memset_zero_async(
+                    secondary_gpu_state_, secondary_state_size_, stream);
+            if (request_state_bank_ && request_state_bank_floats_ > 0)
+            {
+                cudaGDN_gpu_memset_zero_async(
+                    request_state_bank_,
+                    request_state_bank_floats_,
+                    stream);
             }
+            return true;
         }
 
         bool chunk_forward(
@@ -312,38 +387,82 @@ namespace llaminar2
             (void)chunk_size;
             cudaGDN_gpu_set_device(device_ordinal_);
             const int required_state_size = n_heads * d_k * d_v;
-            if (!gpu_state_ || state_size_ != required_state_size)
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[CUDAGatedDeltaNet::chunk_forward] GPU state allocation during graph capture "
-                              "(need "
-                              << required_state_size << " floats, have " << state_size_ << ")");
-                    return false;
-                }
-                allocateState(required_state_size);
-            }
-            if (!gpu_state_)
-            {
-                LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
+            float *live_state = requireState(
+                required_state_size,
+                "CUDAGatedDeltaNet::chunk_forward");
+            if (!live_state)
                 return false;
-            }
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+                resolveVerifierStateDestination(
+                    required_state_size,
+                    stream_);
             if (!effective_state)
                 return false;
 
             // All pointers are device pointers — pass directly to CUDA kernel.
             // No H2D/D2H copies, no scratch buffer, no stream synchronization.
             // The stage handles coherence (ensureOnDevice/allocateOnDevice).
-            return cudaGDN_chunk_forward(
+            const bool ok = cudaGDN_chunk_forward(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
                 device_ordinal_, stream_);
+            return ok;
+        }
+
+        /**
+         * @brief Execute merged-QKV recurrence through the bound CUDA workspace.
+         *
+         * Both launches remain on the exact stage stream and are captured as
+         * one ordered graph sequence. No host materialization, allocation, or
+         * synchronization participates in this mandatory layout operation.
+         */
+        bool chunkForwardMergedQKV(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, int chunk_size,
+            bool use_qk_l2norm) override
+        {
+            const int compact_stride =
+                2 * n_k_heads * d_k + n_heads * d_v;
+            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
+                n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+                qkv_stride != compact_stride)
+            {
+                return false;
+            }
+
+            float *q = nullptr;
+            float *k = nullptr;
+            float *v = nullptr;
+            if (!deinterleave_qkv_device(
+                    merged_qkv, q, k, v,
+                    seq_len, n_k_heads, n_heads,
+                    d_k, d_v, global_v_head_offset))
+            {
+                return false;
+            }
+
+            if (seq_len == 1)
+            {
+                return recurrent_step(
+                    q, k, v,
+                    alpha, beta_raw, A_log, dt_bias,
+                    output, state,
+                    n_heads, d_k, d_v, use_qk_l2norm);
+            }
+            return chunk_forward(
+                q, k, v,
+                alpha, beta_raw, A_log, dt_bias,
+                output, state,
+                seq_len, n_heads, d_k, d_v,
+                chunk_size, use_qk_l2norm);
         }
 
         bool chunkForwardWithEffectiveSeqLen(
@@ -358,36 +477,28 @@ namespace llaminar2
             (void)chunk_size;
             cudaGDN_gpu_set_device(device_ordinal_);
             const int required_state_size = n_heads * d_k * d_v;
-            if (!gpu_state_ || state_size_ != required_state_size)
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[CUDAGatedDeltaNet::chunkForwardWithEffectiveSeqLen] GPU state allocation during graph capture "
-                              "(need "
-                              << required_state_size << " floats, have " << state_size_ << ")");
-                    return false;
-                }
-                allocateState(required_state_size);
-            }
-            if (!gpu_state_)
-            {
-                LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
+            float *live_state = requireState(
+                required_state_size,
+                "CUDAGatedDeltaNet::chunkForwardWithEffectiveSeqLen");
+            if (!live_state)
                 return false;
-            }
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+                resolveVerifierStateDestination(
+                    required_state_size,
+                    stream_);
             if (!effective_state)
                 return false;
 
-            return cudaGDN_chunk_forward_effective(
+            const bool ok = cudaGDN_chunk_forward_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
                 device_effective_seq_len,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
                 device_ordinal_, stream_);
+            return ok;
         }
 
         bool chunkForwardBatchedRequests(
@@ -447,20 +558,15 @@ namespace llaminar2
                     request_state_bank_ +
                     static_cast<size_t>(request) *
                         static_cast<size_t>(required_state_size);
+                float *updated_request_state = request_state;
                 float *snapshots = nullptr;
                 int snapshot_rows = 0;
                 if (capture_active)
                 {
-                    float *work_state =
+                    updated_request_state =
                         speculative_state_work_ +
                         static_cast<size_t>(request) *
                             static_cast<size_t>(required_state_size);
-                    cudaGDN_gpu_memcpy_async(
-                        work_state,
-                        request_state,
-                        static_cast<size_t>(required_state_size),
-                        stream_);
-                    request_state = work_state;
 
                     const int snapshot_base = request * request_seq_len;
                     snapshots =
@@ -485,6 +591,7 @@ namespace llaminar2
                         dt_bias,
                         output + v_offset,
                         request_state,
+                        updated_request_state,
                         request_seq_len, n_heads, head_dim_k, head_dim_v,
                         use_qk_l2norm,
                         snapshots,
@@ -498,6 +605,70 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Run variable-length request recurrence as one grouped launch.
+         *
+         * The low-level grouped launch encodes request identity directly and
+         * retains serial timestep order inside each request block. Verifier
+         * setup copies the contiguous live bank once, then the grouped kernel
+         * writes the flat request-row snapshot namespace directly.
+         */
+        bool chunkForwardBatchedRequestsWithDeviceSeqLens(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int request_count, int request_seq_len,
+            int n_heads, int head_dim_k, int head_dim_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *device_request_seq_lens) override
+        {
+            (void)state;
+            (void)chunk_size;
+            cudaGDN_gpu_set_device(device_ordinal_);
+            const int required_state_size =
+                n_heads * head_dim_k * head_dim_v;
+            if (!stream_ || !device_request_seq_lens ||
+                seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+                seq_len != request_count * request_seq_len ||
+                required_state_size <= 0)
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Invalid device-length request-batched shape");
+                return false;
+            }
+            if (!ensureRequestStateBank(request_count, required_state_size))
+                return false;
+
+            const bool capture_active =
+                verifier_state_capture_ != nullptr &&
+                verifier_state_capture_rows_ >= request_count * request_seq_len &&
+                verifier_state_capture_size_ == required_state_size;
+            float *effective_states = request_state_bank_;
+            if (capture_active)
+            {
+                const int work_floats = request_count * required_state_size;
+                if (!speculative_state_work_ ||
+                    speculative_state_work_size_ < work_floats)
+                {
+                    LOG_ERROR("[CUDAGatedDeltaNet] Grouped verifier requires one speculative state slot per request");
+                    return false;
+                }
+                effective_states = speculative_state_work_;
+            }
+
+            return cudaGDN_chunk_forward_batched_effective(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, request_state_bank_, effective_states,
+                seq_len, request_count, request_seq_len,
+                n_heads, head_dim_k, head_dim_v,
+                use_qk_l2norm,
+                device_request_seq_lens,
+                capture_active ? verifier_state_capture_ : nullptr,
+                required_state_size,
+                capture_active ? verifier_state_capture_rows_ : 0,
+                device_ordinal_, stream_);
+        }
+
         bool recurrent_step(
             const float *q, const float *k, const float *v,
             const float *alpha, const float *beta_raw,
@@ -508,24 +679,15 @@ namespace llaminar2
         {
             cudaGDN_gpu_set_device(device_ordinal_);
             const int required_state_size = n_heads * d_k * d_v;
-            if (!gpu_state_ || state_size_ != required_state_size)
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[CUDAGatedDeltaNet::recurrent_step] GPU state allocation during graph capture "
-                              "(need "
-                              << required_state_size << " floats, have " << state_size_ << ")");
-                    return false;
-                }
-                allocateState(required_state_size);
-            }
-            if (!gpu_state_)
-            {
-                LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
+            float *live_state = requireState(
+                required_state_size,
+                "CUDAGatedDeltaNet::recurrent_step");
+            if (!live_state)
                 return false;
-            }
             float *effective_state =
-                prepareEffectiveStateForVerifierForward(required_state_size, stream_);
+                resolveVerifierStateDestination(
+                    required_state_size,
+                    stream_);
             if (!effective_state)
                 return false;
 
@@ -534,17 +696,55 @@ namespace llaminar2
             // slightly different GDN state over long generations, which can
             // flip near-tie Qwen3.6 tokens while the chunk-style verifier path
             // remains aligned with PyTorch.
-            return cudaGDN_chunk_forward(
+            const bool ok = cudaGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
-                output, effective_state,
+                output, live_state, effective_state,
                 /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
                 verifier_state_capture_,
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
                 device_ordinal_, stream_);
+            return ok;
         }
 
-        void setGPUStream(void *stream) override { stream_ = stream; }
+        void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+        void clearGPUStreamBinding() override { stream_ = nullptr; }
+
+        /**
+         * @brief Enqueue a diagnostic copy of the resident request-state bank.
+         *
+         * Integration tests use this to prove state byte equality before a
+         * continuation row can amplify a hidden recurrence mismatch.  Runtime
+         * execution remains fully device-owned and never consumes this host
+         * observation.  The caller synchronizes the explicit stream.
+         */
+        bool exportRequestStateBank(
+            void *dst_host,
+            int request_count,
+            int state_size,
+            void *stream) const
+        {
+            if (!dst_host || !stream ||
+                !request_state_bank_ ||
+                request_count <= 0 || state_size <= 0 ||
+                request_count > request_state_bank_capacity_ ||
+                !hasState(state_size) ||
+                request_state_bank_floats_ <
+                    static_cast<size_t>(request_count) *
+                        static_cast<size_t>(state_size))
+            {
+                return false;
+            }
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            cudaGDN_gpu_memcpy_d2h_async(
+                static_cast<float *>(dst_host),
+                request_state_bank_,
+                static_cast<size_t>(request_count) *
+                    static_cast<size_t>(state_size),
+                stream);
+            return true;
+        }
 
         bool exportState(void *dst_host, void *dst_device, void *stream) const override
         {
@@ -573,6 +773,41 @@ namespace llaminar2
             return true;
         }
 
+        bool exportStateForSize(int target_state_size, void *dst_host, void *dst_device, void *stream) override
+        {
+            if (target_state_size <= 0)
+                return true;
+            if (!dst_host && !dst_device)
+                return false;
+
+            const float *src = nullptr;
+            if (gpu_state_ && state_size_ == target_state_size)
+                src = gpu_state_;
+            else if (secondary_gpu_state_ && secondary_state_size_ == target_state_size)
+                src = secondary_gpu_state_;
+            if (!src)
+                return false;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (dst_device)
+            {
+                auto *dst = static_cast<float *>(dst_device);
+                if (stream)
+                    cudaGDN_gpu_memcpy_async(dst, src, static_cast<size_t>(target_state_size), stream);
+                else
+                    cudaGDN_gpu_memcpy(dst, src, static_cast<size_t>(target_state_size));
+            }
+            else
+            {
+                auto *dst = static_cast<float *>(dst_host);
+                if (stream)
+                    cudaGDN_gpu_memcpy_d2h_async(dst, src, static_cast<size_t>(target_state_size), stream);
+                else
+                    cudaGDN_gpu_memcpy_d2h(dst, src, static_cast<size_t>(target_state_size));
+            }
+            return true;
+        }
+
         bool importState(const void *src_host, const void *src_device, void *stream) override
         {
             if (stateBytes() == 0)
@@ -581,8 +816,6 @@ namespace llaminar2
             if (!src)
                 return false;
 
-            if (!gpu_state_)
-                allocateState(state_size_);
             if (!gpu_state_)
                 return false;
 
@@ -595,7 +828,45 @@ namespace llaminar2
             {
                 cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
             }
-            return true;
+            return publishLiveStateToRequestZero(
+                gpu_state_,
+                state_size_,
+                stream);
+        }
+
+        bool importStateForSize(int target_state_size, const void *src_host, const void *src_device, void *stream) override
+        {
+            if (target_state_size <= 0)
+                return true;
+            const auto *src = static_cast<const float *>(src_host ? src_host : src_device);
+            if (!src)
+                return false;
+            float *target_state = requireState(
+                target_state_size,
+                "CUDAGatedDeltaNet::importStateForSize");
+            if (!target_state)
+                return false;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (stream)
+            {
+                cudaGDN_gpu_memcpy_async(
+                    target_state,
+                    src,
+                    static_cast<size_t>(target_state_size),
+                    stream);
+            }
+            else
+            {
+                cudaGDN_gpu_memcpy(
+                    target_state,
+                    src,
+                    static_cast<size_t>(target_state_size));
+            }
+            return publishLiveStateToRequestZero(
+                target_state,
+                target_state_size,
+                stream);
         }
 
         void bindDeinterleaveWorkspace(float *scratch, size_t scratch_size) override
@@ -663,13 +934,6 @@ namespace llaminar2
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
         {
             WorkspaceRequirements reqs;
-            // State buffer: n_heads * d_k * d_v floats (use state_size_ if known, else estimate from m,n,k)
-            size_t state_bytes = (state_size_ > 0)
-                                     ? static_cast<size_t>(state_size_) * sizeof(float)
-                                     : static_cast<size_t>(m) * static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(float);
-            if (state_bytes > 0)
-                reqs.buffers.push_back({WS_GDN_STATE, state_bytes, 256, true});
-
             // Deinterleave scratch: estimate based on typical usage (3 × seq × heads × head_dim)
             size_t scratch_bytes = (deinterleave_scratch_size_ > 0)
                                        ? deinterleave_scratch_size_ * sizeof(float)
@@ -689,10 +953,11 @@ namespace llaminar2
         void *stream_ = nullptr;
         float *gpu_state_ = nullptr;
         int state_size_ = 0;
+        float *secondary_gpu_state_ = nullptr;
+        int secondary_state_size_ = 0;
         float *request_state_bank_ = nullptr;
-        int request_state_bank_state_size_ = 0;
+        size_t request_state_bank_floats_ = 0;
         int request_state_bank_capacity_ = 0;
-        float *deinterleave_scratch_ = nullptr;
         size_t deinterleave_scratch_size_ = 0;
         float *bound_deinterleave_scratch_ = nullptr;
         size_t bound_deinterleave_scratch_size_ = 0;
@@ -702,15 +967,55 @@ namespace llaminar2
         float *speculative_state_work_ = nullptr;
         int speculative_state_work_size_ = 0;
         DeviceWorkspaceManager *workspace_ = nullptr;
+        bool device_state_bound_ = false;
 
-        float *prepareEffectiveStateForVerifierForward(int required_state_size, void *stream)
+        bool hasState(int required_state_size) const
+        {
+            return stateForSize(required_state_size) != nullptr;
+        }
+
+        /**
+         * @brief Resolve one immutable cache-owned state geometry.
+         *
+         * CUDA graph nodes retain the pointer value recorded at capture time.
+         * Geometry lookup must therefore never mutate a shared "active" host
+         * pointer whose value depends on whichever graph happened to build or
+         * execute most recently.
+         */
+        float *stateForSize(int required_state_size) const noexcept
+        {
+            if (gpu_state_ && state_size_ == required_state_size)
+                return gpu_state_;
+            if (secondary_gpu_state_ &&
+                secondary_state_size_ == required_state_size)
+            {
+                return secondary_gpu_state_;
+            }
+            return nullptr;
+        }
+
+        float *requireState(int required_state_size, const char *caller) const
+        {
+            if (float *state = stateForSize(required_state_size))
+                return state;
+            LOG_ERROR("["
+                      << caller << "] Required cache-owned GPU state was not bound "
+                      << "(need " << required_state_size
+                      << " floats, have primary=" << state_size_
+                      << " secondary=" << secondary_state_size_ << ")");
+            return nullptr;
+        }
+
+        float *resolveVerifierStateDestination(
+            int required_state_size,
+            void *stream)
         {
             const bool verifier_capture_active =
                 verifier_state_capture_ != nullptr &&
                 verifier_state_capture_rows_ > 0 &&
                 verifier_state_capture_size_ == required_state_size;
             if (!verifier_capture_active)
-                return gpu_state_;
+                return stateForSize(required_state_size);
             if (!stream)
             {
                 LOG_ERROR("[CUDAGatedDeltaNet] Speculative verifier state requires an explicit stream");
@@ -725,12 +1030,85 @@ namespace llaminar2
                 return nullptr;
             }
 
-            cudaGDN_gpu_memcpy_async(
-                speculative_state_work_,
-                gpu_state_,
-                static_cast<size_t>(required_state_size),
-                stream);
             return speculative_state_work_;
+        }
+
+        /**
+         * @brief Publish scalar live state into request zero on its producer stream.
+         *
+         * Single-geometry bindings alias scalar state to request zero, making
+         * publication structurally complete with no operation. Distinct
+         * LocalTP geometries enqueue one explicit stream-ordered device copy.
+         */
+        bool publishLiveStateToRequestZero(
+            const float *live_state,
+            int live_state_size,
+            void *stream) const
+        {
+            if (!stream || !live_state ||
+                live_state_size <= 0 ||
+                !request_state_bank_ ||
+                request_state_bank_capacity_ <= 0 ||
+                request_state_bank_floats_ <
+                    static_cast<size_t>(live_state_size))
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Cannot publish live recurrence state to request zero"
+                          << " state_size=" << live_state_size
+                          << " request_capacity=" << request_state_bank_capacity_
+                          << " request_floats=" << request_state_bank_floats_);
+                return false;
+            }
+
+            if (live_state == request_state_bank_)
+                return true;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            cudaGDN_gpu_memcpy_async(
+                request_state_bank_,
+                live_state,
+                static_cast<size_t>(live_state_size),
+                stream);
+            return true;
+        }
+
+        /**
+         * @brief Publish accepted request zero back to the scalar live owner.
+         *
+         * Grouped publication writes every accepted request directly into the
+         * packed request bank. Request zero also represents the scalar decode
+         * sequence, so its accepted bytes must become the scalar live state on
+         * the same stream before a later scalar or one-request grouped graph
+         * may consume that owner. Keeping both device owners mutually
+         * published removes the need for a host-side currentness flag.
+         */
+        bool publishRequestZeroToLiveState(
+            int live_state_size,
+            void *stream) const
+        {
+            float *live_state = stateForSize(live_state_size);
+            if (!stream ||
+                !live_state ||
+                !request_state_bank_ ||
+                live_state_size <= 0 ||
+                request_state_bank_floats_ <
+                    static_cast<size_t>(live_state_size))
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Cannot publish accepted request-zero recurrence state"
+                          << " state_size=" << live_state_size
+                          << " request_floats=" << request_state_bank_floats_);
+                return false;
+            }
+
+            if (live_state == request_state_bank_)
+                return true;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            cudaGDN_gpu_memcpy_async(
+                live_state,
+                request_state_bank_,
+                static_cast<size_t>(live_state_size),
+                stream);
+            return true;
         }
 
         bool ensureRequestStateBank(int request_count, int required_state_size)
@@ -738,59 +1116,44 @@ namespace llaminar2
             if (request_count <= 0 || required_state_size <= 0)
                 return false;
 
-            if (!gpu_state_ || state_size_ != required_state_size)
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[CUDAGatedDeltaNet] scalar recurrence state allocation during graph capture");
-                    return false;
-                }
-                allocateState(required_state_size);
-            }
-            if (!gpu_state_)
+            float *live_state = requireState(
+                required_state_size,
+                "CUDAGatedDeltaNet::ensureRequestStateBank");
+            if (!live_state)
                 return false;
 
-            if (request_state_bank_ &&
-                request_state_bank_state_size_ == required_state_size &&
-                request_state_bank_capacity_ >= request_count)
-            {
-                return true;
-            }
-
-            if (isGraphCaptureActive())
-            {
-                LOG_ERROR("[CUDAGatedDeltaNet] request recurrence-state bank allocation during graph capture "
-                          "(requests=" << request_count
-                          << ", state_size=" << required_state_size << ")");
-                return false;
-            }
-
-            cudaGDN_gpu_set_device(device_ordinal_);
-            if (request_state_bank_)
-                cudaGDN_gpu_free(request_state_bank_);
-            request_state_bank_ = nullptr;
-            request_state_bank_state_size_ = required_state_size;
-            request_state_bank_capacity_ = request_count;
-
-            const size_t total_floats =
+            const size_t required_request_floats =
                 static_cast<size_t>(request_count) *
                 static_cast<size_t>(required_state_size);
-            if (!cudaGDN_gpu_malloc(&request_state_bank_, total_floats))
+            if (!request_state_bank_ ||
+                request_count > request_state_bank_capacity_ ||
+                required_request_floats > request_state_bank_floats_)
             {
-                LOG_ERROR("[CUDAGatedDeltaNet] GPU malloc failed for request recurrence-state bank");
-                request_state_bank_state_size_ = 0;
-                request_state_bank_capacity_ = 0;
+                LOG_ERROR("[CUDAGatedDeltaNet] Cache-owned request recurrence-state bank is undersized"
+                          << " requests=" << request_count
+                          << " state_size=" << required_state_size
+                          << " request_capacity=" << request_state_bank_capacity_
+                          << " available_floats=" << request_state_bank_floats_);
                 return false;
             }
 
-            void *stream = GPUDeviceContextPool::instance().getNvidiaContext(device_ordinal_).defaultStream();
-            cudaGDN_gpu_memset_zero_async(request_state_bank_, total_floats, stream);
-            cudaGDN_gpu_memcpy_async(
-                request_state_bank_,
-                gpu_state_,
-                static_cast<size_t>(required_state_size),
-                stream);
-            cudaGDN_stream_synchronize(stream);
+            /*
+             * A scalar live bank can authoritatively seed only request zero.
+             * Multi-request grouped execution owns its packed states directly;
+             * accepted-row publication updates those slots in place.
+             */
+            if (request_count == 1)
+            {
+                if (!stream_)
+                {
+                    LOG_ERROR("[CUDAGatedDeltaNet] request recurrence-state publication requires an explicit stream");
+                    return false;
+                }
+                return publishLiveStateToRequestZero(
+                    live_state,
+                    required_state_size,
+                    stream_);
+            }
             return true;
         }
     };

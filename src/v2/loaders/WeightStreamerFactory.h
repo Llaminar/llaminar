@@ -10,7 +10,6 @@
  * Factory Methods:
  * - createFromEnv(): Uses environment variables (LLAMINAR_WEIGHT_STREAMING)
  * - create(): Uses explicit WeightResidencyMode
- * - detectResidencyMode(): Pure calculation based on model size vs VRAM
  *
  * Decision Logic:
  * 1. RESIDENT mode → NullWeightStreamer (no-op, weights stay on device)
@@ -55,7 +54,6 @@ namespace llaminar2
      *       WeightResidencyMode::STREAMING, weight_mgr, num_layers);
      *
      *   // Auto-detect mode:
-     *   auto mode = WeightStreamerFactory::detectResidencyMode(model_bytes, vram_bytes);
      *   auto streamer = WeightStreamerFactory::create(mode, weight_mgr, num_layers);
      */
     class WeightStreamerFactory
@@ -101,31 +99,6 @@ namespace llaminar2
             std::shared_ptr<WeightManager> weight_manager = nullptr,
             int num_layers = 0,
             const StreamingConfig &config = StreamingConfig{});
-
-        /**
-         * @brief Auto-detect best residency mode based on model size and VRAM
-         *
-         * Uses a simple heuristic:
-         * - If model fits with headroom: RESIDENT (no streaming needed)
-         * - Otherwise: STREAMING (on-demand transfer required)
-         *
-         * Formula:
-         *   available_for_weights = available_vram_bytes * (1 - headroom_fraction)
-         *   if (model_memory_bytes <= available_for_weights) → RESIDENT
-         *   else → STREAMING
-         *
-         * @param model_memory_bytes Estimated model weight memory (in bytes)
-         * @param available_vram_bytes Available GPU VRAM (in bytes)
-         * @param headroom_fraction Fraction of VRAM to keep free (default: 0.2 = 20%)
-         * @return Recommended WeightResidencyMode
-         *
-         * @note This is a pure calculation, no WeightManager required
-         * @note Does not account for activation memory, KV cache, etc.
-         */
-        static WeightResidencyMode detectResidencyMode(
-            size_t model_memory_bytes,
-            size_t available_vram_bytes,
-            float headroom_fraction = 0.2f);
 
     private:
         // Private constructor - static factory class

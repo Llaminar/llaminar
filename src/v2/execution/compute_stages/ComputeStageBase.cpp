@@ -9,12 +9,59 @@
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorVerification.h"
+#include "../../transfer/TransferEngine.h"
 #include "../../utils/Logger.h"
 #include "../../kernels/KernelFactory.h"
 #include <chrono>
+#include <stdexcept>
 
 namespace llaminar2
 {
+
+    StageGPUExecution::StageGPUExecution(DeviceId device, void *stream)
+        : device_(device), stream_(stream)
+    {
+        if (!device_.is_gpu())
+        {
+            throw std::invalid_argument(
+                "StageGPUExecution requires a GPU device");
+        }
+        if (!stream_)
+        {
+            throw std::invalid_argument(
+                "StageGPUExecution requires the executor-bound non-null stream");
+        }
+    }
+
+    void StageGPUExecution::prepareInput(ITensor *tensor) const
+    {
+        TransferEngine::prepareDeviceInput(tensor, device_, stream_);
+    }
+
+    void StageGPUExecution::prepareOutput(ITensor *tensor) const
+    {
+        TransferEngine::prepareDeviceOutput(tensor, device_, stream_);
+    }
+
+    void StageGPUExecution::requirePreparedInput(ITensor *tensor) const
+    {
+        TransferEngine::requireDeviceInput(tensor, device_, stream_);
+    }
+
+    void StageGPUExecution::requirePreparedOutput(ITensor *tensor) const
+    {
+        TransferEngine::requireDeviceOutput(tensor, device_, stream_);
+    }
+
+    void StageGPUExecution::publish(ITensor *tensor) const
+    {
+        if (!tensor)
+        {
+            throw std::invalid_argument(
+                "StageGPUExecution::publish requires a tensor");
+        }
+        TransferEngine::publishDeviceWrite(tensor, device_, stream_);
+    }
 
     // =============================================================================
     // Default Layout Expectation (Phase 3: Tensor Layout Contracts)
@@ -41,6 +88,8 @@ namespace llaminar2
             return "GEMM_BIAS";
         case ComputeStageType::GEMM_FUSED_QKV:
             return "GEMM_FUSED_QKV";
+        case ComputeStageType::GEMM_FUSED_KV:
+            return "GEMM_FUSED_KV";
         case ComputeStageType::GEMM_FUSED_GATE_UP:
             return "GEMM_FUSED_GATE_UP";
         case ComputeStageType::RMS_NORM:
@@ -75,18 +124,54 @@ namespace llaminar2
             return "MOE_SHARED_EXPERT_FFN";
         case ComputeStageType::MOE_SHARED_EXPERT_GATE:
             return "MOE_SHARED_EXPERT_GATE";
+        case ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE:
+            return "MOE_CANONICAL_ROUTE_REDUCE";
+        case ComputeStageType::MOE_SHARED_RANK_BANK_PUBLISH:
+            return "MOE_SHARED_RANK_BANK_PUBLISH";
+        case ComputeStageType::MOE_CANONICAL_PUBLICATION_FINALIZE:
+            return "MOE_CANONICAL_PUBLICATION_FINALIZE";
+        case ComputeStageType::MOE_OVERLAY_TICKET_PUBLISH:
+            return "MOE_OVERLAY_TICKET_PUBLISH";
+        case ComputeStageType::MOE_OVERLAY_TICKET_CONSUME:
+            return "MOE_OVERLAY_TICKET_CONSUME";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK:
+            return "MOE_OVERLAY_ACTIVATION_DISPATCH_PACK";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME:
+            return "MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_PACK:
+            return "MOE_OVERLAY_ACTIVATION_RETURN_PACK";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_CONSUME:
+            return "MOE_OVERLAY_ACTIVATION_RETURN_CONSUME";
         case ComputeStageType::MOE_EXPERT_DISPATCH:
             return "MOE_EXPERT_DISPATCH";
-        case ComputeStageType::MOE_EXPERT_PARALLEL_REDUCE:
-            return "MOE_EXPERT_PARALLEL_REDUCE";
         case ComputeStageType::MOE_SPARSE_DISPATCH:
             return "MOE_SPARSE_DISPATCH";
+        case ComputeStageType::MOE_RANK_BATCH_DISPATCH:
+            return "MOE_RANK_BATCH_DISPATCH";
         case ComputeStageType::MOE_LOCAL_EXPERT:
             return "MOE_LOCAL_EXPERT";
+        case ComputeStageType::MOE_LOCAL_EXPERT_INPUT_PUBLISH:
+            return "MOE_LOCAL_EXPERT_INPUT_PUBLISH";
+        case ComputeStageType::MOE_LOCAL_EXPERT_OUTPUT_PUBLISH:
+            return "MOE_LOCAL_EXPERT_OUTPUT_PUBLISH";
+        case ComputeStageType::MOE_LOCAL_EXPERT_COMPLETION:
+            return "MOE_LOCAL_EXPERT_COMPLETION";
         case ComputeStageType::MOE_SPARSE_RETURN_REDUCE:
             return "MOE_SPARSE_RETURN_REDUCE";
+        case ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE:
+            return "MOE_RANK_BATCH_RETURN_REDUCE";
+        case ComputeStageType::MOE_DEVICE_REBALANCE:
+            return "MOE_DEVICE_REBALANCE";
+        case ComputeStageType::MOE_GPU_CURRENT_BATCH_LLEP:
+            return "MOE_GPU_CURRENT_BATCH_LLEP";
+        case ComputeStageType::MOE_DEVICE_DECODE_COMMIT_BOUNDARY:
+            return "MOE_DEVICE_DECODE_COMMIT_BOUNDARY";
+        case ComputeStageType::MOE_CPU_CURRENT_BATCH_LLEP:
+            return "MOE_CPU_CURRENT_BATCH_LLEP";
         case ComputeStageType::ALLREDUCE:
             return "ALLREDUCE";
+        case ComputeStageType::ROOTED_COLLECTIVE:
+            return "ROOTED_COLLECTIVE";
         case ComputeStageType::ALLGATHER:
             return "ALLGATHER";
         case ComputeStageType::ALLGATHER_V:
@@ -123,6 +208,8 @@ namespace llaminar2
             return "KV_CACHE_APPEND";
         case ComputeStageType::KV_CACHE_GATHER:
             return "KV_CACHE_GATHER";
+        case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:
+            return "TP_KV_CACHE_STATE_ALLGATHER";
         case ComputeStageType::ATTENTION_COMPUTE:
             return "ATTENTION_COMPUTE";
         case ComputeStageType::QUANTIZE_Q16_1:
@@ -137,10 +224,30 @@ namespace llaminar2
             return "SHORT_CONV1D";
         case ComputeStageType::GDN_RECURRENCE:
             return "GDN_RECURRENCE";
+        case ComputeStageType::GDN_LIVE_STATE_ALLGATHER:
+            return "GDN_LIVE_STATE_ALLGATHER";
+        case ComputeStageType::PREFILL_CHUNK_MATERIALIZATION:
+            return "PREFILL_CHUNK_MATERIALIZATION";
         case ComputeStageType::Q_GATE_SPLIT:
             return "Q_GATE_SPLIT";
         case ComputeStageType::MTP_CONCAT:
             return "MTP_CONCAT";
+        case ComputeStageType::MTP_DRAFT_TOKEN_PUBLICATION:
+            return "MTP_DRAFT_TOKEN_PUBLICATION";
+        case ComputeStageType::MOE_OVERLAY_EPOCH_BOUNDARY:
+            return "MOE_OVERLAY_EPOCH_BOUNDARY";
+        case ComputeStageType::MOE_OVERLAY_DEVICE_CONTROLLER:
+            return "MOE_OVERLAY_DEVICE_CONTROLLER";
+        case ComputeStageType::MTP_VERIFIER_PREPARATION:
+            return "MTP_VERIFIER_PREPARATION";
+        case ComputeStageType::MTP_STOCHASTIC_TARGET_DISTRIBUTION:
+            return "MTP_STOCHASTIC_TARGET_DISTRIBUTION";
+        case ComputeStageType::MTP_VERIFIER_OUTCOME:
+            return "MTP_VERIFIER_OUTCOME";
+        case ComputeStageType::MTP_STOCHASTIC_SERIAL_OUTCOME:
+            return "MTP_STOCHASTIC_SERIAL_OUTCOME";
+        case ComputeStageType::MTP_SPEC_STATE_PUBLICATION:
+            return "MTP_SPEC_STATE_PUBLICATION";
         default:
             return "UNKNOWN";
         }
@@ -556,7 +663,7 @@ namespace llaminar2
         const void *data = tensor ? tensor->raw_data() : nullptr;
         const char *dtype = tensor ? tensor->dtype_name() : "FP32";
 
-        LOG_DEBUG("[StageDumpInfo::addInput] name=" << name
+        LOG_TRACE("[StageDumpInfo::addInput] name=" << name
                                                     << " tensor=" << (tensor ? "non-null" : "null")
                                                     << " native_type=" << (tensor ? static_cast<int>(tensor->native_type()) : -1)
                                                     << " dtype_name=" << dtype);
@@ -569,7 +676,7 @@ namespace llaminar2
             if (q16_tensor)
             {
                 dtype = q16_tensor->dtype_name_with_block_size();
-                LOG_DEBUG("[StageDumpInfo::addInput] Q16_1 detected, block-size dtype=" << dtype);
+                LOG_TRACE("[StageDumpInfo::addInput] Q16_1 detected, block-size dtype=" << dtype);
             }
             else
             {
@@ -579,7 +686,7 @@ namespace llaminar2
 
         // Compute byte size from logical dimensions and dtype
         size_t byte_size = computeByteSizeForDtype(dtype, rows, cols);
-        LOG_DEBUG("[StageDumpInfo::addInput] Final dtype=" << dtype << " byte_size=" << byte_size);
+        LOG_TRACE("[StageDumpInfo::addInput] Final dtype=" << dtype << " byte_size=" << byte_size);
         size_t element_size = (rows > 0 && cols > 0) ? byte_size / (rows * cols) : sizeof(float);
 
         InputBuffer buf{name, data, rows, cols, dtype, element_size, byte_size};
@@ -625,7 +732,7 @@ namespace llaminar2
         return *this;
     }
 
-    void StageDumpInfo::ensureOutputsOnHost() const
+    void StageDumpInfo::ensureOutputsOnHost(void *stream) const
     {
         // Sync all output tensors from GPU to host.
         // Call this BEFORE reading output.data for verification/dumping.
@@ -650,8 +757,29 @@ namespace llaminar2
                                                                              << " rows=" << output.rows << " cols=" << output.cols);
                     }
 
+                    if (!stream && cpu_tensor->deviceValid() && !cpu_tensor->hostValid())
+                    {
+                        std::ostringstream oss;
+                        oss << "[StageDumpInfo::ensureOutputsOnHost] GPU output '"
+                            << (output.name ? output.name : "<unnamed>")
+                            << "' requires an explicit producer stream before host publication"
+                            << " (device="
+                            << (cpu_tensor->current_device() ? cpu_tensor->current_device()->to_string() : "unknown")
+                            << ")";
+                        LOG_ERROR(oss.str());
+                        throw std::runtime_error(oss.str());
+                    }
+
                     auto t0 = std::chrono::high_resolution_clock::now();
-                    cpu_tensor->ensureOnHost();
+                    if (!cpu_tensor->ensureOnHost(stream))
+                    {
+                        std::ostringstream oss;
+                        oss << "[StageDumpInfo::ensureOutputsOnHost] Failed to sync output '"
+                            << (output.name ? output.name : "<unnamed>")
+                            << "' to host";
+                        LOG_ERROR(oss.str());
+                        throw std::runtime_error(oss.str());
+                    }
                     auto t1 = std::chrono::high_resolution_clock::now();
                     auto elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                     if (elapsed_ms > 1.0)

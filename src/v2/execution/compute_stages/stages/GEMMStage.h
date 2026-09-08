@@ -1,9 +1,11 @@
-/**
- * @file GEMMStage.h
+/** @file GEMMStage.h
  * @brief GEMM stage: C = alpha * A * B + beta * C
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #pragma once
+
+#include "kernels/common/DeviceRowRange.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -128,9 +130,12 @@ namespace llaminar2
              * serial decode's M=1 route, and even tiny output-projection drift can
              * flip later MoE routes. When enabled, this stage preserves the same
              * graph-level output tensor but requires the kernel layer to prove and
-             * use a grouped M=2..4 path with the serial-decode numerical contract.
+             * use an economical grouped path at every positive M with the
+             * serial-decode numerical contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution
@@ -162,6 +167,9 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         bool requiresAllreduce() const override { return params_.needs_allreduce; }
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
 
         /// Target device for coherence management
 
@@ -196,12 +204,8 @@ namespace llaminar2
             TensorBase *C_base,
             ITensorGemm *gemm,
             int effective_n);
+        void clearCachedGemmStream();
 
-        // Reused one-row verifier scratch. Keeping this state on the stage avoids
-        // allocating transient tensors while the hot verifier path is iterating rows.
-        std::shared_ptr<FP32Tensor> verifier_gate_row_;
-        std::shared_ptr<FP32Tensor> verifier_input_row_;
-        std::shared_ptr<FP32Tensor> verifier_output_row_;
     };
 
 } // namespace llaminar2

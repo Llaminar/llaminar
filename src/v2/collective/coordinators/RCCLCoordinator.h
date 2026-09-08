@@ -182,6 +182,32 @@ namespace llaminar2
                                            CollectiveDataType dtype, CollectiveOp op);
 
         /**
+         * @brief In-place allreduce across local GPUs on explicit producer streams.
+         *
+         * Enqueues one grouped RCCL collective over the supplied streams and
+         * returns after launch. The caller owns any subsequent stream waits or
+         * tensor coherence events.
+         */
+        bool allreduceMultiOnStreams(const std::vector<void *> &buffers, size_t count,
+                                     CollectiveDataType dtype, CollectiveOp op,
+                                     const std::vector<void *> &streams);
+
+        bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams);
+
+        /**
+         * @brief Enqueue an anchor-free sideband bundle as one RCCL group.
+         */
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams);
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Each device thread calls this independently with its own buffer and
@@ -242,6 +268,62 @@ namespace llaminar2
                                            int device_idx, void *stream);
 
         /**
+         * @brief Reduce participant-local device input to one root on an
+         *        explicit HIP stream.
+         *
+         * This is the rooted counterpart to allreduceSingleDeviceOnStream().
+         * It enqueues RCCL directly on the caller's stream and performs no
+         * allocation, host transfer, or synchronization, so it is suitable for
+         * participant-local HIP graph capture.
+         *
+         * @param send_buf Participant-local device input.
+         * @param recv_buf Root-owned device result buffer.
+         * @param count Number of elements contributed by every participant.
+         * @param dtype Collective element type.
+         * @param op Reduction operation.
+         * @param root Fixed communicator-local root participant.
+         * @param device_idx Calling participant index.
+         * @param stream Exact non-null HIP stream.
+         * @return true when RCCL accepted the asynchronous operation.
+         */
+        bool reduceSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root,
+            int device_idx,
+            void *stream);
+
+        bool allgatherSingleDeviceOnStream(const void *send_buf,
+                                           void *recv_buf,
+                                           size_t send_count,
+                                           CollectiveDataType dtype,
+                                           int device_idx,
+                                           void *stream);
+
+        bool broadcastSingleDeviceOnStream(const void *send_buf,
+                                           void *recv_buf,
+                                           size_t count,
+                                           CollectiveDataType dtype,
+                                           int root,
+                                           int device_idx,
+                                           void *stream);
+
+        bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream);
+
+        bool broadcastMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                     const std::vector<void *> &recv_buffers,
+                                     size_t count,
+                                     CollectiveDataType dtype,
+                                     int root,
+                                     const std::vector<void *> &streams);
+
+        /**
          * @brief Allgather across all local GPUs
          *
          * Each device contributes send_count elements, receives
@@ -256,6 +338,20 @@ namespace llaminar2
         bool allgatherMulti(const std::vector<const void *> &send_buffers,
                             const std::vector<void *> &recv_buffers,
                             size_t send_count, CollectiveDataType dtype);
+
+        /**
+         * @brief Allgather with GPU stream dependency insertion.
+         *
+         * Enqueues the grouped RCCL allgather and inserts
+         * hipStreamWaitEvent(compute_stream, completion_event) for each device
+         * so later compute-stream work observes the gathered receive buffers
+         * without blocking the host.
+         */
+        bool allgatherMultiWithComputeDeps(
+            const std::vector<const void *> &send_buffers,
+            const std::vector<void *> &recv_buffers,
+            size_t send_count,
+            CollectiveDataType dtype);
 
         /**
          * @brief Broadcast from root to all local GPUs
@@ -394,6 +490,7 @@ namespace llaminar2
         // Internal collective implementations (called ON coordinator thread)
         bool doAllreduceMulti(const std::vector<void *> &buffers, size_t count,
                               int dtype_int, int op_int);
+        bool doInsertCollectiveInputDeps(const char *operation);
         bool doSynchronizeAll();
         bool doInsertComputeStreamDeps();
         bool doAllgatherMulti(const std::vector<const void *> &send_buffers,
@@ -442,6 +539,16 @@ namespace llaminar2
         // against coordinator thread work. Used by allreduceMultiWithComputeDeps
         // to bypass the coordinator thread hop for lower latency.
         std::mutex direct_exec_mutex_;
+
+        /**
+         * @brief Serialize the fatal all-rank RCCL abort transaction.
+         *
+         * A participant failure can be observed by several orchestration
+         * threads, but communicator ownership may be detached and aborted only
+         * once. The guarded transaction launches every active local rank before
+         * joining any rank, matching RCCL's collective abort contract.
+         */
+        std::mutex abort_mutex_;
     };
 
 } // namespace llaminar2

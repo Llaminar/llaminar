@@ -74,6 +74,14 @@ pytorch_qwen*/
 benchmark_results/*
 !benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
 !benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**
+!benchmark_results/native_vnni_dispatch/
+benchmark_results/native_vnni_dispatch/*
+!benchmark_results/native_vnni_dispatch/corpora/
+!benchmark_results/native_vnni_dispatch/corpora/**/
+benchmark_results/native_vnni_dispatch/corpora/**/.inprogress
+benchmark_results/native_vnni_dispatch/corpora/**/*.inprogress
+benchmark_results/native_vnni_dispatch/corpora/**/policy_fit_cache/
+benchmark_results/native_vnni_dispatch/corpora/**/fit-cache/
 *output.txt
 **/wget-log*
 **/*.data
@@ -126,3 +134,21 @@ src/v2/kernels/cuda/*_heuristic_*.h
 run_gemv_timing.sh
 
 /models
+
+# Published NativeVNNI corpus generations are the intentional exception to
+# generated benchmark ignores above. Large payload extensions are Git LFS
+# tracked by .gitattributes; partial work remains under the ignored work root.
+!benchmark_results/native_vnni_dispatch/corpora/**/corpus.manifest.json
+!benchmark_results/native_vnni_dispatch/corpora/**/*.csv
+!benchmark_results/native_vnni_dispatch/corpora/**/*.csv.zst
+!benchmark_results/native_vnni_dispatch/corpora/**/*.json
+!benchmark_results/native_vnni_dispatch/corpora/**/*.jsonl
+!benchmark_results/native_vnni_dispatch/corpora/**/*.log
+!benchmark_results/native_vnni_dispatch/corpora/**/*.sha256
+!benchmark_results/native_vnni_dispatch/corpora/**/*.txt
+!benchmark_results/native_vnni_dispatch/corpora/**/*.ncu-rep
+!benchmark_results/native_vnni_dispatch/corpora/**/*.nsys-rep
+!benchmark_results/native_vnni_dispatch/corpora/**/*.pftrace
+!benchmark_results/native_vnni_dispatch/corpora/**/*.rpd
+!benchmark_results/native_vnni_dispatch/corpora/**/*.sqlite
+!benchmark_results/native_vnni_dispatch/corpora/**/*.tar.zst

@@ -5,7 +5,7 @@
  * Tests the Phase 4 GPU Device Context Refactor for CuBLASGemmKernel and HipBLASGemmKernel:
  * - Context-provided handle vs own handle
  * - Both paths produce same results
- * - Backward compatibility with legacy constructor
+ * - Backward compatibility with ordinal-resolved context
  *
  * These tests require actual GPU hardware.
  *
@@ -103,6 +103,28 @@ namespace
             }
         }
     }
+    /**
+     * @brief Bind declared graph scratch for standalone library arithmetic tests.
+     * @return Owner retained until the tested stream has completed.
+     */
+    template <typename Kernel>
+    std::unique_ptr<DeviceWorkspaceManager> bindDeclaredWorkspace(Kernel &kernel)
+    {
+        const DeviceId device = [&]
+        {
+            if constexpr (requires { kernel.device_id(); })
+                return DeviceId::cuda(kernel.device_id());
+            else
+                return kernel.device();
+        }();
+        const auto requirements = kernel.getWorkspaceRequirements(1, 1, 1);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            device, requirements.total_bytes_with_alignment());
+        if (!workspace->allocate(requirements))
+            throw std::runtime_error("Could not materialize declared test BLAS workspace");
+        kernel.bindWorkspace(workspace.get());
+        return workspace;
+    }
 } // namespace
 
 // ============================================================================
@@ -127,6 +149,9 @@ protected:
         // Use device 0
         device_id_ = 0;
         ASSERT_EQ(cudaSuccess, cudaSetDevice(device_id_));
+        ASSERT_EQ(
+            cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
+            cudaSuccess);
     }
 
     void TearDown() override
@@ -136,22 +161,28 @@ protected:
         // Calling cudaDeviceReset() would invalidate the pool's CUDA context
         // and cause subsequent tests using the pool to fail with CUBLAS_STATUS_INTERNAL_ERROR.
         // The pool handles its own cleanup during process shutdown.
-        cudaDeviceSynchronize();
+        if (stream_)
+        {
+            (void)cudaStreamSynchronize(stream_);
+            (void)cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
     }
 
     int device_id_ = 0;
+    cudaStream_t stream_ = nullptr;
 };
 
-TEST_F(Test__CuBLASGemmContextIntegration, LegacyConstructor_OwnsHandle)
+TEST_F(Test__CuBLASGemmContextIntegration, OrdinalConstructor_BorrowsContext)
 {
     auto kernel = std::make_unique<cuda::CuBLASGemmKernel>(device_id_);
 
-    EXPECT_TRUE(kernel->ownsHandle());
+    EXPECT_FALSE(kernel->ownsHandle());
     EXPECT_EQ(kernel->device_id(), device_id_);
-    EXPECT_FALSE(kernel->hasDeviceContext());
+    EXPECT_TRUE(kernel->hasDeviceContext());
 }
 
-TEST_F(Test__CuBLASGemmContextIntegration, LegacyConstructor_ProducesCorrectResults)
+TEST_F(Test__CuBLASGemmContextIntegration, OrdinalConstructor_ProducesCorrectResults)
 {
     const int M = 64, N = 128, K = 256;
 
@@ -174,9 +205,11 @@ TEST_F(Test__CuBLASGemmContextIntegration, LegacyConstructor_ProducesCorrectResu
     ASSERT_EQ(cudaSuccess, cudaMemcpy(d_B, B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
     ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
 
-    // Create kernel with legacy constructor
+    // Create kernel with ordinal-resolved context
     auto kernel = std::make_unique<cuda::CuBLASGemmKernel>(device_id_);
-    ASSERT_TRUE(kernel->ownsHandle());
+    ASSERT_FALSE(kernel->ownsHandle());
+    kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
 
     // Execute GEMM
     ASSERT_TRUE(kernel->execute(d_A, d_B, d_C, M, N, K, false, false));
@@ -245,6 +278,8 @@ TEST_F(Test__CuBLASGemmContextIntegration, ContextConstructor_ProducesCorrectRes
     // Create kernel with context constructor
     auto kernel = std::make_unique<cuda::CuBLASGemmKernel>(ctx);
     ASSERT_FALSE(kernel->ownsHandle());
+    kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
 
     // Execute GEMM through submitAndWait (required for context-based kernels)
     // The cuBLAS handle from context is bound to the worker thread
@@ -292,9 +327,11 @@ TEST_F(Test__CuBLASGemmContextIntegration, BothConstructors_ProduceSameResults)
     ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A.data(), M * K * sizeof(float), cudaMemcpyHostToDevice));
     ASSERT_EQ(cudaSuccess, cudaMemcpy(d_B, B.data(), K * N * sizeof(float), cudaMemcpyHostToDevice));
 
-    // Execute with legacy constructor
+    // Execute with ordinal-resolved context
     {
         auto kernel = std::make_unique<cuda::CuBLASGemmKernel>(device_id_);
+        kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
         ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
         ASSERT_TRUE(kernel->execute(d_A, d_B, d_C, M, N, K, false, false));
         ASSERT_EQ(cudaSuccess, cudaMemcpy(C_legacy.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
@@ -303,6 +340,8 @@ TEST_F(Test__CuBLASGemmContextIntegration, BothConstructors_ProduceSameResults)
     // Execute with context constructor - must use submitAndWait for context-bound handle
     {
         auto kernel = std::make_unique<cuda::CuBLASGemmKernel>(ctx);
+        kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
         ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));
         bool exec_result = false;
         ctx->submitAndWait([&]()
@@ -327,7 +366,7 @@ TEST_F(Test__CuBLASGemmContextIntegration, ContextConstructor_ThrowsOnNull)
         {
             auto kernel = std::make_unique<cuda::CuBLASGemmKernel>(nullptr);
         },
-        std::runtime_error);
+        std::invalid_argument);
 }
 
 #endif // HAVE_CUDA
@@ -354,6 +393,9 @@ protected:
         // Use device 0
         device_id_ = DeviceId::rocm(0);
         ASSERT_EQ(hipSuccess, hipSetDevice(device_id_.ordinal));
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+            hipSuccess);
     }
 
     void TearDown() override
@@ -363,22 +405,28 @@ protected:
         // Calling hipDeviceReset() would invalidate the pool's HIP context
         // and cause subsequent tests using the pool to fail.
         // The pool handles its own cleanup during process shutdown.
-        hipDeviceSynchronize();
+        if (stream_)
+        {
+            (void)hipStreamSynchronize(stream_);
+            (void)hipStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
     }
 
     DeviceId device_id_;
+    hipStream_t stream_ = nullptr;
 };
 
-TEST_F(Test__HipBLASGemmContextIntegration, LegacyConstructor_OwnsHandle)
+TEST_F(Test__HipBLASGemmContextIntegration, OrdinalConstructor_BorrowsContext)
 {
     auto kernel = std::make_unique<rocm::HipBLASGemmKernel>(device_id_);
 
-    EXPECT_TRUE(kernel->ownsHandle());
+    EXPECT_FALSE(kernel->ownsHandle());
     EXPECT_EQ(kernel->device_ordinal(), device_id_.ordinal);
-    EXPECT_FALSE(kernel->hasDeviceContext());
+    EXPECT_TRUE(kernel->hasDeviceContext());
 }
 
-TEST_F(Test__HipBLASGemmContextIntegration, LegacyConstructor_ProducesCorrectResults)
+TEST_F(Test__HipBLASGemmContextIntegration, OrdinalConstructor_ProducesCorrectResults)
 {
     const int M = 64, N = 128, K = 256;
 
@@ -401,9 +449,11 @@ TEST_F(Test__HipBLASGemmContextIntegration, LegacyConstructor_ProducesCorrectRes
     ASSERT_EQ(hipSuccess, hipMemcpy(d_B, B.data(), K * N * sizeof(float), hipMemcpyHostToDevice));
     ASSERT_EQ(hipSuccess, hipMemset(d_C, 0, M * N * sizeof(float)));
 
-    // Create kernel with legacy constructor
+    // Create kernel with ordinal-resolved context
     auto kernel = std::make_unique<rocm::HipBLASGemmKernel>(device_id_);
-    ASSERT_TRUE(kernel->ownsHandle());
+    ASSERT_FALSE(kernel->ownsHandle());
+    kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
 
     // Execute GEMM
     ASSERT_TRUE(kernel->execute(d_A, d_B, d_C, M, N, K, false, false));
@@ -472,6 +522,8 @@ TEST_F(Test__HipBLASGemmContextIntegration, ContextConstructor_ProducesCorrectRe
     // Create kernel with context constructor
     auto kernel = std::make_unique<rocm::HipBLASGemmKernel>(ctx);
     ASSERT_FALSE(kernel->ownsHandle());
+    kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
 
     // Execute GEMM through submitAndWait (required for context-based kernels)
     // The hipBLAS handle from context is bound to the worker thread
@@ -519,9 +571,11 @@ TEST_F(Test__HipBLASGemmContextIntegration, BothConstructors_ProduceSameResults)
     ASSERT_EQ(hipSuccess, hipMemcpy(d_A, A.data(), M * K * sizeof(float), hipMemcpyHostToDevice));
     ASSERT_EQ(hipSuccess, hipMemcpy(d_B, B.data(), K * N * sizeof(float), hipMemcpyHostToDevice));
 
-    // Execute with legacy constructor
+    // Execute with ordinal-resolved context
     {
         auto kernel = std::make_unique<rocm::HipBLASGemmKernel>(device_id_);
+        kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
         ASSERT_EQ(hipSuccess, hipMemset(d_C, 0, M * N * sizeof(float)));
         ASSERT_TRUE(kernel->execute(d_A, d_B, d_C, M, N, K, false, false));
         ASSERT_EQ(hipSuccess, hipMemcpy(C_legacy.data(), d_C, M * N * sizeof(float), hipMemcpyDeviceToHost));
@@ -530,6 +584,8 @@ TEST_F(Test__HipBLASGemmContextIntegration, BothConstructors_ProduceSameResults)
     // Execute with context constructor - must use submitAndWait for context-bound handle
     {
         auto kernel = std::make_unique<rocm::HipBLASGemmKernel>(ctx);
+        kernel->bindStream(ExplicitGPUStream{stream_});
+    auto workspace = bindDeclaredWorkspace(*kernel);
         ASSERT_EQ(hipSuccess, hipMemset(d_C, 0, M * N * sizeof(float)));
         bool exec_result = false;
         ctx->submitAndWait([&]()
@@ -554,7 +610,7 @@ TEST_F(Test__HipBLASGemmContextIntegration, ContextConstructor_ThrowsOnNull)
         {
             auto kernel = std::make_unique<rocm::HipBLASGemmKernel>(nullptr);
         },
-        std::runtime_error);
+        std::invalid_argument);
 }
 
 #endif // HAVE_ROCM

@@ -20,9 +20,16 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen2ModelParityDefinitions.h"
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
+
+#include <array>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -43,110 +50,85 @@ static const std::vector<std::string> kTPExcludedStages = {
 // Test Configuration Definitions
 // =============================================================================
 
-static const std::vector<TestConfig> kHybridPPTPConfigs = {
-    // Stage 0 = TP(2xCUDA), Stage 1 = ROCm
-    {
-        .name = "LocalPP_TP2xCUDA_ROCm",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP, // PP between TP domain and ROCm
-        .thresholds = {
-            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
-            .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
+/** @return One typed two-stage PP+TP definition. */
+static ModelParityDefinition makeHybridPPTPDefinition(
+    std::string topology_id,
+    std::vector<ModelParityParticipant> participants,
+    Collective tensor_parallel_collective)
+{
+    return qwen2Q40ParityDefinition(
+        ModelParityTopologyDefinition{
+            .test_id = std::move(topology_id),
+            .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+            .participants = std::move(participants),
+            .mpi_ranks = 1,
+            .pipeline_stage_sizes = {2, 1},
+            .tensor_parallel_collective = tensor_parallel_collective,
+        },
+        BackendThresholds{
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.95f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.015f,               // Observed: 0.003 prefill KL (was 0.50 = 167x over-relaxed)
-            .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
-        },
-        .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
-        .tp_collective = Collective::NCCL, // TP collective within stage 0 (CUDA-CUDA)
-    },
-    // Stage 0 = TP(2xROCm), Stage 1 = single CUDA
+            .kl_threshold = 0.015f,
+            .excluded_stages = kTPExcludedStages,
+        });
+}
+
+/** @return Canonically expanded Qwen2 PP+TP cases. */
+static const std::vector<ModelParityCase> &qwen2HybridPPTPCases()
+{
+    static const auto cases = []
     {
-        .name = "LocalPP_TP2xROCm_CUDA",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalPP, // PP between TP domain and CUDA
-        .thresholds = {
-            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
-            .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.015f,               // Observed: 0.002 prefill KL (was 0.50 = 239x over-relaxed)
-            .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
-        },
-        .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
-        .tp_collective = Collective::RCCL, // TP collective within stage 0 (ROCm-ROCm)
-    },
-    // Stage 0 = TP(2xROCm), Stage 1 = CPU
-    {
-        .name = "LocalPP_TP2xROCm_CPU",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::CPU},
-        .parallelism = Parallelism::LocalPP, // PP between TP domain and CPU
-        .thresholds = {
-            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
-            .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.015f,               // Observed: 0.002 prefill KL (was 0.50 = 208x over-relaxed)
-            .excluded_stages = kTPExcludedStages, // TP excluded stages apply to stage 0
-        },
-        .pp_stage_sizes = {2, 1},          // Stage 0: 2 devices (TP), Stage 1: 1 device
-        .tp_collective = Collective::RCCL, // TP collective within stage 0 (ROCm-ROCm)
-    },
-};
+        const std::array definitions = {
+            makeHybridPPTPDefinition(
+                "LocalPP_TP2xCUDA_ROCm",
+                {{GlobalDeviceAddress::cuda(0), 0},
+                 {GlobalDeviceAddress::cuda(1), 0},
+                 {GlobalDeviceAddress::rocm(0), 0}},
+                Collective::NCCL),
+            makeHybridPPTPDefinition(
+                "LocalPP_TP2xROCm_CUDA",
+                {{GlobalDeviceAddress::rocm(0), 0},
+                 {GlobalDeviceAddress::rocm(1), 0},
+                 {GlobalDeviceAddress::cuda(0), 0}},
+                Collective::RCCL),
+            makeHybridPPTPDefinition(
+                "LocalPP_TP2xROCm_CPU",
+                {{GlobalDeviceAddress::rocm(0), 0},
+                 {GlobalDeviceAddress::rocm(1), 0},
+                 {GlobalDeviceAddress::cpu(), 0}},
+                Collective::RCCL),
+        };
+        std::vector<ModelParityCase> expanded;
+        for (const auto &definition : definitions)
+        {
+            auto definition_cases = expandModelParityDefinition(definition);
+            expanded.insert(
+                expanded.end(),
+                std::make_move_iterator(definition_cases.begin()),
+                std::make_move_iterator(definition_cases.end()));
+        }
+        return expanded;
+    }();
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
 class Qwen2HybridPPTPParityTest : public ConfigDrivenParityTest<Qwen2HybridPPTPParityTest>,
-                                  public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+                                  public ModelParityCaseParameter
+{};
 
 // =============================================================================
 // Test Cases
 // =============================================================================
 
-TEST_P(Qwen2HybridPPTPParityTest, PrefillParity)
+TEST_P(Qwen2HybridPPTPParityTest, ProductionParity)
 {
-    // Hybrid PP+TP: pipeline uses LocalPPTestRunner wrapping pre-compiled
-    // TP MDO + single-device DGO. Use non-TP parity comparison since the
-    // outer runner is not a RankOrchestrator (TP-specific snapshot
-    // access requires MDO cast). The combined output is still compared
-    // against PyTorch reference for correctness.
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runPrefillParity();
-    assertParity(summary);
-}
-
-TEST_P(Qwen2HybridPPTPParityTest, DecodeParity)
-{
-    // Hybrid PP+TP: use non-TP decode parity comparison for the same reason
-    // as PrefillParity — the outer runner is a LocalPPTestRunner, not MDO.
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen2HybridPPTPParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
+    runProductionParityCampaign();
 }
 
 // =============================================================================
@@ -156,10 +138,10 @@ TEST_P(Qwen2HybridPPTPParityTest, SnapshotInfrastructure)
 INSTANTIATE_TEST_SUITE_P(
     Qwen2,
     Qwen2HybridPPTPParityTest,
-    ::testing::ValuesIn(kHybridPPTPConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen2HybridPPTPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

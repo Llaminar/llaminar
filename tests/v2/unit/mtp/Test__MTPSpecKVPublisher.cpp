@@ -24,6 +24,7 @@ namespace
         {
             (void)layer;
             (void)seq_idx;
+            ++cached_token_observations;
             return cached_tokens;
         }
         int max_seq_len() const override { return max_tokens_; }
@@ -74,20 +75,36 @@ namespace
             return false;
         }
 
-        void clear() override { cached_tokens = 0; }
-        void clear_sequence(int layer, int seq_idx) override
+        bool resetRequestState(const StateResetContext &) override
+        {
+            cached_tokens = 0;
+            return true;
+        }
+        bool resetSequenceState(int seq_idx, const StateResetContext &) override
+        {
+            (void)seq_idx;
+            cached_tokens = 0;
+            return true;
+        }
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &) override
         {
             (void)layer;
             (void)seq_idx;
             cached_tokens = 0;
+            return true;
         }
-        void clear_layer(int layer) override
+        bool resetLayerState(int layer, const StateResetContext &) override
         {
             (void)layer;
             cached_tokens = 0;
+            return true;
         }
 
         int cached_tokens = 0;
+        mutable int cached_token_observations = 0;
         bool truncate_ok = true;
         std::vector<std::tuple<int, int, void *>> truncate_calls;
 
@@ -132,7 +149,7 @@ TEST(Test__MTPSpecKVPublisher, TruncatesMainAndShiftedMTPCachesToAcceptedPrefix)
     EXPECT_THAT(mtp1.truncate_calls, ElementsAre(std::make_tuple(0, 10, &explicit_stream)));
 }
 
-TEST(Test__MTPSpecKVPublisher, NonReusableSidecarKeepsHostMirrorOnShiftedInvariant)
+TEST(Test__MTPSpecKVPublisher, NonReusableSidecarKeepsShiftedCacheInvariant)
 {
     FakeKVCache main_cache;
     FakeKVCache mtp0;
@@ -154,7 +171,7 @@ TEST(Test__MTPSpecKVPublisher, NonReusableSidecarKeepsHostMirrorOnShiftedInvaria
         << "Committed logical token count 11 requires depth-0 shifted MTP KV "
            "to expose 10 rows. Non-reusable sidecar paths must repair the "
            "initial shifted row before publication rather than under-advance "
-           "the host mirror.";
+           "canonical cache state.";
     EXPECT_EQ(computeMTPShiftedKVTargetCachedTokens(plan, 0), 10);
 
     plan.accepted_count = 0;
@@ -224,6 +241,28 @@ TEST(Test__MTPSpecKVPublisher, FailsWhenMainTruncateFailsBeforeMTPCaches)
     EXPECT_THAT(result.error, HasSubstr("main KV"));
     EXPECT_THAT(main_cache.truncate_calls, SizeIs(1));
     EXPECT_TRUE(mtp0.truncate_calls.empty());
+}
+
+TEST(Test__MTPSpecKVPublisher, ShiftedTruncateFailureDoesNotObserveHostMetadata)
+{
+    FakeKVCache main_cache;
+    FakeKVCache mtp0;
+    mtp0.truncate_ok = false;
+
+    MTPSpecKVPublicationResult result =
+        publishAcceptedMTPSpecKVState(
+            kvPlan(/*base_tokens=*/3, /*accepted_count=*/1),
+            main_cache,
+            {&mtp0},
+            /*seq_idx=*/0,
+            /*stream=*/nullptr);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("MTP KV depth 0"));
+    EXPECT_THAT(mtp0.truncate_calls, SizeIs(1));
+    EXPECT_EQ(mtp0.cached_token_observations, 0)
+        << "A failed device mutation must report its submitted plan directly; "
+           "it cannot drain the device to decorate the error with host metadata.";
 }
 
 TEST(Test__MTPSpecKVPublisher, RejectsNullMTPCache)

@@ -27,7 +27,6 @@
 #pragma once
 
 #include "IBackend.h"
-#include <future>
 #include <memory>
 
 namespace llaminar2
@@ -88,9 +87,9 @@ namespace llaminar2
         size_t deviceMemoryTotal(int device_id) const override;
 
         /**
-         * @brief Get free memory for this rank's NUMA node
+         * @brief Get conservatively allocatable memory for this rank's NUMA node
          * @param device_id Must be 0
-         * @return Free memory in bytes from /sys/devices/system/node/nodeN/meminfo
+         * @return Canonical free-plus-reclaimable-file-cache bytes with tmpfs charged
          */
         size_t deviceMemoryFree(int device_id) const override;
 
@@ -180,40 +179,6 @@ namespace llaminar2
          */
         bool streamSynchronize(int device_id) override;
 
-        // ====================================================================
-        // Async Operations (Trivial for CPU - immediate completion)
-        // ====================================================================
-
-        /**
-         * @brief Async deviceToHost (returns immediately-completed future)
-         */
-        std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) override;
-
-        /**
-         * @brief Async hostToDevice (returns immediately-completed future)
-         */
-        std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) override;
-
-        /**
-         * @brief Async synchronize (returns immediately-completed future)
-         */
-        std::future<bool> synchronizeAsync(int device_id) override;
-
-        /**
-         * @brief Async allocate (returns immediately-completed future)
-         */
-        std::future<void *> allocateAsync(size_t bytes, int device_id) override;
-
-        /**
-         * @brief Async free (returns immediately-completed future)
-         */
-        std::future<void> freeAsync(void *ptr, int device_id) override;
-
-        /**
-         * @brief Async memset (returns immediately-completed future)
-         */
-        std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) override;
-
         /**
          * @brief Set active device (no-op if device_id == 0)
          * @param device_id Must be 0
@@ -253,6 +218,15 @@ namespace llaminar2
          * @return true
          */
         bool recordEvent(void *event, int device_id, void *stream = nullptr) override;
+
+        /**
+         * @brief Report a CPU event as immediately complete.
+         * @param event Dummy CPU event returned by createEvent().
+         * @param device_id Must identify the sole CPU backend.
+         * @param ready Non-null completion destination.
+         * @return true for a valid CPU event and device.
+         */
+        bool queryEvent(void *event, int device_id, bool *ready) override;
 
         /**
          * @brief Wait for event (no-op for CPU - always synchronous)
@@ -330,14 +304,6 @@ namespace llaminar2
 
     private:
         int local_numa_node_;
-
-        // Read NUMA memory info from /sys/devices/system/node/nodeN/meminfo
-        size_t readNumaMemTotal() const;
-        size_t readNumaMemFree() const;
-
-        // Read system-wide memory info from /proc/meminfo (fallback)
-        size_t readSystemMemTotal() const;
-        size_t readSystemMemFree() const;
 
         // Validate device_id (must be 0 for rank-local view)
         bool isValidDeviceId(int device_id) const;

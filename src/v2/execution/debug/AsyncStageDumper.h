@@ -325,13 +325,14 @@ namespace llaminar2
          */
         static void enqueueOutputs(
             const StageDumpContext &ctx,
-            const StageDumpInfo &dump_info)
+            const StageDumpInfo &dump_info,
+            void *stream = nullptr)
         {
             const auto &cfg = debugEnv().stage_dump;
             if (!cfg.dump_outputs)
                 return;
 
-            dump_info.ensureOutputsOnHost();
+            dump_info.ensureOutputsOnHost(stream);
 
             for (const auto &output : dump_info.outputs)
             {

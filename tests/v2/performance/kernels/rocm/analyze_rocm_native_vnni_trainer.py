@@ -22,7 +22,12 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from native_vnni_codebooks import CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK  # noqa: E402
+from native_vnni_codebooks import (  # noqa: E402
+    CODEBOOK_TO_FORMAT,
+    FORMAT_TO_CODEBOOK,
+    GPU_FORMAT_TO_EXECUTION_CODEBOOK,
+)
+from native_vnni_prefill_policy import load_native_vnni_m_policy  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 DEFAULT_POLICY_HEADER = REPO_ROOT / "src/v2/utils/PrefillGraphBucketDefaults.h"
@@ -65,22 +70,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _parse_int_array_from_header(text: str, symbol: str, path: Path) -> list[int]:
-    pattern = rf"{re.escape(symbol)}[^=]*=\s*\{{([^}}]+)\}}"
-    match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
-    if not match:
-        raise SystemExit(f"{path}: could not find {symbol}")
-    values = [int(value) for value in re.findall(r"-?\d+", match.group(1))]
-    if not values:
-        raise SystemExit(f"{path}: {symbol} was empty")
-    return values
-
-
 def load_prefill_m_policy(path: Path) -> list[int]:
-    text = path.read_text()
-    small = _parse_int_array_from_header(text, "kDefaultNativeVNNISmallMRows", path)
-    buckets = _parse_int_array_from_header(text, "kDefaultPrefillGraphBucketSizes", path)
-    return sorted({value for value in [*small, *buckets] if value > 0})
+    return load_native_vnni_m_policy(path)
 
 
 def canonical_label(codebook: int) -> str:
@@ -181,12 +172,15 @@ def load_prefill_rows(paths: list[str], m_policy: list[int], include_off_policy_
                 if expected_codebook is None:
                     raise SystemExit(f"{path}:{row_index}: unknown format {fmt!r}")
 
-                codebook = _to_int(path, row_index, "codebook", row.get("codebook", ""))
-                if codebook != expected_codebook:
+                source_codebook = _to_int(
+                    path, row_index, "codebook", row.get("codebook", "")
+                )
+                if source_codebook != expected_codebook:
                     raise SystemExit(
                         f"{path}:{row_index}: codebook mismatch for {fmt}: "
-                        f"expected {expected_codebook}, found {codebook}"
+                        f"expected {expected_codebook}, found {source_codebook}"
                     )
+                codebook = GPU_FORMAT_TO_EXECUTION_CODEBOOK[fmt]
 
                 m = _to_int(path, row_index, "m", row.get("m", ""))
                 if m <= 1:

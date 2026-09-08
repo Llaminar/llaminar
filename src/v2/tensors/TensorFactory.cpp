@@ -6,7 +6,7 @@
 
 #include "TensorFactory.h"
 #include "BlockStructures.h"
-#include "TensorClasses.h" // For FP32Tensor::createMapped()
+#include "TensorClasses.h"
 #include "../utils/Logger.h"
 #include <cerrno>
 #include <stdexcept>
@@ -45,15 +45,21 @@ namespace llaminar2
             bindToNumaNode();
         }
 
-        // For GPU devices, use mapped memory if enabled
-        // Mapped memory enables zero-copy host access (avoids slow memcpy syncs)
-        if (use_mapped_memory_for_gpu_ && device.is_gpu())
-        {
-            LOG_TRACE("[TensorFactory::createFP32] Using mapped memory for GPU tensor");
-            return FP32Tensor::createMapped(shape, device);
-        }
-
+        // Generic tensor construction always creates ordinary storage. Shared
+        // GPU-visible host pages are an explicit TransferEngine allocation so
+        // graph activation placement cannot change through factory state.
         return std::make_unique<FP32Tensor>(shape, device);
+    }
+
+    std::unique_ptr<FP32Tensor> TensorFactory::createFP32Owned(
+        const std::vector<size_t> &shape,
+        AlignedVector<float> host_data,
+        DeviceId device)
+    {
+        if (numa_node_ >= 0)
+            bindToNumaNode();
+        return std::make_unique<FP32Tensor>(
+            shape, std::move(host_data), device);
     }
 
     std::unique_ptr<FP16Tensor> TensorFactory::createFP16(const std::vector<size_t> &shape)
@@ -77,6 +83,15 @@ namespace llaminar2
         return std::make_unique<FP16Tensor>(shape, fp16_data);
     }
 
+    std::unique_ptr<FP16Tensor> TensorFactory::createFP16Owned(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint16_t> fp16_data)
+    {
+        if (numa_node_ >= 0)
+            bindToNumaNode();
+        return std::make_unique<FP16Tensor>(shape, std::move(fp16_data));
+    }
+
     std::unique_ptr<BF16Tensor> TensorFactory::createBF16(const std::vector<size_t> &shape)
     {
         if (numa_node_ >= 0)
@@ -96,6 +111,15 @@ namespace llaminar2
         }
 
         return std::make_unique<BF16Tensor>(shape, bf16_data);
+    }
+
+    std::unique_ptr<BF16Tensor> TensorFactory::createBF16Owned(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint16_t> bf16_data)
+    {
+        if (numa_node_ >= 0)
+            bindToNumaNode();
+        return std::make_unique<BF16Tensor>(shape, std::move(bf16_data));
     }
 
     std::unique_ptr<INT32Tensor> TensorFactory::createINT32(const std::vector<size_t> &shape)
@@ -281,6 +305,63 @@ namespace llaminar2
             std::ostringstream oss;
             oss << "TensorFactory::createQuantized: unsupported type " << static_cast<int>(type);
             throw std::runtime_error(oss.str());
+        }
+    }
+
+    std::unique_ptr<TensorBase> TensorFactory::createQuantizedOwned(
+        TensorType type,
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
+    {
+        if (numa_node_ >= 0)
+            bindToNumaNode();
+
+        switch (type)
+        {
+        case TensorType::IQ4_NL:
+            return std::make_unique<IQ4_NLTensor>(shape, std::move(raw_data));
+        case TensorType::Q8_0:
+            return std::make_unique<Q8_0Tensor>(shape, std::move(raw_data));
+        case TensorType::Q4_0:
+            return std::make_unique<Q4_0Tensor>(shape, std::move(raw_data));
+        case TensorType::Q4_1:
+            return std::make_unique<Q4_1Tensor>(shape, std::move(raw_data));
+        case TensorType::Q5_0:
+            return std::make_unique<Q5_0Tensor>(shape, std::move(raw_data));
+        case TensorType::Q5_1:
+            return std::make_unique<Q5_1Tensor>(shape, std::move(raw_data));
+        case TensorType::Q6_K:
+            return std::make_unique<Q6_KTensor>(shape, std::move(raw_data));
+        case TensorType::Q2_K:
+            return std::make_unique<Q2_KTensor>(shape, std::move(raw_data));
+        case TensorType::Q5_K:
+            return std::make_unique<Q5_KTensor>(shape, std::move(raw_data));
+        case TensorType::Q3_K:
+            return std::make_unique<Q3_KTensor>(shape, std::move(raw_data));
+        case TensorType::Q4_K:
+            return std::make_unique<Q4_KTensor>(shape, std::move(raw_data));
+        case TensorType::Q8_K:
+            return std::make_unique<Q8_KTensor>(shape, std::move(raw_data));
+        case TensorType::IQ4_XS:
+            return std::make_unique<IQ4_XSTensor>(shape, std::move(raw_data));
+        case TensorType::IQ2_XXS:
+            return std::make_unique<IQ2_XXSTensor>(shape, std::move(raw_data));
+        case TensorType::IQ2_XS:
+            return std::make_unique<IQ2_XSTensor>(shape, std::move(raw_data));
+        case TensorType::IQ3_XXS:
+            return std::make_unique<IQ3_XXSTensor>(shape, std::move(raw_data));
+        case TensorType::IQ2_S:
+            return std::make_unique<IQ2_STensor>(shape, std::move(raw_data));
+        case TensorType::IQ3_S:
+            return std::make_unique<IQ3_STensor>(shape, std::move(raw_data));
+        case TensorType::IQ1_S:
+            return std::make_unique<IQ1_STensor>(shape, std::move(raw_data));
+        case TensorType::IQ1_M:
+            return std::make_unique<IQ1_MTensor>(shape, std::move(raw_data));
+        default:
+            throw std::runtime_error(
+                "TensorFactory::createQuantizedOwned: unsupported type " +
+                std::to_string(static_cast<int>(type)));
         }
     }
 

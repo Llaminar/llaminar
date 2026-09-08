@@ -5,13 +5,18 @@
  * Provides GPU-side argmax and top-k selection over FP32 logits.
  * Mirrors the ROCm implementations in ROCmArgmaxKernels.hip and
  * ROCmSamplingKernels.hip for cross-backend parity.
+ * Ordinary and speculative generation share the SamplingMath controller ABI:
+ * immutable admission selects the algorithm, and explicit-stream publication
+ * writes persistent response rows without host sampling or token transfers.
  *
  * Kernels:
  *   - Argmax: Two-pass multi-block reduction (pass 1 spreads the vocab across
  *     many blocks/SMs producing one partial per block; pass 2 reduces the
  *     partials in a single small block). Falls back to a single-block reduction
  *     when no partial scratch is supplied.
- *   - Top-K: Single-block 32-thread insertion sort + merge (~15-25µs for 76K, k=40)
+ *   - Top-K: deterministic value/index ordering. Qwen-sized batched rows use
+ *     a two-stage cooperative register selector; larger geometries retain a
+ *     total generic partial-list implementation.
  */
 
 #include <cuda_runtime.h>
@@ -20,6 +25,8 @@
 #include <cmath>
 #include <cstdio>
 #include "../../common/SamplingMath.h"
+#include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
+#include "../../../execution/moe/DeviceMoERebalanceABI.h"
 
 // Maximum k supported by the top-k kernel
 constexpr int TOPK_MAX_K = 256;
@@ -29,10 +36,18 @@ constexpr int TOPK_THREADS = 32;
 constexpr int TOPK_MEDIUM_K_CAP = 40;
 constexpr int TOPK_SMALL_K_CAP = 64;
 constexpr int TOPK_SMALL_K_PARTIAL_BLOCKS = 128;
-// Qwen-style top_k=40/64 distributions still benefit from wider partial
-// reductions; 32 blocks regressed the ROCm fixed-depth-1 MTP lane.
+// Qwen-style top_k=40/64 distributions expose enough independent partials to
+// cover one full GA102 while keeping each segment within the cooperative
+// selector's fixed register capacity.
 constexpr int TOPK_SMALL_K_WIDE_PARTIAL_BLOCKS = 64;
 constexpr int TOPK_SMALL_K_THREADS = 64;
+constexpr int TOPK_BATCHED_COOPERATIVE_THREADS = 256;
+constexpr int TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD = 16;
+constexpr int TOPK_BATCHED_COOPERATIVE_CAPACITY =
+    TOPK_BATCHED_COOPERATIVE_THREADS *
+    TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+constexpr int TOPK_BATCHED_COOPERATIVE_WARPS =
+    TOPK_BATCHED_COOPERATIVE_THREADS / 32;
 static_assert(TOPK_MAX_K == llaminar2::sampling_math::kMaxTopK,
               "CUDA sampling TOPK_MAX_K must match shared sampling math");
 
@@ -65,15 +80,33 @@ __device__ __forceinline__ bool topkCandidateBetter(
 }
 
 // ── Argmax multi-block reduction tuning ─────────────────────────────────────
-// Threads per block for both reduction passes. Must be a power of two because
-// the in-block tree reduction halves the active range each step.
+// Threads per block for both reduction passes. Every production geometry is a
+// power-of-two multiple of one CUDA warp so the deterministic warp reduction
+// below can remove repeated block-wide barriers.
 constexpr int ARGMAX_REDUCE_THREADS = 256;
 constexpr int ARGMAX_FINALIZE_THREADS = 256;
-// Target elements processed per thread in pass 1. Chosen so each thread reads a
-// handful of elements (good memory coalescing) while still spreading the vocab
-// across enough blocks to occupy most SMs. 8 → ~74 blocks for a 152K vocab,
-// which keeps all 82 SMs of an RTX 3090 busy without oversubscription.
-constexpr int ARGMAX_ELEMS_PER_THREAD = 8;
+// Target elements processed per thread in pass 1.  The production Qwen 3.6
+// vocabulary has 248,320 columns, so four elements per thread launches 243
+// blocks at the 256-thread geometry.  A repeated full-matrix Perf__ sweep on an
+// RTX 3090 selected this geometry over the lower-wave 8-element launch while
+// preserving the serial lower-token tie break exactly.
+constexpr int ARGMAX_ELEMS_PER_THREAD = 4;
+
+/**
+ * @brief Publish one request-policy INT32 scalar into persistent device state.
+ *
+ * Kernel launch arguments are copied by the CUDA runtime before enqueue
+ * returns, unlike an asynchronous H2D transfer sourced from a caller's stack
+ * scalar. This one-thread kernel is therefore the correct ownership boundary
+ * for host-selected control tokens such as a bounded-thinking stop sequence.
+ */
+__global__ void cuda_publish_int32_control_scalar_kernel(
+    int32_t value,
+    int32_t *out_value)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *out_value = value;
+}
 
 __device__ __forceinline__ bool argmax_better(float candidate_value,
                                               int candidate_index,
@@ -82,6 +115,81 @@ __device__ __forceinline__ bool argmax_better(float candidate_value,
 {
     return candidate_value > current_value ||
            (candidate_value == current_value && candidate_index < current_index);
+}
+
+/**
+ * @brief Value/index pair ordered by serial argmax semantics.
+ *
+ * The index tie break is part of correctness, not merely determinism: serial
+ * decode retains the lowest token id among equal logits.  Carrying both words
+ * through every shuffle makes the parallel grouping mathematically identical
+ * to that order for all finite FP32 logits.
+ */
+struct CudaArgmaxPair
+{
+    float value;
+    int index;
+};
+
+/**
+ * @brief Reduce one full CUDA warp without shared memory or barriers.
+ */
+__device__ __forceinline__ CudaArgmaxPair cuda_argmax_warp_reduce(
+    CudaArgmaxPair pair)
+{
+    constexpr unsigned kFullWarpMask = 0xffffffffU;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        const CudaArgmaxPair candidate{
+            __shfl_down_sync(kFullWarpMask, pair.value, offset),
+            __shfl_down_sync(kFullWarpMask, pair.index, offset)};
+        if (argmax_better(
+                candidate.value,
+                candidate.index,
+                pair.value,
+                pair.index))
+        {
+            pair = candidate;
+        }
+    }
+    return pair;
+}
+
+/**
+ * @brief Reduce one block with one barrier and one final warp reduction.
+ *
+ * All supported launch geometries contain complete warps.  Each warp first
+ * reduces independently, lane zero publishes one pair to shared memory, and
+ * warp zero performs the final reduction.  Only thread zero consumes the
+ * returned pair, so no trailing block barrier is necessary.
+ */
+__device__ __forceinline__ CudaArgmaxPair cuda_argmax_block_reduce(
+    CudaArgmaxPair pair,
+    float *warp_values,
+    int *warp_indices)
+{
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int warp_count = static_cast<int>(blockDim.x) / warpSize;
+
+    pair = cuda_argmax_warp_reduce(pair);
+    if (lane == 0)
+    {
+        warp_values[warp] = pair.value;
+        warp_indices[warp] = pair.index;
+    }
+    __syncthreads();
+
+    if (warp == 0)
+    {
+        pair = lane < warp_count
+                   ? CudaArgmaxPair{
+                         warp_values[lane],
+                         warp_indices[lane]}
+                   : CudaArgmaxPair{-FLT_MAX, INT_MAX};
+        pair = cuda_argmax_warp_reduce(pair);
+    }
+    return pair;
 }
 
 // ============================================================================
@@ -217,8 +325,10 @@ __global__ void cuda_argmax_partial_f32_batched_rows_kernel(
     int row_partial_capacity)
 {
     extern __shared__ char shared_mem[];
-    float *smax = reinterpret_cast<float *>(shared_mem);
-    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+    const int warp_count = static_cast<int>(blockDim.x) / warpSize;
+    float *warp_values = reinterpret_cast<float *>(shared_mem);
+    int *warp_indices = reinterpret_cast<int *>(
+        shared_mem + warp_count * sizeof(float));
 
     const int row = blockIdx.y;
     if (row >= rows)
@@ -241,6 +351,96 @@ __global__ void cuda_argmax_partial_f32_batched_rows_kernel(
         }
     }
 
+    const CudaArgmaxPair block_max = cuda_argmax_block_reduce(
+        CudaArgmaxPair{local_max, local_idx},
+        warp_values,
+        warp_indices);
+
+    if (tid == 0)
+    {
+        const int offset = row * row_partial_capacity + blockIdx.x;
+        partial_vals[offset] = block_max.value;
+        partial_idxs[offset] = block_max.index;
+    }
+}
+
+/**
+ * @brief Grouped verifier argmax pass with serial-row penalty semantics.
+ *
+ * Row `r` sees the durable generated-token histogram plus verifier input
+ * tokens `[prefix_begin, r]`.  That is exactly the history visible to `r`
+ * serial decode calls, but it avoids materializing one sparse host map per row
+ * and avoids mutating the logits matrix before reduction.
+ */
+__global__ void cuda_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
+    const float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device,
+    float *__restrict__ partial_vals,
+    int *__restrict__ partial_idxs,
+    int row_partial_capacity)
+{
+    extern __shared__ char shared_mem[];
+    float *smax = reinterpret_cast<float *>(shared_mem);
+    int *sidx = reinterpret_cast<int *>(
+        shared_mem + blockDim.x * sizeof(float));
+
+    const int row = blockIdx.y;
+    const int active_rows = *active_rows_device;
+    if (active_rows <= 0 || active_rows > rows || row >= active_rows)
+        return;
+
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + tid;
+    const int grid_stride = blockDim.x * gridDim.x;
+    const float *row_data =
+        data + static_cast<size_t>(row) * static_cast<size_t>(row_stride);
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    const int prefix_begin =
+        request_policy.first_token_already_in_history != 0 ? 1 : 0;
+
+    float local_max = -FLT_MAX;
+    int local_idx = INT_MAX;
+    for (int token = gid; token < cols; token += grid_stride)
+    {
+        float value = row_data[token];
+        if (request_policy.enabled != 0)
+        {
+            int count = generated_token_counts[token];
+            for (int history_index = prefix_begin;
+                 history_index <= row;
+                 ++history_index)
+            {
+                count += verifier_input_tokens[history_index] == token ? 1 : 0;
+            }
+
+            if (count > 0)
+            {
+                float penalty = 0.0f;
+                if (request_policy.presence_penalty != 0.0f)
+                    penalty += request_policy.presence_penalty;
+                if (request_policy.frequency_penalty != 0.0f)
+                {
+                    const float frequency_component =
+                        request_policy.frequency_penalty *
+                        static_cast<float>(count);
+                    penalty += frequency_component;
+                }
+                value -= penalty;
+            }
+        }
+        if (argmax_better(value, token, local_max, local_idx))
+        {
+            local_max = value;
+            local_idx = token;
+        }
+    }
+
     smax[tid] = local_max;
     sidx[tid] = local_idx;
     __syncthreads();
@@ -248,8 +448,11 @@ __global__ void cuda_argmax_partial_f32_batched_rows_kernel(
     for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
     {
         if (tid < stride &&
-            argmax_better(smax[tid + stride], sidx[tid + stride],
-                          smax[tid], sidx[tid]))
+            argmax_better(
+                smax[tid + stride],
+                sidx[tid + stride],
+                smax[tid],
+                sidx[tid]))
         {
             smax[tid] = smax[tid + stride];
             sidx[tid] = sidx[tid + stride];
@@ -259,12 +462,14 @@ __global__ void cuda_argmax_partial_f32_batched_rows_kernel(
 
     if (tid == 0)
     {
-        const int offset = row * row_partial_capacity + blockIdx.x;
+        const int offset =
+            row * row_partial_capacity + static_cast<int>(blockIdx.x);
         partial_vals[offset] = smax[0];
         partial_idxs[offset] = sidx[0];
     }
 }
 
+template <bool PUBLISH_MTP_CHAIN, bool DEVICE_ACTIVE_ROWS = false>
 __global__ void cuda_argmax_finalize_f32_batched_rows_kernel(
     const float *__restrict__ partial_vals,
     const int *__restrict__ partial_idxs,
@@ -272,13 +477,28 @@ __global__ void cuda_argmax_finalize_f32_batched_rows_kernel(
     int row_partial_capacity,
     float *__restrict__ out_values,
     int *__restrict__ out_indices,
-    int output_stride)
+    int output_stride,
+    int *__restrict__ chain_condition_tokens,
+    int *__restrict__ chain_position_ids,
+    int chain_position_increment,
+    const int *__restrict__ active_rows_device)
 {
     extern __shared__ char shared_mem[];
-    float *smax = reinterpret_cast<float *>(shared_mem);
-    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+    const int warp_count = static_cast<int>(blockDim.x) / warpSize;
+    float *warp_values = reinterpret_cast<float *>(shared_mem);
+    int *warp_indices = reinterpret_cast<int *>(
+        shared_mem + warp_count * sizeof(float));
 
     const int row = blockIdx.x;
+    if constexpr (DEVICE_ACTIVE_ROWS)
+    {
+        const int active_rows = *active_rows_device;
+        if (active_rows <= 0 || active_rows > static_cast<int>(gridDim.x) ||
+            row >= active_rows)
+        {
+            return;
+        }
+    }
     const int tid = threadIdx.x;
     const int base = row * row_partial_capacity;
 
@@ -295,27 +515,27 @@ __global__ void cuda_argmax_finalize_f32_batched_rows_kernel(
         }
     }
 
-    smax[tid] = local_max;
-    sidx[tid] = local_idx;
-    __syncthreads();
-
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
-    {
-        if (tid < stride &&
-            argmax_better(smax[tid + stride], sidx[tid + stride],
-                          smax[tid], sidx[tid]))
-        {
-            smax[tid] = smax[tid + stride];
-            sidx[tid] = sidx[tid + stride];
-        }
-        __syncthreads();
-    }
+    const CudaArgmaxPair block_max = cuda_argmax_block_reduce(
+        CudaArgmaxPair{local_max, local_idx},
+        warp_values,
+        warp_indices);
 
     if (tid == 0)
     {
         const int out_row = row * output_stride;
-        out_values[out_row] = smax[0];
-        out_indices[out_row] = sidx[0];
+        out_values[out_row] = block_max.value;
+        out_indices[out_row] = block_max.index;
+        if constexpr (PUBLISH_MTP_CHAIN)
+        {
+            /*
+             * The chained sidecar consumes this exact winner and the next
+             * absolute position. Publishing both from the reduction owner makes
+             * the producer boundary one graph node: no later copy kernel can be
+             * omitted, reordered, or accidentally pointed at host-authored state.
+             */
+            chain_condition_tokens[row] = block_max.index;
+            chain_position_ids[row] += chain_position_increment;
+        }
     }
 }
 
@@ -784,6 +1004,253 @@ __global__ void cuda_topk_topp_distribution_from_partials_f32_kernel(
 }
 
 template <int K_CAP>
+struct CUDABatchedTopKCooperativeStorage
+{
+    float warp_values[TOPK_BATCHED_COOPERATIVE_WARPS];
+    int warp_indices[TOPK_BATCHED_COOPERATIVE_WARPS];
+    int winner_index;
+    float selected_values[K_CAP];
+    int selected_indices[K_CAP];
+};
+
+struct CUDATopKCandidate
+{
+    float value;
+    int index;
+};
+
+/**
+ * @brief Reduce one deterministic candidate across a full CUDA warp.
+ *
+ * Every batched selector launches a whole number of 32-lane warps. The same
+ * value-descending/index-ascending comparator used by the serial-row oracle is
+ * applied at every shuffle edge, so work partitioning cannot change ties.
+ */
+__device__ __forceinline__ CUDATopKCandidate cudaTopKReduceWarpBest(
+    CUDATopKCandidate candidate)
+{
+    constexpr unsigned kFullWarp = 0xffffffffu;
+    const int lane = threadIdx.x & 31;
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        const float other_value =
+            __shfl_down_sync(kFullWarp, candidate.value, offset);
+        const int other_index =
+            __shfl_down_sync(kFullWarp, candidate.index, offset);
+        if (lane + offset < 32 &&
+            topkCandidateBetter(
+                other_value,
+                other_index,
+                candidate.value,
+                candidate.index))
+        {
+            candidate.value = other_value;
+            candidate.index = other_index;
+        }
+    }
+    return candidate;
+}
+
+/**
+ * @brief Select a block-wide sorted Top-K from register-resident candidates.
+ *
+ * Each thread owns exactly sixteen candidate slots. Forty cooperative maxima
+ * therefore replace the former per-thread insertion sorts and thread-zero
+ * k-way merge. The winner index is invalidated only in its owning thread after
+ * every rank, which preserves one deterministic global order without atomics,
+ * temporary allocation, or cross-block reduction.
+ */
+template <int K_CAP>
+__device__ __forceinline__ void cudaSelectBatchedTopKCooperative(
+    float (&local_values)[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD],
+    int (&local_indices)[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD],
+    int k,
+    CUDABatchedTopKCooperativeStorage<K_CAP> &storage)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    for (int rank = 0; rank < k; ++rank)
+    {
+        CUDATopKCandidate local_best{-FLT_MAX, -1};
+#pragma unroll
+        for (int item = 0;
+             item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+             ++item)
+        {
+            if (topkCandidateBetter(
+                    local_values[item],
+                    local_indices[item],
+                    local_best.value,
+                    local_best.index))
+            {
+                local_best.value = local_values[item];
+                local_best.index = local_indices[item];
+            }
+        }
+
+        const CUDATopKCandidate warp_best =
+            cudaTopKReduceWarpBest(local_best);
+        if (lane == 0)
+        {
+            storage.warp_values[warp] = warp_best.value;
+            storage.warp_indices[warp] = warp_best.index;
+        }
+        __syncthreads();
+
+        if (warp == 0)
+        {
+            CUDATopKCandidate block_best{-FLT_MAX, -1};
+            if (lane < TOPK_BATCHED_COOPERATIVE_WARPS)
+            {
+                block_best.value = storage.warp_values[lane];
+                block_best.index = storage.warp_indices[lane];
+            }
+            block_best = cudaTopKReduceWarpBest(block_best);
+            if (lane == 0)
+            {
+                storage.winner_index = block_best.index;
+                storage.selected_values[rank] = block_best.value;
+                storage.selected_indices[rank] = block_best.index;
+            }
+        }
+        __syncthreads();
+
+        const int winner_index = storage.winner_index;
+#pragma unroll
+        for (int item = 0;
+             item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+             ++item)
+        {
+            if (local_indices[item] == winner_index)
+                local_indices[item] = -1;
+        }
+    }
+}
+
+/**
+ * @brief Produce exact sorted Top-K partials for Qwen-sized batched rows.
+ */
+template <int K_CAP>
+__global__ void cuda_topk_cooperative_partials_batched_f32_kernel(
+    const float *__restrict__ data,
+    int n,
+    int row_stride,
+    int k,
+    int partial_blocks,
+    float *__restrict__ partial_values,
+    int *__restrict__ partial_indices,
+    const int *__restrict__ active_rows_device)
+{
+    const int row = blockIdx.y;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.y);
+    if (k > K_CAP || active_rows <= 0 ||
+        active_rows > static_cast<int>(gridDim.y) || row >= active_rows)
+    {
+        return;
+    }
+
+    const int partial = blockIdx.x;
+    const int block_start =
+        static_cast<int>((static_cast<long long>(partial) * n) / partial_blocks);
+    const int block_end = static_cast<int>(
+        (static_cast<long long>(partial + 1) * n) / partial_blocks);
+    const float *row_data = data + static_cast<size_t>(row) * row_stride;
+
+    float local_values[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+    int local_indices[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0;
+         item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+         ++item)
+    {
+        const int offset =
+            threadIdx.x + item * TOPK_BATCHED_COOPERATIVE_THREADS;
+        const int index = block_start + offset;
+        const bool valid = index < block_end;
+        local_values[item] = valid ? row_data[index] : -FLT_MAX;
+        local_indices[item] = valid ? index : -1;
+    }
+
+    __shared__ CUDABatchedTopKCooperativeStorage<K_CAP> storage;
+    cudaSelectBatchedTopKCooperative(
+        local_values, local_indices, k, storage);
+
+    const int out_base = (row * partial_blocks + partial) * k;
+    for (int rank = threadIdx.x; rank < k; rank += blockDim.x)
+    {
+        partial_values[out_base + rank] = storage.selected_values[rank];
+        partial_indices[out_base + rank] = storage.selected_indices[rank];
+    }
+}
+
+/**
+ * @brief Merge cooperative partials and build one compact Top-K/Top-P row.
+ */
+template <int K_CAP>
+__global__ void cuda_topk_topp_distribution_cooperative_batched_f32_kernel(
+    const float *__restrict__ partial_values,
+    const int *__restrict__ partial_indices,
+    int partial_blocks,
+    int k,
+    float top_p,
+    float temperature,
+    int *__restrict__ out_token_ids,
+    int out_stride,
+    float *__restrict__ out_probs,
+    const int *__restrict__ active_rows_device)
+{
+    const int row = blockIdx.x;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.x);
+    if (k > K_CAP || active_rows <= 0 ||
+        active_rows > static_cast<int>(gridDim.x) || row >= active_rows)
+    {
+        return;
+    }
+
+    const int candidate_count = partial_blocks * k;
+    const int partial_base = row * candidate_count;
+    float local_values[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+    int local_indices[TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD];
+#pragma unroll
+    for (int item = 0;
+         item < TOPK_BATCHED_COOPERATIVE_ITEMS_PER_THREAD;
+         ++item)
+    {
+        const int offset =
+            threadIdx.x + item * TOPK_BATCHED_COOPERATIVE_THREADS;
+        const bool valid = offset < candidate_count;
+        local_values[item] = valid
+                                 ? partial_values[partial_base + offset]
+                                 : -FLT_MAX;
+        local_indices[item] = valid
+                                  ? partial_indices[partial_base + offset]
+                                  : -1;
+    }
+
+    __shared__ CUDABatchedTopKCooperativeStorage<K_CAP> storage;
+    __shared__ float distribution_weights[K_CAP];
+    cudaSelectBatchedTopKCooperative(
+        local_values, local_indices, k, storage);
+
+    if (threadIdx.x == 0)
+    {
+        const int out_base = row * out_stride;
+        llaminar2::sampling_math::build_topk_topp_distribution_from_sorted(
+            storage.selected_values,
+            storage.selected_indices,
+            k,
+            top_p,
+            temperature,
+            out_token_ids + out_base,
+            out_probs + out_base,
+            distribution_weights);
+    }
+}
+
+template <int K_CAP>
 __global__ void cuda_topk_smallk_partials_batched_f32_kernel(
     const float *__restrict__ data,
     int n,
@@ -791,12 +1258,20 @@ __global__ void cuda_topk_smallk_partials_batched_f32_kernel(
     int k,
     int partial_blocks,
     float *__restrict__ partial_values,
-    int *__restrict__ partial_indices)
+    int *__restrict__ partial_indices,
+    const int *__restrict__ active_rows_device)
 {
     if (k > K_CAP)
         return;
 
     const int row = blockIdx.y;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.y);
+    if (active_rows <= 0 || active_rows > static_cast<int>(gridDim.y) ||
+        row >= active_rows)
+    {
+        return;
+    }
     const int partial = blockIdx.x;
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
@@ -908,12 +1383,20 @@ __global__ void cuda_topk_topp_distribution_batched_from_partials_f32_kernel(
     float temperature,
     int *__restrict__ out_token_ids,
     int out_stride,
-    float *__restrict__ out_probs)
+    float *__restrict__ out_probs,
+    const int *__restrict__ active_rows_device)
 {
     if (k > K_CAP)
         return;
 
     const int row = blockIdx.x;
+    const int active_rows =
+        active_rows_device ? *active_rows_device : static_cast<int>(gridDim.x);
+    if (active_rows <= 0 || active_rows > static_cast<int>(gridDim.x) ||
+        row >= active_rows)
+    {
+        return;
+    }
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     const int candidate_count = partial_blocks * k;
@@ -1457,14 +1940,31 @@ __global__ void cuda_sample_distribution_f32_kernel(
     const float *__restrict__ probs,
     int k,
     float threshold,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     float *__restrict__ out_probability)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
+
+    /*
+     * Request-batched GPU MTP keeps the mutable logical position in its
+     * publication mailbox. Reading that scalar here makes the random draw and
+     * the state it describes part of one ordered device stream. The ordinary
+     * scalar-threshold API remains available for nonresident callers.
+     */
+    const float effective_threshold =
+        threshold_position
+            ? llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                  threshold_seed,
+                  *threshold_position + threshold_position_offset,
+                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+            : threshold;
     *out_token =
         llaminar2::sampling_math::sample_distribution_with_threshold_and_probability(
-            token_ids, probs, k, threshold, out_probability);
+            token_ids, probs, k, effective_threshold, out_probability);
 }
 
 __global__ void cuda_speculative_verify_distribution_kernel(
@@ -1540,18 +2040,7 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_kernel(
     const float *__restrict__ draft_probs,
     int k,
     int distribution_stride,
-    int draft_token0,
-    int draft_token1,
-    int draft_token2,
-    int draft_token3,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchHostParameters parameters,
     int row_count,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
@@ -1562,28 +2051,6 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_kernel(
     if (row >= row_count)
         return;
 
-    int draft_token = draft_token0;
-    float accept_threshold = accept_threshold0;
-    float residual_threshold = residual_threshold0;
-    if (row == 1)
-    {
-        draft_token = draft_token1;
-        accept_threshold = accept_threshold1;
-        residual_threshold = residual_threshold1;
-    }
-    else if (row == 2)
-    {
-        draft_token = draft_token2;
-        accept_threshold = accept_threshold2;
-        residual_threshold = residual_threshold2;
-    }
-    else if (row == 3)
-    {
-        draft_token = draft_token3;
-        accept_threshold = accept_threshold3;
-        residual_threshold = residual_threshold3;
-    }
-
     const int offset = row * distribution_stride;
     llaminar2::sampling_math::speculative_verify_with_thresholds(
         target_token_ids + offset,
@@ -1591,9 +2058,9 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_kernel(
         draft_token_ids + offset,
         draft_probs + offset,
         k,
-        draft_token,
-        accept_threshold,
-        residual_threshold,
+        parameters.draft_tokens[row],
+        parameters.thresholds.accept[row],
+        parameters.thresholds.residual[row],
         out_token + row,
         out_accepted + row,
         out_accept_probability ? out_accept_probability + row : nullptr,
@@ -1604,10 +2071,11 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_kernel(
  * @brief Batched verifier variant whose draft tokens are already on device.
  *
  * This is the first device-resident-token step toward vLLM-style speculative
- * sampling. Each row may either receive host-generated thresholds as kernel
- * arguments or derive deterministic seeded thresholds directly on device.  The
- * accepted draft-token sequence is read from arena scratch produced by the
- * draft sampler instead of from host scalar arguments.
+ * sampling. Each row may receive explicit thresholds, derive seeded thresholds
+ * from a compatibility host position, or read the mutable base position from
+ * the device-resident publication mailbox. The accepted draft-token sequence
+ * is read from arena scratch produced by the draft sampler instead of from host
+ * scalar arguments.
  */
 __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tokens_kernel(
     const int *__restrict__ target_token_ids,
@@ -1618,14 +2086,7 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tok
     int distribution_stride,
     const int *__restrict__ sampled_draft_tokens,
     const float *__restrict__ sampled_draft_probabilities,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     int row_count,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
@@ -1633,6 +2094,8 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tok
     unsigned long long threshold_seed,
     int threshold_first_logical_position,
     int thresholds_from_seed,
+    const int *__restrict__ threshold_base_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -1642,37 +2105,40 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tok
     if (row >= row_count)
         return;
 
-    float accept_threshold = accept_threshold0;
-    float residual_threshold = residual_threshold0;
-    if (row == 1)
-    {
-        accept_threshold = accept_threshold1;
-        residual_threshold = residual_threshold1;
-    }
-    else if (row == 2)
-    {
-        accept_threshold = accept_threshold2;
-        residual_threshold = residual_threshold2;
-    }
-    else if (row == 3)
-    {
-        accept_threshold = accept_threshold3;
-        residual_threshold = residual_threshold3;
-    }
+    float accept_threshold = 0.0f;
+    float residual_threshold = 0.0f;
+
+    const int threshold_logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : threshold_first_logical_position + row;
+    const int inverse_sample_logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : inverse_sample_first_logical_position + row;
 
     if (thresholds_from_seed)
     {
-        const int logical_position = threshold_first_logical_position + row;
         accept_threshold =
             llaminar2::sampling_math::mtp_spec_threshold_from_seed(
                 threshold_seed,
-                logical_position,
+                threshold_logical_position,
                 1 /* MTPSpecStochasticDrawPurpose::Accept */);
         residual_threshold =
             llaminar2::sampling_math::mtp_spec_threshold_from_seed(
                 threshold_seed,
-                logical_position,
+                threshold_logical_position,
                 2 /* MTPSpecStochasticDrawPurpose::Residual */);
+    }
+    else
+    {
+        /*
+         * Explicit host thresholds are packed into bounded value-owned kernel
+         * parameters by the diagnostic wrapper. Seeded production rows never
+         * index this bounded payload, so their runtime depth is unrestricted.
+         */
+        accept_threshold = thresholds.accept[row];
+        residual_threshold = thresholds.residual[row];
     }
 
     const int offset = row * distribution_stride;
@@ -1688,7 +2154,7 @@ __global__ void cuda_speculative_verify_distribution_thresholds_batch_device_tok
                 sampled_draft_tokens[row],
                 accept_threshold,
                 inverse_sample_seed,
-                inverse_sample_first_logical_position + row,
+                inverse_sample_logical_position,
                 out_token + row,
                 out_accepted + row,
                 out_accept_probability ? out_accept_probability + row : nullptr,
@@ -2431,6 +2897,9 @@ __global__ void cuda_sample_processed_logits_if_speculative_batch_needs_bonus_f3
     int vocab_size,
     int row_stride,
     float threshold,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
     const int *__restrict__ verify_tokens,
     const int *__restrict__ verify_accepted,
     int row_count,
@@ -2494,6 +2963,14 @@ __global__ void cuda_sample_processed_logits_if_speculative_batch_needs_bonus_f3
     if (!should_sample_bonus)
         return;
 
+    const float effective_threshold =
+        threshold_position
+            ? llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                  threshold_seed,
+                  *threshold_position + threshold_position_offset,
+                  0 /* MTPSpecStochasticDrawPurpose::Sample */)
+            : threshold;
+
     cuda_processed_logit_row_stats_block<PROCESSED_LOGIT_VERIFY_THREADS>(
         logits,
         vocab_size,
@@ -2509,7 +2986,7 @@ __global__ void cuda_sample_processed_logits_if_speculative_batch_needs_bonus_f3
         max_logit,
         exp_sum,
         argmax_token,
-        threshold,
+        effective_threshold,
         scratch_vals,
         &selected_token);
 
@@ -2707,14 +3184,7 @@ __global__ void cuda_speculative_verify_processed_logits_thresholds_batch_device
     int target_row_stride,
     int draft_row_stride,
     const int *__restrict__ sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
-    float residual_threshold0,
-    float residual_threshold1,
-    float residual_threshold2,
-    float residual_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -2763,23 +3233,8 @@ __global__ void cuda_speculative_verify_processed_logits_thresholds_batch_device
             &draft_argmax);
     }
 
-    float accept_threshold = accept_threshold0;
-    float residual_threshold = residual_threshold0;
-    if (row == 1)
-    {
-        accept_threshold = accept_threshold1;
-        residual_threshold = residual_threshold1;
-    }
-    else if (row == 2)
-    {
-        accept_threshold = accept_threshold2;
-        residual_threshold = residual_threshold2;
-    }
-    else if (row == 3)
-    {
-        accept_threshold = accept_threshold3;
-        residual_threshold = residual_threshold3;
-    }
+    const float accept_threshold = thresholds.accept[row];
+    const float residual_threshold = thresholds.residual[row];
 
     if (tid == 0)
     {
@@ -3012,12 +3467,12 @@ __global__ void cuda_speculative_verify_processed_target_draft_probabilities_thr
     int target_row_stride,
     int draft_row_stride,
     const int *__restrict__ sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
+    int thresholds_from_seed,
+    const int *__restrict__ threshold_base_position,
+    int threshold_position_offset,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
     float *__restrict__ out_accept_probability,
@@ -3053,13 +3508,24 @@ __global__ void cuda_speculative_verify_processed_target_draft_probabilities_thr
         &target_sum,
         &target_argmax);
 
-    float accept_threshold = accept_threshold0;
-    if (row == 1)
-        accept_threshold = accept_threshold1;
-    else if (row == 2)
-        accept_threshold = accept_threshold2;
-    else if (row == 3)
-        accept_threshold = accept_threshold3;
+    float accept_threshold = 0.0f;
+
+    const int logical_position =
+        threshold_base_position
+            ? *threshold_base_position + threshold_position_offset + row
+            : inverse_sample_first_logical_position + row;
+    if (thresholds_from_seed)
+    {
+        accept_threshold =
+            llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                inverse_sample_seed,
+                logical_position,
+                1 /* MTPSpecStochasticDrawPurpose::Accept */);
+    }
+    else
+    {
+        accept_threshold = thresholds.accept[row];
+    }
 
     if (tid == 0)
     {
@@ -3107,7 +3573,7 @@ __global__ void cuda_speculative_verify_processed_target_draft_probabilities_thr
                 target_sum,
                 draft_token,
                 inverse_sample_seed,
-                inverse_sample_first_logical_position + row,
+                logical_position,
                 no_draft_probabilities != 0,
                 scratch_vals,
                 scratch_idxs);
@@ -3132,10 +3598,7 @@ __global__ void cuda_speculative_verify_processed_target_draft_logits_thresholds
     int draft_row_stride,
     const int *__restrict__ sampled_draft_tokens,
     const float *__restrict__ sampled_draft_probabilities,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     unsigned long long inverse_sample_seed,
     int inverse_sample_first_logical_position,
     int *__restrict__ out_token,
@@ -3187,13 +3650,7 @@ __global__ void cuda_speculative_verify_processed_target_draft_logits_thresholds
             &draft_argmax);
     }
 
-    float accept_threshold = accept_threshold0;
-    if (row == 1)
-        accept_threshold = accept_threshold1;
-    else if (row == 2)
-        accept_threshold = accept_threshold2;
-    else if (row == 3)
-        accept_threshold = accept_threshold3;
+    const float accept_threshold = thresholds.accept[row];
 
     if (tid == 0)
     {
@@ -3288,10 +3745,7 @@ __global__ void cuda_speculative_verify_probabilities_thresholds_batch_device_to
     int draft_row_stride,
     int inverse_sample_row_stride,
     const int *__restrict__ sampled_draft_tokens,
-    float accept_threshold0,
-    float accept_threshold1,
-    float accept_threshold2,
-    float accept_threshold3,
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters thresholds,
     int no_draft_probabilities,
     int *__restrict__ out_token,
     int *__restrict__ out_accepted,
@@ -3318,13 +3772,7 @@ __global__ void cuda_speculative_verify_probabilities_thresholds_batch_device_to
         inverse_rejection_samples +
         static_cast<size_t>(row) * inverse_sample_row_stride;
 
-    float accept_threshold = accept_threshold0;
-    if (row == 1)
-        accept_threshold = accept_threshold1;
-    else if (row == 2)
-        accept_threshold = accept_threshold2;
-    else if (row == 3)
-        accept_threshold = accept_threshold3;
+    const float accept_threshold = thresholds.accept[row];
 
     if (tid == 0)
     {
@@ -3390,9 +3838,9 @@ __global__ void cuda_speculative_verify_probabilities_thresholds_batch_device_to
 /**
  * @brief Reduce row-wise stochastic verifier results into one speculative commit plan.
  *
- * The kernel is deliberately one thread: MTP currently verifies at most four
- * rows, and making the reduction serial keeps the stop/rejection semantics
- * easy to audit while remaining graph-capturable.
+ * The kernel is deliberately one thread: the bounded verifier transaction has
+ * only a handful of rows, and making the reduction serial keeps stop/rejection
+ * semantics easy to audit while remaining graph-capturable.
  */
 __global__ void cuda_summarize_speculative_verify_batch_kernel(
     const int *__restrict__ verify_tokens,
@@ -3411,7 +3859,10 @@ __global__ void cuda_summarize_speculative_verify_batch_kernel(
     const int *__restrict__ bonus_token,
     int has_bonus_token,
     int *__restrict__ out_tokens,
-    int *__restrict__ out_meta)
+    int out_token_capacity,
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    int leading_committed_output_count)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3427,7 +3878,12 @@ __global__ void cuda_summarize_speculative_verify_batch_kernel(
         stop_token7};
     const int ready_token =
         has_bonus_token && bonus_token ? *bonus_token : -1;
-    llaminar2::sampling_math::summarize_speculative_verify_batch(
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(row_count + 1)
+            ? static_cast<int>(*max_state_commit_rows)
+            : row_count + 1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch_at_commit_boundary(
         first_token,
         verify_tokens,
         verify_accepted,
@@ -3436,8 +3892,12 @@ __global__ void cuda_summarize_speculative_verify_batch_kernel(
         stop_token_count,
         ready_token,
         has_bonus_token,
+        commit_budget,
         out_tokens,
-        out_meta);
+        out_token_capacity,
+        out_meta,
+        /*greedy_draft_tokens=*/nullptr,
+        leading_committed_output_count);
 }
 
 /**
@@ -3465,7 +3925,10 @@ __global__ void cuda_summarize_speculative_verify_batch_device_first_token_kerne
     const int *__restrict__ bonus_token,
     int has_bonus_token,
     int *__restrict__ out_tokens,
-    int *__restrict__ out_meta)
+    int out_token_capacity,
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    int leading_committed_output_count)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3482,7 +3945,12 @@ __global__ void cuda_summarize_speculative_verify_batch_device_first_token_kerne
     const int ready_token =
         has_bonus_token && bonus_token ? *bonus_token : -1;
     const int sampled_first_token = first_token ? *first_token : -1;
-    llaminar2::sampling_math::summarize_speculative_verify_batch(
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(row_count + 1)
+            ? static_cast<int>(*max_state_commit_rows)
+            : row_count + 1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch_at_commit_boundary(
         sampled_first_token,
         verify_tokens,
         verify_accepted,
@@ -3491,8 +3959,369 @@ __global__ void cuda_summarize_speculative_verify_batch_device_first_token_kerne
         stop_token_count,
         ready_token,
         has_bonus_token,
+        commit_budget,
         out_tokens,
-        out_meta);
+        out_token_capacity,
+        out_meta,
+        /*greedy_draft_tokens=*/nullptr,
+        leading_committed_output_count);
+}
+
+/**
+ * @brief Reduce a generation transaction using only resident mutable controls.
+ *
+ * Request admission publishes the fixed stop-token row once.  The generation
+ * controller is then the sole authority for both the current serial-visible
+ * commit budget and the pending-correction carry bit.  Keeping those reads in
+ * this kernel gives captured graph replay a stable parameter block and prevents
+ * a host transaction shadow from selecting a different compact-row boundary.
+ *
+ * Exactly one row-comparison source is present.  Probability rejection supplies
+ * @p verify_accepted; seeded serial-equivalent generation supplies
+ * @p greedy_draft_tokens and compares the sampled target rows byte-for-byte.
+ */
+__global__ void
+cuda_summarize_speculative_verify_batch_device_generation_controls_kernel(
+    const int *__restrict__ verify_tokens,
+    const int *__restrict__ verify_accepted,
+    const int *__restrict__ greedy_draft_tokens,
+    int row_count,
+    const int *__restrict__ first_token,
+    const int *__restrict__ stop_tokens,
+    const int *__restrict__ bonus_token,
+    int has_bonus_token,
+    const int *__restrict__ generation_control,
+    int *__restrict__ out_tokens,
+    int out_token_capacity,
+    int *__restrict__ out_meta)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    const int ready_token =
+        has_bonus_token && bonus_token ? *bonus_token : -1;
+    const int commit_budget =
+        generation_control
+            ? generation_control[llaminar2::sampling_math::
+                                     kDeviceGenerationControlTransactionCommitBudget]
+            : 0;
+    const int leading_committed_output_count =
+        generation_control
+            ? generation_control[llaminar2::sampling_math::
+                                     kDeviceGenerationControlNextLeadingCommittedOutputCount]
+            : -1;
+    llaminar2::sampling_math::summarize_speculative_verify_batch_at_commit_boundary(
+        first_token ? *first_token : -1,
+        verify_tokens,
+        verify_accepted,
+        row_count,
+        stop_tokens,
+        llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
+        ready_token,
+        has_bonus_token,
+        commit_budget,
+        out_tokens,
+        out_token_capacity,
+        out_meta,
+        greedy_draft_tokens,
+        leading_committed_output_count);
+}
+
+/**
+ * @brief Fused seeded sampling and serial-equivalent speculative reduction.
+ *
+ * MTP admits at most fifteen speculative comparison rows, plus one bonus row.
+ * One CUDA lane owns each compact row and executes the canonical scalar scan in
+ * SamplingMath, preserving exactly the floating-point addition order used by
+ * serial decode. A block barrier then makes the sampled row vector visible to
+ * lane zero, which performs the ordinary compact transaction reduction.
+ *
+ * This is intentionally one warp and one block. The operation is launch- and
+ * dependency-latency bound; increasing the grid would require global
+ * coordination, atomics, or a second kernel. No local-memory scratch is used.
+ */
+template <bool RetainFirstTransactionDiagnostic>
+__global__ __launch_bounds__(32, 1) void
+cuda_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
+    const int *__restrict__ target_token_ids,
+    const float *__restrict__ target_probs,
+    int target_row_stride,
+    int top_k,
+    int row_count,
+    unsigned long long threshold_seed,
+    const int *__restrict__ threshold_position,
+    int threshold_position_offset,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ stop_tokens,
+    const int *__restrict__ generation_control,
+    int *__restrict__ sampled_target_tokens,
+    int *__restrict__ out_tokens,
+    int out_token_capacity,
+    int *__restrict__ out_meta,
+    llaminar2::sampling_math::MTPFirstTransactionDiagnosticRecord
+        *__restrict__ first_transaction_diagnostic)
+{
+    constexpr int kMaxSampleRows = 16;
+    __shared__ int sampled_rows[kMaxSampleRows];
+    __shared__ int active_comparison_rows;
+
+    const int sample_row = static_cast<int>(threadIdx.x);
+    if (sample_row == 0)
+    {
+        const int controller_depth =
+            generation_control[
+                llaminar2::sampling_math::
+                    kDeviceGenerationControlCurrentDraftDepth];
+        const int controller_verifier_rows =
+            generation_control[
+                llaminar2::sampling_math::
+                    kDeviceGenerationControlActiveVerifierRowCount];
+        const bool valid_depth =
+            generation_control[
+                llaminar2::sampling_math::kDeviceGenerationControlOk] != 0 &&
+            controller_depth >= 1 && controller_depth <= row_count &&
+            controller_verifier_rows == controller_depth + 1;
+        active_comparison_rows = valid_depth ? controller_depth : 0;
+        if (!valid_depth)
+        {
+            llaminar2::sampling_math::fail_device_generation_control(
+                const_cast<int *>(generation_control),
+                llaminar2::sampling_math::
+                    DeviceGenerationError::InvalidDepthSelector);
+            llaminar2::sampling_math::
+                initialize_invalid_speculative_batch_outcome(
+                    out_tokens,
+                    out_token_capacity,
+                    out_meta);
+            if constexpr (RetainFirstTransactionDiagnostic)
+            {
+                if (first_transaction_diagnostic)
+                    first_transaction_diagnostic->valid = 0;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (active_comparison_rows == 0)
+    {
+        if (sample_row < kMaxSampleRows)
+            sampled_target_tokens[sample_row] = -1;
+        return;
+    }
+
+    const int sample_row_count = active_comparison_rows + 1;
+    const int transaction_count =
+        generation_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlTransactionCount];
+    const bool retain_first_transaction =
+        RetainFirstTransactionDiagnostic &&
+        first_transaction_diagnostic &&
+        transaction_count == 0;
+    if (sample_row < kMaxSampleRows)
+    {
+        const bool active = sample_row < sample_row_count;
+        float threshold = 0.0f;
+        int sampled = -1;
+        if (active)
+        {
+            threshold =
+                llaminar2::sampling_math::mtp_spec_threshold_from_seed(
+                    threshold_seed,
+                    *threshold_position + threshold_position_offset +
+                        sample_row,
+                    0 /* MTPSpecStochasticDrawPurpose::Sample */);
+            sampled =
+                llaminar2::sampling_math::
+                    sample_distribution_with_threshold(
+                        target_token_ids +
+                            sample_row * target_row_stride,
+                        target_probs + sample_row * target_row_stride,
+                        top_k,
+                        threshold);
+            sampled_rows[sample_row] = sampled;
+            sampled_target_tokens[sample_row] = sampled;
+        }
+        else
+        {
+            sampled_rows[sample_row] = -1;
+            sampled_target_tokens[sample_row] = -1;
+        }
+        if constexpr (RetainFirstTransactionDiagnostic)
+        {
+            if (retain_first_transaction)
+            {
+                llaminar2::sampling_math::
+                    record_mtp_first_transaction_sample_row(
+                        first_transaction_diagnostic,
+                        sample_row,
+                        active,
+                        active
+                            ? target_token_ids +
+                                  sample_row * target_row_stride
+                            : nullptr,
+                        active
+                            ? target_probs +
+                                  sample_row * target_row_stride
+                            : nullptr,
+                        top_k,
+                        verifier_input_tokens,
+                        active_comparison_rows,
+                        threshold,
+                        sampled);
+            }
+        }
+    }
+    __syncthreads();
+
+    if (sample_row != 0)
+        return;
+
+    const int commit_budget =
+        generation_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlTransactionCommitBudget];
+    const int leading_committed_output_count =
+        generation_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlNextLeadingCommittedOutputCount];
+    llaminar2::sampling_math::
+        summarize_speculative_verify_batch_at_commit_boundary(
+            verifier_input_tokens[0],
+            sampled_rows,
+            /*row_accepted=*/nullptr,
+            active_comparison_rows,
+            stop_tokens,
+            llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
+            sampled_rows[active_comparison_rows],
+            /*has_bonus_ready_token=*/1,
+            commit_budget,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            verifier_input_tokens,
+            leading_committed_output_count);
+
+    if constexpr (RetainFirstTransactionDiagnostic)
+    {
+        if (retain_first_transaction)
+        {
+            llaminar2::sampling_math::
+                finalize_mtp_first_transaction_diagnostic(
+                    first_transaction_diagnostic,
+                    threshold_seed,
+                    *threshold_position,
+                    threshold_position_offset,
+                    active_comparison_rows,
+                    top_k,
+                    transaction_count,
+                    commit_budget,
+                    leading_committed_output_count,
+                    out_tokens,
+                    out_token_capacity,
+                    out_meta);
+        }
+    }
+}
+
+/**
+ * @brief Retain one sidecar boundary before its shared workspace is reused.
+ *
+ * One block hashes strided 32-bit words in parallel.  Lane zero folds the
+ * lane-local hashes in a fixed order, giving identical bytes an identical
+ * digest independent of scheduling.  This kernel is present only in an
+ * explicitly diagnostic graph; the production publication specialization has
+ * no corresponding launch or branch.
+ */
+__global__ __launch_bounds__(256, 1) void
+cuda_retain_mtp_first_transaction_draft_boundary_kernel(
+    const uint32_t *__restrict__ data_words,
+    int word_count,
+    int boundary,
+    int draft_slot,
+    const int *__restrict__ condition_token,
+    const int *__restrict__ position_id,
+    const int *__restrict__ generation_control,
+    int generation_control_stride,
+    llaminar2::sampling_math::MTPFirstTransactionDiagnosticRecord
+        *__restrict__ diagnostic)
+{
+    using namespace llaminar2::sampling_math;
+    constexpr int kThreads = 256;
+    __shared__ unsigned long long lane_hashes[kThreads];
+
+    if (!generation_control || !diagnostic || generation_control_stride <
+            kDeviceGenerationControlCount ||
+        generation_control[kDeviceGenerationControlTransactionCount] != 0)
+    {
+        return;
+    }
+
+    const int lane = static_cast<int>(threadIdx.x);
+    uint64_t hash = 1469598103934665603ULL ^
+                    static_cast<uint64_t>(lane + 1);
+    for (int index = lane; index < word_count; index += kThreads)
+    {
+        hash = append_diagnostic_u32_fnv1a(
+            hash,
+            static_cast<uint32_t>(index));
+        hash = append_diagnostic_u32_fnv1a(hash, data_words[index]);
+    }
+    lane_hashes[lane] = hash;
+    __syncthreads();
+
+    if (lane != 0)
+        return;
+
+    if (draft_slot == 0 && boundary == 0)
+    {
+        diagnostic->valid = 0;
+        diagnostic->version = kMTPFirstTransactionDiagnosticVersion;
+        diagnostic->draft_diagnostic_depth = 0;
+        for (int slot = 0; slot < kSpeculativeBatchMaxRows; ++slot)
+        {
+            diagnostic->draft_condition_tokens[slot] = -1;
+            diagnostic->draft_position_ids[slot] = -1;
+            for (int retained_boundary = 0;
+                 retained_boundary < kMTPFirstTransactionDraftBoundaryCount;
+                 ++retained_boundary)
+            {
+                diagnostic->draft_boundary_word_counts[slot]
+                                                       [retained_boundary] = 0;
+                diagnostic->draft_boundary_hashes[slot]
+                                                   [retained_boundary] = 0;
+            }
+        }
+    }
+
+    if (boundary == 0)
+    {
+        diagnostic->draft_condition_tokens[draft_slot] = *condition_token;
+        diagnostic->draft_position_ids[draft_slot] = *position_id;
+        diagnostic->draft_diagnostic_depth = draft_slot + 1;
+    }
+
+    uint64_t folded = 1469598103934665603ULL;
+    if (word_count > 0)
+    {
+        for (int source_lane = 0; source_lane < kThreads; ++source_lane)
+        {
+            const uint64_t lane_hash = lane_hashes[source_lane];
+            folded = append_diagnostic_u32_fnv1a(
+                folded,
+                static_cast<uint32_t>(lane_hash));
+            folded = append_diagnostic_u32_fnv1a(
+                folded,
+                static_cast<uint32_t>(lane_hash >> 32U));
+        }
+    }
+    else
+    {
+        folded = 0;
+    }
+    diagnostic->draft_boundary_word_counts[draft_slot][boundary] =
+        static_cast<uint32_t>(word_count);
+    diagnostic->draft_boundary_hashes[draft_slot][boundary] = folded;
 }
 
 /**
@@ -3518,7 +4347,10 @@ __global__ void cuda_summarize_greedy_speculative_verify_batch_kernel(
     int stop_token7,
     int stop_token_count,
     int *__restrict__ out_tokens,
-    int *__restrict__ out_meta)
+    int out_token_capacity,
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    int leading_committed_output_count)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
@@ -3533,15 +4365,1023 @@ __global__ void cuda_summarize_greedy_speculative_verify_batch_kernel(
         stop_token6,
         stop_token7};
     const int sampled_first_token = draft_tokens ? draft_tokens[0] : first_token;
-    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch(
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(compare_row_count + 1)
+            ? static_cast<int>(*max_state_commit_rows)
+            : compare_row_count + 1;
+    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch_at_commit_boundary(
         sampled_first_token,
         verify_tokens,
         draft_tokens,
         compare_row_count,
         stop_tokens,
         stop_token_count,
+        commit_budget,
         out_tokens,
-        out_meta);
+        out_token_capacity,
+        out_meta,
+        leading_committed_output_count);
+}
+
+/**
+ * @brief Graph-replayable greedy reducer with all mutable controls on device.
+ *
+ * The verifier input row owns the first target token and the fixed stop-token
+ * row owns eight entries with `-1` padding.  Reading both in the kernel keeps a
+ * cached CUDA graph valid when request values change between launches.
+ */
+__global__ void
+cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel(
+    const int *__restrict__ verify_tokens,
+    const int *__restrict__ draft_tokens,
+    int compare_row_count,
+    const int *__restrict__ active_verifier_row_count,
+    const int *__restrict__ stop_tokens,
+    int *__restrict__ out_tokens,
+    int out_token_capacity,
+    int *__restrict__ out_meta,
+    const uint32_t *__restrict__ max_state_commit_rows,
+    const int *__restrict__ next_leading_committed_output_count)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    const int active_rows = *active_verifier_row_count;
+    if (active_rows <= 0 || active_rows > compare_row_count + 1)
+    {
+        for (int token = 0; token < out_token_capacity; ++token)
+            out_tokens[token] = -1;
+        for (int field = 0;
+             field < llaminar2::sampling_math::kSpeculativeBatchMetaCount;
+             ++field)
+        {
+            out_meta[field] = 0;
+        }
+        return;
+    }
+
+    /*
+     * compare_row_count is the immutable physical bucket geometry captured in
+     * the graph.  The request-owned scalar supplies the logical verifier width
+     * for this replay, so padded rows never participate in acceptance or bonus
+     * token selection.
+     */
+    const int active_compare_row_count = active_rows - 1;
+    const int commit_budget =
+        max_state_commit_rows && *max_state_commit_rows <
+                                     static_cast<uint32_t>(active_rows)
+            ? static_cast<int>(*max_state_commit_rows)
+            : active_rows;
+    /*
+     * Response-ledger carry state is owned by the device generation
+     * controller.  It must not be inferred from penalty-history membership:
+     * history can include row zero before that row has crossed the response
+     * transaction boundary, and the two lifecycles intentionally diverge.
+     */
+    const int leading_committed_output_count =
+        *next_leading_committed_output_count;
+    llaminar2::sampling_math::summarize_greedy_speculative_verify_batch_at_commit_boundary(
+        draft_tokens[0],
+        verify_tokens,
+        draft_tokens,
+        active_compare_row_count,
+        stop_tokens,
+        llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens,
+        commit_budget,
+        out_tokens,
+        out_token_capacity,
+        out_meta,
+        leading_committed_output_count);
+}
+
+/**
+ * @brief Advance one shared decode-round boundary from compact request rows.
+ *
+ * Request summaries are produced sequentially on the verifier stream and all
+ * read the same pre-transaction budget. The largest committed-state count is
+ * the number of lockstep serial decode rounds represented by the batch.
+ */
+__global__ void cuda_advance_speculative_commit_boundary_kernel(
+    const int *__restrict__ meta,
+    int request_count,
+    int meta_stride,
+    uint32_t *__restrict__ decode_rounds_committed,
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!meta || request_count <= 0 ||
+        meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+        !decode_rounds_committed ||
+        !decode_rounds_until_maintenance ||
+        !maintenance_due || !decode_boundary_advanced ||
+        *maintenance_due != 0u || *decode_boundary_advanced != 0u)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+
+    uint32_t committed_rounds = 0u;
+    for (int request = 0; request < request_count; ++request)
+    {
+        const int *request_meta =
+            meta + static_cast<size_t>(request) * meta_stride;
+        if (request_meta[llaminar2::sampling_math::kSpecBatchMetaOk] == 0)
+        {
+            *maintenance_due = 2u;
+            return;
+        }
+        const int request_commits =
+            llaminar2::sampling_math::speculative_new_commit_count(
+                request_meta[llaminar2::sampling_math::kSpecBatchMetaOutputCount],
+                request_meta[llaminar2::sampling_math::kSpecBatchMetaLeadingCommittedOutputCount]);
+        if (request_commits < 0)
+        {
+            *maintenance_due = 2u;
+            return;
+        }
+        committed_rounds = max(
+            committed_rounds,
+            static_cast<uint32_t>(request_commits));
+    }
+
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (committed_rounds > remaining)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+    *decode_rounds_committed += committed_rounds;
+    *decode_rounds_until_maintenance = remaining - committed_rounds;
+    if (committed_rounds == remaining)
+        *maintenance_due = 1u;
+    *decode_boundary_advanced = 1u;
+}
+
+/**
+ * @brief Publish one ordinary serial decode boundary into the shared clock.
+ *
+ * A pre-existing marker means grouped MTP already published this exact edge;
+ * the kernel then validates the pair and returns without advancing again.
+ */
+__global__ void cuda_publish_serial_decode_commit_boundary_kernel(
+    uint32_t *__restrict__ decode_rounds_committed,
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!decode_rounds_committed ||
+        !decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+
+    const uint32_t due = *maintenance_due;
+    const uint32_t advanced = *decode_boundary_advanced;
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (advanced > 1u || due > 1u)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+    if (advanced == 1u)
+    {
+        const bool valid_existing_edge =
+            (due == 0u && remaining > 0u) ||
+            (due == 1u && remaining == 0u);
+        if (!valid_existing_edge)
+            *maintenance_due = 2u;
+        return;
+    }
+    if (due != 0u || remaining == 0u ||
+        *decode_rounds_committed == 0xffffffffu)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+
+    ++(*decode_rounds_committed);
+    *decode_rounds_until_maintenance = remaining - 1u;
+    if (remaining == 1u)
+        *maintenance_due = 1u;
+    *decode_boundary_advanced = 1u;
+}
+
+/** Retire only a non-due published edge after the conditional child. */
+__global__ void cuda_acknowledge_decode_commit_boundary_kernel(
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+    const uint32_t due = *maintenance_due;
+    const uint32_t advanced = *decode_boundary_advanced;
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (due == 0u && remaining > 0u && advanced <= 1u)
+    {
+        *decode_boundary_advanced = 0u;
+        return;
+    }
+    if (due == 1u && remaining == 0u && advanced == 1u)
+        return;
+    *maintenance_due = 2u;
+}
+
+/** Bind one persistent MoE scheduler ticket to the active request lifecycle. */
+__global__ void cuda_initialize_device_moe_rebalance_dispatch_ticket_kernel(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    uint32_t participant_id,
+    uint32_t participant_count,
+    llaminar2::DeviceMoERebalanceDispatchTicket *__restrict__ ticket)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !ticket)
+        return;
+
+    llaminar2::DeviceMoERebalanceDispatchTicket initialized{};
+    initialized.magic =
+        llaminar2::DeviceMoERebalanceDispatchTicket::kMagic;
+    initialized.abi_version =
+        llaminar2::DeviceMoERebalanceDispatchTicket::kABIVersion;
+    initialized.session_epoch_low = static_cast<uint32_t>(session_epoch);
+    initialized.session_epoch_high =
+        static_cast<uint32_t>(session_epoch >> 32u);
+    initialized.workspace_generation_low =
+        static_cast<uint32_t>(workspace_generation);
+    initialized.workspace_generation_high =
+        static_cast<uint32_t>(workspace_generation >> 32u);
+    initialized.participant_id = participant_id;
+    initialized.participant_count = participant_count;
+    *ticket = initialized;
+}
+
+/** Pack only the cadence decision consumed by HIP's rank scheduler. */
+__global__ void cuda_publish_device_moe_rebalance_dispatch_ticket_kernel(
+    const uint32_t *__restrict__ controller_magic,
+    const uint32_t *__restrict__ controller_version,
+    const uint32_t *__restrict__ controller_error,
+    const uint32_t *__restrict__ decode_rounds_committed,
+    const uint32_t *__restrict__ decode_rounds_until_maintenance,
+    const uint32_t *__restrict__ maintenance_due,
+    const uint32_t *__restrict__ decode_boundary_advanced,
+    llaminar2::DeviceMoERebalanceDispatchTicket *__restrict__ ticket)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !ticket)
+        return;
+
+    const bool pointers_valid = controller_magic && controller_version &&
+                                controller_error && decode_rounds_committed &&
+                                decode_rounds_until_maintenance &&
+                                maintenance_due && decode_boundary_advanced;
+    const uint32_t version =
+        pointers_valid ? *controller_version : 0u;
+    const uint32_t error = pointers_valid ? *controller_error : 0xffffffffu;
+    const uint32_t committed =
+        pointers_valid ? *decode_rounds_committed : 0u;
+    const uint32_t remaining =
+        pointers_valid ? *decode_rounds_until_maintenance : 0u;
+    const uint32_t due = pointers_valid ? *maintenance_due : 2u;
+    const uint32_t advanced =
+        pointers_valid ? *decode_boundary_advanced : 2u;
+    /* Keep the ticket ABI backend-symmetric even though CUDA normally consumes
+     * this state through a native conditional graph.  A non-due boundary may
+     * already have been acknowledged when a diagnostic ticket is published. */
+    const bool boundary_valid =
+        pointers_valid &&
+        *controller_magic == 0x4d4f4552u &&
+        version == llaminar2::moe_rebalance_abi::kVersion && error == 0u &&
+        due <= 1u && advanced <= 1u &&
+        ((due != 0u && advanced == 1u && remaining == 0u) ||
+         (due == 0u && remaining > 0u));
+
+    ticket->healthy = boundary_valid ? 1u : 0u;
+    ticket->controller_version = version;
+    ticket->decode_rounds_committed = committed;
+    ticket->decode_rounds_until_maintenance = remaining;
+    ticket->maintenance_due = due <= 1u ? due : 0u;
+    ticket->decode_boundary_advanced = advanced <= 1u ? advanced : 0u;
+    ticket->error_code = error;
+    __threadfence_system();
+}
+
+/**
+ * @brief Publish one request's immutable grouped-greedy controls on device.
+ */
+__global__ void cuda_configure_mtp_greedy_penalty_policy_kernel(
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ controls,
+    float presence_penalty,
+    float frequency_penalty,
+    int first_token_already_in_history)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    controls->presence_penalty = presence_penalty;
+    controls->frequency_penalty = frequency_penalty;
+    controls->first_token_already_in_history =
+        first_token_already_in_history != 0 ? 1 : 0;
+    controls->enabled =
+        presence_penalty != 0.0f || frequency_penalty != 0.0f ? 1 : 0;
+}
+
+/**
+ * @brief Apply durable-history penalties when no verifier prefix is present.
+ *
+ * This is the latency-critical M=1 specialization. Adjacent threads own
+ * adjacent vocabulary tokens and reuse one computed penalty across every row.
+ * Keeping verifier-prefix control flow out of this kernel preserves the small
+ * register footprint and launch latency of ordinary serial decode.
+ */
+__global__ void cuda_apply_mtp_durable_penalties_f32_rows_kernel(
+    float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device)
+{
+    const int active_rows = active_rows_device ? *active_rows_device : rows;
+    if (active_rows <= 0 || active_rows > rows)
+        return;
+
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    for (int token = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+         token < cols;
+         token += static_cast<int>(blockDim.x * gridDim.x))
+    {
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        for (int row = 0; row < active_rows; ++row)
+        {
+            data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)] -= penalty;
+        }
+    }
+}
+
+/**
+ * @brief Apply device-owned serial-decode penalties to verifier logit rows.
+ *
+ * Threads traverse adjacent vocabulary tokens, yielding coalesced histogram
+ * reads and in-place logit writes. A token that occurs anywhere in the short
+ * verifier branch is deliberately left for sparse row owners in block zero.
+ * All other tokens have the same durable-history count in every row, so one
+ * thread can apply their penalties to all rows after scanning the branch
+ * exactly once.
+ *
+ * This ownership split reduces the verifier work from O(rows^2 * vocabulary)
+ * token comparisons to O(rows * vocabulary), while retaining one writer for
+ * every output element. The sparse owners and dense owners touch disjoint
+ * token addresses, so they can share one kernel launch without a grid-wide
+ * barrier. The operation needs no atomics or temporary storage.
+ */
+__global__ void cuda_apply_mtp_verifier_penalties_f32_rows_kernel(
+    float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    const int *__restrict__ verifier_input_tokens,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ active_rows_device)
+{
+    const int active_rows = active_rows_device ? *active_rows_device : rows;
+    if (active_rows <= 0 || active_rows > rows)
+        return;
+
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    const int prefix_begin =
+        request_policy.first_token_already_in_history != 0 ? 1 : 0;
+
+    // A verifier launch reserves block zero for sparse branch-token ownership.
+    // It executes concurrently with all dense blocks, and then exits because
+    // dense blocks deliberately skip every address this block can modify.
+    if (blockIdx.x == 0)
+    {
+        for (int row = static_cast<int>(threadIdx.x);
+             row < active_rows;
+             row += static_cast<int>(blockDim.x))
+        {
+            for (int candidate_index = prefix_begin;
+                 candidate_index < active_rows;
+                 ++candidate_index)
+            {
+                const int token = verifier_input_tokens[candidate_index];
+                if (token < 0 || token >= cols)
+                    continue;
+
+                bool already_processed = false;
+                for (int earlier = prefix_begin;
+                     earlier < candidate_index;
+                     ++earlier)
+                {
+                    already_processed |=
+                        verifier_input_tokens[earlier] == token;
+                }
+                if (already_processed)
+                    continue;
+
+                int count = generated_token_counts[token];
+                for (int visible = prefix_begin; visible <= row; ++visible)
+                    count += verifier_input_tokens[visible] == token ? 1 : 0;
+                if (count <= 0)
+                    continue;
+
+                float penalty = 0.0f;
+                if (request_policy.presence_penalty != 0.0f)
+                    penalty += request_policy.presence_penalty;
+                if (request_policy.frequency_penalty != 0.0f)
+                {
+                    penalty += request_policy.frequency_penalty *
+                               static_cast<float>(count);
+                }
+                data[static_cast<size_t>(row) *
+                         static_cast<size_t>(row_stride) +
+                     static_cast<size_t>(token)] -= penalty;
+            }
+        }
+        return;
+    }
+
+    const int dense_block = static_cast<int>(blockIdx.x) - 1;
+    const int dense_blocks = static_cast<int>(gridDim.x) - 1;
+    for (int token = dense_block * static_cast<int>(blockDim.x) +
+                     static_cast<int>(threadIdx.x);
+         token < cols;
+         token += static_cast<int>(blockDim.x) * dense_blocks)
+    {
+        bool verifier_branch_token = false;
+        for (int history_index = prefix_begin;
+             history_index < active_rows;
+             ++history_index)
+        {
+            verifier_branch_token |=
+                verifier_input_tokens[history_index] == token;
+        }
+        if (verifier_branch_token)
+            continue;
+
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        for (int row = 0; row < active_rows; ++row)
+        {
+            data[static_cast<size_t>(row) * static_cast<size_t>(row_stride) +
+                 static_cast<size_t>(token)] -= penalty;
+        }
+    }
+
+}
+
+/**
+ * @brief Return one token from the scalar MTP proposal branch.
+ *
+ * The first condition token lives in the full-sidecar capture slot while all
+ * later branch tokens live in contiguous draft sample slots.  Treating those
+ * two persistent owners as one logical row avoids staging a temporary verifier
+ * prefix merely to score the next proposal.
+ */
+__device__ __forceinline__ int cuda_mtp_branch_token_at(
+    int branch_index,
+    int include_first_condition,
+    const int *__restrict__ first_condition_token,
+    const int *__restrict__ prior_draft_tokens)
+{
+    if (include_first_condition != 0 && branch_index == 0)
+        return first_condition_token[0];
+    return prior_draft_tokens[
+        branch_index - (include_first_condition != 0 ? 1 : 0)];
+}
+
+/**
+ * @brief Apply durable plus speculative-branch penalties to one proposal row.
+ *
+ * Block zero owns every vocabulary address mentioned by the short branch and
+ * deduplicates repeated token ids.  All remaining blocks own the dense durable
+ * histogram addresses and skip branch tokens.  The two ownership sets are
+ * disjoint, so they may execute concurrently without atomics or a grid barrier.
+ */
+__global__ void cuda_apply_mtp_branch_penalties_f32_row_kernel(
+    float *__restrict__ data,
+    int cols,
+    const int *__restrict__ first_condition_token,
+    const int *__restrict__ prior_draft_tokens,
+    int prior_draft_count,
+    const int *__restrict__ generated_token_counts,
+    const llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy)
+{
+    const llaminar2::MTPGreedyPenaltyPolicy request_policy = *policy;
+    if (request_policy.enabled == 0)
+        return;
+
+    const int include_first_condition =
+        request_policy.first_token_already_in_history == 0 ? 1 : 0;
+    const int branch_count = include_first_condition + prior_draft_count;
+
+    if (blockIdx.x == 0)
+    {
+        for (int branch_index = static_cast<int>(threadIdx.x);
+             branch_index < branch_count;
+             branch_index += static_cast<int>(blockDim.x))
+        {
+            const int token = cuda_mtp_branch_token_at(
+                branch_index,
+                include_first_condition,
+                first_condition_token,
+                prior_draft_tokens);
+            if (token < 0 || token >= cols)
+                continue;
+
+            bool already_processed = false;
+            for (int earlier = 0; earlier < branch_index; ++earlier)
+            {
+                already_processed |=
+                    cuda_mtp_branch_token_at(
+                        earlier,
+                        include_first_condition,
+                        first_condition_token,
+                        prior_draft_tokens) == token;
+            }
+            if (already_processed)
+                continue;
+
+            int count = generated_token_counts[token];
+            for (int visible = 0; visible < branch_count; ++visible)
+            {
+                count += cuda_mtp_branch_token_at(
+                             visible,
+                             include_first_condition,
+                             first_condition_token,
+                             prior_draft_tokens) == token
+                             ? 1
+                             : 0;
+            }
+            if (count <= 0)
+                continue;
+
+            float penalty = 0.0f;
+            if (request_policy.presence_penalty != 0.0f)
+                penalty += request_policy.presence_penalty;
+            if (request_policy.frequency_penalty != 0.0f)
+            {
+                penalty += request_policy.frequency_penalty *
+                           static_cast<float>(count);
+            }
+            data[token] -= penalty;
+        }
+        return;
+    }
+
+    const int dense_block = static_cast<int>(blockIdx.x) - 1;
+    const int dense_blocks = static_cast<int>(gridDim.x) - 1;
+    for (int token = dense_block * static_cast<int>(blockDim.x) +
+                     static_cast<int>(threadIdx.x);
+         token < cols;
+         token += dense_blocks * static_cast<int>(blockDim.x))
+    {
+        bool branch_owned = false;
+        for (int branch_index = 0;
+             branch_index < branch_count;
+             ++branch_index)
+        {
+            branch_owned |=
+                cuda_mtp_branch_token_at(
+                    branch_index,
+                    include_first_condition,
+                    first_condition_token,
+                    prior_draft_tokens) == token;
+        }
+        if (branch_owned)
+            continue;
+
+        const int count = generated_token_counts[token];
+        if (count <= 0)
+            continue;
+
+        float penalty = 0.0f;
+        if (request_policy.presence_penalty != 0.0f)
+            penalty += request_policy.presence_penalty;
+        if (request_policy.frequency_penalty != 0.0f)
+        {
+            penalty += request_policy.frequency_penalty *
+                       static_cast<float>(count);
+        }
+        data[token] -= penalty;
+    }
+}
+
+/**
+ * @brief Advance the generated-token histogram from the compact outcome.
+ *
+ * A single thread owns the short row, so duplicate tokens are updated in
+ * deterministic program order without atomics.  Pending-condition row zero was
+ * emitted by the previous transaction and is deliberately skipped.
+ */
+__global__ void cuda_commit_mtp_greedy_penalty_history_kernel(
+    const int *__restrict__ output_tokens,
+    const int *__restrict__ output_meta,
+    llaminar2::MTPGreedyPenaltyPolicy *__restrict__ policy,
+    const int *__restrict__ accepted_state_counts,
+    const int *__restrict__ stopped_flags,
+    int output_token_capacity,
+    int vocab_size,
+    int *__restrict__ generated_token_counts)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (output_meta[llaminar2::sampling_math::kSpecBatchMetaOk] == 0)
+        return;
+
+    if (policy->enabled == 0)
+    {
+        policy->first_token_already_in_history = 0;
+        return;
+    }
+
+    int output_count =
+        output_meta[llaminar2::sampling_math::kSpecBatchMetaOutputCount];
+    if (output_count < 0)
+        output_count = 0;
+    if (output_count > output_token_capacity)
+        output_count = output_token_capacity;
+    const int accepted_state_count = accepted_state_counts[0];
+    if (accepted_state_count < 0 || accepted_state_count > output_count)
+        return;
+    const int begin =
+        policy->first_token_already_in_history != 0 ? 1 : 0;
+    for (int i = begin; i < output_count; ++i)
+    {
+        const int token = output_tokens[i];
+        if (token >= 0 && token < vocab_size)
+            ++generated_token_counts[token];
+    }
+
+    policy->first_token_already_in_history =
+        stopped_flags[0] == 0 && output_count > accepted_state_count ? 1 : 0;
+}
+
+/**
+ * @brief Publish one ordinary sample per independent resident request.
+ *
+ * One lane owns each response/continuation transition; the block spans requests,
+ * not vocabulary elements. CUDA and HIP use the identical shared transition,
+ * including failure atomicity and sampler-free forward-only publication.
+ */
+__global__ void cuda_publish_ordinary_generation_sample_kernel(
+    llaminar2::sampling_math::OrdinaryGenerationPublication publication)
+{
+    using namespace llaminar2::sampling_math;
+    const size_t request = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (request >= static_cast<size_t>(publication.request_count))
+        return;
+    (void)publish_ordinary_generation_request(publication, request);
+}
+
+/**
+ * @brief Initialize one persistent device-generation controller per request.
+ *
+ * The response payload is intentionally left untouched.  Its authoritative
+ * length starts at zero, so clearing a potentially long context-sized token row
+ * would add request-admission bandwidth without changing any observable state.
+ */
+__global__ void cuda_initialize_device_generation_kernel(
+    int request_count,
+    int max_new_tokens,
+    llaminar2::sampling_math::DeviceGenerationPolicy depth_policy,
+    llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
+        initial_leading_row_disposition,
+    int response_token_stride,
+    int control_stride,
+    int *__restrict__ control)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    llaminar2::sampling_math::initialize_device_generation_control(
+        max_new_tokens,
+        response_token_stride,
+        depth_policy,
+        request_control,
+        initial_leading_row_disposition);
+}
+
+/**
+ * @brief Initialize one isolated HIP/CUDA host-scheduler ticket per request.
+ *
+ * Ticket identity is written directly from immutable admission scalars.  The
+ * host never uploads this record and therefore cannot become an alternate
+ * generation-state producer.
+ */
+__global__ void cuda_initialize_device_generation_dispatch_ticket_kernel(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket
+        *__restrict__ tickets)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    auto *const ticket = tickets + request_index;
+    if (llaminar2::sampling_math::
+            initialize_device_generation_dispatch_ticket(
+                session_epoch,
+                workspace_generation,
+                ticket))
+    {
+        llaminar2::sampling_math::publish_device_generation_dispatch_ticket(
+            request_control,
+            /*maintenance_due=*/nullptr,
+            ticket);
+    }
+}
+
+/**
+ * @brief Pack the narrow host-scheduling decision from device authority.
+ */
+__global__ void cuda_publish_device_generation_dispatch_ticket_kernel(
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    const uint32_t *__restrict__ maintenance_due,
+    llaminar2::sampling_math::DeviceGenerationDispatchTicket
+        *__restrict__ tickets)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    llaminar2::sampling_math::publish_device_generation_dispatch_ticket(
+        request_control,
+        maintenance_due,
+        tickets + request_index);
+}
+
+/**
+ * @brief Acknowledge an ordinary prior boundary and publish the next budget.
+ *
+ * A speculative outcome leaves `decode_boundary_advanced` set so the due
+ * maintenance transaction can consume that exact edge without advancing the
+ * clock twice. When the outcome did not make maintenance due, the next verifier
+ * admission is the structural consumer of that acknowledgement. A due,
+ * poisoned, or malformed boundary is rejected before any new transaction can
+ * observe a budget.
+ */
+__global__ void cuda_prepare_device_generation_transaction_budget_kernel(
+    int *__restrict__ control,
+    int control_stride,
+    int request_count,
+    int verifier_row_capacity,
+    const uint32_t *__restrict__ maintenance_rows_remaining,
+    const uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    const bool maintenance_boundary_bound =
+        maintenance_rows_remaining || maintenance_due ||
+        decode_boundary_advanced;
+    const bool maintenance_boundary_complete =
+        maintenance_rows_remaining && maintenance_due &&
+        decode_boundary_advanced;
+    const uint32_t due =
+        maintenance_boundary_complete ? *maintenance_due : 0u;
+    const uint32_t boundary_advanced =
+        maintenance_boundary_complete ? *decode_boundary_advanced : 0u;
+    const bool maintenance_boundary_valid =
+        !maintenance_boundary_bound ||
+        (maintenance_boundary_complete && due == 0u &&
+         boundary_advanced <= 1u);
+    const int maintenance_budget =
+        maintenance_boundary_valid && maintenance_rows_remaining
+            ? static_cast<int>(*maintenance_rows_remaining)
+            : (maintenance_boundary_valid ? verifier_row_capacity : 0);
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    llaminar2::sampling_math::prepare_device_generation_transaction_budget(
+        verifier_row_capacity,
+        maintenance_budget,
+        request_control);
+
+    /*
+     * Exactly one lane retires the shared acknowledgement. Other lanes may
+     * observe either one or zero, both of which are valid ordinary states; no
+     * request depends on the value after validating it.
+     */
+    if (request_index == 0 && maintenance_boundary_valid &&
+        maintenance_boundary_complete && boundary_advanced == 1u)
+    {
+        *decode_boundary_advanced = 0u;
+    }
+}
+
+/**
+ * @brief Commit one compact outcome and derive its accepted publication row.
+ *
+ * One thread owns one request transaction.  Combining response-ledger commit
+ * with publication derivation removes a launch from every MTP transaction and
+ * makes the serial-visible response/state boundary indivisible.
+ */
+__global__ void
+cuda_commit_device_generation_and_derive_speculative_publication_metadata_kernel(
+    const int32_t *__restrict__ compact_tokens,
+    int output_token_stride,
+    int *__restrict__ compact_meta,
+    int meta_stride,
+    const int *__restrict__ base_cached_tokens,
+    int request_count,
+    int padded_state_rows_per_request,
+    int32_t *__restrict__ response_tokens,
+    int response_token_stride,
+    int *__restrict__ control,
+    int control_stride,
+    int *__restrict__ out_restore_rows,
+    int *__restrict__ out_target_cached_tokens,
+    int *__restrict__ out_accepted_state_counts,
+    int *__restrict__ out_ok,
+    int32_t *__restrict__ out_next_condition_tokens,
+    int *__restrict__ out_all_drafts_accepted_flags,
+    int *__restrict__ out_stopped_flags,
+    int32_t *__restrict__ out_next_sidecar_condition_tokens,
+    int32_t *__restrict__ out_next_sidecar_position_ids,
+    int32_t *__restrict__ out_next_verifier_condition_tokens,
+    const int32_t *__restrict__ verifier_input_tokens,
+    int verifier_input_token_stride,
+    llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
+        __restrict__ out_committed_verifier_identity)
+{
+    const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request_index >= request_count)
+        return;
+
+    int32_t *request_response_tokens =
+        response_tokens + static_cast<size_t>(request_index) *
+                              static_cast<size_t>(response_token_stride);
+    int *request_control =
+        control + static_cast<size_t>(request_index) *
+                      static_cast<size_t>(control_stride);
+    const int base_cached_tokens_for_request =
+        base_cached_tokens ? base_cached_tokens[request_index] : -1;
+    const bool has_verifier_identity_binding =
+        verifier_input_tokens != nullptr ||
+        verifier_input_token_stride != 0 ||
+        out_committed_verifier_identity != nullptr;
+    const bool has_complete_verifier_identity_binding =
+        verifier_input_tokens != nullptr &&
+        verifier_input_token_stride > 0 &&
+        out_committed_verifier_identity != nullptr;
+    const bool controller_is_live =
+        request_control[
+            llaminar2::sampling_math::kDeviceGenerationControlOk] != 0 &&
+        request_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlRequestComplete] == 0;
+    const int32_t *request_verifier_input_tokens =
+        has_complete_verifier_identity_binding
+            ? verifier_input_tokens +
+                  static_cast<size_t>(request_index) *
+                      static_cast<size_t>(verifier_input_token_stride)
+            : nullptr;
+    if ((has_verifier_identity_binding &&
+         !has_complete_verifier_identity_binding) ||
+        (has_complete_verifier_identity_binding && controller_is_live &&
+         !llaminar2::sampling_math::
+              valid_committed_verifier_identity_input(
+                  request_verifier_input_tokens,
+                  verifier_input_token_stride,
+                  request_control)))
+    {
+        if (out_ok)
+            out_ok[request_index] = 0;
+        llaminar2::sampling_math::fail_device_generation_control(
+            request_control,
+            llaminar2::sampling_math::DeviceGenerationError::
+                InvalidVerifierTransactionIdentity);
+        return;
+    }
+
+    const bool committed = llaminar2::sampling_math::
+        commit_device_generation_and_derive_speculative_publication_metadata(
+        compact_tokens,
+        output_token_stride,
+        compact_meta,
+        meta_stride,
+        request_index,
+        padded_state_rows_per_request,
+        base_cached_tokens_for_request,
+        request_response_tokens,
+        response_token_stride,
+        request_control,
+        out_restore_rows ? out_restore_rows + request_index : nullptr,
+        out_target_cached_tokens
+            ? out_target_cached_tokens + request_index
+            : nullptr,
+        out_accepted_state_counts
+            ? out_accepted_state_counts + request_index
+            : nullptr,
+        out_ok ? out_ok + request_index : nullptr,
+        out_next_condition_tokens
+            ? out_next_condition_tokens + request_index
+            : nullptr,
+        out_all_drafts_accepted_flags
+            ? out_all_drafts_accepted_flags + request_index
+            : nullptr,
+        out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+
+    if (committed && out_ok && out_ok[request_index] != 0 &&
+        has_complete_verifier_identity_binding &&
+        !llaminar2::sampling_math::publish_committed_verifier_identity(
+            request_verifier_input_tokens,
+            verifier_input_token_stride,
+            request_control,
+            out_committed_verifier_identity + request_index))
+    {
+        out_ok[request_index] = 0;
+        llaminar2::sampling_math::fail_device_generation_control(
+            request_control,
+            llaminar2::sampling_math::DeviceGenerationError::
+                InvalidVerifierTransactionIdentity);
+        return;
+    }
+
+    /*
+     * These mirrors are the direct inputs of the next loop iteration's full
+     * sidecar. Keeping them in the response/state commit kernel guarantees that
+     * the controller, logical mailbox, and sidecar mailbox cross one atomic
+     * device publication boundary.
+     */
+    if (out_next_sidecar_condition_tokens &&
+        out_next_sidecar_position_ids)
+    {
+        out_next_sidecar_condition_tokens[request_index] =
+            out_next_condition_tokens[request_index];
+        out_next_sidecar_position_ids[request_index] =
+            out_target_cached_tokens[request_index];
+    }
+    if (out_next_verifier_condition_tokens)
+    {
+        out_next_verifier_condition_tokens[request_index] =
+            out_next_condition_tokens[request_index];
+    }
 }
 
 /**
@@ -3568,7 +5408,8 @@ __global__ void cuda_derive_speculative_publication_metadata_kernel(
     const int32_t *__restrict__ output_tokens,
     int output_token_stride,
     int *__restrict__ out_all_drafts_accepted_flags,
-    int *__restrict__ out_stopped_flags)
+    int *__restrict__ out_stopped_flags,
+    int32_t *__restrict__ out_next_verifier_condition_tokens)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
@@ -3592,22 +5433,27 @@ __global__ void cuda_derive_speculative_publication_metadata_kernel(
         out_next_condition_tokens ? out_next_condition_tokens + request_index : nullptr,
         out_all_drafts_accepted_flags ? out_all_drafts_accepted_flags + request_index : nullptr,
         out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+    if (out_next_verifier_condition_tokens)
+    {
+        out_next_verifier_condition_tokens[request_index] =
+            out_next_condition_tokens[request_index];
+    }
 }
 
 /**
- * @brief Derive shifted MTP KV publication counts from compact metadata.
+ * @brief Derive shifted MTP KV counts from canonical primary publication.
  *
  * One CUDA thread handles one request. The shared SamplingMath helper owns the
- * depth-dependent off-by-one rule so shifted sidecar caches are advanced with
- * the same semantics as the host publication path.
+ * depth-dependent off-by-one rule.  The primary rows already carry the exact
+ * device-owned transaction boundary, so this kernel cannot diverge by
+ * re-reading compact metadata with a host scalar.
  */
-__global__ void cuda_derive_shifted_speculative_publication_metadata_kernel(
-    const int *__restrict__ meta,
-    int meta_stride,
+__global__ void
+cuda_derive_shifted_speculative_publication_metadata_from_primary_kernel(
     const int *__restrict__ base_cached_tokens,
+    const int *__restrict__ main_target_cached_tokens,
+    const int *__restrict__ main_publication_ok,
     int request_count,
-    int padded_state_rows_per_request,
-    int max_state_commit_rows,
     int mtp_depth,
     int *__restrict__ out_target_cached_tokens,
     int *__restrict__ out_accepted_state_counts,
@@ -3617,19 +5463,262 @@ __global__ void cuda_derive_shifted_speculative_publication_metadata_kernel(
     if (request_index >= request_count)
         return;
 
-    const int base_cached_tokens_for_request =
-        base_cached_tokens ? base_cached_tokens[request_index] : -1;
-    llaminar2::sampling_math::derive_shifted_speculative_publication_metadata(
-        meta,
-        meta_stride,
-        request_index,
-        padded_state_rows_per_request,
-        base_cached_tokens_for_request,
-        max_state_commit_rows,
+    llaminar2::sampling_math::
+        derive_shifted_speculative_publication_metadata_from_primary(
+        base_cached_tokens[request_index],
+        main_target_cached_tokens[request_index],
+        main_publication_ok[request_index],
         mtp_depth,
         out_target_cached_tokens ? out_target_cached_tokens + request_index : nullptr,
         out_accepted_state_counts ? out_accepted_state_counts + request_index : nullptr,
         out_ok ? out_ok + request_index : nullptr);
+}
+
+/**
+ * @brief Prepare shifted-MTP suffix tokens and absolute positions from compact metadata.
+ *
+ * A single CUDA thread is enough for the four-row MTP verifier bound.  Keeping
+ * this as a kernel still matters because the accepted-state count stays
+ * device-resident; the CPU never decides how many suffix rows are publishable.
+ * The same lane expands the request's canonical verifier-base position into the
+ * contiguous position row consumed by the captured KV-only sidecar. Fusing
+ * these stores avoids a second launch and keeps both dynamic graph inputs under
+ * one stream-ordered device owner.
+ */
+__global__ void cuda_prepare_speculative_shifted_kv_tokens_kernel(
+    const int *__restrict__ meta,
+    int meta_stride,
+    const int32_t *__restrict__ output_tokens,
+    int output_token_stride,
+    int request_index,
+    int first_output_token_index,
+    int row_count,
+    int32_t filler_token,
+    int32_t *__restrict__ out_tokens,
+    const int32_t *__restrict__ base_positions,
+    int position_offset,
+    int32_t *__restrict__ out_position_ids)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    llaminar2::sampling_math::prepare_speculative_shifted_kv_tokens(
+        meta,
+        meta_stride,
+        output_tokens,
+        output_token_stride,
+        request_index,
+        first_output_token_index,
+        row_count,
+        filler_token,
+        out_tokens);
+
+    const int32_t first_position =
+        base_positions[request_index] + position_offset;
+    for (int row = 0; row < row_count; ++row)
+        out_position_ids[row] = first_position + row;
+}
+
+/**
+ * @brief Gather strided MTP draft slots and derive grouped sidecar positions.
+ *
+ * Request-batched drafting lays proposal tokens out request-major so the final
+ * verifier can consume each request row contiguously. At an intermediate depth,
+ * adjacent requests are therefore separated by the configured draft depth. One
+ * thread per request gathers that token and adds the current depth to the
+ * device-resident logical position. The output arrays are stable arena buffers
+ * captured by the next MTP sidecar graph.
+ */
+__global__ void cuda_prepare_mtp_batched_sidecar_inputs_kernel(
+    const int32_t *__restrict__ condition_tokens,
+    int condition_token_stride,
+    const int32_t *__restrict__ base_positions,
+    int position_offset,
+    int request_count,
+    int32_t *__restrict__ out_condition_tokens,
+    int32_t *__restrict__ out_position_ids)
+{
+    const int request = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request >= request_count)
+        return;
+
+    out_condition_tokens[request] =
+        condition_tokens[request * condition_token_stride];
+    out_position_ids[request] = base_positions[request] + position_offset;
+}
+
+/**
+ * @brief Publish all dynamic grouped-verifier geometry from device-owned rows.
+ *
+ * Each request owns one device-resident next-position scalar in its KV cache.
+ * Grouped verification needs one absolute position per physical graph row. A
+ * flattened thread index covers the request-major matrix and derives both
+ * coordinates without any host-visible cursor:
+ *
+ * `position[request, token] = live_kv_count[request] + token`.
+ *
+ * Padded columns are populated as well. The first @p request_count threads also
+ * publish each request's valid width. Rectangular graphs need no row-index
+ * input; ragged graphs count their already-published physical verifier rows.
+ * Thus position and recurrent-state masks become visible in one ordered launch,
+ * with no host length mirror or second metadata transfer.
+ */
+__global__ void cuda_prepare_mtp_verifier_geometry_kernel(
+    const int32_t *__restrict__ base_positions,
+    const int32_t *__restrict__ valid_graph_rows,
+    int valid_graph_row_count,
+    int *__restrict__ generation_control,
+    int generation_control_stride,
+    int request_count,
+    int padded_seq_len,
+    int32_t *__restrict__ out_position_ids,
+    int32_t *__restrict__ out_request_lengths)
+{
+    const int flat_row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_rows = request_count * padded_seq_len;
+    if (flat_row < total_rows)
+    {
+        const int request = flat_row / padded_seq_len;
+        const int token = flat_row - request * padded_seq_len;
+        out_position_ids[flat_row] = base_positions[request] + token;
+    }
+
+    if (out_request_lengths && flat_row < request_count)
+    {
+        int valid_tokens = valid_graph_row_count / request_count;
+        if (generation_control)
+        {
+            int *const control =
+                generation_control +
+                static_cast<size_t>(flat_row) *
+                    static_cast<size_t>(generation_control_stride);
+            const int depth =
+                control[llaminar2::sampling_math::
+                            kDeviceGenerationControlCurrentDraftDepth];
+            valid_tokens =
+                control[llaminar2::sampling_math::
+                            kDeviceGenerationControlActiveVerifierRowCount];
+            if (depth <= 0 || valid_tokens != depth + 1 ||
+                valid_tokens > padded_seq_len)
+            {
+                llaminar2::sampling_math::fail_device_generation_control(
+                    control,
+                    llaminar2::sampling_math::
+                        DeviceGenerationError::InvalidDepthSelector);
+                valid_tokens = 0;
+            }
+        }
+        else if (valid_graph_rows)
+        {
+            valid_tokens = 0;
+            for (int row = 0; row < valid_graph_row_count; ++row)
+            {
+                const int physical_row = valid_graph_rows[row];
+                valid_tokens +=
+                    physical_row / padded_seq_len == flat_row ? 1 : 0;
+            }
+        }
+        out_request_lengths[flat_row] = valid_tokens;
+    }
+}
+
+/**
+ * @brief Fuse one controller-selected verifier row into graph-stable buffers.
+ *
+ * One warp owns the complete scalar-request transaction. Lane zero validates
+ * the controller and publishes its scalar outputs; every lane then writes one
+ * or more token/position columns. The physical launch is invariant while the
+ * active prefix changes from M=2 through M=16 behind the controller pointer.
+ */
+__global__ void cuda_prepare_mtp_verifier_controlled_row_kernel(
+    const int32_t *__restrict__ first_token,
+    const int32_t *__restrict__ draft_tokens,
+    const int32_t *__restrict__ base_position,
+    int *__restrict__ generation_control_row,
+    int padded_seq_len,
+    int32_t *__restrict__ out_tokens,
+    int32_t *__restrict__ out_position_ids,
+    int32_t *__restrict__ out_request_length,
+    int32_t *__restrict__ out_base_position_snapshot)
+{
+    __shared__ int active_rows;
+    if (threadIdx.x == 0)
+    {
+        const bool active_request =
+            generation_control_row[
+                llaminar2::sampling_math::kDeviceGenerationControlOk] != 0 &&
+            generation_control_row[
+                llaminar2::sampling_math::
+                    kDeviceGenerationControlRequestComplete] == 0;
+        const int depth = generation_control_row[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlCurrentDraftDepth];
+        const int verifier_rows = generation_control_row[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlActiveVerifierRowCount];
+        if (!active_request || depth <= 0 || verifier_rows != depth + 1 ||
+            verifier_rows > padded_seq_len)
+        {
+            llaminar2::sampling_math::fail_device_generation_control(
+                generation_control_row,
+                llaminar2::sampling_math::
+                    DeviceGenerationError::InvalidDepthSelector);
+            active_rows = 0;
+        }
+        else
+        {
+            active_rows = verifier_rows;
+        }
+        *out_request_length = active_rows;
+        *out_base_position_snapshot = *base_position;
+    }
+    __syncthreads();
+
+    const int base = *base_position;
+    for (int row = static_cast<int>(threadIdx.x); row < padded_seq_len;
+         row += static_cast<int>(blockDim.x))
+    {
+        out_position_ids[row] = base + row;
+        out_tokens[row] =
+            row == 0 ? *first_token
+                     : row < active_rows ? draft_tokens[row - 1] : 0;
+    }
+}
+
+/**
+ * @brief Publish the first device-owned logical rows from terminal prefill samples.
+ *
+ * Request admission has already copied prompt positions into persistent device
+ * metadata, and the sampler has written token identities into device slots. One
+ * thread loads both device-owned values and publishes every mailbox field for one
+ * request, making the initialized row self-consistent at the event recorded after
+ * this launch. `target_positions` may alias `out_target_positions`; consequently
+ * those two parameters intentionally do not use `__restrict__`.
+ */
+__global__ void cuda_initialize_mtp_device_logical_state_kernel(
+    const int32_t *__restrict__ sampled_tokens,
+    const int32_t *target_positions,
+    int request_count,
+    int32_t *__restrict__ out_base_cached_tokens,
+    int32_t *out_target_positions,
+    int32_t *__restrict__ out_accepted_state_counts,
+    int32_t *__restrict__ out_next_condition_tokens,
+    int32_t *__restrict__ out_all_drafts_accepted_flags,
+    int32_t *__restrict__ out_stopped_flags,
+    int32_t *__restrict__ out_publication_ok_flags)
+{
+    const int request = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request >= request_count)
+        return;
+
+    const int position = target_positions[request];
+    out_base_cached_tokens[request] = position;
+    out_target_positions[request] = position;
+    out_accepted_state_counts[request] = 0;
+    out_next_condition_tokens[request] = sampled_tokens[request];
+    out_all_drafts_accepted_flags[request] = 0;
+    out_stopped_flags[request] = 0;
+    out_publication_ok_flags[request] = 1;
 }
 
 // ============================================================================
@@ -3657,6 +5746,170 @@ __global__ void cuda_apply_logit_penalties_f32_kernel(
 // ============================================================================
 // Extern "C" Wrappers
 // ============================================================================
+
+/**
+ * @brief Copy optional explicit threshold rows into a graph-owned launch value.
+ *
+ * Seeded production verification passes null pointers because the kernel reads
+ * device-resident logical positions and derives every draw itself. Integration
+ * probes may provide explicit host values; copying them into the kernel
+ * parameter block avoids retaining any host pointer across graph capture.
+ */
+static llaminar2::sampling_math::SpeculativeBatchThresholdParameters
+packCudaSpeculativeBatchThresholds(
+    const float *accept_thresholds,
+    const float *residual_thresholds,
+    int row_count)
+{
+    llaminar2::sampling_math::SpeculativeBatchThresholdParameters packed{};
+    for (int row = 0; row < row_count; ++row)
+    {
+        if (accept_thresholds)
+            packed.accept[row] = accept_thresholds[row];
+        if (residual_thresholds)
+            packed.residual[row] = residual_thresholds[row];
+    }
+    return packed;
+}
+
+/**
+ * @brief Validate a launch width accepted by the warp-synchronous reducer.
+ */
+static bool validCudaArgmaxThreadCount(int threads)
+{
+    return threads >= 32 && threads <= 1024 &&
+           (threads & (threads - 1)) == 0 &&
+           threads % 32 == 0;
+}
+
+/**
+ * @brief Launch one explicit two-pass argmax geometry.
+ *
+ * This function is shared by the stable production entry point and the
+ * focused Perf__ geometry sweep.  Keeping one launcher prevents the benchmark
+ * from accidentally timing a test-only kernel.  The benchmark varies only
+ * immutable graph-capture geometry; production calls it with compile-time
+ * selected constants and performs no runtime autotuning.
+ */
+static bool launchCudaArgmaxF32BatchedRowsGeometry(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream,
+    int output_stride,
+    int reduce_threads,
+    int elements_per_thread,
+    int finalize_threads,
+    int *chain_condition_tokens,
+    int *chain_position_ids,
+    int chain_position_increment)
+{
+    const bool publish_mtp_chain =
+        chain_condition_tokens != nullptr || chain_position_ids != nullptr ||
+        chain_position_increment != 0;
+    if (rows <= 0 || cols <= 0 || row_stride < cols ||
+        !data || !out_values || !out_indices ||
+        !partial_vals || !partial_idxs || partial_capacity < rows ||
+        !stream || output_stride <= 0 || elements_per_thread <= 0 ||
+        !validCudaArgmaxThreadCount(reduce_threads) ||
+        !validCudaArgmaxThreadCount(finalize_threads) ||
+        (publish_mtp_chain &&
+         (!chain_condition_tokens || !chain_position_ids ||
+          chain_position_increment <= 0)))
+    {
+        return false;
+    }
+
+    cudaSetDevice(device_idx);
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const int row_partial_capacity = partial_capacity / rows;
+    if (row_partial_capacity < 1)
+        return false;
+
+    const long per_block =
+        static_cast<long>(reduce_threads) * elements_per_thread;
+    long blocks = (static_cast<long>(cols) + per_block - 1) / per_block;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > row_partial_capacity)
+        blocks = row_partial_capacity;
+    const int num_blocks = static_cast<int>(blocks);
+
+    const size_t partial_shared_bytes =
+        static_cast<size_t>(reduce_threads / 32) *
+        (sizeof(float) + sizeof(int));
+    cuda_argmax_partial_f32_batched_rows_kernel<<<
+        dim3(num_blocks, rows),
+        reduce_threads,
+        partial_shared_bytes,
+        s>>>(
+        data,
+        rows,
+        cols,
+        row_stride,
+        partial_vals,
+        partial_idxs,
+        row_partial_capacity);
+
+    const size_t finalize_shared_bytes =
+        static_cast<size_t>(finalize_threads / 32) *
+        (sizeof(float) + sizeof(int));
+    if (publish_mtp_chain)
+    {
+        cuda_argmax_finalize_f32_batched_rows_kernel<true><<<
+            rows,
+            finalize_threads,
+            finalize_shared_bytes,
+            s>>>(
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride,
+            chain_condition_tokens,
+            chain_position_ids,
+            chain_position_increment,
+            nullptr);
+    }
+    else
+    {
+        cuda_argmax_finalize_f32_batched_rows_kernel<false><<<
+            rows,
+            finalize_threads,
+            finalize_shared_bytes,
+            s>>>(
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride,
+            nullptr,
+            nullptr,
+            0,
+            nullptr);
+    }
+
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr,
+                "CUDA Argmax FP32 batched rows launch failed: %s\n",
+                cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
 
 extern "C"
 {
@@ -3715,7 +5968,7 @@ extern "C"
         cuda_argmax_finalize_f32_kernel<<<1, fthreads, smem2, s>>>(
             partial_vals, partial_idxs, num_blocks, out_value, out_index);
 
-        cudaError_t err = cudaGetLastError();
+        const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Argmax FP32 (multi-block) launch failed: %s\n",
@@ -3739,56 +5992,464 @@ extern "C"
         void *stream,
         int output_stride)
     {
+        return launchCudaArgmaxF32BatchedRowsGeometry(
+            data,
+            rows,
+            cols,
+            row_stride,
+            out_values,
+            out_indices,
+            partial_vals,
+            partial_idxs,
+            partial_capacity,
+            device_idx,
+            stream,
+            output_stride,
+            ARGMAX_REDUCE_THREADS,
+            ARGMAX_ELEMS_PER_THREAD,
+            ARGMAX_FINALIZE_THREADS,
+            nullptr,
+            nullptr,
+            0);
+    }
+
+    bool cudaOps_argmax_f32_batched_rows_publish_mtp_chain(
+        const float *data,
+        int rows,
+        int cols,
+        int row_stride,
+        float *out_values,
+        int *out_indices,
+        int *chain_condition_tokens,
+        int *chain_position_ids,
+        int chain_position_increment,
+        float *partial_vals,
+        int *partial_idxs,
+        int partial_capacity,
+        int device_idx,
+        void *stream,
+        int output_stride)
+    {
+        return launchCudaArgmaxF32BatchedRowsGeometry(
+            data,
+            rows,
+            cols,
+            row_stride,
+            out_values,
+            out_indices,
+            partial_vals,
+            partial_idxs,
+            partial_capacity,
+            device_idx,
+            stream,
+            output_stride,
+            ARGMAX_REDUCE_THREADS,
+            ARGMAX_ELEMS_PER_THREAD,
+            ARGMAX_FINALIZE_THREADS,
+            chain_condition_tokens,
+            chain_position_ids,
+            chain_position_increment);
+    }
+
+    /**
+     * @brief Perf__ entry point for explicit argmax launch geometry.
+     *
+     * This is intentionally not surfaced through IBackend: inference always
+     * uses the stable winner above.  The performance suite keeps this symbol
+     * live and verifies every candidate against the same byte-exact output.
+     */
+    bool cudaOps_argmax_f32_batched_rows_geometry(
+        const float *data,
+        int rows,
+        int cols,
+        int row_stride,
+        float *out_values,
+        int *out_indices,
+        float *partial_vals,
+        int *partial_idxs,
+        int partial_capacity,
+        int device_idx,
+        void *stream,
+        int output_stride,
+        int reduce_threads,
+        int elements_per_thread,
+        int finalize_threads)
+    {
+        return launchCudaArgmaxF32BatchedRowsGeometry(
+            data,
+            rows,
+            cols,
+            row_stride,
+            out_values,
+            out_indices,
+            partial_vals,
+            partial_idxs,
+            partial_capacity,
+            device_idx,
+            stream,
+            output_stride,
+            reduce_threads,
+            elements_per_thread,
+            finalize_threads,
+            nullptr,
+            nullptr,
+            0);
+    }
+
+    /**
+     * @brief Perf__ entry point for producer-owned MTP-chain publication.
+     *
+     * The candidate geometry reaches the exact production specialization that
+     * writes both the selected draft token and the next chained-sidecar
+     * position. Keeping this entry point out of IBackend prevents runtime
+     * autotuning while still allowing the stable constants above to be selected
+     * from isolated, byte-checked measurements.
+     */
+    bool cudaOps_argmax_f32_batched_rows_publish_mtp_chain_geometry(
+        const float *data,
+        int rows,
+        int cols,
+        int row_stride,
+        float *out_values,
+        int *out_indices,
+        int *chain_condition_tokens,
+        int *chain_position_ids,
+        int chain_position_increment,
+        float *partial_vals,
+        int *partial_idxs,
+        int partial_capacity,
+        int device_idx,
+        void *stream,
+        int output_stride,
+        int reduce_threads,
+        int elements_per_thread,
+        int finalize_threads)
+    {
+        return launchCudaArgmaxF32BatchedRowsGeometry(
+            data,
+            rows,
+            cols,
+            row_stride,
+            out_values,
+            out_indices,
+            partial_vals,
+            partial_idxs,
+            partial_capacity,
+            device_idx,
+            stream,
+            output_stride,
+            reduce_threads,
+            elements_per_thread,
+            finalize_threads,
+            chain_condition_tokens,
+            chain_position_ids,
+            chain_position_increment);
+    }
+
+    bool cudaOps_configure_mtp_greedy_penalty_policy(
+        llaminar2::MTPGreedyPenaltyPolicy *controls,
+        float presence_penalty,
+        float frequency_penalty,
+        bool first_token_already_in_history,
+        int device_idx,
+        void *stream)
+    {
+        if (!controls || !stream)
+            return false;
+
+        cudaSetDevice(device_idx);
+        cuda_configure_mtp_greedy_penalty_policy_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            controls,
+            presence_penalty,
+            frequency_penalty,
+            first_token_already_in_history ? 1 : 0);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MTP greedy penalty policy launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_argmax_f32_batched_rows_mtp_penalties(
+        const float *data,
+        int rows,
+        int cols,
+        int row_stride,
+        const int *verifier_input_tokens,
+        const int *generated_token_counts,
+        const llaminar2::MTPGreedyPenaltyPolicy *policy,
+        const int *active_rows,
+        float *out_values,
+        int *out_indices,
+        float *partial_vals,
+        int *partial_idxs,
+        int partial_capacity,
+        int device_idx,
+        void *stream,
+        int output_stride)
+    {
         if (rows <= 0 || cols <= 0 || row_stride < cols ||
-            !data || !out_values || !out_indices ||
+            !data || !verifier_input_tokens || !generated_token_counts ||
+            !policy || !active_rows || !out_values || !out_indices ||
             !partial_vals || !partial_idxs || partial_capacity < rows ||
-            output_stride <= 0)
+            !stream || output_stride <= 0)
         {
             return false;
         }
 
         cudaSetDevice(device_idx);
-        cudaStream_t s = static_cast<cudaStream_t>(stream);
-
         const int row_partial_capacity = partial_capacity / rows;
         if (row_partial_capacity < 1)
             return false;
 
         const int threads = ARGMAX_REDUCE_THREADS;
-        const long per_block = static_cast<long>(threads) * ARGMAX_ELEMS_PER_THREAD;
-        long blocks = (static_cast<long>(cols) + per_block - 1) / per_block;
+        const long per_block =
+            static_cast<long>(threads) * ARGMAX_ELEMS_PER_THREAD;
+        long blocks =
+            (static_cast<long>(cols) + per_block - 1) / per_block;
         if (blocks < 1)
             blocks = 1;
         if (blocks > row_partial_capacity)
             blocks = row_partial_capacity;
         const int num_blocks = static_cast<int>(blocks);
-
-        const size_t smem1 = threads * (sizeof(float) + sizeof(int));
-        cuda_argmax_partial_f32_batched_rows_kernel<<<dim3(num_blocks, rows), threads, smem1, s>>>(
+        const size_t shared_bytes =
+            static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
+        cuda_argmax_partial_f32_batched_rows_mtp_penalty_kernel<<<
+            dim3(num_blocks, rows),
+            dim3(threads),
+            shared_bytes,
+            static_cast<cudaStream_t>(stream)>>>(
             data,
             rows,
             cols,
             row_stride,
+            verifier_input_tokens,
+            generated_token_counts,
+            policy,
+            active_rows,
             partial_vals,
             partial_idxs,
             row_partial_capacity);
-
-        const int fthreads = ARGMAX_FINALIZE_THREADS;
-        const size_t smem2 = fthreads * (sizeof(float) + sizeof(int));
-        cuda_argmax_finalize_f32_batched_rows_kernel<<<rows, fthreads, smem2, s>>>(
+        cuda_argmax_finalize_f32_batched_rows_kernel<false, true><<<
+            rows,
+            ARGMAX_FINALIZE_THREADS,
+            static_cast<size_t>(ARGMAX_FINALIZE_THREADS) *
+                (sizeof(float) + sizeof(int)),
+            static_cast<cudaStream_t>(stream)>>>(
             partial_vals,
             partial_idxs,
             num_blocks,
             row_partial_capacity,
             out_values,
             out_indices,
-            output_stride);
+            output_stride,
+            nullptr,
+            nullptr,
+            0,
+            active_rows);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MTP penalty-aware batched argmax launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
 
+    bool cudaOps_apply_mtp_penalties_f32_rows(
+        float *data,
+        int rows,
+        int cols,
+        int row_stride,
+        const int *verifier_input_tokens,
+        const int *generated_token_counts,
+        const llaminar2::MTPGreedyPenaltyPolicy *policy,
+        const int *active_rows,
+        int device_idx,
+        void *stream)
+    {
+        if (!data || rows <= 0 || cols <= 0 || row_stride < cols ||
+            !generated_token_counts || !policy || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads = 256;
+        int blocks = (cols + threads - 1) / threads;
+        blocks = blocks > 1024 ? 1024 : blocks;
+        if (verifier_input_tokens)
+        {
+            cuda_apply_mtp_verifier_penalties_f32_rows_kernel<<<
+                dim3(blocks + 1),
+                dim3(threads),
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                data,
+                rows,
+                cols,
+                row_stride,
+                verifier_input_tokens,
+                generated_token_counts,
+                policy,
+                active_rows);
+        }
+        else
+        {
+            cuda_apply_mtp_durable_penalties_f32_rows_kernel<<<
+                dim3(blocks),
+                dim3(threads),
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                data,
+                rows,
+                cols,
+                row_stride,
+                generated_token_counts,
+                policy,
+                active_rows);
+        }
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "CUDA Argmax FP32 batched rows launch failed: %s\n",
-                    cudaGetErrorString(err));
+            fprintf(
+                stderr,
+                "CUDA MTP penalty row transform launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool cudaOps_apply_mtp_branch_penalties_f32_row(
+        float *data,
+        int cols,
+        const int *first_condition_token,
+        const int *prior_draft_tokens,
+        int prior_draft_count,
+        const int *generated_token_counts,
+        const llaminar2::MTPGreedyPenaltyPolicy *policy,
+        int device_idx,
+        void *stream)
+    {
+        if (!data || cols <= 0 || !first_condition_token ||
+            prior_draft_count < 0 ||
+            (prior_draft_count > 0 && !prior_draft_tokens) ||
+            !generated_token_counts || !policy || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads = 256;
+        int dense_blocks = (cols + threads - 1) / threads;
+        dense_blocks = dense_blocks > 1024 ? 1024 : dense_blocks;
+        cuda_apply_mtp_branch_penalties_f32_row_kernel<<<
+            dim3(dense_blocks + 1),
+            dim3(threads),
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            data,
+            cols,
+            first_condition_token,
+            prior_draft_tokens,
+            prior_draft_count,
+            generated_token_counts,
+            policy);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MTP branch penalty row transform launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_commit_mtp_greedy_penalty_history(
+        const int *output_tokens,
+        const int *output_meta,
+        llaminar2::MTPGreedyPenaltyPolicy *policy,
+        const int *accepted_state_counts,
+        const int *stopped_flags,
+        int output_token_capacity,
+        int vocab_size,
+        int *generated_token_counts,
+        int device_idx,
+        void *stream)
+    {
+        if (!output_tokens || !output_meta || !policy ||
+            !accepted_state_counts || !stopped_flags ||
+            output_token_capacity <= 0 || vocab_size <= 0 ||
+            !generated_token_counts || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_commit_mtp_greedy_penalty_history_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            output_tokens,
+            output_meta,
+            policy,
+            accepted_state_counts,
+            stopped_flags,
+            output_token_capacity,
+            vocab_size,
+            generated_token_counts);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MTP greedy penalty history commit launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_int32_control_scalar(
+        int32_t value,
+        int32_t *out_value,
+        int device_idx,
+        void *stream)
+    {
+        if (value < 0 || !out_value || !stream)
+            return false;
+
+        cudaSetDevice(device_idx);
+        cuda_publish_int32_control_scalar_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(value, out_value);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA INT32 control-scalar publication launch failed: %s\n",
+                cudaGetErrorString(err));
             return false;
         }
         return true;
@@ -4010,6 +6671,7 @@ extern "C"
         float *scratch_values,
         int *scratch_indices,
         int scratch_capacity,
+        const int *active_rows,
         int device_idx,
         void *stream)
     {
@@ -4040,19 +6702,46 @@ extern "C"
             {
                 const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
                 const dim3 partial_grid(partial_blocks, row_count);
-                if (k <= TOPK_MEDIUM_K_CAP)
+                const int maximum_partial_span =
+                    (n + partial_blocks - 1) / partial_blocks;
+                const bool use_cooperative_selector =
+                    maximum_partial_span <= TOPK_BATCHED_COOPERATIVE_CAPACITY &&
+                    partial_blocks * k <= TOPK_BATCHED_COOPERATIVE_CAPACITY;
+                if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+                {
+                    cuda_topk_cooperative_partials_batched_f32_kernel<
+                        TOPK_MEDIUM_K_CAP>
+                        <<<partial_grid,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            data, n, row_stride, k, partial_blocks,
+                            scratch_values, scratch_indices, active_rows);
+                }
+                else if (use_cooperative_selector)
+                {
+                    cuda_topk_cooperative_partials_batched_f32_kernel<
+                        TOPK_SMALL_K_CAP>
+                        <<<partial_grid,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            data, n, row_stride, k, partial_blocks,
+                            scratch_values, scratch_indices, active_rows);
+                }
+                else if (k <= TOPK_MEDIUM_K_CAP)
                 {
                     cuda_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>
                         <<<partial_grid, threads, smem_size, s>>>(
                             data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices);
+                            scratch_values, scratch_indices, active_rows);
                 }
                 else
                 {
                     cuda_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>
                         <<<partial_grid, threads, smem_size, s>>>(
                             data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices);
+                            scratch_values, scratch_indices, active_rows);
                 }
 
                 cudaError_t err = cudaGetLastError();
@@ -4063,19 +6752,45 @@ extern "C"
                     return false;
                 }
 
-                if (k <= TOPK_MEDIUM_K_CAP)
+                if (use_cooperative_selector && k <= TOPK_MEDIUM_K_CAP)
+                {
+                    cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
+                        TOPK_MEDIUM_K_CAP>
+                        <<<row_count,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            scratch_values, scratch_indices, partial_blocks, k,
+                            top_p, temperature, out_token_ids, out_stride,
+                            out_probs, active_rows);
+                }
+                else if (use_cooperative_selector)
+                {
+                    cuda_topk_topp_distribution_cooperative_batched_f32_kernel<
+                        TOPK_SMALL_K_CAP>
+                        <<<row_count,
+                           TOPK_BATCHED_COOPERATIVE_THREADS,
+                           0,
+                           s>>>(
+                            scratch_values, scratch_indices, partial_blocks, k,
+                            top_p, temperature, out_token_ids, out_stride,
+                            out_probs, active_rows);
+                }
+                else if (k <= TOPK_MEDIUM_K_CAP)
                 {
                     cuda_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_MEDIUM_K_CAP>
                         <<<row_count, threads, smem_size, s>>>(
                             scratch_values, scratch_indices, partial_blocks, k,
-                            top_p, temperature, out_token_ids, out_stride, out_probs);
+                            top_p, temperature, out_token_ids, out_stride, out_probs,
+                            active_rows);
                 }
                 else
                 {
                     cuda_topk_topp_distribution_batched_from_partials_f32_kernel<TOPK_SMALL_K_CAP>
                         <<<row_count, threads, smem_size, s>>>(
                             scratch_values, scratch_indices, partial_blocks, k,
-                            top_p, temperature, out_token_ids, out_stride, out_probs);
+                            top_p, temperature, out_token_ids, out_stride, out_probs,
+                            active_rows);
                 }
 
                 err = cudaGetLastError();
@@ -4140,14 +6855,14 @@ extern "C"
                     cuda_topk_smallk_partials_batched_f32_kernel<TOPK_MEDIUM_K_CAP>
                         <<<partial_grid, threads, smem_size, s>>>(
                             data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices);
+                            scratch_values, scratch_indices, nullptr);
                 }
                 else
                 {
                     cuda_topk_smallk_partials_batched_f32_kernel<TOPK_SMALL_K_CAP>
                         <<<partial_grid, threads, smem_size, s>>>(
                             data, n, row_stride, k, partial_blocks,
-                            scratch_values, scratch_indices);
+                            scratch_values, scratch_indices, nullptr);
                 }
 
                 cudaError_t err = cudaGetLastError();
@@ -4275,10 +6990,14 @@ extern "C"
         float threshold,
         int *out_token,
         float *out_probability,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
         int device_idx,
         void *stream)
     {
-        if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token || !stream)
+        if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token ||
+            !stream || (threshold_position && threshold_seed == 0))
             return false;
 
         cudaSetDevice(device_idx);
@@ -4288,6 +7007,9 @@ extern "C"
             probs,
             k,
             threshold,
+            threshold_seed,
+            threshold_position,
+            threshold_position_offset,
             out_token,
             out_probability);
 
@@ -4361,17 +7083,20 @@ extern "C"
         int stop_token_count,
         int *out_token,
         float *out_probability,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
         int device_idx,
         void *stream)
     {
         if (!logits || !verify_tokens || !verify_accepted || !out_token ||
             !stream || vocab_size <= 0 || row_stride < vocab_size ||
             row_count < 0 ||
-            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
             (first_token < 0 && !first_token_device) ||
             stop_token_count < 0 ||
             stop_token_count >
-                llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens)
+                llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
+            (threshold_position && threshold_seed == 0))
         {
             return false;
         }
@@ -4386,6 +7111,9 @@ extern "C"
             vocab_size,
             row_stride,
             threshold,
+            threshold_seed,
+            threshold_position,
+            threshold_position_offset,
             verify_tokens,
             verify_accepted,
             row_count,
@@ -4556,7 +7284,7 @@ extern "C"
         void *stream)
     {
         if (!out_samples || !stream ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             vocab_size <= 0 || row_stride < vocab_size)
         {
             return false;
@@ -4640,18 +7368,9 @@ extern "C"
         const float *draft_probs,
         int k,
         int distribution_stride,
-        int draft_token0,
-        int draft_token1,
-        int draft_token2,
-        int draft_token3,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
-        float residual_threshold0,
-        float residual_threshold1,
-        float residual_threshold2,
-        float residual_threshold3,
+        const int *draft_tokens_host,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
         int row_count,
         int *out_token,
         int *out_accepted,
@@ -4662,9 +7381,11 @@ extern "C"
     {
         if (k <= 0 || k > TOPK_MAX_K ||
             distribution_stride < k ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             !target_token_ids || !target_probs ||
             !draft_token_ids || !draft_probs ||
+            !draft_tokens_host || !accept_thresholds_host ||
+            !residual_thresholds_host ||
             !out_token || !out_accepted || !stream)
         {
             return false;
@@ -4672,37 +7393,57 @@ extern "C"
 
         cudaSetDevice(device_idx);
 
-        cuda_speculative_verify_distribution_thresholds_batch_kernel<<<1, 4, 0, static_cast<cudaStream_t>(stream)>>>(
-            target_token_ids,
-            target_probs,
-            draft_token_ids,
-            draft_probs,
-            k,
-            distribution_stride,
-            draft_token0,
-            draft_token1,
-            draft_token2,
-            draft_token3,
-            accept_threshold0,
-            accept_threshold1,
-            accept_threshold2,
-            accept_threshold3,
-            residual_threshold0,
-            residual_threshold1,
-            residual_threshold2,
-            residual_threshold3,
-            row_count,
-            out_token,
-            out_accepted,
-            out_accept_probability,
-            out_accept_threshold);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
+        constexpr int kRowsPerLaunch =
+            llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+        for (int row_base = 0; row_base < row_count;
+             row_base += kRowsPerLaunch)
         {
-            fprintf(stderr, "CUDA Speculative Verify Batch FP32 kernel launch failed: %s\n",
-                    cudaGetErrorString(err));
-            return false;
+            const int launch_rows =
+                std::min(kRowsPerLaunch, row_count - row_base);
+            llaminar2::sampling_math::SpeculativeBatchHostParameters
+                parameters{};
+            for (int row = 0; row < launch_rows; ++row)
+            {
+                parameters.draft_tokens[row] =
+                    draft_tokens_host[row_base + row];
+                parameters.thresholds.accept[row] =
+                    accept_thresholds_host[row_base + row];
+                parameters.thresholds.residual[row] =
+                    residual_thresholds_host[row_base + row];
+            }
+
+            const size_t row_offset =
+                static_cast<size_t>(row_base) *
+                static_cast<size_t>(distribution_stride);
+            cuda_speculative_verify_distribution_thresholds_batch_kernel<<<
+                1,
+                kRowsPerLaunch,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                target_token_ids + row_offset,
+                target_probs + row_offset,
+                draft_token_ids + row_offset,
+                draft_probs + row_offset,
+                k,
+                distribution_stride,
+                parameters,
+                launch_rows,
+                out_token + row_base,
+                out_accepted + row_base,
+                out_accept_probability
+                    ? out_accept_probability + row_base
+                    : nullptr,
+                out_accept_threshold
+                    ? out_accept_threshold + row_base
+                    : nullptr);
+
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA Speculative Verify Batch FP32 kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
         }
         return true;
     }
@@ -4716,14 +7457,8 @@ extern "C"
         int distribution_stride,
         const int *sampled_draft_tokens,
         const float *sampled_draft_probabilities,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
-        float residual_threshold0,
-        float residual_threshold1,
-        float residual_threshold2,
-        float residual_threshold3,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
         int row_count,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
@@ -4731,6 +7466,8 @@ extern "C"
         unsigned long long threshold_seed,
         int threshold_first_logical_position,
         int thresholds_from_seed,
+        const int *threshold_base_position,
+        int threshold_position_offset,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -4744,10 +7481,11 @@ extern "C"
             draft_token_ids == nullptr && draft_probs == nullptr;
         if (k <= 0 || k > TOPK_MAX_K ||
             distribution_stride < k ||
-            row_count <= 0 || row_count > 4 ||
+            row_count <= 0 ||
             !target_token_ids || !target_probs ||
             (!has_draft_distribution && !has_one_hot_draft_distribution) ||
             !sampled_draft_tokens ||
+            (threshold_base_position && !thresholds_from_seed) ||
             !out_token || !out_accepted || !stream)
         {
             return false;
@@ -4755,41 +7493,90 @@ extern "C"
 
         cudaSetDevice(device_idx);
 
-        cuda_speculative_verify_distribution_thresholds_batch_device_tokens_kernel<<<1, 4, 0, static_cast<cudaStream_t>(stream)>>>(
-            target_token_ids,
-            target_probs,
-            draft_token_ids,
-            draft_probs,
-            k,
-            distribution_stride,
-            sampled_draft_tokens,
-            sampled_draft_probabilities,
-            accept_threshold0,
-            accept_threshold1,
-            accept_threshold2,
-            accept_threshold3,
-            residual_threshold0,
-            residual_threshold1,
-            residual_threshold2,
-            residual_threshold3,
-            row_count,
-            inverse_sample_seed,
-            inverse_sample_first_logical_position,
-            inverse_sample_vocab_size,
-            threshold_seed,
-            threshold_first_logical_position,
-            thresholds_from_seed,
-            out_token,
-            out_accepted,
-            out_accept_probability,
-            out_accept_threshold);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
+        constexpr int kRuntimeVerifierThreads = 128;
+        constexpr int kExplicitThresholdRows =
+            llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+        const bool use_seeded_thresholds = thresholds_from_seed != 0;
+        if (!use_seeded_thresholds &&
+            (!accept_thresholds_host || !residual_thresholds_host))
         {
-            fprintf(stderr, "CUDA Speculative Verify Batch Device Tokens FP32 kernel launch failed: %s\n",
-                    cudaGetErrorString(err));
             return false;
+        }
+
+        const int launch_count = use_seeded_thresholds
+                                     ? 1
+                                     : (row_count + kExplicitThresholdRows - 1) /
+                                           kExplicitThresholdRows;
+        for (int launch = 0; launch < launch_count; ++launch)
+        {
+            const int row_base = use_seeded_thresholds
+                                     ? 0
+                                     : launch * kExplicitThresholdRows;
+            const int launch_rows = use_seeded_thresholds
+                                        ? row_count
+                                        : std::min(kExplicitThresholdRows,
+                                                   row_count - row_base);
+            llaminar2::sampling_math::SpeculativeBatchThresholdParameters
+                thresholds{};
+            if (!use_seeded_thresholds)
+            {
+                for (int row = 0; row < launch_rows; ++row)
+                {
+                    thresholds.accept[row] =
+                        accept_thresholds_host[row_base + row];
+                    thresholds.residual[row] =
+                        residual_thresholds_host[row_base + row];
+                }
+            }
+
+            const int threads = use_seeded_thresholds
+                                    ? kRuntimeVerifierThreads
+                                    : kExplicitThresholdRows;
+            const int blocks = (launch_rows + threads - 1) / threads;
+            const size_t row_offset =
+                static_cast<size_t>(row_base) *
+                static_cast<size_t>(distribution_stride);
+            cuda_speculative_verify_distribution_thresholds_batch_device_tokens_kernel<<<
+                blocks,
+                threads,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                target_token_ids + row_offset,
+                target_probs + row_offset,
+                draft_token_ids ? draft_token_ids + row_offset : nullptr,
+                draft_probs ? draft_probs + row_offset : nullptr,
+                k,
+                distribution_stride,
+                sampled_draft_tokens + row_base,
+                sampled_draft_probabilities
+                    ? sampled_draft_probabilities + row_base
+                    : nullptr,
+                thresholds,
+                launch_rows,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position + row_base,
+                inverse_sample_vocab_size,
+                threshold_seed,
+                threshold_first_logical_position + row_base,
+                thresholds_from_seed,
+                threshold_base_position,
+                threshold_position_offset + row_base,
+                out_token + row_base,
+                out_accepted + row_base,
+                out_accept_probability
+                    ? out_accept_probability + row_base
+                    : nullptr,
+                out_accept_threshold
+                    ? out_accept_threshold + row_base
+                    : nullptr);
+
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA Speculative Verify Batch Device Tokens FP32 kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
         }
         return true;
     }
@@ -4802,14 +7589,8 @@ extern "C"
         int target_row_stride,
         int draft_row_stride,
         const int *sampled_draft_tokens,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
-        float residual_threshold0,
-        float residual_threshold1,
-        float residual_threshold2,
-        float residual_threshold3,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -4821,47 +7602,60 @@ extern "C"
         if (!target_logits || !draft_logits || !sampled_draft_tokens ||
             !out_token || !out_accepted || !stream ||
             row_count <= 0 ||
-            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
-            draft_row_stride < vocab_size)
+            draft_row_stride < vocab_size ||
+            !accept_thresholds_host || !residual_thresholds_host)
         {
             return false;
         }
 
         cudaSetDevice(device_idx);
-        cuda_speculative_verify_processed_logits_thresholds_batch_device_tokens_kernel<<<
-            row_count,
-            PROCESSED_LOGIT_VERIFY_THREADS,
-            0,
-            static_cast<cudaStream_t>(stream)>>>(
-            target_logits,
-            draft_logits,
-            row_count,
-            vocab_size,
-            target_row_stride,
-            draft_row_stride,
-            sampled_draft_tokens,
-            accept_threshold0,
-            accept_threshold1,
-            accept_threshold2,
-            accept_threshold3,
-            residual_threshold0,
-            residual_threshold1,
-            residual_threshold2,
-            residual_threshold3,
-            out_token,
-            out_accepted,
-            out_accept_probability,
-            out_accept_threshold,
-            draft_token_probabilities);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
+        constexpr int kRowsPerLaunch =
+            llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+        for (int row_base = 0; row_base < row_count;
+             row_base += kRowsPerLaunch)
         {
-            fprintf(stderr, "CUDA Processed-Logit Stochastic Speculative Verify kernel launch failed: %s\n",
-                    cudaGetErrorString(err));
-            return false;
+            const int launch_rows =
+                std::min(kRowsPerLaunch, row_count - row_base);
+            const auto thresholds = packCudaSpeculativeBatchThresholds(
+                accept_thresholds_host + row_base,
+                residual_thresholds_host + row_base,
+                launch_rows);
+            cuda_speculative_verify_processed_logits_thresholds_batch_device_tokens_kernel<<<
+                launch_rows,
+                PROCESSED_LOGIT_VERIFY_THREADS,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                target_logits +
+                    static_cast<size_t>(row_base) * target_row_stride,
+                draft_logits +
+                    static_cast<size_t>(row_base) * draft_row_stride,
+                launch_rows,
+                vocab_size,
+                target_row_stride,
+                draft_row_stride,
+                sampled_draft_tokens + row_base,
+                thresholds,
+                out_token + row_base,
+                out_accepted + row_base,
+                out_accept_probability
+                    ? out_accept_probability + row_base
+                    : nullptr,
+                out_accept_threshold
+                    ? out_accept_threshold + row_base
+                    : nullptr,
+                draft_token_probabilities
+                    ? draft_token_probabilities + row_base
+                    : nullptr);
+
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA Processed-Logit Stochastic Speculative Verify kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
         }
         return true;
     }
@@ -4874,12 +7668,12 @@ extern "C"
         int target_row_stride,
         int draft_row_stride,
         const int *sampled_draft_tokens,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
+        const float *accept_thresholds_host,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
+        int thresholds_from_seed,
+        const int *threshold_base_position,
+        int threshold_position_offset,
         int *out_token,
         int *out_accepted,
         float *out_accept_probability,
@@ -4893,45 +7687,79 @@ extern "C"
             !sampled_draft_tokens ||
             !out_token || !out_accepted || !stream ||
             row_count <= 0 ||
-            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
-            (!no_draft_probabilities && draft_row_stride < vocab_size))
+            (!no_draft_probabilities && draft_row_stride < vocab_size) ||
+            (threshold_base_position && !thresholds_from_seed))
         {
             return false;
         }
 
         cudaSetDevice(device_idx);
-        cuda_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_kernel<<<
-            row_count,
-            PROCESSED_LOGIT_VERIFY_THREADS,
-            0,
-            static_cast<cudaStream_t>(stream)>>>(
-            target_logits,
-            draft_probabilities,
-            row_count,
-            vocab_size,
-            target_row_stride,
-            draft_row_stride,
-            sampled_draft_tokens,
-            accept_threshold0,
-            accept_threshold1,
-            accept_threshold2,
-            accept_threshold3,
-            inverse_sample_seed,
-            inverse_sample_first_logical_position,
-            out_token,
-            out_accepted,
-            out_accept_probability,
-            out_accept_threshold,
-            no_draft_probabilities);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "CUDA Processed-Target/Draft-Probability Stochastic Verify kernel launch failed: %s\n",
-                    cudaGetErrorString(err));
+        constexpr int kRowsPerLaunch =
+            llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+        const bool use_seeded_thresholds = thresholds_from_seed != 0;
+        if (!use_seeded_thresholds && !accept_thresholds_host)
             return false;
+
+        const int launch_count = use_seeded_thresholds
+                                     ? 1
+                                     : (row_count + kRowsPerLaunch - 1) /
+                                           kRowsPerLaunch;
+        for (int launch = 0; launch < launch_count; ++launch)
+        {
+            const int row_base = use_seeded_thresholds
+                                     ? 0
+                                     : launch * kRowsPerLaunch;
+            const int launch_rows = use_seeded_thresholds
+                                        ? row_count
+                                        : std::min(kRowsPerLaunch,
+                                                   row_count - row_base);
+            const auto thresholds = packCudaSpeculativeBatchThresholds(
+                use_seeded_thresholds
+                    ? nullptr
+                    : accept_thresholds_host + row_base,
+                /*residual_thresholds=*/nullptr,
+                use_seeded_thresholds ? 0 : launch_rows);
+            cuda_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_kernel<<<
+                launch_rows,
+                PROCESSED_LOGIT_VERIFY_THREADS,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                target_logits +
+                    static_cast<size_t>(row_base) * target_row_stride,
+                no_draft_probabilities
+                    ? nullptr
+                    : draft_probabilities +
+                          static_cast<size_t>(row_base) * draft_row_stride,
+                launch_rows,
+                vocab_size,
+                target_row_stride,
+                draft_row_stride,
+                sampled_draft_tokens + row_base,
+                thresholds,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position + row_base,
+                thresholds_from_seed,
+                threshold_base_position,
+                threshold_position_offset + row_base,
+                out_token + row_base,
+                out_accepted + row_base,
+                out_accept_probability
+                    ? out_accept_probability + row_base
+                    : nullptr,
+                out_accept_threshold
+                    ? out_accept_threshold + row_base
+                    : nullptr,
+                no_draft_probabilities);
+
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA Processed-Target/Draft-Probability Stochastic Verify kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
         }
         return true;
     }
@@ -4945,10 +7773,7 @@ extern "C"
         int draft_row_stride,
         const int *sampled_draft_tokens,
         const float *sampled_draft_probabilities,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
+        const float *accept_thresholds_host,
         unsigned long long inverse_sample_seed,
         int inverse_sample_first_logical_position,
         int *out_token,
@@ -4961,45 +7786,62 @@ extern "C"
         if (!target_logits || !draft_logits || !sampled_draft_tokens ||
             !out_token || !out_accepted || !stream ||
             row_count <= 0 ||
-            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
-            draft_row_stride < vocab_size)
+            draft_row_stride < vocab_size ||
+            !accept_thresholds_host)
         {
             return false;
         }
 
         cudaSetDevice(device_idx);
-        cuda_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_kernel<<<
-            row_count,
-            PROCESSED_LOGIT_VERIFY_THREADS,
-            0,
-            static_cast<cudaStream_t>(stream)>>>(
-            target_logits,
-            draft_logits,
-            row_count,
-            vocab_size,
-            target_row_stride,
-            draft_row_stride,
-            sampled_draft_tokens,
-            sampled_draft_probabilities,
-            accept_threshold0,
-            accept_threshold1,
-            accept_threshold2,
-            accept_threshold3,
-            inverse_sample_seed,
-            inverse_sample_first_logical_position,
-            out_token,
-            out_accepted,
-            out_accept_probability,
-            out_accept_threshold);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
+        constexpr int kRowsPerLaunch =
+            llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+        for (int row_base = 0; row_base < row_count;
+             row_base += kRowsPerLaunch)
         {
-            fprintf(stderr, "CUDA Processed-Target/Draft-Logit Stochastic Verify kernel launch failed: %s\n",
-                    cudaGetErrorString(err));
-            return false;
+            const int launch_rows =
+                std::min(kRowsPerLaunch, row_count - row_base);
+            const auto thresholds = packCudaSpeculativeBatchThresholds(
+                accept_thresholds_host + row_base,
+                /*residual_thresholds=*/nullptr,
+                launch_rows);
+            cuda_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_kernel<<<
+                launch_rows,
+                PROCESSED_LOGIT_VERIFY_THREADS,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                target_logits +
+                    static_cast<size_t>(row_base) * target_row_stride,
+                draft_logits +
+                    static_cast<size_t>(row_base) * draft_row_stride,
+                launch_rows,
+                vocab_size,
+                target_row_stride,
+                draft_row_stride,
+                sampled_draft_tokens + row_base,
+                sampled_draft_probabilities
+                    ? sampled_draft_probabilities + row_base
+                    : nullptr,
+                thresholds,
+                inverse_sample_seed,
+                inverse_sample_first_logical_position + row_base,
+                out_token + row_base,
+                out_accepted + row_base,
+                out_accept_probability
+                    ? out_accept_probability + row_base
+                    : nullptr,
+                out_accept_threshold
+                    ? out_accept_threshold + row_base
+                    : nullptr);
+
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA Processed-Target/Draft-Logit Stochastic Verify kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
         }
         return true;
     }
@@ -5014,10 +7856,7 @@ extern "C"
         int draft_row_stride,
         int inverse_sample_row_stride,
         const int *sampled_draft_tokens,
-        float accept_threshold0,
-        float accept_threshold1,
-        float accept_threshold2,
-        float accept_threshold3,
+        const float *accept_thresholds_host,
         int no_draft_probabilities,
         int *out_token,
         int *out_accepted,
@@ -5030,46 +7869,64 @@ extern "C"
             (!no_draft_probabilities && !draft_probabilities) ||
             !sampled_draft_tokens || !out_token || !out_accepted || !stream ||
             row_count <= 0 ||
-            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
             vocab_size <= 0 ||
             target_row_stride < vocab_size ||
             (!no_draft_probabilities && draft_row_stride < vocab_size) ||
-            inverse_sample_row_stride < vocab_size)
+            inverse_sample_row_stride < vocab_size ||
+            !accept_thresholds_host)
         {
             return false;
         }
 
         cudaSetDevice(device_idx);
-        cuda_speculative_verify_probabilities_thresholds_batch_device_tokens_kernel<<<
-            row_count,
-            PROCESSED_LOGIT_VERIFY_THREADS,
-            0,
-            static_cast<cudaStream_t>(stream)>>>(
-            target_probabilities,
-            draft_probabilities,
-            inverse_rejection_samples,
-            row_count,
-            vocab_size,
-            target_row_stride,
-            draft_row_stride,
-            inverse_sample_row_stride,
-            sampled_draft_tokens,
-            accept_threshold0,
-            accept_threshold1,
-            accept_threshold2,
-            accept_threshold3,
-            no_draft_probabilities,
-            out_token,
-            out_accepted,
-            out_accept_probability,
-            out_accept_threshold);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
+        constexpr int kRowsPerLaunch =
+            llaminar2::sampling_math::kSpeculativeBatchMaxRows;
+        for (int row_base = 0; row_base < row_count;
+             row_base += kRowsPerLaunch)
         {
-            fprintf(stderr, "CUDA Full-Probability Stochastic Speculative Verify kernel launch failed: %s\n",
-                    cudaGetErrorString(err));
-            return false;
+            const int launch_rows =
+                std::min(kRowsPerLaunch, row_count - row_base);
+            const auto thresholds = packCudaSpeculativeBatchThresholds(
+                accept_thresholds_host + row_base,
+                /*residual_thresholds=*/nullptr,
+                launch_rows);
+            cuda_speculative_verify_probabilities_thresholds_batch_device_tokens_kernel<<<
+                launch_rows,
+                PROCESSED_LOGIT_VERIFY_THREADS,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                target_probabilities +
+                    static_cast<size_t>(row_base) * target_row_stride,
+                no_draft_probabilities
+                    ? nullptr
+                    : draft_probabilities +
+                          static_cast<size_t>(row_base) * draft_row_stride,
+                inverse_rejection_samples +
+                    static_cast<size_t>(row_base) * inverse_sample_row_stride,
+                launch_rows,
+                vocab_size,
+                target_row_stride,
+                draft_row_stride,
+                inverse_sample_row_stride,
+                sampled_draft_tokens + row_base,
+                thresholds,
+                no_draft_probabilities,
+                out_token + row_base,
+                out_accepted + row_base,
+                out_accept_probability
+                    ? out_accept_probability + row_base
+                    : nullptr,
+                out_accept_threshold
+                    ? out_accept_threshold + row_base
+                    : nullptr);
+
+            const cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "CUDA Full-Probability Stochastic Speculative Verify kernel launch failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
         }
         return true;
     }
@@ -5091,12 +7948,15 @@ extern "C"
         const int *bonus_token,
         int has_bonus_token,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        int leading_committed_output_count,
         int device_idx,
         void *stream)
     {
         if (row_count < 0 ||
-            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+            out_token_capacity < row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count >
                 llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
@@ -5125,7 +7985,10 @@ extern "C"
             bonus_token,
             has_bonus_token,
             out_tokens,
-            out_meta);
+            out_token_capacity,
+            out_meta,
+            max_state_commit_rows,
+            leading_committed_output_count);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -5154,12 +8017,15 @@ extern "C"
         const int *bonus_token,
         int has_bonus_token,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        int leading_committed_output_count,
         int device_idx,
         void *stream)
     {
         if (row_count < 0 ||
-            row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+            out_token_capacity < row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count >
                 llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
@@ -5188,13 +8054,215 @@ extern "C"
             bonus_token,
             has_bonus_token,
             out_tokens,
-            out_meta);
+            out_token_capacity,
+            out_meta,
+            max_state_commit_rows,
+            leading_committed_output_count);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Speculative Verify Batch Device-First Summary kernel launch failed: %s\n",
                     cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_summarize_speculative_verify_batch_device_generation_controls(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        const int *greedy_draft_tokens,
+        int row_count,
+        const int *first_token,
+        const int *stop_tokens,
+        const int *bonus_token,
+        int has_bonus_token,
+        const int *generation_control,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        int device_idx,
+        void *stream)
+    {
+        const bool has_acceptance_rows = verify_accepted != nullptr;
+        const bool has_greedy_rows = greedy_draft_tokens != nullptr;
+        if (!verify_tokens || has_acceptance_rows == has_greedy_rows ||
+            row_count < 0 || !first_token || !stop_tokens ||
+            (has_bonus_token && !bonus_token) || !generation_control ||
+            out_token_capacity < row_count + 1 || !out_tokens || !out_meta ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_summarize_speculative_verify_batch_device_generation_controls_kernel<<<
+            1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            verify_tokens,
+            verify_accepted,
+            greedy_draft_tokens,
+            row_count,
+            first_token,
+            stop_tokens,
+            bonus_token,
+            has_bonus_token,
+            generation_control,
+            out_tokens,
+            out_token_capacity,
+            out_meta);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA device-generation speculative summary launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool
+    cudaOps_sample_and_summarize_serial_equivalent_speculative_batch_device_generation_controls(
+        const int *target_token_ids,
+        const float *target_probs,
+        int target_row_stride,
+        int top_k,
+        int row_count,
+        unsigned long long threshold_seed,
+        const int *threshold_position,
+        int threshold_position_offset,
+        const int *verifier_input_tokens,
+        const int *stop_tokens,
+        const int *generation_control,
+        int *sampled_target_tokens,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        void *first_transaction_diagnostic,
+        int device_idx,
+        void *stream)
+    {
+        constexpr int kMaxComparisonRows = 15;
+        if (!target_token_ids || !target_probs ||
+            target_row_stride <= 0 || top_k <= 0 ||
+            top_k > target_row_stride || row_count <= 0 ||
+            row_count > kMaxComparisonRows || threshold_seed == 0 ||
+            !threshold_position || !verifier_input_tokens || !stop_tokens ||
+            !generation_control || !sampled_target_tokens || !out_tokens ||
+            out_token_capacity < row_count + 1 || !out_meta || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        using DiagnosticRecord =
+            llaminar2::sampling_math::MTPFirstTransactionDiagnosticRecord;
+        auto *diagnostic =
+            static_cast<DiagnosticRecord *>(first_transaction_diagnostic);
+        if (diagnostic)
+        {
+            cuda_sample_and_summarize_serial_equivalent_speculative_batch_kernel<
+                true><<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                target_token_ids,
+                target_probs,
+                target_row_stride,
+                top_k,
+                row_count,
+                threshold_seed,
+                threshold_position,
+                threshold_position_offset,
+                verifier_input_tokens,
+                stop_tokens,
+                generation_control,
+                sampled_target_tokens,
+                out_tokens,
+                out_token_capacity,
+                out_meta,
+                diagnostic);
+        }
+        else
+        {
+            cuda_sample_and_summarize_serial_equivalent_speculative_batch_kernel<
+                false><<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                target_token_ids,
+                target_probs,
+                target_row_stride,
+                top_k,
+                row_count,
+                threshold_seed,
+                threshold_position,
+                threshold_position_offset,
+                verifier_input_tokens,
+                stop_tokens,
+                generation_control,
+                sampled_target_tokens,
+                out_tokens,
+                out_token_capacity,
+                out_meta,
+                nullptr);
+        }
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA fused serial-equivalent speculative outcome launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_retain_mtp_first_transaction_draft_boundary(
+        const uint32_t *data_words,
+        int word_count,
+        int boundary,
+        int draft_slot,
+        const int *condition_token,
+        const int *position_id,
+        const int *generation_control,
+        int generation_control_stride,
+        void *diagnostic_record,
+        int device_idx,
+        void *stream)
+    {
+        using namespace llaminar2::sampling_math;
+        if (word_count < 0 || (word_count > 0 && !data_words) ||
+            boundary < 0 ||
+            boundary >= kMTPFirstTransactionDraftBoundaryCount ||
+            draft_slot < 0 || draft_slot >= kSpeculativeBatchMaxRows ||
+            !condition_token || !position_id || !generation_control ||
+            generation_control_stride < kDeviceGenerationControlCount ||
+            !diagnostic_record || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_retain_mtp_first_transaction_draft_boundary_kernel<<<
+            1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+            data_words,
+            word_count,
+            boundary,
+            draft_slot,
+            condition_token,
+            position_id,
+            generation_control,
+            generation_control_stride,
+            static_cast<MTPFirstTransactionDiagnosticRecord *>(
+                diagnostic_record));
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA first-transaction MTP draft-boundary diagnostic launch failed: %s\n",
+                cudaGetErrorString(err));
             return false;
         }
         return true;
@@ -5215,12 +8283,15 @@ extern "C"
         int stop_token7,
         int stop_token_count,
         int *out_tokens,
+        int out_token_capacity,
         int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        int leading_committed_output_count,
         int device_idx,
         void *stream)
     {
         if (compare_row_count < 0 ||
-            compare_row_count > llaminar2::sampling_math::kSpeculativeBatchMaxRows ||
+            out_token_capacity < compare_row_count + 1 ||
             stop_token_count < 0 ||
             stop_token_count >
                 llaminar2::sampling_math::kSpeculativeBatchMaxStopTokens ||
@@ -5246,12 +8317,576 @@ extern "C"
             stop_token7,
             stop_token_count,
             out_tokens,
-            out_meta);
+            out_token_capacity,
+            out_meta,
+            max_state_commit_rows,
+            leading_committed_output_count);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Greedy Speculative Verify Batch Summary kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_summarize_greedy_speculative_verify_batch_device_controls(
+        const int *verify_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        const int *active_verifier_row_count,
+        const int *stop_tokens,
+        int *out_tokens,
+        int out_token_capacity,
+        int *out_meta,
+        const uint32_t *max_state_commit_rows,
+        const int *next_leading_committed_output_count,
+        int device_idx,
+        void *stream)
+    {
+        if (compare_row_count < 0 ||
+            out_token_capacity < compare_row_count + 1 ||
+            !verify_tokens || !draft_tokens || !active_verifier_row_count ||
+            !stop_tokens || !next_leading_committed_output_count ||
+            !out_tokens || !out_meta || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_summarize_greedy_speculative_verify_batch_device_controls_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            verify_tokens,
+            draft_tokens,
+            compare_row_count,
+            active_verifier_row_count,
+            stop_tokens,
+            out_tokens,
+            out_token_capacity,
+            out_meta,
+            max_state_commit_rows,
+            next_leading_committed_output_count);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA device-control greedy speculative summary launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_advance_speculative_commit_boundary(
+        const int *meta,
+        int request_count,
+        int meta_stride,
+        uint32_t *decode_rounds_committed,
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream)
+    {
+        if (!meta || request_count <= 0 ||
+            meta_stride <
+                llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+            !decode_rounds_committed ||
+            !decode_rounds_until_maintenance ||
+            !maintenance_due || !decode_boundary_advanced || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_advance_speculative_commit_boundary_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            meta,
+            request_count,
+            meta_stride,
+            decode_rounds_committed,
+            decode_rounds_until_maintenance,
+            maintenance_due,
+            decode_boundary_advanced);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA speculative commit-boundary advance launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_serial_decode_commit_boundary(
+        uint32_t *decode_rounds_committed,
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream)
+    {
+        if (!decode_rounds_committed ||
+            !decode_rounds_until_maintenance || !maintenance_due ||
+            !decode_boundary_advanced || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_publish_serial_decode_commit_boundary_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            decode_rounds_committed,
+            decode_rounds_until_maintenance,
+            maintenance_due,
+            decode_boundary_advanced);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA serial decode commit-boundary publication failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_acknowledge_decode_commit_boundary(
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream)
+    {
+        if (!decode_rounds_until_maintenance || !maintenance_due ||
+            !decode_boundary_advanced || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_acknowledge_decode_commit_boundary_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            decode_rounds_until_maintenance,
+            maintenance_due,
+            decode_boundary_advanced);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA decode commit-boundary acknowledgement failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_initialize_device_moe_rebalance_dispatch_ticket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        uint32_t participant_id,
+        uint32_t participant_count,
+        llaminar2::DeviceMoERebalanceDispatchTicket *ticket,
+        int device_idx,
+        void *stream)
+    {
+        if (session_epoch == 0u || workspace_generation == 0u ||
+            participant_count == 0u || participant_id >= participant_count ||
+            !ticket || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_initialize_device_moe_rebalance_dispatch_ticket_kernel<<<
+            1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            session_epoch,
+            workspace_generation,
+            participant_id,
+            participant_count,
+            ticket);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MoE dispatch-ticket initialization failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_device_moe_rebalance_dispatch_ticket(
+        const uint32_t *controller_magic,
+        const uint32_t *controller_version,
+        const uint32_t *controller_error,
+        const uint32_t *decode_rounds_committed,
+        const uint32_t *decode_rounds_until_maintenance,
+        const uint32_t *maintenance_due,
+        const uint32_t *decode_boundary_advanced,
+        llaminar2::DeviceMoERebalanceDispatchTicket *ticket,
+        int device_idx,
+        void *stream)
+    {
+        if (!controller_magic || !controller_version || !controller_error ||
+            !decode_rounds_committed || !decode_rounds_until_maintenance ||
+            !maintenance_due || !decode_boundary_advanced || !ticket ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_publish_device_moe_rebalance_dispatch_ticket_kernel<<<
+            1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            controller_magic,
+            controller_version,
+            controller_error,
+            decode_rounds_committed,
+            decode_rounds_until_maintenance,
+            maintenance_due,
+            decode_boundary_advanced,
+            ticket);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MoE dispatch-ticket publication failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /** @brief Enqueue ordinary publication on the exact caller-owned stream. */
+    bool cudaOps_publish_ordinary_generation_sample(
+        const llaminar2::sampling_math::OrdinaryGenerationPublication &publication,
+        int device_idx, void *stream)
+    {
+        if (!publication.valid() || !stream || device_idx < 0)
+            return false;
+        if (cudaSetDevice(device_idx) != cudaSuccess) return false;
+        constexpr int threads = 32;
+        const int blocks = 1 + (publication.request_count - 1) / threads;
+        cuda_publish_ordinary_generation_sample_kernel<<<
+            blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(publication);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    bool cudaOps_initialize_device_generation(
+        int request_count,
+        int max_new_tokens,
+        const llaminar2::sampling_math::DeviceGenerationPolicy &depth_policy,
+        llaminar2::sampling_math::DeviceGenerationLeadingRowDisposition
+            initial_leading_row_disposition,
+        int response_token_stride,
+        int control_stride,
+        int *control,
+        int device_idx,
+        void *stream)
+    {
+        if (request_count <= 0 ||
+            !llaminar2::sampling_math::valid_device_generation_admission(
+                depth_policy, max_new_tokens, initial_leading_row_disposition) ||
+            response_token_stride <= 0 || response_token_stride < max_new_tokens ||
+            control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            !control || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        // One request owns one scalar controller row. Production generation is
+        // normally batch one, so one warp avoids launching three immediately
+        // retired warps while retaining grid totality for larger request sets.
+        constexpr int threads_per_block = 32;
+        const int blocks =
+            (request_count + threads_per_block - 1) / threads_per_block;
+        cuda_initialize_device_generation_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            request_count,
+            max_new_tokens,
+            depth_policy,
+            initial_leading_row_disposition,
+            response_token_stride,
+            control_stride,
+            control);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA device-generation initialization launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_initialize_device_generation_dispatch_tickets(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        int *control,
+        int control_stride,
+        int request_count,
+        llaminar2::sampling_math::DeviceGenerationDispatchTicket *tickets,
+        int device_idx,
+        void *stream)
+    {
+        if (session_epoch == 0 || workspace_generation == 0 || !control ||
+            control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || !tickets || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 32;
+        const int blocks =
+            (request_count + threads_per_block - 1) / threads_per_block;
+        cuda_initialize_device_generation_dispatch_ticket_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            session_epoch,
+            workspace_generation,
+            control,
+            control_stride,
+            request_count,
+            tickets);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA device-generation ticket initialization launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_device_generation_dispatch_tickets(
+        int *control,
+        int control_stride,
+        int request_count,
+        const uint32_t *maintenance_due,
+        llaminar2::sampling_math::DeviceGenerationDispatchTicket *tickets,
+        int device_idx,
+        void *stream)
+    {
+        if (!control ||
+            control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || !tickets || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 32;
+        const int blocks =
+            (request_count + threads_per_block - 1) / threads_per_block;
+        cuda_publish_device_generation_dispatch_ticket_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            control,
+            control_stride,
+            request_count,
+            maintenance_due,
+            tickets);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA device-generation ticket publication launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_prepare_device_generation_transaction_budget(
+        int *control,
+        int control_stride,
+        int request_count,
+        int verifier_row_capacity,
+        const uint32_t *maintenance_rows_remaining,
+        const uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream)
+    {
+        const bool has_maintenance_boundary =
+            maintenance_rows_remaining || maintenance_due ||
+            decode_boundary_advanced;
+        const bool has_complete_maintenance_boundary =
+            maintenance_rows_remaining && maintenance_due &&
+            decode_boundary_advanced;
+        if (!control ||
+            control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            request_count <= 0 || verifier_row_capacity <= 0 || !stream ||
+            (has_maintenance_boundary &&
+             !has_complete_maintenance_boundary))
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        // Keep the tiny row transition to one physical CUDA warp per block.
+        constexpr int threads_per_block = 32;
+        const int blocks =
+            (request_count + threads_per_block - 1) / threads_per_block;
+        cuda_prepare_device_generation_transaction_budget_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            control,
+            control_stride,
+            request_count,
+            verifier_row_capacity,
+            maintenance_rows_remaining,
+            maintenance_due,
+            decode_boundary_advanced);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA device-generation budget launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool
+    cudaOps_commit_device_generation_and_derive_speculative_publication_metadata(
+        const int32_t *compact_tokens,
+        int output_token_stride,
+        int *compact_meta,
+        int meta_stride,
+        const int *base_cached_tokens,
+        int request_count,
+        int padded_state_rows_per_request,
+        int32_t *response_tokens,
+        int response_token_stride,
+        int *control,
+        int control_stride,
+        int *out_restore_rows,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_counts,
+        int *out_ok,
+        int *out_next_condition_tokens,
+        int *out_all_drafts_accepted_flags,
+        int *out_stopped_flags,
+        int *out_next_sidecar_condition_tokens,
+        int *out_next_sidecar_position_ids,
+        int *out_next_verifier_condition_tokens,
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
+            out_committed_verifier_identity,
+        int device_idx,
+        void *stream)
+    {
+        if (!compact_tokens || output_token_stride <= 0 || !compact_meta ||
+            meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+            !base_cached_tokens || request_count <= 0 ||
+            padded_state_rows_per_request <= 0 ||
+            !response_tokens || response_token_stride <= 0 ||
+            !control ||
+            control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            !out_restore_rows || !out_target_cached_tokens ||
+            !out_accepted_state_counts || !out_ok ||
+            ((out_next_sidecar_condition_tokens ||
+              out_next_sidecar_position_ids) &&
+             (!out_next_sidecar_condition_tokens ||
+              !out_next_sidecar_position_ids ||
+              !out_next_condition_tokens)) ||
+            (out_next_verifier_condition_tokens &&
+             !out_next_condition_tokens) ||
+            ((verifier_input_tokens ||
+              verifier_input_token_stride != 0 ||
+              out_committed_verifier_identity) &&
+             (!verifier_input_tokens ||
+              verifier_input_token_stride <= 0 ||
+              !out_committed_verifier_identity)) ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        // The fused transaction is request-independent. One physical warp is
+        // the minimum economical CUDA launch for the production batch-one case;
+        // larger batches retain grid totality without divergent cooperation.
+        constexpr int threads_per_block = 32;
+        const int blocks =
+            (request_count + threads_per_block - 1) / threads_per_block;
+        cuda_commit_device_generation_and_derive_speculative_publication_metadata_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            compact_tokens,
+            output_token_stride,
+            compact_meta,
+            meta_stride,
+            base_cached_tokens,
+            request_count,
+            padded_state_rows_per_request,
+            response_tokens,
+            response_token_stride,
+            control,
+            control_stride,
+            out_restore_rows,
+            out_target_cached_tokens,
+            out_accepted_state_counts,
+            out_ok,
+            reinterpret_cast<int32_t *>(out_next_condition_tokens),
+            out_all_drafts_accepted_flags,
+            out_stopped_flags,
+            reinterpret_cast<int32_t *>(
+                out_next_sidecar_condition_tokens),
+            reinterpret_cast<int32_t *>(out_next_sidecar_position_ids),
+            reinterpret_cast<int32_t *>(
+                out_next_verifier_condition_tokens),
+            verifier_input_tokens,
+            verifier_input_token_stride,
+            out_committed_verifier_identity);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA fused device-generation publication launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }
@@ -5274,6 +8909,7 @@ extern "C"
         int output_token_stride,
         int *out_all_drafts_accepted_flags,
         int *out_stopped_flags,
+        int *out_next_verifier_condition_tokens,
         int device_idx,
         void *stream)
     {
@@ -5282,6 +8918,8 @@ extern "C"
             !out_accepted_state_counts || !out_ok || !stream ||
             ((out_next_condition_tokens || output_tokens) &&
              (!out_next_condition_tokens || !output_tokens || output_token_stride <= 0)) ||
+            (out_next_verifier_condition_tokens &&
+             !out_next_condition_tokens) ||
             meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
             request_count <= 0 ||
             padded_state_rows_per_request <= 0 ||
@@ -5314,7 +8952,9 @@ extern "C"
             output_tokens,
             output_token_stride,
             out_all_drafts_accepted_flags,
-            out_stopped_flags);
+            out_stopped_flags,
+            reinterpret_cast<int32_t *>(
+                out_next_verifier_condition_tokens));
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -5326,13 +8966,11 @@ extern "C"
         return true;
     }
 
-    bool cudaOps_derive_shifted_speculative_publication_metadata(
-        const int *meta,
-        int meta_stride,
+    bool cudaOps_derive_shifted_speculative_publication_metadata_from_primary(
         const int *base_cached_tokens,
+        const int *main_target_cached_tokens,
+        const int *main_publication_ok,
         int request_count,
-        int padded_state_rows_per_request,
-        int max_state_commit_rows,
         int mtp_depth,
         int *out_target_cached_tokens,
         int *out_accepted_state_counts,
@@ -5340,36 +8978,32 @@ extern "C"
         int device_idx,
         void *stream)
     {
-        if (!meta || !base_cached_tokens ||
+        if (!base_cached_tokens ||
+            !main_target_cached_tokens ||
+            !main_publication_ok ||
             !out_target_cached_tokens ||
             !out_accepted_state_counts ||
             !out_ok ||
             !stream ||
-            meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
             request_count <= 0 ||
-            padded_state_rows_per_request <= 0 ||
-            max_state_commit_rows < 0 ||
-            max_state_commit_rows > padded_state_rows_per_request ||
             mtp_depth < 0)
         {
             return false;
         }
 
         cudaSetDevice(device_idx);
-        constexpr int threads_per_block = 128;
+        constexpr int threads_per_block = 32;
         const int blocks =
             (request_count + threads_per_block - 1) / threads_per_block;
-        cuda_derive_shifted_speculative_publication_metadata_kernel<<<
+        cuda_derive_shifted_speculative_publication_metadata_from_primary_kernel<<<
             blocks,
             threads_per_block,
             0,
             static_cast<cudaStream_t>(stream)>>>(
-            meta,
-            meta_stride,
             base_cached_tokens,
+            main_target_cached_tokens,
+            main_publication_ok,
             request_count,
-            padded_state_rows_per_request,
-            max_state_commit_rows,
             mtp_depth,
             out_target_cached_tokens,
             out_accepted_state_counts,
@@ -5379,6 +9013,345 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Shifted Speculative Publication Metadata kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_prepare_speculative_shifted_kv_tokens(
+        const int *meta,
+        int meta_stride,
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int request_index,
+        int first_output_token_index,
+        int row_count,
+        int32_t filler_token,
+        int32_t *out_tokens,
+        const int32_t *base_positions,
+        int position_offset,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream)
+    {
+        if (!meta ||
+            !output_tokens ||
+            !out_tokens ||
+            !base_positions ||
+            !out_position_ids ||
+            !stream ||
+            meta_stride < llaminar2::sampling_math::kSpeculativeBatchMetaCount ||
+            output_token_stride <= first_output_token_index ||
+            request_index < 0 ||
+            first_output_token_index < 0 ||
+            row_count <= 0)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_prepare_speculative_shifted_kv_tokens_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            meta,
+            meta_stride,
+            output_tokens,
+            output_token_stride,
+            request_index,
+            first_output_token_index,
+            row_count,
+            filler_token,
+            out_tokens,
+            base_positions,
+            position_offset,
+            out_position_ids);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Speculative Shifted KV Token Prep kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue device-resident preparation for one grouped MTP sidecar.
+     */
+    bool cudaOps_prepare_mtp_batched_sidecar_inputs(
+        const int32_t *condition_tokens,
+        int condition_token_stride,
+        const int32_t *base_positions,
+        int position_offset,
+        int request_count,
+        int32_t *out_condition_tokens,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream)
+    {
+        if (!condition_tokens ||
+            condition_token_stride <= 0 ||
+            !base_positions ||
+            request_count <= 0 ||
+            !out_condition_tokens ||
+            !out_position_ids ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 32;
+        cuda_prepare_mtp_batched_sidecar_inputs_kernel<<<
+            1,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            condition_tokens,
+            condition_token_stride,
+            base_positions,
+            position_offset,
+            request_count,
+            out_condition_tokens,
+            out_position_ids);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA batched MTP sidecar input preparation failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /** @brief Enqueue the position-only scalar/rectangular compatibility form. */
+    bool cudaOps_prepare_mtp_verifier_position_ids(
+        const int32_t *base_positions,
+        int request_count,
+        int padded_seq_len,
+        int32_t *out_position_ids,
+        int device_idx,
+        void *stream)
+    {
+        if (!base_positions ||
+            request_count <= 0 ||
+            padded_seq_len <= 0 ||
+            !out_position_ids ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 128;
+        const int total_rows = request_count * padded_seq_len;
+        const int blocks =
+            (total_rows + threads_per_block - 1) / threads_per_block;
+        cuda_prepare_mtp_verifier_geometry_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            base_positions,
+            /*valid_graph_rows=*/nullptr,
+            /*valid_graph_row_count=*/0,
+            /*generation_control=*/nullptr,
+            /*generation_control_stride=*/0,
+            request_count,
+            padded_seq_len,
+            out_position_ids,
+            /*out_request_lengths=*/nullptr);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA grouped MTP verifier position preparation failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue one device-resident grouped-verifier geometry publication.
+     */
+    bool cudaOps_prepare_mtp_verifier_geometry(
+        const int32_t *base_positions,
+        const int32_t *valid_graph_rows,
+        int valid_graph_row_count,
+        int *generation_control,
+        int generation_control_stride,
+        int request_count,
+        int padded_seq_len,
+        int32_t *out_position_ids,
+        int32_t *out_request_lengths,
+        int device_idx,
+        void *stream)
+    {
+        const int total_rows = request_count * padded_seq_len;
+        const bool rectangular = valid_graph_rows == nullptr;
+        const bool device_controlled = generation_control != nullptr;
+        if (!base_positions || request_count <= 0 || padded_seq_len <= 0 ||
+            !out_position_ids || !out_request_lengths || !stream ||
+            (device_controlled != (generation_control_stride > 0)) ||
+            (device_controlled &&
+             generation_control_stride <
+                 llaminar2::sampling_math::kDeviceGenerationControlCount) ||
+            (rectangular &&
+             (valid_graph_row_count <= 0 ||
+              valid_graph_row_count > total_rows ||
+              valid_graph_row_count % request_count != 0)) ||
+            (!rectangular &&
+             (valid_graph_row_count <= 0 || valid_graph_row_count > total_rows)))
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 128;
+        const int blocks =
+            (total_rows + threads_per_block - 1) / threads_per_block;
+        cuda_prepare_mtp_verifier_geometry_kernel<<<
+            blocks,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            base_positions,
+            valid_graph_rows,
+            valid_graph_row_count,
+            generation_control,
+            generation_control_stride,
+            request_count,
+            padded_seq_len,
+            out_position_ids,
+            out_request_lengths);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA grouped MTP verifier geometry preparation failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /** @brief Enqueue one fused controller-owned verifier row publication. */
+    bool cudaOps_prepare_mtp_verifier_controlled_row(
+        const int32_t *first_token,
+        const int32_t *draft_tokens,
+        const int32_t *base_position,
+        int *generation_control_row,
+        int generation_control_stride,
+        int padded_seq_len,
+        int32_t *out_tokens,
+        int32_t *out_position_ids,
+        int32_t *out_request_length,
+        int32_t *out_base_position_snapshot,
+        int device_idx,
+        void *stream)
+    {
+        if (!first_token || !draft_tokens || !base_position ||
+            !generation_control_row ||
+            generation_control_stride <
+                llaminar2::sampling_math::kDeviceGenerationControlCount ||
+            padded_seq_len <= 1 || !out_tokens || !out_position_ids ||
+            !out_request_length || !out_base_position_snapshot || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads_per_block = 32;
+        cuda_prepare_mtp_verifier_controlled_row_kernel<<<
+            1,
+            threads_per_block,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            first_token,
+            draft_tokens,
+            base_position,
+            generation_control_row,
+            padded_seq_len,
+            out_tokens,
+            out_position_ids,
+            out_request_length,
+            out_base_position_snapshot);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA controlled MTP verifier row preparation failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Enqueue first-publication metadata from request-batched prefill.
+     */
+    bool cudaOps_initialize_mtp_device_logical_state(
+        const int32_t *sampled_tokens,
+        const int32_t *target_positions,
+        int request_count,
+        int32_t *out_base_cached_tokens,
+        int32_t *out_target_positions,
+        int32_t *out_accepted_state_counts,
+        int32_t *out_next_condition_tokens,
+        int32_t *out_all_drafts_accepted_flags,
+        int32_t *out_stopped_flags,
+        int32_t *out_publication_ok_flags,
+        int device_idx,
+        void *stream)
+    {
+        if (!sampled_tokens ||
+            !target_positions ||
+            request_count <= 0 ||
+            !out_base_cached_tokens ||
+            !out_target_positions ||
+            !out_accepted_state_counts ||
+            !out_next_condition_tokens ||
+            !out_all_drafts_accepted_flags ||
+            !out_stopped_flags ||
+            !out_publication_ok_flags ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_initialize_mtp_device_logical_state_kernel<<<
+            1,
+            32,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            sampled_tokens,
+            target_positions,
+            request_count,
+            out_base_cached_tokens,
+            out_target_positions,
+            out_accepted_state_counts,
+            out_next_condition_tokens,
+            out_all_drafts_accepted_flags,
+            out_stopped_flags,
+            out_publication_ok_flags);
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "CUDA MTP device logical-state initialization failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

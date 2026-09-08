@@ -6,6 +6,7 @@
 #include "ResidualAddStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../backends/BackendManager.h"
@@ -81,19 +82,20 @@ namespace llaminar2
 
             if (params_.device_id.is_gpu())
             {
-                if (!input_base->ensureOnDevice(params_.device_id) ||
-                    !output_base->allocateOnDevice(params_.device_id))
-                    return false;
+                const StageGPUExecution execution = gpuExecution();
+                execution.requirePreparedInput(input_base);
+                execution.requirePreparedOutput(output_base);
                 IBackend *backend = getBackendFor(params_.device_id);
                 if (!backend)
                     return false;
-                const bool ok = backend->deviceToDevice(
-                    output_base->active_mutable_data_ptr(),
-                    input_base->active_data_ptr(),
+                const bool ok = backend->deviceCopyAsync(
+                    output_base->gpu_data_ptr(),
+                    input_base->gpu_data_ptr(),
                     bytes,
-                    params_.device_id.ordinal);
+                    params_.device_id.ordinal,
+                    gpuStream());
                 if (ok)
-                    output_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, params_.device_id);
+                    gpuExecution().publish(output_base);
                 return ok;
             }
 
@@ -105,7 +107,7 @@ namespace llaminar2
         TensorType residual_type = params_.residual->native_type();
         TensorType output_type = params_.output->native_type();
 
-        LOG_DEBUG("[ResidualAddStage] Execute: num_elements=" << num_elements
+        LOG_TRACE("[ResidualAddStage] Execute: num_elements=" << num_elements
                                                               << " input_type=" << params_.input->dtype_name()
                                                               << " residual_type=" << params_.residual->dtype_name()
                                                               << " output_type=" << params_.output->dtype_name());
@@ -263,11 +265,7 @@ namespace llaminar2
         bool ok = kernel->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
                                        params_.device_id.toKernelDeviceIndex());
         if (ok && params_.device_id.is_gpu())
-        {
-            output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                               params_.device_id,
-                                               gpuStream());
-        }
+            gpuExecution().publish(output_base);
 
         if (Logger::getInstance().shouldLog(LogLevel::TRACE) && !params_.device_id.is_gpu())
         {

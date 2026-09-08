@@ -1,5 +1,6 @@
 #include "Qwen36MoEParityTestBase.h"
 
+#include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 
@@ -27,9 +28,10 @@ namespace
         auto test_case = cpuSingleDeviceCase();
         test_case.name = "Qwen3.6 MoE CPU SingleDevice benchmark-prompt MTP diagnostic";
         test_case.prompt = qwen36MoEBenchmarkPrompt();
-        test_case.metadata_envs = {"LLAMINAR_QWEN36_MOE_CPU_MTP_DIAGNOSTIC_METADATA"};
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_MOE_MTP_DIAGNOSTIC_METADATA"};
         test_case.default_metadata_path =
-            "pytorch_qwen36_moe_cpu_mtp_diagnostic_snapshots/metadata.txt";
+            "pytorch_qwen36_moe_mtp_diagnostic_snapshots/metadata.txt";
         test_case.decode_steps = 4;
         test_case.max_seq_len = 768;
         return test_case;
@@ -49,14 +51,29 @@ namespace
 #define QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE cpuSingleDeviceBenchmarkPromptCase
 #define QWEN36_MOE_PREFIX_MTP_DEPTH3_CASE cpuSingleDeviceDepth3Case
 #define QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION 0
+#define QWEN36_MOE_PREFIX_MTP_EXPECTS_SIDECAR_MAIN_STATE_PRESERVED 1
 #include "Qwen36MoESingleDevicePrefixMTPParityTests.inc"
 
 int main(int argc, char **argv)
 {
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    /*
+     * The parity binary invokes OrchestrationRunner directly rather than the
+     * application RuntimeInitPhase. Declare the aggregate CPU allocation
+     * domain before any workspace-owning graph is constructed; production MPI
+     * ranks perform the equivalent initialization with their exact NUMA node.
+     */
+    initCPUBackend(-1);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+
+    std::string retirement_error;
+    if (!releaseMoEMTPModelContextCampaignCache(&retirement_error))
+    {
+        std::cerr << retirement_error << '\n';
+        result = 1;
+    }
 
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();

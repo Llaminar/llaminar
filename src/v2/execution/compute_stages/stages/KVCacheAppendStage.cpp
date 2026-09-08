@@ -12,9 +12,11 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../kernels/cpu/turboquant/TurboQuantQuantizeKV.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/OpenMPUtils.h"
 
 #include "../../../utils/KVCacheProfiler.h"
@@ -25,6 +27,7 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <stdexcept>
 
 namespace
 {
@@ -68,97 +71,6 @@ namespace
         }
     }
 
-    static bool copyTensorBytesForDebugSnapshot(
-        const llaminar2::ITensor *tensor,
-        llaminar2::DeviceId device,
-        void *stream,
-        std::vector<uint8_t> &bytes)
-    {
-        if (!tensor || bytes.empty())
-        {
-            return false;
-        }
-
-        const void *device_ptr = tensor->gpu_data_ptr();
-        if (device_ptr && device.is_gpu())
-        {
-            llaminar2::IBackend *backend = llaminar2::getBackendFor(device);
-            if (!backend)
-            {
-                return false;
-            }
-
-            return backend->deviceToHostFast(
-                bytes.data(), device_ptr, bytes.size(), device.toKernelDeviceIndex(), stream);
-        }
-
-        if (const void *host = tensor->raw_data())
-        {
-            std::memcpy(bytes.data(), host, bytes.size());
-            return true;
-        }
-
-        return false;
-    }
-
-    static bool tensorToFP32DebugSnapshot(
-        const llaminar2::ITensor *tensor,
-        llaminar2::DeviceId device,
-        void *stream,
-        size_t rows,
-        size_t cols,
-        std::vector<float> &out)
-    {
-        if (!tensor || rows == 0 || cols == 0)
-        {
-            out.clear();
-            return false;
-        }
-
-        const size_t count = rows * cols;
-        const size_t elem_size = elementSizeForTensorType(tensor->native_type());
-        if (elem_size == 0)
-        {
-            out.clear();
-            return false;
-        }
-
-        std::vector<uint8_t> bytes(count * elem_size);
-        if (!copyTensorBytesForDebugSnapshot(tensor, device, stream, bytes))
-        {
-            out.clear();
-            return false;
-        }
-
-        out.resize(count);
-        switch (tensor->native_type())
-        {
-        case llaminar2::TensorType::FP32:
-            std::memcpy(out.data(), bytes.data(), count * sizeof(float));
-            return true;
-        case llaminar2::TensorType::FP16:
-        {
-            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-            for (size_t i = 0; i < count; ++i)
-            {
-                out[i] = llaminar2::fp16_to_fp32(src[i]);
-            }
-            return true;
-        }
-        case llaminar2::TensorType::BF16:
-        {
-            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-            for (size_t i = 0; i < count; ++i)
-            {
-                out[i] = llaminar2::simd::bf16_to_fp32(src[i]);
-            }
-            return true;
-        }
-        default:
-            out.clear();
-            return false;
-        }
-    }
 }
 
 namespace llaminar2
@@ -173,38 +85,100 @@ namespace llaminar2
     {
     }
 
-    bool KVCacheAppendStage::shouldUseDecodeEquivalentVerifierAppend(
-        int total_tokens,
-        int batch_size,
-        int seq_len) const
+    bool KVCacheAppendStage::bindCanonicalGraphAppendSources(
+        void *stream,
+        int runtime_seq_len)
     {
-        if (!params_.kv_cache)
+        if (!params_.kv_cache || !params_.kv_cache->isGraphCaptureReady() ||
+            !stream)
         {
             return false;
         }
 
-        if (batch_size != 1 || seq_len != total_tokens)
+        const int request_count = std::max(1, params_.batch_size);
+        const int physical_tokens =
+            runtime_seq_len > 0
+                ? runtime_seq_len
+                : (params_.seq_len > 0
+                       ? params_.seq_len
+                       : params_.num_tokens / request_count);
+        if (physical_tokens <= 0 || params_.num_tokens <= 0 ||
+            physical_tokens * request_count > params_.num_tokens)
         {
+            LOG_ERROR("[KVCacheAppendStage] Invalid graph append capture geometry"
+                      << " physical_tokens=" << physical_tokens
+                      << " request_count=" << request_count
+                      << " total_tokens=" << params_.num_tokens
+                      << " layer=" << params_.layer_idx
+                      << " seq_idx=" << params_.seq_idx);
             return false;
         }
 
-        // Phase 9.8 verifier rows are bounded by the production MTP draft
-        // depth.  Larger shapes are true prefill and must keep the normal
-        // throughput path.
-        if (total_tokens < 2 || total_tokens > 4)
+        bool ready = true;
+        for (int request = 0; request < request_count; ++request)
         {
+            const int32_t *const source =
+                params_.request_sequence_lengths_device
+                    ? params_.request_sequence_lengths_device + request
+                    : nullptr;
+            ready = params_.kv_cache->bindGraphAppendCountSource(
+                        params_.layer_idx,
+                        params_.seq_idx + request,
+                        source,
+                        physical_tokens,
+                        stream) &&
+                    ready;
+        }
+        return ready;
+    }
+
+    bool KVCacheAppendStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!params_.device_id.is_gpu() || !stream)
+        {
+            LOG_ERROR("[KVCacheAppendStage] Graph capture preparation requires an explicit GPU stream");
             return false;
         }
-
-        if (params_.layer_idx < 0 || params_.seq_idx < 0)
+        setGPUStream(stream);
+        if (!bindCanonicalGraphAppendSources(stream, /*runtime_seq_len=*/0))
         {
+            LOG_ERROR("[KVCacheAppendStage] Could not bind canonical append-count sources before graph capture"
+                      << " layer=" << params_.layer_idx
+                      << " first_seq_idx=" << params_.seq_idx);
             return false;
         }
+        return true;
+    }
 
-        // This row-equivalent path is for decode/verifier continuation over an
-        // existing prefix.  Tiny prompt prefills should not pay the serial row
-        // cost, and they have no serial decode cache state to match.
-        return params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx) > 0;
+    bool KVCacheAppendStage::shouldUseDecodeEquivalentVerifierAppend(
+        int request_rows) const
+    {
+        if (params_.append_semantics !=
+            KVCacheAppendSemantics::DecodeEquivalentVerifier)
+            return false;
+
+        /*
+         * A one-row verifier transaction is the zero-draft boundary of the
+         * same grouped contract, not a different serial execution mode.  All
+         * cache backends accept one or more verifier rows, which keeps M=1
+         * total and lets the graph exercise the identical publication path at
+         * every supported verifier depth.
+         */
+        if (!params_.kv_cache || params_.layer_idx < 0 || params_.seq_idx < 0 ||
+            request_rows < 1)
+        {
+            LOG_ERROR("[KVCacheAppendStage] Invalid grouped verifier cache-publication contract"
+                      << " rows=" << request_rows
+                      << " layer=" << params_.layer_idx
+                      << " seq=" << params_.seq_idx
+                      << " cache=" << params_.kv_cache);
+            throw std::runtime_error(
+                "invalid grouped verifier KV cache-publication contract");
+        }
+        return true;
     }
 
     bool KVCacheAppendStage::execute(IDeviceContext *ctx)
@@ -223,11 +197,20 @@ namespace llaminar2
             return false;
         }
 
+        void *stage_stream = nullptr;
+        if (params_.device_id.is_gpu())
+        {
+            stage_stream = requireGPUStream();
+            const StageGPUExecution execution = gpuExecution();
+            execution.requirePreparedInput(
+                const_cast<ITensor *>(params_.K));
+            execution.requirePreparedInput(
+                const_cast<ITensor *>(params_.V));
+        }
+
         // Determine the graph-shaped token count first, then narrow to the real
-        // prefix for non-captured padded execution. Captured prefill records the
-        // fixed bucket kernel shape and advances host metadata by the real
-        // prefix while recording so later captured attention stages can see the
-        // just-appended cache view.
+        // prefix for non-captured padded execution. Captured GPU execution keeps
+        // head/count and real request lengths entirely in canonical device state.
         int total_tokens = params_.num_tokens;
         if (total_tokens <= 0)
         {
@@ -259,42 +242,35 @@ namespace llaminar2
             const auto start = std::chrono::high_resolution_clock::now();
 
             bool success = false;
-            void *stream = gpuStream();
-            if (params_.device_id.is_gpu() && !stream)
-            {
-                LOG_ERROR("[KVCacheAppendStage] GPU KV append requires an explicit non-null stage stream");
-                return false;
-            }
+            void *stream = stage_stream;
 
             if (debugEnv().attention.debug_kv_append_source_snapshot &&
                 debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
             {
-                const size_t rows = static_cast<size_t>(num_tokens);
-                const size_t k_cols = k_tensor->shape().size() > 1 ? k_tensor->shape()[1] : k_tensor->cols();
-                const size_t v_cols = v_tensor->shape().size() > 1 ? v_tensor->shape()[1] : v_tensor->cols();
-                const bool have_k = tensorToFP32DebugSnapshot(
-                    k_tensor, params_.device_id, stream, rows, k_cols,
-                    debug_append_source_k_snapshot_);
-                const bool have_v = tensorToFP32DebugSnapshot(
-                    v_tensor, params_.device_id, stream, rows, v_cols,
-                    debug_append_source_v_snapshot_);
-
-                debug_append_source_k_rows_ = have_k ? rows : 0;
-                debug_append_source_k_cols_ = have_k ? k_cols : 0;
-                debug_append_source_v_rows_ = have_v ? rows : 0;
-                debug_append_source_v_cols_ = have_v ? v_cols : 0;
+                debug_append_source_k_rows_ = static_cast<size_t>(num_tokens);
+                debug_append_source_k_cols_ = k_tensor->shape().size() > 1 ? k_tensor->shape()[1] : k_tensor->cols();
+                debug_append_source_v_rows_ = static_cast<size_t>(num_tokens);
+                debug_append_source_v_cols_ = v_tensor->shape().size() > 1 ? v_tensor->shape()[1] : v_tensor->cols();
             }
             else
             {
-                debug_append_source_k_snapshot_.clear();
-                debug_append_source_v_snapshot_.clear();
                 debug_append_source_k_rows_ = 0;
                 debug_append_source_k_cols_ = 0;
                 debug_append_source_v_rows_ = 0;
                 debug_append_source_v_cols_ = 0;
             }
 
-            if (shouldUseDecodeEquivalentVerifierAppend(num_tokens, params_.batch_size, params_.seq_len))
+            size_t requested_cache_snapshot_rows = 0;
+            if (debugEnv().attention.debug_kv_cache_snapshot &&
+                debugEnv().attention.debugKVCacheSnapshotLayerSelected(params_.layer_idx))
+            {
+                const int cached_tokens =
+                    params_.kv_cache->get_cached_tokens(params_.layer_idx, seq_idx);
+                requested_cache_snapshot_rows =
+                    static_cast<size_t>(std::max(0, cached_tokens + num_tokens));
+            }
+
+            if (shouldUseDecodeEquivalentVerifierAppend(num_tokens))
             {
                 success = params_.kv_cache->appendVerifierRowsDecodeEquivalent(
                     params_.layer_idx,
@@ -340,33 +316,12 @@ namespace llaminar2
                 KVCacheProfiler::record(KVCacheOpType::APPEND, duration_ns, tokens, bytes);
             }
 
-            if (success &&
-                isGraphCaptureActive() &&
-                isGraphCaptureHostBookkeepingActive() &&
-                params_.kv_cache->isGraphCaptureReady())
-            {
-                // Segmented decode capture records GPU append kernels, but the
-                // immediate launch-after-capture deliberately skips
-                // onGraphReplayed(). Advance host metadata during recording so
-                // subsequent captured stages see the appended token in
-                // get_cached_tokens()/dynamic dequant params, matching normal
-                // execution. Prefill capture and collective Phase-2 capture keep
-                // this guard disabled and continue to use replay callbacks or
-                // real post-capture execution instead.
-                const int advance_tokens = replay_advance_tokens_ > 0
-                                               ? replay_advance_tokens_
-                                               : num_tokens;
-                if (advance_tokens > num_tokens)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Capture bookkeeping token count exceeds append token count: real="
-                              << advance_tokens << " append=" << num_tokens);
-                    return false;
-                }
-                params_.kv_cache->advanceHead(params_.layer_idx, seq_idx, advance_tokens);
-            }
-
             if (success)
             {
+                if (requested_cache_snapshot_rows > 0)
+                {
+                    debug_cache_snapshot_rows_ = requested_cache_snapshot_rows;
+                }
                 // Snapshot callbacks may request KV cache contents from
                 // buildDumpInfoImpl().  The executor often builds dump info
                 // before execute() for coherence, so force a post-append
@@ -376,6 +331,17 @@ namespace llaminar2
 
             return success;
         };
+
+        /*
+         * Cache storage is an ordered K/V precision pair. Reading the legacy
+         * single `precision()` value loses V's physical format and previously
+         * made asymmetric caches depend on branch accidents. Resolve the pair
+         * once and use it for every batched and scalar publication decision.
+         */
+        const ActivationPrecision cache_k_precision =
+            params_.kv_cache->k_precision();
+        const ActivationPrecision cache_v_precision =
+            params_.kv_cache->v_precision();
 
         // Determine batch handling mode
         const int batch_size = params_.batch_size;
@@ -412,19 +378,6 @@ namespace llaminar2
                 const size_t k_seq_bytes = static_cast<size_t>(seq_len) * k_cols * k_elem_bytes;
                 const size_t v_seq_bytes = static_cast<size_t>(seq_len) * v_cols * v_elem_bytes;
 
-                auto *k_mut = const_cast<ITensor *>(params_.K);
-                auto *v_mut = const_cast<ITensor *>(params_.V);
-                if (!params_.K->gpu_data_ptr() && !k_mut->ensureOnDevice(target))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to ensure K on GPU for batched append");
-                    return false;
-                }
-                if (!params_.V->gpu_data_ptr() && !v_mut->ensureOnDevice(target))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to ensure V on GPU for batched append");
-                    return false;
-                }
-
                 const auto *k_base_ptr = static_cast<const uint8_t *>(params_.K->gpu_data_ptr());
                 const auto *v_base_ptr = static_cast<const uint8_t *>(params_.V->gpu_data_ptr());
                 if (!k_base_ptr || !v_base_ptr)
@@ -433,15 +386,33 @@ namespace llaminar2
                     return false;
                 }
 
-                const int gpu_ordinal = target.gpu_ordinal();
                 for (int b = 0; b < batch_size; ++b)
                 {
                     const int seq_idx = params_.seq_idx + b;
                     void *k_seq_ptr = const_cast<uint8_t *>(k_base_ptr + static_cast<size_t>(b) * k_seq_bytes);
                     void *v_seq_ptr = const_cast<uint8_t *>(v_base_ptr + static_cast<size_t>(b) * v_seq_bytes);
 
-                    GpuTensorView k_view(k_seq_ptr, static_cast<size_t>(seq_len), k_cols, k_type, gpu_ordinal);
-                    GpuTensorView v_view(v_seq_ptr, static_cast<size_t>(seq_len), v_cols, v_type, gpu_ordinal);
+                    /*
+                     * The parent tensors were joined to stage_stream above.
+                     * These wrappers describe pointer-offset slices of that
+                     * already-ordered storage; they are not independent
+                     * coherence owners and therefore carry the exact device
+                     * and producer stream into the cache boundary.
+                     */
+                    PreparedGpuTensorView k_view(
+                        k_seq_ptr,
+                        static_cast<size_t>(seq_len),
+                        k_cols,
+                        k_type,
+                        target,
+                        stage_stream);
+                    PreparedGpuTensorView v_view(
+                        v_seq_ptr,
+                        static_cast<size_t>(seq_len),
+                        v_cols,
+                        v_type,
+                        target,
+                        stage_stream);
 
                     if (!append_to_cache(seq_idx, &k_view, &v_view, seq_len))
                     {
@@ -450,10 +421,39 @@ namespace llaminar2
                     }
                 }
 
+                /*
+                 * append_to_cache() receives one pointer-offset view at a time,
+                 * but SnapshotCapture observes this stage through the original
+                 * request-major parent tensors.  Restore the parent geometry
+                 * after every request has been enqueued so an integration
+                 * diagnostic can compare request `b` with its serial row.
+                 * Leaving the final one-row slice geometry here silently made
+                 * every grouped snapshot describe request zero only.
+                 */
+                if (debugEnv().attention.debug_kv_append_source_snapshot &&
+                    debugEnv().attention.debugKVAppendSourceLayerSelected(
+                        params_.layer_idx))
+                {
+                    const size_t source_rows =
+                        static_cast<size_t>(batch_size) *
+                        static_cast<size_t>(seq_len);
+                    debug_append_source_k_rows_ = source_rows;
+                    debug_append_source_v_rows_ = source_rows;
+                    debug_append_source_k_cols_ =
+                        params_.K->shape().size() > 1
+                            ? params_.K->shape()[1]
+                            : params_.K->cols();
+                    debug_append_source_v_cols_ =
+                        params_.V->shape().size() > 1
+                            ? params_.V->shape()[1]
+                            : params_.V->cols();
+                    invalidateDumpInfoCache();
+                }
+
                 return true;
             }
 
-            LOG_DEBUG("[KVCacheAppendStage] Batched append: batch_size=" << batch_size
+            LOG_TRACE("[KVCacheAppendStage] Batched append: batch_size=" << batch_size
                                                                          << " seq_len=" << seq_len
                                                                          << " kv_dim=" << kv_dim
                                                                          << " layer=" << params_.layer_idx);
@@ -488,8 +488,8 @@ namespace llaminar2
                                                             << params_.layer_idx << " seq_idx=" << seq_idx);
 
                 bool success = false;
-                const ActivationPrecision cache_precision = params_.kv_cache->precision();
-                if (cache_precision == ActivationPrecision::FP16)
+                if (cache_k_precision == ActivationPrecision::FP16 &&
+                    cache_v_precision == ActivationPrecision::FP16)
                 {
                     const auto conv_start = std::chrono::high_resolution_clock::now();
 
@@ -501,16 +501,6 @@ namespace llaminar2
                     k_fp16->from_fp32(k_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
                     v_fp16->from_fp32(v_slice->data(), static_cast<size_t>(seq_len) * kv_dim);
 
-                    if (params_.device_id.is_gpu())
-                    {
-                        if (!k_fp16->ensureOnDevice(params_.device_id) ||
-                            !v_fp16->ensureOnDevice(params_.device_id))
-                        {
-                            LOG_ERROR("[KVCacheAppendStage] Failed to upload FP16 converted K/V slices to GPU");
-                            return false;
-                        }
-                    }
-
                     const auto conv_end = std::chrono::high_resolution_clock::now();
                     const uint64_t conv_ns = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
@@ -521,7 +511,8 @@ namespace llaminar2
 
                     success = append_to_cache(seq_idx, k_fp16.get(), v_fp16.get(), seq_len);
                 }
-                else if (cache_precision == ActivationPrecision::Q8_1)
+                else if (cache_k_precision == ActivationPrecision::Q8_1 &&
+                         cache_v_precision == ActivationPrecision::Q8_1)
                 {
                     const auto conv_start = std::chrono::high_resolution_clock::now();
 
@@ -538,16 +529,6 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (params_.device_id.is_gpu())
-                    {
-                        if (!k_q8->ensureOnDevice(params_.device_id) ||
-                            !v_q8->ensureOnDevice(params_.device_id))
-                        {
-                            LOG_ERROR("[KVCacheAppendStage] Failed to upload Q8_1 converted K/V slices to GPU");
-                            return false;
-                        }
-                    }
-
                     const auto conv_end = std::chrono::high_resolution_clock::now();
                     const uint64_t conv_ns = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
@@ -558,7 +539,8 @@ namespace llaminar2
 
                     success = append_to_cache(seq_idx, k_q8.get(), v_q8.get(), seq_len);
                 }
-                else if (cache_precision == ActivationPrecision::TQ4)
+                else if (cache_k_precision == ActivationPrecision::TQ4 &&
+                         cache_v_precision == ActivationPrecision::TQ4)
                 {
                     if (!params_.turboquant_ctx)
                     {
@@ -578,9 +560,10 @@ namespace llaminar2
 
                     success = append_to_cache(seq_idx, k_tq4.get(), v_tq4.get(), seq_len);
                 }
-                else if (cache_precision == ActivationPrecision::TQ8)
+                else if (cache_k_precision == ActivationPrecision::TQ8 &&
+                         (cache_v_precision == ActivationPrecision::TQ4 ||
+                          cache_v_precision == ActivationPrecision::TQ8))
                 {
-                    // Split TQ: TQ8 for K, TQ4 for V
                     if (!params_.turboquant_ctx)
                     {
                         LOG_ERROR("[KVCacheAppendStage] Split TQ cache requires turboquant_ctx in params");
@@ -589,15 +572,26 @@ namespace llaminar2
                     const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
                     const std::vector<size_t> tq_shape{static_cast<size_t>(seq_len), kv_dim};
 
-                    auto k_tq8 = TQ8Tensor::quantize_from_fp32(k_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                    auto v_tq4 = TQ4Tensor::quantize_from_fp32(v_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                    if (!k_tq8 || !v_tq4)
+                    auto k_tq8 = TQ8Tensor::quantize_from_fp32(
+                        k_slice->data(), tq_shape, params_.head_dim,
+                        turboquant_ctx);
+                    std::shared_ptr<TensorBase> v_tq;
+                    if (cache_v_precision == ActivationPrecision::TQ8)
+                        v_tq = TQ8Tensor::quantize_from_fp32(
+                            v_slice->data(), tq_shape, params_.head_dim,
+                            turboquant_ctx);
+                    else
+                        v_tq = TQ4Tensor::quantize_from_fp32(
+                            v_slice->data(), tq_shape, params_.head_dim,
+                            turboquant_ctx);
+                    if (!k_tq8 || !v_tq)
                     {
-                        LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to split TQ");
+                        LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to the declared TQ pair");
                         return false;
                     }
 
-                    success = append_to_cache(seq_idx, k_tq8.get(), v_tq4.get(), seq_len);
+                    success = append_to_cache(
+                        seq_idx, k_tq8.get(), v_tq.get(), seq_len);
                 }
                 else
                 {
@@ -615,20 +609,83 @@ namespace llaminar2
         }
 
         // Single-sequence path (original behavior)
-        LOG_DEBUG("[KVCacheAppendStage] Single-sequence append: " << total_tokens
+        LOG_TRACE("[KVCacheAppendStage] Single-sequence append: " << total_tokens
                                                                   << " tokens to layer " << params_.layer_idx << " seq " << params_.seq_idx);
 
         // Check if tensors match cache precision - if not, need to convert
         // This handles Hybrid mode where K_rope is FP32 and V is Q8_1 but cache is FP32
-        bool cache_is_fp32 = (params_.kv_cache->precision() == ActivationPrecision::FP32);
-        bool cache_is_fp16 = (params_.kv_cache->precision() == ActivationPrecision::FP16);
-        bool cache_is_q8_1 = (params_.kv_cache->precision() == ActivationPrecision::Q8_1);
+        const bool cache_is_fp32 =
+            cache_k_precision == ActivationPrecision::FP32 &&
+            cache_v_precision == ActivationPrecision::FP32;
+        const bool cache_is_fp16 =
+            cache_k_precision == ActivationPrecision::FP16 &&
+            cache_v_precision == ActivationPrecision::FP16;
+        const bool cache_is_q8_1 =
+            cache_k_precision == ActivationPrecision::Q8_1 &&
+            cache_v_precision == ActivationPrecision::Q8_1;
         bool k_is_fp32 = (params_.K->native_type() == TensorType::FP32);
         bool v_is_fp32 = (params_.V->native_type() == TensorType::FP32);
         const bool has_gpu_inputs = (params_.K->gpu_data_ptr() != nullptr && params_.V->gpu_data_ptr() != nullptr);
 
-        // If cache is FP32 but inputs are not, convert to FP32 for cache append
-        if (cache_is_fp32 && (!k_is_fp32 || !v_is_fp32))
+        /*
+         * CUDA and ROCm compressed caches own one fused FP32-to-physical
+         * append launch: AQ8 for K and Q8_1/TQ4/TQ8 for V. Keeping that
+         * conversion behind the cache boundary preserves capture, avoids host
+         * scratch, and lets Q8_1 operate without an unrelated TQ context.
+         */
+        const bool gpu_asymmetric_compressed_cache =
+            params_.device_id.is_gpu() &&
+            cache_k_precision == ActivationPrecision::AQ8 &&
+            (cache_v_precision == ActivationPrecision::Q8_1 ||
+             cache_v_precision == ActivationPrecision::TQ4 ||
+             cache_v_precision == ActivationPrecision::TQ8);
+        if (gpu_asymmetric_compressed_cache)
+        {
+            const bool value_uses_turboquant =
+                cache_v_precision == ActivationPrecision::TQ4 ||
+                cache_v_precision == ActivationPrecision::TQ8;
+            if (value_uses_turboquant && !params_.turboquant_ctx)
+            {
+                LOG_ERROR("[KVCacheAppendStage] AQ8/TQ GPU cache requires turboquant_ctx for value rotation");
+                return false;
+            }
+            if (!has_gpu_inputs)
+            {
+                LOG_ERROR("[KVCacheAppendStage] AQ8/compressed GPU cache requires device-resident K/V inputs");
+                return false;
+            }
+
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+            const bool success = append_to_cache(
+                params_.seq_idx, params_.K, params_.V, total_tokens);
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    conv_end - conv_start)
+                    .count());
+            KVCacheProfiler::record(
+                value_uses_turboquant
+                    ? KVCacheOpType::CONVERT_TO_TQ
+                    : KVCacheOpType::CONVERT_TO_Q8_1,
+                conv_ns, static_cast<uint64_t>(total_tokens), 0);
+            if (!success)
+            {
+                LOG_ERROR("[KVCacheAppendStage] fused AQ8/compressed GPU append failed for K="
+                          << activationPrecisionToString(cache_k_precision)
+                          << " V="
+                          << activationPrecisionToString(cache_v_precision));
+                return false;
+            }
+            return true;
+        }
+
+        /*
+         * CPU caches convert mismatched producer tensors here because their
+         * storage is host-owned. GPU caches own a fused convert-and-append
+         * launch for every native floating format; routing a GPU append through
+         * this branch would allocate host temporaries and invalidate capture.
+         */
+        if (!has_gpu_inputs && cache_is_fp32 && (!k_is_fp32 || !v_is_fp32))
         {
             const auto conv_start = std::chrono::high_resolution_clock::now();
 
@@ -798,16 +855,6 @@ namespace llaminar2
             fp16_k_scratch_->from_fp32(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
             fp16_v_scratch_->from_fp32(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
 
-            if (params_.device_id.is_gpu())
-            {
-                if (!fp16_k_scratch_->ensureOnDevice(params_.device_id) ||
-                    !fp16_v_scratch_->ensureOnDevice(params_.device_id))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to upload FP16 converted K/V tensors to GPU");
-                    return false;
-                }
-            }
-
             const auto conv_end = std::chrono::high_resolution_clock::now();
             const uint64_t conv_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
@@ -884,16 +931,6 @@ namespace llaminar2
                 }
             }
 
-            if (params_.device_id.is_gpu())
-            {
-                if (!q8_k_scratch_->ensureOnDevice(params_.device_id) ||
-                    !q8_v_scratch_->ensureOnDevice(params_.device_id))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to upload Q8_1 converted K/V tensors to GPU");
-                    return false;
-                }
-            }
-
             const auto conv_end = std::chrono::high_resolution_clock::now();
             const uint64_t conv_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
@@ -922,7 +959,9 @@ namespace llaminar2
         // See: PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
         // =================================================================
 
-        bool cache_is_q16_1 = (params_.kv_cache->precision() == ActivationPrecision::Q16_1);
+        const bool cache_is_q16_1 =
+            cache_k_precision == ActivationPrecision::Q16_1 &&
+            cache_v_precision == ActivationPrecision::Q16_1;
 
         if (cache_is_q16_1)
         {
@@ -1218,7 +1257,9 @@ namespace llaminar2
         // =================================================================
         // TQ4 cache path with TurboQuant rotation-based quantization
         // =================================================================
-        bool cache_is_tq4 = (params_.kv_cache->precision() == ActivationPrecision::TQ4);
+        const bool cache_is_tq4 =
+            cache_k_precision == ActivationPrecision::TQ4 &&
+            cache_v_precision == ActivationPrecision::TQ4;
 
         if (cache_is_tq4)
         {
@@ -1340,9 +1381,12 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Split TQ cache path: TQ8 for K, TQ4 for V
+        // CPU TurboQuant cache path: TQ8 K with selectable TQ4 or TQ8 V
         // =================================================================
-        bool cache_is_tq8 = (params_.kv_cache->k_precision() == ActivationPrecision::TQ8);
+        const bool cache_is_tq8 =
+            cache_k_precision == ActivationPrecision::TQ8 &&
+            (cache_v_precision == ActivationPrecision::TQ4 ||
+             cache_v_precision == ActivationPrecision::TQ8);
 
         if (cache_is_tq8)
         {
@@ -1352,37 +1396,7 @@ namespace llaminar2
                 return false;
             }
 
-            // =============================================================
-            // GPU fast path: pass FP32 K/V directly to the TQ cache.
-            // The GPU cache (CUDARingKVCacheTQ / ROCmRingKVCacheTQ) has
-            // built-in GPU quantize kernels that avoid the catastrophic
-            // D2H → CPU quant → H2D round-trip.
-            // =============================================================
-            if (params_.device_id.is_gpu())
-            {
-                const auto conv_start = std::chrono::high_resolution_clock::now();
-
-                // K/V are already on GPU from upstream stages (QKV proj, RoPE).
-                // Pass them directly — appendWithStream() will detect FP32 and
-                // use GPU quantize kernels (tq8_quantize_kernel + tq4_quantize_kernel).
-                bool success = append_to_cache(params_.seq_idx, params_.K, params_.V, total_tokens);
-
-                const auto conv_end = std::chrono::high_resolution_clock::now();
-                const uint64_t conv_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
-                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
-
-                if (!success)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] append failed (split TQ GPU quantize path)");
-                    return false;
-                }
-                return true;
-            }
-
-            // =============================================================
-            // CPU path: quantize on CPU, then upload blocks to cache
-            // =============================================================
+            // CPU path: quantize into cache-native blocks before publication.
             const auto conv_start = std::chrono::high_resolution_clock::now();
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
             const int head_dim = params_.head_dim;
@@ -1404,80 +1418,68 @@ namespace llaminar2
                 tq8_k_scratch_ = std::make_shared<TQ8Tensor>(tq_shape, head_dim);
                 tq8_k_scratch_->set_turboquant_context(&turboquant_ctx);
             }
-            if (!tq4_v_scratch_ || tq4_v_scratch_->shape() != tq_shape)
+            const bool value_is_tq8 =
+                cache_v_precision == ActivationPrecision::TQ8;
+            if (value_is_tq8 &&
+                (!tq8_v_scratch_ || tq8_v_scratch_->shape() != tq_shape))
+            {
+                tq8_v_scratch_ = std::make_shared<TQ8Tensor>(tq_shape, head_dim);
+                tq8_v_scratch_->set_turboquant_context(&turboquant_ctx);
+            }
+            if (!value_is_tq8 &&
+                (!tq4_v_scratch_ || tq4_v_scratch_->shape() != tq_shape))
             {
                 tq4_v_scratch_ = std::make_shared<TQ4Tensor>(tq_shape, head_dim);
                 tq4_v_scratch_->set_turboquant_context(&turboquant_ctx);
             }
 
-            const size_t bpr = tq8_k_scratch_->blocks_per_row();
+            const size_t k_block_bytes = tq8_k_scratch_->block_bytes();
+            const size_t v_block_bytes = value_is_tq8
+                                             ? tq8_v_scratch_->block_bytes()
+                                             : tq4_v_scratch_->block_bytes();
+            const size_t blocks_per_row = tq8_k_scratch_->blocks_per_row();
+            auto *k_blocks = static_cast<uint8_t *>(
+                tq8_k_scratch_->raw_mutable_data());
+            auto *v_blocks = static_cast<uint8_t *>(
+                value_is_tq8
+                    ? tq8_v_scratch_->raw_mutable_data()
+                    : tq4_v_scratch_->raw_mutable_data());
 
-            // --- Decode fast path: fused K+V quantization per head ---
-            // Interleaves TQ8(K) and TQ4(V) for the same head so the 64KB
-            // rotation matrix stays hot in L1/L2 for both operations.
-            // Also pre-resolves per-head contexts to avoid mutex+hashmap per call.
-            if (total_tokens <= 2)
-            {
-                // Pre-resolve all per-head contexts once (avoids mutex per head)
-                const TurboQuantContext *head_ctx_ptrs[16]; // max 16 KV heads
-                for (size_t h = 0; h < bpr && h < 16; ++h)
-                    head_ctx_ptrs[h] = &turboquant_ctx.for_layer(static_cast<int>(h));
-
-                const size_t k_bb = tq8_k_scratch_->block_bytes();
-                const size_t v_bb = tq4_v_scratch_->block_bytes();
-                uint8_t *k_raw = static_cast<uint8_t *>(tq8_k_scratch_->raw_mutable_data());
-                uint8_t *v_raw = static_cast<uint8_t *>(tq4_v_scratch_->raw_mutable_data());
-
-                for (size_t r = 0; r < static_cast<size_t>(total_tokens); ++r)
-                {
-                    const float *k_row = k_fp32 + r * kv_dim;
-                    const float *v_row = v_fp32 + r * kv_dim;
-                    uint8_t *k_row_dst = k_raw + r * bpr * k_bb;
-                    uint8_t *v_row_dst = v_raw + r * bpr * v_bb;
-                    alignas(64) float scratch0[128];
-                    alignas(64) float scratch1[128];
-
-                    for (size_t h = 0; h < bpr; ++h)
-                    {
-                        const float *k_head = k_row + h * static_cast<size_t>(head_dim);
-                        const float *v_head = v_row + h * static_cast<size_t>(head_dim);
-                        const auto &hctx = *head_ctx_ptrs[h];
-
-                        // K (TQ8) — rotation matrix loaded into cache
-                        if (head_dim == 128)
-                        {
-                            auto *k_block = reinterpret_cast<TQ8Block_128 *>(k_row_dst + h * k_bb);
-                            turboquant_quantize_tq8<128>(k_head, hctx, *k_block, scratch0, scratch1);
-                            // V (TQ4) — same rotation matrix still hot in L1/L2
-                            auto *v_block = reinterpret_cast<TQ4Block_128 *>(v_row_dst + h * v_bb);
-                            turboquant_quantize_tq4<128>(v_head, hctx, *v_block, scratch0, scratch1);
-                        }
-                        else
-                        {
-                            auto *k_block = reinterpret_cast<TQ8Block_64 *>(k_row_dst + h * k_bb);
-                            turboquant_quantize_tq8<64>(k_head, hctx, *k_block, scratch0, scratch1);
-                            auto *v_block = reinterpret_cast<TQ4Block_64 *>(v_row_dst + h * v_bb);
-                            turboquant_quantize_tq4<64>(v_head, hctx, *v_block, scratch0, scratch1);
-                        }
-                    }
-                }
-            }
-            else
-            {
-                // Prefill path: use existing parallel quantization
-                tq8_k_scratch_->copyFrom_fp32_rows(k_fp32, static_cast<size_t>(total_tokens), turboquant_ctx);
-                tq4_v_scratch_->copyFrom_fp32_rows(v_fp32, static_cast<size_t>(total_tokens), turboquant_ctx);
-            }
+            /*
+             * Decode, grouped verification, and prefill share one implementation.
+             * Each `(row, head)` invokes the same ISA-dispatched vector primitive
+             * as serial decode, while K and V share one OpenMP workshare and a
+             * cache-hot rotation context.
+             */
+            turboquant_quantize_kv_rows(
+                k_fp32,
+                v_fp32,
+                k_blocks,
+                v_blocks,
+                total_tokens,
+                head_dim,
+                static_cast<int>(blocks_per_row),
+                blocks_per_row * k_block_bytes,
+                blocks_per_row * v_block_bytes,
+                k_block_bytes,
+                v_block_bytes,
+                turboquant_ctx,
+                value_is_tq8);
 
             const auto conv_end = std::chrono::high_resolution_clock::now();
             const uint64_t conv_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
             KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
 
-            bool success = append_to_cache(params_.seq_idx, tq8_k_scratch_.get(), tq4_v_scratch_.get(), total_tokens);
+            const TensorBase *value_scratch = value_is_tq8
+                                                  ? static_cast<const TensorBase *>(tq8_v_scratch_.get())
+                                                  : static_cast<const TensorBase *>(tq4_v_scratch_.get());
+            bool success = append_to_cache(
+                params_.seq_idx, tq8_k_scratch_.get(), value_scratch, total_tokens);
             if (!success)
             {
-                LOG_ERROR("[KVCacheAppendStage] append failed (split TQ cache: TQ8 K + TQ4 V)");
+                LOG_ERROR("[KVCacheAppendStage] append failed (TurboQuant cache: TQ8 K + "
+                          << (value_is_tq8 ? "TQ8" : "TQ4") << " V)");
                 return false;
             }
 
@@ -1572,17 +1574,22 @@ namespace llaminar2
         if (debugEnv().attention.debug_kv_append_source_snapshot &&
             debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
         {
-            if (!debug_append_source_k_snapshot_.empty() &&
-                debug_append_source_k_rows_ > 0 && debug_append_source_k_cols_ > 0)
+            const size_t rows = debug_append_source_k_rows_ > 0
+                                    ? debug_append_source_k_rows_
+                                    : static_cast<size_t>(params_.num_tokens > 0 ? params_.num_tokens : 0);
+            const size_t k_cols = debug_append_source_k_cols_ > 0
+                                      ? debug_append_source_k_cols_
+                                      : (params_.K->shape().size() > 1 ? params_.K->shape()[1] : params_.K->cols());
+            const size_t v_cols = debug_append_source_v_cols_ > 0
+                                      ? debug_append_source_v_cols_
+                                      : (params_.V->shape().size() > 1 ? params_.V->shape()[1] : params_.V->cols());
+            if (rows > 0 && k_cols > 0)
             {
-                info.addOutput("source_k", debug_append_source_k_snapshot_.data(),
-                               debug_append_source_k_rows_, debug_append_source_k_cols_);
+                info.addOutput("source_k", params_.K, rows, k_cols);
             }
-            if (!debug_append_source_v_snapshot_.empty() &&
-                debug_append_source_v_rows_ > 0 && debug_append_source_v_cols_ > 0)
+            if (rows > 0 && v_cols > 0)
             {
-                info.addOutput("source_v", debug_append_source_v_snapshot_.data(),
-                               debug_append_source_v_rows_, debug_append_source_v_cols_);
+                info.addOutput("source_v", params_.V, rows, v_cols);
             }
         }
 
@@ -1593,28 +1600,48 @@ namespace llaminar2
             ITensor *cache_k = nullptr;
             ITensor *cache_v = nullptr;
             int kv_len = 0;
-            if (params_.kv_cache->get_kv(
-                    params_.layer_idx, params_.seq_idx, &cache_k, &cache_v, &kv_len) &&
-                kv_len > 0 && cache_k && cache_v)
+            const int cached_tokens =
+                params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx);
+            const int append_tokens =
+                replay_advance_tokens_ > 0
+                    ? replay_advance_tokens_
+                    : (params_.num_tokens > 0 ? params_.num_tokens : static_cast<int>(params_.K->rows()));
+            const int expected_tokens =
+                debug_cache_snapshot_rows_ > 0
+                    ? static_cast<int>(debug_cache_snapshot_rows_)
+                    : std::max(0, cached_tokens + append_tokens);
+            if (params_.kv_cache->get_kv_snapshot_view(
+                    params_.layer_idx, params_.seq_idx, expected_tokens, &cache_k, &cache_v, &kv_len) &&
+                kv_len == expected_tokens && kv_len > 0 && cache_k && cache_v)
             {
                 const size_t rows = static_cast<size_t>(kv_len);
                 const size_t k_cols = cache_k->cols();
                 const size_t v_cols = cache_v->cols();
-                void *stream = gpuStream();
-                const bool have_k = tensorToFP32DebugSnapshot(
-                    cache_k, params_.device_id, stream, rows, k_cols, debug_cache_k_snapshot_);
-                const bool have_v = tensorToFP32DebugSnapshot(
-                    cache_v, params_.device_id, stream, rows, v_cols, debug_cache_v_snapshot_);
-
-                if (have_k)
+                if (rows > 0 && k_cols > 0)
                 {
-                    info.addOutput("cache_k", debug_cache_k_snapshot_.data(), rows, k_cols);
+                    info.addOutput("cache_k", cache_k, rows, k_cols);
                 }
-                if (have_v)
+                if (rows > 0 && v_cols > 0)
                 {
-                    info.addOutput("cache_v", debug_cache_v_snapshot_.data(), rows, v_cols);
+                    info.addOutput("cache_v", cache_v, rows, v_cols);
                 }
             }
+            else
+            {
+                throw std::runtime_error(
+                    "KV cache debug snapshot requested but cache could not expose a direct snapshot view for layer=" +
+                    std::to_string(params_.layer_idx) +
+                    " seq=" + std::to_string(params_.seq_idx) +
+                    " expected_tokens=" + std::to_string(expected_tokens));
+            }
+        }
+        else if (debugEnv().attention.debug_kv_append_source_snapshot &&
+                 debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx) &&
+                 !debugEnv().attention.debug_kv_cache_snapshot)
+        {
+            LOG_TRACE("[KVCacheAppendStage] Capturing KV append source without "
+                      "the optional post-append cache snapshot for layer="
+                      << params_.layer_idx);
         }
 
         info.addScalarInt("layer_idx", params_.layer_idx);

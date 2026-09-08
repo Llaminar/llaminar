@@ -18,19 +18,27 @@ namespace
 
 DeviceMemoryPlan makePlan(size_t weights_mb, size_t kv_mb, size_t act_mb,
                           size_t ws_mb, size_t free_mb,
-                          size_t headroom_mb = 128)
+                          size_t state_mb = 0)
 {
     constexpr size_t MB = 1024ULL * 1024;
-    DeviceMemoryPlan p;
-    p.device = DeviceId::cuda(0);
-    p.weight_bytes = weights_mb * MB;
-    p.kv_cache_bytes = kv_mb * MB;
-    p.activation_bytes = act_mb * MB;
-    p.workspace_bytes = ws_mb * MB;
-    p.device_total_bytes = free_mb * MB;
-    p.device_free_bytes = free_mb * MB;
-    p.headroom_bytes = headroom_mb * MB;
-    return p;
+    PhysicalMemoryBOMBuilder builder({
+        .world_rank = -1,
+        .device = DeviceId::cuda(0),
+        .total_bytes = free_mb * MB,
+        .admission_available_bytes = free_mb * MB,
+    });
+    builder
+        .add(
+            PhysicalMemoryOwner::PrimaryModelWeights,
+            weights_mb * MB)
+        .add(PhysicalMemoryOwner::KVCache, kv_mb * MB)
+        .add(
+            PhysicalMemoryOwner::RecurrentLiveState,
+            state_mb * MB)
+        .add(PhysicalMemoryOwner::ActivationArena, act_mb * MB)
+        .add(PhysicalMemoryOwner::ExecutionWorkspace, ws_mb * MB);
+    return DeviceMemoryPlan(builder.build(), /*max_seq_len=*/0,
+                            /*activation_seq_len=*/0);
 }
 
 } // anonymous namespace
@@ -41,24 +49,35 @@ TEST(Test__DeviceMemoryPlan, TotalBytes_SumsAllComponents)
     EXPECT_EQ(p.total_bytes(), (100 + 50 + 30 + 200) * 1024ULL * 1024);
 }
 
+TEST(Test__DeviceMemoryPlan, TotalBytesIncludesPersistentState)
+{
+    constexpr size_t MB = 1024ULL * 1024ULL;
+    auto p = makePlan(100, 50, 30, 200, 1024, 75);
+
+    EXPECT_EQ(
+        p.total_bytes(),
+        (100 + 50 + 75 + 30 + 200) * MB);
+    EXPECT_NE(p.summary().find("state=75 MB"), std::string::npos);
+}
+
 TEST(Test__DeviceMemoryPlan, Fits_TrueWhenUnderBudget)
 {
-    // Total = 380 MB + 128 MB headroom = 508 MB, free = 1024 MB
+    // Exact concrete total = 380 MB, free = 1024 MB.
     auto p = makePlan(100, 50, 30, 200, 1024);
     EXPECT_TRUE(p.fits());
 }
 
 TEST(Test__DeviceMemoryPlan, Fits_FalseWhenOverBudget)
 {
-    // Total = 380 MB + 128 MB headroom = 508 MB, free = 400 MB
-    auto p = makePlan(100, 50, 30, 200, 400);
+    // Exact concrete total = 380 MB, free = 379 MB.
+    auto p = makePlan(100, 50, 30, 200, 379);
     EXPECT_FALSE(p.fits());
 }
 
 TEST(Test__DeviceMemoryPlan, Fits_ExactBoundary)
 {
-    // Total = 380 MB + 128 MB headroom = 508 MB, free = 508 MB → exactly fits
-    auto p = makePlan(100, 50, 30, 200, 508);
+    // Exact concrete total = 380 MB, free = 380 MB.
+    auto p = makePlan(100, 50, 30, 200, 380);
     EXPECT_TRUE(p.fits());
 }
 
@@ -66,15 +85,19 @@ TEST(Test__DeviceMemoryPlan, Fits_OneByteShort)
 {
     // One byte short of fitting
     constexpr size_t MB = 1024ULL * 1024;
-    DeviceMemoryPlan p;
-    p.device = DeviceId::cuda(0);
-    p.weight_bytes = 100 * MB;
-    p.kv_cache_bytes = 50 * MB;
-    p.activation_bytes = 30 * MB;
-    p.workspace_bytes = 200 * MB;
-    p.device_total_bytes = 508 * MB;
-    p.device_free_bytes = 508 * MB - 1;  // One byte short
-    p.headroom_bytes = 128 * MB;
+    PhysicalMemoryBOMBuilder builder({
+        .world_rank = -1,
+        .device = DeviceId::cuda(0),
+        .total_bytes = 380 * MB,
+        .admission_available_bytes = 380 * MB - 1,
+    });
+    builder
+        .add(PhysicalMemoryOwner::PrimaryModelWeights, 100 * MB)
+        .add(PhysicalMemoryOwner::KVCache, 50 * MB)
+        .add(PhysicalMemoryOwner::ActivationArena, 30 * MB)
+        .add(PhysicalMemoryOwner::ExecutionWorkspace, 200 * MB);
+    DeviceMemoryPlan p(
+        builder.build(), /*max_seq_len=*/0, /*activation_seq_len=*/0);
     EXPECT_FALSE(p.fits());
 }
 
@@ -86,21 +109,21 @@ TEST(Test__DeviceMemoryPlan, Deficit_ZeroWhenFits)
 
 TEST(Test__DeviceMemoryPlan, Deficit_CorrectWhenOverBudget)
 {
-    // Total = 380 MB + 128 MB = 508 MB, free = 400 MB → deficit = 108 MB
-    auto p = makePlan(100, 50, 30, 200, 400);
-    EXPECT_EQ(p.deficit(), 108ULL * 1024 * 1024);
+    // Total = 380 MB, free = 300 MB → deficit = 80 MB.
+    auto p = makePlan(100, 50, 30, 200, 300);
+    EXPECT_EQ(p.deficit(), 80ULL * 1024 * 1024);
 }
 
 TEST(Test__DeviceMemoryPlan, Remaining_CorrectWhenFits)
 {
-    // Total = 380 MB + 128 MB = 508 MB, free = 1024 MB → remaining = 516 MB
+    // Total = 380 MB, free = 1024 MB → remaining = 644 MB.
     auto p = makePlan(100, 50, 30, 200, 1024);
-    EXPECT_EQ(p.remaining(), 516ULL * 1024 * 1024);
+    EXPECT_EQ(p.remaining(), 644ULL * 1024 * 1024);
 }
 
 TEST(Test__DeviceMemoryPlan, Remaining_ZeroWhenOverBudget)
 {
-    auto p = makePlan(100, 50, 30, 200, 400);
+    auto p = makePlan(100, 50, 30, 200, 379);
     EXPECT_EQ(p.remaining(), 0u);
 }
 
@@ -119,7 +142,7 @@ TEST(Test__DeviceMemoryPlan, Summary_ContainsOK_WhenFits)
 
 TEST(Test__DeviceMemoryPlan, Summary_ContainsOVER_WhenDoesNotFit)
 {
-    auto p = makePlan(100, 50, 30, 200, 400);
+    auto p = makePlan(100, 50, 30, 200, 379);
     EXPECT_NE(p.summary().find("[OVER"), std::string::npos);
 }
 
@@ -129,5 +152,5 @@ TEST(Test__DeviceMemoryPlan, ZeroBytes_Fits)
     EXPECT_TRUE(p.fits());
     EXPECT_EQ(p.total_bytes(), 0u);
     EXPECT_EQ(p.deficit(), 0u);
-    EXPECT_EQ(p.remaining(), 128ULL * 1024 * 1024);  // free - headroom
+    EXPECT_EQ(p.remaining(), 256ULL * 1024 * 1024);
 }

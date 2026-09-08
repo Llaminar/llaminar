@@ -2,7 +2,7 @@
  * @file Test__NativeVNNI_GEMV.cpp
  * @brief Integration tests for native-VNNI GEMV kernel — GPU accuracy comparison
  *
- * Tests the complete native-VNNI GEMV pipeline on GPU for all 16 supported formats:
+ * Tests the complete native-VNNI GEMV pipeline on GPU for all quantized formats:
  *   1. Create random quantized weights
  *   2. Pack with packWeightsToROCm() → produces native-VNNI payload/scales
  *   3. Create ROCmQuantisedGemmKernel with workspace
@@ -23,6 +23,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -36,7 +37,7 @@
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
-#include "kernels/rocm/ROCmWeightPacker.h"
+#include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "tensors/Tensors.h"
@@ -44,7 +45,9 @@
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/VerifierRowTestInventory.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -186,6 +189,57 @@ namespace
         }
 
         return (lhs.size() == rhs.size()) ? lhs.size() : count;
+    }
+
+    /**
+     * @brief Assert that grouped ROCm verifier rows exactly match serial decode.
+     *
+     * The grouped verifier path publishes rows into live MTP state, so ordinary
+     * cosine/L2 tolerances are only useful as breadcrumbs after a failure.  The
+     * pass condition is byte-for-byte equality with the backend's own M=1 decode
+     * GEMV for each FP32 output element.
+     */
+    void expectBitwiseEqualFloatRows(
+        const std::string &label,
+        const float *actual,
+        const float *expected,
+        size_t count,
+        size_t row_width)
+    {
+        ASSERT_NE(actual, nullptr) << label << " actual rows are null";
+        ASSERT_NE(expected, nullptr) << label << " expected rows are null";
+        ASSERT_GT(count, 0u) << label << " row buffer is empty";
+
+        if (std::memcmp(actual, expected, count * sizeof(float)) == 0)
+            return;
+
+        size_t first_mismatch = 0;
+        uint32_t actual_bits = 0;
+        uint32_t expected_bits = 0;
+        for (; first_mismatch < count; ++first_mismatch)
+        {
+            std::memcpy(&actual_bits, actual + first_mismatch, sizeof(actual_bits));
+            std::memcpy(&expected_bits, expected + first_mismatch, sizeof(expected_bits));
+            if (actual_bits != expected_bits)
+                break;
+        }
+
+        const size_t safe_row_width = row_width == 0 ? count : row_width;
+        const size_t mismatch_row = first_mismatch / safe_row_width;
+        const size_t mismatch_col = first_mismatch % safe_row_width;
+        ADD_FAILURE()
+            << label << " is not bitwise serial-decode equivalent"
+            << " first_mismatch=" << first_mismatch
+            << " row=" << mismatch_row
+            << " col=" << mismatch_col
+            << " actual=" << (first_mismatch < count ? actual[first_mismatch] : 0.0f)
+            << " expected=" << (first_mismatch < count ? expected[first_mismatch] : 0.0f)
+            << " actual_bits=0x" << std::hex << actual_bits
+            << " expected_bits=0x" << expected_bits << std::dec
+            << " max_abs=" << maxAbsError(actual, expected, count)
+            << " rel_l2=" << relativeL2Error(actual, expected, count)
+            << " cosine=" << cosineSimilarity(actual, expected, count)
+            << " symmetric_kl=" << symmetricKLDivergenceFromLogits(actual, expected, count);
     }
 
     /// CPU FP32 reference GEMV: output[j] = sum_k(input[k] * W_dequant[j][k])
@@ -356,6 +410,9 @@ namespace
         {"Q8_0", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ8_0Random({N, K}); }, true},
+        {"Q8_1", false, 0.990f,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_1Random({N, K}); }, true},
         {"IQ4_NL", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
@@ -390,6 +447,9 @@ namespace
         {"Q2_K", true, 0.970f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ2_KRandom({N, K}); }},
+        {"Q8_K", true, 0.990f,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_KRandom({N, K}); }, true},
 
         // Tier 3: IQ grid-index super-blocks
         {"IQ3_S", true, 0.975f,
@@ -436,15 +496,32 @@ namespace
                 (void)hipGetDeviceProperties(&props, 0);
                 LOG_INFO("[NativeVNNI_GEMV] ROCm device: " << props.name
                                                            << " (" << props.gcnArchName << ")");
+                ASSERT_EQ(
+                    hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+                    hipSuccess);
             }
 #else
             has_rocm_device_ = false;
 #endif
         }
 
+        void TearDown() override
+        {
+#ifdef HAVE_ROCM
+            workspace_.reset();
+            if (stream_)
+            {
+                EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+                stream_ = nullptr;
+            }
+#endif
+        }
+
         bool has_rocm_device_ = false;
 
 #ifdef HAVE_ROCM
+        hipStream_t stream_ = nullptr;
+
         bool packForNativeVNNIGemv(const GEMVFormatSpec &fmt,
                                    const TensorBase *weights,
                                    ROCmPackedWeights &packed)
@@ -469,7 +546,7 @@ namespace
         };
 
         /**
-         * @brief Forces the M=2..4 verifier launch to reuse the generated M=1 policy.
+         * @brief Forces every grouped verifier launch to reuse the generated M=1 policy.
          *
          * This is the production dense verifier contract: grouped rows may
          * amortize work, but every row must remain numerically equivalent to a
@@ -502,6 +579,7 @@ namespace
                 return false;
             }
             kernel.bindWorkspace(workspace_.get());
+            kernel.setGPUStream(stream_);
             return true;
         }
 
@@ -520,11 +598,12 @@ namespace
                           int M, int N, int K)
         {
             const auto device = DeviceId::rocm(0);
-            if (!input->ensureOnDevice(device) || !output->ensureOnDevice(device))
+            if (!input->ensureOnDevice(device, stream_) ||
+                !output->ensureOnDevice(device, stream_))
                 return false;
             bool ok = kernel.multiply_tensor(input, output, M, N, K);
             if (ok)
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
             return ok;
         }
 #endif
@@ -720,10 +799,10 @@ namespace
         ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_base.get(), M, N, K));
         ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_accum.get(), M, N, K,
                                            true, alpha, beta));
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
 
-        output_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        output_accum->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(output_base, stream_);
+        TransferEngine::publishCurrentDeviceWrite(output_accum, stream_);
 
         const float *base = output_base->data();
         const float *accum = output_accum->data();
@@ -791,10 +870,10 @@ namespace
             gate.get(), up.get(), output_base.get(), M, N, K));
         ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
             gate.get(), up.get(), output_accum.get(), M, N, K, alpha, beta));
-        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
 
-        output_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        output_accum->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(output_base, stream_);
+        TransferEngine::publishCurrentDeviceWrite(output_accum, stream_);
 
         const float *base = output_base->data();
         const float *accum = output_accum->data();
@@ -892,10 +971,6 @@ namespace
         const std::vector<uint16_t> host_mins = packed.native_vnni_mins;
 
         ROCmQuantisedGemmKernel kernel(&packed, 0);
-        hipStream_t stream = nullptr;
-        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
-        ASSERT_NE(stream, nullptr);
-        kernel.setGPUStream(stream);
         ASSERT_TRUE(setupWorkspace(kernel, max_M, N, K));
 
         for (const int M : kVerifierRows)
@@ -907,7 +982,7 @@ namespace
 
             ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K))
                 << "Q4_K packed-contract run M=" << M;
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
 
             const void *d_quant_a = workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A);
             const void *d_scales_a = workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE);
@@ -918,11 +993,11 @@ namespace
             std::vector<float> scales_a(static_cast<size_t>(M) * static_cast<size_t>(blocks_per_row));
             ASSERT_EQ(hipMemcpyAsync(quant_a.data(), d_quant_a,
                                      quant_a.size() * sizeof(int8_t),
-                                     hipMemcpyDeviceToHost, stream),
+                                     hipMemcpyDeviceToHost, stream_),
                       hipSuccess);
             ASSERT_EQ(hipMemcpyAsync(scales_a.data(), d_scales_a,
                                      scales_a.size() * sizeof(float),
-                                     hipMemcpyDeviceToHost, stream),
+                                     hipMemcpyDeviceToHost, stream_),
                       hipSuccess);
 
             auto *output_fp32 = dynamic_cast<FP32Tensor *>(output_gpu.get());
@@ -932,9 +1007,9 @@ namespace
             std::vector<float> gpu_output(static_cast<size_t>(M) * static_cast<size_t>(N));
             ASSERT_EQ(hipMemcpyAsync(gpu_output.data(), d_output,
                                      gpu_output.size() * sizeof(float),
-                                     hipMemcpyDeviceToHost, stream),
+                                     hipMemcpyDeviceToHost, stream_),
                       hipSuccess);
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
 
             std::vector<float> native_contract_ref(static_cast<size_t>(M) * static_cast<size_t>(N));
             std::vector<float> fp32_ref(static_cast<size_t>(M) * static_cast<size_t>(N));
@@ -979,26 +1054,30 @@ namespace
         }
 
         cleanupWorkspace(kernel);
-        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
     }
 
     /**
      * @test Native-VNNI GEMV is bitwise stable across repeated runs.
      *
-     * Guards against the CUDA-style failure mode where split-K atomics or
-     * shared scratch make repeated runs diverge. This shape is large enough
-     * to exercise the GEMV scatter+reduce path (KB > 1) on ROCm.
+     * Guards the production M=1 contract itself, rather than relying on a
+     * grouped-verifier test to infer what serial decode did. This shape and
+     * forced KB exercise the persistent-partial, fixed-order reducer (KB > 1)
+     * and PerfStats proves that exact route was launched on every repetition.
      */
-    TEST_F(NativeVNNIGEMVTest, Q4_0_RepeatedRuns_AreBitwiseStable_OnScatterReduceShape)
+    TEST_F(NativeVNNIGEMVTest, Q4_0_SerialM1OrderedKPartitionIsBitwiseStableAndPublished)
     {
         if (!has_rocm_device_)
         {
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        const int M = 1;
-        const int N = 3584;
-        const int K = 3584;
+        ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
+        NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
+        PerfStatsCollector::reset();
+
+        constexpr int M = 1;
+        constexpr int N = 3584;
+        constexpr int K = 3584;
         constexpr int kRepeatRuns = 5;
 
         auto weights = TestTensorFactory::createQ4_0Random(
@@ -1033,20 +1112,45 @@ namespace
             const size_t mismatch = firstBitwiseMismatchIndex(reference, snapshot);
             EXPECT_EQ(mismatch, reference.size())
                 << "run=" << run
-                << " first_mismatch=" << mismatch
-                << " reference=" << reference[mismatch]
-                << " candidate=" << snapshot[mismatch];
+                << " first_mismatch=" << mismatch;
 
             if (mismatch != reference.size())
             {
+                ADD_FAILURE()
+                    << "reference=" << reference[mismatch]
+                    << " candidate=" << snapshot[mismatch];
                 break;
             }
         }
 
+        const auto records = PerfStatsCollector::snapshot({"kernel"});
+        const auto route = std::find_if(
+            records.begin(),
+            records.end(),
+            [=](const PerfStatRecord &record)
+            {
+                return record.name == "rocm_native_vnni_small_m_launch" &&
+                       record.tags.count("m") != 0 &&
+                       record.tags.at("m") == "1" &&
+                       record.tags.count("n") != 0 &&
+                       record.tags.at("n") == std::to_string(N) &&
+                       record.tags.count("k") != 0 &&
+                       record.tags.at("k") == std::to_string(K) &&
+                       record.tags.count("kb") != 0 &&
+                       record.tags.at("kb") == "4" &&
+                       record.tags.count("path") != 0 &&
+                       record.tags.at("path") == "split_reduce";
+            });
+        ASSERT_NE(route, records.end())
+            << "serial M=1 must publish its fixed-order K-partition route\n"
+            << PerfStatsCollector::summaryString({"kernel"}, 0);
+        EXPECT_GE(route->value, static_cast<double>(kRepeatRuns));
+
         cleanupWorkspace(kernel);
+        PerfStatsCollector::reset();
     }
 
-    TEST_F(NativeVNNIGEMVTest, DeterministicModeUsesSplitReduceEvenWhenGpuGraphsWouldForceAtomic)
+    TEST_F(NativeVNNIGEMVTest, VerifierRowsUseOrderedKPartitionWithoutGraphCapture)
     {
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
@@ -1056,15 +1160,12 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
-        ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "1");
-        ScopedDebugEnvOverride atomic_env("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1");
+        ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "0");
         ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
         NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
         PerfStatsCollector::reset();
         ASSERT_TRUE(PerfStatsCollector::isEnabled());
-        ASSERT_TRUE(debugEnv().gemm.deterministic);
-        EXPECT_FALSE(debugEnv().rocm.nvnni_atomic_reduce);
+        EXPECT_FALSE(debugEnv().execution.gpu_graphs);
 
         constexpr int M = 2;
         constexpr int N = 512;
@@ -1080,12 +1181,13 @@ namespace
 
         auto input = TestTensorFactory::createFP32Random({M, K}, -1.0f, 1.0f, 94002u);
         auto output_gpu = TestTensorFactory::createFP32({M, N});
+        auto verifier_scope = kernel.beginVerifierDecodeEquivalentScope();
+        ASSERT_NE(verifier_scope, nullptr);
         ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
         ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
         const auto records = PerfStatsCollector::snapshot({"kernel"});
         bool found_split_reduce = false;
-        bool found_atomic_reduce = false;
         for (const auto &record : records)
         {
             if (record.name != "rocm_native_vnni_small_m_launch")
@@ -1101,22 +1203,19 @@ namespace
                 continue;
             }
             found_split_reduce = found_split_reduce || tag("path") == "split_reduce";
-            found_atomic_reduce = found_atomic_reduce || tag("path") == "atomic_reduce";
         }
 
         EXPECT_TRUE(found_split_reduce)
-            << "deterministic ROCm native-VNNI small-M GEMV must use ordered split-reduce"
+            << "ROCm native-VNNI small-M GEMV must use ordered K-partition reduction"
             << "\n"
             << PerfStatsCollector::summaryString({"kernel"}, 0);
-        EXPECT_FALSE(found_atomic_reduce)
-            << "LLAMINAR_DETERMINISTIC must beat both GPU-graph and env-requested atomic reduce";
 
         cleanupWorkspace(kernel);
         PerfStatsCollector::reset();
 #endif
     }
 
-    TEST_F(NativeVNNIGEMVTest, GpuGraphsUseWorkspaceSplitReduceUnlessAtomicExplicitlyRequested)
+    TEST_F(NativeVNNIGEMVTest, VerifierRowsUnderGpuGraphsUseOrderedKPartition)
     {
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
@@ -1126,16 +1225,12 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "1");
-        ScopedDebugEnvOverride atomic_env("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "0");
         ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
         NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
         PerfStatsCollector::reset();
         ASSERT_TRUE(PerfStatsCollector::isEnabled());
         EXPECT_TRUE(debugEnv().execution.gpu_graphs);
-        EXPECT_FALSE(debugEnv().gemm.deterministic);
-        EXPECT_FALSE(debugEnv().rocm.nvnni_atomic_reduce);
 
         constexpr int M = 2;
         constexpr int N = 512;
@@ -1151,12 +1246,13 @@ namespace
 
         auto input = TestTensorFactory::createFP32Random({M, K}, -1.0f, 1.0f, 95002u);
         auto output_gpu = TestTensorFactory::createFP32({M, N});
+        auto verifier_scope = kernel.beginVerifierDecodeEquivalentScope();
+        ASSERT_NE(verifier_scope, nullptr);
         ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
         ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
         const auto records = PerfStatsCollector::snapshot({"kernel"});
         bool found_split_reduce = false;
-        bool found_atomic_reduce = false;
         for (const auto &record : records)
         {
             if (record.name != "rocm_native_vnni_small_m_launch")
@@ -1172,22 +1268,19 @@ namespace
                 continue;
             }
             found_split_reduce = found_split_reduce || tag("path") == "split_reduce";
-            found_atomic_reduce = found_atomic_reduce || tag("path") == "atomic_reduce";
         }
 
         EXPECT_TRUE(found_split_reduce)
-            << "ROCm GPU-graph small-M GEMV should use declared workspace split-reduce by default"
+            << "ROCm GPU-graph small-M GEMV must use declared workspace K-partition reduction"
             << "\n"
             << PerfStatsCollector::summaryString({"kernel"}, 0);
-        EXPECT_FALSE(found_atomic_reduce)
-            << "Atomic small-M GEMV is an explicit ROCm tuning mode, not a graph-capture default";
 
         cleanupWorkspace(kernel);
         PerfStatsCollector::reset();
 #endif
     }
 
-    TEST_F(NativeVNNIGEMVTest, SpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs)
+    TEST_F(NativeVNNIGEMVTest, RuntimeM_AllNativeFormatsDirectAndSplitKMatchSerialGEMVsAndCapture)
     {
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
@@ -1197,16 +1290,18 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
         }
 
-        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
-        NativeVNNITuningOverrideGuard force_direct(/*kb=*/1);
         NativeVNNIDecodeEquivalentM1PolicyGuard force_decode_equivalent_policy;
         constexpr int N = 384;
         constexpr int K = 512;
-        const std::array<int, 3> verifier_rows = {2, 3, 4};
         const auto device = DeviceId::rocm(0);
 
-        for (const auto &fmt : ALL_GEMV_FORMATS)
+        for (int forced_kb : {1, 4})
         {
+            NativeVNNITuningOverrideGuard force_matching_serial_kb(forced_kb);
+            for (const auto &fmt : ALL_GEMV_FORMATS)
+            {
+                SCOPED_TRACE(
+                    fmt.name + " forced_kb=" + std::to_string(forced_kb));
             auto weights = fmt.create(N, K);
             ASSERT_NE(weights, nullptr) << fmt.name << " weights";
 
@@ -1214,7 +1309,11 @@ namespace
             ASSERT_TRUE(packForNativeVNNIGemv(fmt, weights.get(), packed))
                 << fmt.name << " native-VNNI pack";
             ROCmQuantisedGemmKernel kernel(&packed, 0);
-            ASSERT_TRUE(setupWorkspace(kernel, 4, N, K))
+            ASSERT_TRUE(setupWorkspace(
+                kernel,
+                kGroupedVerifierRuntimeRows.back(),
+                N,
+                K))
                 << fmt.name << " workspace";
 
             DeviceNativeVNNIMatrixDesc desc;
@@ -1251,7 +1350,7 @@ namespace
             ASSERT_NE(d_sums_A, nullptr) << fmt.name << " blockwise sum workspace";
             ASSERT_NE(d_partial, nullptr) << fmt.name << " scatter partial workspace";
 
-            for (int M : verifier_rows)
+            for (const int M : kGroupedVerifierRuntimeRows)
             {
                 auto input = TestTensorFactory::createFP32Random(
                     {static_cast<size_t>(M), static_cast<size_t>(K)},
@@ -1289,6 +1388,12 @@ namespace
                     32))
                     << fmt.name << " blockwise activation quantization M=" << M;
 
+                hipGraph_t graph = nullptr;
+                hipGraphExec_t executable = nullptr;
+                ASSERT_EQ(
+                    hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+                    hipSuccess)
+                    << fmt.name << " capture begin M=" << M;
                 ASSERT_TRUE(rocmGemv_native_vnni_small_m_fp32_with_sums(
                     d_A_int8,
                     static_cast<const uint8_t *>(desc.payload),
@@ -1305,7 +1410,16 @@ namespace
                     desc.codebook_id,
                     0,
                     stream))
-                    << fmt.name << " specialized small-M GEMV M=" << M;
+                    << fmt.name << " captured runtime-M GEMV M=" << M;
+                ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess)
+                    << fmt.name << " capture end M=" << M;
+                ASSERT_NE(graph, nullptr) << fmt.name << " captured graph M=" << M;
+                ASSERT_EQ(
+                    hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                    hipSuccess)
+                    << fmt.name << " graph instantiate M=" << M;
+                ASSERT_EQ(hipGraphLaunch(executable, stream), hipSuccess)
+                    << fmt.name << " graph replay M=" << M;
 
                 for (int row = 0; row < M; ++row)
                 {
@@ -1336,39 +1450,31 @@ namespace
 
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
                     << fmt.name << " stream sync M=" << M;
-                output_specialized->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                output_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output_specialized, stream);
+                TransferEngine::publishCurrentDeviceWrite(output_serial, stream);
 
                 const float *specialized = output_specialized->data();
                 const float *serial = output_serial->data();
                 const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
-                const float rel_l2 = relativeL2Error(specialized, serial, count);
-                const float max_abs = maxAbsError(specialized, serial, count);
-                const float cosine = cosineSimilarity(specialized, serial, count);
-                const float symmetric_kl =
-                    symmetricKLDivergenceFromLogits(specialized, serial, count);
-                EXPECT_LE(rel_l2, 1e-6f)
-                    << fmt.name << " M=" << M << " relative L2 differs from serial GEMVs";
-                EXPECT_LE(max_abs, 2e-6f)
-                    << fmt.name << " M=" << M << " max abs differs from serial GEMVs";
-                EXPECT_GE(cosine, 0.9999999f)
-                    << fmt.name << " M=" << M
-                    << " cosine differs from serial GEMVs"
-                    << " rel_l2=" << rel_l2
-                    << " max_abs=" << max_abs
-                    << " symmetric_kl=" << symmetric_kl;
-                EXPECT_LE(symmetric_kl, 1e-10f)
-                    << fmt.name << " M=" << M
-                    << " symmetric KLD differs from serial GEMVs"
-                    << " cosine=" << cosine
-                    << " rel_l2=" << rel_l2
-                    << " max_abs=" << max_abs;
+                expectBitwiseEqualFloatRows(
+                    fmt.name + " ROCm native-VNNI grouped verifier rows M=" +
+                        std::to_string(M),
+                    specialized,
+                    serial,
+                    count,
+                    static_cast<size_t>(N));
+
+                ASSERT_EQ(hipGraphExecDestroy(executable), hipSuccess)
+                    << fmt.name << " graph executable destroy M=" << M;
+                ASSERT_EQ(hipGraphDestroy(graph), hipSuccess)
+                    << fmt.name << " graph destroy M=" << M;
             }
 
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            kernel.setGPUStream(nullptr);
+            kernel.clearGPUStreamBinding();
             ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
             cleanupWorkspace(kernel);
+            }
         }
 #endif
     }
@@ -1464,16 +1570,16 @@ namespace
     }
 
     // =============================================================================
-    // Summary test: run all 16 formats at moderate dimensions and print table
+    // Summary test: run every quantized format at moderate dimensions and print table
     // =============================================================================
 
     /**
-     * @test Comprehensive accuracy sweep: all 16 native-VNNI formats in one test
+     * @test Comprehensive accuracy sweep: every quantized format in one test
      *
      * Runs each format through M=1 GEMV with N=128, K varies by format.
      * Prints a summary table at the end with cosine similarity and max abs error.
      */
-    TEST_F(NativeVNNIGEMVTest, AccuracySweep_All16Formats)
+    TEST_F(NativeVNNIGEMVTest, AccuracySweep_AllQuantizedFormats)
     {
         if (!has_rocm_device_)
         {

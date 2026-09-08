@@ -51,8 +51,8 @@
 **Background**: The VNNI instruction `vpdpbusd` computes `acc += dot(u8[4], i8[4])` in one instruction. On AVX2, this must be emulated with two instructions: `_mm256_maddubs_epi16` (u8×i8→i16 pairwise) + `_mm256_madd_epi16` (i16 horizontal pair add→i32). This is the proven approach used by llama.cpp/GGML.
 
 ### Task 1.1: Create AVX2 GEMV kernel file
-- **New file**: `src/v2/kernels/cpu/native_vnni/CPUNativeAVX2Gemv.h`
-- **Reference**: `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h` (1630 lines, 39 `vpdpbusd` calls)
+- **New file**: `src/v2/kernels/cpu/gemm/CPUNativeAVX2Gemv.h`
+- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h` (1630 lines, 39 `vpdpbusd` calls)
 - **Approach**:
   1. Copy the structure of `CPUNativeVNNIGemv.h`
   2. Replace all `_mm512_dpbusd_epi32(acc, a, b)` with the AVX2 two-instruction equivalent:
@@ -75,20 +75,20 @@
 - `[ ]` Complete
 
 ### Task 1.2: Create AVX2 weight packer
-- **New file**: `src/v2/kernels/cpu/native_vnni/CPUNativeAVX2WeightPacker.h`
-- **Reference**: `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIWeightPacker.h` (1132 lines)
+- **New file**: `src/v2/kernels/cpu/gemm/CPUNativeAVX2WeightPacker.h`
+- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h` (1132 lines)
 - **Approach**: The VNNI weight packer interleaves bytes for VNNI lane order. AVX2 needs the same interleave but for 32-byte (256-bit) lanes instead of 64-byte (512-bit). The packed format may differ.
 - **Decision point**: Can AVX2 use the same packed format as VNNI (just process half at a time), or does it need a different interleave? Using the same format is simpler but may leave performance on the table. Start with the same format.
 - `[ ]` Complete
 
 ### Task 1.3: Create AVX2 tile config
-- **New file**: `src/v2/kernels/cpu/native_vnni/CPUNativeAVX2TileConfig.h`
-- **Reference**: `src/v2/kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h` (~200 lines)
+- **New file**: `src/v2/kernels/cpu/gemm/CPUNativeAVX2TileConfig.h`
+- **Reference**: `src/v2/kernels/cpu/gemm/CPUNativeVNNITileConfig.h` (~200 lines)
 - **Change**: Tile sizes based on YMM (256-bit) register count and width instead of ZMM (512-bit).
 - `[ ]` Complete
 
 ### Task 1.4: Add dispatch in GEMM kernel
-- **File**: `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h` (586 lines)
+- **File**: `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h` (586 lines)
 - **Change**: At the top-level `multiply_tensor()` and `multiply_fused_tensor()` methods, add runtime dispatch:
   ```cpp
   if (cpu_supports_avx512_vnni()) {
@@ -297,10 +297,10 @@
 | File | Lines | What | Current AVX2 | Task |
 |------|-------|------|-------------|------|
 | `src/v2/CMakeLists.txt` | 61 | `-march=native` hardcoded | None | 0.1 |
-| `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemv.h` | 1630 | VNNI GEMV (M=1 decode) | None (39 `vpdpbusd`) | 1.1 |
-| `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIWeightPacker.h` | 1132 | VNNI weight interleave | Partial (14 AVX2) | 1.2 |
-| `src/v2/kernels/cpu/native_vnni/CPUNativeVNNITileConfig.h` | ~200 | ZMM tile sizing | None | 1.3 |
-| `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h` | 586 | GEMM top-level dispatch | None | 1.4 |
+| `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemv.h` | 1630 | VNNI GEMV (M=1 decode) | None (39 `vpdpbusd`) | 1.1 |
+| `src/v2/kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h` | 1132 | VNNI weight interleave | Partial (14 AVX2) | 1.2 |
+| `src/v2/kernels/cpu/gemm/CPUNativeVNNITileConfig.h` | ~200 | ZMM tile sizing | None | 1.3 |
+| `src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h` | 586 | GEMM top-level dispatch | None | 1.4 |
 | `src/v2/kernels/KernelFactory.cpp` | ~580–630 | GEMM factory dispatch | None | 1.5 |
 
 ### P1 — Important for performance (functional scalar fallback exists)

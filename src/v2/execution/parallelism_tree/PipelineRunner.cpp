@@ -147,11 +147,22 @@ namespace llaminar2
         // Clear cache on the stage we own
         if (my_stage_index_ >= 0 && stages_[my_stage_index_].runner)
         {
-            stages_[my_stage_index_].runner->clear_cache();
+            stages_[my_stage_index_].runner->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("pipeline-runner"));
         }
 
         // Reset position
         position_ = 0;
+    }
+
+    bool PipelineRunner::purgePrefixCache()
+    {
+        if (my_stage_index_ < 0 ||
+            !stages_[my_stage_index_].runner)
+        {
+            return true;
+        }
+        return stages_[my_stage_index_].runner->purgePrefixCache();
     }
 
     int PipelineRunner::get_position() const

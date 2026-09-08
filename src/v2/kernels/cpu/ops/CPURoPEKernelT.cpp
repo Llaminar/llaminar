@@ -13,11 +13,13 @@
  */
 
 #include "CPURoPEKernelT.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../primitives/RoPEPrimitives.h"
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, etc.
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
+#include <array>
 #include <cstring>
 
 namespace llaminar2
@@ -25,6 +27,89 @@ namespace llaminar2
 
     // Thread-local state for decode optimization (mirrors CPURoPEKernelT)
     static thread_local primitives::RoPEPersistentState tls_state_;
+
+    namespace
+    {
+        /**
+         * @brief Validate the common grouped verifier tensor contract.
+         *
+         * Native-format specializations differ only in their dynamic cast and
+         * primitive dispatch. Keeping shape/depth validation here ensures every
+         * format rejects truncated rows, invalid head counts, and unsupported
+         * partial-native RoPE in the same loud way.
+         */
+        bool validate_grouped_verifier_request(
+            const TensorBase *Q,
+            const TensorBase *K,
+            TensorType expected_type,
+            int verifier_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            int rotary_dim,
+            const char *format_label)
+        {
+            if (!Q || Q->native_type() != expected_type ||
+                (K && K->native_type() != expected_type))
+            {
+                LOG_ERROR("CPURoPEKernelT<" << format_label
+                                             << "> grouped verifier tensors must both use "
+                                             << format_label);
+                return false;
+            }
+            if (verifier_rows < 2 ||
+                n_heads <= 0 || n_kv_heads < 0 ||
+                head_dim <= 0 || (head_dim % 2) != 0)
+            {
+                LOG_ERROR("CPURoPEKernelT<" << format_label
+                                             << "> grouped verifier dimensions are invalid");
+                return false;
+            }
+            if (rotary_dim > 0 && rotary_dim < head_dim &&
+                expected_type != TensorType::FP32)
+            {
+                LOG_ERROR("CPURoPEKernelT<" << format_label
+                                             << "> native partial RoPE is not implemented");
+                return false;
+            }
+
+            const size_t q_cols = static_cast<size_t>(n_heads) * head_dim;
+            const size_t k_cols = static_cast<size_t>(n_kv_heads) * head_dim;
+            if (Q->rows() < static_cast<size_t>(verifier_rows) || Q->cols() < q_cols ||
+                (K && (K->rows() < static_cast<size_t>(verifier_rows) || K->cols() < k_cols)))
+            {
+                LOG_ERROR("CPURoPEKernelT<" << format_label
+                                             << "> grouped verifier tensor extent mismatch");
+                return false;
+            }
+            return true;
+        }
+
+        /** @brief Publish one mandatory route record for the grouped CPU kernel. */
+        void record_grouped_rope_route(
+            const char *tensor_format,
+            int verifier_rows,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            int rotary_dim)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_rope_grouped_verifier_rows_calls",
+                1.0,
+                "verifier",
+                "cpu",
+                {{"tensor_format", tensor_format},
+                 {"verifier_rows", std::to_string(verifier_rows)},
+                 {"q_heads", std::to_string(n_heads)},
+                 {"kv_heads", std::to_string(n_kv_heads)},
+                 {"head_dim", std::to_string(head_dim)},
+                 {"rotary_dim", std::to_string(rotary_dim > 0 ? rotary_dim : head_dim)},
+                 {"math_policy", "serial_decode_equivalent"},
+                 {"execution_policy", "single_grouped_row_head_workshare"}});
+        }
+    } // namespace
 
     // ============================================================================
     // FP32 Specialization Implementation
@@ -470,25 +555,10 @@ namespace llaminar2
         (void)mpi_ctx;
         (void)device_idx;
 
-        if (!Q || Q->native_type() != TensorType::FP32)
+        if (!validate_grouped_verifier_request(
+                Q, K, TensorType::FP32, verifier_rows,
+                n_heads, n_kv_heads, head_dim, rotary_dim, "FP32"))
         {
-            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: Q must be FP32Tensor");
-            return false;
-        }
-        if (K && K->native_type() != TensorType::FP32)
-        {
-            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: K must be FP32Tensor");
-            return false;
-        }
-        if (verifier_rows <= 1 || verifier_rows > 4)
-        {
-            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: verifier_rows must be M=2..4, got "
-                      << verifier_rows);
-            return false;
-        }
-        if (head_dim <= 0 || (head_dim % 2) != 0 || n_heads <= 0 || n_kv_heads < 0)
-        {
-            LOG_ERROR("CPURoPEKernelT<FP32>::apply_verifier_rows_decode_equivalent: invalid dimensions");
             return false;
         }
 
@@ -519,6 +589,9 @@ namespace llaminar2
             pos_offset,
             rope_theta,
             &tls_state_);
+        record_grouped_rope_route(
+            "FP32", verifier_rows, n_heads, n_kv_heads,
+            head_dim, rotary_dim);
         return true;
     }
 
@@ -577,6 +650,52 @@ namespace llaminar2
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
     }
 
+    bool CPURoPEKernelT<ActivationPrecision::BF16>::apply_verifier_rows_decode_equivalent(
+        TensorBase *Q,
+        TensorBase *K,
+        const int *position_ids,
+        int verifier_rows,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        const IMPIContext *mpi_ctx,
+        int device_idx,
+        int pos_offset,
+        int rotary_dim)
+    {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
+        (void)mpi_ctx;
+        (void)device_idx;
+        if (!validate_grouped_verifier_request(
+                Q, K, TensorType::BF16, verifier_rows,
+                n_heads, n_kv_heads, head_dim, rotary_dim, "BF16"))
+        {
+            return false;
+        }
+
+        auto *q_bf16 = dynamic_cast<BF16Tensor *>(Q);
+        auto *k_bf16 = K ? dynamic_cast<BF16Tensor *>(K) : nullptr;
+        if (!q_bf16 || (K && !k_bf16))
+            return false;
+
+        primitives::apply_rope_bf16_decode_equivalent_rows(
+            q_bf16->mutable_typed_data(),
+            k_bf16 ? k_bf16->mutable_typed_data() : nullptr,
+            position_ids,
+            verifier_rows,
+            head_dim,
+            n_heads,
+            n_kv_heads,
+            pos_offset,
+            rope_theta,
+            &tls_state_);
+        record_grouped_rope_route(
+            "BF16", verifier_rows, n_heads, n_kv_heads,
+            head_dim, rotary_dim);
+        return true;
+    }
+
     // --- FP16 apply_fp16() ---
     bool CPURoPEKernelT<ActivationPrecision::FP16>::apply_fp16(
         uint16_t *data, uint16_t *output,
@@ -630,6 +749,52 @@ namespace llaminar2
             q_fp16->mutable_typed_data(),
             k_fp16 ? k_fp16->mutable_typed_data() : nullptr,
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+    }
+
+    bool CPURoPEKernelT<ActivationPrecision::FP16>::apply_verifier_rows_decode_equivalent(
+        TensorBase *Q,
+        TensorBase *K,
+        const int *position_ids,
+        int verifier_rows,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        const IMPIContext *mpi_ctx,
+        int device_idx,
+        int pos_offset,
+        int rotary_dim)
+    {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
+        (void)mpi_ctx;
+        (void)device_idx;
+        if (!validate_grouped_verifier_request(
+                Q, K, TensorType::FP16, verifier_rows,
+                n_heads, n_kv_heads, head_dim, rotary_dim, "FP16"))
+        {
+            return false;
+        }
+
+        auto *q_fp16 = dynamic_cast<FP16Tensor *>(Q);
+        auto *k_fp16 = K ? dynamic_cast<FP16Tensor *>(K) : nullptr;
+        if (!q_fp16 || (K && !k_fp16))
+            return false;
+
+        primitives::apply_rope_fp16_decode_equivalent_rows(
+            q_fp16->mutable_typed_data(),
+            k_fp16 ? k_fp16->mutable_typed_data() : nullptr,
+            position_ids,
+            verifier_rows,
+            head_dim,
+            n_heads,
+            n_kv_heads,
+            pos_offset,
+            rope_theta,
+            &tls_state_);
+        record_grouped_rope_route(
+            "FP16", verifier_rows, n_heads, n_kv_heads,
+            head_dim, rotary_dim);
+        return true;
     }
 
     // --- Q8_1 apply_q8_1() ---
@@ -688,6 +853,57 @@ namespace llaminar2
             q_q8->mutable_typed_data(),
             k_q8 ? k_q8->mutable_typed_data() : nullptr,
             position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+    }
+
+    bool CPURoPEKernelT<ActivationPrecision::Q8_1>::apply_verifier_rows_decode_equivalent(
+        TensorBase *Q,
+        TensorBase *K,
+        const int *position_ids,
+        int verifier_rows,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        const IMPIContext *mpi_ctx,
+        int device_idx,
+        int pos_offset,
+        int rotary_dim)
+    {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
+        (void)mpi_ctx;
+        (void)device_idx;
+        if (!validate_grouped_verifier_request(
+                Q, K, TensorType::Q8_1, verifier_rows,
+                n_heads, n_kv_heads, head_dim, rotary_dim, "Q8_1"))
+        {
+            return false;
+        }
+        if (head_dim % Q8_1Block::BLOCK_SIZE != 0)
+        {
+            LOG_ERROR("CPURoPEKernelT<Q8_1> grouped verifier head_dim is not block aligned");
+            return false;
+        }
+
+        auto *q_q8 = dynamic_cast<Q8_1Tensor *>(Q);
+        auto *k_q8 = K ? dynamic_cast<Q8_1Tensor *>(K) : nullptr;
+        if (!q_q8 || (K && !k_q8))
+            return false;
+
+        primitives::apply_rope_q8_1_decode_equivalent_rows(
+            q_q8->mutable_typed_data(),
+            k_q8 ? k_q8->mutable_typed_data() : nullptr,
+            position_ids,
+            verifier_rows,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            pos_offset,
+            rope_theta,
+            &tls_state_);
+        record_grouped_rope_route(
+            "Q8_1", verifier_rows, n_heads, n_kv_heads,
+            head_dim, rotary_dim);
+        return true;
     }
 
     // --- Q8_1 apply_q8_1_to_fp32() (Hybrid mode) ---
@@ -1264,6 +1480,89 @@ namespace llaminar2
             LOG_ERROR("CPURoPEKernelT<Q16_1>::apply_tensor: Unknown block size");
             return false;
         }
+    }
+
+    bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_verifier_rows_decode_equivalent(
+        TensorBase *Q,
+        TensorBase *K,
+        const int *position_ids,
+        int verifier_rows,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float rope_theta,
+        const IMPIContext *mpi_ctx,
+        int device_idx,
+        int pos_offset,
+        int rotary_dim)
+    {
+        KERNEL_PROFILE_SCOPE(KernelType::ROPE);
+        (void)mpi_ctx;
+        if (!validate_grouped_verifier_request(
+                Q, K, TensorType::Q16_1, verifier_rows,
+                n_heads, n_kv_heads, head_dim, rotary_dim, "Q16_1"))
+        {
+            return false;
+        }
+
+        auto *q_q16 = dynamic_cast<Q16_1Tensor *>(Q);
+        auto *k_q16 = K ? dynamic_cast<Q16_1Tensor *>(K) : nullptr;
+        if (!q_q16 || (K && !k_q16) ||
+            (k_q16 && k_q16->q16_block_size() != q_q16->q16_block_size()))
+        {
+            LOG_ERROR("CPURoPEKernelT<Q16_1> grouped verifier requires matching Q/K block sizes");
+            return false;
+        }
+
+        std::array<int, 4> contiguous_positions{};
+        const int *effective_positions = position_ids;
+        if (!effective_positions)
+        {
+            for (int row = 0; row < verifier_rows; ++row)
+                contiguous_positions[static_cast<size_t>(row)] = pos_offset + row;
+            effective_positions = contiguous_positions.data();
+        }
+
+        void *q_raw = q_q16->raw_mutable_data();
+        void *k_raw = k_q16 ? k_q16->raw_mutable_data() : nullptr;
+        bool success = false;
+        switch (q_q16->q16_block_size())
+        {
+        case Q16BlockSize::BLOCK_32:
+            success = apply_typed_block<Q16_1Block>(
+                static_cast<Q16_1Block *>(q_raw),
+                static_cast<Q16_1Block *>(k_raw),
+                effective_positions, verifier_rows,
+                n_heads, n_kv_heads, head_dim,
+                rope_theta, device_idx, rotary_dim);
+            break;
+        case Q16BlockSize::BLOCK_64:
+            success = apply_typed_block<Q16_1Block_64>(
+                static_cast<Q16_1Block_64 *>(q_raw),
+                static_cast<Q16_1Block_64 *>(k_raw),
+                effective_positions, verifier_rows,
+                n_heads, n_kv_heads, head_dim,
+                rope_theta, device_idx, rotary_dim);
+            break;
+        case Q16BlockSize::BLOCK_128:
+            success = apply_typed_block<Q16_1Block_128>(
+                static_cast<Q16_1Block_128 *>(q_raw),
+                static_cast<Q16_1Block_128 *>(k_raw),
+                effective_positions, verifier_rows,
+                n_heads, n_kv_heads, head_dim,
+                rope_theta, device_idx, rotary_dim);
+            break;
+        default:
+            LOG_ERROR("CPURoPEKernelT<Q16_1> grouped verifier encountered an unknown block size");
+            return false;
+        }
+        if (!success)
+            return false;
+
+        record_grouped_rope_route(
+            "Q16_1", verifier_rows, n_heads, n_kv_heads,
+            head_dim, rotary_dim);
+        return true;
     }
 
     // ============================================================================

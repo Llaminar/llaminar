@@ -69,6 +69,8 @@
 
 #pragma once
 
+#include "memory/CPUWeightStoragePlacement.h"
+
 #include "../backends/DeviceType.h"            // Shared DeviceType enum
 #include "../backends/DeviceId.h"              // Type-safe device identification
 #include "../execution/config/RuntimeConfig.h" // ActivationPrecision
@@ -90,6 +92,7 @@ namespace llaminar2
     enum class KVCacheLayoutMode : uint8_t;
     class ITensor;
     class TensorBase;
+    class IPackedWeights;
     class ITensorGemm;
     class ITensorRoPE;
     class ITensorSwiGLU;
@@ -128,6 +131,7 @@ namespace llaminar2
     class FP16Tensor;
     class BF16Tensor;
     class TurboQuantContext;
+    class PhysicalMemoryAuthority;
     struct HybridKVCacheConfig;
 
     enum class TensorType; // Forward declare from Tensors.h
@@ -175,7 +179,6 @@ namespace llaminar
                 EMBEDDING,
                 FUSED_QKV,
                 FUSED_GATE_UP,
-                MOE,
             };
 
             /**
@@ -270,6 +273,17 @@ namespace llaminar
 
                 /// TurboQuant context (for TQ4 KV cache). Not owned.
                 const ::llaminar2::TurboQuantContext *turboquant_ctx = nullptr;
+
+                /**
+                 * Rank-bound production authority for this cache allocation.
+                 *
+                 * KernelFactory claims @ref estimateBytes from the KVCache BOM
+                 * before constructing any concrete backend object. Null is
+                 * reserved for direct standalone/unit fixtures; production
+                 * orchestrators must always supply the admitted authority.
+                 */
+                std::shared_ptr<::llaminar2::PhysicalMemoryAuthority>
+                    physical_memory_authority;
 
                 /// Hybrid KV cache config (for models with GDN + FA layers). Not owned.
                 /// When non-null, createKVCache() produces a hybrid cache that only allocates
@@ -953,16 +967,21 @@ namespace llaminar
                     llaminar2::DeviceId target_device);
 
                 /**
-                 * @brief Get or create a device-scoped MoE kernel
+                 * @brief Create an independently owned MoE kernel launch context.
                  *
-                 * Cache key is target_device only (MoE always operates on FP32).
-                 * Returns a device-appropriate IMoEKernel for routing, gather/scatter,
-                 * shared expert gating, and SwiGLU fallback operations.
+                 * Unlike stateless tensor kernels, an MoE kernel owns mutable
+                 * stream bindings, workspace pointers, descriptor tables, and
+                 * reusable device scratch. Returning a fresh instance prevents
+                 * separately captured routing, expert, shared-expert, and
+                 * rebalance stages from retargeting one another's launch state.
+                 * The caller must retain the returned object for the complete
+                 * lifetime of every graph executable that captured its device
+                 * metadata.
                  *
-                 * @param target_device Target device for execution
-                 * @return Cached or newly created IMoEKernel instance
+                 * @param target_device Target device for execution.
+                 * @return A newly constructed backend-specific MoE kernel.
                  */
-                static llaminar2::IMoEKernel *getOrCreateMoEKernel(
+                static std::unique_ptr<llaminar2::IMoEKernel> createMoEKernel(
                     llaminar2::DeviceId target_device);
 
                 /**
@@ -1356,21 +1375,44 @@ namespace llaminar
                     size_t total_vocab = 0);
 
                 /**
-                 * @brief Prepare GEMM weights for an expert view WITHOUT global registry registration.
+                 * @brief Prepare repacked GEMM weights for a borrowed expert view.
                  *
-                 * Performs local VNNI repacking / kernel binding and returns a
-                 * shared_ptr that the caller owns. Lifetime is managed by the caller
-                 * (PreparedWeightStore expert slab).
+                 * This pointer overload is restricted to source-independent
+                 * packed formats. Floating-point engines execute from their source
+                 * tensor and must use the shared-ownership overload below.
                  *
-                 * @param tensor Expert view tensor (2D slice of 3D parent)
+                 * @param tensor Borrowed quantized expert view (2D slice of a 3D parent).
                  * @param target_device Target device for preparation
                  * @param prep_kind Preparation kind (AUTO resolves to CPU_PACKED for CPU)
-                 * @return shared_ptr to ITensorGemm — caller owns lifetime. Returns nullptr on failure.
+                 * @param placement Final CPU storage first-touch policy, applied before packing.
+                 * @return Caller-owned prepared engine, or nullptr when the
+                 *         format cannot safely use borrowed source ownership.
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
                     const llaminar2::TensorBase *tensor,
                     llaminar2::DeviceId target_device,
-                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
+
+                /**
+                 * @brief Prepare a caller-owned expert GEMM with explicit source lifetime.
+                 *
+                 * Floating-point CPU engines copy exact native bytes into their
+                 * engine-owned execution slot. Shared ownership keeps the source
+                 * alive for that preparation transaction. Quantized CPU engines
+                 * likewise repack into engine-owned storage.
+                 *
+                 * @param tensor Shared expert view (2D slice of a 3D parent).
+                 * @param target_device Exact preparation device.
+                 * @param prep_kind Requested preparation representation.
+                 * @param placement Final CPU storage first-touch policy, applied before copying.
+                 * @return Prepared engine with a complete source-lifetime contract.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
+                    std::shared_ptr<llaminar2::TensorBase> tensor,
+                    llaminar2::DeviceId target_device,
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
 
                 /**
                  * @brief Create a GEMM engine from a transferred (pre-packed) weight blob.
@@ -1386,6 +1428,38 @@ namespace llaminar
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> createExpertGemmFromTransferBlob(
                     const std::vector<uint8_t> &blob);
+
+                /**
+                 * @brief Create a GEMM engine from arbitrary contiguous wire storage.
+                 *
+                 * This overload lets dynamic migration receive directly into
+                 * uninitialized aligned storage without copying into a temporary
+                 * `std::vector` solely to satisfy the construction API.
+                 *
+                 * @param data First byte of one complete packed-weight wire record.
+                 * @param size Number of readable bytes beginning at `data`.
+                 * @param placement Final CPU storage placement before archive bytes are copied.
+                 * @return Caller-owned prepared GEMM engine, or `nullptr` on failure.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> createExpertGemmFromTransferBlob(
+                    const uint8_t *data,
+                    size_t size,
+                    llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
+
+                /**
+                 * @brief Consume final CPU packed storage into a prepared GEMM engine.
+                 *
+                 * Direct CPU expert movement receives MPI sections into the
+                 * allocations owned by `packed_weights`; this factory moves those
+                 * allocations into the kernel without a serialization round trip.
+                 *
+                 * @param packed_weights Complete eager CPU NativeVNNI weights.
+                 * @return Shared prepared engine, or `nullptr` for an incompatible
+                 *         or incomplete packed representation.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm>
+                createExpertGemmFromPackedWeights(
+                    std::unique_ptr<llaminar2::IPackedWeights> packed_weights);
 
                 /**
                  * @brief Number of active GEMM engine registry entries
@@ -1586,25 +1660,6 @@ namespace llaminar
                 static std::unordered_map<ResidualAddCacheKey, std::unique_ptr<llaminar2::ITensorResidualAdd>, ResidualAddCacheKeyHash> residual_add_cache_;
                 static std::unordered_map<AttentionCacheKey, std::unique_ptr<llaminar2::ITensorAttention>, AttentionCacheKeyHash> attention_cache_;
                 static std::unordered_map<EmbeddingCacheKey, std::unique_ptr<llaminar2::ITensorEmbedding>, EmbeddingCacheKeyHash> embedding_cache_;
-
-                // MoE kernel cache — keyed by DeviceId (always FP32, no tensor type variant)
-                struct MoECacheKey
-                {
-                    llaminar2::DeviceId device_id;
-                    bool operator==(const MoECacheKey &other) const
-                    {
-                        return device_id == other.device_id;
-                    }
-                };
-                struct MoECacheKeyHash
-                {
-                    size_t operator()(const MoECacheKey &k) const
-                    {
-                        return std::hash<int>()(static_cast<int>(k.device_id.type)) ^
-                               (std::hash<int>()(k.device_id.ordinal) << 1);
-                    }
-                };
-                static std::unordered_map<MoECacheKey, std::unique_ptr<llaminar2::IMoEKernel>, MoECacheKeyHash> moe_cache_;
 
                 // Generic device-scoped non-GEMM registry
                 static std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> device_kernel_registry_;

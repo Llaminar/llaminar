@@ -19,6 +19,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <numeric>
 #include <random>
@@ -26,10 +27,13 @@
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/moe/DeviceMoETransferSlotDirectory.h"
+#include "execution/moe/MoERuntimeTable.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/SIMDHelpers.h"
 #include "../../../mocks/MockComputeStage.h"
+#include "../../../mocks/MockLocalTPContext.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
@@ -151,6 +155,778 @@ TEST_F(ComputeStagesTest, GEMMStage_TypeAndBackend)
     EXPECT_EQ(stage.type(), ComputeStageType::GEMM);
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
+}
+
+/**
+ * @brief Prove prefill LLEP reserves metadata for every destination request.
+ *
+ * Local planning and payload transport have intentionally different capacity
+ * domains. Each participant can request a full payload bucket for its local
+ * destination bank, so the allgather projection must hold the sum of those
+ * requests even though each source still sends at most one local bucket.
+ */
+TEST_F(ComputeStagesTest, PrefillLLEPMergedPlanCapacityCoversEveryParticipantBucket)
+{
+    DeviceMoERebalanceConfig config;
+    config.participant_count = 2;
+
+    EXPECT_EQ(
+        deviceMoEPrefillLLEPMergedPlanCapacity(
+            config,
+            /*local_plan_capacity=*/32u,
+            /*payload_slots_per_participant=*/32u),
+        64u)
+        << "CUDA2/ROCm2 projection must not force two destination-local "
+           "32-command plans into one 32-command output buffer.";
+
+    config.participant_count = 4;
+    EXPECT_EQ(
+        deviceMoEPrefillLLEPMergedPlanCapacity(
+            config,
+            /*local_plan_capacity=*/96u,
+            /*payload_slots_per_participant=*/32u),
+        128u);
+
+    config.participant_count = 3;
+    EXPECT_EQ(
+        deviceMoEPrefillLLEPMergedPlanCapacity(
+            config,
+            /*local_plan_capacity=*/256u,
+            /*payload_slots_per_participant=*/16u),
+        256u)
+        << "A larger topology-derived local plan remains authoritative.";
+}
+
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
+{
+    auto tp = std::make_unique<llaminar2::test::MockLocalTPContext>();
+    tp->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1), GlobalDeviceAddress::cuda(2)});
+    tp->setBackend(CollectiveBackendType::NCCL);
+    tp->setRawAllgatherGraphCaptureSupported(true);
+
+    DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = DeviceId::cpu();
+    table_config.num_layers = 2;
+    table_config.num_experts = 4;
+    table_config.top_k = 2;
+    table_config.mirror_to_device = false;
+    DeviceMoERuntimeTable table(table_config);
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 2;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 3;
+    config.window_size_tokens = 16;
+    config.max_hot_replicas_per_participant = 1;
+
+    MoEDeviceRebalanceStage::Params params;
+    params.device_id = DeviceId::cuda(1);
+    params.tp_ctx = tp.get();
+    params.moe_runtime_table = &table;
+    params.tp_device_idx = 1;
+    params.config = config;
+    params.stage_name = "decode_rebalance";
+
+    MoEDeviceRebalanceStage stage(params);
+    EXPECT_EQ(stage.type(), ComputeStageType::MOE_DEVICE_REBALANCE);
+    EXPECT_STREQ(computeStageTypeName(stage.type()), "MOE_DEVICE_REBALANCE");
+    EXPECT_EQ(stage.name(), "decode_rebalance");
+
+    const size_t local_entries = 8;
+    const size_t gathered_entries = local_entries * 3;
+    const size_t plan_entries = 2;
+    const size_t transfer_command_buffers = 2;
+    EXPECT_EQ(stage.estimatedMemoryBytes(),
+              (local_entries + gathered_entries) * sizeof(uint64_t) +
+                  plan_entries * sizeof(DeviceMoERebalancePlanEntry) +
+                  sizeof(uint32_t) +
+                  sizeof(DeviceMoERebalanceCommandBufferHeader) +
+                  sizeof(DeviceMoERebalanceGraphControllerState) +
+                  sizeof(DeviceMoEPlacementBank) +
+                  sizeof(DeviceMoERebalanceWaveState) +
+                  sizeof(DeviceMoERebalanceStatus));
+
+    const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(0, 0, 0);
+    ASSERT_EQ(reqs.buffers.size(), 9u);
+    const auto *local_desc = reqs.find("moe_rebalance_local_histogram_decode_rebalance");
+    const auto *gathered_desc = reqs.find("moe_rebalance_gathered_histogram_decode_rebalance");
+    const auto *plan_desc = reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
+    const auto *plan_count_desc = reqs.find("moe_rebalance_transfer_plan_count_decode_rebalance");
+    const auto *command_header_desc = reqs.find("moe_rebalance_command_header_decode_rebalance");
+    const auto *controller_state_desc = reqs.find("moe_rebalance_controller_state_decode_rebalance");
+    const auto *placement_plan_scratch_desc =
+        reqs.find("moe_rebalance_placement_plan_scratch_decode_rebalance");
+    const auto *wave_state_desc = reqs.find("moe_rebalance_wave_state_decode_rebalance");
+    const auto *status_desc = reqs.find("moe_rebalance_status_decode_rebalance");
+    ASSERT_NE(local_desc, nullptr);
+    ASSERT_NE(gathered_desc, nullptr);
+    ASSERT_NE(plan_desc, nullptr);
+    ASSERT_NE(plan_count_desc, nullptr);
+    ASSERT_NE(command_header_desc, nullptr);
+    ASSERT_NE(controller_state_desc, nullptr);
+    ASSERT_NE(placement_plan_scratch_desc, nullptr);
+    ASSERT_NE(wave_state_desc, nullptr);
+    ASSERT_NE(status_desc, nullptr);
+    EXPECT_EQ(reqs.find("moe_rebalance_local_transfer_payload_decode_rebalance"), nullptr)
+        << "ResidentOnly rebalance must not allocate fixed-size payload staging buffers.";
+    EXPECT_EQ(reqs.find("moe_rebalance_gathered_transfer_payload_decode_rebalance"), nullptr)
+        << "ResidentOnly rebalance must keep expert payload bytes off captured collectives.";
+    EXPECT_EQ(local_desc->size_bytes, local_entries * sizeof(uint64_t));
+    EXPECT_EQ(gathered_desc->size_bytes, gathered_entries * sizeof(uint64_t));
+    EXPECT_EQ(plan_desc->size_bytes, plan_entries * sizeof(DeviceMoERebalancePlanEntry));
+    EXPECT_EQ(plan_count_desc->size_bytes, sizeof(uint32_t));
+    EXPECT_EQ(command_header_desc->size_bytes, sizeof(DeviceMoERebalanceCommandBufferHeader));
+    EXPECT_EQ(controller_state_desc->size_bytes, sizeof(DeviceMoERebalanceGraphControllerState));
+    EXPECT_EQ(placement_plan_scratch_desc->size_bytes,
+              sizeof(DeviceMoEPlacementBank))
+        << "Speculative planning owns one immutable-address graph-lifetime RCU bank; it must not borrow a live placement bank.";
+    EXPECT_EQ(wave_state_desc->size_bytes, sizeof(DeviceMoERebalanceWaveState));
+    EXPECT_EQ(status_desc->size_bytes, sizeof(DeviceMoERebalanceStatus));
+
+    auto wave_params = params;
+    wave_params.config.layer_wave_count = 1;
+    MoEDeviceRebalanceStage wave_stage(wave_params);
+    const WorkspaceRequirements wave_reqs = wave_stage.getWorkspaceRequirements(0, 0, 0);
+    const auto *wave_local_desc =
+        wave_reqs.find("moe_rebalance_local_histogram_decode_rebalance");
+    const auto *wave_gathered_desc =
+        wave_reqs.find("moe_rebalance_gathered_histogram_decode_rebalance");
+    ASSERT_NE(wave_local_desc, nullptr);
+    ASSERT_NE(wave_gathered_desc, nullptr);
+    EXPECT_EQ(wave_local_desc->size_bytes,
+              config.num_experts * sizeof(uint64_t))
+        << "Layer-wave rebalance should gather only the active wave histogram.";
+    EXPECT_EQ(wave_gathered_desc->size_bytes,
+              config.num_experts * config.participant_count * sizeof(uint64_t));
+
+    params.local_transfer_slots = reinterpret_cast<DeviceMoEExpertDirectoryEntry *>(0x1000);
+    params.local_transfer_slot_count = 1;
+    params.transfer_mode = DeviceMoERebalanceTransferMode::CollectiveSidebandPayload;
+    params.collective_payload_slot_bytes = 4096;
+    MoEDeviceRebalanceStage rolling_stage(params);
+    const WorkspaceRequirements rolling_reqs = rolling_stage.getWorkspaceRequirements(0, 0, 0);
+    const auto *rolling_plan_desc =
+        rolling_reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
+    ASSERT_NE(rolling_plan_desc, nullptr);
+    EXPECT_EQ(rolling_plan_desc->size_bytes,
+              transfer_command_buffers * plan_entries * sizeof(DeviceMoERebalancePlanEntry))
+        << "command metadata capacity must not shrink to the payload transfer-slot lane.";
+
+    auto compact_params = params;
+    compact_params.config.layer_wave_count = 1;
+    compact_params.local_transfer_slots = reinterpret_cast<DeviceMoEExpertDirectoryEntry *>(0x1000);
+    compact_params.local_transfer_slot_count = static_cast<uint32_t>(plan_entries);
+    compact_params.collective_payload_slot_capacity = 1;
+    compact_params.transfer_mode = DeviceMoERebalanceTransferMode::CompactTransferSlots;
+    compact_params.collective_payload_slot_bytes = 4096;
+    MoEDeviceRebalanceStage compact_stage(compact_params);
+    const size_t compact_plan_entries =
+        static_cast<size_t>(deviceMoERebalanceCommandPlanCapacity(
+            compact_params.config,
+            compact_params.transfer_mode));
+    EXPECT_EQ(compact_plan_entries, 9u)
+        << "Compact root-domain commands need participant^2 headroom for resident command projection.";
+    const size_t compact_local_entries = config.num_experts;
+    const size_t compact_gathered_entries =
+        compact_local_entries * static_cast<size_t>(compact_params.config.participant_count);
+    const size_t compact_local_source_descriptors =
+        static_cast<size_t>(compact_params.config.participant_count) *
+        transfer_command_buffers *
+        compact_plan_entries;
+    const size_t compact_payload_slot_capacity =
+        std::min(compact_plan_entries,
+                 static_cast<size_t>(compact_params.collective_payload_slot_capacity));
+    const size_t compact_payload_slot_count =
+        compact_payload_slot_capacity;
+    const size_t compact_payload_local_bytes =
+        compact_payload_slot_count * compact_params.collective_payload_slot_bytes;
+    const size_t compact_payload_gathered_bytes =
+        compact_payload_local_bytes * static_cast<size_t>(compact_params.config.participant_count);
+    EXPECT_EQ(compact_stage.estimatedMemoryBytes(),
+              (compact_local_entries + compact_gathered_entries) * sizeof(uint64_t) +
+                  transfer_command_buffers * compact_plan_entries * sizeof(DeviceMoERebalancePlanEntry) +
+                  transfer_command_buffers * sizeof(uint32_t) +
+                  transfer_command_buffers * sizeof(DeviceMoERebalanceCommandBufferHeader) +
+                  sizeof(DeviceMoERebalanceGraphControllerState) +
+                  sizeof(DeviceMoEPlacementBank) +
+                  transfer_command_buffers * sizeof(DeviceMoERebalanceWaveState) +
+                  sizeof(DeviceMoERebalanceStatus) +
+                  sizeof(DeviceMoERebalanceApplyStatus) +
+                  sizeof(DeviceMoERebalanceApplyStatus) +
+                  static_cast<size_t>(compact_params.config.participant_count) *
+                      sizeof(DeviceMoERebalanceApplyStatus) +
+                  deviceMoETransferSlotClaimIndexBytes(
+                      compact_params.local_transfer_slot_count) +
+                  transfer_command_buffers * compact_plan_entries *
+                      static_cast<size_t>(compact_params.config.participant_count) *
+                      sizeof(DeviceMoERebalancePlanEntry) +
+                  transfer_command_buffers * static_cast<size_t>(compact_params.config.participant_count) *
+                      sizeof(DeviceMoERebalanceCommandBufferHeader) +
+                  transfer_command_buffers * static_cast<size_t>(compact_params.config.participant_count) *
+                      sizeof(DeviceMoERebalanceWaveState) +
+                  compact_local_source_descriptors * sizeof(DeviceMoEExpertDirectoryEntry) +
+                  compact_payload_local_bytes +
+                  compact_payload_gathered_bytes);
+
+    const WorkspaceRequirements compact_reqs = compact_stage.getWorkspaceRequirements(0, 0, 0);
+    ASSERT_EQ(compact_reqs.buffers.size(), 19u);
+    auto unmaterialized_compact_params = compact_params;
+    unmaterialized_compact_params.local_transfer_slots = nullptr;
+    const MoEDeviceRebalanceStage unmaterialized_compact_stage(
+        unmaterialized_compact_params);
+    const WorkspaceRequirements unmaterialized_compact_reqs =
+        unmaterialized_compact_stage.getWorkspaceRequirements(0, 0, 0);
+    EXPECT_EQ(
+        unmaterialized_compact_reqs.total_bytes_with_alignment(),
+        compact_reqs.total_bytes_with_alignment())
+        << "Workspace identity must be capacity-owned before device pointers materialize.";
+    EXPECT_EQ(
+        unmaterialized_compact_stage.estimatedMemoryBytes(),
+        compact_stage.estimatedMemoryBytes())
+        << "A null setup-time pointer cannot hide transfer workspace from admission.";
+    EXPECT_NE(
+        compact_reqs.find(
+            "moe_rebalance_placement_plan_scratch_decode_rebalance"),
+        nullptr)
+        << "Compact transfer planning still requires an isolated speculative RCU bank.";
+    const auto *compact_local_source_desc =
+        compact_reqs.find("moe_rebalance_local_source_descriptors_decode_rebalance");
+    ASSERT_NE(compact_local_source_desc, nullptr);
+    EXPECT_NE(compact_reqs.find("moe_rebalance_copy_status_decode_rebalance"), nullptr);
+    EXPECT_NE(compact_reqs.find("moe_rebalance_gathered_copy_status_decode_rebalance"), nullptr);
+    EXPECT_NE(compact_reqs.find("moe_rebalance_gathered_wave_state_decode_rebalance"), nullptr);
+    EXPECT_NE(compact_reqs.find("moe_rebalance_transfer_slot_claim_index_decode_rebalance"), nullptr);
+    EXPECT_EQ(compact_reqs.find("moe_rebalance_gathered_source_descriptors_decode_rebalance"), nullptr);
+    EXPECT_EQ(compact_reqs.find("moe_rebalance_local_directory_decode_rebalance"), nullptr)
+        << "Compact arrivals must not pack a full layer-by-expert resident directory.";
+    EXPECT_EQ(compact_reqs.find("moe_rebalance_gathered_directory_decode_rebalance"), nullptr)
+        << "Compact arrivals must not gather the full directory.";
+    const auto *compact_local_payload =
+        compact_reqs.find("moe_rebalance_local_transfer_payload_decode_rebalance");
+    const auto *compact_gathered_payload =
+        compact_reqs.find("moe_rebalance_gathered_transfer_payload_decode_rebalance");
+    ASSERT_NE(compact_local_payload, nullptr);
+    ASSERT_NE(compact_gathered_payload, nullptr);
+    EXPECT_EQ(compact_local_source_desc->size_bytes,
+              compact_local_source_descriptors * sizeof(DeviceMoEExpertDirectoryEntry));
+    EXPECT_EQ(compact_local_payload->size_bytes, compact_payload_local_bytes);
+    EXPECT_EQ(compact_gathered_payload->size_bytes, compact_payload_gathered_bytes);
+
+    compact_params.local_transfer_slot_count = 1;
+    MoEDeviceRebalanceStage compact_rolling_payload_stage(compact_params);
+    const WorkspaceRequirements compact_rolling_payload_reqs =
+        compact_rolling_payload_stage.getWorkspaceRequirements(0, 0, 0);
+    const auto *compact_rolling_plan =
+        compact_rolling_payload_reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
+    const auto *compact_rolling_local_payload =
+        compact_rolling_payload_reqs.find("moe_rebalance_local_transfer_payload_decode_rebalance");
+    const auto *compact_rolling_gathered_payload =
+        compact_rolling_payload_reqs.find("moe_rebalance_gathered_transfer_payload_decode_rebalance");
+    ASSERT_NE(compact_rolling_plan, nullptr);
+    ASSERT_NE(compact_rolling_local_payload, nullptr);
+    ASSERT_NE(compact_rolling_gathered_payload, nullptr);
+    EXPECT_EQ(compact_rolling_plan->size_bytes,
+              transfer_command_buffers * compact_plan_entries * sizeof(DeviceMoERebalancePlanEntry));
+    EXPECT_EQ(compact_rolling_local_payload->size_bytes,
+              compact_params.collective_payload_slot_bytes)
+        << "Compact payload lane must scale with dense outgoing arrival slots, not per-destination empty lanes.";
+    EXPECT_EQ(compact_rolling_gathered_payload->size_bytes,
+              static_cast<size_t>(compact_params.config.participant_count) *
+                  compact_rolling_local_payload->size_bytes);
+
+    params.local_transfer_slots = reinterpret_cast<DeviceMoEExpertDirectoryEntry *>(0x1000);
+    params.local_transfer_slot_count = static_cast<uint32_t>(plan_entries);
+    params.transfer_mode = DeviceMoERebalanceTransferMode::CollectiveSidebandPayload;
+    params.collective_payload_slot_bytes = 4096;
+    MoEDeviceRebalanceStage transfer_stage(params);
+
+    const size_t local_directory_entries = local_entries;
+    const size_t collective_payload_slot_count =
+        plan_entries * static_cast<size_t>(config.participant_count);
+    const size_t collective_payload_local_bytes =
+        collective_payload_slot_count * params.collective_payload_slot_bytes;
+    const size_t collective_payload_gathered_bytes =
+        collective_payload_local_bytes * static_cast<size_t>(config.participant_count);
+    EXPECT_EQ(transfer_stage.estimatedMemoryBytes(),
+              (local_entries + gathered_entries) * sizeof(uint64_t) +
+                  transfer_command_buffers * plan_entries * sizeof(DeviceMoERebalancePlanEntry) +
+                  transfer_command_buffers * sizeof(uint32_t) +
+                  transfer_command_buffers * sizeof(DeviceMoERebalanceCommandBufferHeader) +
+                  sizeof(DeviceMoERebalanceGraphControllerState) +
+                  sizeof(DeviceMoEPlacementBank) +
+                  transfer_command_buffers * sizeof(DeviceMoERebalanceWaveState) +
+                  sizeof(DeviceMoERebalanceStatus) +
+                  local_directory_entries * sizeof(DeviceMoEExpertDirectoryEntry) +
+                  sizeof(DeviceMoERebalanceApplyStatus) +
+                  sizeof(DeviceMoERebalanceApplyStatus) +
+                  static_cast<size_t>(config.participant_count) *
+                      sizeof(DeviceMoERebalanceApplyStatus) +
+                  deviceMoETransferSlotClaimIndexBytes(
+                      params.local_transfer_slot_count) +
+                  transfer_command_buffers * plan_entries *
+                      static_cast<size_t>(config.participant_count) *
+                      sizeof(DeviceMoERebalancePlanEntry) +
+                  transfer_command_buffers * static_cast<size_t>(config.participant_count) *
+                      sizeof(DeviceMoERebalanceCommandBufferHeader) +
+                  transfer_command_buffers * static_cast<size_t>(config.participant_count) *
+                      sizeof(DeviceMoERebalanceWaveState) +
+                  collective_payload_local_bytes +
+                  collective_payload_gathered_bytes);
+
+    const WorkspaceRequirements transfer_reqs = transfer_stage.getWorkspaceRequirements(0, 0, 0);
+    ASSERT_EQ(transfer_reqs.buffers.size(), 19u);
+    EXPECT_NE(
+        transfer_reqs.find(
+            "moe_rebalance_placement_plan_scratch_decode_rebalance"),
+        nullptr)
+        << "Fixed-payload planning still requires an isolated speculative RCU bank.";
+    const auto *transfer_plan_desc =
+        transfer_reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
+    const auto *transfer_plan_count_desc =
+        transfer_reqs.find("moe_rebalance_transfer_plan_count_decode_rebalance");
+    const auto *transfer_command_header_desc =
+        transfer_reqs.find("moe_rebalance_command_header_decode_rebalance");
+    const auto *transfer_wave_state_desc =
+        transfer_reqs.find("moe_rebalance_wave_state_decode_rebalance");
+    const auto *gathered_transfer_plan_desc =
+        transfer_reqs.find("moe_rebalance_gathered_transfer_plan_decode_rebalance");
+    const auto *gathered_command_header_desc =
+        transfer_reqs.find("moe_rebalance_gathered_command_header_decode_rebalance");
+    const auto *gathered_wave_state_desc =
+        transfer_reqs.find("moe_rebalance_gathered_wave_state_decode_rebalance");
+    const auto *copy_status_desc =
+        transfer_reqs.find("moe_rebalance_copy_status_decode_rebalance");
+    const auto *gathered_copy_status_desc =
+        transfer_reqs.find("moe_rebalance_gathered_copy_status_decode_rebalance");
+    const auto *local_directory_desc =
+        transfer_reqs.find("moe_rebalance_local_directory_decode_rebalance");
+    const auto *gathered_directory_desc =
+        transfer_reqs.find("moe_rebalance_gathered_directory_decode_rebalance");
+    const auto *local_transfer_payload_desc =
+        transfer_reqs.find("moe_rebalance_local_transfer_payload_decode_rebalance");
+    const auto *gathered_transfer_payload_desc =
+        transfer_reqs.find("moe_rebalance_gathered_transfer_payload_decode_rebalance");
+    const auto *apply_status_desc =
+        transfer_reqs.find("moe_rebalance_apply_status_decode_rebalance");
+    const auto *transfer_slot_claim_index_desc =
+        transfer_reqs.find("moe_rebalance_transfer_slot_claim_index_decode_rebalance");
+    ASSERT_NE(transfer_plan_desc, nullptr);
+    ASSERT_NE(transfer_plan_count_desc, nullptr);
+    ASSERT_NE(transfer_command_header_desc, nullptr);
+    ASSERT_NE(transfer_wave_state_desc, nullptr);
+    ASSERT_NE(gathered_transfer_plan_desc, nullptr);
+    ASSERT_NE(gathered_command_header_desc, nullptr);
+    ASSERT_NE(gathered_wave_state_desc, nullptr);
+    ASSERT_NE(copy_status_desc, nullptr);
+    ASSERT_NE(gathered_copy_status_desc, nullptr);
+    ASSERT_NE(local_directory_desc, nullptr);
+    ASSERT_EQ(gathered_directory_desc, nullptr)
+        << "collective staging payloads carry source descriptors and must not allgather the full expert directory";
+    ASSERT_NE(local_transfer_payload_desc, nullptr);
+    ASSERT_NE(gathered_transfer_payload_desc, nullptr);
+    ASSERT_NE(apply_status_desc, nullptr);
+    ASSERT_NE(transfer_slot_claim_index_desc, nullptr);
+    EXPECT_EQ(transfer_plan_desc->size_bytes,
+              transfer_command_buffers * plan_entries * sizeof(DeviceMoERebalancePlanEntry));
+    EXPECT_EQ(transfer_plan_count_desc->size_bytes,
+              transfer_command_buffers * sizeof(uint32_t));
+    EXPECT_EQ(transfer_command_header_desc->size_bytes,
+              transfer_command_buffers * sizeof(DeviceMoERebalanceCommandBufferHeader));
+    EXPECT_EQ(transfer_wave_state_desc->size_bytes,
+              transfer_command_buffers * sizeof(DeviceMoERebalanceWaveState));
+    EXPECT_EQ(gathered_transfer_plan_desc->size_bytes,
+              transfer_command_buffers * plan_entries *
+                  static_cast<size_t>(config.participant_count) *
+                  sizeof(DeviceMoERebalancePlanEntry));
+    EXPECT_EQ(gathered_command_header_desc->size_bytes,
+              transfer_command_buffers * static_cast<size_t>(config.participant_count) *
+                  sizeof(DeviceMoERebalanceCommandBufferHeader));
+    EXPECT_EQ(gathered_wave_state_desc->size_bytes,
+              transfer_command_buffers * static_cast<size_t>(config.participant_count) *
+                  sizeof(DeviceMoERebalanceWaveState));
+    EXPECT_EQ(copy_status_desc->size_bytes, sizeof(DeviceMoERebalanceApplyStatus));
+    EXPECT_EQ(gathered_copy_status_desc->size_bytes,
+              static_cast<size_t>(config.participant_count) *
+                  sizeof(DeviceMoERebalanceApplyStatus));
+    EXPECT_EQ(local_directory_desc->size_bytes,
+              local_directory_entries * sizeof(DeviceMoEExpertDirectoryEntry));
+    EXPECT_EQ(local_transfer_payload_desc->size_bytes,
+              collective_payload_local_bytes);
+    EXPECT_EQ(gathered_transfer_payload_desc->size_bytes,
+              collective_payload_gathered_bytes);
+    EXPECT_EQ(apply_status_desc->size_bytes, sizeof(DeviceMoERebalanceApplyStatus));
+    EXPECT_EQ(transfer_slot_claim_index_desc->size_bytes,
+              deviceMoETransferSlotClaimIndexBytes(
+                  params.local_transfer_slot_count));
+
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "capture must require a mirrored device runtime table";
+#ifdef HAVE_CUDA
+    EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#endif
+#ifdef HAVE_ROCM
+    EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_ROCM));
+#endif
+    EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::CPU));
+}
+
+/**
+ * @brief Reproduce the complete maintenance workspace from the 35B ROCm cell.
+ *
+ * The production failure admitted only the ordinary graph workspace, then
+ * discovered these persistent maintenance buffers while constructing the
+ * serial graph family.  Keep the model geometry, transfer-directory capacity,
+ * and Q4_K_XL wire stride explicit here so a later lifecycle refactor cannot
+ * silently drop any portion of the 10.5 MB physical claim again.
+ */
+TEST_F(ComputeStagesTest,
+       MoEDeviceRebalanceWorkspaceContract_CoversQwen35DynamicProductionGeometry)
+{
+    const DeviceMoERebalanceWorkspaceCapacity capacity{
+        .num_layers = 40u,
+        .num_experts = 256u,
+        .participant_count = 2u,
+        .layer_window_count = 39u,
+        .layer_wave_count = 4u,
+        .max_hot_replicas_per_participant = 25u,
+        .flags = static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::ResetHistogramsAfterApply) |
+                 static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::DeferRuntimeApply) |
+                 static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::PlanMissingArrivals) |
+                 static_cast<std::uint32_t>(
+                     DeviceMoERebalanceFlags::HotReplicaCache),
+        .local_transfer_slot_count = 1004u,
+        .collective_payload_slot_capacity = 1u,
+        .phase = DeviceMoERebalanceStagePhase::PlanCopyApply,
+        .transfer_mode =
+            DeviceMoERebalanceTransferMode::CompactTransferSlots,
+    };
+    const DeviceMoERebalanceWorkspaceBinding binding{
+        .capacity = capacity,
+        .collective_payload_slot_bytes = 3277312u,
+        .workspace_suffix = "qwen35_dynamic_production_geometry",
+    };
+
+    const auto requirements =
+        DeviceMoERebalanceWorkspaceContract::requirements(binding);
+    ASSERT_EQ(requirements.buffers.size(), 19u);
+    EXPECT_EQ(
+        DeviceMoERebalanceWorkspaceContract::logicalBytes(binding),
+        10498656u);
+    EXPECT_EQ(
+        DeviceMoERebalanceWorkspaceContract::allocationBytes(binding),
+        10500608u);
+    EXPECT_EQ(
+        requirements.total_bytes_with_alignment(),
+        DeviceMoERebalanceWorkspaceContract::allocationBytes(binding));
+
+    const auto *local_payload = requirements.find(
+        "moe_rebalance_local_transfer_payload_qwen35_dynamic_production_geometry");
+    const auto *gathered_payload = requirements.find(
+        "moe_rebalance_gathered_transfer_payload_qwen35_dynamic_production_geometry");
+    const auto *claim_index = requirements.find(
+        "moe_rebalance_transfer_slot_claim_index_qwen35_dynamic_production_geometry");
+    ASSERT_NE(local_payload, nullptr);
+    ASSERT_NE(gathered_payload, nullptr);
+    ASSERT_NE(claim_index, nullptr);
+    EXPECT_EQ(local_payload->size_bytes, 3277312u);
+    EXPECT_EQ(gathered_payload->size_bytes, 6554624u);
+    EXPECT_EQ(claim_index->size_bytes, 16208u);
+}
+
+/**
+ * @brief Proves status ownership is phase-driven rather than buffer-driven.
+ *
+ * The atomic maintenance transaction owns both copy and apply publication,
+ * while nodes embedded in the monolithic decode graph retain explicit,
+ * phase-local ownership. This matrix keeps every live stage phase explicit
+ * without launching GPU work.
+ */
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_StatusPublicationContractIsPhaseComplete)
+{
+    struct ExpectedContract
+    {
+        DeviceMoERebalanceStagePhase phase;
+        bool copy_status;
+        bool apply_status;
+    };
+    constexpr ExpectedContract expected[] = {
+        {DeviceMoERebalanceStagePhase::PlanCopyApply, true, true},
+        {DeviceMoERebalanceStagePhase::CollectState, false, false},
+        {DeviceMoERebalanceStagePhase::PlanAndCopy, true, true},
+        {DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband, false, false},
+        {DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband, true, false},
+        {DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband, true, true},
+        {DeviceMoERebalanceStagePhase::Apply, false, true},
+        {DeviceMoERebalanceStagePhase::JoinTransfer, false, false},
+    };
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 2;
+    config.top_k = 1;
+    config.participant_count = 2;
+
+    for (const auto &cell : expected)
+    {
+        MoEDeviceRebalanceStage::Params params;
+        params.device_id = DeviceId::cuda(0);
+        params.config = config;
+        params.stage_name = "status_contract";
+        params.local_transfer_slots =
+            reinterpret_cast<DeviceMoEExpertDirectoryEntry *>(0x1000);
+        params.local_transfer_slot_count = 1;
+        params.transfer_mode =
+            DeviceMoERebalanceTransferMode::CompactTransferSlots;
+        params.phase = cell.phase;
+
+        const MoEDeviceRebalanceStage stage(params);
+        const auto contract = stage.statusPublicationContract();
+        EXPECT_EQ(contract.copy_status, cell.copy_status)
+            << "phase=" << static_cast<int>(cell.phase);
+        EXPECT_EQ(contract.apply_status, cell.apply_status)
+            << "phase=" << static_cast<int>(cell.phase);
+    }
+}
+
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_PrepareGraphLaunchRequiresExplicitStream)
+{
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 2;
+    config.top_k = 1;
+    config.participant_id = 0;
+    config.participant_count = 2;
+    config.window_size_tokens = 8;
+
+    MoEDeviceRebalanceStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.config = config;
+    params.stage_name = "decode_rebalance";
+
+    MoEDeviceRebalanceStage stage(params);
+    EXPECT_FALSE(stage.prepareGraphLaunch(ctx_.get(), nullptr))
+        << "Graph-captured rebalance must hard-fail rather than falling back to a default stream";
+}
+
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferCapacityRetargetsMixedProjectionFormats)
+{
+    uint8_t payload = 0;
+    uint16_t scales = 0;
+    uint16_t mins = 0;
+    uint32_t emins = 0;
+
+    auto descFor = [&](uint8_t codebook_id, bool with_mins, bool with_emins)
+    {
+        DeviceNativeVNNIMatrixDesc desc;
+        desc.payload = &payload;
+        desc.scales = &scales;
+        desc.mins = with_mins ? &mins : nullptr;
+        desc.emins = with_emins ? &emins : nullptr;
+        desc.n = 4;
+        desc.k = 32;
+        desc.blocks_per_row = 1;
+        desc.codebook_id = codebook_id;
+        return desc;
+    };
+
+    DeviceMoEExpertDirectoryEntry source;
+    source.descriptor.gate = descFor(/*codebook_id=*/19, false, false);
+    source.descriptor.up = descFor(/*codebook_id=*/10, true, true);
+    source.descriptor.down = descFor(/*codebook_id=*/14, true, false);
+    source.descriptor.logical_expert_id = 1;
+    source.flags =
+        static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
+        static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
+    source.participant = 0;
+    ASSERT_TRUE(deviceMoEDirectoryCopyReady(source));
+
+    DeviceMoEExpertDirectoryEntry destination;
+    destination.descriptor.gate = descFor(/*codebook_id=*/4, true, true);
+    destination.descriptor.up = descFor(/*codebook_id=*/4, true, true);
+    destination.descriptor.down = descFor(/*codebook_id=*/4, true, true);
+    for (DeviceNativeVNNIMatrixDesc *projection : {
+             &destination.descriptor.gate,
+             &destination.descriptor.up,
+             &destination.descriptor.down})
+    {
+        projection->allocation_payload_bytes_per_block = 32;
+        projection->allocation_has_mins = 1;
+        projection->allocation_has_emins = 1;
+    }
+
+    const uint8_t *const gate_payload = destination.descriptor.gate.payload;
+    const void *const gate_scales = destination.descriptor.gate.scales;
+    const uint8_t gate_capacity =
+        destination.descriptor.gate.allocation_payload_bytes_per_block;
+    ASSERT_TRUE(deviceMoEDirectoryFitsTransferCapacity(source, destination))
+        << "One persistent transfer slot must accept every observed layer codebook that fits its immutable allocation";
+
+    deviceMoERetargetTransferDirectoryFormats(destination, source);
+    EXPECT_EQ(destination.descriptor.gate.codebook_id, 19u);
+    EXPECT_EQ(destination.descriptor.up.codebook_id, 10u);
+    EXPECT_EQ(destination.descriptor.down.codebook_id, 14u);
+    EXPECT_EQ(destination.descriptor.gate.payload, gate_payload);
+    EXPECT_EQ(destination.descriptor.gate.scales, gate_scales);
+    EXPECT_EQ(
+        destination.descriptor.gate.allocation_payload_bytes_per_block,
+        gate_capacity)
+        << "Retargeting format metadata must never alter graph-captured allocation identity";
+
+    destination.descriptor.gate.allocation_payload_bytes_per_block = 16;
+    EXPECT_FALSE(deviceMoEDirectoryFitsTransferCapacity(source, destination))
+        << "A Q8 source must fail closed when the stable destination allocation is too small";
+}
+
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromStorageCapacity)
+{
+    using ProjectionSpec = DeviceMoETransferSlotDirectory::ProjectionSpec;
+    auto spec =
+        [](const char *label,
+           int payload_bytes,
+           bool has_mins,
+           bool has_emins,
+           uint8_t codebook_id,
+           bool is_superblock)
+    {
+        ProjectionSpec result;
+        result.label = label;
+        result.N = 4;
+        result.K = 32;
+        result.payload_bytes_per_block = payload_bytes;
+        result.is_asymmetric = has_mins;
+        result.has_emins = has_emins;
+        result.codebook_id = codebook_id;
+        result.format = ExpertWeightFormat::nativeVnni({
+            .codebook_id = codebook_id,
+            .is_superblock = is_superblock,
+            .present = true,
+        });
+        return result;
+    };
+
+    const std::vector<ProjectionSpec> q4_layer{
+        spec("gate", 16, false, false, 4, false),
+        spec("up", 16, false, false, 4, false),
+        spec("down", 16, false, false, 4, false)};
+    const std::vector<ProjectionSpec> mixed_layer{
+        spec("gate", 32, false, false, 19, false),
+        spec("up", 8, true, true, 10, true),
+        spec("down", 9, true, false, 14, true)};
+
+    const auto profile =
+        DeviceMoETransferSlotDirectory::profileForLayerFormats(
+            {q4_layer, mixed_layer});
+    ASSERT_EQ(profile.allocation_specs.size(), 3u);
+    EXPECT_EQ(profile.allocation_specs[0].payload_bytes_per_block, 32);
+    EXPECT_EQ(profile.allocation_specs[1].payload_bytes_per_block, 16);
+    EXPECT_TRUE(profile.allocation_specs[1].is_asymmetric);
+    EXPECT_TRUE(profile.allocation_specs[1].has_emins);
+    EXPECT_EQ(profile.allocation_specs[2].payload_bytes_per_block, 16);
+    EXPECT_TRUE(profile.allocation_specs[2].is_asymmetric);
+
+    EXPECT_EQ(profile.max_wire_payload_bytes, 252u)
+        << "The collective wire slot should match the largest real layer payload";
+
+    constexpr size_t kBlocksPerProjection = 4;
+    constexpr size_t kCapacityBytesPerBlock =
+        (32 + 2) + (16 + 2 + 2 + 4) + (16 + 2 + 2);
+    EXPECT_EQ(
+        kBlocksPerProjection * kCapacityBytesPerBlock,
+        312u)
+        << "Component-wise storage capacity may exceed every realizable wire payload without inflating collectives";
+}
+
+/**
+ * @brief Prove scheduling windows never alter domain slot identity.
+ *
+ * Prefill starts at layer zero while decode maintenance starts after the first
+ * routed layer. Both graphs publish into one runtime table, so they must derive
+ * the same directory capacity despite their different scheduling windows.
+ */
+TEST_F(ComputeStagesTest, MoEDeviceRebalancePersistentSlotsCoverRuntimeDomain)
+{
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 40;
+    config.layer_window_start = 1;
+    config.layer_window_count = 39;
+    config.layer_wave_count = 4;
+    config.max_hot_replicas_per_participant = 0;
+
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        40u)
+        << "Dynamic ownership needs one durable lane per runtime layer even "
+           "when the maintenance cursor skips layer zero";
+
+    config.max_hot_replicas_per_participant = 2;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        80u);
+
+    config.layer_window_count = 0;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        80u)
+        << "A zero scheduling window must not change persistent storage";
+
+    config.layer_window_start = config.num_layers;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        80u)
+        << "An exhausted scheduling cursor still shares the live domain directory";
+
+    config.num_layers = 0;
+    EXPECT_EQ(
+        DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(config),
+        0u);
+}
+
+/**
+ * @brief Prove persistent cache occupancy cannot consume arrival-wave storage.
+ *
+ * Qwen3.6-35B has forty routed MoE layers. The failing CUDA2/ROCm2 E2E case
+ * allowed two persistent replicas per layer and moved at most thirty-two
+ * experts per transaction with two configured transfer buffers. The directory
+ * must therefore own 80 persistent slots plus two disjoint 32-slot staging
+ * waves; capping the entire directory at 32 leaves no legal destination after
+ * warmup and makes request-boundary maintenance fail.
+ */
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceTransferDirectorySeparatesActiveAndStagingCapacity)
+{
+    const auto capacity =
+        DeviceMoETransferSlotDirectory::planBufferedCapacity(
+            /*requested_active_slots=*/80,
+            /*transfer_wave_slots=*/32,
+            /*transfer_buffer_count=*/2);
+
+    EXPECT_EQ(capacity.active_slots, 80u);
+    EXPECT_EQ(capacity.staging_slots, 64u);
+    EXPECT_EQ(capacity.total_slots, 144u);
+
+    const auto qwen36_hot_ten_percent =
+        DeviceMoETransferSlotDirectory::planBufferedCapacity(
+            /*requested_active_slots=*/1000,
+            /*transfer_wave_slots=*/2,
+            /*transfer_buffer_count=*/2);
+    EXPECT_EQ(qwen36_hot_ten_percent.active_slots, 1000u);
+    EXPECT_EQ(qwen36_hot_ten_percent.staging_slots, 4u);
+    EXPECT_EQ(qwen36_hot_ten_percent.total_slots, 1004u)
+        << "Qwen3.6's forty routed layers and twenty-five hot replicas per "
+           "participant must not inherit the unrelated 256-expert layer bound";
+
+    EXPECT_THROW(
+        DeviceMoETransferSlotDirectory::planBufferedCapacity(
+            /*requested_active_slots=*/
+                static_cast<uint64_t>(kDeviceMoEMaxTransferSlots),
+            /*transfer_wave_slots=*/1,
+            /*transfer_buffer_count=*/1),
+        std::invalid_argument)
+        << "The signed descriptor slot ABI must reject overflow before graph construction.";
 }
 
 TEST_F(ComputeStagesTest, GEMMStage_EstimatedFlops)

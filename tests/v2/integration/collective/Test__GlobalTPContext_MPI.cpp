@@ -26,6 +26,13 @@
 #include "tensors/TensorClasses.h"
 #include "utils/Logger.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
 using namespace llaminar2;
 
 // =============================================================================
@@ -414,6 +421,199 @@ TEST_F(Test__GlobalTPContext_MPI, AllgatherBytes_SmallControlRecord)
     EXPECT_FLOAT_EQ(gathered[0].score, 1.5f);
     EXPECT_EQ(gathered[1].token, 11);
     EXPECT_FLOAT_EQ(gathered[1].score, 2.5f);
+}
+
+/**
+ * @test PackedRootGatherAndExactPrefixBroadcast
+ *
+ * Prove the transport transaction used by canonical CPU MoE publication:
+ * participants contribute unequal counts of fixed-width records, rank zero
+ * receives them into storage that aliases its local contribution, and only the
+ * active compact result prefix is subsequently broadcast. This catches root
+ * displacement/`MPI_IN_PLACE` mistakes and accidental bucket-tail transport.
+ */
+TEST_F(Test__GlobalTPContext_MPI, PackedRootGatherAndExactPrefixBroadcast)
+{
+    auto ctx = createTwoRankContext();
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr size_t record_width = 3u;
+    constexpr size_t root_capacity = 3u;
+    constexpr int root_index = 0;
+    const size_t local_record_count = world_rank_ == 0 ? 1u : 2u;
+    std::vector<float> records(root_capacity * record_width, -1.0f);
+
+    if (world_rank_ == 0)
+    {
+        const std::array<float, record_width> local = {10.0f, 11.0f, 100.0f};
+        std::copy(local.begin(), local.end(), records.begin());
+    }
+    else
+    {
+        const std::array<float, 2u * record_width> local = {
+            20.0f,
+            21.0f,
+            200.0f,
+            30.0f,
+            31.0f,
+            300.0f,
+        };
+        std::copy(local.begin(), local.end(), records.begin());
+    }
+
+    size_t gathered_record_count = 0u;
+    ASSERT_TRUE(ctx->gatherVariableFloatRecordsToRoot(
+        records.data(),
+        local_record_count,
+        records.data(),
+        root_capacity,
+        record_width,
+        root_index,
+        gathered_record_count,
+        "test_packed_root_gather"));
+
+    if (world_rank_ == root_index)
+    {
+        EXPECT_EQ(gathered_record_count, root_capacity);
+        const std::array<float, root_capacity * record_width> expected = {
+            10.0f,
+            11.0f,
+            100.0f,
+            20.0f,
+            21.0f,
+            200.0f,
+            30.0f,
+            31.0f,
+            300.0f,
+        };
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(), records.begin()));
+    }
+    else
+    {
+        EXPECT_EQ(gathered_record_count, 0u);
+    }
+
+    FP32Tensor compact_result({5u});
+    std::fill_n(
+        compact_result.mutable_data(),
+        compact_result.numel(),
+        world_rank_ == root_index ? -7.0f : -9.0f);
+    if (world_rank_ == root_index)
+    {
+        compact_result.mutable_data()[0] = 1.0f;
+        compact_result.mutable_data()[1] = 2.0f;
+        compact_result.mutable_data()[2] = 3.0f;
+    }
+
+    ASSERT_TRUE(ctx->broadcastFloatElements(
+        &compact_result,
+        /*element_count=*/3u,
+        root_index,
+        "test_compact_prefix_broadcast"));
+    EXPECT_FLOAT_EQ(compact_result.data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(compact_result.data()[1], 2.0f);
+    EXPECT_FLOAT_EQ(compact_result.data()[2], 3.0f);
+    EXPECT_FLOAT_EQ(
+        compact_result.data()[3],
+        world_rank_ == root_index ? -7.0f : -9.0f)
+        << "exact-prefix broadcast must not overwrite arena tail storage";
+    EXPECT_FLOAT_EQ(
+        compact_result.data()[4],
+        world_rank_ == root_index ? -7.0f : -9.0f)
+        << "exact-prefix broadcast must not overwrite arena tail storage";
+}
+
+/**
+ * @test PackedRootGatherReusesPrivateLaneAcrossZeroCountTransactions
+ *
+ * Replays the rooted publication protocol without an inter-transaction barrier
+ * while each participant alternates between one record and no records. This
+ * proves that a zero-count sender still contributes a discoverable envelope,
+ * that MPI source ordering cannot leak a later transaction into an earlier one,
+ * and that the persistent request/source metadata is reset completely. Non-root
+ * receive storage is null to exercise the interface's explicit ignored-buffer
+ * contract.
+ */
+TEST_F(
+    Test__GlobalTPContext_MPI,
+    PackedRootGatherReusesPrivateLaneAcrossZeroCountTransactions)
+{
+    auto ctx = createTwoRankContext();
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr size_t record_width = 3u;
+    constexpr size_t root_capacity = 2u;
+    constexpr int root_index = 0;
+    constexpr float untouched = -777.0f;
+
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        const bool contributes = world_rank_ == root_index
+                                     ? iteration % 3 != 0
+                                     : iteration % 2 != 0;
+        const size_t local_record_count = contributes ? 1u : 0u;
+        const std::array<float, record_width> local_record = {
+            static_cast<float>(1000 * iteration + 100 * world_rank_ + 1),
+            static_cast<float>(1000 * iteration + 100 * world_rank_ + 2),
+            static_cast<float>(1000 * iteration + 100 * world_rank_ + 3),
+        };
+        std::array<float, root_capacity * record_width> root_records{};
+        root_records.fill(untouched);
+
+        size_t gathered_record_count = 99u;
+        ASSERT_TRUE(ctx->gatherVariableFloatRecordsToRoot(
+            contributes ? local_record.data() : nullptr,
+            local_record_count,
+            world_rank_ == root_index ? root_records.data() : nullptr,
+            root_capacity,
+            record_width,
+            root_index,
+            gathered_record_count,
+            "test_repeated_packed_root_gather"));
+
+        if (world_rank_ != root_index)
+        {
+            EXPECT_EQ(gathered_record_count, 0u);
+            continue;
+        }
+
+        const bool peer_contributes = iteration % 2 != 0;
+        const size_t expected_records =
+            static_cast<size_t>(contributes) +
+            static_cast<size_t>(peer_contributes);
+        ASSERT_EQ(gathered_record_count, expected_records);
+
+        size_t expected_offset = 0u;
+        if (contributes)
+        {
+            EXPECT_TRUE(std::equal(
+                local_record.begin(),
+                local_record.end(),
+                root_records.begin()));
+            expected_offset += record_width;
+        }
+        if (peer_contributes)
+        {
+            const std::array<float, record_width> peer_record = {
+                static_cast<float>(1000 * iteration + 101),
+                static_cast<float>(1000 * iteration + 102),
+                static_cast<float>(1000 * iteration + 103),
+            };
+            EXPECT_TRUE(std::equal(
+                peer_record.begin(),
+                peer_record.end(),
+                root_records.begin() +
+                    static_cast<std::ptrdiff_t>(expected_offset)));
+            expected_offset += record_width;
+        }
+        EXPECT_TRUE(std::all_of(
+            root_records.begin() +
+                static_cast<std::ptrdiff_t>(expected_offset),
+            root_records.end(),
+            [](float value) { return value == untouched; }))
+            << "packed gather overwrote inactive arena tail at iteration "
+            << iteration;
+    }
 }
 
 // =============================================================================

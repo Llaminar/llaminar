@@ -8,50 +8,291 @@
 
 #include "ROCmRingKVCacheTQ.h"
 #include "ROCmTurboQuantKernels.h"
+#include "../../kvcache/KVCacheWorkspaceContract.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 namespace llaminar2
 {
+    extern "C" void hip_kv_sequence_state_advance(
+        int *d_head, int *d_count, int num_tokens, int max_seq_len,
+        hipStream_t stream);
+    extern "C" void hip_kv_sequence_state_advance_dynamic(
+        int *d_head, int *d_count, const int *d_append_count,
+        int captured_num_tokens, int max_seq_len, hipStream_t stream);
+
+    /**
+     * @brief Gather asymmetric TurboQuant K/V rows into device prefix storage.
+     *
+     * TurboQuant stores K and V with different native row widths. Treating the
+     * payload as raw bytes preserves every quantized code and scale exactly
+     * while allowing one launch to cover both arrays. The canonical ring head
+     * and count remain device-owned inputs, so graph replay never consults a
+     * potentially stale host mirror.
+     */
+    __global__ void rocm_tq_ring_logical_block_export_device_kernel(
+        const uint8_t *__restrict__ ring_k,
+        const uint8_t *__restrict__ ring_v,
+        const uint8_t *__restrict__ ring_k_anchor,
+        uint8_t *__restrict__ block_k,
+        uint8_t *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        size_t k_row_bytes,
+        size_t v_row_bytes,
+        size_t k_anchor_bytes)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count < 0 || count > max_seq_len ||
+            head < 0 || head >= max_seq_len ||
+            logical_token_start < 0 ||
+            logical_token_start > count ||
+            token_count < 0 ||
+            token_count > count - logical_token_start)
+        {
+            return;
+        }
+
+        int tail = (head - count) % max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+
+        const size_t k_bytes =
+            static_cast<size_t>(token_count) * k_row_bytes;
+        const size_t v_bytes =
+            static_cast<size_t>(token_count) * v_row_bytes;
+        const size_t total = k_anchor_bytes + k_bytes + v_bytes;
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < total;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            if (linear < k_anchor_bytes)
+            {
+                block_k[linear] = ring_k_anchor[linear];
+                continue;
+            }
+            const size_t payload = linear - k_anchor_bytes;
+            const bool is_k = payload < k_bytes;
+            const size_t local = is_k ? payload : payload - k_bytes;
+            const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
+            const int token = static_cast<int>(local / row_bytes);
+            const size_t byte_in_row = local % row_bytes;
+            const int physical =
+                (tail + logical_token_start + token) % max_seq_len;
+            const size_t source =
+                static_cast<size_t>(physical) * row_bytes + byte_in_row;
+            if (is_k)
+                block_k[k_anchor_bytes + local] = ring_k[source];
+            else
+                block_v[local] = ring_v[source];
+        }
+    }
+
+    /**
+     * @brief Scatter a device-resident TurboQuant block into the live ring.
+     *
+     * The kernel validates the live device metadata before writing. A stale or
+     * out-of-order restore therefore cannot mutate payload storage, and the
+     * stream-ordered publication kernel below will likewise refuse to advance
+     * the metadata.
+     */
+    __global__ void rocm_tq_ring_logical_block_import_device_kernel(
+        uint8_t *__restrict__ ring_k,
+        uint8_t *__restrict__ ring_v,
+        uint8_t *__restrict__ ring_k_anchor,
+        const uint8_t *__restrict__ block_k,
+        const uint8_t *__restrict__ block_v,
+        const int *__restrict__ ring_head,
+        const int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len,
+        size_t k_row_bytes,
+        size_t v_row_bytes,
+        size_t k_anchor_bytes)
+    {
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+
+        const size_t k_bytes =
+            static_cast<size_t>(token_count) * k_row_bytes;
+        const size_t v_bytes =
+            static_cast<size_t>(token_count) * v_row_bytes;
+        const size_t total = k_anchor_bytes + k_bytes + v_bytes;
+        for (size_t linear =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             linear < total;
+             linear += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            if (linear < k_anchor_bytes)
+            {
+                ring_k_anchor[linear] = block_k[linear];
+                continue;
+            }
+            const size_t payload = linear - k_anchor_bytes;
+            const bool is_k = payload < k_bytes;
+            const size_t local = is_k ? payload : payload - k_bytes;
+            const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
+            const int token = static_cast<int>(local / row_bytes);
+            const size_t byte_in_row = local % row_bytes;
+            const int physical = (head + token) % max_seq_len;
+            const size_t destination =
+                static_cast<size_t>(physical) * row_bytes + byte_in_row;
+            if (is_k)
+                ring_k[destination] = block_k[k_anchor_bytes + local];
+            else
+                ring_v[destination] = block_v[local];
+        }
+    }
+
+    /**
+     * @brief Publish TQ ring metadata after asynchronous device payload import.
+     *
+     * This one-thread kernel is deliberately separate from the scatter. Stream
+     * ordering guarantees that no consumer can observe the new count before
+     * every payload byte has reached its canonical ring location.
+     */
+    __global__ void rocm_tq_ring_logical_block_import_publish_kernel(
+        int *__restrict__ ring_head,
+        int *__restrict__ cached_tokens,
+        int logical_token_start,
+        int token_count,
+        int max_seq_len)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+        const int count = *cached_tokens;
+        const int head = *ring_head;
+        if (count != logical_token_start ||
+            head != (logical_token_start % max_seq_len))
+        {
+            return;
+        }
+        const int new_count = logical_token_start + token_count;
+        *cached_tokens = new_count;
+        *ring_head = new_count % max_seq_len;
+    }
 
     ROCmRingKVCacheTQ::ROCmRingKVCacheTQ(
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
-        const TurboQuantContext *tq_ctx, int device_id)
-        : ROCmRingKVCacheBase(n_layers, batch_size, max_seq_len,
-                               n_kv_heads, head_dim, n_kv_heads * head_dim, device_id)
+        const TurboQuantContext *tq_ctx, int device_id,
+        TurboQuantKVMode mode)
+        : ROCmRingKVCacheTQ(n_layers, batch_size, max_seq_len,
+                            n_kv_heads, n_kv_heads, 0,
+                            head_dim, tq_ctx, device_id, mode)
     {
+    }
+
+    ROCmRingKVCacheTQ::ROCmRingKVCacheTQ(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, const TurboQuantContext *tq_ctx, int device_id,
+        TurboQuantKVMode mode)
+        : ROCmRingKVCacheBase(n_layers, batch_size, max_seq_len,
+                              n_kv_heads, head_dim, local_n_kv_heads * head_dim, device_id),
+          local_n_kv_heads_(local_n_kv_heads),
+          kv_head_start_(kv_head_start),
+          mode_(mode)
+    {
+        if (local_n_kv_heads <= 0 || local_n_kv_heads > n_kv_heads ||
+            kv_head_start < 0 || kv_head_start + local_n_kv_heads > n_kv_heads)
+        {
+            throw std::invalid_argument("ROCmRingKVCacheTQ: invalid LocalTP KV-head range");
+        }
         (void)hipSetDevice(device_id_);
+
+        auto construction_cleanup = [this](void *) noexcept
+        {
+            releaseOwnedDeviceStorage();
+        };
+        std::unique_ptr<void, decltype(construction_cleanup)>
+            construction_guard(this, construction_cleanup);
 
         if (head_dim_ == 64)
         {
-            tq8_block_size_ = sizeof(TQ8Block<64>);
-            tq4_block_size_ = sizeof(TQ4Block<64>);
+            k_block_size_ = sizeof(AttentionKeyQ8Block<64>);
+            v_block_size_ = mode_ == TurboQuantKVMode::AQ8_K_Q8_1_V
+                                ? 2 * sizeof(Q8_1Block)
+                            : mode_ == TurboQuantKVMode::AQ8_K_TQ8_V
+                                ? sizeof(TQ8Block<64>)
+                                : sizeof(TQ4Block<64>);
         }
         else if (head_dim_ == 128)
         {
-            tq8_block_size_ = sizeof(TQ8Block<128>);
-            tq4_block_size_ = sizeof(TQ4Block<128>);
+            k_block_size_ = sizeof(AttentionKeyQ8Block<128>);
+            v_block_size_ = mode_ == TurboQuantKVMode::AQ8_K_Q8_1_V
+                                ? 4 * sizeof(Q8_1Block)
+                            : mode_ == TurboQuantKVMode::AQ8_K_TQ8_V
+                                ? sizeof(TQ8Block<128>)
+                                : sizeof(TQ4Block<128>);
+        }
+        else if (head_dim_ == 256)
+        {
+            k_block_size_ = sizeof(AttentionKeyQ8Block<256>);
+            v_block_size_ = mode_ == TurboQuantKVMode::AQ8_K_Q8_1_V
+                                ? 8 * sizeof(Q8_1Block)
+                            : mode_ == TurboQuantKVMode::AQ8_K_TQ8_V
+                                ? sizeof(TQ8Block<256>)
+                                : sizeof(TQ4Block<256>);
         }
         else
         {
-            LOG_ERROR("ROCmRingKVCacheTQ: unsupported head_dim=" << head_dim_);
-            return;
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ: head_dim must be 64, 128, or 256");
         }
 
-        const uint64_t rotation_seed = tq_ctx ? tq_ctx->rotation().seed : 42;
+        hipStream_t init_stream = static_cast<hipStream_t>(
+            GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
+        if (!init_stream)
+            throw std::runtime_error("ROCmRingKVCacheTQ: explicit initialization stream unavailable");
 
-        hip_tq_upload_codebooks(0);
-        rotations_ = hip_tq_create_rotations(n_layers_, n_kv_heads_, head_dim_,
-                                              rotation_seed, device_id_, 0);
+        // Only TurboQuant values require model-lifetime codebooks and
+        // rotations. AQ8 keys and Q8_1 values carry their own scale metadata.
+        if (turboQuantValueUsesRotation(mode_))
+        {
+            if (!tq_ctx)
+                throw std::runtime_error(
+                    "ROCmRingKVCacheTQ: TQ value storage requires TurboQuantContext");
+            if (!hip_tq_upload_codebooks(init_stream))
+                throw std::runtime_error(
+                    "ROCmRingKVCacheTQ: failed to enqueue constant codebook publication");
+            rotations_ = hip_tq_create_rotations(
+                n_layers_, local_n_kv_heads_, head_dim_,
+                tq_ctx->rotation().seed, device_id_, init_stream,
+                kv_head_start_);
+        }
 
-        const size_t k_entry_bytes = static_cast<size_t>(max_seq_len_) * n_kv_heads_ * tq8_block_size_;
-        const size_t v_entry_bytes = static_cast<size_t>(max_seq_len_) * n_kv_heads_ * tq4_block_size_;
+        const size_t k_entry_bytes = static_cast<size_t>(max_seq_len_) * local_n_kv_heads_ * k_block_size_;
+        const size_t v_entry_bytes = static_cast<size_t>(max_seq_len_) * local_n_kv_heads_ * v_block_size_;
+        const size_t anchor_bytes = static_cast<size_t>(kv_dim_) * sizeof(float);
+        auto *const backend = getROCmBackend();
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ: ROCm backend unavailable during cache allocation");
+        }
 
         entries_.resize(n_layers_);
 
@@ -61,82 +302,254 @@ namespace llaminar2
 
             for (int s = 0; s < batch_size_; ++s)
             {
-                (void)hipMalloc(&entries_[l][s].d_K, k_entry_bytes);
-                (void)hipMalloc(&entries_[l][s].d_V, v_entry_bytes);
-                entries_[l][s].head = 0;
-                entries_[l][s].count = 0;
+                auto &entry = entries_[l][s];
+                entry.d_K = backend->allocate(k_entry_bytes, device_id_);
+                entry.d_V = backend->allocate(v_entry_bytes, device_id_);
+                entry.d_K_anchor = static_cast<float *>(
+                    backend->allocate(anchor_bytes, device_id_));
+                if (!entry.d_K || !entry.d_V || !entry.d_K_anchor ||
+                    hipMemsetAsync(entry.d_K, 0, k_entry_bytes, init_stream) != hipSuccess ||
+                    hipMemsetAsync(entry.d_V, 0, v_entry_bytes, init_stream) != hipSuccess ||
+                    hipMemsetAsync(entry.d_K_anchor, 0, anchor_bytes, init_stream) != hipSuccess)
+                {
+                    throw std::runtime_error(
+                        "ROCmRingKVCacheTQ: failed to allocate or initialize compressed entry storage");
+                }
             }
         }
-
-        // Allocate per-layer FP16 scratch buffers
+        if (!publishBatchedEntryTables(init_stream))
         {
-            const size_t scratch_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(_Float16);
-            layer_scratch_.resize(n_layers_);
-            for (int l = 0; l < n_layers_; ++l)
-            {
-                (void)hipMalloc(&layer_scratch_[l].d_K, scratch_bytes);
-                (void)hipMalloc(&layer_scratch_[l].d_V, scratch_bytes);
-                layer_scratch_[l].invalidate();
-            }
-            LOG_DEBUG("ROCmRingKVCacheTQ: per-layer FP16 scratch: "
-                     << n_layers_ << " x " << (2 * scratch_bytes / 1024) << "KB");
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ: failed to publish resident batched entry topology");
         }
 
-        // Pre-allocate temp buffers for GPU-side quantization (avoids per-call hipMalloc)
-        {
-            const size_t k_temp_bytes = static_cast<size_t>(max_seq_len) * n_kv_heads * tq8_block_size_;
-            const size_t v_temp_bytes = static_cast<size_t>(max_seq_len) * n_kv_heads * tq4_block_size_;
-            (void)hipMalloc(&d_quantize_k_temp_, k_temp_bytes);
-            (void)hipMalloc(&d_quantize_v_temp_, v_temp_bytes);
-            LOG_DEBUG("ROCmRingKVCacheTQ: pre-allocated quantize temp buffers: K="
-                     << (k_temp_bytes / 1024) << "KB, V=" << (v_temp_bytes / 1024) << "KB");
-        }
+        // Grouped verifier graph replay and device-resident MTP publication
+        // share these canonical base head/count scalars.
+        allocateDeviceParams();
 
-        // Allocate graph capture dynamic params (per-layer)
-        {
-            (void)hipMalloc(&d_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams));
-            (void)hipHostMalloc(&h_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams),
-                          hipHostMallocDefault);
-            memset(h_dequant_params_, 0, n_layers_ * sizeof(HIPTQDequantDynamicParams));
-            dequant_params_device_valid_.assign(static_cast<size_t>(n_layers_), 0);
-            LOG_DEBUG("ROCmRingKVCacheTQ: graph capture params allocated for " << n_layers_ << " layers");
-        }
+        // Conversion addresses arrive from the graph workspace. The cache
+        // keeps only per-layer wrappers over that shared producer/consumer
+        // storage, never one private full-context allocation per layer.
+        layer_scratch_.resize(n_layers_);
+        for (auto &scratch : layer_scratch_)
+            scratch.invalidate();
 
+        const hipError_t init_sync = hipStreamSynchronize(init_stream);
+        if (init_sync != hipSuccess)
+            throw std::runtime_error(std::string("ROCmRingKVCacheTQ initialization failed: ") +
+                                     hipGetErrorString(init_sync));
+
+        construction_guard.release();
         LOG_DEBUG("ROCmRingKVCacheTQ: created on device " << device_id_
                   << " (" << n_layers_ << " layers, " << batch_size_ << " batch, "
-                  << max_seq_len_ << " maxseq, head_dim=" << head_dim_
+                  << max_seq_len_ << " maxseq, local/total_heads="
+                  << local_n_kv_heads_ << "/" << n_kv_heads_ << ", head_dim=" << head_dim_
                   << ", TQ8+TQ4, FP16 scratch)");
     }
 
     ROCmRingKVCacheTQ::~ROCmRingKVCacheTQ()
     {
         (void)hipSetDevice(device_id_);
+        releaseOwnedDeviceStorage();
+    }
 
-        for (auto &layer : entries_)
-            for (auto &entry : layer)
-            {
-                if (entry.d_K) (void)hipFree(entry.d_K);
-                if (entry.d_V) (void)hipFree(entry.d_V);
-            }
-
-        // Free per-layer scratch
-        for (auto &scratch : layer_scratch_)
+    void ROCmRingKVCacheTQ::releaseOwnedDeviceStorage() noexcept
+    {
+        auto *const backend = getROCmBackend();
+        bool owns_device_storage =
+            d_batched_k_entry_table_ || d_batched_v_entry_table_ ||
+            d_batched_k_anchor_table_ ||
+            rotations_.d_rotations || rotations_.d_rotations_t;
+        for (const auto &layer : entries_)
+            for (const auto &entry : layer)
+                owns_device_storage = owns_device_storage || entry.d_K ||
+                                      entry.d_V || entry.d_K_anchor;
+        if (owns_device_storage && !backend)
         {
-            scratch.k_view.reset();
-            scratch.v_view.reset();
-            if (scratch.d_K) (void)hipFree(scratch.d_K);
-            if (scratch.d_V) (void)hipFree(scratch.d_V);
+            LOG_ERROR("[ROCmRingKVCacheTQ] ROCm backend unavailable during cache teardown");
+            std::terminate();
         }
 
-        // Free pre-allocated quantize temp buffers
-        if (d_quantize_k_temp_) (void)hipFree(d_quantize_k_temp_);
-        if (d_quantize_v_temp_) (void)hipFree(d_quantize_v_temp_);
+        try
+        {
+            batched_k_view_.reset();
+            batched_v_view_.reset();
+            if (d_batched_k_entry_table_)
+                backend->free(d_batched_k_entry_table_, device_id_);
+            if (d_batched_v_entry_table_)
+                backend->free(d_batched_v_entry_table_, device_id_);
+            if (d_batched_k_anchor_table_)
+                backend->free(d_batched_k_anchor_table_, device_id_);
+            d_batched_k_entry_table_ = nullptr;
+            d_batched_v_entry_table_ = nullptr;
+            d_batched_k_anchor_table_ = nullptr;
 
-        // Free graph capture params
-        if (d_dequant_params_) (void)hipFree(d_dequant_params_);
-        if (h_dequant_params_) (void)hipHostFree(h_dequant_params_);
+            for (auto &layer : entries_)
+            {
+                for (auto &entry : layer)
+                {
+                    if (entry.d_K)
+                        backend->free(entry.d_K, device_id_);
+                    if (entry.d_V)
+                        backend->free(entry.d_V, device_id_);
+                    if (entry.d_K_anchor)
+                        backend->free(entry.d_K_anchor, device_id_);
+                    entry.d_K = nullptr;
+                    entry.d_V = nullptr;
+                    entry.d_K_anchor = nullptr;
+                }
+            }
 
-        hip_tq_free_rotations(rotations_);
+            for (auto &scratch : layer_scratch_)
+            {
+                scratch.k_view.reset();
+                scratch.v_view.reset();
+                scratch.d_K = nullptr;
+                scratch.d_V = nullptr;
+            }
+            layer_scratch_.clear();
+            workspace_ = nullptr;
+            scratch_capacity_bytes_ = 0;
+
+            hip_tq_free_rotations(rotations_);
+        }
+        catch (...)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] ROCm backend threw during cache teardown");
+            std::terminate();
+        }
+    }
+
+    WorkspaceRequirements ROCmRingKVCacheTQ::getWorkspaceRequirements(
+        int m, int n, int k) const
+    {
+        (void)k;
+        return kv_cache_workspace::conversionRequirements({
+            .configured_batch_size = batch_size_,
+            .configured_context_rows = max_seq_len_,
+            .requested_graph_rows = m,
+            .requested_batch_size = n,
+            .conversion_row_bytes =
+                static_cast<size_t>(kv_dim_) * sizeof(_Float16),
+            .native_row_bytes = 0u,
+        });
+    }
+
+    void ROCmRingKVCacheTQ::bindWorkspace(
+        DeviceWorkspaceManager *workspace)
+    {
+        if (workspace_ == workspace)
+            return;
+        if (isGraphCaptureActive())
+        {
+            throw std::runtime_error(
+                "ROCmRingKVCacheTQ workspace ownership cannot change during HIP graph capture");
+        }
+        if (workspace && !workspace->isAllocated())
+        {
+            throw std::invalid_argument(
+                "ROCmRingKVCacheTQ requires a fully allocated workspace");
+        }
+
+        void *scratch_k = nullptr;
+        void *scratch_v = nullptr;
+        size_t capacity = 0;
+        if (workspace)
+        {
+            scratch_k =
+                workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+            scratch_v =
+                workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+            const size_t k_capacity =
+                workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+            const size_t v_capacity =
+                workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+            const size_t required =
+                static_cast<size_t>(batch_size_) * max_seq_len_ * kv_dim_ *
+                sizeof(_Float16);
+            if (!scratch_k || !scratch_v ||
+                k_capacity < required || v_capacity < required)
+            {
+                throw std::runtime_error(
+                    "ROCmRingKVCacheTQ workspace lacks full-horizon FP16 K/V conversion storage");
+            }
+            capacity = std::min(k_capacity, v_capacity);
+        }
+
+        batched_k_view_.reset();
+        batched_v_view_.reset();
+        for (auto &scratch : layer_scratch_)
+        {
+            scratch.invalidate();
+            scratch.d_K = static_cast<_Float16 *>(scratch_k);
+            scratch.d_V = static_cast<_Float16 *>(scratch_v);
+        }
+        workspace_ = workspace;
+        scratch_capacity_bytes_ = capacity;
+    }
+
+    bool ROCmRingKVCacheTQ::publishBatchedEntryTables(hipStream_t stream)
+    {
+        requireGPUExecutionStream(
+            static_cast<void *>(stream),
+            "ROCmRingKVCacheTQ::publishBatchedEntryTables");
+        if (n_layers_ <= 0 || batch_size_ <= 0)
+            return false;
+
+        const size_t entry_count =
+            static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
+        const size_t table_bytes = entry_count * sizeof(void *);
+        std::vector<void *> host_k(entry_count);
+        std::vector<void *> host_v(entry_count);
+        std::vector<void *> host_k_anchor(entry_count);
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int request = 0; request < batch_size_; ++request)
+            {
+                const size_t index =
+                    static_cast<size_t>(layer) * batch_size_ + request;
+                host_k[index] = entries_[layer][request].d_K;
+                host_v[index] = entries_[layer][request].d_V;
+                host_k_anchor[index] = entries_[layer][request].d_K_anchor;
+            }
+        }
+
+        auto *const backend = getROCmBackend();
+        if (!backend)
+            return false;
+
+        d_batched_k_entry_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
+        d_batched_v_entry_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
+        d_batched_k_anchor_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
+        if (!d_batched_k_entry_table_ ||
+            !d_batched_v_entry_table_ ||
+            !d_batched_k_anchor_table_ ||
+            !backend->hostToDevice(
+                d_batched_k_entry_table_, host_k.data(),
+                table_bytes, device_id_, stream) ||
+            !backend->hostToDevice(
+                d_batched_v_entry_table_, host_v.data(),
+                table_bytes, device_id_, stream) ||
+            !backend->hostToDevice(
+                d_batched_k_anchor_table_, host_k_anchor.data(),
+                table_bytes, device_id_, stream))
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] Resident entry-table publication failed");
+            if (d_batched_k_entry_table_)
+                backend->free(d_batched_k_entry_table_, device_id_);
+            if (d_batched_v_entry_table_)
+                backend->free(d_batched_v_entry_table_, device_id_);
+            if (d_batched_k_anchor_table_)
+                backend->free(d_batched_k_anchor_table_, device_id_);
+            d_batched_k_entry_table_ = nullptr;
+            d_batched_v_entry_table_ = nullptr;
+            d_batched_k_anchor_table_ = nullptr;
+            return false;
+        }
+        return true;
     }
 
     // =========================================================================
@@ -160,154 +573,506 @@ namespace llaminar2
         int layer, int seq_idx, const ITensor *k, const ITensor *v,
         int num_tokens, void *stream)
     {
+        requireGPUExecutionStream(
+            stream,
+            "ROCmRingKVCacheTQ::appendWithStream");
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
         if (!k || !v)
             return false;
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmRingKVCacheTQ::appendWithStream] Null stream is not allowed");
-            return false;
-        }
-
         (void)hipSetDevice(device_id_);
         const auto hip_stream = static_cast<hipStream_t>(stream);
         cached_stream_ = hip_stream;
         auto &entry = entries_[layer][seq_idx];
-        const bool capture_active = isGraphCaptureActive();
+        const int index = layer * batch_size_ + seq_idx;
+        const int *d_append_count =
+            deviceDynamicAppendCountPtr(layer, seq_idx);
+        if (!d_head_params_ || !d_count_params_)
+            return false;
 
-        const bool k_is_tq = (k->native_type() == TensorType::TQ8 || k->native_type() == TensorType::TQ4);
-        const bool v_is_tq = (v->native_type() == TensorType::TQ4);
-
-        LOG_DEBUG("[ROCmRingKVCacheTQ::append] layer=" << layer
-                 << " seq=" << seq_idx << " tokens=" << num_tokens
-                 << " K.dtype=" << k->dtype_name()
-                 << " V.dtype=" << v->dtype_name()
-                 << " pre_quantized=" << (k_is_tq && v_is_tq));
-
-        // ================================================================
-        // Fast path: K and V are already TQ-quantized blocks
-        // ================================================================
-        if (k_is_tq && v_is_tq)
+        if (k->native_type() != TensorType::FP32 || v->native_type() != TensorType::FP32 ||
+            !k->gpu_data_ptr() || !v->gpu_data_ptr())
         {
-            const uint8_t *h_K_blocks = static_cast<const uint8_t *>(k->raw_data());
-            const uint8_t *h_V_blocks = static_cast<const uint8_t *>(v->raw_data());
-            if (!h_K_blocks || !h_V_blocks)
+            LOG_ERROR("[ROCmRingKVCacheTQ::appendWithStream] TQ cache append requires device-resident FP32 K/V tensors");
+            return false;
+        }
+        if (k->shape().size() < 2 || v->shape().size() < 2 ||
+            k->shape()[0] < static_cast<size_t>(num_tokens) ||
+            v->shape()[0] < static_cast<size_t>(num_tokens) ||
+            k->shape()[1] != static_cast<size_t>(kv_dim_) ||
+            v->shape()[1] != static_cast<size_t>(kv_dim_))
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::appendWithStream] Position-major K/V shape does not match the local cache shard");
+            return false;
+        }
+
+        const auto *d_k = static_cast<const float *>(k->gpu_data_ptr());
+        const auto *d_v = static_cast<const float *>(v->gpu_data_ptr());
+        const size_t rotation_offset = static_cast<size_t>(layer) *
+                                       local_n_kv_heads_ * head_dim_ * head_dim_;
+        const float *d_rotations = rotations_.d_rotations
+                                       ? rotations_.d_rotations + rotation_offset
+                                       : nullptr;
+        const bool ok = hip_tq_quantize_grouped_ring_dynamic(
+            d_k, d_v, d_rotations, entry.d_K, entry.d_V,
+            entry.d_K_anchor, &d_head_params_[index],
+            &d_count_params_[index], d_append_count,
+            max_seq_len_, num_tokens,
+            local_n_kv_heads_, head_dim_, false, false, mode_,
+            AttentionKeyAnchorPolicy::MeanRetained, hip_stream);
+        if (ok)
+        {
+            hip_kv_sequence_state_advance_dynamic(
+                &d_head_params_[index], &d_count_params_[index],
+                d_append_count, num_tokens, max_seq_len_, hip_stream);
+        }
+        if (!ok)
+            return false;
+
+        return true;
+    }
+
+    bool ROCmRingKVCacheTQ::appendVerifierRowsDecodeEquivalent(
+        int layer,
+        int seq_idx,
+        const ITensor *K,
+        const ITensor *V,
+        int verifier_rows,
+        void *gpu_stream)
+    {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCacheTQ::appendVerifierRowsDecodeEquivalent");
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_ ||
+            verifier_rows < 1 || !K || !V)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] Invalid grouped verifier append request");
+            return false;
+        }
+        if (K->native_type() != TensorType::FP32 ||
+            V->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] Grouped verifier publication requires device-resident FP32 K/V so the cache can construct its request anchor; got K="
+                      << K->dtype_name() << " V=" << V->dtype_name());
+            return false;
+        }
+
+        const auto source_layout = [&](const ITensor *tensor,
+                                       const char *label,
+                                       bool *head_major) -> bool
+        {
+            if (!tensor || !head_major || tensor->shape().size() < 2)
+                return false;
+            const size_t rows = tensor->shape()[0];
+            const size_t cols = tensor->shape()[1];
+            const bool position_major =
+                rows >= static_cast<size_t>(verifier_rows) &&
+                cols == static_cast<size_t>(kv_dim_);
+            const bool verifier_head_major =
+                rows == static_cast<size_t>(local_n_kv_heads_ * verifier_rows) &&
+                cols == static_cast<size_t>(head_dim_);
+            if (!position_major && !verifier_head_major)
+            {
+                LOG_ERROR("[ROCmRingKVCacheTQ] Unsupported grouped " << label
+                          << " shape [" << rows << "," << cols << "] for M="
+                          << verifier_rows << " local_heads=" << local_n_kv_heads_
+                          << " head_dim=" << head_dim_);
+                return false;
+            }
+            *head_major = verifier_head_major && !position_major;
+            return true;
+        };
+
+        bool k_head_major = false;
+        bool v_head_major = false;
+        if (!source_layout(K, "K", &k_head_major) ||
+            !source_layout(V, "V", &v_head_major))
+        {
+            return false;
+        }
+
+        const void *d_k = K->gpu_data_ptr();
+        const void *d_v = V->gpu_data_ptr();
+        if (!d_k || !d_v)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] Grouped verifier K/V must already be device resident");
+            return false;
+        }
+
+        (void)hipSetDevice(device_id_);
+        const auto stream = static_cast<hipStream_t>(gpu_stream);
+        cached_stream_ = stream;
+        auto &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
+        const size_t rotation_offset = static_cast<size_t>(layer) *
+                                       local_n_kv_heads_ * head_dim_ * head_dim_;
+        const float *d_rotations = rotations_.d_rotations
+                                       ? rotations_.d_rotations + rotation_offset
+                                       : nullptr;
+
+        if (!d_head_params_ || !d_count_params_)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] Grouped verifier requires canonical device sequence state");
+            return false;
+        }
+        const int index = layer * batch_size_ + seq_idx;
+        const int *d_append_count =
+            deviceDynamicAppendCountPtr(layer, seq_idx);
+        const bool ok = hip_tq_quantize_grouped_ring_dynamic(
+            static_cast<const float *>(d_k),
+            static_cast<const float *>(d_v),
+            d_rotations, entry.d_K, entry.d_V, entry.d_K_anchor,
+            &d_head_params_[index], &d_count_params_[index], d_append_count,
+            max_seq_len_, verifier_rows,
+            local_n_kv_heads_, head_dim_, k_head_major, v_head_major,
+            mode_, AttentionKeyAnchorPolicy::FirstRetained, stream);
+        if (ok)
+        {
+            hip_kv_sequence_state_advance_dynamic(
+                &d_head_params_[index], &d_count_params_[index],
+                d_append_count, verifier_rows, max_seq_len_, stream);
+        }
+        if (!ok)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ] Grouped verifier publication launch failed");
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "rocm_kv_cache_grouped_verifier_append_calls",
+            1.0,
+            "verifier",
+            "rocm",
+            {{"cache_format", turboQuantKVModeName(mode_)},
+             {"source_k_format", K->dtype_name()},
+             {"source_v_format", V->dtype_name()},
+             {"verifier_rows", std::to_string(verifier_rows)},
+             {"source_k_layout", k_head_major ? "head_major" : "position_major"},
+             {"source_v_layout", v_head_major ? "head_major" : "position_major"},
+             {"execution_mode", capture_active ? "graph_captured" : "eager_device_state"},
+             {"row_count_policy", d_append_count ? "resident_device_count" : "captured_exact_shape"},
+             {"topology", is_sharded() ? "local_tp_shard" : "replicated"},
+             {"commit_policy", "single_grouped_metadata_commit"},
+             {"local_kv_heads", std::to_string(local_n_kv_heads_)},
+             {"head_dim", std::to_string(head_dim_)},
+             {"kv_head_start", std::to_string(kv_head_start_)}});
+        return true;
+    }
+
+    IKVCache::KVCacheLogicalBlockLayout
+    ROCmRingKVCacheTQ::logicalBlockLayout(int global_layer, int token_count) const
+    {
+        KVCacheLogicalBlockLayout layout{
+            .k_precision = ActivationPrecision::AQ8,
+            .v_precision = turboQuantValuePrecision(mode_),
+            .layout = TensorLayout::KV_POS_HEAD_DIM,
+            .local_kv_heads = local_n_kv_heads_,
+            .kv_head_start = kv_head_start_,
+            .head_dim = head_dim_,
+            .device_resident = true,
+        };
+        if (remapLayerIndex(global_layer) < 0 || token_count <= 0)
+            return layout;
+        layout.k_bytes = static_cast<size_t>(kv_dim_) * sizeof(float) +
+                         static_cast<size_t>(token_count) *
+                             local_n_kv_heads_ * k_block_size_;
+        layout.v_bytes = static_cast<size_t>(token_count) * local_n_kv_heads_ * v_block_size_;
+        return layout;
+    }
+
+    IKVCache::KVCacheSequenceState
+    ROCmRingKVCacheTQ::sequenceState(int global_layer, int seq_idx) const
+    {
+        const int layer = remapLayerIndex(global_layer);
+        if (layer < 0 || seq_idx < 0 || seq_idx >= batch_size_)
+            return {};
+        return ROCmRingKVCacheBase::sequenceState(layer, seq_idx);
+    }
+
+    bool ROCmRingKVCacheTQ::exportLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc,
+        void *dst_k,
+        void *dst_v) const
+    {
+        requireGPUExecutionStream(
+            desc.stream,
+            "ROCmRingKVCacheTQ::exportLogicalBlock");
+        const int layer = remapLayerIndex(desc.layer);
+        if (layer < 0 || desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0)
+        {
+            return false;
+        }
+        const auto &entry = entries_[layer][desc.seq_idx];
+        if (desc.token_count == 0)
+        {
+            if (desc.payload_domain ==
+                KVCacheLogicalBlockPayloadDomain::Device)
+            {
+                return true;
+            }
+            KVCacheSequenceState state;
+            return observeDeviceSequenceState(layer, desc.seq_idx, &state) &&
+                   desc.logical_token_start <= state.cached_tokens;
+        }
+        if (!dst_k || !dst_v || !entry.d_K || !entry.d_V ||
+            !entry.d_K_anchor)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::exportLogicalBlock] Non-empty export requires destinations and an explicit stream");
+            return false;
+        }
+
+        (void)hipSetDevice(device_id_);
+        const auto stream = static_cast<hipStream_t>(desc.stream);
+        if (desc.payload_domain ==
+            KVCacheLogicalBlockPayloadDomain::Device)
+        {
+            if (!d_head_params_ || !d_count_params_)
                 return false;
 
-            const size_t k_row_bytes = static_cast<size_t>(n_kv_heads_) * tq8_block_size_;
-            const size_t v_row_bytes = static_cast<size_t>(n_kv_heads_) * tq4_block_size_;
-
-            for (int t = 0; t < num_tokens; ++t)
+            const int entry_index =
+                layer * batch_size_ + desc.seq_idx;
+            constexpr int threads = 256;
+            const size_t k_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
+            const size_t v_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
+            const size_t k_anchor_bytes =
+                static_cast<size_t>(kv_dim_) * sizeof(float);
+            const size_t bytes =
+                k_anchor_bytes + static_cast<size_t>(desc.token_count) *
+                (k_row_bytes + v_row_bytes);
+            const int blocks = std::max(
+                1,
+                std::min<int>(
+                    65535,
+                    static_cast<int>((bytes + threads - 1) / threads)));
+            hipLaunchKernelGGL(
+                rocm_tq_ring_logical_block_export_device_kernel,
+                dim3(blocks),
+                dim3(threads),
+                0,
+                stream,
+                static_cast<const uint8_t *>(entry.d_K),
+                static_cast<const uint8_t *>(entry.d_V),
+                reinterpret_cast<const uint8_t *>(entry.d_K_anchor),
+                static_cast<uint8_t *>(dst_k),
+                static_cast<uint8_t *>(dst_v),
+                &d_head_params_[entry_index],
+                &d_count_params_[entry_index],
+                desc.logical_token_start,
+                desc.token_count,
+                max_seq_len_,
+                k_row_bytes,
+                v_row_bytes,
+                k_anchor_bytes);
+            const hipError_t launch_error = hipGetLastError();
+            if (launch_error != hipSuccess)
             {
-                const int pos = (entry.head + t) % max_seq_len_;
-                const size_t k_dst_offset = static_cast<size_t>(pos) * k_row_bytes;
-                const size_t v_dst_offset = static_cast<size_t>(pos) * v_row_bytes;
-                const size_t k_src_offset = static_cast<size_t>(t) * k_row_bytes;
-                const size_t v_src_offset = static_cast<size_t>(t) * v_row_bytes;
-
-                (void)hipMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_K) + k_dst_offset,
-                    h_K_blocks + k_src_offset,
-                    k_row_bytes, hipMemcpyHostToDevice, hip_stream);
-                (void)hipMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_V) + v_dst_offset,
-                    h_V_blocks + v_src_offset,
-                    v_row_bytes, hipMemcpyHostToDevice, hip_stream);
+                LOG_ERROR("[ROCmRingKVCacheTQ::exportLogicalBlock] device-domain gather launch failed: "
+                          << hipGetErrorString(launch_error));
+                return false;
             }
-
-            if (!capture_active)
-            {
-                entry.head = (entry.head + num_tokens) % max_seq_len_;
-                entry.count = std::min(entry.count + num_tokens, max_seq_len_);
-            }
-
-            // DON'T invalidate per-layer scratch here — dequant_to_scratch's
-            // can_incremental() will detect count == cached_count + 1 and do
-            // a single-position fused dequant instead of a full re-linearize.
-
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "rocm_device_logical_tq_kv_exports",
+                1.0,
+                "harvest",
+                "rocm:" + std::to_string(device_id_),
+                {{"tokens", std::to_string(desc.token_count)}});
             return true;
         }
 
-        // ================================================================
-        // GPU quantize path: K and V are FP32 — quantize on GPU
-        // Uses pre-allocated temp buffers (no per-call hipMalloc)
-        // ================================================================
-        const float *d_k_input = nullptr;
-        const float *d_v_input = nullptr;
-        void *d_k_uploaded = nullptr;
-        void *d_v_uploaded = nullptr;
-
-        if (k->is_on_gpu())
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, desc.seq_idx, &state))
+            return false;
+        const int export_head = state.implementation_head;
+        const int export_count = state.cached_tokens;
+        if (export_head < 0 || export_head >= max_seq_len_ || export_count < 0 ||
+            export_count > max_seq_len_ || desc.logical_token_start > export_count ||
+            desc.token_count > export_count - desc.logical_token_start)
         {
-            d_k_input = static_cast<const float *>(k->gpu_data_ptr());
-        }
-        else
-        {
-            const size_t bytes = static_cast<size_t>(num_tokens) * kv_dim_ * sizeof(float);
-            (void)hipMalloc(&d_k_uploaded, bytes);
-            (void)hipMemcpyAsync(d_k_uploaded, k->data(), bytes, hipMemcpyHostToDevice, hip_stream);
-            d_k_input = static_cast<const float *>(d_k_uploaded);
+            return false;
         }
 
-        if (v->is_on_gpu())
+        int tail = (export_head - export_count) % max_seq_len_;
+        if (tail < 0)
+            tail += max_seq_len_;
+        const size_t k_row_bytes = static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
+        const size_t v_row_bytes = static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
+        auto *out_k = static_cast<uint8_t *>(dst_k);
+        auto *out_v = static_cast<uint8_t *>(dst_v);
+        const auto *ring_k = static_cast<const uint8_t *>(entry.d_K);
+        const auto *ring_v = static_cast<const uint8_t *>(entry.d_V);
+        const size_t k_anchor_bytes =
+            static_cast<size_t>(kv_dim_) * sizeof(float);
+        if (hipMemcpyAsync(
+                out_k, entry.d_K_anchor, k_anchor_bytes,
+                hipMemcpyDeviceToHost, stream) != hipSuccess)
         {
-            d_v_input = static_cast<const float *>(v->gpu_data_ptr());
+            return false;
         }
-        else
+        for (int row = 0; row < desc.token_count; ++row)
         {
-            const size_t bytes = static_cast<size_t>(num_tokens) * kv_dim_ * sizeof(float);
-            (void)hipMalloc(&d_v_uploaded, bytes);
-            (void)hipMemcpyAsync(d_v_uploaded, v->data(), bytes, hipMemcpyHostToDevice, hip_stream);
-            d_v_input = static_cast<const float *>(d_v_uploaded);
-        }
-
-        const float *k_rotations = rotations_.rotation(layer, 0);
-
-        // Quantize into pre-allocated temp buffers
-        bool ok = hip_tq8_quantize(d_k_input, k_rotations, d_quantize_k_temp_,
-                                    num_tokens, n_kv_heads_, head_dim_, hip_stream);
-        if (ok)
-        {
-            ok = hip_tq4_quantize(d_v_input, k_rotations, d_quantize_v_temp_,
-                                   num_tokens, n_kv_heads_, head_dim_, hip_stream);
-        }
-
-        if (ok)
-        {
-            // Copy quantized blocks from temp to ring buffer positions
-            const size_t k_pos_bytes = static_cast<size_t>(n_kv_heads_) * tq8_block_size_;
-            const size_t v_pos_bytes = static_cast<size_t>(n_kv_heads_) * tq4_block_size_;
-
-            for (int t = 0; t < num_tokens; ++t)
+            const int logical_row = desc.logical_token_start + row;
+            const int physical_row = (tail + logical_row) % max_seq_len_;
+            if (hipMemcpyAsync(out_k + k_anchor_bytes +
+                                   static_cast<size_t>(row) * k_row_bytes,
+                               ring_k + static_cast<size_t>(physical_row) * k_row_bytes,
+                               k_row_bytes, hipMemcpyDeviceToHost, stream) != hipSuccess ||
+                hipMemcpyAsync(out_v + static_cast<size_t>(row) * v_row_bytes,
+                               ring_v + static_cast<size_t>(physical_row) * v_row_bytes,
+                               v_row_bytes, hipMemcpyDeviceToHost, stream) != hipSuccess)
             {
-                int dst_pos = (entry.head + t) % max_seq_len_;
-                (void)hipMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_K) + static_cast<size_t>(dst_pos) * k_pos_bytes,
-                    static_cast<uint8_t *>(d_quantize_k_temp_) + static_cast<size_t>(t) * k_pos_bytes,
-                    k_pos_bytes, hipMemcpyDeviceToDevice, hip_stream);
-                (void)hipMemcpyAsync(
-                    static_cast<uint8_t *>(entry.d_V) + static_cast<size_t>(dst_pos) * v_pos_bytes,
-                    static_cast<uint8_t *>(d_quantize_v_temp_) + static_cast<size_t>(t) * v_pos_bytes,
-                    v_pos_bytes, hipMemcpyDeviceToDevice, hip_stream);
+                LOG_ERROR("[ROCmRingKVCacheTQ::exportLogicalBlock] TQ payload copy failed");
+                return false;
             }
         }
+        return hipStreamSynchronize(stream) == hipSuccess;
+    }
 
-        if (ok && !capture_active)
+    bool ROCmRingKVCacheTQ::importLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc,
+        const void *src_k,
+        const void *src_v)
+    {
+        requireGPUExecutionStream(
+            desc.stream,
+            "ROCmRingKVCacheTQ::importLogicalBlock");
+        const int layer = remapLayerIndex(desc.layer);
+        if (layer < 0 || desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0 ||
+            desc.logical_token_start > max_seq_len_ ||
+            desc.token_count > max_seq_len_ - desc.logical_token_start)
         {
-            entry.head = (entry.head + num_tokens) % max_seq_len_;
-            entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+            return false;
+        }
+        auto &entry = entries_[layer][desc.seq_idx];
+        const auto stream = static_cast<hipStream_t>(desc.stream);
+        if (desc.payload_domain ==
+            KVCacheLogicalBlockPayloadDomain::Device)
+        {
+            if (desc.token_count == 0)
+            {
+                if (desc.logical_token_start != 0)
+                    return true;
+                layer_scratch_[layer].invalidate();
+                return setDeviceSequenceState(
+                    layer, desc.seq_idx, 0, 0, stream);
+            }
+            if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
+                !entry.d_K_anchor ||
+                !d_head_params_ || !d_count_params_)
+            {
+                return false;
+            }
 
-            // DON'T invalidate per-layer scratch — let dequant_to_scratch's
-            // can_incremental() handle it for single-token decode.
-            // For multi-token append (prefill), is_current_for will fail which
-            // triggers a full linearize dequant — correct behavior.
+            const int entry_index =
+                layer * batch_size_ + desc.seq_idx;
+            constexpr int threads = 256;
+            const size_t k_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
+            const size_t v_row_bytes =
+                static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
+            const size_t k_anchor_bytes =
+                static_cast<size_t>(kv_dim_) * sizeof(float);
+            const size_t bytes =
+                k_anchor_bytes + static_cast<size_t>(desc.token_count) *
+                (k_row_bytes + v_row_bytes);
+            const int blocks = std::max(
+                1,
+                std::min<int>(
+                    65535,
+                    static_cast<int>((bytes + threads - 1) / threads)));
+            hipLaunchKernelGGL(
+                rocm_tq_ring_logical_block_import_device_kernel,
+                dim3(blocks),
+                dim3(threads),
+                0,
+                stream,
+                static_cast<uint8_t *>(entry.d_K),
+                static_cast<uint8_t *>(entry.d_V),
+                reinterpret_cast<uint8_t *>(entry.d_K_anchor),
+                static_cast<const uint8_t *>(src_k),
+                static_cast<const uint8_t *>(src_v),
+                &d_head_params_[entry_index],
+                &d_count_params_[entry_index],
+                desc.logical_token_start,
+                desc.token_count,
+                max_seq_len_,
+                k_row_bytes,
+                v_row_bytes,
+                k_anchor_bytes);
+            hipLaunchKernelGGL(
+                rocm_tq_ring_logical_block_import_publish_kernel,
+                dim3(1),
+                dim3(1),
+                0,
+                stream,
+                &d_head_params_[entry_index],
+                &d_count_params_[entry_index],
+                desc.logical_token_start,
+                desc.token_count,
+                max_seq_len_);
+            const hipError_t launch_error = hipGetLastError();
+            if (launch_error != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRingKVCacheTQ::importLogicalBlock] device-domain scatter launch failed: "
+                          << hipGetErrorString(launch_error));
+                return false;
+            }
+            layer_scratch_[layer].invalidate();
+            PerfStatsCollector::addCounter(
+                "prefix_cache",
+                "rocm_device_logical_tq_kv_imports",
+                1.0,
+                "restore",
+                "rocm:" + std::to_string(device_id_),
+                {{"tokens", std::to_string(desc.token_count)}});
+            return true;
         }
 
-        if (d_k_uploaded) (void)hipFree(d_k_uploaded);
-        if (d_v_uploaded) (void)hipFree(d_v_uploaded);
+        if (desc.token_count == 0)
+        {
+            if (desc.logical_token_start != 0)
+                return true;
+            layer_scratch_[layer].invalidate();
+            return setDeviceSequenceState(
+                layer, desc.seq_idx, 0, 0, stream);
+        }
+        if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
+            !entry.d_K_anchor)
+        {
+            return false;
+        }
 
-        return ok;
+        (void)hipSetDevice(device_id_);
+        const size_t k_row_bytes = static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
+        const size_t v_row_bytes = static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
+        const size_t k_bytes = static_cast<size_t>(desc.token_count) * k_row_bytes;
+        const size_t v_bytes = static_cast<size_t>(desc.token_count) * v_row_bytes;
+        const size_t k_anchor_bytes =
+            static_cast<size_t>(kv_dim_) * sizeof(float);
+        auto *ring_k = static_cast<uint8_t *>(entry.d_K);
+        auto *ring_v = static_cast<uint8_t *>(entry.d_V);
+        if (hipMemcpyAsync(entry.d_K_anchor, src_k, k_anchor_bytes,
+                           hipMemcpyHostToDevice, stream) != hipSuccess ||
+            hipMemcpyAsync(ring_k + static_cast<size_t>(desc.logical_token_start) * k_row_bytes,
+                           static_cast<const uint8_t *>(src_k) + k_anchor_bytes,
+                           k_bytes, hipMemcpyHostToDevice, stream) != hipSuccess ||
+            hipMemcpyAsync(ring_v + static_cast<size_t>(desc.logical_token_start) * v_row_bytes,
+                           src_v, v_bytes, hipMemcpyHostToDevice, stream) != hipSuccess)
+        {
+            return false;
+        }
+        const int new_count = desc.logical_token_start + desc.token_count;
+        const int new_head = new_count % max_seq_len_;
+        layer_scratch_[layer].invalidate();
+        if (!setDeviceSequenceState(
+                layer, desc.seq_idx, new_head, new_count, stream))
+            return false;
+        return true;
     }
 
     // =========================================================================
@@ -322,301 +1087,53 @@ namespace llaminar2
             GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
     }
 
-    void ROCmRingKVCacheTQ::clearEntryStorage(int layer, int seq_idx, hipStream_t stream)
+    bool ROCmRingKVCacheTQ::dequant_to_scratch(
+        int layer, int seq_idx, float rope_theta, int position_start,
+        int rope_dim, hipStream_t stream, int *out_count) const
     {
-        auto &entry = entries_[layer][seq_idx];
-        const size_t k_bytes = static_cast<size_t>(max_seq_len_) * n_kv_heads_ * tq8_block_size_;
-        const size_t v_bytes = static_cast<size_t>(max_seq_len_) * n_kv_heads_ * tq4_block_size_;
-
-        if (entry.d_K)
+        const size_t required =
+            static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(_Float16);
+        if (!out_count || isGraphCaptureActive() || !workspace_ ||
+            scratch_capacity_bytes_ < required)
         {
-            hipError_t err = hipMemsetAsync(entry.d_K, 0, k_bytes, stream);
-            if (err != hipSuccess)
-                LOG_WARN("[ROCmRingKVCacheTQ::clear] K memset failed: " << hipGetErrorString(err));
-        }
-        if (entry.d_V)
-        {
-            hipError_t err = hipMemsetAsync(entry.d_V, 0, v_bytes, stream);
-            if (err != hipSuccess)
-                LOG_WARN("[ROCmRingKVCacheTQ::clear] V memset failed: " << hipGetErrorString(err));
-        }
-    }
-
-    void ROCmRingKVCacheTQ::clearScratchStorage(int layer, hipStream_t stream)
-    {
-        auto &scratch = layer_scratch_[layer];
-        const size_t scratch_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(_Float16);
-
-        if (scratch.d_K)
-        {
-            hipError_t err = hipMemsetAsync(scratch.d_K, 0, scratch_bytes, stream);
-            if (err != hipSuccess)
-                LOG_WARN("[ROCmRingKVCacheTQ::clear] scratch K memset failed: " << hipGetErrorString(err));
-        }
-        if (scratch.d_V)
-        {
-            hipError_t err = hipMemsetAsync(scratch.d_V, 0, scratch_bytes, stream);
-            if (err != hipSuccess)
-                LOG_WARN("[ROCmRingKVCacheTQ::clear] scratch V memset failed: " << hipGetErrorString(err));
+            LOG_ERROR("[ROCmRingKVCacheTQ::dequant_to_scratch] Scalar observation requires bound full-horizon workspace outside graph capture");
+            return false;
         }
 
-        scratch.k_view.reset();
-        scratch.v_view.reset();
-        scratch.invalidate();
-    }
-
-    void ROCmRingKVCacheTQ::clearDynamicParams(int layer, int seq_idx, hipStream_t stream)
-    {
-        const int entry_idx = layer * batch_size_ + seq_idx;
-        if (h_head_params_)
-            h_head_params_[entry_idx] = 0;
-        if (h_count_params_)
-            h_count_params_[entry_idx] = 0;
-        if (d_head_params_)
-        {
-            hipError_t err = hipMemsetAsync(&d_head_params_[entry_idx], 0, sizeof(int), stream);
-            if (err != hipSuccess)
-                LOG_WARN("[ROCmRingKVCacheTQ::clear] head param memset failed: " << hipGetErrorString(err));
-        }
-        if (d_count_params_)
-        {
-            hipError_t err = hipMemsetAsync(&d_count_params_[entry_idx], 0, sizeof(int), stream);
-            if (err != hipSuccess)
-                LOG_WARN("[ROCmRingKVCacheTQ::clear] count param memset failed: " << hipGetErrorString(err));
-        }
-
-        if (h_dequant_params_)
-            std::memset(&h_dequant_params_[layer], 0, sizeof(HIPTQDequantDynamicParams));
-        if (layer >= 0 && layer < static_cast<int>(dequant_params_device_valid_.size()))
-            dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
-        if (d_dequant_params_)
-        {
-            hipError_t err = hipMemsetAsync(&d_dequant_params_[layer], 0,
-                                            sizeof(HIPTQDequantDynamicParams), stream);
-            if (err != hipSuccess)
-                LOG_WARN("[ROCmRingKVCacheTQ::clear] dequant param memset failed: " << hipGetErrorString(err));
-        }
-    }
-
-    void ROCmRingKVCacheTQ::clear_sequence(int layer, int seq_idx)
-    {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-            return;
-
-        (void)hipSetDevice(device_id_);
-        hipStream_t stream = clearStream();
-        clearEntryStorage(layer, seq_idx, stream);
-        clearScratchStorage(layer, stream);
-        clearDynamicParams(layer, seq_idx, stream);
-
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess)
-            LOG_WARN("[ROCmRingKVCacheTQ::clear_sequence] sync failed: " << hipGetErrorString(sync_err));
-
-        cached_stream_ = nullptr;
-        ROCmRingKVCacheBase::clear_sequence(layer, seq_idx);
-    }
-
-    void ROCmRingKVCacheTQ::clear_layer(int layer)
-    {
-        if (layer < 0 || layer >= n_layers_)
-            return;
-
-        (void)hipSetDevice(device_id_);
-        hipStream_t stream = clearStream();
-        for (int seq = 0; seq < batch_size_; ++seq)
-        {
-            clearEntryStorage(layer, seq, stream);
-            clearDynamicParams(layer, seq, stream);
-        }
-        clearScratchStorage(layer, stream);
-
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess)
-            LOG_WARN("[ROCmRingKVCacheTQ::clear_layer] sync failed: " << hipGetErrorString(sync_err));
-
-        cached_stream_ = nullptr;
-        for (int seq = 0; seq < batch_size_; ++seq)
-            ROCmRingKVCacheBase::clear_sequence(layer, seq);
-    }
-
-    void ROCmRingKVCacheTQ::clear_sequence(int seq_idx)
-    {
-        if (seq_idx < 0 || seq_idx >= batch_size_)
-            return;
-
-        (void)hipSetDevice(device_id_);
-        hipStream_t stream = clearStream();
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            clearEntryStorage(layer, seq_idx, stream);
-            clearScratchStorage(layer, stream);
-            clearDynamicParams(layer, seq_idx, stream);
-        }
-
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess)
-            LOG_WARN("[ROCmRingKVCacheTQ::clear_sequence] sync failed: " << hipGetErrorString(sync_err));
-
-        cached_stream_ = nullptr;
-        for (int layer = 0; layer < n_layers_; ++layer)
-            ROCmRingKVCacheBase::clear_sequence(layer, seq_idx);
-    }
-
-    void ROCmRingKVCacheTQ::clear()
-    {
-        (void)hipSetDevice(device_id_);
-        hipStream_t stream = clearStream();
-
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            for (int seq = 0; seq < batch_size_; ++seq)
-            {
-                clearEntryStorage(layer, seq, stream);
-                clearDynamicParams(layer, seq, stream);
-            }
-            clearScratchStorage(layer, stream);
-        }
-
-        hipError_t sync_err = hipStreamSynchronize(stream);
-        if (sync_err != hipSuccess)
-            LOG_WARN("[ROCmRingKVCacheTQ::clear] sync failed: " << hipGetErrorString(sync_err));
-
-        cached_stream_ = nullptr;
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            for (int seq = 0; seq < batch_size_; ++seq)
-                ROCmRingKVCacheBase::clear_sequence(layer, seq);
-        }
-    }
-
-    bool ROCmRingKVCacheTQ::dequant_to_scratch(int layer, int seq_idx, float rope_theta, int position_start, hipStream_t stream) const
-    {
         auto &scratch = layer_scratch_[layer];
         const auto &entry = entries_[layer][seq_idx];
-
-        if (entry.count == 0)
-        {
-            scratch.cached_count = 0;
-            scratch.cached_layer = layer;
-            scratch.cached_seq = seq_idx;
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return false;
+        *out_count = state.cached_tokens;
+        if (state.cached_tokens == 0)
             return true;
-        }
 
-        // Check if scratch already holds the right data
-        if (scratch.is_current_for(layer, seq_idx, entry.count, entry.head,
-                                    rope_theta, position_start))
-        {
-            return true; // Already up-to-date
-        }
-
-        const int tail = entry.tail(max_seq_len_);
+        const int tail =
+            (state.implementation_head - state.cached_tokens + max_seq_len_) %
+            max_seq_len_;
         const int D = head_dim_;
-        const size_t layer_rot_offset = static_cast<size_t>(layer) * n_kv_heads_ * D * D;
-        const float *d_K_rot_t = rotations_.d_rotations_t + layer_rot_offset;
+        const size_t layer_rot_offset = static_cast<size_t>(layer) * local_n_kv_heads_ * D * D;
+        const float *d_K_rot_t = rotations_.d_rotations_t
+                                     ? rotations_.d_rotations_t + layer_rot_offset
+                                     : nullptr;
         const float *d_V_rot_t = d_K_rot_t;
-        const float *d_K_rot = rotations_.d_rotations + layer_rot_offset;
+        const float *d_K_rot = rotations_.d_rotations
+                                   ? rotations_.d_rotations + layer_rot_offset
+                                   : nullptr;
         const float *d_V_rot = d_K_rot;
 
-        // Incremental dequant: only process the newly appended position.
-        // Valid during decode when count increased by exactly 1 and no eviction.
-        // Per-layer scratch makes this reliable — no cross-layer invalidation.
-        //
-        // Uses fused K+V kernel: 1 launch per layer instead of 2.
-        if (scratch.can_incremental(layer, seq_idx, entry.count, tail,
-                                     rope_theta, position_start))
-        {
-            bool ok;
-            if (d_dequant_params_ && h_dequant_params_ && stream)
-            {
-                // Graph-capturable path: the kernel reads dynamic params from
-                // device memory. Captured execution must not record H2D; params
-                // are pre-uploaded by setDynamicDequantParams().
-                if (isGraphCaptureActive())
-                {
-                    if (layer < 0 ||
-                        layer >= static_cast<int>(dequant_params_device_valid_.size()) ||
-                        !dequant_params_device_valid_[static_cast<size_t>(layer)])
-                    {
-                        LOG_ERROR("[ROCmRingKVCacheTQ::dequant_to_scratch] TQ dequant params were not ready before HIP graph capture");
-                        return false;
-                    }
-                }
-                else
-                {
-                    h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
-                    h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
-                    h_dequant_params_[layer].rope_position =
-                        (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
-
-                    hipError_t copy_err =
-                        hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
-                                        sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
-                    if (copy_err != hipSuccess)
-                    {
-                        LOG_ERROR("[ROCmRingKVCacheTQ::dequant_to_scratch] hipMemcpyAsync failed: "
-                                  << hipGetErrorString(copy_err));
-                        return false;
-                    }
-                    dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
-                }
-
-                ok = hip_tq_incremental_single_fp16_dynamic(
-                    scratch.d_K, scratch.d_V,
-                    entry.d_K, entry.d_V,
-                    d_K_rot, d_V_rot,
-                    &d_dequant_params_[layer],
-                    n_kv_heads_, head_dim_,
-                    rope_theta, stream);
-            }
-            else
-            {
-                const int new_pos = entry.count - 1;
-                const int new_ring_pos = (tail + new_pos) % max_seq_len_;
-                const size_t out_offset = static_cast<size_t>(new_pos) * kv_dim_;
-
-                ok = hip_tq_incremental_single_fp16(
-                    scratch.d_K + out_offset,
-                    scratch.d_V + out_offset,
-                    entry.d_K, entry.d_V,
-                    d_K_rot, d_V_rot,
-                    new_ring_pos, 0,
-                    n_kv_heads_, head_dim_,
-                    rope_theta, (rope_theta > 0.0f) ? position_start + new_pos : 0,
-                    stream);
-            }
-
-            if (ok)
-            {
-                scratch.cached_count = entry.count;
-                scratch.cached_head = entry.head;
-            }
-            return ok;
-        }
-
-        // Full linearize + dequant + optional RoPE into per-layer FP16 scratch
-        bool ok = hip_tq_ring_linearize_dequant_fp16(
+        return hip_tq_ring_linearize_dequant_fp16(
             scratch.d_K, scratch.d_V,
             entry.d_K, entry.d_V,
+            entry.d_K_anchor,
             d_K_rot_t, d_V_rot_t,
             d_K_rot, d_V_rot,
-            tail, entry.count, max_seq_len_,
-            n_kv_heads_, head_dim_,
-            rope_theta, position_start,
+            tail, state.cached_tokens, max_seq_len_,
+            local_n_kv_heads_, head_dim_,
+            rope_theta, position_start, rope_dim,
+            mode_,
             stream);
-
-        if (ok)
-        {
-            scratch.cached_layer = layer;
-            scratch.cached_seq = seq_idx;
-            scratch.cached_count = entry.count;
-            scratch.cached_head = entry.head;
-            scratch.cached_tail = tail;
-            scratch.cached_rope_theta = rope_theta;
-            scratch.cached_position_start = position_start;
-        }
-
-        return ok;
     }
 
     // =========================================================================
@@ -639,19 +1156,23 @@ namespace llaminar2
             return nullptr;
 
         (void)hipSetDevice(device_id_);
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
+        int count = 0;
+        if (!dequant_to_scratch(
+                layer, seq_idx, 0.0f, 0, 0, clearStream(), &count) ||
+            count == 0)
+            return nullptr;
         auto &scratch = layer_scratch_[layer];
 
         if (!scratch.k_view)
         {
             scratch.k_view = std::make_unique<GpuTensorView>(
-                scratch.d_K, scratch.cached_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                scratch.d_K, count, kv_dim_,
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
         else
         {
             static_cast<GpuTensorView*>(scratch.k_view.get())->update_view(
-                scratch.d_K, scratch.cached_count);
+                scratch.d_K, count);
         }
         return scratch.k_view.get();
     }
@@ -662,19 +1183,23 @@ namespace llaminar2
             return nullptr;
 
         (void)hipSetDevice(device_id_);
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
+        int count = 0;
+        if (!dequant_to_scratch(
+                layer, seq_idx, 0.0f, 0, 0, clearStream(), &count) ||
+            count == 0)
+            return nullptr;
         auto &scratch = layer_scratch_[layer];
 
         if (!scratch.v_view)
         {
             scratch.v_view = std::make_unique<GpuTensorView>(
-                scratch.d_V, scratch.cached_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                scratch.d_V, count, kv_dim_,
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
         else
         {
             static_cast<GpuTensorView*>(scratch.v_view.get())->update_view(
-                scratch.d_V, scratch.cached_count);
+                scratch.d_V, count);
         }
         return scratch.v_view.get();
     }
@@ -689,7 +1214,7 @@ namespace llaminar2
             return false;
         if (out_k) *out_k = k;
         if (out_v) *out_v = v;
-        if (out_kv_len) *out_kv_len = get_cached_tokens(layer, seq_idx);
+        if (out_kv_len) *out_kv_len = static_cast<int>(k->rows());
         return true;
     }
 
@@ -703,7 +1228,214 @@ namespace llaminar2
             return false;
         if (out_k) *out_k = k;
         if (out_v) *out_v = v;
-        if (out_kv_len) *out_kv_len = get_cached_tokens(layer, seq_idx);
+        if (out_kv_len) *out_kv_len = static_cast<int>(k->rows());
+        return true;
+    }
+
+    bool ROCmRingKVCacheTQ::get_kv_batched_device_view(
+        int layer,
+        int first_seq_idx,
+        int request_count,
+        ITensor **out_k,
+        ITensor **out_v,
+        void *gpu_stream)
+    {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCacheTQ::get_kv_batched_device_view");
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
+            request_count <= 0 ||
+            first_seq_idx > batch_size_ - request_count ||
+            !d_head_params_ || !d_count_params_ ||
+            !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
+            !d_batched_k_anchor_table_ ||
+            (turboQuantValueUsesRotation(mode_) && !rotations_.d_rotations) ||
+            !workspace_ ||
+            scratch_capacity_bytes_ <
+                static_cast<size_t>(request_count) * max_seq_len_ * kv_dim_ *
+                    sizeof(_Float16))
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::get_kv_batched_device_view] Invalid resident gather contract"
+                      << " layer=" << layer
+                      << " first_seq=" << first_seq_idx
+                      << " requests=" << request_count
+                      << " stream=" << gpu_stream);
+            return false;
+        }
+
+        (void)hipSetDevice(device_id_);
+        auto &scratch = layer_scratch_[layer];
+        const size_t rotation_offset =
+            static_cast<size_t>(layer) * local_n_kv_heads_ * head_dim_ * head_dim_;
+        const int entry_offset = layer * batch_size_ + first_seq_idx;
+        const auto stream = static_cast<hipStream_t>(gpu_stream);
+        if (!hip_tq_batched_ring_dequant_fp16_device_state(
+                scratch.d_K,
+                scratch.d_V,
+                const_cast<const void *const *>(d_batched_k_entry_table_),
+                const_cast<const void *const *>(d_batched_v_entry_table_),
+                const_cast<const void *const *>(d_batched_k_anchor_table_),
+                d_head_params_,
+                d_count_params_,
+                rotations_.d_rotations
+                    ? rotations_.d_rotations + rotation_offset
+                    : nullptr,
+                entry_offset,
+                request_count,
+                max_seq_len_,
+                max_seq_len_,
+                local_n_kv_heads_,
+                head_dim_,
+                /*rope_theta=*/0.0f,
+                /*position_start=*/0,
+                /*rope_dim=*/0,
+                mode_,
+                stream))
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::get_kv_batched_device_view] Grouped TQ dequant launch failed");
+            return false;
+        }
+
+        scratch.invalidate();
+        cached_stream_ = stream;
+        const size_t rows =
+            static_cast<size_t>(request_count) * max_seq_len_;
+        if (!batched_k_view_ ||
+            batched_k_view_->gpu_data_ptr() != scratch.d_K ||
+            batched_k_view_->shape().empty() ||
+            batched_k_view_->shape()[0] != rows)
+        {
+            batched_k_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_K, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, DeviceId::rocm(device_id_));
+        }
+        if (!batched_v_view_ ||
+            batched_v_view_->gpu_data_ptr() != scratch.d_V ||
+            batched_v_view_->shape().empty() ||
+            batched_v_view_->shape()[0] != rows)
+        {
+            batched_v_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_V, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, DeviceId::rocm(device_id_));
+        }
+        if (out_k)
+            *out_k = batched_k_view_.get();
+        if (out_v)
+            *out_v = batched_v_view_.get();
+        return true;
+    }
+
+    bool ROCmRingKVCacheTQ::get_kv_batched_converted_device_view(
+        int layer,
+        int first_seq_idx,
+        int request_count,
+        ActivationPrecision target,
+        ITensor **out_k,
+        ITensor **out_v,
+        const KVReadParams &read)
+    {
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        const int requested_heads =
+            read.n_kv_heads > 0 ? read.n_kv_heads : local_n_kv_heads_;
+        const int requested_head_dim =
+            read.head_dim > 0 ? read.head_dim : head_dim_;
+        const int effective_rope_dim =
+            read.rope_dim > 0 ? read.rope_dim : requested_head_dim;
+        if (layer < 0 || layer >= n_layers_ || first_seq_idx < 0 ||
+            request_count <= 0 ||
+            first_seq_idx > batch_size_ - request_count ||
+            target != ActivationPrecision::FP16 || !read.gpu_stream ||
+            requested_heads != local_n_kv_heads_ ||
+            requested_head_dim != head_dim_ ||
+            effective_rope_dim <= 0 || effective_rope_dim > head_dim_ ||
+            (effective_rope_dim % 2) != 0 ||
+            !d_head_params_ || !d_count_params_ ||
+            !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
+            !d_batched_k_anchor_table_ ||
+            (turboQuantValueUsesRotation(mode_) && !rotations_.d_rotations) ||
+            !workspace_ ||
+            scratch_capacity_bytes_ <
+                static_cast<size_t>(request_count) * max_seq_len_ * kv_dim_ *
+                    sizeof(_Float16))
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::get_kv_batched_converted_device_view] Invalid grouped conversion contract"
+                      << " layer=" << layer
+                      << " first_seq=" << first_seq_idx
+                      << " requests=" << request_count
+                      << " target=" << activationPrecisionToString(target)
+                      << " heads=" << requested_heads
+                      << " head_dim=" << requested_head_dim
+                      << " rope_dim=" << effective_rope_dim
+                      << " stream=" << read.gpu_stream);
+            return false;
+        }
+
+        (void)hipSetDevice(device_id_);
+        auto &scratch = layer_scratch_[layer];
+        const size_t rotation_offset =
+            static_cast<size_t>(layer) * local_n_kv_heads_ * head_dim_ * head_dim_;
+        const int entry_offset = layer * batch_size_ + first_seq_idx;
+        const auto stream = static_cast<hipStream_t>(read.gpu_stream);
+        if (!hip_tq_batched_ring_dequant_fp16_device_state(
+                scratch.d_K,
+                scratch.d_V,
+                const_cast<const void *const *>(d_batched_k_entry_table_),
+                const_cast<const void *const *>(d_batched_v_entry_table_),
+                const_cast<const void *const *>(d_batched_k_anchor_table_),
+                d_head_params_,
+                d_count_params_,
+                rotations_.d_rotations
+                    ? rotations_.d_rotations + rotation_offset
+                    : nullptr,
+                entry_offset,
+                request_count,
+                max_seq_len_,
+                max_seq_len_,
+                local_n_kv_heads_,
+                head_dim_,
+                read.rope_theta,
+                read.position_start,
+                effective_rope_dim,
+                mode_,
+                stream))
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::get_kv_batched_converted_device_view] Grouped TQ conversion/RoPE launch failed");
+            return false;
+        }
+
+        scratch.invalidate();
+        cached_stream_ = stream;
+        const size_t rows =
+            static_cast<size_t>(request_count) * max_seq_len_;
+        if (!batched_k_view_ ||
+            batched_k_view_->gpu_data_ptr() != scratch.d_K ||
+            batched_k_view_->shape().empty() ||
+            batched_k_view_->shape()[0] != rows)
+        {
+            batched_k_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_K, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, DeviceId::rocm(device_id_));
+        }
+        if (!batched_v_view_ ||
+            batched_v_view_->gpu_data_ptr() != scratch.d_V ||
+            batched_v_view_->shape().empty() ||
+            batched_v_view_->shape()[0] != rows)
+        {
+            batched_v_view_ = std::make_unique<GpuTensorView>(
+                scratch.d_V, rows, static_cast<size_t>(kv_dim_),
+                TensorType::FP16, DeviceId::rocm(device_id_));
+        }
+        if (out_k)
+            *out_k = batched_k_view_.get();
+        if (out_v)
+            *out_v = batched_v_view_.get();
         return true;
     }
 
@@ -719,133 +1451,65 @@ namespace llaminar2
         const KVReadParams *rope)
     {
         (void)target;
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (out_kv_len)
+            *out_kv_len = 0;
 
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
 
         (void)hipSetDevice(device_id_);
-        const auto &entry = entries_[layer][seq_idx];
-
-        if (entry.count == 0)
-        {
-            if (out_k)
-                *out_k = nullptr;
-            if (out_v)
-                *out_v = nullptr;
-            if (out_kv_len)
-                *out_kv_len = 0;
-            return true;
-        }
 
         const float rope_theta = (rope && rope->rope_theta > 0.0f) ? rope->rope_theta : 0.0f;
         const int position_start = (rope && rope_theta > 0.0f) ? rope->position_start : 0;
+        const int rope_dim = (rope && rope_theta > 0.0f)
+                                 ? (rope->rope_dim > 0 ? rope->rope_dim : head_dim_)
+                                 : 0;
         hipStream_t stream = (rope && rope->gpu_stream)
                                  ? static_cast<hipStream_t>(rope->gpu_stream)
                                  : clearStream();
-        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, stream);
-        if (!ok)
+        int count = 0;
+        if (!dequant_to_scratch(
+                layer, seq_idx, rope_theta, position_start, rope_dim,
+                stream, &count))
             return false;
+        if (count == 0)
+            return true;
 
         auto &scratch = layer_scratch_[layer];
 
         if (!scratch.k_view)
         {
             scratch.k_view = std::make_unique<GpuTensorView>(
-                scratch.d_K, entry.count, kv_dim_,
-                TensorType::FP16, device_id_);
+                scratch.d_K, count, kv_dim_,
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
         else
         {
             static_cast<GpuTensorView*>(scratch.k_view.get())->update_view(
-                scratch.d_K, entry.count);
+                scratch.d_K, count);
         }
         if (!scratch.v_view)
         {
             scratch.v_view = std::make_unique<GpuTensorView>(
-                scratch.d_V, entry.count, kv_dim_,
-                TensorType::FP16, device_id_);
+                scratch.d_V, count, kv_dim_,
+                TensorType::FP16, DeviceId::rocm(device_id_));
         }
         else
         {
             static_cast<GpuTensorView*>(scratch.v_view.get())->update_view(
-                scratch.d_V, entry.count);
+                scratch.d_V, count);
         }
 
         if (out_k) *out_k = scratch.k_view.get();
         if (out_v) *out_v = scratch.v_view.get();
-        if (out_kv_len) *out_kv_len = entry.count;
+        if (out_kv_len) *out_kv_len = count;
 
         return true;
     }
-
-    // =========================================================================
-    // Graph Capture Support
-    // =========================================================================
-
-    void ROCmRingKVCacheTQ::setDynamicHead(int layer, int seq_idx, void *gpu_stream)
-    {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-            return;
-        if (!d_dequant_params_ || !h_dequant_params_)
-            return;
-
-        ROCmRingKVCacheBase::setDynamicHead(layer, seq_idx, gpu_stream);
-        // TQ dequant metadata is prepared through setDynamicDequantParams().
-    }
-
-    void ROCmRingKVCacheTQ::setDynamicDequantParams(
-        int layer, int seq_idx,
-        float rope_theta, int position_start,
-        void *gpu_stream)
-    {
-        if (!d_dequant_params_ || !h_dequant_params_)
-            return;
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-            return;
-        dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
-
-        const auto &entry = entries_[layer][seq_idx];
-        h_dequant_params_[layer].ring_pos = entry.head;
-        h_dequant_params_[layer].out_offset_elems = entry.count * kv_dim_;
-        h_dequant_params_[layer].rope_position =
-            (rope_theta > 0.0f) ? position_start + entry.count : 0;
-
-        auto *stream = static_cast<hipStream_t>(gpu_stream);
-        if (!stream)
-        {
-            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] Explicit HIP stream required");
-            return;
-        }
-
-        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
-        const hipError_t cap_err = hipStreamIsCapturing(stream, &status);
-        if (cap_err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] hipStreamIsCapturing failed: "
-                      << hipGetErrorString(cap_err));
-            return;
-        }
-        if (isGraphCaptureActive() || status == hipStreamCaptureStatusActive)
-        {
-            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] Refusing to record TQ dequant-param H2D inside HIP graph capture");
-            return;
-        }
-
-        const hipError_t copy_err =
-            hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
-                           sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
-        if (copy_err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] hipMemcpyAsync failed: "
-                      << hipGetErrorString(copy_err));
-            return;
-        }
-        dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
-    }
-
-    // advanceHead() is now provided by ROCmRingKVCacheBase.
-    // clear(), clear_sequence(), clear_layer() are now provided by
-    // ROCmRingKVCacheBase via entry accessor overrides (resetEntry, onClearSequence).
 
     // =========================================================================
     // Eviction
@@ -853,17 +1517,21 @@ namespace llaminar2
 
     void ROCmRingKVCacheTQ::evict_oldest(int layer, int seq_idx, int num_tokens)
     {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            num_tokens < 0)
             return;
 
-        auto &entry = entries_[layer][seq_idx];
-        if (num_tokens >= entry.count)
+        const auto stream = clearStream();
+        if (!evictOldestDeviceSequenceState(
+                layer,
+                seq_idx,
+                num_tokens,
+                stream))
         {
-            clear_sequence(layer, seq_idx);
+            LOG_ERROR("[ROCmRingKVCacheTQ::evict_oldest] Device metadata eviction launch failed");
             return;
         }
-
-        entry.count -= num_tokens;
 
         layer_scratch_[layer].invalidate();
     }
@@ -876,11 +1544,25 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         const TurboQuantContext *tq_ctx,
-        int device_id)
+        int device_id,
+        TurboQuantKVMode mode)
     {
         return std::make_unique<ROCmRingKVCacheTQ>(
             n_layers, batch_size, max_seq_len,
-            n_kv_heads, head_dim, tq_ctx, device_id);
+            n_kv_heads, head_dim, tq_ctx, device_id, mode);
+    }
+
+    std::unique_ptr<IKVCache> createShardedROCmRingKVCacheTQ(
+        int n_layers, int batch_size, int max_seq_len,
+        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
+        int head_dim, const TurboQuantContext *tq_ctx,
+        int device_id,
+        TurboQuantKVMode mode)
+    {
+        return std::make_unique<ROCmRingKVCacheTQ>(
+            n_layers, batch_size, max_seq_len,
+            n_kv_heads, local_n_kv_heads, kv_head_start,
+            head_dim, tq_ctx, device_id, mode);
     }
 
 } // namespace llaminar2

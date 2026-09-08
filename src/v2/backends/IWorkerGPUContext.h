@@ -1,15 +1,57 @@
+/**
+ * @file IWorkerGPUContext.h
+ * @brief Backend-neutral ownership contract for one GPU worker context.
+ *
+ * The interface owns exact streams, events, library handles, and serialized
+ * setup work for one physical GPU. Execution callers retain explicit stream
+ * identities; no method may reinterpret a null stream as an ambient default.
+ */
+
 #pragma once
 
 #include "IGPUGraphCapture.h"
+#include "GPUBlasSubmission.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Scheduling class for a persistent named auxiliary GPU stream.
+     *
+     * `LatencyCritical` is reserved for bounded control work that must become
+     * runnable between kernels in a long retained inference epoch.
+     * `BackgroundMaintenance` is the lowest-priority compute-stream class and
+     * is used for asynchronous residency DMA. Stream priority does not claim
+     * to control copy-engine arbitration, which remains backend-owned.
+     */
+    enum class GPUAuxiliaryStreamSchedulingClass : std::uint8_t
+    {
+        Normal = 0,
+        LatencyCritical = 1,
+        BackgroundMaintenance = 2,
+    };
+
+    /**
+     * @brief Observable completion state of one exact GPU stream.
+     *
+     * Backend execution failures are deliberately absent from this enum. A
+     * CUDA/HIP failure is not a scheduling state that callers may ignore: the
+     * concrete context throws with the backend, device, and lifecycle boundary
+     * that first observed it.
+     */
+    enum class GPUStreamExecutionState : std::uint8_t
+    {
+        Pending = 0, ///< At least one command on the stream has not retired.
+        Complete, ///< Every command submitted before the query has retired.
+    };
 
     struct PointerValidationResult
     {
@@ -51,11 +93,12 @@ namespace llaminar2
      * - `submitAndWait()`, `submitAsync()`
      * - `synchronize()`
      * - `collectiveComm()` (read-only access)
+     * - `acquireBlasSubmission()` (serialized host submission, no GPU wait)
      *
      * **Worker-thread-only methods** (must be called from within submitted work):
      * - `defaultStream()`, `createStream()`, `destroyStream()`
-     * - `createEvent()`, `destroyEvent()`, `recordEvent()`, `waitEvent()`, `synchronizeEvent()`
-     * - `blasHandle()`
+     * - `createEvent()`, `destroyEvent()`, `recordEvent()`, `waitEvent()`, `queryEventChecked()`, `synchronizeEvent()`
+     * - Raw library-handle inspection outside a scoped BLAS submission
      * - `setCollectiveComm()` (write access)
      *
      * ## Usage Pattern
@@ -65,8 +108,8 @@ namespace llaminar2
      * context->submitAndWait([&] {
      *     // Inside here, we're on the worker thread
      *     void* stream = context->defaultStream();
-     *     void* handle = context->blasHandle();
-     *     // ... launch kernels, call cuBLAS/hipBLAS ...
+     *     auto blas = context->acquireBlasSubmission();
+     *     // Bind the exact stream and arena workspace, then enqueue BLAS work.
      * });
      *
      * // Or asynchronously
@@ -127,18 +170,50 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Submit work and wait for completion (blocking)
+         * @brief Report whether the caller is this context's owning worker.
          *
-         * The work function is executed on the dedicated worker thread that owns
-         * the GPU context. This method blocks until the work completes.
+         * Resource adapters use this exact identity when setup code is reached
+         * from within a larger device transaction.  A synchronous nested
+         * submission cannot be placed behind the transaction that is currently
+         * running: doing so would make the worker wait for itself.
          *
-         * @param work Function to execute on worker thread
-         * @throws std::runtime_error if worker thread is not running
-         * @thread_safety Thread-safe, can be called from any thread
-         *
-         * @note The work function has access to all worker-thread-only methods
+         * @return `true` only on the dedicated worker thread for this context.
+         * @thread_safety Thread-safe after context construction completes.
          */
-        virtual void submitAndWait(std::function<void()> work) = 0;
+        virtual bool ownsCurrentThread() const noexcept { return false; }
+
+        /**
+         * @brief Submit work and wait for completion without self-deadlocking.
+         *
+         * Calls made by the owning worker execute inline because queueing them
+         * behind the current transaction would be an impossible dependency.
+         * Calls from every other thread use @ref submitAsync and wait on the
+         * returned future.  `future::get()` deliberately propagates setup and
+         * launch exceptions to the submitting authority.
+         *
+         * @param work Function to execute on the owning worker.
+         * @throws std::invalid_argument if @p work is empty.
+         * @throws std::runtime_error if the worker is not running.
+         * @thread_safety Thread-safe, including calls from the owning worker.
+         *
+         * @note The work function has access to all worker-thread-only methods.
+         */
+        virtual void submitAndWait(std::function<void()> work)
+        {
+            if (!work)
+            {
+                throw std::invalid_argument(
+                    "IWorkerGPUContext::submitAndWait requires work");
+            }
+
+            if (ownsCurrentThread())
+            {
+                work();
+                return;
+            }
+
+            submitAsync(std::move(work)).get();
+        }
 
         /**
          * @brief Submit work without waiting (non-blocking)
@@ -187,6 +262,57 @@ namespace llaminar2
          */
         virtual void destroyStream(void *stream) = 0;
 
+        /**
+         * @brief Get or create a named context-owned auxiliary stream.
+         *
+         * Auxiliary streams are explicit, non-default streams owned by the
+         * device context and reused across higher-level services such as
+         * GPU-direct expert transfers.  The returned stream remains valid until
+         * the device context is shut down or resetAuxiliaryStreams() is called.
+         *
+         * @param name Stable stream purpose/name.
+         * @param created Optional output set true when this call created the stream.
+         * @return Platform-specific stream handle, or nullptr on failure.
+         * @thread_safety Thread-safe, can be called from any thread.
+         */
+        virtual void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) = 0;
+
+        /**
+         * @brief Get or create a named stream with an exact scheduling class.
+         *
+         * The same name may never be rebound with a different class. Backends
+         * that cannot materialize a requested non-normal class return null;
+         * callers must fail the unsupported production configuration instead
+         * of silently substituting a normal stream.
+         *
+         * @param name Stable stream purpose/name.
+         * @param scheduling_class Immutable scheduling class for this name.
+         * @param created Optional output set true only for a new stream.
+         * @return Exact persistent stream or null when unsupported/invalid.
+         */
+        virtual void *getOrCreateAuxiliaryStream(
+            const std::string &name,
+            GPUAuxiliaryStreamSchedulingClass scheduling_class,
+            bool *created = nullptr)
+        {
+            if (scheduling_class !=
+                GPUAuxiliaryStreamSchedulingClass::Normal)
+            {
+                if (created)
+                    *created = false;
+                return nullptr;
+            }
+            return getOrCreateAuxiliaryStream(name, created);
+        }
+
+        /**
+         * @brief Destroy all named auxiliary streams owned by this context.
+         *
+         * Primarily used during context cleanup and tests.
+         * @thread_safety Thread-safe, can be called from any thread.
+         */
+        virtual void resetAuxiliaryStreams() = 0;
+
         // =========================================================================
         // Event Access (worker-thread-only)
         // =========================================================================
@@ -210,20 +336,102 @@ namespace llaminar2
         /**
          * @brief Record an event on a stream
          * @param event Event handle to record
-         * @param stream Stream to record on (nullptr = default stream)
+         * @param stream Exact producer stream. Must not be null.
          * @thread_safety Must be called from worker thread (within submitted work)
          */
-        virtual void recordEvent(void *event, void *stream = nullptr) = 0;
+        virtual void recordEvent(void *event, void *stream) = 0;
+
+        /**
+         * @brief Record an event on a stream and report launch status.
+         *
+         * This status-bearing companion is intended for graph-captured stream
+         * dependencies where losing the event edge must fail the stage instead
+         * of only logging. Implementations should not silently fall back to the
+         * default/null stream. Concrete GPU contexts must establish their exact
+         * device before recording so a persistent orchestration worker that owns
+         * @p stream can capture the edge without masquerading as the context's
+         * private resource-management worker.
+         *
+         * @thread_safety Concrete GPU implementations admit the exact stream's
+         * capture owner; the default adapter retains @ref recordEvent's worker
+         * restriction.
+         */
+        virtual bool recordEventChecked(void *event, void *stream)
+        {
+            if (!event)
+                throw std::invalid_argument("IWorkerGPUContext::recordEventChecked requires a non-null event");
+            if (!stream)
+                throw std::invalid_argument("IWorkerGPUContext::recordEventChecked requires the exact non-null producer stream");
+            recordEvent(event, stream);
+            return true;
+        }
 
         /**
          * @brief Make a stream wait for an event
          * @param event Event handle to wait for
-         * @param stream Stream that should wait (nullptr = default stream)
+         * @param stream Exact consumer stream. Must not be null.
          * @thread_safety Must be called from worker thread (within submitted work)
          *
          * @note This is a GPU-side wait, not a CPU-side wait
          */
-        virtual void waitEvent(void *event, void *stream = nullptr) = 0;
+        virtual void waitEvent(void *event, void *stream) = 0;
+
+        /**
+         * @brief Make a stream wait for an event and report launch status.
+         *
+         * Use this for required graph-captured stream edges. A false result
+         * means the dependency was not queued and callers should fail fast.
+         * Concrete GPU contexts establish their exact device and admit the
+         * persistent orchestration worker that owns @p stream; the default
+         * adapter retains @ref waitEvent's worker restriction.
+         */
+        virtual bool waitEventChecked(void *event, void *stream)
+        {
+            if (!event)
+                throw std::invalid_argument("IWorkerGPUContext::waitEventChecked requires a non-null event");
+            if (!stream)
+                throw std::invalid_argument("IWorkerGPUContext::waitEventChecked requires the exact non-null consumer stream");
+            waitEvent(event, stream);
+            return true;
+        }
+
+        /**
+         * @brief Query whether an event has completed without blocking the CPU.
+         *
+         * @param event Event handle to query.
+         * @param ready Output flag set to true only when the event has completed.
+         * @return false when the event is invalid or the backend query failed.
+         *
+         * This is intended for opportunistic async scheduling decisions. Callers
+         * must not replace a false result with a blocking synchronize fallback.
+         */
+        virtual bool queryEventChecked(void *event, bool &ready)
+        {
+            ready = false;
+            (void)event;
+            return false;
+        }
+
+        /**
+         * @brief Query one exact stream and throw on any CUDA/HIP execution fault.
+         *
+         * This is the nonblocking error-observation primitive for graph and
+         * transfer lifecycles. `Pending` and `Complete` are both successful
+         * backend observations; every other backend result is a fatal
+         * asynchronous execution error and must throw rather than being folded
+         * into a boolean scheduling decision.
+         *
+         * @param stream Exact non-null stream whose submitted work is observed.
+         * @param boundary Stable lifecycle name included in fatal diagnostics.
+         * @return Pending or Complete without synchronizing the host.
+         * @throws std::invalid_argument for a null stream or empty boundary.
+         * @throws std::runtime_error when device selection or stream execution failed.
+         * @thread_safety May be called by the owning worker or by the persistent
+         *                orchestration thread that owns the exact stream.
+         */
+        [[nodiscard]] virtual GPUStreamExecutionState queryStreamExecutionState(
+            void *stream,
+            std::string_view boundary) = 0;
 
         /**
          * @brief Synchronize the CPU with an event (blocking)
@@ -233,6 +441,20 @@ namespace llaminar2
          * @note This blocks the worker thread until the event completes on the GPU
          */
         virtual void synchronizeEvent(void *event) = 0;
+
+        /**
+         * @brief Synchronize the CPU with an event and report backend status.
+         *
+         * This companion is intended for diagnostic/timing paths that need to
+         * attribute asynchronous GPU failures to a specific recorded event.
+         */
+        virtual bool synchronizeEventChecked(void *event)
+        {
+            if (!event)
+                return false;
+            synchronizeEvent(event);
+            return true;
+        }
 
         /**
          * @brief Compute elapsed time in milliseconds between two recorded events
@@ -247,13 +469,14 @@ namespace llaminar2
         virtual float eventElapsedTime(void *start, void *stop) = 0;
 
         // =========================================================================
-        // Library Handles (worker-thread-only)
+        // Persistent library handles and serialized, exact-stream submissions
         // =========================================================================
 
         /**
          * @brief Get the BLAS library handle for this device
          * @return Platform-specific handle (cublasHandle_t or hipblasHandle_t)
-         * @thread_safety Must be called from worker thread (within submitted work)
+         * @thread_safety Immutable while initialized. Library calls require the
+         *                scope returned by acquireBlasSubmission(), on any thread.
          *
          * @note The handle is created during context initialization and persists
          *       for the lifetime of the context
@@ -264,12 +487,31 @@ namespace llaminar2
          * @brief Get the cuBLASLt/hipBLASLt handle for this device (for fused GEMM operations)
          * @return Raw handle pointer (cublasLtHandle_t or hipblasLtHandle_t cast to void*)
          *         nullptr if not available
-         * @thread_safety Must be called from worker thread (within submitted work)
+         * @thread_safety Immutable while initialized. Library calls require the
+         *                scope returned by acquireBlasSubmission(), on any thread.
          *
          * @note The handle is created during context initialization and persists
          *       for the lifetime of the context. Used for fused operations like GEMM+bias.
          */
         virtual void *blasLtHandle() = 0;
+
+        /**
+         * @brief Serialize exact stream/workspace binding and one complete BLAS call.
+         * @return Scope borrowing this context's persistent library handles.
+         * @throws std::logic_error If context initialization is incomplete.
+         *
+         * Unlike setup work submission, this scope does not marshal to a worker
+         * thread and never waits for device execution. Handle pointers are
+         * immutable throughout the live context generation. Every BLAS caller
+         * shares this lock, including distinct projection adapter instances.
+         * Context retirement remains an exclusive, already-quiescent lifecycle.
+         */
+        [[nodiscard]] GPUBlasSubmission acquireBlasSubmission()
+        {
+            if (!isInitialized())
+                throw std::logic_error("GPU BLAS submission requires a live worker context");
+            return GPUBlasSubmission(blas_submission_mutex_, blasHandle(), blasLtHandle());
+        }
 
         // =========================================================================
         // Collective Communicator (set by collective backend during initialization)
@@ -306,6 +548,22 @@ namespace llaminar2
         virtual void synchronize() = 0;
 
         /**
+         * @brief Wait for all work on this device to complete and report backend status.
+         *
+         * This status-bearing companion to synchronize() is used by graph-capture
+         * boundary fences so asynchronous CUDA/HIP failures stop at the boundary
+         * that observes them.
+         *
+         * @return true when the device completed successfully, false when the backend reported an error.
+         * @thread_safety Thread-safe, can be called from any thread
+         */
+        virtual bool synchronizeChecked()
+        {
+            synchronize();
+            return true;
+        }
+
+        /**
          * @brief Synchronize a specific stream (CPU blocks until stream completes)
          * @param stream Stream handle to synchronize. nullptr = legacy default stream (stream 0).
          * @thread_safety Thread-safe, can be called from any thread
@@ -337,21 +595,30 @@ namespace llaminar2
         }
 
         /**
-         * @brief Insert a GPU-side dependency between two streams (non-blocking from CPU)
-         * @param dependent_stream Stream that should wait (nullptr = legacy stream 0)
-         * @param dependency_stream Stream to wait for (nullptr = legacy stream 0)
+         * @brief Insert a checked GPU-side dependency between two explicit streams.
          *
-         * Makes dependent_stream wait until all prior work on dependency_stream
-         * completes, using an internal event. This is a GPU-side wait — the CPU
-         * is NOT blocked. This is much cheaper than synchronizeStream() because
-         * it avoids CPU stalls entirely.
+         * @param dependent_stream Stream that must wait for the producer.
+         * @param dependency_stream Producer stream whose already-enqueued work must complete.
+         * @return true when both event publication and the stream wait were accepted
+         *         by the backend; false when ordering could not be established.
          *
-         * Used by segmented graph capture to order graph launches (on capture_stream)
-         * with manual stage dispatches (on legacy stream 0) without CPU overhead.
+         * The method records a context-owned, timing-disabled event on
+         * `dependency_stream` and makes `dependent_stream` wait for that record.
+         * It never synchronizes either stream on the host. Implementations keep
+         * the event storage alive for the device-context lifetime, so inserting
+         * a dependency performs no event allocation or destruction in the
+         * inference hot path.
          *
-         * @note The event is managed internally; callers don't need to create/destroy events.
+         * A false result is a correctness failure, not an optional optimization
+         * miss. Callers must stop the graph transaction rather than continuing
+         * with unordered producer and consumer streams.
+         *
+         * @thread_safety Thread-safe; concurrent callers may publish independent
+         *                handoffs for the same device context.
          */
-        virtual void insertStreamDependency(void *dependent_stream, void *dependency_stream) = 0;
+        virtual bool insertStreamDependency(
+            void *dependent_stream,
+            void *dependency_stream) = 0;
 
         // =========================================================================
         // GPU Graph Capture (worker-thread-only)
@@ -380,8 +647,6 @@ namespace llaminar2
         // =========================================================================
         // Diagnostics and Debug Utilities
         // =========================================================================
-
-        virtual void clearLastError() {}
 
         virtual PointerValidationResult validatePointerDevice(const void *gpu_ptr, int expected_ordinal)
         {
@@ -427,6 +692,9 @@ namespace llaminar2
 
     protected:
         IWorkerGPUContext() = default;
+
+    private:
+        std::mutex blas_submission_mutex_; ///< Host API state, not a GPU execution barrier.
     };
 
 } // namespace llaminar2

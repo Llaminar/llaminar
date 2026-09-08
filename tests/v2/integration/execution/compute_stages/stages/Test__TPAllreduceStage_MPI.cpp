@@ -299,7 +299,7 @@ TEST_F(Test__TPAllreduceStage_MPI, DumpInfoIncludesScalarsGlobalTP)
         {
             found_tp_scope = true;
             // On same node: NODE_LOCAL; across nodes: GLOBAL
-            EXPECT_NE(static_cast<int>(scalar.value), static_cast<int>(TPScope::LOCAL));
+            EXPECT_NE(static_cast<int>(scalar.value), static_cast<int>(TPScope::RANK_LOCAL));
         }
     }
     EXPECT_TRUE(found_tp_scope);

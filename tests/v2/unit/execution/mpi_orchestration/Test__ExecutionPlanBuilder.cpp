@@ -156,7 +156,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_LocalTP_TwoGPUs)
                        .build();
 
     config.tp_degree = 2;
-    config.tp_scope = TPScope::LOCAL;
+    config.tp_scope = TPScope::RANK_LOCAL;
 
     auto plans = builder->buildAllPlans(config, model, cluster);
 
@@ -179,7 +179,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_LocalTP_MixedGPUs_UsesPCIeBAR)
                        .build();
 
     config.tp_degree = 2;
-    config.tp_scope = TPScope::LOCAL;
+    config.tp_scope = TPScope::RANK_LOCAL;
 
     auto plans = builder->buildAllPlans(config, model, cluster);
 
@@ -200,7 +200,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_LocalTP_HonorsExplicitBackend)
                        .build();
 
     config.tp_degree = 2;
-    config.tp_scope = TPScope::LOCAL;
+    config.tp_scope = TPScope::RANK_LOCAL;
     config.default_backend = CollectiveBackendType::HOST;
 
     auto plans = builder->buildAllPlans(config, model, cluster);
@@ -249,7 +249,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_GlobalTP_TwoRanks)
     }
 }
 
-TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_TwoRanksUsesCrossRankDomain)
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeTP_TwoRanksUsesCrossRankDomain)
 {
     auto cluster = ClusterInventoryBuilder()
                        .addRank(0, "localhost", 0, {})
@@ -277,7 +277,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_TwoRanksUsesCrossRankDo
     }
 }
 
-TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_ExplicitCPUDeviceMapKeepsRanksOnCPU)
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeTP_ExplicitCPUDeviceMapKeepsRanksOnCPU)
 {
     auto cluster = ClusterInventoryBuilder()
                        .addRank(0, "localhost", 0, {{DeviceType::CUDA, 0}})
@@ -304,7 +304,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_ExplicitCPUDeviceMapKee
         EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
         EXPECT_TRUE(plan.primary_device.isCPU());
         EXPECT_EQ(plan.primary_device.numa_node, r);
-        EXPECT_TRUE(plan.primary_device_numa_explicit);
+        EXPECT_TRUE(plan.hasResolvedPrimaryDeviceNuma());
         EXPECT_TRUE(plan.local_tp_devices.empty());
         EXPECT_EQ(plan.global_tp_domain_size, 2);
         EXPECT_EQ(plan.weight_shard.total_shards, 2);
@@ -1202,9 +1202,9 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainMissingDeviceThrows)
                        .build();
 
     config.domain_definitions.push_back(DomainDefinition::parse(
-        "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+        "rocm_hot=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0"));
     config.domain_definitions.push_back(DomainDefinition::parse(
-        "cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;owner=0"));
+        "cpu_cold=0:cpu:0,2:cpu:0;scope=rank_local;backend=upi;owner=0"));
 
     EXPECT_THROW(
         (void)builder->buildAllPlans(config, model, cluster),
@@ -1212,6 +1212,65 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainMissingDeviceThrows)
         << "Explicit domains must fail at planning time when a participant "
            "is absent from the cluster inventory; otherwise execution can "
            "build null collective participants and crash later.";
+}
+
+/**
+ * @brief Single-rank local execution owns every detected CPU NUMA participant.
+ *
+ * Explicit one-process expert-overlay tests use CPU LocalTP to model a cold
+ * same-host tier.  In that topology, cpu:0 and cpu:1 are two local NUMA
+ * participants served by rank 0, not missing remote ranks.  This regression
+ * keeps the inventory resolver from rejecting the second socket before the
+ * runtime can build the intended local CPU TP domain.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainSingleRankCpuLocalTPResolvesLocalNuma)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "rocm_hot=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0"));
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "cpu_cold=0:cpu:0,1:cpu:0;scope=rank_local;backend=upi;owner=0"));
+
+    std::vector<RankExecutionPlan> plans;
+    ASSERT_NO_THROW(plans = builder->buildAllPlans(config, model, cluster));
+    ASSERT_EQ(plans.size(), 1u);
+}
+
+/**
+ * @brief A two-rank CPU named domain retains one exact NUMA device per rank.
+ *
+ * Both MPI ranks share a hostname, so host-local selection would incorrectly
+ * install both sockets as an inner LocalTP domain on each rank. The resolved
+ * device-owner mapping must instead produce two symmetric global TP shards.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalCpuDomainUsesResolvedDeviceOwners)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0)
+                       .addRank(1, "localhost", 1)
+                       .build();
+
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "cpu_overlay=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"));
+
+    const auto plans = builder->buildAllPlans(config, model, cluster);
+    ASSERT_EQ(plans.size(), 2u);
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        const auto &plan = plans[static_cast<size_t>(rank)];
+        ASSERT_EQ(plan.local_tp_devices.size(), 1u);
+        EXPECT_TRUE(plan.local_tp_devices.front().isCPU());
+        EXPECT_EQ(plan.local_tp_devices.front().numa_node, rank);
+        EXPECT_FALSE(plan.usesLocalTP());
+        EXPECT_TRUE(plan.usesGlobalTP());
+        EXPECT_EQ(plan.global_tp_domain_size, 2);
+        EXPECT_EQ(plan.global_tp_rank_in_domain, rank);
+        EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
+    }
 }
 
 TEST_F(Test__ExecutionPlanBuilder, BuildPlan_EmptyInventory_FallsBackToCPU)
@@ -1278,8 +1337,8 @@ TEST_F(Test__ExecutionPlanBuilder, ClusterInventory_TotalGPUs_MatchesAddedDevice
 // =============================================================================
 
 /**
- * @brief Build a LocalTP-then-NodeLocalTP topology:
- *        Stage 0: "rocm_domain" — two ROCm GPUs on rank 0 (scope=local)
+ * @brief Build a LocalTP-then-NodeTP topology:
+ *        Stage 0: "rocm_domain" — two ROCm GPUs on rank 0 (scope=rank_local)
  *        Stage 1: "cpu_domain"  — one CPU per rank on ranks 0+1 (scope=node_local)
  *        n_layers = 28
  */
@@ -1289,7 +1348,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildGlobalPPTopology_LocalThenNodeLocal)
 
     // Domain 0: two ROCm GPUs on rank 0 (local)
     cfg.domain_definitions.push_back(DomainDefinition::parse(
-        "rocm_domain=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+        "rocm_domain=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0"));
 
     // Domain 1: one CPU per rank, two ranks (node_local)
     cfg.domain_definitions.push_back(DomainDefinition::parse(

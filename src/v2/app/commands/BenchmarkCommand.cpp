@@ -14,7 +14,9 @@
 #include "app/Splash.h"
 #include "app/modes/BenchmarkMode.h"
 #include "config/OrchestrationConfigParser.h"
+#include "utils/BenchmarkRunner.h"
 #include "utils/Logger.h"
+#include "utils/MPIBootstrap.h"
 #include <iostream>
 #include <vector>
 
@@ -53,6 +55,26 @@ namespace llaminar2
             return 1;
         }
 
+        /*
+         * The original launcher can reject an unreadable or empty prompt file
+         * before paying model-load and MPI startup costs. Once already under an
+         * explicit MPI launcher, the benchmark request controller reads the
+         * file after model initialization. Participant ranks stay in the
+         * production worker loop and therefore never require that path.
+         */
+        if (!MPIBootstrap::detectMPIEnvironment().is_mpi_process)
+        {
+            try
+            {
+                (void)resolveBenchmarkPrompt(config);
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "Error: " << error.what() << "\n";
+                return 1;
+            }
+        }
+
         if (config.validate_only)
         {
             command_validation::printValidateOnlySuccess(config);
@@ -75,7 +97,8 @@ namespace llaminar2
         full_argv.push_back(const_cast<char *>(kSubcmd));
         for (int i = 1; i < argc; ++i)
             full_argv.push_back(argv[i]);
-        int full_argc = static_cast<int>(full_argv.size());
+        full_argv.push_back(nullptr);
+        int full_argc = static_cast<int>(full_argv.size() - 1);
 
         // MPI Bootstrap (may exec into mpirun, replacing this process)
         MPIBootstrapPhase bootstrap;
@@ -89,11 +112,6 @@ namespace llaminar2
         if (!ctx_opt)
             return config.dry_run ? 0 : 1;
         auto ctx = std::move(*ctx_opt);
-        // RuntimeInitPhase reparses argv after MPI_Init. The benchmark
-        // subcommand is represented by command dispatch rather than a required
-        // --benchmark flag, so re-apply the mode bit to the runtime config that
-        // benchmark summaries and JSON artifacts report.
-        ctx.config.benchmark_mode = true;
 
         // Run benchmark directly — no mode chain needed
         BenchmarkMode mode;

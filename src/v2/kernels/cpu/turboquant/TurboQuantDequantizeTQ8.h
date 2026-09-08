@@ -51,12 +51,12 @@ namespace llaminar2
                 output[i] = 0.0f;
             return;
         }
-        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
         for (int i = 0; i < D; ++i)
-            scratch[i] = TQ8_CENTROIDS[block.indices[i]] * inv_scale;
+            scratch[i] =
+                TQ8_CENTROIDS[block.indices[i]] * reconstruction_scale;
         apply_rotation_transpose(ctx.rotation(), scratch, output);
-        for (int i = 0; i < D; ++i)
-            output[i] *= block.norm;
     }
 
 #if defined(__AVX2__)
@@ -75,22 +75,20 @@ namespace llaminar2
                 output[i] = 0.0f;
             return;
         }
-        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
-        const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
+        const __m256 vreconstruction_scale =
+            _mm256_set1_ps(reconstruction_scale);
         for (int i = 0; i < D; i += 8)
         {
             __m128i raw8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.indices + i));
             __m256i vidx = _mm256_cvtepu8_epi32(raw8);
             __m256 vcentroids = _mm256_i32gather_ps(TQ8_CENTROIDS.data(), vidx, sizeof(float));
-            _mm256_storeu_ps(scratch + i, _mm256_mul_ps(vcentroids, vinv_scale));
+            _mm256_storeu_ps(
+                scratch + i,
+                _mm256_mul_ps(vcentroids, vreconstruction_scale));
         }
         apply_rotation_transpose(ctx.rotation(), scratch, output);
-        const __m256 vnorm = _mm256_set1_ps(block.norm);
-        for (int i = 0; i < D; i += 8)
-        {
-            __m256 v = _mm256_loadu_ps(output + i);
-            _mm256_storeu_ps(output + i, _mm256_mul_ps(v, vnorm));
-        }
     }
 #endif
 
@@ -110,22 +108,20 @@ namespace llaminar2
                 output[i] = 0.0f;
             return;
         }
-        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
-        const __m512 vinv_scale = _mm512_set1_ps(inv_scale);
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
+        const __m512 vreconstruction_scale =
+            _mm512_set1_ps(reconstruction_scale);
         for (int i = 0; i < D; i += 16)
         {
             __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.indices + i));
             __m512i vidx = _mm512_cvtepu8_epi32(raw);
             __m512 vcentroids = _mm512_i32gather_ps(vidx, TQ8_CENTROIDS.data(), sizeof(float));
-            _mm512_storeu_ps(scratch + i, _mm512_mul_ps(vcentroids, vinv_scale));
+            _mm512_storeu_ps(
+                scratch + i,
+                _mm512_mul_ps(vcentroids, vreconstruction_scale));
         }
         apply_rotation_transpose(ctx.rotation(), scratch, output);
-        const __m512 vnorm = _mm512_set1_ps(block.norm);
-        for (int i = 0; i < D; i += 16)
-        {
-            __m512 v = _mm512_loadu_ps(output + i);
-            _mm512_storeu_ps(output + i, _mm512_mul_ps(v, vnorm));
-        }
     }
 #endif
 

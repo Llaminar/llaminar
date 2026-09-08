@@ -45,6 +45,13 @@ namespace llaminar2::test
             ON_CALL(*this, lastError()).WillByDefault(testing::ReturnRef(empty_error_));
             ON_CALL(*this, executionPlan()).WillByDefault(testing::ReturnRef(default_plan_));
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
+            ON_CALL(*this, mtpRequestPolicy())
+                .WillByDefault(testing::Return(MTPRequestPolicy{}));
+            ON_CALL(*this, primaryDeviceId()).WillByDefault(testing::Return(DeviceId::cpu()));
+            ON_CALL(*this, moeRuntimeMovementEpoch())
+                .WillByDefault(testing::Return(0u));
+            ON_CALL(*this, moeOptimizationStatus())
+                .WillByDefault(testing::Return(MoEOptimizationStatus{}));
             ON_CALL(*this, supportsPrefillBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, prefillBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, supportsDecodeStepBatch(testing::_)).WillByDefault(testing::Return(false));
@@ -58,8 +65,16 @@ namespace llaminar2::test
                                                    return r;
                                                }));
             ON_CALL(*this, setDecodeStepTokenBudget(testing::_)).WillByDefault(testing::Return());
-            ON_CALL(*this, maybeApplyMoERebalance()).WillByDefault(testing::Return(true));
+            ON_CALL(*this, maybeApplyMoERebalance(testing::_))
+                .WillByDefault(testing::Return(true));
             ON_CALL(*this, prefixStateProbe()).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
+            ON_CALL(*this, purgePrefixCache()).WillByDefault(testing::Return(true));
+            ON_CALL(*this, inferenceReadiness())
+                .WillByDefault(testing::Return(InferenceReadiness{}));
+            ON_CALL(*this, prepareForInference())
+                .WillByDefault(testing::Return(true));
+            ON_CALL(*this, coordinatedRootRank())
+                .WillByDefault(testing::Return(0));
         }
 
         // Lifecycle
@@ -82,11 +97,14 @@ namespace llaminar2::test
                      const SamplingParams &sampling),
                     (override));
         MOCK_METHOD(void, setDecodeStepTokenBudget, (int max_tokens), (override));
-        MOCK_METHOD(bool, maybeApplyMoERebalance, (), (override));
+        MOCK_METHOD(bool, maybeApplyMoERebalance, (uint64_t), (override));
 
         // Configuration
         MOCK_METHOD(const RankExecutionPlan &, executionPlan, (), (const, override));
         MOCK_METHOD(const OrchestrationConfig &, config, (), (const, override));
+        MOCK_METHOD(bool, configureMTPRequestPolicy,
+                    (const MTPRequestPolicy &policy), (override));
+        MOCK_METHOD(MTPRequestPolicy, mtpRequestPolicy, (), (const, override));
 
         // Status
         MOCK_METHOD(bool, isInitialized, (), (const, override));
@@ -94,6 +112,12 @@ namespace llaminar2::test
         MOCK_METHOD(int, vocabSize, (), (const, override));
         MOCK_METHOD(int, currentPosition, (), (const, override));
         MOCK_METHOD(void, clearCache, (), (override));
+        MOCK_METHOD(bool, purgePrefixCache, (), (override));
+        MOCK_METHOD(DeviceId, primaryDeviceId, (), (const, override));
+        MOCK_METHOD(uint64_t, moeRuntimeMovementEpoch, (), (const, override));
+        MOCK_METHOD(MoEOptimizationStatus, moeOptimizationStatus, (), (const, override));
+        MOCK_METHOD(InferenceReadiness, inferenceReadiness, (), (const, override));
+        MOCK_METHOD(bool, prepareForInference, (), (override));
 
         // Advanced
         MOCK_METHOD(const float *, lastLogits, (), (const, override));
@@ -117,11 +141,14 @@ namespace llaminar2::test
         MOCK_METHOD(std::string, getStopThinkingPrompt, (), (const, override));
         MOCK_METHOD(ToolCallFormat, getToolCallFormat, (), (const, override));
         MOCK_METHOD(PrefixRuntimeStateSnapshot, prefixStateProbe, (), (const, override));
+        MOCK_METHOD(RequestRuntimeSummary, requestRuntimeSummary, (), (const, override));
 
         // MPI worker coordination
         MOCK_METHOD(void, runMPIWorkerLoop, (), (override));
+        MOCK_METHOD(bool, yieldMPIWorkersForRetainedRunner, (), (override));
         MOCK_METHOD(void, shutdownMPIWorkers, (), (override));
         MOCK_METHOD(void, abortMPIWorkers, (const std::string &reason), (override));
+        MOCK_METHOD(int, coordinatedRootRank, (), (const, override));
         MOCK_METHOD(void, setMPICoordinatedMode, (bool enabled), (override));
 
         // =====================================================================
@@ -198,6 +225,14 @@ namespace llaminar2::test
                     (const std::string &config_path), (override));
         MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromOrchestrationConfig,
                     (OrchestrationConfig config), (override));
+        MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromOrchestrationConfig,
+                    (OrchestrationConfig config,
+                     std::shared_ptr<ModelContext> model_context),
+                    (override));
+        MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromOrchestrationConfig,
+                    (OrchestrationConfig config,
+                     ModelContextReuseContract reuse_contract),
+                    (override));
         MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createSimple,
                     (const std::string &model_path, const std::string &device_spec), (override));
     };

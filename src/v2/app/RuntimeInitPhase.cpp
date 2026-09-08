@@ -7,12 +7,14 @@
 #include "app/MPIBootstrapPhase.h"
 #include "app/MPIShutdown.h"
 #include "app/ChatTemplateResolver.h"
+#include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
 #include "backends/InventoryPrinter.h"
 #include "config/OrchestrationConfigParser.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "models/IGraphConfigBuilder.h"
+#include "planning/ClusterInventoryGatherer.h"
 #include "utils/ChatTemplate.h"
 #include "utils/Tokenizer.h"
 #include "utils/Logger.h"
@@ -23,9 +25,147 @@
 #include <algorithm>
 #include <cstdlib>
 #include <omp.h>
+#include <sstream>
+#include <stdexcept>
 
 namespace llaminar2
 {
+
+    int RuntimeInitPhase::resolveCPUBackendNUMANode(
+        const OrchestrationConfig &config,
+        int mpi_rank,
+        int mpi_world_size,
+        const NUMAInfo &numa_info)
+    {
+        std::optional<int> explicit_node;
+        const auto declare_explicit_node =
+            [&](int node, const char *source)
+        {
+            if (node < 0)
+            {
+                throw std::runtime_error(
+                    std::string(source) +
+                    " declared CPU NUMA placement without an exact node");
+            }
+            if (explicit_node.has_value() && *explicit_node != node)
+            {
+                throw std::runtime_error(
+                    "Conflicting explicit CPU NUMA declarations for rank " +
+                    std::to_string(mpi_rank));
+            }
+            explicit_node = node;
+        };
+
+        if (config.device_for_this_rank.has_value() &&
+            config.device_for_this_rank->isCPU() &&
+            config.device_for_this_rank_numa_explicit)
+        {
+            declare_explicit_node(
+                config.device_for_this_rank->numa_node,
+                "--device");
+        }
+
+        for (const auto &[mapped_rank, address] : config.device_map)
+        {
+            if (mapped_rank != mpi_rank || !address.isCPU())
+                continue;
+
+            const auto explicit_it = std::find_if(
+                config.device_map_numa_explicit.begin(),
+                config.device_map_numa_explicit.end(),
+                [mapped_rank](const auto &entry)
+                {
+                    return entry.first == mapped_rank;
+                });
+            if (explicit_it != config.device_map_numa_explicit.end() &&
+                explicit_it->second)
+            {
+                declare_explicit_node(address.numa_node, "--device-map");
+            }
+        }
+
+        if (explicit_node.has_value())
+        {
+            if (numa_info.detection_succeeded &&
+                numa_info.local_numa_node != *explicit_node)
+            {
+                throw std::runtime_error(
+                    "Explicit CPU NUMA node " +
+                    std::to_string(*explicit_node) +
+                    " disagrees with rank affinity on node " +
+                    std::to_string(numa_info.local_numa_node));
+            }
+            return *explicit_node;
+        }
+
+        if (mpi_world_size > 1 || config.cpu_global_tp_all_local)
+        {
+            if (!numa_info.detection_succeeded ||
+                numa_info.local_numa_node < 0)
+            {
+                throw std::runtime_error(
+                    "Rank-local CPU backend initialization requires exact NUMA affinity");
+            }
+            return numa_info.local_numa_node;
+        }
+
+        return -1;
+    }
+
+    bool RuntimeInitPhase::requiresHostWideAcceleratorVisibility(
+        const OrchestrationConfig &config,
+        int mpi_rank)
+    {
+        const auto contains_gpu = [](const auto &devices)
+        {
+            return std::any_of(
+                devices.begin(), devices.end(),
+                [](const GlobalDeviceAddress &device)
+                { return device.isGPU(); });
+        };
+
+        if (config.device_for_this_rank.has_value() &&
+            config.device_for_this_rank->isGPU())
+        {
+            return true;
+        }
+        if (std::any_of(
+                config.device_map.begin(), config.device_map.end(),
+                [mpi_rank](const auto &entry)
+                {
+                    return entry.first == mpi_rank && entry.second.isGPU();
+                }))
+        {
+            return true;
+        }
+        if (contains_gpu(config.tp_devices) || config.tp_degree > 1)
+            return true;
+
+        if (std::any_of(
+                config.domain_definitions.begin(),
+                config.domain_definitions.end(),
+                [&](const DomainDefinition &domain)
+                { return contains_gpu(domain.devices); }))
+        {
+            return true;
+        }
+
+        const auto &overlay = config.moe_routed_expert_plan;
+        if (!overlay || !overlay->usesExpertOverlayAuthority())
+            return false;
+
+        if (std::any_of(
+                overlay->domains.begin(), overlay->domains.end(),
+                [&](const RoutedExpertDomain &domain)
+                { return contains_gpu(domain.participants); }))
+        {
+            return true;
+        }
+        return std::any_of(
+            overlay->dense_domains.begin(), overlay->dense_domains.end(),
+            [&](const ExecutionDomainDefinition &domain)
+            { return contains_gpu(domain.participants); });
+    }
 
     bool RuntimeInitPhase::runDryRunPreflight(OrchestrationConfig &config,
                                               IOrchestrationRunner &runner,
@@ -67,9 +207,19 @@ namespace llaminar2
         int provided;
         MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
-        // Re-parse arguments (MPI_Init may modify argc/argv)
+        /*
+         * Re-parse arguments because MPI_Init may modify argc/argv. Subcommand
+         * mode is not represented by a required legacy flag, so preserve the
+         * mode selected by the command object across this parser boundary.
+         * Runtime factories and validators must see the same mode that the
+         * command validated before MPI startup.
+         */
+        const bool command_selected_benchmark = config.benchmark_mode;
+        const bool command_selected_server = config.serve_mode;
         OrchestrationConfigParser parser;
         config = parser.parseArgs(argc, argv);
+        config.benchmark_mode = config.benchmark_mode || command_selected_benchmark;
+        config.serve_mode = config.serve_mode || command_selected_server;
 
         auto mpi_ctx = MPIContextFactory::global();
 
@@ -179,6 +329,30 @@ namespace llaminar2
             }
         }
 
+        /*
+         * CPUBackend is a process-global object, but every MPI process is one
+         * rank-local participant. Publish its immutable NUMA identity before
+         * DeviceManager or any graph preparation can request CPU storage.
+         * Accessors deliberately do not auto-create an aggregate backend: that
+         * would make a later exact placement impossible because singleton
+         * allocation policy is fixed for the process lifetime.
+         */
+        try
+        {
+            initCPUBackend(resolveCPUBackendNUMANode(
+                config,
+                mpi_ctx->rank(),
+                mpi_ctx->world_size(),
+                numa_info));
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[Main] CPU backend placement initialization failed: "
+                      << e.what());
+            mpiShutdown();
+            return std::nullopt;
+        }
+
         // Set logger rank
         Logger::getInstance().setRank(mpi_ctx->rank());
 
@@ -208,32 +382,8 @@ namespace llaminar2
         {
             device_manager_numa_filter = numa_info.local_numa_node;
 
-            std::optional<GlobalDeviceAddress> mapped_device_for_rank;
-            for (const auto &[mapped_rank, mapped_addr] : config.device_map)
-            {
-                if (mapped_rank == mpi_ctx->rank())
-                {
-                    mapped_device_for_rank = mapped_addr;
-                    break;
-                }
-            }
-
-            const bool has_gpu_request =
-                (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU()) ||
-                (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU()) ||
-                std::any_of(config.tp_devices.begin(), config.tp_devices.end(),
-                            [](const GlobalDeviceAddress &d)
-                            { return d.isGPU(); }) ||
-                std::any_of(config.domain_definitions.begin(), config.domain_definitions.end(),
-                            [](const DomainDefinition &dom)
-                            {
-                                return std::any_of(dom.devices.begin(), dom.devices.end(),
-                                                   [](const GlobalDeviceAddress &d)
-                                                   { return d.isGPU(); });
-                            }) ||
-                (config.tp_degree > 1);
-
-            if (has_gpu_request)
+            if (requiresHostWideAcceleratorVisibility(
+                    config, mpi_ctx->rank()))
             {
                 device_manager_numa_filter = -1;
                 LOG_INFO("[Main] GPU device(s) requested; initialising DeviceManager without NUMA filtering");
@@ -249,19 +399,46 @@ namespace llaminar2
         // leaves other ranks out of the collective and causes subsequent
         // MPI collectives (e.g. syncInitStep Allreduce) to mis-match and
         // report MPI_ERR_TRUNCATE.
-        const auto &cluster = mpi_ctx->concrete_topology().clusterInventory();
+        /*
+         * Gather from DeviceManager's real hardware enumeration. MPITopology's
+         * lightweight placement view is intentionally suitable for MPI
+         * communicator geometry, but it cannot be the device authority: it
+         * only knows accelerators named by visibility environment variables.
+         */
+        const auto cluster = gatherClusterInventory(
+            mpi_ctx, {}, config.hostfile);
         if (mpi_ctx->rank() == 0)
         {
             InventoryPrinter::printClusterInventory(cluster);
         }
 
         std::optional<MoEExpertOverlayExecutionPlan> overlay_execution_plan;
-        if (config.moe_expert_parallel_plan && config.moe_expert_parallel_plan->isTieredOverlay())
+        if (config.moe_routed_expert_plan &&
+            config.moe_routed_expert_plan->usesExpertOverlayAuthority())
         {
             try
             {
+                auto resolved_overlay =
+                    bindMoEExpertOverlayPlanToClusterInventory(
+                        *config.moe_routed_expert_plan,
+                        cluster);
+                const auto install_errors =
+                    installResolvedMoEExpertOverlayPlan(
+                        config,
+                        std::move(resolved_overlay),
+                        MoEExpertOverlayPlanInstallOrigin::
+                            UserDeclaredDomains);
+                if (!install_errors.empty())
+                {
+                    std::ostringstream error;
+                    error << "failed to install hardware-resolved MoE overlay topology:";
+                    for (const auto &entry : install_errors)
+                        error << "\n - " << entry;
+                    throw std::invalid_argument(error.str());
+                }
+
                 overlay_execution_plan = resolveMoEExpertOverlayExecutionPlan(
-                    config.moe_expert_parallel_plan,
+                    config.moe_routed_expert_plan,
                     MoEExpertOverlayExecutionPlanResolverOptions{
                         .current_world_rank = mpi_ctx->rank(),
                         .world_size = mpi_ctx->world_size(),
@@ -326,6 +503,10 @@ namespace llaminar2
         if (config.dry_run)
         {
             runDryRunPreflight(config, *runner, mpi_ctx->rank(), std::cout);
+            // The runner may own duplicated communicators even when preflight
+            // builds no executable graph. Release them before finalizing the
+            // process-wide MPI session.
+            runner->shutdown();
             mpiShutdown();
             return std::nullopt;
         }
@@ -336,6 +517,10 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to initialize: " << runner->lastError());
             }
+            // Initialization is transactional but may already have created
+            // graph runners, mapped fabrics, and private MPI communicators.
+            // Their dependency DAG must be dismantled while MPI is live.
+            runner->shutdown();
             mpiShutdown();
             return std::nullopt;
         }
@@ -348,6 +533,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to get tokenizer from runner");
             }
+            runner->shutdown();
             mpiShutdown();
             return std::nullopt;
         }

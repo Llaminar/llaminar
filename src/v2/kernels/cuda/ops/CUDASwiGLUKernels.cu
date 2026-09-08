@@ -5,9 +5,12 @@
  *
  * Contains FP32, BF16, and FP16 SwiGLU kernels with extern "C" wrapper functions.
  * SwiGLU computes: silu(gate) * up = gate / (1 + exp(-gate)) * up
+ * The scalar numerical program is shared with ROCm so expert placement cannot
+ * change a published activation word in heterogeneous execution.
  */
 
 #include "CUDAHelpers.cuh"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
 #include <cstdio>
 
 // =========================================================================
@@ -26,7 +29,9 @@ __global__ void swiglu_fp32_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size)
     {
-        output[idx] = silu(gate[idx]) * up[idx];
+        output[idx] =
+            llaminar2::device_swiglu_contract::swigluValue(
+                gate[idx], up[idx]);
     }
 }
 
@@ -44,7 +49,8 @@ __global__ void swiglu_bf16_kernel(
     {
         float g = bf16_to_float(gate[idx]);
         float u = bf16_to_float(up[idx]);
-        float result = silu(g) * u;
+        float result =
+            llaminar2::device_swiglu_contract::swigluValue(g, u);
         output[idx] = float_to_bf16(result);
     }
 }
@@ -63,7 +69,8 @@ __global__ void swiglu_fp16_kernel(
     {
         float g = fp16_to_float(gate[idx]);
         float u = fp16_to_float(up[idx]);
-        float result = silu(g) * u;
+        float result =
+            llaminar2::device_swiglu_contract::swigluValue(g, u);
         output[idx] = float_to_fp16(result);
     }
 }

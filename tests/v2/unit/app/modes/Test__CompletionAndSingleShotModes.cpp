@@ -2,6 +2,7 @@
 #include <gmock/gmock.h>
 
 #include "app/AppContext.h"
+#include "app/modes/BenchmarkMode.h"
 #include "app/modes/CompletionMode.h"
 #include "app/modes/SingleShotChatMode.h"
 #include "mocks/MockMPIContext.h"
@@ -21,6 +22,7 @@ using ::testing::HasSubstr;
 using ::testing::NiceMock;
 using ::testing::Not;
 using ::testing::Return;
+using ::testing::Sequence;
 using ::testing::Throw;
 
 namespace
@@ -50,7 +52,7 @@ namespace
 
     struct ModeHarness
     {
-        explicit ModeHarness(int rank, int world_size)
+        explicit ModeHarness(int rank, int world_size, int authority_rank = 0)
         {
             auto owned_runner = std::make_unique<NiceMock<MockOrchestrationRunner>>();
             runner = owned_runner.get();
@@ -62,6 +64,8 @@ namespace
             ctx.tokenizer = tokenizer;
             ctx.config.prompt = "Hello";
             ctx.config.n_predict = 1;
+            ON_CALL(*runner, coordinatedRootRank())
+                .WillByDefault(Return(authority_rank));
         }
 
         AppContext ctx;
@@ -92,6 +96,95 @@ namespace
     };
 }
 
+TEST(Test__BenchmarkMode, NonRootRankEntersWorkerLoopWithoutStartingASecondController)
+{
+    ModeHarness h(/*rank=*/1, /*world_size=*/2);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(1);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(0);
+    EXPECT_CALL(*h.runner, clearCache()).Times(0);
+    EXPECT_CALL(*h.runner, prefill(_)).Times(0);
+    EXPECT_CALL(*h.runner, decodeStep()).Times(0);
+    EXPECT_CALL(*h.tokenizer, encode(_, _, _)).Times(0);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__BenchmarkMode, WorldRankZeroFollowsInventorySelectedNonzeroAuthority)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/2, /*authority_rank=*/1);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(1);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(0);
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+    EXPECT_CALL(*h.tokenizer, encode(_, _, _)).Times(0);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__BenchmarkMode, InventorySelectedNonzeroAuthorityOwnsRequestAndShutdown)
+{
+    ModeHarness h(/*rank=*/1, /*world_size=*/2, /*authority_rank=*/1);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(0);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(1).WillOnce(Return(true));
+    EXPECT_CALL(*h.tokenizer, encode(_, false, false))
+        .WillOnce(Return(std::vector<int>{}));
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
+    EXPECT_CALL(*h.runner, abortMPIWorkers(_)).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 1);
+}
+
+TEST(Test__BenchmarkMode, RootRankOwnsControllerAndClosesWorkersOnEarlyFailure)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/2);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(0);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(1).WillOnce(Return(true));
+    EXPECT_CALL(*h.tokenizer, encode(_, false, false))
+        .WillOnce(Return(std::vector<int>{}));
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
+    EXPECT_CALL(*h.runner, abortMPIWorkers(_)).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 1);
+}
+
+TEST(Test__BenchmarkMode, RootRefusesToBenchmarkAnUnreadyRuntime)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/2);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(0);
+    EXPECT_CALL(*h.runner, prepareForInference())
+        .Times(1)
+        .WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, encode(_, _, _)).Times(0);
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 1);
+}
+
 TEST(Test__CompletionMode, NonRootRankEntersWorkerLoopWithoutTokenization)
 {
     ModeHarness h(/*rank=*/1, /*world_size=*/2);
@@ -112,11 +205,20 @@ TEST(Test__CompletionMode, NonRootRankEntersWorkerLoopWithoutTokenization)
 TEST(Test__CompletionMode, RootRankShutsDownWorkersOnSuccess)
 {
     ModeHarness h(/*rank=*/0, /*world_size=*/2);
+    Sequence request_admission;
 
     EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
     EXPECT_CALL(*h.tokenizer, encode("Hello", false, false)).WillOnce(Return(std::vector<int>{1, 2}));
-    EXPECT_CALL(*h.runner, prefill(ElementsAre(1, 2))).WillOnce(Return(true));
-    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*h.runner, setSamplingParams(_))
+        .InSequence(request_admission);
+    EXPECT_CALL(*h.tokenizer, stop_tokens())
+        .InSequence(request_admission)
+        .WillOnce(Return(std::vector<int>{99, 100}));
+    EXPECT_CALL(*h.runner, setStopTokens(ElementsAre(99, 100)))
+        .InSequence(request_admission);
+    EXPECT_CALL(*h.runner, prefill(ElementsAre(1, 2)))
+        .InSequence(request_admission)
+        .WillOnce(Return(true));
     EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult(42)));
     EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(1).WillRepeatedly(Return(false));
     EXPECT_CALL(*h.tokenizer, decode_token(42)).WillOnce(Return(" answer"));
@@ -151,7 +253,7 @@ TEST(Test__CompletionMode, RootRankShutsDownWorkersOnPrefillFailure)
     EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
     EXPECT_CALL(*h.tokenizer, encode("Hello", false, false)).WillOnce(Return(std::vector<int>{1}));
     EXPECT_CALL(*h.runner, prefill(ElementsAre(1))).WillOnce(Return(false));
-    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(0);
+    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
     EXPECT_CALL(*h.runner, decodeStep()).Times(0);
     EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
     EXPECT_CALL(*h.runner, shutdown()).Times(1);
@@ -168,7 +270,7 @@ TEST(Test__CompletionMode, RootRankShutsDownWorkersWhenPrefillThrows)
     EXPECT_CALL(*h.tokenizer, encode("Hello", false, false)).WillOnce(Return(std::vector<int>{1}));
     EXPECT_CALL(*h.runner, prefill(ElementsAre(1)))
         .WillOnce(Throw(std::runtime_error("prefill threw")));
-    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(0);
+    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
     EXPECT_CALL(*h.runner, decodeStep()).Times(0);
     EXPECT_CALL(*h.runner, flushStageTimeline()).Times(0);
     EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(0);
@@ -314,12 +416,21 @@ TEST(Test__SingleShotChatMode, RootRankShutsDownWorkersOnSuccess)
     ModeHarness h(/*rank=*/0, /*world_size=*/2);
     h.ctx.config.single_shot_chat = true;
     h.ctx.config.system_prompt = "system";
+    Sequence request_admission;
 
     EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
     EXPECT_CALL(*h.tokenizer, hasChatTemplate()).WillOnce(Return(true));
     EXPECT_CALL(*h.tokenizer, encodeChat(_, true, "")).WillOnce(Return(std::vector<int>{7, 8}));
-    EXPECT_CALL(*h.runner, prefill(ElementsAre(7, 8))).WillOnce(Return(true));
-    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*h.runner, setSamplingParams(_))
+        .InSequence(request_admission);
+    EXPECT_CALL(*h.tokenizer, stop_tokens())
+        .InSequence(request_admission)
+        .WillOnce(Return(std::vector<int>{99, 100}));
+    EXPECT_CALL(*h.runner, setStopTokens(ElementsAre(99, 100)))
+        .InSequence(request_admission);
+    EXPECT_CALL(*h.runner, prefill(ElementsAre(7, 8)))
+        .InSequence(request_admission)
+        .WillOnce(Return(true));
     EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult(42)));
     EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(1).WillRepeatedly(Return(false));
     EXPECT_CALL(*h.tokenizer, decode_token(42)).WillOnce(Return(" answer"));
@@ -357,7 +468,7 @@ TEST(Test__SingleShotChatMode, RootRankShutsDownWorkersWhenPrefillThrows)
     EXPECT_CALL(*h.tokenizer, encodeChat(_, true, "")).WillOnce(Return(std::vector<int>{7}));
     EXPECT_CALL(*h.runner, prefill(ElementsAre(7)))
         .WillOnce(Throw(std::runtime_error("chat prefill threw")));
-    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(0);
+    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
     EXPECT_CALL(*h.runner, decodeStep()).Times(0);
     EXPECT_CALL(*h.runner, flushStageTimeline()).Times(0);
     EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(0);

@@ -199,7 +199,8 @@ namespace llaminar2
         ro_config.batch_size = ctx.runner_config.batch_size;
         ro_config.activation_precision = ctx.runner_config.activation_precision;
         ro_config.kv_cache_precision = ctx.runner_config.kv_cache_precision;
-        ro_config.use_mapped_memory = ctx.runner_config.use_mapped_memory;
+        ro_config.tp_allreduce_precision_override =
+            ctx.runner_config.tp_allreduce_precision_override;
         ro_config.nested_pp_stage_config = pp_cfg;
         ro_config.prepared_weight_store = weight_context->prepared_store;
 

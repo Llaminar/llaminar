@@ -5,7 +5,9 @@
  * @brief ROCm/HIP kernels for reverse repack: GPU separated VNNI → raw GGUF blocks.
  *
  * HIP counterpart of kernels/cuda/repack/CUDAVnniUnpackKernels.h.
- * Only per-block formats are reversible (see CUDAVnniUnpackKernels.h for table).
+ * Q8_K is also reversible because its raw payload is preserved and its partial
+ * sums are derived from those bytes.  See CUDAVnniUnpackKernels.h for the full
+ * format table shared by both backends.
  */
 
 #include "loaders/gpu_pipeline/RepackFormat.h"
@@ -17,8 +19,8 @@ namespace llaminar2 {
 /**
  * @brief Launch HIP kernel to reverse-repack GPU separated VNNI → raw GGUF blocks.
  *
- * Only supports per-block formats (Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1, Q8_0).
- * Returns false for unsupported (lossy) formats.
+ * Supports all losslessly reversible formats, including Q8_1 and Q8_K.  Returns
+ * false for unsupported scale-compressed superblock formats.
  *
  * @param format       Quantization format
  * @param d_payload    GPU separated payload [blocks_per_row * N * payload_bytes]

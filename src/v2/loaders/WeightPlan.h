@@ -1,7 +1,21 @@
+/**
+ * @file WeightPlan.h
+ * @brief Declarative model-weight planning and immutable binding lookup.
+ *
+ * A @ref WeightPlan describes every source tensor, derivation, target device,
+ * and prepared representation before any graph is built.  A
+ * @ref FrozenModelWeightSet is the graph-time authority created from that
+ * plan.  In particular, heterogeneous ExpertOverlay plans may contain more
+ * than one binding for a routed-expert parent; callers that build a graph for
+ * a concrete device must use the device-qualified lookup rather than relying
+ * on insertion order.
+ */
+
 #pragma once
 
 #include "WeightIdentity.h"
 #include "WeightLifecycleTrace.h"
+#include "planning/PhysicalMemoryBOM.h"
 
 #include <functional>
 #include <memory>
@@ -64,6 +78,7 @@ namespace llaminar2
         int overlay_participant_world_rank = -1;
         DeviceId target_device = DeviceId::cpu();
         std::optional<DeviceId> lookup_device;
+        bool bypass_tensor_parallel = false;
         WeightHostPolicy host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         PreparedWeightKind expected_prepared_kind = PreparedWeightKind::None;
         WeightSliceSpec slice;
@@ -78,30 +93,65 @@ namespace llaminar2
         std::vector<DeviceId> devices;
     };
 
+    /** @brief Immutable-intent list used to materialize one model weight view. */
     class WeightPlan
     {
     public:
-        explicit WeightPlan(InferenceStrategy strategy = {});
+        /**
+         * @brief Create an empty plan with its execution and memory authority.
+         *
+         * The owner is a property of the complete frozen set rather than a
+         * call-site hint supplied during allocation. This prevents a mirrored
+         * decode/MTP sidecar from being admitted as
+         * `AdditionalModelWeights` and later materialized against the primary
+         * owner line merely because both sets use the same loader pipeline.
+         *
+         * @param strategy Execution strategy served by the plan.
+         * @param physical_memory_owner Exact persistent-weight BOM owner.
+         * @throws std::invalid_argument for a non-weight memory owner.
+         */
+        explicit WeightPlan(
+            InferenceStrategy strategy = {},
+            PhysicalMemoryOwner physical_memory_owner =
+                PhysicalMemoryOwner::PrimaryModelWeights);
 
+        /** @return Immutable execution strategy carried by this plan. */
         const InferenceStrategy &strategy() const { return strategy_; }
+        /** @return Exact physical-memory owner carried into materialization. */
+        PhysicalMemoryOwner physicalMemoryOwner() const noexcept
+        {
+            return physical_memory_owner_;
+        }
+        /** @return Ordered requirements that will be materialized. */
         const std::vector<WeightRequirement> &requirements() const { return requirements_; }
+        /** @brief Normalize and append one declarative tensor requirement. */
         void add(WeightRequirement requirement);
+        /** @return Number of declarative requirements. */
         size_t size() const { return requirements_.size(); }
+        /** @return Whether the plan contains no requirements. */
         bool empty() const { return requirements_.empty(); }
+        /** @return A human-readable audit table for diagnostics and CSV evidence. */
         std::string renderAuditTable() const;
 
     private:
         InferenceStrategy strategy_;
+        PhysicalMemoryOwner physical_memory_owner_ =
+            PhysicalMemoryOwner::PrimaryModelWeights;
         std::vector<WeightRequirement> requirements_;
     };
 
+    /** @brief Mutable construction helper that assigns immutable binding IDs. */
     class ModelWeightSetBuilder
     {
     public:
+        /** @brief Start a binding builder for one execution strategy. */
         explicit ModelWeightSetBuilder(InferenceStrategy strategy = {});
 
+        /** @brief Add a binding and assign missing binding/instance identifiers. */
         WeightBinding &addBinding(WeightBinding binding);
+        /** @brief Mark all bindings immutable and transfer their ownership. */
         std::vector<WeightBinding> freezeBindings();
+        /** @return Strategy inherited by bindings created through this builder. */
         const InferenceStrategy &strategy() const { return strategy_; }
 
     private:
@@ -110,26 +160,69 @@ namespace llaminar2
         std::vector<WeightBinding> bindings_;
     };
 
+    /**
+     * @brief Immutable graph-time lookup authority for materialized weights.
+     *
+     * The unqualified layer lookup remains available for single-binding plans.
+     * Heterogeneous plans must select bindings with @ref optionalLayerForDevice
+     * so a CPU tier's exact expert slice can never shadow a CUDA or ROCm tier
+     * merely because it was appended later to the plan.
+     */
     class FrozenModelWeightSet
     {
     public:
-        /// Bindings are logically immutable after construction. Call validateForGraph()
-        /// before execution to enforce that every binding came from ModelWeightSetBuilder::freezeBindings().
-        FrozenModelWeightSet(InferenceStrategy strategy, std::vector<WeightBinding> bindings);
+        /**
+         * @brief Construct and index immutable materialized bindings.
+         *
+         * Call @ref validateForGraph before execution to verify that every
+         * binding came from @ref ModelWeightSetBuilder::freezeBindings.
+         */
+        FrozenModelWeightSet(
+            InferenceStrategy strategy,
+            std::vector<WeightBinding> bindings,
+            PhysicalMemoryOwner physical_memory_owner =
+                PhysicalMemoryOwner::PrimaryModelWeights);
 
+        /** @return Execution strategy used to materialize these bindings. */
         const InferenceStrategy &strategy() const { return strategy_; }
+        /** @return Exact persistent-weight owner certified by the source plan. */
+        PhysicalMemoryOwner physicalMemoryOwner() const noexcept
+        {
+            return physical_memory_owner_;
+        }
+        /** @return All immutable bindings in deterministic plan order. */
         const std::vector<WeightBinding> &bindings() const { return bindings_; }
+        /** @brief Return a required model-global binding or throw when absent. */
         const WeightBinding &global(const std::string &canonical_name) const;
+        /** @brief Return a required layer binding or throw when absent. */
         const WeightBinding &layer(int layer_idx, const std::string &suffix) const;
+        /** @brief Return an unqualified layer binding, or nullptr when absent. */
         const WeightBinding *optionalLayer(int layer_idx, const std::string &suffix) const;
+        /**
+         * @brief Return the sole layer binding resident on @p device.
+         *
+         * A null result means that the device does not own the requested
+         * binding.  More than one matching binding is an invalid graph
+         * authority and throws instead of selecting by insertion order.
+         */
+        const WeightBinding *optionalLayerForDevice(
+            int layer_idx,
+            const std::string &suffix,
+            DeviceId device) const;
+        /** @brief Return all bindings whose home or resident device is @p device. */
         std::vector<const WeightBinding *> forDevice(DeviceId device) const;
+        /** @brief Verify immutable IDs and prepared-handle identity invariants. */
         void validateForGraph() const;
+        /** @return A human-readable audit table for diagnostics and evidence. */
         std::string renderAuditTable() const;
 
     private:
+        /** @brief Populate the legacy unqualified lookup indexes for one binding. */
         void indexBinding(size_t index, const WeightBinding &binding);
 
         InferenceStrategy strategy_;
+        PhysicalMemoryOwner physical_memory_owner_ =
+            PhysicalMemoryOwner::PrimaryModelWeights;
         std::vector<WeightBinding> bindings_;
         std::unordered_map<std::string, size_t> global_index_;
         std::unordered_map<std::string, size_t> layer_index_;

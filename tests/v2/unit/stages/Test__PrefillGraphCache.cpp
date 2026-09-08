@@ -68,24 +68,20 @@ private:
 };
 
 /**
- * @brief Temporarily override the ROCm grouped-prefill flag for preflight tests.
+ * @brief Mock stage with exact-shape prefill support but delayed capture readiness.
  */
-class ScopedRocmGroupedPrefillFlag
+class ColdLazyPreflightOnlyMockStage : public MockComputeStage
 {
 public:
-    explicit ScopedRocmGroupedPrefillFlag(bool enabled)
-        : old_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
-    {
-        mutableDebugEnv().rocm.moe_grouped_prefill = enabled;
-    }
+    ColdLazyPreflightOnlyMockStage(std::string name, DeviceId dev)
+        : MockComputeStage(ComputeStageType::GEMM, std::move(name), dev) {}
 
-    ~ScopedRocmGroupedPrefillFlag()
-    {
-        mutableDebugEnv().rocm.moe_grouped_prefill = old_prefill_;
-    }
+    bool supportsLazyPrefillGraphCapturePreflight() const override { return true; }
+    bool isGraphCapturable() const override { return capture_ready_; }
+    void setCaptureReady(bool ready) { capture_ready_ = ready; }
 
 private:
-    bool old_prefill_;
+    bool capture_ready_ = false;
 };
 
 /**
@@ -113,6 +109,21 @@ public:
 };
 
 /**
+ * @brief Observable lifecycle state shared by the fake graph and worker.
+ *
+ * The cache now owns capture as one callback-scoped transaction. Keeping the
+ * counters outside the graph object lets tests inspect begin/end/instantiate
+ * behavior after the successfully instantiated graph moves into the cache.
+ */
+struct FakePrefillGraphCaptureProbe
+{
+    int begin_calls = 0;
+    int end_calls = 0;
+    int instantiate_calls = 0;
+    bool end_succeeds = true;
+};
+
+/**
  * @brief Minimal graph capture object for PrefillGraphCache state-machine tests.
  *
  * The cache tests only need to verify lifecycle dispatch and phase transitions,
@@ -121,21 +132,42 @@ public:
 class FakePrefillGraphCapture final : public IGPUGraphCapture
 {
 public:
-    bool beginCapture() override { return true; }
-    bool endCapture() override { return true; }
+    explicit FakePrefillGraphCapture(
+        FakePrefillGraphCaptureProbe *probe,
+        void *stream)
+        : probe_(probe), stream_(stream)
+    {
+    }
+
+    bool beginCapture() override
+    {
+        ++probe_->begin_calls;
+        return true;
+    }
+    bool endCapture() override
+    {
+        ++probe_->end_calls;
+        return probe_->end_succeeds;
+    }
     bool instantiate() override
     {
+        ++probe_->instantiate_calls;
         executable_ = true;
         return true;
     }
     bool launch() override { return executable_; }
+    [[nodiscard]] void *executionStream() const noexcept override { return stream_; }
     GraphUpdateResult tryUpdate() override { return GraphUpdateResult::Success; }
+    [[nodiscard]] bool supportsExecutableUpdate() const noexcept override { return true; }
     bool hasExecutable() const override { return executable_; }
+    [[nodiscard]] std::size_t residentMemoryBytes() const noexcept override { return 0u; }
     size_t nodeCount() const override { return 1; }
     void reset() override { executable_ = false; }
     const char *backendName() const override { return "Fake"; }
 
 private:
+    FakePrefillGraphCaptureProbe *probe_ = nullptr;
+    void *stream_ = nullptr;
     bool executable_ = false;
 };
 
@@ -169,6 +201,13 @@ public:
         destroyed_stream_ = stream;
         destroy_stream_calls_++;
     }
+    void *getOrCreateAuxiliaryStream(const std::string &, bool *created = nullptr) override
+    {
+        if (created)
+            *created = false;
+        return &auxiliary_stream_;
+    }
+    void resetAuxiliaryStreams() override {}
 
     void *createEvent() override { return nullptr; }
     void destroyEvent(void *) override {}
@@ -182,19 +221,31 @@ public:
     void *collectiveComm() const override { return nullptr; }
     void synchronize() override {}
     void synchronizeStream(void *) override {}
-    void insertStreamDependency(void *, void *) override {}
+    GPUStreamExecutionState queryStreamExecutionState(
+        void *stream,
+        std::string_view boundary) override
+    {
+        if (!stream || boundary.empty())
+            throw std::invalid_argument("mock stream query requires an exact stream and boundary");
+        return GPUStreamExecutionState::Complete;
+    }
+    bool insertStreamDependency(void *, void *) override { return true; }
 
     std::unique_ptr<IGPUGraphCapture> createGraphCapture() override
     {
         default_capture_calls_++;
-        return std::make_unique<FakePrefillGraphCapture>();
+        return std::make_unique<FakePrefillGraphCapture>(
+            &capture_probe_,
+            defaultStream());
     }
 
     std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override
     {
         explicit_capture_calls_++;
         last_capture_stream_ = stream;
-        return std::make_unique<FakePrefillGraphCapture>();
+        return std::make_unique<FakePrefillGraphCapture>(
+            &capture_probe_,
+            stream);
     }
 
     int default_capture_calls_ = 0;
@@ -202,10 +253,12 @@ public:
     int destroy_stream_calls_ = 0;
     void *last_capture_stream_ = nullptr;
     void *destroyed_stream_ = nullptr;
+    FakePrefillGraphCaptureProbe capture_probe_;
 
 private:
     int default_stream_ = 0;
     int created_stream_ = 0;
+    int auxiliary_stream_ = 0;
 };
 
 // =============================================================================
@@ -252,6 +305,10 @@ static MoERoutingStage::Params makeColdRocmRoutingParams(
     int num_experts,
     int top_k)
 {
+    // Preflight only checks ownership. The pointer is never dereferenced by
+    // this device-free unit test, but its stable lifetime models the required
+    // resident active-row scalar owned by a real padded graph.
+    static int32_t active_row_count_device_sentinel = 0;
     MoERoutingStage::Params params;
     params.device_id = device;
     params.input = input;
@@ -264,6 +321,8 @@ static MoERoutingStage::Params makeColdRocmRoutingParams(
     params.top_k = top_k;
     params.norm_topk_prob = true;
     params.layer_idx = 0;
+    params.active_row_count_device =
+        &active_row_count_device_sentinel;
     return params;
 }
 
@@ -275,7 +334,7 @@ TEST(Test__PrefillGraphCache, DefaultConfig_MatchesExpectedDefaults)
 {
     PrefillGraphConfig config;
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.min_seq_len, 256);
+    EXPECT_EQ(config.minimum_padded_bucket_seq_len, 256);
     EXPECT_FALSE(config.trace);
     EXPECT_TRUE(config.buckets_enabled);
     EXPECT_EQ(config.max_cached_entries, 10u);
@@ -339,6 +398,195 @@ TEST(Test__PrefillGraphCache, BucketSelection_NormalizesConfiguredBuckets)
     EXPECT_EQ(selection.bucket_seq_len, 256);
 }
 
+TEST(Test__PrefillGraphCache, ResidentCapacityFiltersLargerBucketsAndRemainsTotal)
+{
+    const auto bounded = prefillGraphBucketsAtOrBelowCapacity(
+        {64, 128, 256, 512, 1024, 2048, 4096},
+        2048);
+
+    EXPECT_EQ(
+        bounded,
+        (std::vector<int>{64, 128, 256, 512, 1024, 2048}));
+    EXPECT_TRUE(selectPrefillGraphBucket(2048, bounded));
+    EXPECT_FALSE(selectPrefillGraphBucket(2049, bounded));
+
+    const auto below_default_minimum =
+        prefillGraphBucketsAtOrBelowCapacity({64, 128}, 32);
+    EXPECT_EQ(below_default_minimum, (std::vector<int>{32}))
+        << "short-context runners still need one total graph boundary";
+}
+
+TEST(Test__PrefillGraphCache,
+     ExpertOverlayDefaultSegmentFitsCompleteBucketFamilyAndRuntimeReserve)
+{
+    const auto retained_buckets = prefillGraphBucketsAtOrBelowCapacity(
+        defaultPrefillGraphBuckets(),
+        kDefaultExpertOverlayPrefillSegmentRows);
+
+    EXPECT_EQ(kDefaultExpertOverlayPrefillSegmentRows, 600)
+        << "The production bucket inventory currently resolves the measured "
+           "single-segment 595-token regime to its 600-row capture";
+    ASSERT_FALSE(retained_buckets.empty());
+    EXPECT_EQ(retained_buckets.back(),
+              kDefaultExpertOverlayPrefillSegmentRows);
+    EXPECT_LE(
+        retained_buckets.size() +
+            kExpertOverlayPrefillGraphIdentityReserve,
+        kDefaultPrefillGraphMaxCachedEntries)
+        << "Serving setup must not evict its own lower buckets when live "
+           "request and prefix-runtime identities are installed";
+}
+
+TEST(Test__PrefillGraphCache,
+     ExpertOverlayLadderMinimizesPaddingWithinRetainedCacheBudget)
+{
+    const auto retained = retainedPrefillGraphBucketLadder(
+        defaultPrefillGraphBuckets(),
+        /*resident_graph_rows=*/768,
+        /*maximum_bucket_count=*/8);
+    EXPECT_EQ(
+        retained,
+        (std::vector<int>{64, 128, 256, 384, 512, 576, 672, 768}));
+    EXPECT_EQ(
+        retainedPrefillGraphBucketLadder(
+            {64, 128, 256}, 256, /*maximum_bucket_count=*/1),
+        (std::vector<int>{256}));
+    EXPECT_TRUE(
+        retainedPrefillGraphBucketLadder(
+            {64, 128}, 128, /*maximum_bucket_count=*/0)
+            .empty());
+}
+
+TEST(Test__PrefillGraphCache, ResidentCandidatesAreDescendingConfiguredShapes)
+{
+    EXPECT_EQ(
+        residentPrefillGraphRowCandidates(
+            {512, 128, -1, 256, 128, 1024}, 600),
+        (std::vector<int>{512, 256, 128}));
+    EXPECT_EQ(
+        residentPrefillGraphRowCandidates({64, 128}, 32),
+        (std::vector<int>{32}));
+    EXPECT_TRUE(
+        residentPrefillGraphRowCandidates({64, 128}, 0).empty());
+}
+
+TEST(Test__PrefillGraphCache, SegmentedCandidatesDoNotAdmitFullContextGraphs)
+{
+    const std::vector<int> buckets{256, 512, 1024, 2048, 4096};
+    EXPECT_EQ(
+        segmentedPrefillGraphRowCandidates(buckets, 4096, 256),
+        (std::vector<int>{256}));
+    EXPECT_EQ(
+        segmentedPrefillGraphRowCandidates(buckets, 4096, 448),
+        (std::vector<int>{256}));
+    EXPECT_EQ(
+        segmentedPrefillGraphRowCandidates(buckets, 128, 256),
+        (std::vector<int>{128}));
+    EXPECT_TRUE(
+        segmentedPrefillGraphRowCandidates(buckets, 4096, 0).empty());
+}
+
+TEST(Test__PrefillGraphCache,
+     MTPSharedCapacityCannotManufactureAPrefillBucket)
+{
+    const int admitted_prefill_rows =
+        resolvePrefillScheduleRowCapacity(
+            /*admitted_prefill_rows=*/9,
+            /*configured_segment_rows=*/256);
+    ASSERT_EQ(admitted_prefill_rows, 9);
+
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 15;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    const int shared_graph_rows =
+        resolveRetainedGraphRowCapacity(admitted_prefill_rows, mtp);
+    ASSERT_EQ(shared_graph_rows, 16)
+        << "the physical graph arena must still cover depth plus bonus row";
+
+    EXPECT_EQ(
+        retainedRawPrefillGraphBucketLadder(
+            {9},
+            admitted_prefill_rows,
+            /*configured_floor=*/1,
+            /*maximum_bucket_count=*/4u),
+        (std::vector<int>{9}))
+        << "neither the larger verifier arena nor a logical suffix may "
+           "manufacture another prefill executable shape";
+    EXPECT_EQ(resolvePrefillScheduleRowCapacity(9, 4), 4);
+    EXPECT_EQ(resolvePrefillScheduleRowCapacity(0, 4), 0);
+    EXPECT_EQ(resolvePrefillScheduleRowCapacity(9, 0), 0);
+}
+
+TEST(Test__PrefillGraphCache, RawPromptFloorCannotExceedResidentCapacity)
+{
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(256, 128),
+        128);
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(64, 128),
+        64);
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(0, 128),
+        1);
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(256, 0),
+        256);
+}
+
+TEST(Test__PrefillGraphCache,
+     RawPromptInventoryIsSharedByCaptureAndAuthenticatedSidebands)
+{
+    const auto buckets = rawPrefillGraphBucketsForResidentCapacity(
+        {64, 128, 256, 512},
+        /*resident_graph_rows=*/256,
+        /*configured_floor=*/64);
+    EXPECT_EQ(buckets, (std::vector<int>{64, 128, 256}));
+
+    const auto ten_rows = selectPrefillGraphBucket(10, buckets);
+    ASSERT_TRUE(ten_rows);
+    EXPECT_EQ(ten_rows.bucket_seq_len, 64)
+        << "a transaction ticket must authenticate the same physical bucket "
+           "that ForwardExecutionEngine captures";
+
+    const auto short_context = rawPrefillGraphBucketsForResidentCapacity(
+        {64, 128},
+        /*resident_graph_rows=*/32,
+        /*configured_floor=*/64);
+    EXPECT_EQ(short_context, (std::vector<int>{32}))
+        << "the shared resolver retains the capacity-complete short-context "
+           "boundary";
+}
+
+TEST(Test__PrefillGraphCache,
+     RetainedRawPromptLadderPreservesTheForwardPreflightFloor)
+{
+    const auto retained = retainedRawPrefillGraphBucketLadder(
+        {64, 128, 256, 384, 512, 600},
+        /*resident_graph_rows=*/600,
+        /*configured_floor=*/256,
+        /*maximum_bucket_count=*/4u);
+    ASSERT_FALSE(retained.empty());
+    EXPECT_EQ(retained.front(), 256);
+    EXPECT_EQ(retained.back(), 600);
+    EXPECT_LE(retained.size(), 4u);
+    EXPECT_EQ(
+        std::find(retained.begin(), retained.end(), 64),
+        retained.end());
+    EXPECT_EQ(
+        std::find(retained.begin(), retained.end(), 128),
+        retained.end());
+
+    EXPECT_EQ(
+        retainedRawPrefillGraphBucketLadder(
+            {64, 128, 256},
+            /*resident_graph_rows=*/128,
+            /*configured_floor=*/256,
+            /*maximum_bucket_count=*/4u),
+        (std::vector<int>{128}))
+        << "a memory-planned graph below the global floor remains total";
+}
+
 TEST(Test__PrefillGraphCache, BucketPadding_CopiesRealTokensAndPadsTail)
 {
     const int tokens[] = {10, 11, 12};
@@ -387,7 +635,9 @@ TEST(Test__PrefillGraphCache, ChunkSchedule_UsesFixedIntervalAndRealTokenRange)
     EXPECT_EQ(schedule.chunks[2].chunk_index, 2);
     EXPECT_EQ(schedule.chunks[2].token_offset, 224);
     EXPECT_EQ(schedule.chunks[2].real_count, 58);
-    EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 64);
+    EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 128)
+        << "A fixed real-token interval must retain one physical graph bucket "
+           "for its short final tail.";
 }
 
 TEST(Test__PrefillGraphCache, ChunkSchedule_RebalanceIntervalsCountRealTokensOnly)
@@ -661,10 +911,10 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsDisabledConfig)
     EXPECT_EQ(reason, PrefillGraphRejectReason::FeatureDisabled);
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsLowSeqLen)
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketBelowFloor)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 256;
+    config.minimum_padded_bucket_seq_len = 256;
     PrefillGraphCache cache(config);
 
     PrefillGraphCacheKey key;
@@ -672,8 +922,68 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsLowSeqLen)
     key.device_id = DeviceId::rocm(0);
     auto graph = buildCapturableGraph(key.device_id);
 
-    auto reason = cache.preflight(graph, key, nullptr, false);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SeqLenBelowMinimum);
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        false,
+        false,
+        /*real_seq_len=*/32,
+        /*bucket_seq_len=*/64);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::PaddedBucketBelowMinimum);
+}
+
+TEST(Test__PrefillGraphCache, ServingRawPromptLadderPassesPreflightForEveryShortRequest)
+{
+    // The HTTP regression was 39 live rows scheduled into a 64-row bucket
+    // while preflight required 256. Exercise both GPU identities without
+    // initializing a device: this is a planner/preflight contract test.
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        for (const int capacity : {64, 128, 256, 512})
+        {
+            PrefillGraphConfig config;
+            config.minimum_padded_bucket_seq_len =
+                effectivePrefillGraphMinimumPaddedBucketSeqLen(256, capacity);
+            PrefillGraphCache cache(config);
+            const auto buckets = rawPrefillGraphBucketsForResidentCapacity(
+                {32, 64, 128, 256, 512}, capacity, 256);
+            for (int live_rows = 2; live_rows <= capacity; ++live_rows)
+            {
+                const auto selection = selectPrefillGraphBucket(live_rows, buckets);
+                auto key = makeGPUKey(selection.bucket_seq_len);
+                key.device_id = device;
+                const auto graph = buildCapturableGraph(device);
+                const auto reason = cache.preflight(graph, key, nullptr, false,
+                    false, live_rows, selection.bucket_seq_len);
+                EXPECT_NE(reason, PrefillGraphRejectReason::PaddedBucketBelowMinimum)
+                    << "live=" << live_rows << " capacity=" << capacity;
+            }
+        }
+    }
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AllowsExactGraphBelowPaddedBucketFloor)
+{
+    PrefillGraphConfig config;
+    config.minimum_padded_bucket_seq_len = 256;
+    PrefillGraphCache cache(config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = 64;
+    key.device_id = DeviceId::rocm(0);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    const auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        false,
+        false,
+        /*real_seq_len=*/64,
+        /*bucket_seq_len=*/64);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+        << "The minimum coalesces padded raw prompts; it must not authorize eager execution for exact GPU graphs.";
 }
 
 TEST(Test__PrefillGraphCache, Preflight_RejectsCPUDevice)
@@ -690,7 +1000,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsCPUDevice)
     EXPECT_EQ(reason, PrefillGraphRejectReason::NotGPUDevice);
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsSnapshots)
+TEST(Test__PrefillGraphCache, Preflight_AllowsSnapshots)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -699,10 +1009,10 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsSnapshots)
     auto graph = buildCapturableGraph(key.device_id);
 
     auto reason = cache.preflight(graph, key, nullptr, /*snapshots_active=*/true);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SnapshotsActive);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsMoERebalancing)
+TEST(Test__PrefillGraphCache, Preflight_AllowsExactShapeMoERebalancing)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -711,7 +1021,51 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsMoERebalancing)
     auto graph = buildCapturableGraph(key.device_id);
 
     auto reason = cache.preflight(graph, key, nullptr, false, /*moe_rebalancing_active=*/true);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketNonGraphStableMoERebalancing)
+{
+    PrefillGraphConfig config;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(768);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/true,
+        /*real_seq_len=*/512,
+        /*bucket_seq_len=*/768);
     EXPECT_EQ(reason, PrefillGraphRejectReason::ActiveMoERebalancing);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AllowsPaddedBucketGraphStableMoERebalancing)
+{
+    PrefillGraphConfig config;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(768);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/true,
+        /*real_seq_len=*/512,
+        /*bucket_seq_len=*/768,
+        PrefillGraphPreflightMode::Default,
+        /*collectives_graph_capturable=*/false,
+        /*heterogeneous_segmentation_admitted=*/false,
+        PrefillMoEGraphStability::Stable);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
 TEST(Test__PrefillGraphCache, Preflight_RejectsCollectives)
@@ -725,6 +1079,54 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsCollectives)
     std::unordered_set<std::string> collectives = {"allreduce_0"};
     auto reason = cache.preflight(graph, key, &collectives, false);
     EXPECT_EQ(reason, PrefillGraphRejectReason::CollectiveNodesPresent);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AllowsCallerVettedGraphCapturableCollectives)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(512);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    std::unordered_set<std::string> collectives = {"allreduce_0"};
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &collectives,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/0,
+        /*bucket_seq_len=*/0,
+        PrefillGraphPreflightMode::Default,
+        /*collectives_graph_capturable=*/true);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_CallerVettedCollectivesStillRequireCapturableStages)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(512);
+
+    ComputeGraph graph;
+    graph.addNode("stage_0", std::make_unique<CapturableMockStage>("stage_0", key.device_id), key.device_id);
+    graph.addNode("stage_1", std::make_unique<NonCapturableMockStage>("stage_1", key.device_id), key.device_id);
+    graph.addDependency("stage_1", "stage_0");
+
+    std::unordered_set<std::string> collectives = {"allreduce_0"};
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &collectives,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/0,
+        /*bucket_seq_len=*/0,
+        PrefillGraphPreflightMode::Default,
+        /*collectives_graph_capturable=*/true);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
 }
 
 TEST(Test__PrefillGraphCache, Preflight_RejectsNonCapturableStage)
@@ -744,10 +1146,58 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsNonCapturableStage)
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
 }
 
+TEST(Test__PrefillGraphCache, Preflight_ExactShapeUsesLazySupportBeforeWarmupReadiness)
+{
+    PrefillGraphConfig config;
+    config.minimum_padded_bucket_seq_len = 1;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(595);
+    ComputeGraph graph;
+    auto stage = std::make_unique<ColdLazyPreflightOnlyMockStage>("lazy_stage", key.device_id);
+    auto *stage_ptr = stage.get();
+    graph.addNode("lazy_stage", std::move(stage), key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/595);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+        << "Exact-shape cold preflight should allow a support-only warmup pass.";
+
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/595,
+        PrefillGraphPreflightMode::CaptureReady);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable)
+        << "Capture itself must still require warmed graph resources.";
+
+    stage_ptr->setCaptureReady(true);
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/595,
+        PrefillGraphPreflightMode::CaptureReady);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
 TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupReadiness)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
 
@@ -776,7 +1226,8 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupR
         /*moe_rebalancing_active=*/false,
         /*real_seq_len=*/595,
         /*bucket_seq_len=*/608);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+        << "Default preflight validates support so a fresh warmup can run.";
 
     const auto reset = cache.prepareEntriesForRequestReset();
     ASSERT_EQ(reset.initialized, 1u);
@@ -820,8 +1271,6 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupR
 
 TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKernelWarmup)
 {
-    ScopedRocmGroupedPrefillFlag grouped_prefill(true);
-
     constexpr int seq_len = 608;
     constexpr int real_seq_len = 595;
     constexpr int d_model = 64;
@@ -834,7 +1283,7 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKer
     auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
 
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
 
@@ -864,14 +1313,22 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKer
         real_seq_len,
         seq_len);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 #else
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
 #endif
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupported)
+/**
+ * @brief A padded router must name the resident scalar that masks padding rows.
+ *
+ * Backend support alone is insufficient: without this device-owned logical-row
+ * count, a fixed-width captured launch would route synthetic padding and mutate
+ * downstream expert state. Cold preflight must reject that incomplete graph
+ * before warmup or capture can hide the missing ownership edge.
+ */
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedMoERoutingWithoutResidentRowCount)
 {
     constexpr int seq_len = 608;
     constexpr int real_seq_len = 595;
@@ -885,12 +1342,63 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupport
     auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
 
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = seq_len;
+    key.device_id = DeviceId::rocm(0);
+
+    auto params = makeColdRocmRoutingParams(
+        input.get(),
+        gate_weights.get(),
+        output_indices.get(),
+        output_weights.get(),
+        key.device_id,
+        seq_len,
+        d_model,
+        num_experts,
+        top_k);
+    params.active_row_count_device = nullptr;
+
+    ComputeGraph graph;
+    graph.addNode(
+        "layer0_moe_routing",
+        std::make_unique<MoERoutingStage>(params),
+        key.device_id);
+
+    EXPECT_EQ(
+        cache.preflight(
+            graph,
+            key,
+            nullptr,
+            /*snapshots_active=*/false,
+            /*moe_rebalancing_active=*/false,
+            real_seq_len,
+            seq_len),
+        PrefillGraphRejectReason::StageNotCapturable);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingUsesBackendGroupedCapability)
+{
+    constexpr int seq_len = 608;
+    constexpr int real_seq_len = 595;
+    constexpr int d_model = 64;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+
+    auto input = TestTensorFactory::createFP32({seq_len, d_model});
+    auto gate_weights = TestTensorFactory::createFP32({num_experts, d_model});
+    auto output_indices = TestTensorFactory::createFP32({seq_len * top_k, 1});
+    auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
+
+    PrefillGraphConfig config;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
 
     {
-        ScopedRocmGroupedPrefillFlag grouped_prefill(false);
         PrefillGraphCacheKey key;
         key.seq_len = seq_len;
         key.device_id = DeviceId::rocm(0);
@@ -903,11 +1411,16 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupport
 
         const auto reason = cache.preflight(
             graph, key, nullptr, false, false, real_seq_len, seq_len);
+#if defined(HAVE_ROCM)
+        EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+            << "Cold padded MoE routing should use compiled backend capability, "
+               "not a runtime capability-advertisement switch";
+#else
         EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+#endif
     }
 
     {
-        ScopedRocmGroupedPrefillFlag grouped_prefill(true);
         PrefillGraphCacheKey key;
         key.seq_len = seq_len;
         key.device_id = DeviceId::cuda(0);
@@ -920,7 +1433,11 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupport
 
         const auto reason = cache.preflight(
             graph, key, nullptr, false, false, real_seq_len, seq_len);
+#if defined(HAVE_CUDA)
+        EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+#else
         EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+#endif
     }
 }
 
@@ -952,7 +1469,7 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsEmptyCollectiveSet)
 TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWithUnsupportedGDNState)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -980,7 +1497,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWithUnsupportedGDNSta
 TEST(Test__PrefillGraphCache, Preflight_AcceptsPaddedBucketWithSupportedGDNState)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1014,7 +1531,7 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsPaddedBucketWithSupportedGDNState
 TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketIfAnyGDNStateLacksContract)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1048,7 +1565,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketIfAnyGDNStateLacksCon
 TEST(Test__PrefillGraphCache, Preflight_RejectsSupportedPaddedGDNWhenStageIsNotCapturable)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = true;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1075,7 +1592,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsSupportedPaddedGDNWhenStageIsNotC
 TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWhenBucketsDisabled)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     config.buckets_enabled = false;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
@@ -1096,7 +1613,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWhenBucketsDisabled)
 TEST(Test__PrefillGraphCache, Preflight_AllowsExactBucketWithGDNState)
 {
     PrefillGraphConfig config;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     PrefillGraphCache cache(config);
     auto key = makeGPUKey(768);
     ComputeGraph graph;
@@ -1176,17 +1693,21 @@ TEST(Test__PrefillGraphCache, Launch_FailsIfNotReady)
     EXPECT_FALSE(cache.launch(key));
 }
 
-TEST(Test__PrefillGraphCache, BeginCapture_FailsIfNotWarmedUp)
+TEST(Test__PrefillGraphCache, CaptureTransactionFailsIfNotWarmedUp)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
 
     auto key = makeGPUKey(512);
     // Cold state - should fail
-    EXPECT_FALSE(cache.beginCapture(key, nullptr, nullptr));
+    EXPECT_FALSE(cache.captureAndInstantiate(
+        key,
+        nullptr,
+        nullptr,
+        []() { return true; }));
 }
 
-TEST(Test__PrefillGraphCache, BeginCapture_FailsWithNullContext)
+TEST(Test__PrefillGraphCache, CaptureTransactionFailsWithNullContext)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -1194,10 +1715,14 @@ TEST(Test__PrefillGraphCache, BeginCapture_FailsWithNullContext)
     auto key = makeGPUKey(512);
     cache.markWarmedUp(key);
     // Null GPU context - should fail
-    EXPECT_FALSE(cache.beginCapture(key, nullptr, nullptr));
+    EXPECT_FALSE(cache.captureAndInstantiate(
+        key,
+        nullptr,
+        nullptr,
+        []() { return true; }));
 }
 
-TEST(Test__PrefillGraphCache, BeginCapture_FailsWithNullExplicitStream)
+TEST(Test__PrefillGraphCache, CaptureTransactionFailsWithNullExplicitStream)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -1206,13 +1731,17 @@ TEST(Test__PrefillGraphCache, BeginCapture_FailsWithNullExplicitStream)
     auto key = makeGPUKey(512);
     cache.markWarmedUp(key);
 
-    EXPECT_FALSE(cache.beginCapture(key, &gpu_ctx, nullptr));
+    EXPECT_FALSE(cache.captureAndInstantiate(
+        key,
+        &gpu_ctx,
+        nullptr,
+        []() { return true; }));
     EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Warmup);
     EXPECT_EQ(gpu_ctx.default_capture_calls_, 0);
     EXPECT_EQ(gpu_ctx.explicit_capture_calls_, 0);
 }
 
-TEST(Test__PrefillGraphCache, BeginCapture_UsesExplicitStreamOverload)
+TEST(Test__PrefillGraphCache, CaptureTransactionUsesExplicitStreamOverload)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -1222,11 +1751,94 @@ TEST(Test__PrefillGraphCache, BeginCapture_UsesExplicitStreamOverload)
     cache.markWarmedUp(key);
     void *explicit_stream = gpu_ctx.createStream();
 
-    EXPECT_TRUE(cache.beginCapture(key, &gpu_ctx, explicit_stream));
-    EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Capturing);
+    bool body_observed_capturing_phase = false;
+    EXPECT_TRUE(cache.captureAndInstantiate(
+        key,
+        &gpu_ctx,
+        explicit_stream,
+        [&]()
+        {
+            body_observed_capturing_phase =
+                cache.phase(key) == PrefillGraphPhase::Capturing;
+            return true;
+        }));
+    EXPECT_TRUE(body_observed_capturing_phase);
+    EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Ready);
     EXPECT_EQ(gpu_ctx.default_capture_calls_, 0);
     EXPECT_EQ(gpu_ctx.explicit_capture_calls_, 1);
     EXPECT_EQ(gpu_ctx.last_capture_stream_, explicit_stream);
+    EXPECT_EQ(gpu_ctx.capture_probe_.begin_calls, 1);
+    EXPECT_EQ(gpu_ctx.capture_probe_.end_calls, 1);
+    EXPECT_EQ(gpu_ctx.capture_probe_.instantiate_calls, 1);
+    EXPECT_TRUE(cache.materializedTransactionZeroPending(key));
+    EXPECT_EQ(cache.replayCount(key), 0);
+
+    EXPECT_TRUE(cache.launch(key));
+    EXPECT_FALSE(cache.materializedTransactionZeroPending(key));
+    EXPECT_EQ(cache.replayCount(key), 1);
+}
+
+TEST(Test__PrefillGraphCache, SetupMaterializationArmsColdEntryWithoutWarmup)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+    const auto key = makeGPUKey(512);
+
+    ASSERT_EQ(cache.phase(key), PrefillGraphPhase::Cold);
+    cache.markInitializedForSetupMaterialization(key);
+
+    EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Initialized);
+    EXPECT_EQ(cache.warmupCount(key), 0);
+    EXPECT_EQ(cache.initializedCount(key), 1);
+    EXPECT_FALSE(cache.hasGraph(key));
+    EXPECT_FALSE(cache.materializedTransactionZeroPending(key));
+
+    cache.markInitializedForSetupMaterialization(key);
+    EXPECT_EQ(cache.initializedCount(key), 1)
+        << "Idempotent setup discovery must not invent another lifecycle transition";
+}
+
+TEST(Test__PrefillGraphCache, CaptureBodyFailureClosesTransactionAndStaysCold)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+    PrefillMockGPUContext gpu_ctx;
+
+    auto key = makeGPUKey(512);
+    cache.markWarmedUp(key);
+    void *explicit_stream = gpu_ctx.createStream();
+
+    EXPECT_FALSE(cache.captureAndInstantiate(
+        key,
+        &gpu_ctx,
+        explicit_stream,
+        []() { return false; }));
+    EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Cold);
+    EXPECT_FALSE(cache.hasGraph(key));
+    EXPECT_EQ(gpu_ctx.capture_probe_.begin_calls, 1);
+    EXPECT_EQ(gpu_ctx.capture_probe_.end_calls, 1);
+    EXPECT_EQ(gpu_ctx.capture_probe_.instantiate_calls, 0)
+        << "A failed graph body may not publish an executable.";
+}
+
+TEST(Test__PrefillGraphCache, FailedBackendCaptureClosureIsFatal)
+{
+    EXPECT_DEATH(
+        {
+            PrefillGraphConfig config;
+            PrefillGraphCache cache(config);
+            PrefillMockGPUContext gpu_ctx;
+            gpu_ctx.capture_probe_.end_succeeds = false;
+
+            const auto key = makeGPUKey(512);
+            cache.markWarmedUp(key);
+            (void)cache.captureAndInstantiate(
+                key,
+                &gpu_ctx,
+                gpu_ctx.createStream(),
+                []() { return false; });
+        },
+        "Fatal backend endCapture failure");
 }
 
 // =============================================================================
@@ -1289,8 +1901,11 @@ TEST(Test__PrefillGraphCache, Capacity_EvictedBucketWarmsAndCapturesAgain)
 
     // First lifecycle for key256: warm up, capture, instantiate, and become ready.
     cache.markWarmedUp(key256);
-    ASSERT_TRUE(cache.beginCapture(key256, &gpu_ctx, explicit_stream));
-    ASSERT_TRUE(cache.endCaptureAndInstantiate(key256));
+    ASSERT_TRUE(cache.captureAndInstantiate(
+        key256,
+        &gpu_ctx,
+        explicit_stream,
+        []() { return true; }));
     EXPECT_EQ(cache.phase(key256), PrefillGraphPhase::Ready);
     EXPECT_EQ(cache.warmupCount(key256), 1u);
     EXPECT_EQ(cache.captureCount(key256), 1u);
@@ -1305,8 +1920,11 @@ TEST(Test__PrefillGraphCache, Capacity_EvictedBucketWarmsAndCapturesAgain)
     // counters survive the eviction, so the test distinguishes recapture from
     // any silent normal-path execution that would leave these counts unchanged.
     cache.markWarmedUp(key256);
-    ASSERT_TRUE(cache.beginCapture(key256, &gpu_ctx, explicit_stream));
-    ASSERT_TRUE(cache.endCaptureAndInstantiate(key256));
+    ASSERT_TRUE(cache.captureAndInstantiate(
+        key256,
+        &gpu_ctx,
+        explicit_stream,
+        []() { return true; }));
 
     EXPECT_EQ(cache.phase(key256), PrefillGraphPhase::Ready);
     EXPECT_EQ(cache.warmupCount(key256), 2u);
@@ -1405,7 +2023,7 @@ TEST(Test__PrefillGraphCache, ToString_RejectReasons)
 {
     EXPECT_STREQ(toString(PrefillGraphRejectReason::None), "None");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::FeatureDisabled), "FeatureDisabled");
-    EXPECT_STREQ(toString(PrefillGraphRejectReason::SeqLenBelowMinimum), "SeqLenBelowMinimum");
+    EXPECT_STREQ(toString(PrefillGraphRejectReason::PaddedBucketBelowMinimum), "PaddedBucketBelowMinimum");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::NotGPUDevice), "NotGPUDevice");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::SnapshotsActive), "SnapshotsActive");
     EXPECT_STREQ(toString(PrefillGraphRejectReason::ActiveMoERebalancing), "ActiveMoERebalancing");
@@ -1491,12 +2109,16 @@ TEST_F(PrefillGraphCacheGPUTest, FullLifecycle_ColdToReady)
                             {
         void *stream = gpu_ctx_->defaultStream();
 
-        // Begin capture (empty capture is valid — validates state machine)
-        ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
-        EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Capturing);
-
-        // End capture and instantiate (empty graph)
-        ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
+        // Empty capture is valid and exercises the transactional state machine.
+        ASSERT_TRUE(cache.captureAndInstantiate(
+            key,
+            gpu_ctx_,
+            stream,
+            [&]()
+            {
+                EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Capturing);
+                return true;
+            }));
         EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Ready);
         EXPECT_TRUE(cache.hasGraph(key));
 
@@ -1520,8 +2142,11 @@ TEST_F(PrefillGraphCacheGPUTest, InvalidateAll_ResetsReadyEntries)
     gpu_ctx_->submitAndWait([&]
                             {
         void *stream = gpu_ctx_->defaultStream();
-        ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
-        ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
+        ASSERT_TRUE(cache.captureAndInstantiate(
+            key,
+            gpu_ctx_,
+            stream,
+            []() { return true; }));
         EXPECT_TRUE(cache.hasGraph(key)); });
 
     cache.invalidateAll();
@@ -1530,7 +2155,7 @@ TEST_F(PrefillGraphCacheGPUTest, InvalidateAll_ResetsReadyEntries)
     EXPECT_EQ(cache.nodeCount(key), 0u);
 }
 
-TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesWarmupToInitializedAndPreservesReadyEntries)
+TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesReadyAndWarmupToInitialized)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -1541,8 +2166,11 @@ TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesWarmupToInitializedAndPreser
     gpu_ctx_->submitAndWait([&]
                             {
         void *stream = gpu_ctx_->defaultStream();
-        ASSERT_TRUE(cache.beginCapture(ready_key, gpu_ctx_, stream));
-        ASSERT_TRUE(cache.endCaptureAndInstantiate(ready_key));
+        ASSERT_TRUE(cache.captureAndInstantiate(
+            ready_key,
+            gpu_ctx_,
+            stream,
+            []() { return true; }));
         ASSERT_TRUE(cache.launch(ready_key));
         EXPECT_EQ(cache.replayCount(ready_key), 1); });
 
@@ -1551,22 +2179,19 @@ TEST_F(PrefillGraphCacheGPUTest, RequestResetDemotesWarmupToInitializedAndPreser
     ASSERT_EQ(cache.phase(warmup_key), PrefillGraphPhase::Warmup);
 
     const auto reset = cache.prepareEntriesForRequestReset();
-    EXPECT_EQ(reset.ready_preserved, 1u);
+    EXPECT_EQ(reset.ready_demoted, 1u);
     EXPECT_EQ(reset.initialized, 1u)
         << "Warmup-only entries keep lazy stage/kernel initialization but must lose request-armed capture state.";
     EXPECT_EQ(reset.dropped, 0u);
-    EXPECT_EQ(cache.phase(ready_key), PrefillGraphPhase::Ready);
-    EXPECT_TRUE(cache.hasGraph(ready_key));
-    EXPECT_EQ(cache.replayCount(ready_key), 1);
+    EXPECT_EQ(cache.phase(ready_key), PrefillGraphPhase::Initialized);
+    EXPECT_FALSE(cache.hasGraph(ready_key))
+        << "Request reset must not preserve a launchable prefill executable captured against stale request state.";
+    EXPECT_EQ(cache.replayCount(ready_key), 0);
+    EXPECT_EQ(cache.initializedCount(ready_key), 1u);
     EXPECT_EQ(cache.phase(warmup_key), PrefillGraphPhase::Initialized);
     EXPECT_FALSE(cache.hasGraph(warmup_key));
     EXPECT_EQ(cache.initializedCount(warmup_key), 1u);
     EXPECT_EQ(cache.lastInvalidationReason(), PrefillGraphRejectReason::RequestStateReset);
-
-    gpu_ctx_->submitAndWait([&]
-                            {
-        ASSERT_TRUE(cache.launch(ready_key));
-        EXPECT_EQ(cache.replayCount(ready_key), 2); });
 }
 
 TEST_F(PrefillGraphCacheGPUTest, InitializedEntryCanCaptureAfterStrictReadiness)
@@ -1585,8 +2210,11 @@ TEST_F(PrefillGraphCacheGPUTest, InitializedEntryCanCaptureAfterStrictReadiness)
     gpu_ctx_->submitAndWait([&]
                             {
         void *stream = gpu_ctx_->defaultStream();
-        ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
-        ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
+        ASSERT_TRUE(cache.captureAndInstantiate(
+            key,
+            gpu_ctx_,
+            stream,
+            []() { return true; }));
         EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Ready);
         EXPECT_EQ(cache.captureCount(key), 1u); });
 }
@@ -1602,8 +2230,11 @@ TEST_F(PrefillGraphCacheGPUTest, ReplayCount_IncrementedOnLaunch)
     gpu_ctx_->submitAndWait([&]
                             {
         void *stream = gpu_ctx_->defaultStream();
-        ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
-        ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
+        ASSERT_TRUE(cache.captureAndInstantiate(
+            key,
+            gpu_ctx_,
+            stream,
+            []() { return true; }));
 
         ASSERT_TRUE(cache.launch(key));
         ASSERT_TRUE(cache.launch(key));
@@ -1622,8 +2253,11 @@ TEST_F(PrefillGraphCacheGPUTest, NodeCount_ZeroForEmptyCapture)
     gpu_ctx_->submitAndWait([&]
                             {
         void *stream = gpu_ctx_->defaultStream();
-        ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
-        ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
+        ASSERT_TRUE(cache.captureAndInstantiate(
+            key,
+            gpu_ctx_,
+            stream,
+            []() { return true; }));
         // Empty capture has 0 nodes
         EXPECT_EQ(cache.nodeCount(key), 0u); });
 }

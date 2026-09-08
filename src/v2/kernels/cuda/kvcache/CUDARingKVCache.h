@@ -32,11 +32,12 @@
 
 // Minimal includes - avoid MPI headers for nvcc compatibility
 #include "CUDARingKVCacheBase.h"                     // Common ring buffer base class
-#include "../../kvcache/KVCacheDeviceParams.h"       // Device-side params for graph capture
+#include "../../kvcache/KVCacheWorkspaceBuffers.h"   // Shared conversion workspace names
 #include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
 #include "../../../backends/IWorkerGPUContext.h"     // Device context support
 #include "../../../tensors/BlockStructures.h"        // Q8_1Block
+#include "../../../tensors/TensorType.h"             // TensorType
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -49,30 +50,6 @@ namespace llaminar2
     // Forward declarations
     class DeviceWorkspaceManager;
     struct WorkspaceRequirements;
-
-    // =========================================================================
-    // KV Cache Workspace Buffer Names
-    // =========================================================================
-
-    /**
-     * Standard buffer names for KV cache gather workspace.
-     * Used by launch_gather_kernel() for batched attention.
-     */
-    namespace KVCacheWorkspaceBuffers
-    {
-        /// Array of K cache pointers [batch_size × sizeof(void*)]
-        constexpr const char *BATCH_K_PTRS = "kvcache_batch_k_ptrs";
-        /// Array of V cache pointers [batch_size × sizeof(void*)]
-        constexpr const char *BATCH_V_PTRS = "kvcache_batch_v_ptrs";
-        /// Array of tail indices [batch_size × sizeof(int)]
-        constexpr const char *BATCH_TAILS = "kvcache_batch_tails";
-        /// Array of count values [batch_size × sizeof(int)]
-        constexpr const char *BATCH_COUNTS = "kvcache_batch_counts";
-        /// K conversion scratch used by append/read precision adaptation.
-        constexpr const char *CONV_SCRATCH_K = "kvcache_conv_scratch_k";
-        /// V conversion scratch used by append/read precision adaptation.
-        constexpr const char *CONV_SCRATCH_V = "kvcache_conv_scratch_v";
-    }
 
     // =========================================================================
     // ICUDARingKVCache Interface
@@ -150,7 +127,6 @@ namespace llaminar2
         // Bring in convenience overloads from IKVCache
         using IKVCache::append;
         using IKVCache::appendWithStream;
-        using IKVCache::clear_sequence;
         using IKVCache::get_kv;
 
         // =====================================================================
@@ -167,6 +143,20 @@ namespace llaminar2
         virtual bool append(int layer, int seq_idx,
                             const void *d_k, const void *d_v,
                             int num_tokens, cudaStream_t stream) = 0;
+
+        /**
+         * @brief Capture-safe fused convert+append path.
+         *
+         * Used by appendWithStream() for precision-mismatch paths. This avoids
+         * routing graph-captured appends through cache-wide conversion scratch,
+         * which can be overwritten by another captured cache append before the
+         * original append consumes it.
+         */
+        virtual bool appendConvertedWithStream(int layer, int seq_idx,
+                                               const void *d_k_src, const void *d_v_src,
+                                               TensorType src_type,
+                                               int num_tokens,
+                                               cudaStream_t stream) = 0;
 
         // Convenience for single-sequence mode
         bool append(int layer, const void *d_k, const void *d_v,
@@ -226,8 +216,6 @@ namespace llaminar2
         // Statistics
         // =====================================================================
 
-        virtual int get_total_evicted() const = 0;
-        virtual void reset_eviction_counter() = 0;
         virtual int get_linearization_count() const = 0;
         virtual void reset_linearization_counter() = 0;
 
@@ -307,7 +295,11 @@ namespace llaminar2
     // =========================================================================
 
     /**
-     * @brief Per-layer, per-sequence ring buffer entry
+     * @brief Immutable per-layer, per-sequence device payload topology.
+     *
+     * Mutable ring head/count state deliberately does not live in this host
+     * object. CUDARingKVCacheBase owns one canonical device row for each entry,
+     * and every append/read kernel consumes that row directly.
      */
     template <ActivationPrecision Precision>
     struct CUDARingKVEntry
@@ -317,34 +309,9 @@ namespace llaminar2
         DataT *d_K = nullptr; ///< Device memory: [max_seq_len, kv_dim]
         DataT *d_V = nullptr; ///< Device memory: [max_seq_len, kv_dim]
 
-        // Ring buffer state
-        int head = 0;  ///< Next write position
-        int count = 0; ///< Number of valid tokens
-
         // Per-sequence scratch buffers for linearization
         DataT *d_K_scratch = nullptr; ///< Linearized K when wrapped
         DataT *d_V_scratch = nullptr; ///< Linearized V when wrapped
-        bool scratch_valid = false;   ///< True if scratch contains current linearized data
-
-        /**
-         * @brief Get tail (oldest token) position
-         */
-        int tail(int max_seq_len) const
-        {
-            return (head - count + max_seq_len) % max_seq_len;
-        }
-
-        /**
-         * @brief Check if buffer is wrapped (tail > head or wraps around)
-         */
-        bool is_wrapped(int max_seq_len) const
-        {
-            if (count == 0)
-                return false;
-            int t = tail(max_seq_len);
-            // Wrapped if tail >= head (meaning data wraps around end of buffer)
-            return t >= head && count > 0;
-        }
     };
 
     // =========================================================================
@@ -447,16 +414,6 @@ namespace llaminar2
 
         ActivationPrecision k_precision() const override { return Precision; }
 
-        /**
-         * @brief Reset ring metadata and request-scoped CUDA sidecar buffers.
-         *
-         * Clears host/device dynamic head params, conversion scratch, RoPE shadow
-         * views, tensor wrappers, and persistent K/V storage. This preserves the
-         * same empty-cache invariant as reconstructing the cache while keeping
-         * stable device pointers for cached compute graphs.
-         */
-        void clear() override;
-
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
@@ -470,6 +427,49 @@ namespace llaminar2
         bool get_kv(int layer, int seq_idx,
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  ITensor **out_k, ITensor **out_v,
+                                  int *out_kv_len = nullptr) override;
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  const ITensor **out_k, const ITensor **out_v,
+                                  int *out_kv_len = nullptr) const override;
+
+        /**
+         * @brief Gather independent CUDA ring entries through device-owned metadata.
+         *
+         * Immutable entry pointers are uploaded once when workspace is bound;
+         * every replay then reads live ring heads/counts directly on the GPU and
+         * writes one contiguous native-format tensor for FlashAttention.
+         */
+        bool get_kv_batched_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            ITensor **out_k,
+            ITensor **out_v,
+            void *gpu_stream) override;
+
+        /** @copydoc IKVCache::get_kv_device_ring_view */
+        bool get_kv_device_ring_view(
+            int layer,
+            int seq_idx,
+            ITensor **out_k,
+            ITensor **out_v,
+            const int **device_head,
+            const int **device_count,
+            int *physical_capacity,
+            void *gpu_stream) override;
+
+        bool get_kv_batched_converted_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            ActivationPrecision target,
+            ITensor **out_k,
+            ITensor **out_v,
+            const KVReadParams &read) override;
 
         /**
          * @brief Append grouped verifier rows with serial-decode cache semantics.
@@ -490,7 +490,6 @@ namespace llaminar2
 
         // Bring in IKVCache overloads to avoid hiding
         using ICUDARingKVCache::append;
-        using ICUDARingKVCache::clear_sequence;
         using ICUDARingKVCache::gather_kv_batched;
 
         // =====================================================================
@@ -529,8 +528,6 @@ namespace llaminar2
                               int *kv_lens, int max_kv_len,
                               cudaStream_t stream) override;
 
-        int get_total_evicted() const override { return total_evicted_; }
-        void reset_eviction_counter() override { total_evicted_ = 0; }
         int get_linearization_count() const override { return linearization_count_; }
         void reset_linearization_counter() override { linearization_count_ = 0; }
 
@@ -546,6 +543,11 @@ namespace llaminar2
                           const DataT *d_k, const DataT *d_v,
                           int num_tokens, cudaStream_t stream);
 
+        bool appendConvertedWithStream(int layer, int seq_idx,
+                                       const void *d_k_src, const void *d_v_src,
+                                       TensorType src_type,
+                                       int num_tokens, cudaStream_t stream) override;
+
         // =====================================================================
         // IWorkspaceConsumer Interface
         // =====================================================================
@@ -553,9 +555,10 @@ namespace llaminar2
         /**
          * @brief Get workspace requirements for batched gather operations
          *
-         * Returns required buffer requirements for pointer arrays used in
-         * launch_gather_kernel(). Gather operations must use workspace buffers;
-         * raw per-call cudaMalloc/cudaFree is not allowed in the inference path.
+         * Returns the conversion/materialization scratch required by grouped
+         * request-batch reads. Immutable entry-pointer tables and mutable ring
+         * metadata are cache-owned device allocations; no host staging arrays
+         * or per-call GPU allocations participate.
          *
          * @param m Batch size (number of sequences)
          * @param n Unused
@@ -620,8 +623,7 @@ namespace llaminar2
         // When set, provides default stream for methods that accept optional streams
         IWorkerGPUContext *device_ctx_ = nullptr;
 
-        // Workspace manager for batched gather operations.
-        // launch_gather_kernel() requires these pre-allocated buffers.
+        // Workspace manager for grouped conversion/materialization scratch.
         DeviceWorkspaceManager *workspace_ = nullptr;
 
         // Entry storage: [n_layers][batch_size]
@@ -631,11 +633,55 @@ namespace llaminar2
         // Index 0 = K view, Index 1 = V view
         // Mutable because views are lazily created in const methods
         mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> tensor_views_;
+        mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> snapshot_tensor_views_;
+        /// Stable wrappers over complete physical rings used by direct attention.
+        mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> device_ring_views_;
+
+        /// Cache-owned wrappers over workspace-backed batched gather payloads.
+        std::unique_ptr<ITensor> batched_k_view_;
+        std::unique_ptr<ITensor> batched_v_view_;
+        /// Stable FP16 wrappers for grouped device-owned conversion/RoPE reads.
+        std::unique_ptr<ITensor> converted_batched_k_view_;
+        std::unique_ptr<ITensor> converted_batched_v_view_;
+        /// Per-cache immutable device topology; never shared with MTP caches.
+        DataT **d_batched_k_entry_table_ = nullptr;
+        DataT **d_batched_v_entry_table_ = nullptr;
+        /// True after construction uploads every immutable entry pointer.
+        bool batched_pointer_tables_ready_ = false;
 
         // Helper methods
         void allocate_entry(EntryT &entry);
         void free_entry(EntryT &entry);
-        void linearize_entry(EntryT &entry, cudaStream_t stream);
+        void allocate_all_entries();
+
+        /**
+         * @brief Publish immutable K/V entry topology before graph capture can begin.
+         *
+         * Grouped cache kernels consume one device array of K pointers and one
+         * device array of V pointers. CUDA entry allocations remain stable for
+         * the cache lifetime, so construction publishes these arrays exactly
+         * once. bindWorkspace() must never allocate these tables or perform H2D
+         * copies because workspace rebinding can occur while an outer graph
+         * transaction is recording.
+         *
+         * @throws std::runtime_error if either table cannot be allocated or
+         *         copied to the owning device.
+         */
+        void initializeBatchedEntryPointerTables();
+
+        /**
+         * @brief Release cache-owned entry topology during teardown or failed construction.
+         *
+         * This method is noexcept so partially constructed caches can clean up
+         * both tables before propagating their original initialization error.
+         */
+        void releaseBatchedEntryPointerTables() noexcept;
+
+        void linearize_entry(
+            EntryT &entry,
+            int head,
+            int count,
+            cudaStream_t stream);
 
         /**
          * @brief Get effective stream for kernel launches
@@ -653,50 +699,29 @@ namespace llaminar2
         }
 
         // Kernel launchers
-        void launch_append_kernel(EntryT &entry, const DataT *d_k, const DataT *d_v,
-                                  int num_tokens, cudaStream_t stream);
+        /**
+         * @brief Launch a graph-capturable append kernel with explicit replay row ownership.
+         *
+         * @param d_head Device scalar containing the ring head for this replay.
+         * @param d_append_count Device scalar containing the real rows inside a captured bucket.
+         */
         void launch_append_kernel_dynamic(EntryT &entry, const DataT *d_k, const DataT *d_v,
-                                          const int *d_head, int num_tokens, cudaStream_t stream);
-        void launch_linearize_kernel(const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
-                                     cudaStream_t stream);
-        bool launch_gather_kernel(const std::vector<EntryT *> &entries,
-                                  DataT *d_k_out, DataT *d_v_out,
-                                  int *kv_lens, int max_kv_len,
-                                  int num_seqs, cudaStream_t stream);
+                                          const int *d_head, const int *d_append_count,
+                                          int num_tokens, cudaStream_t stream);
+        void launch_linearize_kernel(
+            const EntryT &entry,
+            int head,
+            int count,
+            DataT *d_k_out,
+            DataT *d_v_out,
+            cudaStream_t stream);
 
-        // =====================================================================
-        // CUDARingKVCacheBase entry accessors and hooks
-        // =====================================================================
-
-        int entryHead(int layer, int seq_idx) const override { return entries_[layer][seq_idx].head; }
-        int entryCount(int layer, int seq_idx) const override { return entries_[layer][seq_idx].count; }
-        void setEntryHead(int layer, int seq_idx, int value) override { entries_[layer][seq_idx].head = value; }
-        void setEntryCount(int layer, int seq_idx, int value) override { entries_[layer][seq_idx].count = value; }
-
-        void resetEntry(int layer, int seq_idx) override
-        {
-            entries_[layer][seq_idx].head = 0;
-            entries_[layer][seq_idx].count = 0;
-            entries_[layer][seq_idx].scratch_valid = false;
-        }
-
-        void onClearSequence(int layer, int seq_idx) override
+        void onResetLayerSequenceState(int layer, int seq_idx) override
         {
             invalidateRoPEShadow(layer, seq_idx);
         }
 
-        void onEviction(int layer, int seq_idx, int num_evicted) override
-        {
-            total_evicted_ += num_evicted;
-        }
-
-        void onAdvanceComplete(int layer, int seq_idx) override
-        {
-            entries_[layer][seq_idx].scratch_valid = false;
-        }
-
-        // Statistics
-        mutable int total_evicted_ = 0;
+        // Diagnostic scalar-read statistics. Canonical ring state remains on device.
         mutable int linearization_count_ = 0;
 
     public:
@@ -714,9 +739,10 @@ namespace llaminar2
          * For Q8_1 caches: linearize + dequant → FP16 + RoPE → shadow buffer
          * For FP32 caches: linearize + convert → FP16 + RoPE → shadow buffer
          *
-         * Shadow buffers are allocated lazily and reused across calls.
-         * Only newly-appended tokens are processed (incremental update).
-         * Falls back to full rebuild on first call or after eviction/clear.
+         * Shadow views use graph-planned K/V workspace as FP16 output. This
+         * scalar API is an observation boundary and rebuilds from one temporary
+         * device-state snapshot. Production attention uses the grouped device
+         * conversion path.
          *
          * FP32/Q8_1/BF16 paths use pre-allocated conv_scratch buffers
          * (via ensureConvScratch) to avoid cudaMalloc/cudaFree in the hot path.
@@ -736,9 +762,6 @@ namespace llaminar2
         {
             __half *d_K = nullptr;     ///< [max_seq_len, kv_dim] FP16 K with RoPE
             __half *d_V = nullptr;     ///< [max_seq_len, kv_dim] FP16 V
-            int converted_count = 0;   ///< Rows already converted
-            int last_head = -1;        ///< Head position at last conversion
-            bool rope_applied = false; ///< Whether RoPE was applied
 
             std::unique_ptr<ITensor> k_view; ///< GpuTensorView for K
             std::unique_ptr<ITensor> v_view; ///< GpuTensorView for V
@@ -747,8 +770,8 @@ namespace llaminar2
         // [n_layers][batch_size] — lazily initialized
         mutable std::vector<std::vector<RoPEShadow>> rope_shadows_;
 
-        /// Allocate shadow buffers for a layer/seq if needed
-        void ensureRoPEShadow(int layer, int seq_idx) const;
+        /// Bind a layer/sequence shadow view to graph-planned conversion output.
+        void ensureRoPEShadow(int layer, int seq_idx);
 
         /// Invalidate shadow after append/evict
         void invalidateRoPEShadow(int layer, int seq_idx) const;

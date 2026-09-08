@@ -56,30 +56,30 @@ namespace llaminar2::test
         {
             ExecutionDomainDefinition domain;
             domain.name = "dense_cont";
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
             domain.weights = {0.5f, 0.5f};
             domain.backend = CollectiveBackendType::HOST;
             domain.owner_rank = 0;
-            domain.compute_kind = ExecutionDomainComputeKind::REPLICATED_EXPERTS;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain routedDomain(const std::string &name, GlobalDeviceAddress participant)
+        RoutedExpertDomain routedDomain(const std::string &name, GlobalDeviceAddress participant)
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = name;
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::HOST;
             domain.participants = {std::move(participant)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertRoutedTier routedTier(const std::string &name, const std::string &domain, int priority, bool fallback = false)
+        RoutedExpertTier routedTier(const std::string &name, const std::string &domain, int priority, bool fallback = false)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             tier.priority = priority;
@@ -87,11 +87,11 @@ namespace llaminar2::test
             return tier;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> makeProductionPlan()
+        std::shared_ptr<MoERoutedExpertPlacementPlan> makeProductionPlan()
         {
-            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
             plan->enabled = true;
-            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan->continuation_domain = "dense_cont";
             plan->base_model_domain = "dense_cont";
             plan->shared_expert_domain = "dense_cont";
@@ -99,7 +99,7 @@ namespace llaminar2::test
             plan->continuation_domain_spec.logical_root_participant = 0;
             plan->continuation_domain_spec.dense_tp_enabled = true;
             plan->continuation_domain_spec.hidden_layout = MoEContinuationActivationLayout::ReplicatedHidden;
-            plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+            plan->residency_policy = RoutedExpertResidencyPolicy::ExplicitMasks;
             plan->dense_domains = {denseContinuationDomain()};
             plan->domains = {
                 routedDomain("hot_domain", GlobalDeviceAddress::cpu(0)),
@@ -109,11 +109,11 @@ namespace llaminar2::test
                 routedTier("hot", "hot_domain", 0),
                 routedTier("cold", "cold_domain", 99, true),
             };
-            plan->placements.push_back(ExpertLayerPlacement{
+            plan->placements.push_back(RoutedExpertLayerPlacement{
                 .layer = 0,
                 .routed_expert_tier = {0, 1, 0, 1, 0, 1},
             });
-            validateMoEExpertParallelPlanOrThrow(
+            validateMoERoutedExpertPlacementPlanOrThrow(
                 *plan,
                 {.layer_count = 1, .routed_expert_count = kNumExperts});
             return plan;
@@ -234,7 +234,7 @@ namespace llaminar2::test
         continuation_tp_context.setBackend(CollectiveBackendType::HOST);
 
         InferenceRunnerConfig runner_config;
-        runner_config.moe_expert_parallel_plan = plan;
+        runner_config.moe_routed_expert_plan = plan;
         runner_config.moe_expert_overlay_mpi_ctx = runner_mpi_ctx;
         runner_config.tp_ctx = &continuation_tp_context;
 
@@ -249,8 +249,8 @@ namespace llaminar2::test
             owned_domain_tp_contexts,
             "[MoEGraphNativeSmoke]"));
 
-        ASSERT_NE(graph_config.moe.expert_parallel_plan, nullptr);
-        EXPECT_EQ(graph_config.moe.expert_parallel_plan.get(), plan.get());
+        ASSERT_NE(graph_config.moe.routed_expert_plan, nullptr);
+        EXPECT_EQ(graph_config.moe.routed_expert_plan.get(), plan.get());
         EXPECT_EQ(graph_config.moe.overlay_mpi_ctx, runner_mpi_ctx);
         EXPECT_EQ(graph_config.moe.expert_overlay_runtime_plan, nullptr);
         EXPECT_EQ(graph_config.moe.expert_overlay_execution_plan, nullptr);
@@ -263,7 +263,14 @@ namespace llaminar2::test
         auto buffers = makeActivationBuffers(activation_arena);
 
         Qwen35MoEGraph graph_builder(graph_config, nullptr);
-        ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::cpu());
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer,
+            buffers,
+            0,
+            kSeqLen,
+            kBatchSize,
+            DeviceId::cpu(),
+            /*device_state_publication_stream=*/nullptr);
 
         EXPECT_GT(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_DISPATCH), 0u);
         EXPECT_GT(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_RETURN_REDUCE), 0u);

@@ -174,13 +174,18 @@ namespace llaminar2
                                      out_kv_lens);
         }
 
-        // Cache management (IKVCache)
-        void clear() override = 0;
-        void clear_sequence(int layer, int seq_idx) override = 0;
-        void clear_layer(int layer) override = 0;
-
-        // Bring in IKVCache::clear_sequence(seq_idx) default implementation
-        using IKVCache::clear_sequence;
+        // Explicit cache-state lifecycle (IKVCache)
+        bool resetRequestState(const StateResetContext &context) override = 0;
+        bool resetSequenceState(
+            int seq_idx,
+            const StateResetContext &context) override = 0;
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &context) override = 0;
+        bool resetLayerState(
+            int layer,
+            const StateResetContext &context) override = 0;
 
         // =================================================================
         // CPU-Specific Methods (for testing and internal use)

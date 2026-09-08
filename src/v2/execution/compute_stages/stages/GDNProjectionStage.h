@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "kernels/common/DeviceRowRange.h"
+
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
@@ -100,6 +102,8 @@ namespace llaminar2
              * back to hidden row-wise replay.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
         };
 
         static_assert(StageParamsRequired<Params>);
@@ -123,15 +127,26 @@ namespace llaminar2
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
         void unbindWorkspace() override;
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
 
         // GDN projection uses standard GEMM path — graph-capturable
         bool isGraphCapturable() const override { return true; }
+
+        /** @brief Provision all four projection engines before graph capture. */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
 
     private:
         /// Lazily resolve a GEMM kernel from a prepared weight ref.
         /// Caches the result in @p cached for subsequent calls (like GEMMStage).
         ITensorGemm *resolveGemm(
             const ITensor *weight, ITensorGemm *&cached, const char *name);
+        void clearCachedGemmStreams();
 
         Params params_;
     };

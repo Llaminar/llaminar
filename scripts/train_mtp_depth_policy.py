@@ -93,7 +93,10 @@ def parse_args() -> argparse.Namespace:
         "--holdout-modulus",
         type=int,
         default=4,
-        help="Stable group hash modulus; one bucket is holdout.",
+        help=(
+            "Stable group hash modulus; one bucket is holdout. Set to zero "
+            "to train on the complete corpus without a holdout split."
+        ),
     )
     parser.add_argument(
         "--holdout-bucket",
@@ -139,13 +142,18 @@ def _to_float(row: dict[str, str], key: str, default: float = 0.0) -> float:
         return default
 
 
-def _group_key(row: dict[str, str], source: Path | None = None) -> tuple[str, ...]:
+def _group_key(
+    row: dict[str, str],
+    source_id: int | None = None,
+) -> tuple[str, ...]:
     """Build a stable same-run lane key while ignoring metrics and variants.
 
     Fixed d1/d2/d3 rows are comparable only inside one benchmark lane.  The
-    source path keeps two summaries with the same device/model/mode from
-    overwriting each other, while the lane fields keep multi-topology and
-    multi-request-batch rows separated within one summary.
+    deterministic source ordinal keeps two summaries with the same
+    device/model/mode from overwriting each other, while the lane fields keep
+    multi-topology and multi-request-batch rows separated within one summary.
+    Filesystem paths are deliberately excluded: relocating an identical corpus
+    must not reshuffle train and holdout domains.
     """
 
     preferred = [
@@ -163,11 +171,15 @@ def _group_key(row: dict[str, str], source: Path | None = None) -> tuple[str, ..
     ]
     if preferred:
         parts: list[str] = []
-        if source is not None:
-            parts.append(f"source={source}")
+        if source_id is not None:
+            parts.append(f"source_id={source_id}")
         parts.extend(f"{key}={row.get(key, '')}" for key in preferred)
         return tuple(parts)
-    fallback_parts = [f"source={source}"] if source is not None else []
+    fallback_parts = (
+        [f"source_id={source_id}"]
+        if source_id is not None
+        else []
+    )
     fallback_parts.extend(
         row[key]
         for key in sorted(row)
@@ -213,7 +225,7 @@ def _model_class_from_summary(model: str) -> str:
 
 def load_fixed_rows(paths: Iterable[Path]) -> list[FixedDepthRow]:
     rows: list[FixedDepthRow] = []
-    for path in paths:
+    for source_id, path in enumerate(paths):
         with path.open("r", newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle, delimiter="\t")
             for row in reader:
@@ -224,7 +236,7 @@ def load_fixed_rows(paths: Iterable[Path]) -> list[FixedDepthRow]:
                     continue
                 rows.append(
                     FixedDepthRow(
-                        group_key=_group_key(row, path),
+                        group_key=_group_key(row, source_id),
                         backend=_backend_from_device(row.get("device", "")),
                         model_class=_model_class_from_summary(row.get("model", "")),
                         mode=row.get("mode", ""),
@@ -273,6 +285,15 @@ def label_examples(rows: list[FixedDepthRow]) -> list[LabeledExample]:
 
 
 def is_holdout(group_key: tuple[str, ...], modulus: int, bucket: int) -> bool:
+    """Return whether a semantic lane belongs to the deterministic holdout.
+
+    A zero modulus is an explicit full-corpus training mode.  It is useful for
+    small synthetic regressions where probabilistically withholding the only
+    example for a domain would make the expected rule table ill-defined.
+    """
+
+    if modulus == 0:
+        return False
     joined = "\x1f".join(group_key).encode("utf-8")
     digest = hashlib.sha256(joined).digest()
     return int.from_bytes(digest[:8], "little") % modulus == bucket
@@ -562,6 +583,14 @@ def write_summary(path: Path, rules: list[LearnedRule], examples: list[LabeledEx
 
 def main() -> int:
     args = parse_args()
+    if args.holdout_modulus < 0:
+        raise SystemExit("--holdout-modulus must be non-negative")
+    if args.holdout_modulus == 0 and args.holdout_bucket != 0:
+        raise SystemExit("--holdout-bucket must be zero when holdout is disabled")
+    if args.holdout_modulus > 0 and not (
+        0 <= args.holdout_bucket < args.holdout_modulus
+    ):
+        raise SystemExit("--holdout-bucket must be in [0, holdout-modulus)")
     if args.min_train_accuracy < 0.0 or args.min_train_accuracy > 1.0:
         raise SystemExit("--min-train-accuracy must be in [0, 1]")
     if args.min_holdout_accuracy < 0.0 or args.min_holdout_accuracy > 1.0:

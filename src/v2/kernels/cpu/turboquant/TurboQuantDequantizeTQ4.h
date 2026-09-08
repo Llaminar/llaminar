@@ -65,7 +65,8 @@ namespace llaminar2
                 output[i] = 0.0f;
             return;
         }
-        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
         for (int i = 0; i < D; i += 8)
         {
             uint8_t idx8[8];
@@ -73,11 +74,12 @@ namespace llaminar2
             tq3_unpack_8(block.mse_indices + (i / 8) * 3, idx8);
             unpack_bitplane_8(block.high_bits + (i / 8), high_bits);
             for (int j = 0; j < 8; ++j)
-                scratch[i + j] = TQ4_CENTROIDS[idx8[j] | static_cast<uint8_t>(high_bits[j] << 3)] * inv_scale;
+                scratch[i + j] =
+                    TQ4_CENTROIDS[idx8[j] |
+                                   static_cast<uint8_t>(high_bits[j] << 3)] *
+                    reconstruction_scale;
         }
         apply_rotation_transpose(ctx.rotation(), scratch, output);
-        for (int i = 0; i < D; ++i)
-            output[i] *= block.norm;
     }
 
 #if defined(__AVX2__)
@@ -96,8 +98,10 @@ namespace llaminar2
                 output[i] = 0.0f;
             return;
         }
-        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
-        const __m256 vinv_scale = _mm256_set1_ps(inv_scale);
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
+        const __m256 vreconstruction_scale =
+            _mm256_set1_ps(reconstruction_scale);
         for (int i = 0; i < D; i += 8)
         {
             const int group = i / 8;
@@ -112,15 +116,11 @@ namespace llaminar2
 
             __m256i vidx = _mm256_load_si256(reinterpret_cast<const __m256i *>(idx32));
             __m256 vcentroids = _mm256_i32gather_ps(TQ4_CENTROIDS.data(), vidx, sizeof(float));
-            _mm256_storeu_ps(scratch + i, _mm256_mul_ps(vcentroids, vinv_scale));
+            _mm256_storeu_ps(
+                scratch + i,
+                _mm256_mul_ps(vcentroids, vreconstruction_scale));
         }
         apply_rotation_transpose(ctx.rotation(), scratch, output);
-        const __m256 vnorm = _mm256_set1_ps(block.norm);
-        for (int i = 0; i < D; i += 8)
-        {
-            __m256 v = _mm256_loadu_ps(output + i);
-            _mm256_storeu_ps(output + i, _mm256_mul_ps(v, vnorm));
-        }
     }
 #endif
 
@@ -140,8 +140,10 @@ namespace llaminar2
                 output[i] = 0.0f;
             return;
         }
-        const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
-        const __m512 vinv_scale = _mm512_set1_ps(inv_scale);
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
+        const __m512 vreconstruction_scale =
+            _mm512_set1_ps(reconstruction_scale);
         for (int i = 0; i < D; i += 16)
         {
             alignas(64) int32_t idx32[16];
@@ -158,15 +160,11 @@ namespace llaminar2
             }
             __m512i vidx = _mm512_load_si512(idx32);
             __m512 vcentroids = _mm512_i32gather_ps(vidx, TQ4_CENTROIDS.data(), sizeof(float));
-            _mm512_storeu_ps(scratch + i, _mm512_mul_ps(vcentroids, vinv_scale));
+            _mm512_storeu_ps(
+                scratch + i,
+                _mm512_mul_ps(vcentroids, vreconstruction_scale));
         }
         apply_rotation_transpose(ctx.rotation(), scratch, output);
-        const __m512 vnorm = _mm512_set1_ps(block.norm);
-        for (int i = 0; i < D; i += 16)
-        {
-            __m512 v = _mm512_loadu_ps(output + i);
-            _mm512_storeu_ps(output + i, _mm512_mul_ps(v, vnorm));
-        }
     }
 #endif
 

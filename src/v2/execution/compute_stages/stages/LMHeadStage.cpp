@@ -1,12 +1,12 @@
-/**
- * @file LMHeadStage.cpp
+/** @file LMHeadStage.cpp
  * @brief Implementation of LMHeadStage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #include "LMHeadStage.h"
-#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -74,7 +74,7 @@ namespace llaminar2
     {
         ScopedGemmContext gemm_ctx(GemmContext::LM_HEAD);
 
-        LOG_DEBUG("[LMHeadStage] Execute: seq_len=" << params_.seq_len
+        LOG_TRACE("[LMHeadStage] Execute: seq_len=" << params_.seq_len
                                                     << " d_model=" << params_.d_model
                                                     << " vocab_size=" << params_.vocab_size);
 
@@ -107,20 +107,35 @@ namespace llaminar2
         // Get or create GEMM kernel for LM head weight
         // CRITICAL: Use DeviceId overload (not DeviceType) to ensure correct GPU ordinal
         // Using DeviceType alone would default to ROCm:0 even when running on ROCm:1
-        LOG_DEBUG("[LMHeadStage] Requesting kernel with device_id=" << params_.device_id.toKernelDeviceIndex()
+        LOG_TRACE("[LMHeadStage] Requesting kernel with device_id=" << params_.device_id.toKernelDeviceIndex()
                                                                     << " (is_rocm=" << params_.device_id.is_rocm()
                                                                     << ", rocm_ordinal=" << (params_.device_id.is_rocm() ? params_.device_id.rocm_ordinal() : -1) << ")"
                                                                     << " lm_head_weight=" << (void *)lm_head_weight
                                                                     << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
 
         ITensorGemm *lm_gemm = resolvePreparedKernel("LMHeadStage");
-        LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
+        LOG_TRACE("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
             LOG_ERROR("[LMHeadStage] Failed to get/create LM head GEMM kernel");
             return false;
         }
         bindStageStream(lm_gemm);
+
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+            output_partition_scope;
+        if (params_.serial_equivalent_partition_width > 0)
+        {
+            if (params_.serial_equivalent_partition_width > params_.vocab_size)
+            {
+                throw std::logic_error(
+                    "[LMHeadStage] Replicated LM-head serial partition width exceeds its physical vocabulary width");
+            }
+            output_partition_scope =
+                lm_gemm->beginOutputPartitionEquivalenceScope(
+                    params_.vocab_size,
+                    params_.serial_equivalent_partition_width);
+        }
 
         // LM head: logits = hidden @ lm_head^T + bias
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
@@ -145,7 +160,7 @@ namespace llaminar2
         }
 
         // Bias is passed directly to GEMM kernel for fused application.
-        // CPU NativeVNNI uses its batched M=2..4 path here for verifier rows;
+        // CPU NativeVNNI uses its runtime-row grouped path here for verifier rows;
         // parity tests compare these rows against serial one-token decode.
         bool success = false;
         if (params_.force_decode_equivalent_verifier_prefill &&
@@ -182,11 +197,7 @@ namespace llaminar2
         }
 
         if (params_.device_id.is_gpu())
-        {
-            logits->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                          params_.device_id,
-                                          gpuStream());
-        }
+            gpuExecution().publish(logits);
 
         return true;
     }
@@ -199,13 +210,6 @@ namespace llaminar2
     {
         if (!hidden_states || !logits || !lm_gemm)
             return false;
-        if (lm_m > 4)
-        {
-            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier prefill is only supported "
-                      << "for tiny MTP verifier batches, got m=" << lm_m);
-            return false;
-        }
-
         const bool is_gpu = params_.device_id.is_gpu();
         void *stream = gpuStream();
         if (is_gpu && !stream)
@@ -214,8 +218,18 @@ namespace llaminar2
             return false;
         }
 
+        if (hidden_states->native_type() != TensorType::FP32 ||
+            logits->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier LM-head requires FP32 hidden/logits"
+                      << " hidden=" << hidden_states->dtype_name()
+                      << " logits=" << logits->dtype_name());
+            return false;
+        }
+
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {lm_gemm, logits, params_.vocab_size, params_.bias_tensor, "lm_head"}};
+        auto verifier_rows = lm_gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
         const bool success = lm_gemm->multiply_fused_verifier_rows_decode_equivalent(
             hidden_states,
             projections,
@@ -223,29 +237,26 @@ namespace llaminar2
             params_.d_model,
             params_.mpi_ctx,
             bound_workspace_);
-
-        if (success)
+        if (!success)
         {
-            if (is_gpu)
-                verifier_gemm_rows::markDeviceOutputWritten(
-                    logits, params_.device_id, stream);
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "lm_head_decode_equivalent_verifier_prefill_rows",
-                static_cast<double>(lm_m),
-                {},
-                params_.device_id.to_string(),
-                {{"route", "grouped"}});
-        }
-        else
-        {
-            LOG_ERROR("[LMHeadStage] Grouped decode-equivalent verifier LM-head is unsupported or failed"
+            LOG_ERROR("[LMHeadStage] Grouped decode-equivalent LM-head failed"
                       << " device=" << params_.device_id.to_string()
                       << " m=" << lm_m
                       << " vocab=" << params_.vocab_size
                       << " d_model=" << params_.d_model);
+            return false;
         }
-        return success;
+
+        if (is_gpu)
+            gpuExecution().publish(logits);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "lm_head_grouped_decode_equivalent_verifier_prefill_rows",
+            static_cast<double>(lm_m),
+            {},
+            params_.device_id.to_string(),
+            {{"route", "grouped"}});
+        return true;
     }
 
     size_t LMHeadStage::estimatedFlops() const
@@ -404,7 +415,7 @@ namespace llaminar2
         }
 
         auto *consumer = dynamic_cast<IWorkspaceConsumer *>(lm_gemm);
-        LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] Returning kernel=" << (void *)lm_gemm
+        LOG_TRACE("[LMHeadStage::getKernelAsWorkspaceConsumer] Returning kernel=" << (void *)lm_gemm
                                                                                   << " as consumer=" << (void *)consumer);
         return consumer;
     }
@@ -417,9 +428,14 @@ namespace llaminar2
         auto contract = StageBufferContract::build()
                             .addInput(*params_.input_buffer_id)
                             .addOutput(*params_.output_buffer_id);
-        // Model weight is not arena-managed
+        // The projection consumes its store-owned prepared representation.
         if (params_.lm_head_weight)
-            contract.addWeight(const_cast<ITensor *>(params_.lm_head_weight));
+        {
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.lm_head_weight),
+                params_.prepared_store,
+                params_.prepared_ref.value_or(PreparedWeightRef{}));
+        }
         if (params_.bias_tensor)
             contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_tensor)));
         return contract;

@@ -4,33 +4,34 @@
  * @author David Sanftenberg
  * @date January 2026
  *
- * These tests verify that TensorSlice properly delegates device coherence
- * operations to its wrapped inner tensor. This is critical for MPI tensor
- * parallelism where weight tensors are wrapped in TensorSlice for sharding.
+ * These tests verify that TensorSlice delegates every device-coherence
+ * operation to its wrapped tensor. This is critical for tensor parallelism,
+ * where sharded weights retain one authoritative allocation and every slice
+ * must observe the same placement, publication event, and validity state.
  *
- * Root cause of issue: While TensorSlice inherits from TensorBase (which is
- * aliased to TensorBase), the StageCoherence code was calling ensureOnDevice()
- * on the TensorSlice wrapper rather than the inner tensor. Since TensorSlice
- * doesn't override the coherence methods, they operated on TensorSlice's own
- * (empty) coherence state rather than the inner tensor's state.
- *
- * The fix in StageCoherence.cpp unwraps TensorSlice to access the inner tensor
- * for coherence operations. These tests verify that approach works correctly.
+ * TensorSlice owns no independent coherence state. Its transfer and
+ * publication methods delegate directly to the inner tensor, so callers never
+ * need to identify or unwrap slices. TransferEngine can therefore treat
+ * ITensor uniformly without recreating tensor-wrapper knowledge at each call
+ * site.
  *
  * Test categories:
  * 1. MockTensor - Verifies coherence calls are tracked
  * 2. TensorSlice Inheritance - Verifies class hierarchy
- * 3. TensorSlice Coherence Delegation - Verifies unwrapping works
- * 4. StageCoherence Integration - Verifies the fix works end-to-end
+ * 3. TensorSlice Coherence Delegation - Verifies wrapper-transparent behavior
+ * 4. Publication and residency lifecycle - Verifies shared inner state
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
+#include <cstdint>
 #include <memory>
 #include <vector>
 #include <string>
 #include "tensors/TensorSlice.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
+#include "../../mocks/MockBackend.h"
 
 using namespace llaminar2;
 
@@ -63,11 +64,8 @@ public:
     mutable int ensureOnHost_calls = 0;
     mutable int allocateOnDevice_calls = 0;
     mutable int invalidateGpuData_calls = 0;
-    mutable int transitionTo_calls = 0;
     mutable DeviceId last_ensureOnDevice_target = DeviceId::cpu();
     mutable DeviceId last_allocateOnDevice_target = DeviceId::cpu();
-    mutable TensorCoherenceState last_transitionTo_state = TensorCoherenceState::HOST_ONLY;
-    mutable std::optional<DeviceId> last_transitionTo_device = std::nullopt;
 
     // Override coherence methods to track calls
     bool ensureOnDevice(DeviceId target_device, void *stream = nullptr) override
@@ -96,16 +94,6 @@ public:
         invalidateGpuData_calls++;
     }
 
-    void transitionTo(TensorCoherenceState new_state,
-                      std::optional<DeviceId> authoritative_dev = std::nullopt) override
-    {
-        transitionTo_calls++;
-        last_transitionTo_state = new_state;
-        last_transitionTo_device = authoritative_dev;
-        // Delegate to TensorBase (FP32Tensor) for real state machine
-        FP32Tensor::transitionTo(new_state, authoritative_dev);
-    }
-
     /// Inject a fake GPU pointer (simulates what ensureOnDevice does)
     void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
 
@@ -119,7 +107,6 @@ public:
         ensureOnHost_calls = 0;
         allocateOnDevice_calls = 0;
         invalidateGpuData_calls = 0;
-        transitionTo_calls = 0;
     }
 };
 
@@ -139,6 +126,21 @@ protected:
     void TearDown() override
     {
         mock_tensor_.reset();
+    }
+
+    /**
+     * @brief Give a test tensor simulated GPU storage without touching hardware.
+     *
+     * Graph-owned publication now validates that the named device actually
+     * owns the tensor allocation. MockBackend supplies ordinary host memory as
+     * device storage so this remains a true CPU-only unit test.
+     */
+    void prepareSimulatedDevice(
+        MockCoherenceTensor &tensor,
+        DeviceId device)
+    {
+        tensor.setBackendForTesting(&backend_);
+        ASSERT_TRUE(tensor.FP32Tensor::allocateOnDevice(device));
     }
 
     // Helper to create TensorSlice with SliceMetadata
@@ -180,6 +182,7 @@ protected:
         return std::make_unique<Q4_0Tensor>(std::vector<size_t>{rows, cols}, std::move(raw_data));
     }
 
+    llaminar2::test::MockBackend backend_;
     std::unique_ptr<MockCoherenceTensor> mock_tensor_;
 };
 
@@ -256,6 +259,65 @@ TEST_F(Test__TensorSliceCoherence, DelegatesIsOnDevice)
         << "TensorSlice should delegate is_on_device() to inner";
 }
 
+/**
+ * @brief Prove that every public placement/coherence query follows the inner tensor.
+ *
+ * TensorSlice delegates transfers and device pointers to its wrapped storage.
+ * Querying shadow state on the wrapper would let TransferEngine observe a real
+ * device pointer with no owner, so this regression exercises the complete
+ * query surface through the wrapper after publication.
+ */
+TEST_F(Test__TensorSliceCoherence, DelegatesPlacementAndCoherenceQueries)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+    const DeviceId device = DeviceId::cuda(0);
+    prepareSimulatedDevice(*inner_ptr, device);
+
+    auto slice = createSlice(std::move(inner));
+    TransferEngine::publishGraphOwnedDeviceWrite(slice.get(), device);
+
+    ASSERT_TRUE(slice->current_device().has_value());
+    EXPECT_EQ(*slice->current_device(), device);
+    EXPECT_EQ(
+        slice->coherenceState(),
+        TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    ASSERT_TRUE(slice->getAuthoritativeDevice().has_value());
+    EXPECT_EQ(*slice->getAuthoritativeDevice(), device);
+    EXPECT_TRUE(slice->isDeviceAuthoritative(device));
+    EXPECT_FALSE(slice->isHostAuthoritative());
+    EXPECT_TRUE(slice->deviceValid());
+    EXPECT_TRUE(slice->is_on_device(device));
+}
+
+/**
+ * @brief Reproduce the LocalTP short-convolution transfer boundary on CPU mocks.
+ *
+ * The failing production tensor was a sharded TensorSlice whose inner object
+ * owned valid CUDA storage. TransferEngine must validate that polymorphic
+ * placement instead of consulting the wrapper's intentionally empty storage
+ * fields. A non-null sentinel stream is sufficient because this unit test
+ * performs no real GPU work.
+ */
+TEST_F(Test__TensorSliceCoherence, TransferEngineAcceptsInnerDevicePlacement)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+    const DeviceId device = DeviceId::cuda(0);
+    prepareSimulatedDevice(*inner_ptr, device);
+
+    auto slice = createSlice(std::move(inner));
+    TransferEngine::publishSynchronized(slice.get());
+    void *const stream = reinterpret_cast<void *>(uintptr_t{1});
+
+    EXPECT_NO_THROW(
+        TransferEngine::prepareDeviceInput(slice.get(), device, stream));
+    EXPECT_NO_THROW(
+        TransferEngine::prepareDeviceOutput(slice.get(), device, stream));
+    ASSERT_TRUE(slice->current_device().has_value());
+    EXPECT_EQ(*slice->current_device(), device);
+}
+
 // =============================================================================
 // Test Category 3: Coherence Method Behavior
 // =============================================================================
@@ -304,19 +366,22 @@ TEST_F(Test__TensorSliceCoherence, EnsureOnHostCallsInner)
         << "ensureOnHost should be called on inner tensor";
 }
 
-TEST_F(Test__TensorSliceCoherence, TransitionToDeviceAuthoritativeOnInner)
+TEST_F(Test__TensorSliceCoherence, GraphOwnedPublicationOnInner)
 {
     auto mock = std::make_unique<MockCoherenceTensor>(512, 256);
+    prepareSimulatedDevice(*mock, DeviceId::cuda(0));
 
     auto slice = createSlice(std::move(mock));
 
-    // Get inner and call transitionTo
+    // Publish against the inner tensor to verify the public service contract.
     auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
     ASSERT_NE(inner_cpu, nullptr);
-    inner_cpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishGraphOwnedDeviceWrite(
+        inner_cpu,
+        DeviceId::cuda(0));
 
     EXPECT_EQ(inner_cpu->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE)
-        << "transitionTo should set inner tensor to DEVICE_AUTHORITATIVE";
+        << "Graph-owned publication should set device authority";
 }
 
 // =============================================================================
@@ -346,46 +411,7 @@ TEST_F(Test__TensorSliceCoherence, DirectEnsureOnDeviceDelegatesToInner)
 }
 
 // =============================================================================
-// Test Category 5: The Solution - Unwrap and Call Inner
-// =============================================================================
-
-TEST_F(Test__TensorSliceCoherence, UnwrappingPatternWorksCorrectly)
-{
-    // This test verifies the pattern used in StageCoherence.cpp fix
-    auto mock = std::make_unique<MockCoherenceTensor>(512, 256);
-    MockCoherenceTensor *mock_ptr = mock.get();
-
-    auto slice = createSlice(std::move(mock));
-
-    // ===== Simulate StageCoherence.cpp unwrapping logic =====
-    TensorBase *tensor = slice.get();
-    TensorBase *tensor_base = dynamic_cast<TensorBase *>(tensor);
-
-    // First cast succeeds (TensorSlice inherits from TensorBase)
-    ASSERT_NE(tensor_base, nullptr);
-
-    // But we need to check if it's a TensorSlice and unwrap
-    auto *as_slice = dynamic_cast<TensorSlice *>(tensor);
-    if (as_slice)
-    {
-        // It's a TensorSlice - get the inner tensor
-        tensor_base = dynamic_cast<TensorBase *>(as_slice->inner());
-        ASSERT_NE(tensor_base, nullptr) << "Inner tensor should be TensorBase";
-    }
-
-    // Now call ensureOnDevice on the unwrapped inner tensor
-    DeviceId target = DeviceId::rocm(0);
-    tensor_base->ensureOnDevice(target);
-
-    // Verify the mock was called
-    EXPECT_EQ(mock_ptr->ensureOnDevice_calls, 1)
-        << "After unwrapping, ensureOnDevice should call inner's method";
-    EXPECT_EQ(mock_ptr->last_ensureOnDevice_target.to_string(), target.to_string())
-        << "Target device should be passed correctly to inner";
-}
-
-// =============================================================================
-// Test Category 6: Edge Cases
+// Test Category 5: Edge Cases
 // =============================================================================
 
 TEST_F(Test__TensorSliceCoherence, MultipleCalls_TrackAll)
@@ -410,6 +436,7 @@ TEST_F(Test__TensorSliceCoherence, MixedCoherenceCalls)
 {
     auto mock = std::make_unique<MockCoherenceTensor>(512, 256);
     MockCoherenceTensor *mock_ptr = mock.get();
+    prepareSimulatedDevice(*mock_ptr, DeviceId::rocm(0));
 
     auto slice = createSlice(std::move(mock));
     auto *inner_cpu = dynamic_cast<TensorBase *>(slice->inner());
@@ -420,7 +447,7 @@ TEST_F(Test__TensorSliceCoherence, MixedCoherenceCalls)
 
     // Simulate typical usage pattern
     inner_cpu->ensureOnDevice(DeviceId::rocm(0));                        // Upload to GPU
-    inner_cpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // GPU kernel modified it
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(inner_cpu);  // GPU kernel modified it
     inner_cpu->ensureOnHost();                                           // Download back
 
     EXPECT_EQ(mock_ptr->ensureOnDevice_calls, 1);
@@ -786,12 +813,17 @@ TEST_F(Test__TensorSliceCoherence, CoherenceState_InnerReflectsTransitions)
 {
     auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
     auto *inner_ptr = inner.get();
+    prepareSimulatedDevice(*inner_ptr, DeviceId::rocm(0));
 
     auto slice = createSlice(std::move(inner));
 
-    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::HOST_ONLY);
+    EXPECT_EQ(
+        inner_ptr->coherenceState(),
+        TensorCoherenceState::HOST_AUTHORITATIVE)
+        << "Output allocation creates device storage without copying or "
+           "publishing a device write";
 
-    inner_ptr->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    TransferEngine::publishGraphOwnedCurrentDeviceWrite(inner_ptr);
     EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 }
 
@@ -860,7 +892,7 @@ TEST_F(Test__TensorSliceCoherence, FullLifecycle_MarkDirtyAfterGpuCompute)
     slice->allocateOnDevice(DeviceId::cuda(0));
     EXPECT_EQ(inner_ptr->allocateOnDevice_calls, 1);
 
-    slice->mark_host_dirty();
+    TransferEngine::publishHostWrite(slice);
 }
 
 // =============================================================================
@@ -938,61 +970,58 @@ TEST_F(Test__TensorSliceCoherence, SharedPtrConstruction_InvalidateGpuDataDelega
 }
 
 // =============================================================================
-// transitionTo Delegation Tests
+// TransferEngine Publication Delegation Tests
 // =============================================================================
 
-TEST_F(Test__TensorSliceCoherence, TransitionTo_DelegatesToInner_DeviceAuthoritative)
+TEST_F(Test__TensorSliceCoherence, DevicePublication_DelegatesToInner)
 {
     auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
     auto *inner_ptr = inner.get();
+    prepareSimulatedDevice(*inner_ptr, DeviceId::rocm(0));
     auto slice = createSlice(std::move(inner));
     inner_ptr->resetCallCounters();
 
-    slice->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::rocm(0));
+    TransferEngine::publishGraphOwnedDeviceWrite(slice, DeviceId::rocm(0));
 
-    EXPECT_EQ(inner_ptr->transitionTo_calls, 1)
-        << "transitionTo must delegate to inner tensor";
-    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    EXPECT_TRUE(inner_ptr->last_transitionTo_device.has_value());
-    EXPECT_EQ(inner_ptr->last_transitionTo_device.value(), DeviceId::rocm(0));
     EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE)
         << "Inner tensor coherence state must actually change";
+    ASSERT_TRUE(inner_ptr->getAuthoritativeDevice().has_value());
+    EXPECT_EQ(inner_ptr->getAuthoritativeDevice().value(), DeviceId::rocm(0));
 }
 
-TEST_F(Test__TensorSliceCoherence, TransitionTo_DelegatesToInner_HostAuthoritative)
+TEST_F(Test__TensorSliceCoherence, HostPublication_DelegatesToInner)
 {
     auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
     auto *inner_ptr = inner.get();
+    prepareSimulatedDevice(*inner_ptr, DeviceId::cuda(0));
     auto slice = createSlice(std::move(inner));
     inner_ptr->resetCallCounters();
 
-    slice->transitionTo(TensorCoherenceState::HOST_AUTHORITATIVE);
+    TransferEngine::publishHostWrite(slice);
 
-    EXPECT_EQ(inner_ptr->transitionTo_calls, 1);
-    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::HOST_AUTHORITATIVE);
-    EXPECT_FALSE(inner_ptr->last_transitionTo_device.has_value())
+    EXPECT_FALSE(inner_ptr->getAuthoritativeDevice().has_value())
         << "HOST_AUTHORITATIVE should not carry a device";
     EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::HOST_AUTHORITATIVE);
 }
 
-TEST_F(Test__TensorSliceCoherence, TransitionTo_DelegatesToInner_Synced)
+TEST_F(Test__TensorSliceCoherence, SynchronizedPublication_DelegatesToInner)
 {
     auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
     auto *inner_ptr = inner.get();
+    prepareSimulatedDevice(*inner_ptr, DeviceId::cuda(0));
     auto slice = createSlice(std::move(inner));
     inner_ptr->resetCallCounters();
 
-    slice->transitionTo(TensorCoherenceState::SYNCED);
+    TransferEngine::publishSynchronized(slice);
 
-    EXPECT_EQ(inner_ptr->transitionTo_calls, 1);
-    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::SYNCED);
     EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::SYNCED);
 }
 
-TEST_F(Test__TensorSliceCoherence, TransitionTo_SharedPtrConstruction_Delegates)
+TEST_F(Test__TensorSliceCoherence, DevicePublication_SharedPtrConstruction_Delegates)
 {
     auto inner = std::make_shared<MockCoherenceTensor>(512, 256);
     MockCoherenceTensor *inner_ptr = inner.get();
+    prepareSimulatedDevice(*inner_ptr, DeviceId::cuda(1));
 
     SliceMetadata meta;
     meta.mode = SliceMode::ROW_PARALLEL;
@@ -1007,18 +1036,18 @@ TEST_F(Test__TensorSliceCoherence, TransitionTo_SharedPtrConstruction_Delegates)
     auto slice = std::make_unique<TensorSlice>(inner, std::move(meta));
     inner_ptr->resetCallCounters();
 
-    slice->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::cuda(1));
+    TransferEngine::publishGraphOwnedDeviceWrite(slice, DeviceId::cuda(1));
 
-    EXPECT_EQ(inner_ptr->transitionTo_calls, 1)
-        << "transitionTo must delegate with shared_ptr construction";
-    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    EXPECT_EQ(inner_ptr->last_transitionTo_device.value(), DeviceId::cuda(1));
+    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    ASSERT_TRUE(inner_ptr->getAuthoritativeDevice().has_value());
+    EXPECT_EQ(inner_ptr->getAuthoritativeDevice().value(), DeviceId::cuda(1));
 }
 
-TEST_F(Test__TensorSliceCoherence, TransitionTo_NestedSlice_DelegatesToInnermost)
+TEST_F(Test__TensorSliceCoherence, DevicePublication_NestedSlice_DelegatesToInnermost)
 {
     auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
     auto *inner_ptr = inner.get();
+    prepareSimulatedDevice(*inner_ptr, DeviceId::rocm(0));
 
     // Wrap in first TensorSlice
     auto slice1 = createSlice(std::move(inner));
@@ -1026,9 +1055,9 @@ TEST_F(Test__TensorSliceCoherence, TransitionTo_NestedSlice_DelegatesToInnermost
     auto slice2 = createSlice(std::move(slice1));
     inner_ptr->resetCallCounters();
 
-    slice2->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::rocm(0));
+    TransferEngine::publishGraphOwnedDeviceWrite(slice2, DeviceId::rocm(0));
 
-    EXPECT_EQ(inner_ptr->transitionTo_calls, 1)
-        << "Nested TensorSlice must delegate transitionTo all the way to innermost tensor";
     EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    ASSERT_TRUE(inner_ptr->getAuthoritativeDevice().has_value());
+    EXPECT_EQ(inner_ptr->getAuthoritativeDevice().value(), DeviceId::rocm(0));
 }

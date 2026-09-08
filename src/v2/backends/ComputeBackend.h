@@ -3,8 +3,8 @@
  * @brief Device manager and compute context interfaces (LEGACY)
  *
  * ⚠️ DEPRECATION NOTICE (Phase 3 - October 2025):
- * GPU contexts (CUDAComputeContext, ROCmComputeContext, VulkanComputeContext) have been
- * disabled and replaced with IBackend architecture (see backends/IBackend.h).
+ * GPU contexts were removed and replaced with the IBackend architecture
+ * (see backends/IBackend.h).
  *
  * CPU device enumeration (DeviceManager) is still functional and used by Main.cpp.
  * Full removal is deferred until V2 has a production-ready device manager.
@@ -21,10 +21,12 @@
 
 #include "DeviceId.h"
 #include "GlobalDeviceAddress.h"
+#include "PeerAccessCoverage.h"
 #include <string>
 #include <vector>
 #include <memory>
 #include <cstddef>
+#include <optional>
 
 namespace llaminar2
 {
@@ -66,21 +68,143 @@ namespace llaminar2
     };
 
     /**
-     * @brief P2P access matrix for a set of GPU devices
+     * @brief Driver-backed P2P access matrix for one GPU backend.
+     *
+     * Matrix indices are internal enumeration positions, while callers name
+     * devices by backend ordinal.  The ordinal-aware helpers below prevent a
+     * filtered or reordered inventory from being mistaken for a dense
+     * zero-based device list.
      */
     struct P2PMatrix
     {
-        ComputeBackendType backend;
+        ComputeBackendType backend = ComputeBackendType::CPU;
         std::vector<int> device_ids;               // Backend device IDs (ordered)
         std::vector<std::vector<bool>> can_access; // can_access[i][j] = device i can access device j's memory
 
-        int device_count() const { return static_cast<int>(device_ids.size()); }
+        /** @return Number of backend ordinals represented by this matrix. */
+        [[nodiscard]] int device_count() const noexcept
+        {
+            return static_cast<int>(device_ids.size());
+        }
 
-        bool has_p2p(int from_idx, int to_idx) const
+        /**
+         * @brief Query one directed edge by matrix index.
+         * @param from_idx Source matrix index.
+         * @param to_idx Destination matrix index.
+         * @return False for an invalid or structurally incomplete matrix.
+         */
+        [[nodiscard]] bool has_p2p(int from_idx, int to_idx) const noexcept
         {
             if (from_idx < 0 || from_idx >= device_count() || to_idx < 0 || to_idx >= device_count())
                 return false;
-            return can_access[from_idx][to_idx];
+            if (static_cast<std::size_t>(from_idx) >= can_access.size() ||
+                static_cast<std::size_t>(to_idx) >=
+                    can_access[static_cast<std::size_t>(from_idx)].size())
+            {
+                return false;
+            }
+            return can_access[static_cast<std::size_t>(from_idx)]
+                             [static_cast<std::size_t>(to_idx)];
+        }
+
+        /**
+         * @brief Resolve a backend ordinal to its matrix index.
+         * @param device_id CUDA or ROCm device ordinal.
+         * @return Matrix index, or empty when the ordinal was not queried.
+         */
+        [[nodiscard]] std::optional<int> indexForDevice(
+            int device_id) const noexcept
+        {
+            for (std::size_t index = 0; index < device_ids.size(); ++index)
+            {
+                if (device_ids[index] == device_id)
+                    return static_cast<int>(index);
+            }
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Query one directed peer edge by backend device ordinal.
+         * @param from_device_id Source CUDA or ROCm ordinal.
+         * @param to_device_id Destination CUDA or ROCm ordinal.
+         * @return Driver-reported accessibility, or false for unknown devices.
+         */
+        [[nodiscard]] bool canAccessDevice(
+            int from_device_id,
+            int to_device_id) const noexcept
+        {
+            const auto from = indexForDevice(from_device_id);
+            const auto to = indexForDevice(to_device_id);
+            return from.has_value() && to.has_value() &&
+                   has_p2p(*from, *to);
+        }
+
+        /**
+         * @brief Classify direct peer access for an exact device domain.
+         *
+         * `Partial` deliberately includes an asymmetric edge.  Native
+         * NCCL/RCCL remains authoritative whenever the driver exposes any P2P
+         * opportunity because the collective library can select a topology
+         * better than a forced host bounce.  A custom mapped transport is
+         * eligible only for `None`.
+         *
+         * @param requested_device_ids Distinct backend ordinals in the domain.
+         * @return Coverage, or empty for fewer than two devices, duplicates,
+         *         missing ordinals, or a malformed matrix.
+         */
+        [[nodiscard]] std::optional<PeerAccessCoverage> coverageForDevices(
+            const std::vector<int> &requested_device_ids) const
+        {
+            if (requested_device_ids.size() < 2u ||
+                can_access.size() != device_ids.size())
+            {
+                return std::nullopt;
+            }
+            for (const auto &row : can_access)
+            {
+                if (row.size() != device_ids.size())
+                    return std::nullopt;
+            }
+
+            std::vector<int> indices;
+            indices.reserve(requested_device_ids.size());
+            for (std::size_t requested = 0;
+                 requested < requested_device_ids.size();
+                 ++requested)
+            {
+                for (std::size_t prior = 0; prior < requested; ++prior)
+                {
+                    if (requested_device_ids[prior] ==
+                        requested_device_ids[requested])
+                    {
+                        return std::nullopt;
+                    }
+                }
+                const auto index =
+                    indexForDevice(requested_device_ids[requested]);
+                if (!index)
+                    return std::nullopt;
+                indices.push_back(*index);
+            }
+
+            bool any_directed_edge = false;
+            bool every_pair_bidirectional = true;
+            for (std::size_t from = 0; from < indices.size(); ++from)
+            {
+                for (std::size_t to = from + 1u; to < indices.size(); ++to)
+                {
+                    const bool forward = has_p2p(indices[from], indices[to]);
+                    const bool reverse = has_p2p(indices[to], indices[from]);
+                    any_directed_edge = any_directed_edge || forward || reverse;
+                    every_pair_bidirectional =
+                        every_pair_bidirectional && forward && reverse;
+                }
+            }
+
+            if (every_pair_bidirectional)
+                return PeerAccessCoverage::Complete;
+            return any_directed_edge ? PeerAccessCoverage::Partial
+                                     : PeerAccessCoverage::None;
         }
     };
 
@@ -95,6 +219,7 @@ namespace llaminar2
         std::string name;          // Human-readable name
         size_t total_memory_bytes; // Total device memory
         size_t free_memory_bytes;  // Free device memory (approximate)
+        int compute_units = 0;     // CUDA SMs, ROCm CUs, or backend-equivalent units
         int compute_capability;    // Backend-specific capability (e.g., CUDA compute 8.6 → 86)
         bool supports_fp16;        // Hardware FP16 support
         bool supports_bf16;        // Hardware BF16 support
@@ -105,7 +230,7 @@ namespace llaminar2
     /**
      * @brief Abstract compute context interface
      *
-     * Implementations: CPUComputeContext, CUDAComputeContext, ROCmComputeContext, VulkanComputeContext
+     * The surviving implementation is CPUComputeContext. GPU execution uses IBackend.
      */
     class ComputeContext
     {
@@ -169,101 +294,6 @@ namespace llaminar2
         struct Impl;
         std::unique_ptr<Impl> pimpl_;
     };
-
-    // ============================================================================
-    // GPU Compute Contexts (DEPRECATED - Phase 3)
-    // ============================================================================
-    // These classes are DEPRECATED as of Phase 3. Use IBackend interface instead:
-    //   - src/v2/backends/IBackend.h (abstract interface)
-    //   - src/v2/backends/cuda/CUDABackend.{h,cu} (CUDA implementation)
-    //   - src/v2/backends/rocm/ROCmBackend.{h,cpp} (ROCm implementation)
-    //
-    // The code below is kept for Main.cpp device enumeration compatibility but
-    // should NOT be extended. It will be removed in Phase 4.
-    // ============================================================================
-
-#if 0 // DISABLED: GPU contexts moved to IBackend (Phase 3)
-
-#ifdef HAVE_CUDA
-/**
- * @brief CUDA compute context (DEPRECATED - use CUDABackend)
- */
-class CUDAComputeContext : public ComputeContext
-{
-public:
-    CUDAComputeContext() = default;
-
-    void *allocate(size_t bytes) override;
-    void free(void *ptr) override;
-    void copy_to_device(void *dst, const void *src, size_t bytes) override;
-    void copy_from_device(void *dst, const void *src, size_t bytes) override;
-    void synchronize() override;
-
-    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_CUDA; }
-    bool supports_bf16() const override { return true; } // CUDA_R_16BF
-    bool supports_fp16() const override { return true; }
-    bool supports_int8() const override { return true; }
-
-    // Public members for device management
-    int device_id = 0;
-    cudaStream_t stream = nullptr;
-    cublasHandle_t cublas_handle = nullptr;
-};
-#endif
-
-#ifdef HAVE_ROCM
-/**
- * @brief ROCm compute context (DEPRECATED - use ROCmBackend)
- */
-class ROCmComputeContext : public ComputeContext
-{
-public:
-    ROCmComputeContext() = default;
-
-    void *allocate(size_t bytes) override;
-    void free(void *ptr) override;
-    void copy_to_device(void *dst, const void *src, size_t bytes) override;
-    void copy_from_device(void *dst, const void *src, size_t bytes) override;
-    void synchronize() override;
-
-    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_ROCM; }
-    bool supports_bf16() const override { return true; }
-    bool supports_fp16() const override { return true; }
-    bool supports_int8() const override { return true; }
-    // Public members for device management
-    int device_id = 0;
-    hipStream_t stream = nullptr;
-    hipblasHandle_t hipblas_handle = nullptr;
-};
-#endif
-
-#ifdef HAVE_VULKAN
-/**
- * @brief Vulkan compute context (DEPRECATED - will use IBackend)
- */
-class VulkanComputeContext : public ComputeContext
-{
-public:
-    VulkanComputeContext() = default;
-
-    void *allocate(size_t bytes) override;
-    void free(void *ptr) override;
-    void copy_to_device(void *dst, const void *src, size_t bytes) override;
-    void copy_from_device(void *dst, const void *src, size_t bytes) override;
-    void synchronize() override;
-
-    ComputeBackendType backend_type() const override { return ComputeBackendType::GPU_VULKAN; }
-    bool supports_bf16() const override { return false; } // Depends on extension
-    bool supports_fp16() const override { return true; }
-    bool supports_int8() const override { return true; }
-
-    // Public members for device management
-    int device_id = 0;
-    // TODO: VkDevice, VkQueue, VkCommandPool, etc.
-};
-#endif
-
-#endif // #if 0 - GPU contexts disabled (Phase 3)
 
     /**
      * @brief Device manager singleton
@@ -436,6 +466,40 @@ public:
          * @return true if matching device exists
          */
         bool deviceExists(const GlobalDeviceAddress &device, bool strict_numa) const;
+
+        /**
+         * @brief Classify driver-reported P2P coverage for a GPU device cell.
+         *
+         * The matrix is populated during every `initialize()` call regardless
+         * of whether inventory tables are printed.  Mixed CUDA/ROCm cells have
+         * no native collective P2P domain and therefore return empty; callers
+         * must handle heterogeneous transport explicitly rather than treating
+         * missing topology as a no-P2P measurement.
+         *
+         * @param devices Distinct process-local devices in one homogeneous cell.
+         * @return Exact coverage, or empty for invalid, mixed, unknown, or
+         *         incompletely enumerated cells.
+         */
+        [[nodiscard]] std::optional<PeerAccessCoverage>
+        peerAccessCoverage(const std::vector<DeviceId> &devices) const;
+
+        /**
+         * @brief Query one exact driver-reported directed GPU peer edge.
+         *
+         * Direction matters on asymmetric PCIe/IOMMU topologies.  `accessor`
+         * names the device whose runtime stream will read memory owned by
+         * `peer`; for a destination-owned peer copy this is therefore
+         * `peerAccessAvailable(destination, source)`.  Returning an optional
+         * keeps an invalid or mixed-backend query distinct from a measured
+         * same-backend edge whose answer is false.
+         *
+         * @param accessor GPU that would directly address peer memory.
+         * @param peer Distinct same-backend GPU owning that memory.
+         * @return Driver capability, or empty for invalid/mixed/unknown input.
+         */
+        [[nodiscard]] std::optional<bool> peerAccessAvailable(
+            DeviceId accessor,
+            DeviceId peer) const;
 
         /**
          * @brief Get a formatted string listing all available devices

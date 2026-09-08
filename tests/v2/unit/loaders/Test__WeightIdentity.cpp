@@ -1,3 +1,8 @@
+/**
+ * @file Test__WeightIdentity.cpp
+ * @brief Unit tests for semantic weight identity and lifecycle classification.
+ */
+
 #include <gtest/gtest.h>
 
 #include "loaders/WeightIdentity.h"
@@ -22,10 +27,15 @@ TEST(Test__WeightIdentity, InfersCommonWeightRoles)
     EXPECT_EQ(inferWeightRole("output_norm.weight"), WeightRole::OutputNorm);
     EXPECT_EQ(inferWeightRole("blk.3.attn_qkv.weight"), WeightRole::FusedQKV);
     EXPECT_EQ(inferWeightRole("blk.3.attn_output.weight"), WeightRole::AttentionWO);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_alpha.weight"), WeightRole::GDNAlphaBetaProjection);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_beta.weight"), WeightRole::GDNAlphaBetaProjection);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_a"), WeightRole::GDNSsmParam);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_dt.bias"), WeightRole::Bias);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_conv1d.weight"), WeightRole::GDNSsmParam);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_exps.weight"), WeightRole::MoEExpertGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp.weight"), WeightRole::MoERouter);
     EXPECT_EQ(inferWeightRole("blk.40.ffn_gate_inp.weight"), WeightRole::MoERouter);
-    EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp_shexp.weight"), WeightRole::SharedExpertGate);
+    EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp_shexp.weight"), WeightRole::SharedExpertInputGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_shexp.weight"), WeightRole::SharedExpertGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_up_shexp.weight"), WeightRole::SharedExpertUp);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_down_shexp.weight"), WeightRole::SharedExpertDown);
@@ -38,6 +48,23 @@ TEST(Test__WeightIdentity, InfersLayerAndExpert)
     EXPECT_EQ(inferWeightLayer("token_embd.weight"), -1);
     EXPECT_EQ(inferWeightExpert("blk.2.experts.42.ffn_gate.weight"), 42);
     EXPECT_EQ(inferWeightExpert("blk.2.ffn_gate_exps.weight"), -1);
+}
+
+TEST(Test__WeightIdentity, DistinguishesRoutedExpertsFromSharedExperts)
+{
+    EXPECT_TRUE(isRoutedExpertRole(WeightRole::MoEExpertGate));
+    EXPECT_TRUE(isRoutedExpertRole(WeightRole::MoEExpertUp));
+    EXPECT_TRUE(isRoutedExpertRole(WeightRole::MoEExpertDown));
+
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertGate));
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertInputGate));
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertUp));
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertDown));
+
+    EXPECT_FALSE(isRoutedExpertRole(WeightRole::SharedExpertGate));
+    EXPECT_FALSE(isRoutedExpertRole(WeightRole::SharedExpertUp));
+    EXPECT_FALSE(isRoutedExpertRole(WeightRole::SharedExpertDown));
+    EXPECT_FALSE(isSharedExpertRole(WeightRole::MoEExpertGate));
 }
 
 TEST(Test__WeightIdentity, CreatesStableSourceIdentity)
@@ -81,6 +108,62 @@ TEST(Test__WeightMetadataRegistry, RegistersSourceAndDerivedClone)
     EXPECT_EQ(*clone_meta->identity.source_instance_id, source_meta->identity.instance_id);
     EXPECT_EQ(clone_meta->residency.home_device, DeviceId::rocm(0));
     EXPECT_EQ(clone_meta->slice.source_rows, 4u);
+}
+
+TEST(Test__WeightMetadataRegistry, SourceRegistrationRefreshesStalePointerIdentity)
+{
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8});
+
+    WeightMetadataRegistry registry;
+    ASSERT_TRUE(registry.registerSource(tensor.get(), "blk.31.ffn_down.weight", DeviceId::rocm(1)));
+
+    /*
+     * Reusing a raw TensorBase address across runner lifetimes must not let the
+     * previous graph binding identity leak into a newly loaded source tensor.
+     * The registry cannot observe destruction, so source registration is the
+     * request-boundary owner that refreshes stale pointer-keyed metadata.
+     */
+    ASSERT_TRUE(registry.registerSource(tensor.get(), "token_embd.weight", DeviceId::rocm(1)));
+
+    auto meta = registry.metadata(tensor.get());
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->identity.canonical_name, "token_embd.weight");
+    EXPECT_EQ(meta->identity.role, WeightRole::Embedding);
+    EXPECT_EQ(meta->identity.layer, -1);
+    EXPECT_EQ(meta->identity.derivation, WeightDerivationKind::Source);
+    EXPECT_EQ(meta->residency.home_device, DeviceId::rocm(1));
+}
+
+/**
+ * @brief Accelerator bindings cannot erase a live CPU source-byte consumer.
+ */
+TEST(Test__WeightMetadataRegistry, CpuExecutionHostPolicyIsMonotonic)
+{
+    auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8});
+    WeightMetadataRegistry registry;
+    ASSERT_TRUE(registry.registerSource(
+        tensor.get(), "blk.0.ffn_gate_exps.weight", DeviceId::cpu()));
+
+    ASSERT_TRUE(registry.mergeHostPolicy(
+        tensor.get(), WeightHostPolicy::RequiredForCPUExecution));
+    ASSERT_TRUE(registry.mergeHostPolicy(
+        tensor.get(), WeightHostPolicy::ReleasableAfterPreparation));
+
+    auto residency = registry.residency(tensor.get());
+    ASSERT_TRUE(residency.has_value());
+    EXPECT_EQ(
+        residency->host_policy,
+        WeightHostPolicy::RequiredForCPUExecution);
+
+    // Refreshing the same source for another device is also a policy join,
+    // because the CPU graph remains live in the same model context.
+    EXPECT_FALSE(registry.registerSource(
+        tensor.get(), "blk.0.ffn_gate_exps.weight", DeviceId::cuda(0)));
+    residency = registry.residency(tensor.get());
+    ASSERT_TRUE(residency.has_value());
+    EXPECT_EQ(
+        residency->host_policy,
+        WeightHostPolicy::RequiredForCPUExecution);
 }
 
 TEST(Test__WeightMetadataRegistry, DescribeIncludesIdentity)
@@ -154,6 +237,56 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
     ASSERT_TRUE(clone_meta->identity.source_instance_id.has_value());
     EXPECT_EQ(*clone_meta->identity.source_instance_id, source_meta->identity.instance_id);
     EXPECT_EQ(clone_meta->residency.home_device, DeviceId::cuda(0));
+}
+
+TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
+{
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor("token_embd.weight", {8, 4})
+                      .build();
+
+    WeightManager manager(*loader);
+    auto embedding = manager.getWeightForDevice("token_embd.weight", DeviceId::cpu());
+    ASSERT_NE(embedding, nullptr);
+
+    /*
+     * Simulate stale metadata for a reused TensorBase address.  Materialization
+     * may use metadata for slice and residency details, but the WeightPlan is
+     * the first-class owner of graph binding identity at runner construction.
+     */
+    auto stale_identity = makeSourceWeightIdentity(
+        "blk.31.ffn_down.weight",
+        ModelContextId{99},
+        123);
+    ASSERT_TRUE(manager.weightMetadataRegistry()->registerWeight(
+        embedding.get(),
+        stale_identity,
+        {},
+        WeightResidency{DeviceId::cpu(), DeviceId::cpu()}));
+
+    InferenceStrategy strategy;
+    strategy.model_id = ModelContextId{77};
+    strategy.devices = {DeviceId::cpu()};
+
+    WeightRequirement requirement;
+    requirement.canonical_name = "token_embd.weight";
+    requirement.required = true;
+    requirement.role = WeightRole::Embedding;
+    requirement.target_device = DeviceId::cpu();
+    requirement.lookup_device = DeviceId::cpu();
+
+    WeightPlan plan(strategy);
+    plan.add(requirement);
+
+    auto frozen = manager.materialize(plan);
+    ASSERT_NO_THROW((void)frozen.global("token_embd.weight"));
+
+    const auto &binding = frozen.global("token_embd.weight");
+    EXPECT_EQ(binding.identity.canonical_name, "token_embd.weight");
+    EXPECT_EQ(binding.identity.role, WeightRole::Embedding);
+    EXPECT_EQ(binding.identity.layer, -1);
+    EXPECT_EQ(binding.identity.logical_id, stableWeightLogicalId("token_embd.weight"));
+    EXPECT_EQ(binding.identity.model_id.value, 77u);
 }
 
 TEST(Test__WeightManagerMetadata, RegistersLocalTPSliceMetadata)

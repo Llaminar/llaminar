@@ -16,6 +16,7 @@
 #include "backends/UPIBackend.h"
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,6 +24,57 @@
 
 namespace llaminar2
 {
+
+    /** Communication operation governed by the same-node rooted policy. */
+    enum class CPURootedPublicationOperation : uint8_t
+    {
+        PackedRecordGather,
+        CompactOutputBroadcast,
+    };
+
+    /** Economical transport regime selected before a rooted transaction. */
+    enum class CPURootedPublicationTransport : uint8_t
+    {
+        SharedMemoryLatency,
+        MPIBandwidth,
+    };
+
+    /**
+     * @brief Measured transport policy for exact same-node CPU MoE publication.
+     *
+     * `V2_Perf_CPURootedPublicationTransport` sweeps both protocols from 8 KiB
+     * through 32 MiB. On the supported dual-socket topology, shared memory wins
+     * the decode-sized latency regime while MPI wins once copy bandwidth
+     * dominates. The operation-specific boundaries deliberately leave margin
+     * around the measured crossover instead of dispatching on a noisy tie.
+     *
+     * Selection is total over payload size and happens before communication;
+     * runtime failure never changes transport.
+     */
+    struct CPURootedPublicationTransportPolicy
+    {
+        /** Includes Qwen3.6 top-8, d=2048 serial decode (65,568 bytes). */
+        static constexpr size_t kPackedGatherSharedMemoryMaxBytes =
+            96u * 1024u;
+        /** Includes compact d=2048 verifier groups through M=4. */
+        static constexpr size_t kBroadcastSharedMemoryMaxBytes =
+            32u * 1024u;
+
+        /** Select the first-class transport for one common payload size. */
+        [[nodiscard]] static constexpr CPURootedPublicationTransport select(
+            CPURootedPublicationOperation operation,
+            size_t payload_bytes) noexcept
+        {
+            const size_t shared_memory_max =
+                operation ==
+                        CPURootedPublicationOperation::PackedRecordGather
+                    ? kPackedGatherSharedMemoryMaxBytes
+                    : kBroadcastSharedMemoryMaxBytes;
+            return payload_bytes <= shared_memory_max
+                       ? CPURootedPublicationTransport::SharedMemoryLatency
+                       : CPURootedPublicationTransport::MPIBandwidth;
+        }
+    };
 
     // Forward declarations
     struct TPDomain;
@@ -117,7 +169,7 @@ namespace llaminar2
          * Returns NODE_LOCAL if all participating ranks are on the same physical
          * node, GLOBAL otherwise. This replaces the hardcoded GLOBAL from
          * IGlobalTPContext, enabling the same GlobalTPContext class to serve
-         * both NodeLocalTP (cross-socket, same machine) and true GlobalTP
+         * both NodeTP (cross-socket, same machine) and true GlobalTP
          * (cross-machine) use cases.
          */
         TPScope scope() const override;
@@ -140,6 +192,20 @@ namespace llaminar2
         GlobalDeviceAddress localDevice() const override;
         void barrier() const override;
         bool allgatherBytes(const void *send_data, void *recv_data, size_t byte_count) const override;
+        bool gatherVariableFloatRecordsToRoot(
+            const float *local_records,
+            size_t local_record_count,
+            float *root_records,
+            size_t root_record_capacity,
+            size_t record_width_elements,
+            int root_index,
+            size_t &gathered_record_count,
+            const std::string &stage_name) override;
+        bool broadcastFloatElements(
+            TensorBase *tensor,
+            size_t element_count,
+            int root_index,
+            const std::string &stage_name) override;
         bool send(const TensorBase *tensor, int dest_index) override;
         bool recv(TensorBase *tensor, int source_index) override;
 
@@ -160,7 +226,7 @@ namespace llaminar2
         /**
          * @brief Check if all domain ranks are on the same physical node
          *
-         * When true, this GlobalTPContext is conceptually a NodeLocalTP context:
+         * When true, this GlobalTPContext is conceptually a NodeTP context:
          * all participants share the same machine and communicate via UPI or
          * shared memory rather than cross-node networking.
          *
@@ -210,6 +276,17 @@ namespace llaminar2
         void detectNodeIds();
 
         MPI_Comm domain_comm_;                        ///< Domain-specific MPI communicator
+        /**
+         * @brief Private point-to-point lane for rooted canonical publication.
+         *
+         * Packed MoE records are variable-sized messages rather than an MPI
+         * collective.  Giving that protocol its own communicator context makes
+         * message matching structural: its fixed tag cannot consume an ordinary
+         * pipeline send, and an ordinary send cannot consume a publication
+         * message.  The communicator is duplicated once during context setup and
+         * is never created or replaced in the execution hot path.
+         */
+        MPI_Comm rooted_publication_comm_ = MPI_COMM_NULL;
         int domain_id_;                               ///< Domain identifier
         int my_rank_in_domain_;                       ///< Our rank within domain (0 to size-1)
         int domain_size_;                             ///< Number of participants
@@ -221,6 +298,20 @@ namespace llaminar2
         CollectiveBackendType backend_type_;          ///< Backend type for this context
         std::unique_ptr<ICollectiveBackend> backend_; ///< Backend for collective operations (ShmemSpin or UPI)
         std::atomic<bool> abort_requested_{false};    ///< One-sided failure/cancel flag
+        /** Persistent requests for one in-flight packed message per participant. */
+        std::vector<MPI_Request> rooted_record_requests_;
+        /** Root-side duplicate-source guard reused by every packed gather. */
+        std::vector<uint8_t> rooted_record_source_seen_;
+        /**
+         * @brief Rank-local ordinal for backend allreduce submissions.
+         *
+         * All ranks in a valid TP transaction must submit the same named
+         * collective at the same ordinal. The value is intentionally advanced
+         * only after argument validation and immediately before backend entry,
+         * making paired diagnostic traces useful for locating the first
+         * control-flow divergence without adding another collective.
+         */
+        std::atomic<uint64_t> allreduce_sequence_{0};
     };
 
 } // namespace llaminar2

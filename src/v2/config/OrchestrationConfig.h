@@ -31,10 +31,11 @@
 #include "CollectiveBackendType.h"
 #include "ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
-#include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include <string>
 #include <vector>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <memory>
@@ -52,7 +53,7 @@ namespace llaminar2
     enum class TPScope
     {
         AUTO,       ///< Automatically determine based on topology
-        LOCAL,      ///< TP within single MPI rank (intra-rank: NVLink, HOST, NCCL)
+        RANK_LOCAL, ///< TP within one MPI rank (intra-rank: NVLink, HOST, NCCL)
         NODE_LOCAL, ///< TP across MPI ranks on same physical node (UPI, shmem, cross-process NCCL)
         GLOBAL,     ///< TP across all nodes (MPI over InfiniBand/Ethernet)
         HYBRID      ///< Hierarchical: local TP + global PP
@@ -117,14 +118,14 @@ namespace llaminar2
      * through toExecutionDomainDefinition() and keep PP layer ownership in
      * PPStageDefinition rather than extending this legacy wrapper.
      *
-     * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]"
+     * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type][;scope=rank_local|node_local|global][;owner=N][;ranks=0,1,...]"
      *
      * Examples:
      *   "gpu_tp=cuda:0,cuda:1" -> Equal split across 2 CUDA GPUs
      *   "mixed=cuda:0,rocm:0;weights=0.73,0.27" -> Proportional split
      *   "fast=cuda:0,cuda:1;backend=nccl" -> Force NCCL backend
-     *   "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0" -> Local TP, rank 0
-     *   "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1" -> Node-local TP
+     *   "rocm_socket0=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0" -> rank-local TP, rank 0
+     *   "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1" -> NodeTP
      */
     struct DomainDefinition
     {
@@ -132,10 +133,17 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices; ///< Devices in this domain
         std::vector<float> weights;               ///< Optional: proportional weights (must sum to 1.0)
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
-        ExecutionDomainComputeKind compute_kind = ExecutionDomainComputeKind::UNSPECIFIED;
+        RoutedExpertComputePolicy routed_compute_policy =
+            RoutedExpertComputePolicy::Unspecified;
+        RoutedExpertPhasePolicy routed_phase_policy =
+            RoutedExpertPhasePolicy::Unspecified;
+        RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::Unspecified;
+        RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::Unspecified;
 
         // Phase 5: domain scope and rank ownership
-        TPScope scope = TPScope::AUTO;   ///< Domain scope (local=single-rank, node_local/global=multi-rank)
+        TPScope scope = TPScope::AUTO;   ///< Domain scope (rank_local=single-rank, node_local/global=multi-rank)
         std::optional<int> owner_rank;   ///< Explicit owner MPI rank for local domains (;owner=N)
         std::vector<int> explicit_ranks; ///< Explicit participating ranks for node_local/global (;ranks=0,1,...)
 
@@ -351,7 +359,8 @@ namespace llaminar2
         // Inference Configuration
         // =========================================================================
 
-        std::string prompt; ///< Input prompt
+        std::string prompt; ///< Input prompt.
+        bool prompt_was_explicitly_provided = false; ///< Distinguishes an omitted prompt from `--prompt ""`.
         int n_predict = -1; ///< Tokens to generate (-1 = until EOS)
         int batch_size = 1; ///< Batch size
         int n_threads = -1; ///< Thread count (-1 = auto)
@@ -379,8 +388,10 @@ namespace llaminar2
         // Benchmark Configuration
         // =========================================================================
 
-        bool benchmark_mode = false;              ///< Run benchmark
-        std::string benchmark_json_output_path;   ///< Optional machine-readable benchmark JSON output path
+        bool benchmark_mode = false;            ///< Run benchmark.
+        std::string benchmark_json_output_path; ///< Optional machine-readable benchmark JSON output path.
+        std::string benchmark_prompt_file_path; ///< Exact benchmark prompt bytes loaded from this text file.
+        bool benchmark_prompt_file_was_provided = false; ///< Distinguishes omission from `--prompt-file ""`.
 
         // =========================================================================
         // Server Configuration
@@ -431,30 +442,38 @@ namespace llaminar2
         bool moe_shared_experts_gpu = true; ///< Place shared experts on GPU
         bool moe_sparse_experts_cpu = true; ///< Place sparse experts on CPU
 
-        /// Routed MoE expert execution mode for the standard Qwen3.5 MoE path.
-        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+        /// Physical routed-expert compute distribution for the standard path.
+        RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
-        /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+        /// Static whole-expert ownership ordering for apportioned domains.
+        RoutedExpertOwnerOrder routed_expert_owner_order =
+            RoutedExpertOwnerOrder::Ordinal;
+
+        /// Bounded hot remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
-        /// Decode histogram / dynamic rebalance settings promoted from env knobs.
+        /// Ordinary prefill assignment economy and graph-window policy.
+        RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
+
+        /// Durable expert-residency observation and maintenance policy.
         MoERebalanceRuntimeConfig moe_rebalance;
 
-        /// Optional same-layer MoE expert overlay / expert-parallel plan.
-        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+        /// Optional same-layer routed-expert placement plan.
+        std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
 
         // =========================================================================
         // Precision
         // =========================================================================
 
-        std::string activation_precision = "fp32"; ///< "fp32", "bf16", "fp16", "q8_1"
+        std::string activation_precision = "fp32"; ///< Only FP32 is implemented for production model activations.
         std::string kv_cache_precision = "auto";   ///< "auto" (q16_1 on CPU, fp16 on GPU), "fp32", "fp16", "q8_1", "q16_1"
+        std::string tp_allreduce_precision_override; ///< "", "auto"/"schema", "fp32", "fp16", or "bf16"
 
         // =========================================================================
         // Prefix Cache and MTP
         // =========================================================================
 
-        PrefixCacheRuntimeConfig prefix_cache; ///< Disabled-by-default prefix-state cache settings
+        PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
         MTPRuntimeConfig mtp;                  ///< Disabled-by-default multi-token prediction settings
 
         // =========================================================================
@@ -492,10 +511,9 @@ namespace llaminar2
         /**
          * @brief Canonical view of all user-declared execution domains.
          *
-         * During the DomainDefinition/ExpertComputeDomain migration this joins
-         * legacy named-domain inputs and MoE overlay-domain inputs into one
-         * normalized inventory. Placements such as pp_stage_definitions and
-         * routed_tiers remain separate references over these domains.
+         * Named domains and routed-expert domain declarations feed one
+         * normalized hardware inventory. Placements such as PP stages and
+         * routed tiers remain separate references over those domains.
          */
         std::vector<ExecutionDomainDefinition> executionDomainDefinitions() const;
 
@@ -517,27 +535,64 @@ namespace llaminar2
     };
 
     /**
-     * @brief Validate only the MoE expert overlay portion of an orchestration config.
+     * @brief Validate the routed-expert placement portion of a configuration.
      *
      * This is intentionally separate from OrchestrationConfig::validate() so the
-     * CLI parser can validate overlay flags after YAML+CLI merging without also
-     * rejecting legacy/incomplete non-overlay CLI combinations that older parser
-     * tests and scripts still parse successfully.
+     * CLI parser can validate placement flags after YAML and CLI merging without
+     * coupling that validation to unrelated orchestration modes.
      */
-    std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config);
+    std::vector<std::string> validateMoERoutedExpertPlacementConfig(
+        const OrchestrationConfig &config);
 
     /**
-     * @brief Reconcile legacy overlay-domain inputs with the canonical domain inventory.
+     * @brief Reconcile routed-expert declarations with the domain inventory.
      *
-     * Phase 9C treats --define-domain as the single hardware-domain inventory.
-     * The legacy --moe-expert-overlay-domain/YAML domains syntax remains
-     * accepted as an alias: it contributes to the same inventory, then overlay
-     * placements (continuation/base/shared/tier) are resolved back into
-     * MoEExpertParallelPlan::domains for existing runtime consumers.
+     * Both --define-domain and --moe-routed-expert-domain contribute typed
+     * declarations to one inventory. Continuation, base, shared, and routed-tier
+     * placement references are then resolved back into the placement plan.
      *
      * @return Empty vector if normalization succeeded, otherwise conflict or
      *         conversion errors suitable for user-facing validation output.
      */
-    std::vector<std::string> normalizeMoEExpertOverlayDomains(OrchestrationConfig &config);
+    std::vector<std::string> normalizeMoERoutedExpertPlacementDomains(
+        OrchestrationConfig &config);
+
+    /**
+     * @brief Provenance of a hardware-resolved ExpertOverlay installation.
+     *
+     * A user-declared domain remains the public topology authority. An
+     * implicit plan is different: it is the canonical replacement for simple
+     * `--tp-devices`/`--tp` selectors after model metadata identifies routed
+     * experts. Keeping both representations live would create two authorities
+     * and trigger valid mutual-exclusion rules during the second validation.
+     */
+    enum class MoEExpertOverlayPlanInstallOrigin : std::uint8_t
+    {
+        UserDeclaredDomains,
+        SynthesizedSimpleTP,
+    };
+
+    /**
+     * @brief Atomically install a hardware-resolved ExpertOverlay plan.
+     *
+     * Startup first parses rank-agnostic hardware selectors, then resolves
+     * them against the gathered cluster inventory. This lifecycle boundary
+     * updates both the routed placement plan and the canonical named-domain
+     * inventory together. It rejects any change to user intent other than
+     * specializing wildcard host/NUMA selectors and filling rank ownership.
+     * Rank-local domains install one `owner_rank` with no explicit rank list;
+     * cross-rank domains install one rank binding per participant.
+     *
+     * @param config Configuration whose requested overlay is being resolved.
+     * @param resolved_plan Immutable-copy result of inventory binding.
+     * @param origin Whether domains came from user intent or replaced simple
+     *        TP selectors during implicit single-tier normalization. The latter
+     *        atomically retires those selectors after successful installation.
+     * @return Empty on success; otherwise validation errors and no mutation.
+     */
+    std::vector<std::string> installResolvedMoEExpertOverlayPlan(
+        OrchestrationConfig &config,
+        std::shared_ptr<MoERoutedExpertPlacementPlan> resolved_plan,
+        MoEExpertOverlayPlanInstallOrigin origin);
 
 } // namespace llaminar2

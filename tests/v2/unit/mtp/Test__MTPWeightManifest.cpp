@@ -6,6 +6,7 @@
 #include "mocks/MockModelLoader.h"
 #include "tensors/Tensors.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -231,6 +232,66 @@ TEST(Test__MTPWeightManifest, DiscoversNextNMoEBlockLayoutFromQwen36Metadata)
     EXPECT_EQ(manifest.depths[0].source_layer_index, 40);
     EXPECT_EQ(manifest.depths[0].moe_gate_exps, "blk.40.ffn_gate_exps.weight");
     EXPECT_EQ(manifest.depths[0].shared_expert_gate_inp, "blk.40.ffn_gate_inp_shexp.weight");
+}
+
+/**
+ * @brief A participant replica and ExpertOverlay must never co-own experts.
+ *
+ * The compact predictor still needs its router and always-active shared expert
+ * locally. Only the three routed parents move behind ExpertOverlay's prepared
+ * residency registry.
+ */
+TEST(Test__MTPWeightManifest,
+     ParticipantReplicaNamesRespectTypedRoutedExpertAuthority)
+{
+    MockModelLoaderBuilder builder;
+    builder.setArchitecture("qwen35moe")
+        .setBlockCount(41)
+        .setInt("qwen35moe.nextn_predict_layers", 1);
+    addNextNMoEDepth(builder, 40);
+    auto loader = builder.build();
+
+    const MTPWeightManifest manifest = discoverMTPWeightManifest(
+        *loader,
+        "qwen35moe",
+        41,
+        /*explicit_mtp=*/true);
+    ASSERT_TRUE(manifest.available) << manifest.diagnostic;
+
+    const auto sidecar_owned = manifest.participantReplicaNames(
+        MTPRoutedExpertWeightAuthority::SidecarParticipant);
+    const auto overlay_owned = manifest.participantReplicaNames(
+        MTPRoutedExpertWeightAuthority::ExpertOverlay);
+    const auto contains = [](const std::vector<std::string> &names,
+                             const std::string &name)
+    {
+        return std::find(names.begin(), names.end(), name) != names.end();
+    };
+
+    for (const auto *routed_parent : {
+             "blk.40.ffn_gate_exps.weight",
+             "blk.40.ffn_up_exps.weight",
+             "blk.40.ffn_down_exps.weight",
+         })
+    {
+        EXPECT_TRUE(contains(sidecar_owned, routed_parent));
+        EXPECT_FALSE(contains(overlay_owned, routed_parent));
+    }
+
+    for (const auto *participant_weight : {
+             "blk.40.nextn.eh_proj.weight",
+             "blk.40.attn_q.weight",
+             "blk.40.ffn_gate_inp.weight",
+             "blk.40.ffn_gate_shexp.weight",
+             "blk.40.ffn_up_shexp.weight",
+             "blk.40.ffn_down_shexp.weight",
+             "blk.40.ffn_gate_inp_shexp.weight",
+         })
+    {
+        EXPECT_TRUE(contains(sidecar_owned, participant_weight));
+        EXPECT_TRUE(contains(overlay_owned, participant_weight));
+    }
+    EXPECT_EQ(sidecar_owned.size(), overlay_owned.size() + 3u);
 }
 
 TEST(Test__MTPWeightManifest, DiscoversGenericMTPLayersLayout)

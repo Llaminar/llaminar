@@ -51,7 +51,8 @@ namespace llaminar2
      * and then chooses the matching runner entrypoint:
      *
      * - one request + host tokens -> `forward()`
-     * - one request + device token row -> `forwardWithDeviceTokenIds()`
+     * - one request + device token row ->
+     *   `forwardGroupedMTPVerifierWithDeviceTokenIds()`
      * - multiple requests + host tokens -> `forward_batch()`
      * - multiple requests + device token rows -> `forwardBatchWithDeviceTokenIds()`
      *
@@ -79,9 +80,6 @@ namespace llaminar2
         std::vector<MTPDecodeCatchupGreedyRequest> requests;
         std::vector<int32_t> base_cached_tokens;
         MTPVerifierForwardExecutionOptions forward_options = {};
-        MTPSpecTransactionPublicationContract publication_contract =
-            MTPSpecTransactionPublicationContract::
-                DirectAcceptedStatePublication;
     };
 
     /**
@@ -123,10 +121,7 @@ namespace llaminar2
     MTPGreedyVerifierBatchTransactionResult executeMTPGreedyVerifierScheduledBatchTransaction(
         IInferenceRunner &runner,
         const MTPSpecRequestBatch &scheduled_batch,
-        MTPVerifierForwardExecutionOptions forward_options = {},
-        MTPSpecTransactionPublicationContract publication_contract =
-            MTPSpecTransactionPublicationContract::
-                DirectAcceptedStatePublication);
+        MTPVerifierForwardExecutionOptions forward_options = {});
 
     /**
      * @brief Result of scheduling and executing an owned greedy verifier batch.
@@ -159,10 +154,7 @@ namespace llaminar2
         IInferenceRunner &runner,
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
-        MTPVerifierForwardExecutionOptions forward_options = {},
-        MTPSpecTransactionPublicationContract publication_contract =
-            MTPSpecTransactionPublicationContract::
-                DirectAcceptedStatePublication);
+        MTPVerifierForwardExecutionOptions forward_options = {});
 
     /**
      * @brief Callback used to publish accepted verifier state before commit.
@@ -170,7 +162,7 @@ namespace llaminar2
      * The publisher receives the fully validated transaction plan. It should
      * apply KV, terminal hidden/logits, GDN, short-conv, and shifted MTP state
      * through the normal runner/backend publication path. Returning false keeps
-     * ownership pending so the caller can retry or replay safely.
+     * ownership pending so the caller can retry publication safely.
      */
     using MTPGreedyVerifierBatchPublicationFn =
         std::function<bool(const MTPSpecTransactionBatchPlan &, std::string *)>;
@@ -190,10 +182,7 @@ namespace llaminar2
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
         MTPGreedyVerifierBatchPublicationFn publish,
-        MTPVerifierForwardExecutionOptions forward_options = {},
-        MTPSpecTransactionPublicationContract publication_contract =
-            MTPSpecTransactionPublicationContract::
-                DirectAcceptedStatePublication);
+        MTPVerifierForwardExecutionOptions forward_options = {});
 
     /**
      * @brief Result of reducing a scheduled stochastic verifier batch.
@@ -217,10 +206,7 @@ namespace llaminar2
      */
     MTPDeviceOutcomeBatchTransactionResult executeMTPDeviceOutcomeScheduledBatchTransaction(
         const MTPSpecRequestBatch &scheduled_batch,
-        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes,
-        MTPSpecTransactionPublicationContract publication_contract =
-            MTPSpecTransactionPublicationContract::
-                DirectAcceptedStatePublication);
+        std::vector<MTPDeviceRejectionBatchOutcome> device_outcomes);
 
     /**
      * @brief Callback that produces compact stochastic verifier outcomes.
@@ -265,9 +251,6 @@ namespace llaminar2
         MTPSpecRequestBatchOwner &owner,
         const MTPSpecRequestBatchScheduler &scheduler,
         MTPDeviceOutcomeBatchProducerFn produce,
-        MTPGreedyVerifierBatchPublicationFn publish,
-        MTPSpecTransactionPublicationContract publication_contract =
-            MTPSpecTransactionPublicationContract::
-                DirectAcceptedStatePublication);
+        MTPGreedyVerifierBatchPublicationFn publish);
 
 } // namespace llaminar2

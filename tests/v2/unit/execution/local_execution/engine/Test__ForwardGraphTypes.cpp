@@ -4,79 +4,428 @@
  *
  * Tests ForwardGraphSignature equality/hashing, GraphBuildResult,
  * GraphCacheConfig defaults, and ForwardGraphCache invalidation.
+ * Model-free replay probes also enforce source-definition ownership, one
+ * executable per retained parent, and no launch/recapture on request reset.
  */
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <future>
+#include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/graph/RetainedParentTicketServiceWorker.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
+#include "execution/moe/MoEOverlayRetainedParentComposer.h"
+#include "memory/BufferArena.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
+#include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h"
 
 using namespace llaminar2;
 
+/**
+ * @brief Prove the retained-parent service lane is persistent and single-slot.
+ *
+ * The first invocation deliberately remains live while the caller continues,
+ * modelling a CPU service that waits for a GPU-produced mapped ticket during
+ * backend graph submission. A second invocation is rejected until the exact
+ * generation is collected; the same thread then executes a second task.
+ */
+TEST(Test__RetainedParentTicketServiceWorker,
+     PrearmsOneInvocationAndReusesThePersistentThread)
+{
+    RetainedParentTicketServiceWorker worker;
+    struct BlockingTask
+    {
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+    } blocking;
+
+    const auto ticket = worker.dispatch(
+        [](void *opaque) -> bool
+        {
+            auto &task = *static_cast<BlockingTask *>(opaque);
+            task.entered.store(true, std::memory_order_release);
+            while (!task.release.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            return true;
+        },
+        &blocking);
+    ASSERT_TRUE(ticket.valid());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!blocking.entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(blocking.entered.load(std::memory_order_acquire));
+    EXPECT_FALSE(worker.idle());
+    EXPECT_THROW(
+        static_cast<void>(worker.dispatch(
+            [](void *) -> bool { return true; }, &blocking)),
+        std::logic_error);
+
+    blocking.release.store(true, std::memory_order_release);
+    EXPECT_TRUE(worker.await(ticket));
+    EXPECT_TRUE(worker.idle());
+
+    int second_invocation = 0;
+    const auto second_ticket = worker.dispatch(
+        [](void *opaque) -> bool
+        {
+            ++*static_cast<int *>(opaque);
+            return false;
+        },
+        &second_invocation);
+    EXPECT_FALSE(worker.await(second_ticket));
+    EXPECT_EQ(second_invocation, 1);
+    EXPECT_TRUE(worker.idle());
+}
+
 namespace
 {
     class FakeSegmentStage final : public IComputeStage
     {
     public:
-        FakeSegmentStage(bool capturable,
+        FakeSegmentStage(DeviceId device,
+                         bool capturable,
                          bool manual_boundary = false,
                          ComputeStageType stage_type = ComputeStageType::COPY,
-                         bool warmup_dependent_capture = false,
+                         bool launch_preparation_dependent_capture = false,
                          bool segment_boundary_before = false,
                          bool segment_boundary_after = false,
-                         const uint64_t *variant_signature = nullptr)
-            : IComputeStage(DeviceId::cpu()),
+                         const uint64_t *variant_signature = nullptr,
+                         bool passive_capture_noop = false,
+                         ManualGraphBoundaryScheduling manual_scheduling =
+                             ManualGraphBoundaryScheduling::
+                                 BetweenExecutableLaunches,
+                         ConcurrentManualFailureRole failure_role =
+                             ConcurrentManualFailureRole::None,
+                         bool execute_result = true)
+            : IComputeStage(device),
               capturable_(capturable),
               manual_boundary_(manual_boundary),
               stage_type_(stage_type),
-              warmup_dependent_capture_(warmup_dependent_capture),
+              launch_preparation_dependent_capture_(launch_preparation_dependent_capture),
               segment_boundary_before_(segment_boundary_before),
               segment_boundary_after_(segment_boundary_after),
-              variant_signature_(variant_signature)
+              variant_signature_(variant_signature),
+              passive_capture_noop_(passive_capture_noop),
+              manual_scheduling_(manual_scheduling),
+              failure_role_(failure_role),
+              execute_result_(execute_result)
         {
         }
 
-        bool execute(IDeviceContext *) override { return true; }
+        bool execute(IDeviceContext *) override
+        {
+            ++execute_calls_;
+            return execute_result_;
+        }
         ComputeStageType type() const override { return stage_type_; }
         std::string name() const override { return "fake_segment_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
         bool isGraphCapturable() const override { return capturable_; }
+        bool isPassiveGraphCaptureNoOp() const override
+        {
+            return passive_capture_noop_;
+        }
         uint64_t graphCaptureVariantSignature() const override
         {
             return variant_signature_ ? *variant_signature_ : 0;
         }
-        bool supportsWarmupDependentGraphCapture() const override { return warmup_dependent_capture_; }
+        bool supportsGraphCaptureAfterLaunchPreparation() const override
+        {
+            return launch_preparation_dependent_capture_;
+        }
         bool requiresGraphCaptureSegmentBoundaryBefore() const override { return segment_boundary_before_; }
         bool requiresGraphCaptureSegmentBoundaryAfter() const override { return segment_boundary_after_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
+        ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept override
+        {
+            return manual_scheduling_;
+        }
+        ConcurrentManualFailureRole
+        concurrentManualFailureRole() const noexcept override
+        {
+            return failure_role_;
+        }
+        bool publishConcurrentManualFailure() noexcept override
+        {
+            ++abort_publications_;
+            return failure_role_ ==
+                   ConcurrentManualFailureRole::DeviceIngressPublisher;
+        }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        int execute_calls_ = 0;
+        int abort_publications_ = 0;
 
     private:
         bool capturable_ = true;
         bool manual_boundary_ = false;
         ComputeStageType stage_type_ = ComputeStageType::COPY;
-        bool warmup_dependent_capture_ = false;
+        bool launch_preparation_dependent_capture_ = false;
         bool segment_boundary_before_ = false;
         bool segment_boundary_after_ = false;
         const uint64_t *variant_signature_ = nullptr;
+        bool passive_capture_noop_ = false;
+        ManualGraphBoundaryScheduling manual_scheduling_ =
+            ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
+        ConcurrentManualFailureRole failure_role_ =
+            ConcurrentManualFailureRole::None;
+        bool execute_result_ = true;
+    };
+
+    /**
+     * @brief Capturable helper stage with one stable tensor-backed diagnostic.
+     *
+     * The tensor remains host-resident because the regression deliberately
+     * rejects this output in the snapshot filter. If the executor accidentally
+     * selects it, normal snapshot preparation fails instead of hiding the wrong
+     * graph identity behind a fake GPU allocation.
+     */
+    class FakeSnapshotOutputStage final : public IComputeStage
+    {
+    public:
+        FakeSnapshotOutputStage(DeviceId device, ITensor *output)
+            : IComputeStage(device), output_(output)
+        {
+        }
+
+        /** @brief Record model execution during initial native capture only. */
+        bool execute(IDeviceContext *) override
+        {
+            ++execute_calls_;
+            return true;
+        }
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::COPY;
+        }
+        std::string name() const override
+        {
+            return "fake_snapshot_output_stage";
+        }
+        bool supportsBackend(ComputeBackendType) const override
+        {
+            return true;
+        }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        bool isGraphCapturable() const override { return true; }
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            StageDumpInfo info;
+            info.outputs.push_back(StageDumpInfo::OutputBuffer{
+                .name = "helper_output",
+                .data = nullptr,
+                .rows = 1,
+                .cols = 1,
+                .dtype = "FP32",
+                .element_size = sizeof(float),
+                .byte_size = sizeof(float),
+                .tensor = output_,
+            });
+            return info;
+        }
+
+        int execute_calls_ = 0;
+
+    private:
+        ITensor *output_ = nullptr;
+    };
+
+    /**
+     * @brief Stage double exposing prepared-weight proof lifetime and call counts.
+     *
+     * Retained heterogeneous schedules validate every stage while sealing the
+     * plan. Immutable residency-backed stages must not repeat that exhaustive
+     * proof for every packet, while conservatively mutable stages must retain
+     * their per-execution check.
+     */
+    class FakeRetainedScheduleStage final : public IComputeStage
+    {
+    public:
+        FakeRetainedScheduleStage(
+            DeviceId device,
+            PreparedWeightValidationLifetime validation_lifetime,
+            std::vector<std::string> *execution_log = nullptr)
+            : IComputeStage(device),
+              validation_lifetime_(validation_lifetime),
+              execution_log_(execution_log)
+        {
+        }
+
+        /** @brief Record one direct retained-plan invocation. */
+        bool execute(IDeviceContext *) override
+        {
+            ++execute_calls_;
+            if (execution_log_)
+                execution_log_->push_back(name_);
+            return true;
+        }
+
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        std::string name() const override { return name_; }
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::CPU;
+        }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+
+        /** @brief Count each prepared-weight proof requested by the executor. */
+        bool validatePreparedWeights(std::string *error) const override
+        {
+            ++validation_calls_;
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        PreparedWeightValidationLifetime
+        preparedWeightValidationLifetime() const noexcept override
+        {
+            return validation_lifetime_;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        std::string name_ = "fake_retained_schedule_stage";
+        mutable int validation_calls_ = 0;
+        int execute_calls_ = 0;
+
+    private:
+        PreparedWeightValidationLifetime validation_lifetime_;
+        std::vector<std::string> *execution_log_ = nullptr;
+    };
+
+    /**
+     * @brief Reusable gate that fails unless all GPU wave members overlap.
+     *
+     * Each stage waits for the other distinct-device stage to enter. A
+     * flattened executor times out the first stage; a worker-dispatched wave
+     * releases both immediately without touching physical hardware.
+     */
+    class RetainedWaveConcurrencyGate
+    {
+    public:
+        /** @brief Arrive and wait for the configured wave width. */
+        bool arriveAndWait(size_t required)
+        {
+            std::unique_lock lock(mutex_);
+            ++arrivals_;
+            if (arrivals_ >= required)
+            {
+                released_ = true;
+                condition_.notify_all();
+                return true;
+            }
+            return condition_.wait_for(
+                lock,
+                std::chrono::seconds(1),
+                [&] { return released_; });
+        }
+
+        /** @return Number of stages that reached the gate. */
+        size_t arrivals() const
+        {
+            std::lock_guard lock(mutex_);
+            return arrivals_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        std::condition_variable condition_;
+        size_t arrivals_ = 0;
+        bool released_ = false;
+    };
+
+    /** @brief Hardware-free GPU stage used to prove retained wave concurrency. */
+    class ConcurrentRetainedGPUStage final : public IComputeStage
+    {
+    public:
+        ConcurrentRetainedGPUStage(
+            DeviceId device,
+            RetainedWaveConcurrencyGate *gate,
+            size_t required)
+            : IComputeStage(device), gate_(gate), required_(required)
+        {
+        }
+
+        /** @brief Block until every independent GPU stage is executing. */
+        bool execute(IDeviceContext *context) override
+        {
+            return context && context->deviceId() == device() && gate_ &&
+                   gate_->arriveAndWait(required_);
+        }
+
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        std::string name() const override
+        {
+            return "concurrent_retained_gpu_stage";
+        }
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::GPU_ROCM;
+        }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        bool validatePreparedWeights(std::string *error) const override
+        {
+            if (error)
+                error->clear();
+            return true;
+        }
+        PreparedWeightValidationLifetime
+        preparedWeightValidationLifetime() const noexcept override
+        {
+            return PreparedWeightValidationLifetime::StageLifetime;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+    private:
+        RetainedWaveConcurrencyGate *gate_ = nullptr;
+        size_t required_ = 0;
     };
 
     class FakeGraphLaunchPrepStage final : public IComputeStage
     {
     public:
-        explicit FakeGraphLaunchPrepStage(DeviceId device)
-            : IComputeStage(device)
+        explicit FakeGraphLaunchPrepStage(
+            DeviceId device,
+            GraphLaunchPreparationPolicy policy =
+                GraphLaunchPreparationPolicy::CaptureAndReplay,
+            bool capture_requires_preparation = false)
+            : IComputeStage(device),
+              policy_(policy),
+              capture_requires_preparation_(capture_requires_preparation)
         {
         }
 
@@ -90,8 +439,22 @@ namespace
         ComputeStageType type() const override { return ComputeStageType::COPY; }
         std::string name() const override { return "fake_graph_launch_prep_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
-        bool isGraphCapturable() const override { return true; }
-        bool needsGraphLaunchPreparation() const override { return true; }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        bool isGraphCapturable() const override
+        {
+            return !capture_requires_preparation_ || prepare_calls_ > 0;
+        }
+        bool supportsGraphCaptureAfterLaunchPreparation() const override
+        {
+            return capture_requires_preparation_;
+        }
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return policy_;
+        }
 
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override
         {
@@ -112,13 +475,155 @@ namespace
         IDeviceContext *last_ctx_ = nullptr;
         void *last_stream_ = nullptr;
         void *stream_seen_by_stage_ = nullptr;
+
+    private:
+        GraphLaunchPreparationPolicy policy_;
+        bool capture_requires_preparation_ = false;
     };
 
+    /**
+     * @brief Capturable stage that deliberately rejects its recorded execution.
+     *
+     * This test double models a production stage discovering an invalid graph
+     * capture contract after the native stream has entered capture mode. Its
+     * call counter proves the controller does not attempt eager recovery by
+     * executing the same stage a second time.
+     */
+    class FakeCaptureFailureStage final : public IComputeStage
+    {
+    public:
+        explicit FakeCaptureFailureStage(DeviceId device)
+            : IComputeStage(device)
+        {
+        }
+
+        bool execute(IDeviceContext *) override
+        {
+            ++execute_calls_;
+            return false;
+        }
+
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        std::string name() const override { return "fake_capture_failure_stage"; }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+        bool isGraphCapturable() const override { return true; }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        int execute_calls_ = 0;
+    };
+
+    class FakeCapturedStateStage final : public IComputeStage
+    {
+    public:
+        FakeCapturedStateStage(DeviceId device,
+                               bool has_capture,
+                               bool requires_capture = true,
+                               bool restore_ok = true)
+            : IComputeStage(device),
+              has_capture_(has_capture),
+              requires_capture_(requires_capture),
+              restore_ok_(restore_ok)
+        {
+        }
+
+        bool execute(IDeviceContext *) override { return true; }
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        std::string name() const override { return "fake_captured_state_stage"; }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+        bool hasVerifierStateCapture() const override { return has_capture_; }
+        bool requiresVerifierStateCaptureForPublication() const override { return requires_capture_; }
+        bool restoreVerifierStateCaptureRow(int row, void *stream) override
+        {
+            ++restore_calls_;
+            last_row_ = row;
+            last_stream_ = stream;
+            return restore_ok_;
+        }
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream) override
+        {
+            ++restore_rows_calls_;
+            last_rows_.assign(
+                host_row_indices,
+                host_row_indices + request_count);
+            last_stream_ = stream;
+            return restore_ok_;
+        }
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override
+        {
+            ++restore_device_rows_calls_;
+            last_device_lengths_ = device_request_seq_lens;
+            last_request_count_ = request_count;
+            last_request_row_width_ = request_row_width;
+            last_stream_ = stream;
+            return restore_ok_;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        int restore_calls_ = 0;
+        int restore_rows_calls_ = 0;
+        int restore_device_rows_calls_ = 0;
+        int last_row_ = -1;
+        int last_request_count_ = 0;
+        int last_request_row_width_ = 0;
+        const int *last_device_lengths_ = nullptr;
+        std::vector<int> last_rows_;
+        void *last_stream_ = nullptr;
+
+    private:
+        bool has_capture_ = false;
+        bool requires_capture_ = true;
+        bool restore_ok_ = true;
+    };
+
+    /** @brief Device-free capture counters, including owner-created graph-only views. */
     class FakeReplayGraphCapture final : public IGPUGraphCapture
     {
     public:
-        bool beginCapture() override { return true; }
-        bool endCapture() override { return true; }
+        explicit FakeReplayGraphCapture(
+            void *stream = nullptr,
+            bool executable = true,
+            size_t node_count = 1u)
+            : stream_(stream),
+              executable_(executable),
+              node_count_(node_count)
+        {
+        }
+
+        bool beginCapture() override
+        {
+            ++begin_capture_calls_;
+            if (capturing_)
+                return false;
+            capturing_ = true;
+            return true;
+        }
+        /** @brief Observe graph-only view creation without creating an executable. */
+        std::unique_ptr<IGPUGraphCapture> createOrderedTimelineFragment() override
+        {
+            auto fragment = std::make_unique<FakeReplayGraphCapture>(stream_, false, 0u);
+            created_fragments_.push_back(fragment.get());
+            return fragment;
+        }
+        bool endCapture() override
+        {
+            ++end_capture_calls_;
+            if (!capturing_)
+                return false;
+            capturing_ = false;
+            node_count_ = 1u;
+            return true;
+        }
         bool instantiate() override
         {
             ++instantiate_calls_;
@@ -130,35 +635,78 @@ namespace
             ++launch_calls_;
             return executable_;
         }
+        [[nodiscard]] void *executionStream() const noexcept override { return stream_; }
         GraphUpdateResult tryUpdate() override
         {
             ++try_update_calls_;
             return update_result_;
         }
+        [[nodiscard]] bool supportsExecutableUpdate() const noexcept override
+        {
+            return supports_executable_update_;
+        }
         bool hasExecutable() const override { return executable_; }
-        size_t nodeCount() const override { return 1; }
-        void reset() override { executable_ = false; }
+        [[nodiscard]] std::size_t residentMemoryBytes() const noexcept override
+        {
+            return 0u;
+        }
+        size_t nodeCount() const override { return node_count_; }
+        void reset() override
+        {
+            capturing_ = false;
+            executable_ = false;
+            node_count_ = 0u;
+        }
         const char *backendName() const override { return "FakeReplay"; }
 
+        /** @brief Simulate a backend composer adding one native parent node. */
+        void markGraphBuilt()
+        {
+            node_count_ = 1u;
+            executable_ = false;
+        }
+
+        int begin_capture_calls_ = 0;
+        std::vector<FakeReplayGraphCapture *> created_fragments_; ///< Borrowed test observations.
+        int end_capture_calls_ = 0;
         int launch_calls_ = 0;
         int instantiate_calls_ = 0;
         int try_update_calls_ = 0;
         GraphUpdateResult update_result_ = GraphUpdateResult::Success;
+        bool supports_executable_update_ = true;
+        bool capturing_ = false;
 
     private:
+        void *stream_ = nullptr;
         bool executable_ = true;
+        size_t node_count_ = 1u;
     };
 
     class FakeReplayGPUContext final : public IWorkerGPUContext
     {
     public:
-        int deviceOrdinal() const override { return 0; }
+        explicit FakeReplayGPUContext(
+            int device_ordinal = 0,
+            bool asynchronous_submission = false,
+            bool create_graph_only_captures = false)
+            : device_ordinal_(device_ordinal),
+              asynchronous_submission_(asynchronous_submission),
+              create_graph_only_captures_(create_graph_only_captures)
+        {
+        }
+
+        int deviceOrdinal() const override { return device_ordinal_; }
         std::string deviceName() const override { return "FakeReplayGPU"; }
         bool isInitialized() const override { return true; }
 
         void submitAndWait(std::function<void()> work) override { work(); }
         std::future<void> submitAsync(std::function<void()> work) override
         {
+            if (asynchronous_submission_)
+            {
+                return std::async(
+                    std::launch::async, std::move(work));
+            }
             work();
             std::promise<void> done;
             done.set_value();
@@ -168,6 +716,13 @@ namespace
         void *defaultStream() override { return &default_stream_; }
         void *createStream() override { return &capture_stream_; }
         void destroyStream(void *) override { ++destroy_stream_calls_; }
+        void *getOrCreateAuxiliaryStream(const std::string &, bool *created = nullptr) override
+        {
+            if (created)
+                *created = false;
+            return &auxiliary_stream_;
+        }
+        void resetAuxiliaryStreams() override {}
 
         void *createEvent() override
         {
@@ -176,8 +731,24 @@ namespace
         }
         void destroyEvent(void *) override { ++events_destroyed_; }
         void recordEvent(void *, void *) override { ++events_recorded_; }
-        void waitEvent(void *, void *) override {}
+        void waitEvent(void *, void *) override { ++events_waited_; }
+        bool queryEventChecked(void *event, bool &ready) override
+        {
+            ++event_query_calls_;
+            ready = false;
+            if (!event || !query_event_checked_result_)
+                return false;
+            ready = query_event_ready_;
+            return true;
+        }
         void synchronizeEvent(void *) override { ++events_synchronized_; }
+        bool synchronizeEventChecked(void *event) override
+        {
+            if (!event || !synchronize_event_checked_result_)
+                return false;
+            synchronizeEvent(event);
+            return true;
+        }
         float eventElapsedTime(void *, void *) override
         {
             ++event_elapsed_queries_;
@@ -187,23 +758,31 @@ namespace
         void *blasLtHandle() override { return nullptr; }
         void setCollectiveComm(void *) override {}
         void *collectiveComm() const override { return nullptr; }
-        void synchronize() override {}
+        void synchronize() override { ++device_synchronize_calls_; }
         void synchronizeStream(void *) override { ++synchronize_stream_calls_; }
         bool synchronizeStreamChecked(void *) override
         {
             ++synchronize_stream_checked_calls_;
             return synchronize_stream_checked_result_;
         }
-        void insertStreamDependency(void *, void *) override {}
+        GPUStreamExecutionState queryStreamExecutionState(
+            void *stream,
+            std::string_view boundary) override
+        {
+            if (!stream || boundary.empty())
+                throw std::invalid_argument("mock stream query requires an exact stream and boundary");
+            return GPUStreamExecutionState::Complete;
+        }
+        bool insertStreamDependency(void *, void *) override { return true; }
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override
         {
-            return std::make_unique<FakeReplayGraphCapture>();
+            return createFakeGraphCapture(defaultStream());
         }
 
-        std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *) override
+        std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override
         {
-            return std::make_unique<FakeReplayGraphCapture>();
+            return createFakeGraphCapture(stream);
         }
 
         int synchronize_stream_calls_ = 0;
@@ -213,13 +792,34 @@ namespace
         int events_created_ = 0;
         int events_destroyed_ = 0;
         int events_recorded_ = 0;
+        int events_waited_ = 0;
+        int event_query_calls_ = 0;
         int events_synchronized_ = 0;
         int event_elapsed_queries_ = 0;
+        int device_synchronize_calls_ = 0;
+        bool synchronize_event_checked_result_ = true;
+        bool query_event_checked_result_ = true;
+        bool query_event_ready_ = true;
         float elapsed_ms_ = 0.25f;
+        std::vector<FakeReplayGraphCapture *> created_graph_captures_;
 
     private:
+        std::unique_ptr<IGPUGraphCapture> createFakeGraphCapture(void *stream)
+        {
+            auto capture = std::make_unique<FakeReplayGraphCapture>(
+                stream,
+                /*executable=*/!create_graph_only_captures_,
+                /*node_count=*/create_graph_only_captures_ ? 0u : 1u);
+            created_graph_captures_.push_back(capture.get());
+            return capture;
+        }
+
+        int device_ordinal_ = 0;
+        bool asynchronous_submission_ = false;
+        bool create_graph_only_captures_ = false;
         int default_stream_ = 0;
         int capture_stream_ = 0;
+        int auxiliary_stream_ = 0;
     };
 
     void addFakeSegmentStage(ComputeGraph &graph,
@@ -227,30 +827,49 @@ namespace
                              bool capturable,
                              bool manual_boundary = false,
                              ComputeStageType stage_type = ComputeStageType::COPY,
-                             bool warmup_dependent_capture = false,
+                             bool launch_preparation_dependent_capture = false,
                              bool segment_boundary_before = false,
                              bool segment_boundary_after = false,
-                             const uint64_t *variant_signature = nullptr)
+                             const uint64_t *variant_signature = nullptr,
+                             DeviceId device = DeviceId::cpu(),
+                             bool passive_capture_noop = false,
+                             ManualGraphBoundaryScheduling manual_scheduling =
+                                 ManualGraphBoundaryScheduling::
+                                     BetweenExecutableLaunches,
+                             ConcurrentManualFailureRole failure_role =
+                                 ConcurrentManualFailureRole::None,
+                             bool execute_result = true)
     {
         graph.addNode(
             name,
             std::make_unique<FakeSegmentStage>(
+                device,
                 capturable,
                 manual_boundary,
                 stage_type,
-                warmup_dependent_capture,
+                launch_preparation_dependent_capture,
                 segment_boundary_before,
                 segment_boundary_after,
-                variant_signature),
-            DeviceId::cpu());
+                variant_signature,
+                passive_capture_noop,
+                manual_scheduling,
+                failure_role,
+                execute_result),
+            device);
     }
 
     FakeGraphLaunchPrepStage *addFakeGraphLaunchPrepStage(
         ComputeGraph &graph,
         const std::string &name,
-        DeviceId device)
+        DeviceId device,
+        GraphLaunchPreparationPolicy policy =
+            GraphLaunchPreparationPolicy::CaptureAndReplay,
+        bool capture_requires_preparation = false)
     {
-        auto stage = std::make_unique<FakeGraphLaunchPrepStage>(device);
+        auto stage = std::make_unique<FakeGraphLaunchPrepStage>(
+            device,
+            policy,
+            capture_requires_preparation);
         auto *raw_stage = stage.get();
         graph.addNode(name, std::move(stage), device);
         return raw_stage;
@@ -270,6 +889,7 @@ namespace
             }
             setenv(name, value, 1);
             mutableDebugEnv().reload();
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
         }
 
         ~ScopedEnvVar()
@@ -283,6 +903,7 @@ namespace
                 unsetenv(name_.c_str());
             }
             mutableDebugEnv().reload();
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
         }
 
         ScopedEnvVar(const ScopedEnvVar &) = delete;
@@ -387,6 +1008,24 @@ TEST(Test__ForwardGraphSignature, DifferentDecodeNotEqual)
     EXPECT_NE(a, b);
 }
 
+TEST(Test__ForwardGraphSignature, SnapshotTopologyHasDedicatedIdentity)
+{
+    ForwardGraphSignature lean{
+        .seq_len = 1,
+        .batch_size = 1,
+        .device = DeviceId::rocm(0),
+        .decode = true,
+        .snapshot_configuration_identity = 1};
+    ForwardGraphSignature diagnostic = lean;
+    diagnostic.snapshot_configuration_identity = 2;
+
+    EXPECT_NE(lean, diagnostic);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(lean),
+        ForwardGraphSignatureHash{}(diagnostic))
+        << "Lean and checkpoint-bearing executables must coexist without aliasing";
+}
+
 TEST(Test__ForwardGraphSignature, DifferentAllPositionLogitsNotEqual)
 {
     ForwardGraphSignature terminal_only{.seq_len = 2, .batch_size = 1, .decode = true,
@@ -394,6 +1033,29 @@ TEST(Test__ForwardGraphSignature, DifferentAllPositionLogitsNotEqual)
     ForwardGraphSignature all_positions{.seq_len = 2, .batch_size = 1, .decode = true,
                                         .all_position_logits = true};
     EXPECT_NE(terminal_only, all_positions);
+}
+
+TEST(Test__ForwardGraphSignature, GraphOwnedMTPOutcomeHasDedicatedIdentity)
+{
+    ForwardGraphSignature ordinary_verifier{
+        .seq_len = 4,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .decode = true,
+        .all_position_logits = true,
+        .all_position_logit_rows = 4,
+        .mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::Disabled};
+    ForwardGraphSignature graph_owned_greedy = ordinary_verifier;
+    graph_owned_greedy.mtp_verifier_outcome_graph_mode =
+        MTPVerifierOutcomeGraphMode::Greedy;
+
+    EXPECT_NE(ordinary_verifier, graph_owned_greedy);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(ordinary_verifier),
+        ForwardGraphSignatureHash{}(graph_owned_greedy))
+        << "A verifier graph with a terminal reducer/collective must never "
+           "reuse an executable captured without that transaction.";
 }
 
 TEST(Test__ForwardGraphSignature, DifferentDeviceTokenSourceNotEqual)
@@ -408,6 +1070,305 @@ TEST(Test__ForwardGraphSignature, DifferentDeviceTokenSourceNotEqual)
     EXPECT_NE(host_tokens, device_tokens);
     EXPECT_NE(ForwardGraphSignatureHash{}(host_tokens),
               ForwardGraphSignatureHash{}(device_tokens));
+}
+
+TEST(Test__ForwardGraphSignature, DifferentPositionPolicyNotEqual)
+{
+    ForwardGraphSignature explicit_rows{
+        .seq_len = 256,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .position_policy = ForwardPositionPolicy::ExplicitRows};
+    ForwardGraphSignature contiguous_offset = explicit_rows;
+    contiguous_offset.position_policy = ForwardPositionPolicy::ContiguousOffset;
+
+    EXPECT_NE(explicit_rows, contiguous_offset);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(explicit_rows),
+        ForwardGraphSignatureHash{}(contiguous_offset));
+}
+
+TEST(Test__ForwardGraphSignature, DifferentDeviceSequenceLengthSourceNotEqual)
+{
+    const int32_t first_owner = 3, second_owner = 3;
+    ForwardGraphSignature external_rows{
+        .seq_len = 16,
+        .batch_size = 2,
+        .all_position_logits = true,
+        .all_position_logit_rows = 2,
+        .device_sequence_lengths = nullptr};
+    ForwardGraphSignature resident_request_lengths = external_rows;
+    resident_request_lengths.device_sequence_lengths = &first_owner;
+
+    EXPECT_NE(external_rows, resident_request_lengths)
+        << "Verifier-row and request-length-owned graphs must never share a cached executable";
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(external_rows),
+        ForwardGraphSignatureHash{}(resident_request_lengths));
+
+    auto rebound = resident_request_lengths;
+    rebound.device_sequence_lengths = &second_owner;
+    EXPECT_TRUE(rebound.usesDeviceSequenceLengths());
+    EXPECT_NE(rebound, resident_request_lengths)
+        << "Equal current counts do not make different captured owners interchangeable";
+    EXPECT_NE(ForwardGraphSignatureHash{}(rebound),
+              ForwardGraphSignatureHash{}(resident_request_lengths));
+}
+
+TEST(Test__ForwardGraphSignature,
+     ShiftedMTPPrefillBindingIdentityPreventsStaleGraphReuse)
+{
+    ForwardGraphSignature first{
+        .seq_len = 512,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .execution_role = ForwardExecutionRole::MainInference,
+        .decode = false,
+        .uses_device_token_ids = true,
+        .device_sequence_lengths = reinterpret_cast<const int32_t *>(uintptr_t{0x1000}),
+        .shifted_mtp_prefill_capture_identity = UINT64_C(0x1234)};
+    ForwardGraphSignature rebound = first;
+    rebound.shifted_mtp_prefill_capture_identity = UINT64_C(0x5678);
+
+    EXPECT_NE(first, rebound);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(first),
+        ForwardGraphSignatureHash{}(rebound));
+}
+
+TEST(Test__ForwardGraphSignature,
+     RestoredPrefixStateTransactionHasDedicatedGraphIdentity)
+{
+    ForwardGraphSignature ordinary{
+        .seq_len = 1,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .execution_role = ForwardExecutionRole::MainInference,
+        .state_transaction = ForwardStateTransaction::Ordinary,
+        .decode = true,
+        .decode_has_history = true};
+    ForwardGraphSignature bridge = ordinary;
+    bridge.state_transaction =
+        ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+
+    EXPECT_NE(ordinary, bridge);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(ordinary),
+        ForwardGraphSignatureHash{}(bridge));
+}
+
+TEST(Test__ForwardGraphTypes,
+     ShiftedMTPProducerClassificationIncludesPrefillAndPrefixBridgeOnly)
+{
+    EXPECT_TRUE(isGraphIntegratedShiftedMTPTransaction(
+        ForwardExecutionRole::MainInference,
+        ForwardExecutionPhase::Prefill,
+        ForwardStateTransaction::Ordinary,
+        /*batch_size=*/2,
+        /*seq_len=*/9));
+    EXPECT_TRUE(isGraphIntegratedShiftedMTPTransaction(
+        ForwardExecutionRole::MTPCondition,
+        ForwardExecutionPhase::Decode,
+        ForwardStateTransaction::RestoredPrefixMTPDecodeBridge,
+        /*batch_size=*/1,
+        /*seq_len=*/1));
+
+    EXPECT_FALSE(isGraphIntegratedShiftedMTPTransaction(
+        ForwardExecutionRole::MainInference,
+        ForwardExecutionPhase::Decode,
+        ForwardStateTransaction::Ordinary,
+        /*batch_size=*/1,
+        /*seq_len=*/1));
+    EXPECT_FALSE(isGraphIntegratedShiftedMTPTransaction(
+        ForwardExecutionRole::MTPCondition,
+        ForwardExecutionPhase::Decode,
+        ForwardStateTransaction::RestoredPrefixMTPDecodeBridge,
+        /*batch_size=*/2,
+        /*seq_len=*/1));
+    EXPECT_FALSE(isGraphIntegratedShiftedMTPTransaction(
+        ForwardExecutionRole::GroupedMTPVerifier,
+        ForwardExecutionPhase::Decode,
+        ForwardStateTransaction::Ordinary,
+        /*batch_size=*/1,
+        /*seq_len=*/2));
+}
+
+TEST(Test__ForwardGraphSignature,
+     MTPMainTerminalHiddenBindingIdentityPreventsStaleGraphReuse)
+{
+    ForwardGraphSignature first{
+        .seq_len = 1,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .execution_role = ForwardExecutionRole::MTPCondition,
+        .decode = true,
+        .uses_device_token_ids = true,
+        .mtp_main_terminal_hidden_capture_identity = UINT64_C(0x1234)};
+    ForwardGraphSignature rebound = first;
+    rebound.mtp_main_terminal_hidden_capture_identity = UINT64_C(0x5678);
+
+    EXPECT_NE(first, rebound);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(first),
+        ForwardGraphSignatureHash{}(rebound));
+}
+
+TEST(Test__ForwardGraphSignature,
+     SnapshotArenaReusePolicyIsTypedAndSeparatesConcurrentMTPRoles)
+{
+    using ReuseClass =
+        DeviceGraphExecutor::GraphSnapshotArenaReuseClass;
+
+    ForwardGraphSignature prefill{
+        .seq_len = 256,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .execution_role = ForwardExecutionRole::MainInference,
+        .decode = false,
+        .is_bucketed_prefill = true,
+        .bucket_seq_len = 256,
+        .snapshot_configuration_identity = UINT64_C(73),
+    };
+    const auto prefill_policy =
+        graphSnapshotArenaReusePolicyForSignature(prefill);
+    EXPECT_TRUE(prefill_policy.valid());
+    EXPECT_TRUE(prefill_policy.shared());
+    EXPECT_EQ(
+        prefill_policy.reuse_class,
+        ReuseClass::PrefillOrMTPVerifierAlternative);
+    EXPECT_EQ(prefill_policy.configuration_identity, UINT64_C(73));
+
+    ForwardGraphSignature condition = prefill;
+    condition.seq_len = 1;
+    condition.decode = true;
+    condition.is_bucketed_prefill = false;
+    condition.bucket_seq_len = 0;
+    condition.execution_role = ForwardExecutionRole::MTPCondition;
+    const auto condition_policy =
+        graphSnapshotArenaReusePolicyForSignature(condition);
+    EXPECT_EQ(
+        condition_policy.reuse_class,
+        ReuseClass::MTPConditionAlternative);
+
+    ForwardGraphSignature verifier = condition;
+    verifier.seq_len = 16;
+    verifier.execution_role =
+        ForwardExecutionRole::GroupedMTPVerifier;
+    verifier.all_position_logits = true;
+    verifier.all_position_logit_rows = 16;
+    const auto verifier_policy =
+        graphSnapshotArenaReusePolicyForSignature(verifier);
+    EXPECT_EQ(
+        verifier_policy.reuse_class,
+        ReuseClass::PrefillOrMTPVerifierAlternative);
+    EXPECT_EQ(verifier_policy, prefill_policy)
+        << "Prefill publication is complete before grouped verification begins";
+    EXPECT_NE(verifier_policy, condition_policy)
+        << "Condition and verifier snapshots can coexist in one retained MTP parent";
+
+    ForwardGraphSignature serial_decode = condition;
+    serial_decode.execution_role =
+        ForwardExecutionRole::MainInference;
+    const auto serial_policy =
+        graphSnapshotArenaReusePolicyForSignature(serial_decode);
+    EXPECT_TRUE(serial_policy.valid());
+    EXPECT_FALSE(serial_policy.shared());
+    EXPECT_EQ(serial_policy.reuse_class, ReuseClass::Dedicated);
+    EXPECT_EQ(serial_policy.configuration_identity, 0u);
+
+    ForwardGraphSignature another_snapshot_selection = prefill;
+    another_snapshot_selection.snapshot_configuration_identity = 74;
+    EXPECT_NE(
+        graphSnapshotArenaReusePolicyForSignature(
+            another_snapshot_selection),
+        prefill_policy)
+        << "A new diagnostic topology must never inherit an older captured address namespace";
+}
+
+/**
+ * @brief Completion provenance distinguishes integrated shifted prefill by type.
+ *
+ * This regression prevents completion consumers from rediscovering transaction
+ * scope through global MTP configuration or from waiting on the retired
+ * post-forward sidecar event after shifted KV population joins the main graph.
+ */
+TEST(Test__ForwardGraphTypes,
+     ShiftedMTPPrefillBindingDeclaresTransitiveCompletionScope)
+{
+    ForwardInput ordinary;
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(ordinary),
+        ForwardCompletionScope::ModelForwardOnly);
+
+    ForwardInput integrated;
+    integrated.shifted_mtp_prefill.emplace();
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(integrated),
+        ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill);
+
+    ForwardInput decode_publication;
+    decode_publication.mtp_main_terminal_hidden.emplace();
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(decode_publication),
+        ForwardCompletionScope::GraphIntegratedMTPTerminalHidden);
+
+    decode_publication.shifted_mtp_prefill.emplace();
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(decode_publication),
+        ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill)
+        << "Shifted prefill is the complete superset transaction.";
+}
+
+/**
+ * @brief A scalar MTP condition remains logical main output in row storage.
+ *
+ * This is the production shape used when a bounded response leaves no room for
+ * speculative drafts. The next token must sample the condition graph's freshly
+ * written all-position allocation, not the stale canonical prefill row.
+ */
+TEST(Test__ForwardLogitsPublication,
+     ScalarMTPConditionOwnsAllPositionStorageAsCurrentMainLogits)
+{
+    const ForwardLogitsPublicationDescriptor publication{
+        .execution_role = ForwardExecutionRole::MTPCondition,
+        .logical_all_position_logits = false,
+        .storage_surface =
+            ForwardLogitsStorageSurface::AllPositionFull,
+    };
+
+    EXPECT_TRUE(publication.isMainModelOutput());
+    EXPECT_TRUE(publication.supportsScalarMainConsumer());
+    EXPECT_TRUE(publication.supportsMainRequestBatchConsumer())
+        << "The same stable row allocation is valid for a one-request grouped condition.";
+    EXPECT_FALSE(publication.isColumnParallelStorage());
+}
+
+TEST(Test__ForwardLogitsPublication,
+     GroupedVerifierCannotMasqueradeAsCurrentMainLogits)
+{
+    const ForwardLogitsPublicationDescriptor publication{
+        .execution_role = ForwardExecutionRole::GroupedMTPVerifier,
+        .logical_all_position_logits = true,
+        .storage_surface =
+            ForwardLogitsStorageSurface::AllPositionFull,
+    };
+
+    EXPECT_FALSE(publication.isMainModelOutput());
+    EXPECT_FALSE(publication.supportsScalarMainConsumer());
+    EXPECT_FALSE(publication.supportsMainRequestBatchConsumer());
+}
+
+TEST(Test__ForwardLogitsPublication,
+     UnknownStorageCannotReachAnyMainConsumer)
+{
+    const ForwardLogitsPublicationDescriptor publication{
+        .execution_role = ForwardExecutionRole::MainInference,
+        .logical_all_position_logits = false,
+        .storage_surface = ForwardLogitsStorageSurface::Unknown,
+    };
+
+    EXPECT_FALSE(publication.supportsScalarMainConsumer());
+    EXPECT_FALSE(publication.supportsMainRequestBatchConsumer());
 }
 
 TEST(Test__ForwardGraphSignature, DifferentPPFieldsNotEqual)
@@ -433,6 +1394,23 @@ TEST(Test__ForwardGraphSignature, DifferentMoEPlacementEpochNotEqual)
     ForwardGraphSignature epoch1 = epoch0;
     epoch1.moe_placement_epoch = 1;
     EXPECT_NE(epoch0, epoch1);
+}
+
+TEST(Test__ForwardGraphSignature, PrefixRuntimeRehydrationHasDedicatedGraphIdentity)
+{
+    ForwardGraphSignature steady{
+        .seq_len = 128,
+        .batch_size = 1,
+        .decode = false,
+        .rehydrate_prefix_runtime_on_device = false};
+    ForwardGraphSignature restored = steady;
+    restored.rehydrate_prefix_runtime_on_device = true;
+
+    EXPECT_NE(steady, restored);
+    EXPECT_NE(ForwardGraphSignatureHash{}(steady),
+              ForwardGraphSignatureHash{}(restored))
+        << "A restore graph contains an extra captured collective transaction "
+           "and must never alias an ordinary prefill executable.";
 }
 
 // =========================================================================
@@ -483,6 +1461,163 @@ TEST(Test__ForwardGraphSignatureHash, UsableAsUnorderedMapKey)
     // Lookup with equivalent key works
     ForwardGraphSignature decode2{.seq_len = 1, .batch_size = 1, .decode = true};
     EXPECT_EQ(map[decode2], 42);
+}
+
+/**
+ * @brief Preserve exact grouped-verifier geometry in replay telemetry.
+ *
+ * GPU replay timings are reclaimed asynchronously, so they cannot derive M
+ * from mutable request state at collection time.  This regression proves the
+ * graph cache receives all cache-key dimensions needed to distinguish an M=5
+ * verifier from its neighboring M=2..4 graph families.
+ */
+TEST(Test__ForwardGraphSignature, ReplayWorkloadGeometryIsExactAndTotal)
+{
+    const ForwardGraphSignature signature{
+        .seq_len = 5,
+        .batch_size = 2,
+        .device = DeviceId::cuda(0),
+        .decode = true,
+        .decode_has_history = true,
+        .all_position_logits = true,
+        .live_mtp_request_batch_condition = false,
+        .all_position_logit_rows = 10,
+        .mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::StochasticRejection,
+        .uses_device_token_ids = true,
+        .uses_device_position_ids = true,
+        .position_policy = ForwardPositionPolicy::ExplicitRows,
+        .device_sequence_lengths = reinterpret_cast<const int32_t *>(uintptr_t{0x1000}),
+        .moe_placement_epoch = 17,
+    };
+
+    const auto geometry = replayWorkloadGeometryForSignature(signature);
+    ASSERT_TRUE(geometry.valid());
+    EXPECT_EQ(geometry.seq_len, 5);
+    EXPECT_EQ(geometry.batch_size, 2);
+    EXPECT_EQ(geometry.m, 10);
+    EXPECT_EQ(geometry.all_position_rows, 10);
+    EXPECT_EQ(
+        geometry.verifier_outcome_mode,
+        static_cast<uint8_t>(MTPVerifierOutcomeGraphMode::StochasticRejection));
+    EXPECT_EQ(
+        geometry.position_policy,
+        static_cast<uint8_t>(ForwardPositionPolicy::ExplicitRows));
+    EXPECT_EQ(geometry.moe_placement_epoch, 17u);
+    EXPECT_TRUE(geometry.decode);
+    EXPECT_TRUE(geometry.all_position_logits);
+    EXPECT_FALSE(geometry.live_mtp_request_batch_condition);
+
+    ForwardGraphSignature overflow = signature;
+    overflow.seq_len = std::numeric_limits<int>::max();
+    overflow.batch_size = 2;
+    EXPECT_FALSE(replayWorkloadGeometryForSignature(overflow).valid())
+        << "Overflowing graph dimensions must not publish a fabricated M tag.";
+}
+
+/**
+ * @brief Prove grouped verifier topology is total over M.
+ *
+ * The historical public-forward heuristic treated only M<=4 continuations as
+ * decode. Dynamic MTP consequently changed to prefill collectives at M=5 even
+ * though every verifier row remained serial-decode-equivalent. Exercise both
+ * the current depth-15 range (M<=16 including the bonus row) and out-of-range
+ * values so row count can never become an architectural phase boundary again.
+ */
+TEST(Test__ForwardExecutionPhasePolicy, GroupedVerifierDecodeTopologyIsMTotal)
+{
+    constexpr std::array<int, 12> kVerifierRows{
+        1, 2, 3, 4, 5, 8, 15, 16, 17, 32, 1024, 16384};
+
+    for (const int m : kVerifierRows)
+    {
+        const ForwardExecutionPhase phase = resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::GroupedMTPVerifier,
+            .seq_len = m,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        });
+        EXPECT_EQ(phase, ForwardExecutionPhase::Decode) << "M=" << m;
+    }
+
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::GroupedMTPVerifier,
+            .seq_len = 8,
+            .batch_size = 3,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Decode)
+        << "Request-batched grouped verification is also decode-equivalent.";
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MTPCondition,
+            .seq_len = 1024,
+            .batch_size = 16,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Decode)
+        << "Device-resident MTP condition rows cannot select prefill topology.";
+}
+
+/**
+ * @brief Preserve explicit and compatibility policy for ordinary inference.
+ */
+TEST(Test__ForwardExecutionPhasePolicy, MainInferenceRetainsExplicitBoundaries)
+{
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .seq_len = 5,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Prefill);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .seq_len = 4,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 128,
+        }),
+        ForwardExecutionPhase::Decode);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .invocation = ForwardInvocationKind::ExplicitDecode,
+            .seq_len = 1024,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 0,
+        }),
+        ForwardExecutionPhase::Decode);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .invocation = ForwardInvocationKind::ExplicitPrefill,
+            .seq_len = 1,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 128,
+        }),
+        ForwardExecutionPhase::Prefill);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .invocation =
+                ForwardInvocationKind::RestoredPrefixMTPDecodeBridge,
+            .seq_len = 1,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 128,
+        }),
+        ForwardExecutionPhase::Decode)
+        << "A restored-prefix MTP bridge must use serial-decode math.";
 }
 
 // =========================================================================
@@ -561,6 +1696,72 @@ TEST(Test__ForwardGraphCache, DefaultState)
     EXPECT_EQ(cache.gpu_stream, nullptr);
     EXPECT_EQ(cache.gpu_ctx, nullptr);
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
+    EXPECT_TRUE(cache.snapshot_manifest.stage_copies.empty());
+    EXPECT_TRUE(cache.snapshot_manifest.outputless_stages.empty());
+}
+
+/**
+ * @brief Graph snapshot manifests must be isolated by forward-cache identity.
+ *
+ * Grouped verifier and serial decode graphs deliberately reuse stage names such
+ * as `embedding`. A process-wide stage-name map lets warming one geometry
+ * replace the immutable descriptor consumed by another geometry's capture.
+ * Each GraphSegmentCache must therefore own an independent manifest.
+ */
+TEST(Test__ForwardGraphCache, SnapshotManifestsAreOwnedPerGraphGeometry)
+{
+    ForwardGraphCache grouped;
+    ForwardGraphCache serial;
+
+    grouped.segment_cache.snapshot_manifest.outputless_stages.insert("embedding");
+
+    EXPECT_TRUE(
+        grouped.segment_cache.snapshot_manifest.outputless_stages.contains(
+            "embedding"));
+    EXPECT_FALSE(
+        serial.segment_cache.snapshot_manifest.outputless_stages.contains(
+            "embedding"));
+
+    serial.segment_cache.snapshot_manifest.outputless_stages.insert("lm_head");
+    grouped.invalidate();
+
+    EXPECT_TRUE(grouped.segment_cache.snapshot_manifest.outputless_stages.empty());
+    EXPECT_TRUE(
+        serial.segment_cache.snapshot_manifest.outputless_stages.contains(
+            "lm_head"))
+        << "invalidating one graph must not mutate another graph's manifest";
+}
+
+/**
+ * @brief Decode replay provenance must name the graph's execution stream.
+ *
+ * Replay-state maintenance can temporarily bind stages to another stream.
+ * That generic binding is not evidence that the stream produced logits. This
+ * regression reproduces the stale grouped-verifier host observation race by
+ * giving every stream role a distinct sentinel and requiring replay to select
+ * the typed segment-capture owner.
+ */
+TEST(Test__ForwardGraphCache, DecodeReplayOutputProducerIgnoresGenericAppliedStream)
+{
+    ForwardGraphCache cache;
+    int replay_stream = 0;
+    int applied_stream = 0;
+    int worker_stream = 0;
+
+    cache.segment_cache.capture_stream = &replay_stream;
+    cache.applied_stream = &applied_stream;
+    cache.gpu_stream = &worker_stream;
+
+    EXPECT_EQ(cache.decodeOutputProducerStream(
+                  ForwardGraphCache::DecodeLaunchPath::CapturedReplay),
+              &replay_stream);
+    EXPECT_EQ(cache.decodeOutputProducerStream(
+                  ForwardGraphCache::DecodeLaunchPath::Direct),
+              &applied_stream);
+
+    // The sentinel is not an owned GPU stream; do not present it to the
+    // GraphSegmentCache lifecycle destructor as a live backend resource.
+    cache.segment_cache.capture_stream = nullptr;
 }
 
 TEST(Test__ForwardGraphCache, InvalidateResetsAllFields)
@@ -610,27 +1811,1818 @@ TEST(Test__ForwardGraphCache, InvalidateIdempotent)
     EXPECT_TRUE(cache.token_ids.empty());
 }
 
+/**
+ * @brief Verify replay-time host positions are owned by the current forward input.
+ *
+ * Bucketed prefill graph replay can reuse the same captured shape for a later
+ * prompt suffix chunk.  The cache therefore must not prefer graph-build
+ * position rows over fresh replay rows, because RoPE would rotate K with the
+ * previous chunk's absolute positions.
+ */
+TEST(Test__ForwardGraphCache, ReplayHostPositionIdsPreferCurrentInputOverCacheStorage)
+{
+    ForwardGraphCache cache;
+    cache.position_ids = {0, 1, 2, 3};
+
+    const std::vector<int> suffix_positions = {256, 257, 258, 259};
+    ForwardInput input;
+    input.position_ids = suffix_positions.data();
+    input.seq_len = static_cast<int>(suffix_positions.size());
+
+    const int *selected = selectForwardReplayHostPositionIds(cache, input);
+
+    ASSERT_EQ(selected, suffix_positions.data());
+    EXPECT_EQ(std::vector<int>(selected, selected + suffix_positions.size()),
+              suffix_positions);
+}
+
+/**
+ * @brief Verify cache-owned host positions are only a no-input compatibility fallback.
+ */
+TEST(Test__ForwardGraphCache, ReplayHostPositionIdsFallbackToCacheWhenInputHasNoRows)
+{
+    ForwardGraphCache cache;
+    cache.position_ids = {7, 8, 9};
+
+    ForwardInput input;
+    input.seq_len = static_cast<int>(cache.position_ids.size());
+
+    const int *selected = selectForwardReplayHostPositionIds(cache, input);
+
+    ASSERT_EQ(selected, cache.position_ids.data());
+    EXPECT_EQ(std::vector<int>(selected, selected + cache.position_ids.size()),
+              cache.position_ids);
+}
+
+/**
+ * @brief Verify device-resident replay positions remain the single source of truth.
+ */
+TEST(Test__ForwardGraphCache, ReplayHostPositionIdsDoNotMaskDeviceResidentRows)
+{
+    ForwardGraphCache cache;
+    cache.position_ids = {0, 1, 2};
+
+    const std::vector<int> host_shadow = {512, 513, 514};
+    ForwardInput input;
+    input.position_ids = host_shadow.data();
+    input.position_ids_device = reinterpret_cast<const void *>(0xCAFE);
+    input.seq_len = static_cast<int>(host_shadow.size());
+
+    EXPECT_EQ(selectForwardReplayHostPositionIds(cache, input), nullptr);
+}
+
+/**
+ * @brief Explicit position tables own every flattened request row.
+ */
+TEST(Test__ForwardGraphCache, PositionRowCountIncludesBatchDimension)
+{
+    ForwardInput input;
+    input.batch_size = 2;
+    input.seq_len = 16;
+
+    EXPECT_EQ(forwardPositionRowCount(input), 32);
+}
+
+/**
+ * @brief Invalid position geometry cannot wrap into a small RoPE launch.
+ */
+TEST(Test__ForwardGraphCache, PositionRowCountRejectsInvalidAndOverflowingGeometry)
+{
+    ForwardInput input;
+    input.batch_size = 0;
+    input.seq_len = 16;
+    EXPECT_EQ(forwardPositionRowCount(input), 0);
+
+    input.batch_size = 2;
+    input.seq_len = std::numeric_limits<int>::max();
+    EXPECT_EQ(forwardPositionRowCount(input), 0);
+}
+
+TEST(Test__DeviceGraphExecutor, CapturedTerminalStatePublishesCapturedStages)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cpu());
+
+    int stream_token = 0;
+    void *stream = &stream_token;
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        stream,
+        "unit"));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_row_, 7);
+    EXPECT_EQ(stage_ptr->last_stream_, stream);
+}
+
+/**
+ * @brief Capacity metadata must not turn an active scalar request into a batch.
+ *
+ * Request-batch-capable runners retain graph-stable device metadata at their
+ * configured capacity. During a scalar oracle prefill that allocation remains
+ * present, while the active request count is one. Publication must therefore
+ * restore the scalar terminal row and ignore the inactive capacity entries.
+ */
+TEST(Test__DeviceGraphExecutor, ScalarPublicationIgnoresCapacitySizedDeviceLengths)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cpu());
+
+    const int capacity_lengths[2] = {8, 0};
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        /*producer_stream_override=*/nullptr,
+        "scalar_with_batch_capacity",
+        capacity_lengths,
+        /*request_count=*/1,
+        /*request_row_width=*/8));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_row_, 7);
+}
+
+/**
+ * @brief A true request batch cannot silently use scalar publication.
+ */
+TEST(Test__DeviceGraphExecutor, RequestBatchRequiresHostOrDeviceLengths)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    graph.addNode(
+        "captured",
+        std::make_unique<FakeCapturedStateStage>(
+            DeviceId::cpu(),
+            /*has_capture=*/true),
+        DeviceId::cpu());
+
+    EXPECT_FALSE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        /*producer_stream_override=*/nullptr,
+        "missing_request_lengths",
+        /*device_request_seq_lens=*/nullptr,
+        /*request_count=*/2,
+        /*request_row_width=*/8));
+}
+
+/**
+ * @brief CPU request batches publish one real terminal row per request.
+ *
+ * CPU grouped recurrence kernels own their request-length metadata on the
+ * host. The executor must translate each real length into the flattened padded
+ * row domain and invoke the grouped publication primitive exactly once. This
+ * protects CPU request batching from accidentally inheriting the GPU-only
+ * device-length contract or publishing the scalar request-zero tail.
+ */
+TEST(Test__DeviceGraphExecutor, CPURequestBatchPublishesHostOwnedTerminalRows)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cpu());
+
+    const std::vector<int> real_lengths{8, 5};
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        /*producer_stream_override=*/nullptr,
+        "cpu_request_batch",
+        /*device_request_seq_lens=*/nullptr,
+        /*request_count=*/2,
+        /*request_row_width=*/8,
+        &real_lengths));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 0);
+    EXPECT_EQ(stage_ptr->restore_rows_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_rows_, (std::vector<int>{7, 12}));
+    EXPECT_EQ(stage_ptr->last_stream_, nullptr);
+}
+
+/**
+ * @brief GPU publication is governed only by resident request metadata.
+ *
+ * Serving may retain a host shadow for logging, but that shadow is not part of
+ * the GPU execution transaction and may lag resident metadata. The executor
+ * must neither validate nor dereference it while a GPU stage publishes from
+ * the graph-stable device length vector.
+ */
+TEST(Test__DeviceGraphExecutor, GPURequestBatchIgnoresHostLengthShadow)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cuda(0),
+        /*has_capture=*/true);
+    auto *stage_ptr = stage.get();
+    graph.addNode("captured", std::move(stage), DeviceId::cuda(0));
+
+    const int resident_lengths[2] = {8, 5};
+    const std::vector<int> intentionally_stale_host_shadow{0};
+    int stream_token = 0;
+    void *stream = &stream_token;
+    ASSERT_TRUE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/7,
+        stream,
+        "gpu_request_batch",
+        resident_lengths,
+        /*request_count=*/2,
+        /*request_row_width=*/8,
+        &intentionally_stale_host_shadow));
+
+    EXPECT_EQ(stage_ptr->restore_calls_, 0);
+    EXPECT_EQ(stage_ptr->restore_rows_calls_, 0);
+    EXPECT_EQ(stage_ptr->restore_device_rows_calls_, 1);
+    EXPECT_EQ(stage_ptr->last_device_lengths_, resident_lengths);
+    EXPECT_EQ(stage_ptr->last_request_count_, 2);
+    EXPECT_EQ(stage_ptr->last_request_row_width_, 8);
+    EXPECT_EQ(stage_ptr->last_stream_, stream);
+}
+
+TEST(Test__DeviceGraphExecutor, CapturedTerminalStateRequiresExplicitGPUStream)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cuda(0),
+        /*has_capture=*/true);
+    graph.addNode("captured", std::move(stage), DeviceId::cuda(0));
+
+    EXPECT_THROW(
+        (void)executor.publishCapturedTerminalStateAfterGraphExecution(
+            graph,
+            /*terminal_row=*/3,
+            nullptr,
+            "unit"),
+        std::logic_error);
+}
+
+TEST(Test__DeviceGraphExecutor, CapturedTerminalStateFailsWhenRequiredCaptureMissing)
+{
+    DeviceGraphExecutor executor;
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeCapturedStateStage>(
+        DeviceId::cpu(),
+        /*has_capture=*/false,
+        /*requires_capture=*/true);
+    graph.addNode("missing_capture", std::move(stage), DeviceId::cpu());
+
+    EXPECT_FALSE(executor.publishCapturedTerminalStateAfterGraphExecution(
+        graph,
+        /*terminal_row=*/0,
+        nullptr,
+        "unit"));
+}
+
 TEST(Test__GraphSegmentCache, ResetCanPreserveCaptureStream)
 {
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
-    void *stream = reinterpret_cast<void *>(0x1234);
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    void *stream = cache.capture_stream;
 
     cache.initialized = true;
     cache.needs_capture = true;
-    cache.consecutive_failures = 2;
     cache.decode_step = 17;
-    cache.capture_stream = stream;
 
     cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
 
     EXPECT_FALSE(cache.initialized);
     EXPECT_FALSE(cache.needs_capture);
-    EXPECT_EQ(cache.consecutive_failures, 0);
     EXPECT_EQ(cache.decode_step, 0u);
     EXPECT_EQ(cache.capture_stream, stream);
 }
 
-TEST(Test__GraphSegmentCache, WarmupSegmentsSkipPostWarmupResegmentForStableDenseStages)
+/**
+ * @brief First-use snapshot identity must not fence request work on its stream.
+ *
+ * A device-owned transaction can leave valid pre-capture publication queued
+ * until its retained executable launches.  Merely assigning the executor's
+ * initial snapshot generation owns no stale graph resource and therefore must
+ * not record or synchronously observe a completion event.
+ */
+TEST(Test__GraphSegmentCache,
+     PristineSnapshotIdentityAdoptionDoesNotFenceCaptureStream)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+
+    ASSERT_TRUE(cache.adoptSnapshotConfigurationEpochIfPristine(7));
+
+    EXPECT_EQ(cache.snapshot_configuration_epoch, 7u);
+    EXPECT_EQ(gpu_ctx.events_created_, 0);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+
+    cache.initialized = true;
+    EXPECT_FALSE(cache.adoptSnapshotConfigurationEpochIfPristine(8));
+    EXPECT_EQ(cache.snapshot_configuration_epoch, 7u);
+}
+
+/**
+ * @brief Prove a latency-critical host boundary actively progresses one event.
+ *
+ * The transaction follower observes its captured D2H publication without a
+ * backend blocking-wait wake-up. This remains an exact terminal event fence
+ * and must not degrade into a stream or device synchronization.
+ */
+TEST(Test__GraphSegmentCache,
+     ActiveHostFenceQueriesExactEventWithoutBlockingSynchronization)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.bindBorrowedCaptureStream(
+        &gpu_ctx,
+        gpu_ctx.defaultStream(),
+        DeviceId::rocm(0)));
+
+    cache.waitForCaptureStreamFence(
+        DeviceGraphExecutor::GraphSegmentCache::HostFenceWaitPolicy::
+            ActiveProgress);
+
+    EXPECT_EQ(gpu_ctx.events_created_, 1);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 1);
+    EXPECT_EQ(gpu_ctx.event_query_calls_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+/**
+ * @brief A deferred follower observes the event recorded at graph submission.
+ *
+ * Recording the event from the later waiter can accidentally include unrelated
+ * maintenance work queued on the same participant stream. The dedicated
+ * terminal ticket proves that observation performs only an event query and
+ * that the cache serializes successive retained transactions.
+ */
+TEST(Test__GraphSegmentCache,
+     PublishedTerminalIsObservedWithoutRerecordingSharedStream)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.bindBorrowedCaptureStream(
+        &gpu_ctx,
+        gpu_ctx.defaultStream(),
+        DeviceId::rocm(0)));
+    ASSERT_TRUE(cache.prepareCaptureStreamTerminal(&gpu_ctx));
+    ASSERT_EQ(gpu_ctx.events_created_, 1);
+
+    const auto first = cache.publishCaptureStreamTerminal();
+    ASSERT_TRUE(first.valid());
+    EXPECT_EQ(first.generation, 1u);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 1);
+
+    cache.waitForPublishedCaptureStreamTerminal(
+        first,
+        DeviceGraphExecutor::GraphSegmentCache::HostFenceWaitPolicy::
+            ActiveProgress);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 1)
+        << "Terminal observation must not move the event to later stream work";
+    EXPECT_EQ(gpu_ctx.event_query_calls_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+
+    const auto second = cache.publishCaptureStreamTerminal();
+    ASSERT_TRUE(second.valid());
+    EXPECT_EQ(second.generation, 2u);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 2);
+    cache.waitForPublishedCaptureStreamTerminal(
+        second,
+        DeviceGraphExecutor::GraphSegmentCache::HostFenceWaitPolicy::
+            ActiveProgress);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 2);
+    EXPECT_EQ(gpu_ctx.event_query_calls_, 2);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+/**
+ * @brief Prove the worker-to-capture transition is a GPU event edge.
+ *
+ * This is the lifecycle edge that protects the first graph capture from reading
+ * stale KV/GDN state. It must never regress to a host wait or a full-device
+ * synchronization, both of which distort LocalTP collective ordering.
+ */
+TEST(Test__GraphSegmentCache, CaptureStreamHandoffUsesEventWithoutDeviceSync)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+
+    ASSERT_TRUE(cache.orderCaptureStreamAfter(
+        &gpu_ctx,
+        gpu_ctx.defaultStream()));
+
+    EXPECT_EQ(gpu_ctx.events_created_, 1);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 1);
+    EXPECT_EQ(gpu_ctx.events_waited_, 1);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+}
+
+/**
+ * @brief Exercise transaction-zero capture with a LocalTP-style hook.
+ *
+ * The first cached-decode invocation must queue the event handoff, invoke one
+ * deterministic capture-entry/exit pair, prepare every launch, record model
+ * arithmetic once, and launch the resulting executable. Actual LocalTP wires
+ * this hook to its rank rendezvous.
+ */
+TEST(Test__GraphSegmentCache, FirstCaptureInvokesBoundaryAfterEventHandoff)
+{
+    ComputeGraph graph;
+    auto *stage = addFakeGraphLaunchPrepStage(
+        graph,
+        "collective_graph_stage",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureOnly,
+        /*capture_requires_preparation=*/true);
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "main_decode";
+    FakeReplayGPUContext gpu_ctx;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+
+    std::vector<std::pair<std::string, void *>> observed_boundaries;
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        nullptr,
+        /*collectives_graph_capturable=*/true,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/false,
+        [&](const std::string &boundary_name, void *capture_stream)
+        {
+            observed_boundaries.emplace_back(boundary_name, capture_stream);
+            return true;
+        }));
+
+    ASSERT_EQ(observed_boundaries.size(), 2u)
+        << "Atomic first use requires one capture-begin/capture-end rendezvous pair.";
+    EXPECT_NE(observed_boundaries[0].first.find("capture_begin"), std::string::npos);
+    EXPECT_NE(observed_boundaries[0].first.find("context=main_decode"), std::string::npos);
+    EXPECT_EQ(observed_boundaries[0].second, cache.capture_stream);
+    EXPECT_NE(observed_boundaries[1].first.find("capture_end"), std::string::npos);
+    EXPECT_EQ(observed_boundaries[1].second, cache.capture_stream);
+    EXPECT_EQ(stage->prepare_calls_, 1);
+    EXPECT_EQ(stage->execute_calls_, 1)
+        << "Transaction zero must record model arithmetic exactly once.";
+    EXPECT_TRUE(stage->executed_after_prepare_);
+    EXPECT_GE(gpu_ctx.events_recorded_, 1);
+    EXPECT_GE(gpu_ctx.events_waited_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0)
+        << "Transaction-zero capture must not rendezvous with the host.";
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_TRUE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
+}
+
+/**
+ * @brief A diagnostic filter must not invalidate an unrelated helper graph.
+ *
+ * The forward parity filter is executor-wide, while MTP/publication helpers
+ * own independent native graph caches. Once launch preparation has frozen this
+ * helper's tensor descriptor, a filter that rejects the output is provably the
+ * same lean topology and must replay the existing executable.
+ */
+TEST(Test__GraphSegmentCache,
+     UnselectedSnapshotOutputKeepsPreparedHelperExecutable)
+{
+    FP32Tensor output(std::vector<size_t>{1});
+    ComputeGraph graph;
+    auto stage = std::make_unique<FakeSnapshotOutputStage>(
+        DeviceId::cuda(0), &output);
+    auto *const stage_ptr = stage.get();
+    graph.addNode(
+        "diagnostically_unrelated_helper",
+        std::move(stage),
+        DeviceId::cuda(0));
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "diagnostically_unrelated_helper";
+    FakeReplayGPUContext gpu_ctx;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    DeviceGraphExecutor::DecodeCapturePolicy policy;
+    policy.allow_cached_graph_replay = true;
+
+    const auto submit = [&]
+    {
+        return executor.executeDecodeWithCapturePolicy(
+            graph,
+            &ctx,
+            &cache,
+            gpu_ctx.defaultStream(),
+            &gpu_ctx,
+            /*collective_nodes=*/nullptr,
+            policy);
+    };
+
+    ASSERT_TRUE(submit());
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 1u);
+    auto *const captured = gpu_ctx.created_graph_captures_.front();
+    ASSERT_NE(captured, nullptr);
+    EXPECT_EQ(stage_ptr->execute_calls_, 1);
+    EXPECT_EQ(captured->instantiate_calls_, 1);
+    EXPECT_EQ(captured->launch_calls_, 1);
+    EXPECT_EQ(cache.snapshot_configuration_epoch, 1u);
+
+    size_t snapshot_callback_calls = 0u;
+    executor.setSnapshotCallback(
+        [&](const std::string &, const StageDumpInfo &)
+        {
+            ++snapshot_callback_calls;
+        });
+    executor.setSnapshotStageFilter(
+        [](const std::string &, const StageDumpInfo &)
+        {
+            return false;
+        });
+    executor.setSnapshotConfigurationIdentity(9u);
+
+    graph.reset();
+    ASSERT_TRUE(submit());
+    EXPECT_EQ(gpu_ctx.created_graph_captures_.size(), 1u)
+        << "An unrelated diagnostic policy must not instantiate a second helper graph";
+    EXPECT_EQ(captured->instantiate_calls_, 1);
+    EXPECT_EQ(captured->launch_calls_, 2);
+    EXPECT_EQ(stage_ptr->execute_calls_, 1)
+        << "Steady replay must not execute the stage eagerly";
+    EXPECT_EQ(snapshot_callback_calls, 0u);
+    EXPECT_EQ(cache.snapshot_configuration_epoch, 1u);
+    EXPECT_EQ(
+        cache.snapshot_selection_identity.source_configuration_identity,
+        9u);
+    EXPECT_EQ(
+        cache.snapshot_selection_identity.effective_configuration_identity,
+        1u);
+    EXPECT_TRUE(cache.snapshot_manifest.storageBound());
+    EXPECT_TRUE(cache.snapshot_manifest.stage_copies.empty());
+    EXPECT_TRUE(cache.snapshot_manifest.outputless_stages.empty());
+    EXPECT_EQ(
+        cache.snapshot_manifest.filtered_stages,
+        std::unordered_set<std::string>{
+            "diagnostically_unrelated_helper"});
+}
+
+/**
+ * @brief Prove retained-parent capture never submits a source child graph.
+ *
+ * Three independently captured units model dense/packet/expert boundaries. The
+ * topology composer receives graph-only templates, builds one parent, and the
+ * cache launches only that parent for transaction zero and steady replay. This
+ * locks out the old host-segment behavior without requiring a GPU in unit tests.
+ */
+TEST(Test__GraphSegmentCache,
+     RetainedParentOwnsTransactionZeroAndSteadyReplay)
+{
+    for (const auto policy : {
+             DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentComposition,
+             DeviceGraphExecutor::GraphReplayPlanPolicy::RequireCloneableParentComposition})
+    {
+    SCOPED_TRACE(static_cast<int>(policy));
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph,
+        "dense_prefix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/true,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "packet_body",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::COPY,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/true,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "dense_suffix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    graph.addDependency("packet_body", "dense_prefix");
+    graph.addDependency("dense_suffix", "packet_body");
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "retained_parent_unit";
+    FakeReplayGPUContext gpu_ctx(
+        /*device_ordinal=*/0,
+        /*asynchronous_submission=*/false,
+        /*create_graph_only_captures=*/true);
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    size_t composer_calls = 0u;
+    const DeviceGraphExecutor::RetainedParentCompositionHook composer =
+        [&](IGPUGraphCapture &destination,
+            const ComputeGraph &source_graph,
+            std::span<const DeviceGraphExecutor::GraphSegmentCache::
+                                RetainedCaptureUnitTemplateView> units)
+        {
+            ++composer_calls;
+            EXPECT_EQ(&source_graph, &graph);
+            EXPECT_EQ(units.size(), 3u);
+            for (const auto &unit : units)
+            {
+                EXPECT_NE(unit.capture, nullptr);
+                EXPECT_FALSE(unit.capture->hasExecutable());
+                EXPECT_EQ(unit.captured_node_count, 1u);
+                EXPECT_EQ(unit.stream, cache.capture_stream);
+            }
+            auto *fake_parent =
+                dynamic_cast<FakeReplayGraphCapture *>(&destination);
+            EXPECT_NE(fake_parent, nullptr);
+            if (!fake_parent)
+                return false;
+            fake_parent->markGraphBuilt();
+            return true;
+        };
+
+    std::vector<DeviceGraphExecutor::GraphExecutableLaunchPhase> phases;
+    const DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
+        [&](DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+            void *stream)
+        {
+            EXPECT_EQ(stream, cache.capture_stream);
+            phases.push_back(phase);
+            return true;
+        };
+
+    const auto submit = [&]
+    {
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            &ctx,
+            cache,
+            gpu_ctx.defaultStream(),
+            &gpu_ctx,
+            /*collective_nodes=*/nullptr,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true,
+            /*capture_boundary=*/{},
+            policy,
+            launch_dependency,
+            std::span<const BufferId>{},
+            composer);
+    };
+
+    ASSERT_TRUE(submit());
+    const bool independent_sources = policy ==
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireCloneableParentComposition;
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), independent_sources ? 4u : 1u);
+    auto *const parent = gpu_ctx.created_graph_captures_.front();
+    ASSERT_EQ(parent->created_fragments_.size(), independent_sources ? 0u : 3u);
+    for (size_t child = 0u; child < 3u; ++child)
+    {
+        auto *const source = dynamic_cast<FakeReplayGraphCapture *>(
+            cache.segments[child].capture.get());
+        ASSERT_NE(source, nullptr);
+        EXPECT_EQ(source->instantiate_calls_, 0);
+        EXPECT_EQ(source->launch_calls_, 0);
+        EXPECT_FALSE(source->hasExecutable());
+    }
+    ASSERT_NE(parent, nullptr);
+    EXPECT_EQ(parent->instantiate_calls_, 1);
+    EXPECT_EQ(parent->launch_calls_, 1);
+    EXPECT_TRUE(cache.retained_composed_parent_replay.valid());
+    EXPECT_EQ(
+        cache.graph_replay_plan_policy,
+        policy);
+
+    graph.reset();
+    ASSERT_TRUE(submit());
+    EXPECT_EQ(composer_calls, 1u);
+    EXPECT_EQ(parent->instantiate_calls_, 1);
+    EXPECT_EQ(parent->launch_calls_, 2);
+    for (size_t child = 0u; child < 3u; ++child)
+        EXPECT_EQ(static_cast<FakeReplayGraphCapture *>(
+            cache.segments[child].capture.get())->launch_calls_, 0);
+    ASSERT_EQ(phases.size(), 2u);
+    EXPECT_EQ(
+        phases[0],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction);
+    EXPECT_EQ(
+        phases[1],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    }
+}
+
+/**
+ * @brief Setup can materialize a follower parent without executing inference.
+ *
+ * A heterogeneous follower must finish native capture and instantiation before
+ * the continuation authority publishes its first authenticated ticket. This
+ * regression proves setup owns no launch, while the first ordinary invocation
+ * submits the already-instantiated parent as transaction zero and the next
+ * invocation is steady replay. No source child is ever submitted.
+ */
+TEST(Test__GraphSegmentCache,
+     RetainedParentSetupMaterializationDefersTransactionZeroLaunch)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph,
+        "dense_prefix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/true,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "packet_body",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::COPY,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/true,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "dense_suffix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    graph.addDependency("packet_body", "dense_prefix");
+    graph.addDependency("dense_suffix", "packet_body");
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    size_t snapshot_callback_calls = 0u;
+    executor.setSnapshotCallback(
+        [&](const std::string &, const StageDumpInfo &)
+        {
+            ++snapshot_callback_calls;
+        });
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "retained_parent_setup_materialization_unit";
+    FakeReplayGPUContext gpu_ctx(
+        /*device_ordinal=*/0,
+        /*asynchronous_submission=*/false,
+        /*create_graph_only_captures=*/true);
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    size_t composer_calls = 0u;
+    const DeviceGraphExecutor::RetainedParentCompositionHook composer =
+        [&](IGPUGraphCapture &destination,
+            const ComputeGraph &source_graph,
+            std::span<const DeviceGraphExecutor::GraphSegmentCache::
+                                RetainedCaptureUnitTemplateView> units)
+        {
+            ++composer_calls;
+            EXPECT_EQ(&source_graph, &graph);
+            EXPECT_EQ(units.size(), 3u);
+            for (const auto &unit : units)
+            {
+                EXPECT_NE(unit.capture, nullptr);
+                EXPECT_FALSE(unit.capture->hasExecutable());
+                EXPECT_EQ(unit.captured_node_count, 1u);
+                EXPECT_EQ(unit.stream, cache.capture_stream);
+            }
+            auto *fake_parent =
+                dynamic_cast<FakeReplayGraphCapture *>(&destination);
+            EXPECT_NE(fake_parent, nullptr);
+            if (!fake_parent)
+                return false;
+            fake_parent->markGraphBuilt();
+            return true;
+        };
+
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        /*collective_nodes=*/nullptr,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true,
+        /*capture_boundary=*/{},
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            RequireRetainedParentComposition,
+        /*launch_dependency=*/{},
+        std::span<const BufferId>{},
+        composer,
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            MaterializeWithoutLaunch));
+
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 1u);
+    auto *const parent = gpu_ctx.created_graph_captures_.front();
+    ASSERT_EQ(parent->created_fragments_.size(), 3u);
+    ASSERT_NE(parent, nullptr);
+    EXPECT_EQ(composer_calls, 1u);
+    EXPECT_EQ(parent->instantiate_calls_, 1);
+    EXPECT_EQ(parent->launch_calls_, 0)
+        << "Setup must not consume a follower transaction.";
+    EXPECT_EQ(snapshot_callback_calls, 0u)
+        << "Setup may seal diagnostic D2D nodes but must not publish values.";
+    EXPECT_EQ(cache.snapshot_manifest.outputless_stages.size(), 3u)
+        << "The setup executable must retain the final snapshot topology.";
+    EXPECT_TRUE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
+    EXPECT_EQ(cache.decode_step, 0u);
+    EXPECT_EQ(
+        cache.executable_submission_state,
+        DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::
+            MaterializedUnlaunched);
+    for (size_t child = 0u; child < 3u; ++child)
+        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
+
+    std::vector<DeviceGraphExecutor::GraphExecutableLaunchPhase> phases;
+    const DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
+        [&](DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+            void *stream)
+        {
+            EXPECT_EQ(stream, cache.capture_stream);
+            phases.push_back(phase);
+            return true;
+        };
+    const auto submit = [&]
+    {
+        graph.reset();
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            &ctx,
+            cache,
+            gpu_ctx.defaultStream(),
+            &gpu_ctx,
+            /*collective_nodes=*/nullptr,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true,
+            /*capture_boundary=*/{},
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                RequireRetainedParentComposition,
+            launch_dependency,
+            std::span<const BufferId>{},
+            composer);
+    };
+
+    ASSERT_TRUE(submit());
+    EXPECT_EQ(gpu_ctx.created_graph_captures_.size(), 1u)
+        << "First inference must replay the setup-owned executable.";
+    EXPECT_EQ(parent->created_fragments_.size(), 3u)
+        << "Replay must not create or record replacement fragments.";
+    EXPECT_EQ(composer_calls, 1u);
+    EXPECT_EQ(parent->instantiate_calls_, 1);
+    EXPECT_EQ(parent->launch_calls_, 1);
+    EXPECT_EQ(cache.decode_step, 1u);
+    EXPECT_EQ(
+        cache.executable_submission_state,
+        DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::
+            ReplayReady);
+
+    ASSERT_TRUE(submit());
+    EXPECT_EQ(parent->launch_calls_, 2);
+    EXPECT_EQ(cache.decode_step, 2u);
+    ASSERT_EQ(phases.size(), 2u);
+    EXPECT_EQ(
+        phases[0],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction);
+    EXPECT_EQ(
+        phases[1],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
+    for (size_t child = 0u; child < 3u; ++child)
+        EXPECT_EQ(parent->created_fragments_[child]->launch_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+/**
+ * @brief One retained GPU parent overlaps an authenticated CPU ticket unit.
+ *
+ * The validated captured/manual/captured lifecycle retains two bounded
+ * graph-only compiler units. Transaction submission launches their composed
+ * parent once, while the host services the ordered manual program without
+ * synchronizing either stream. The sealed replay plan preserves that service
+ * program so steady replay repeats the same lifecycle.
+ */
+TEST(Test__GraphSegmentCache,
+     RetainedParentServicesCertifiedManualTicketAfterSingleLaunch)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "producer", true, false, ComputeStageType::COPY, false,
+        false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "cpu_service", false, true, ComputeStageType::MOE_LOCAL_EXPERT,
+        false, false, false, nullptr, DeviceId::cpu(), false,
+        ManualGraphBoundaryScheduling::ConcurrentTicketService,
+        ConcurrentManualFailureRole::DeviceIngressPublisher);
+    addFakeSegmentStage(
+        graph, "consumer", true, false, ComputeStageType::COPY, false,
+        false, false, nullptr, DeviceId::cuda(0));
+    graph.addDependency("cpu_service", "producer");
+    graph.addDependency("consumer", "cpu_service");
+    graph.setHeterogeneousTicketUnitContract(
+        "producer",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "before_cpu",
+        });
+    graph.setTerminalNode("consumer");
+    graph.setHeterogeneousTicketUnitContract(
+        "consumer",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    const auto discovered_plan =
+        makeMoEOverlayRetainedParentPlan(graph);
+    ASSERT_TRUE(discovered_plan.has_value());
+    ASSERT_TRUE(discovered_plan->valid());
+    EXPECT_EQ(
+        discovered_plan->replay_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            RequireRetainedParentWithConcurrentTicketService)
+        << "Only the authority owns concurrent CPU ticket service";
+
+    auto *const service = dynamic_cast<FakeSegmentStage *>(
+        graph.getNode("cpu_service")->stage.get());
+    ASSERT_NE(service, nullptr);
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx(
+        /*device_ordinal=*/0,
+        /*asynchronous_submission=*/false,
+        /*create_graph_only_captures=*/true);
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    size_t composer_calls = 0u;
+    const DeviceGraphExecutor::RetainedParentCompositionHook composer =
+        [&](IGPUGraphCapture &destination,
+            const ComputeGraph &,
+            std::span<const DeviceGraphExecutor::GraphSegmentCache::
+                                RetainedCaptureUnitTemplateView> units)
+    {
+        ++composer_calls;
+        EXPECT_EQ(units.size(), 2u);
+        auto *const parent =
+            dynamic_cast<FakeReplayGraphCapture *>(&destination);
+        if (!parent)
+            return false;
+        parent->markGraphBuilt();
+        return true;
+    };
+
+    const auto submit = [&]
+    {
+        graph.reset();
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            &ctx,
+            cache,
+            gpu_ctx.defaultStream(),
+            &gpu_ctx,
+            /*collective_nodes=*/nullptr,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true,
+            /*capture_boundary=*/{},
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                RequireRetainedParentWithConcurrentTicketService,
+            /*launch_dependency=*/{},
+            std::span<const BufferId>{},
+            composer);
+    };
+
+    ASSERT_TRUE(submit());
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 1u);
+    auto *const parent = gpu_ctx.created_graph_captures_.front();
+    ASSERT_EQ(parent->created_fragments_.size(), 2u);
+    ASSERT_NE(parent, nullptr);
+    EXPECT_EQ(parent->launch_calls_, 1);
+    EXPECT_EQ(service->execute_calls_, 1);
+    EXPECT_EQ(composer_calls, 1u);
+    ASSERT_EQ(
+        cache.retained_composed_parent_replay
+            .concurrent_ticket_service_segment_indices,
+        std::vector<size_t>{2u});
+    EXPECT_EQ(
+        cache.retained_composed_parent_replay.child_unit_count,
+        2u);
+
+    ASSERT_TRUE(submit());
+    EXPECT_EQ(parent->launch_calls_, 2);
+    EXPECT_EQ(service->execute_calls_, 2);
+    EXPECT_EQ(composer_calls, 1u);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+/** @brief An ordinary host boundary cannot masquerade as concurrent service. */
+TEST(Test__GraphSegmentCache,
+     RetainedParentConcurrentServiceRejectsUncertifiedManualStage)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "producer", true);
+    addFakeSegmentStage(graph, "manual", false, true);
+    addFakeSegmentStage(graph, "consumer", true);
+    graph.addDependency("manual", "producer");
+    graph.addDependency("consumer", "manual");
+    graph.setHeterogeneousTicketUnitContract(
+        "producer",
+        GraphHeterogeneousTicketUnitContract{.identity = "before_cpu"});
+    graph.setTerminalNode("consumer");
+    graph.setHeterogeneousTicketUnitContract(
+        "consumer",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    EXPECT_THROW(
+        DeviceGraphCaptureController::buildCapturePlan(
+            graph,
+            cache,
+            nullptr,
+            /*has_collective_nodes=*/false,
+            /*collectives_graph_capturable=*/false,
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                RequireRetainedParentWithConcurrentTicketService),
+        std::runtime_error);
+}
+
+/**
+ * @brief Setup-only capture also applies to ordinary segmented root graphs.
+ *
+ * The continuation graph is not itself a retained composed parent: it owns
+ * captured GPU regions separated by one explicit heterogeneous collective.
+ * Setup records and instantiates the GPU regions but must not execute that
+ * manual boundary. The first request launches both resident executables under
+ * InitialTransaction and executes the boundary exactly once in graph order.
+ */
+TEST(Test__GraphSegmentCache,
+     SegmentedRootSetupMaterializationDefersManualBoundaryAndLaunch)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph,
+        "dense_prefix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "sparse_collective",
+        /*capturable=*/false,
+        /*manual_boundary=*/true,
+        ComputeStageType::COPY,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "dense_suffix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    graph.addDependency("sparse_collective", "dense_prefix");
+    graph.addDependency("dense_suffix", "sparse_collective");
+
+    auto *const prefix = dynamic_cast<FakeSegmentStage *>(
+        graph.getNode("dense_prefix")->stage.get());
+    auto *const boundary = dynamic_cast<FakeSegmentStage *>(
+        graph.getNode("sparse_collective")->stage.get());
+    auto *const suffix = dynamic_cast<FakeSegmentStage *>(
+        graph.getNode("dense_suffix")->stage.get());
+    ASSERT_NE(prefix, nullptr);
+    ASSERT_NE(boundary, nullptr);
+    ASSERT_NE(suffix, nullptr);
+
+    std::unordered_set<std::string> collective_nodes{
+        "sparse_collective"};
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "segmented_root_setup_materialization_unit";
+    FakeReplayGPUContext gpu_ctx(
+        /*device_ordinal=*/0,
+        /*asynchronous_submission=*/false,
+        /*create_graph_only_captures=*/true);
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        &collective_nodes,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true,
+        /*capture_boundary=*/{},
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation,
+        /*launch_dependency=*/{},
+        std::span<const BufferId>{},
+        /*retained_parent_composer=*/{},
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            MaterializeWithoutLaunch));
+
+    ASSERT_EQ(cache.segments.size(), 3u);
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 2u);
+    for (auto *capture : gpu_ctx.created_graph_captures_)
+    {
+        ASSERT_NE(capture, nullptr);
+        EXPECT_EQ(capture->instantiate_calls_, 1);
+        EXPECT_EQ(capture->launch_calls_, 0);
+    }
+    EXPECT_EQ(prefix->execute_calls_, 1)
+        << "Captured kernel calls are recorded but not submitted.";
+    EXPECT_EQ(suffix->execute_calls_, 1);
+    EXPECT_EQ(boundary->execute_calls_, 0)
+        << "Setup may not enter the live heterogeneous protocol.";
+    EXPECT_EQ(
+        cache.executable_submission_state,
+        DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::
+            MaterializedUnlaunched);
+    EXPECT_EQ(cache.decode_step, 0u);
+
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        &collective_nodes,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true,
+        /*capture_boundary=*/{},
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation));
+
+    for (auto *capture : gpu_ctx.created_graph_captures_)
+        EXPECT_EQ(capture->launch_calls_, 1);
+    EXPECT_EQ(boundary->execute_calls_, 1);
+    EXPECT_EQ(prefix->execute_calls_, 1);
+    EXPECT_EQ(suffix->execute_calls_, 1);
+    EXPECT_EQ(
+        cache.executable_submission_state,
+        DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::
+            ReplayReady);
+    EXPECT_EQ(cache.decode_step, 1u);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+/**
+ * @brief Manual collective replay retains the graph cache's snapshot authority.
+ *
+ * A heterogeneous graph executes collectives between native graph segments.
+ * Those stages are outside stream capture, but they are not eager, standalone
+ * executions: their diagnostic copies belong to the same cache-owned manifest
+ * as the surrounding captured segments. This regression arms a snapshot
+ * callback and submits the graph twice. The second submission specifically
+ * exercises steady manual replay, where the legacy `executeNode()` path tried
+ * to record into an empty transient manifest before the controller could use
+ * the already-bound graph manifest.
+ */
+TEST(Test__GraphSegmentCache,
+     SegmentedManualCollectiveReplayUsesCacheOwnedSnapshotManifest)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph,
+        "captured_prefix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "manual_allreduce",
+        /*capturable=*/false,
+        /*manual_boundary=*/true,
+        ComputeStageType::ALLREDUCE,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph,
+        "captured_suffix",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+    graph.addDependency("manual_allreduce", "captured_prefix");
+    graph.addDependency("captured_suffix", "manual_allreduce");
+
+    auto *const manual = dynamic_cast<FakeSegmentStage *>(
+        graph.getNode("manual_allreduce")->stage.get());
+    ASSERT_NE(manual, nullptr);
+
+    std::unordered_set<std::string> collective_nodes{"manual_allreduce"};
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    std::size_t snapshot_callback_calls = 0u;
+    executor.setSnapshotCallback(
+        [&](const std::string &, const StageDumpInfo &)
+        {
+            ++snapshot_callback_calls;
+        });
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "segmented_manual_snapshot_authority_unit";
+    FakeReplayGPUContext gpu_ctx;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    const auto submit = [&]()
+    {
+        graph.reset();
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            &ctx,
+            cache,
+            gpu_ctx.defaultStream(),
+            &gpu_ctx,
+            &collective_nodes,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true,
+            /*capture_boundary=*/{},
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                AllowHeterogeneousBoundarySegmentation);
+    };
+
+    ASSERT_TRUE(submit());
+    ASSERT_TRUE(cache.snapshot_manifest.storageBound());
+    EXPECT_EQ(cache.snapshot_manifest.outputless_stages.size(), 3u);
+    EXPECT_EQ(manual->execute_calls_, 1);
+
+    ASSERT_TRUE(submit());
+    EXPECT_EQ(manual->execute_calls_, 2)
+        << "Steady replay must execute the manual collective exactly once.";
+    EXPECT_TRUE(cache.snapshot_manifest.storageBound());
+    EXPECT_EQ(snapshot_callback_calls, 0u)
+        << "Outputless stages freeze manifest topology without inventing callbacks.";
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+/**
+ * @brief Transaction zero validates bytes that setup deliberately did not own.
+ *
+ * Address-only setup capture must not confer payload authority. The first
+ * admitted request therefore asks the controller to preflight each capturable
+ * segment at its execution point. Steady replay drops that one-time arena walk.
+ */
+TEST(Test__GraphSegmentCache,
+     SetupMaterializedTransactionZeroOwnsOneStrictInputPreflight)
+{
+    const StageRunPolicy setup_recording =
+        StageRunPolicy::setupGraphMaterialization();
+    EXPECT_FALSE(setup_recording.coherence);
+    EXPECT_FALSE(setup_recording.weight_coherence);
+    EXPECT_FALSE(setup_recording.mark_dirty);
+    EXPECT_EQ(
+        setup_recording.graph_recording_authority,
+        StageRunPolicy::GraphRecordingAuthority::SetupAddressesOnly);
+
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph,
+        "materialized_graph",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::GEMM,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        nullptr,
+        DeviceId::cuda(0));
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "setup_transaction_zero_preflight_unit";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"materialized_graph"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    size_t input_preflight_calls = 0u;
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs =
+            [&](const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            EXPECT_EQ(segment.stage_names,
+                      std::vector<std::string>{"materialized_graph"});
+            ++input_preflight_calls;
+            return true;
+        },
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest =
+            []() { return true; },
+        .record_snapshot_copies =
+            [](ComputeNode &, void *) { return true; },
+        .post_launch =
+            [](DeviceGraphExecutor::GraphSegment &, void *) {},
+        .require_replay_input_preflight = true,
+    };
+
+    auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/1,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(input_preflight_calls, 1u);
+
+    hooks.require_replay_input_preflight = false;
+    result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/2,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(input_preflight_calls, 1u)
+        << "Steady replay must retain the no-arena-walk hot path.";
+}
+
+/**
+ * @brief A no-work participant joins a sibling capture wave after launch.
+ *
+ * The active executable must launch before the passive begin rendezvous. This
+ * is the ordering needed by ExpertOverlay: transaction zero publishes the
+ * outbound ticket, the root performs manual heterogeneous work, and only then
+ * does a non-root participant join the root's return-ingress capture lifecycle.
+ */
+TEST(Test__GraphSegmentCache,
+     PassiveCaptureWaveJoinsAfterActiveTransactionZeroLaunch)
+{
+    ComputeGraph graph;
+    addFakeGraphLaunchPrepStage(
+        graph,
+        "captured_outbound",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureOnly,
+        /*capture_requires_preparation=*/true);
+    graph.setGraphCaptureWaveContract(
+        "captured_outbound",
+        GraphCaptureWaveContract{
+            .identity = "overlay_outbound",
+        });
+    addFakeSegmentStage(
+        graph,
+        "nonroot_ordered_reduce_noop",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::MOE_CANONICAL_ROUTE_REDUCE,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        /*variant_signature=*/nullptr,
+        DeviceId::cuda(0),
+        /*passive_capture_noop=*/true);
+    graph.setGraphCaptureWaveContract(
+        "nonroot_ordered_reduce_noop",
+        GraphCaptureWaveContract{
+            .identity = "overlay_ordered_reduce",
+            .participation = GraphCaptureWaveParticipation::Passive,
+            .passive_following_identities = {"overlay_inbound"},
+        });
+    auto *const passive_stage = dynamic_cast<FakeSegmentStage *>(
+        graph.getNode("nonroot_ordered_reduce_noop")->stage.get());
+    ASSERT_NE(passive_stage, nullptr);
+    addFakeSegmentStage(
+        graph,
+        "heterogeneous_manual_boundary",
+        /*capturable=*/false,
+        /*manual_boundary=*/true,
+        ComputeStageType::COPY,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        /*variant_signature=*/nullptr,
+        DeviceId::cuda(0));
+    graph.addDependency(
+        "heterogeneous_manual_boundary",
+        "captured_outbound");
+    graph.addDependency(
+        "nonroot_ordered_reduce_noop",
+        "heterogeneous_manual_boundary");
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "role_asymmetric_decode";
+    FakeReplayGPUContext gpu_ctx;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+
+    std::vector<std::string> observed_boundaries;
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        nullptr,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/false,
+        [&](const std::string &boundary_name, void *capture_stream)
+        {
+            EXPECT_EQ(capture_stream, cache.capture_stream);
+            if (boundary_name.find("overlay_ordered_reduce") !=
+                    std::string::npos ||
+                boundary_name.find("overlay_inbound") !=
+                    std::string::npos)
+            {
+                if (cache.segments.empty())
+                {
+                    ADD_FAILURE() << "Passive wave observed before capture-plan publication";
+                    return false;
+                }
+                const auto *capture =
+                    dynamic_cast<const FakeReplayGraphCapture *>(
+                        cache.segments.front().capture.get());
+                if (!capture)
+                {
+                    ADD_FAILURE() << "Passive wave observed before active graph creation";
+                    return false;
+                }
+                EXPECT_EQ(capture->launch_calls_, 1)
+                    << "A passive wave may not block the active transaction-zero launch";
+            }
+            observed_boundaries.push_back(boundary_name);
+            return true;
+        },
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation));
+
+    ASSERT_EQ(observed_boundaries.size(), 6u);
+    EXPECT_NE(
+        observed_boundaries[0].find(
+            "phase=capture_begin:step=1:wave=0:identity=explicit:overlay_outbound"),
+        std::string::npos);
+    EXPECT_NE(
+        observed_boundaries[1].find(
+            "phase=capture_end:step=1:wave=0:identity=explicit:overlay_outbound"),
+        std::string::npos);
+    EXPECT_NE(
+        observed_boundaries[2].find(
+            "phase=capture_begin:step=1:wave=1:identity=explicit:overlay_ordered_reduce"),
+        std::string::npos);
+    EXPECT_NE(
+        observed_boundaries[3].find(
+            "phase=capture_end:step=1:wave=1:identity=explicit:overlay_ordered_reduce"),
+        std::string::npos);
+    EXPECT_NE(
+        observed_boundaries[4].find(
+            "phase=capture_begin:step=1:wave=2:identity=explicit:overlay_inbound"),
+        std::string::npos);
+    EXPECT_NE(
+        observed_boundaries[5].find(
+            "phase=capture_end:step=1:wave=2:identity=explicit:overlay_inbound"),
+        std::string::npos);
+    ASSERT_EQ(cache.segments.size(), 2u);
+    EXPECT_FALSE(cache.segments[1].capturable);
+    ASSERT_EQ(cache.segments[1].passive_capture_waves_after.size(), 2u);
+    EXPECT_EQ(cache.segments[1].passive_capture_waves_after[0].ordinal, 1u);
+    EXPECT_EQ(cache.segments[1].passive_capture_waves_after[0].identity,
+              "overlay_ordered_reduce");
+    EXPECT_EQ(cache.segments[1].passive_capture_waves_after[0]
+                  .declarative_noop_stage_names,
+              std::vector<std::string>{"nonroot_ordered_reduce_noop"});
+    EXPECT_EQ(cache.segments[1].passive_capture_waves_after[1].ordinal, 2u);
+    EXPECT_EQ(cache.segments[1].passive_capture_waves_after[1].identity,
+              "overlay_inbound");
+    EXPECT_TRUE(cache.segments[1].passive_capture_waves_after[1]
+                    .declarative_noop_stage_names.empty());
+    EXPECT_EQ(passive_stage->execute_calls_, 0)
+        << "A passive node must never manufacture an empty native graph by "
+           "calling its no-op execute method inside capture.";
+}
+
+/**
+ * @brief Reject passive topology metadata on a stage that may perform work.
+ */
+TEST(Test__GraphSegmentCache,
+     PassiveCaptureContractRequiresCertifiedImmutableNoOp)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph,
+        "ordinary_stage",
+        /*capturable=*/true,
+        /*manual_boundary=*/false,
+        ComputeStageType::COPY,
+        /*launch_preparation_dependent_capture=*/false,
+        /*segment_boundary_before=*/false,
+        /*segment_boundary_after=*/false,
+        /*variant_signature=*/nullptr,
+        DeviceId::cuda(0));
+
+    EXPECT_THROW(
+        graph.setGraphCaptureWaveContract(
+            "ordinary_stage",
+            GraphCaptureWaveContract{
+                .identity = "forbidden_passive_wave",
+                .participation =
+                    GraphCaptureWaveParticipation::Passive,
+            }),
+        std::invalid_argument);
+}
+
+/**
+ * @brief Prove a live external event stays outside capture on transaction zero.
+ *
+ * The same typed hook must run after capture/instantiation but before the first
+ * executable launch, then immediately before every steady replay.  This is the
+ * lifecycle used by device-owned MoE maintenance: recording the event wait
+ * before native capture would export a root event into a conditional child
+ * graph, while running it after launch would race the live-state producer.
+ */
+TEST(Test__GraphSegmentCache,
+     LaunchDependencyRunsAfterCaptureAndImmediatelyBeforeEveryLaunch)
+{
+    ComputeGraph graph;
+    addFakeGraphLaunchPrepStage(
+        graph,
+        "live_state_consumer",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureAndReplay,
+        /*capture_requires_preparation=*/true);
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "launch_dependency_lifecycle";
+    FakeReplayGPUContext gpu_ctx;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+
+    void *const producer_event = gpu_ctx.createEvent();
+    ASSERT_NE(producer_event, nullptr);
+    std::vector<DeviceGraphExecutor::GraphExecutableLaunchPhase> phases;
+    int hook_event_records = 0;
+    int hook_event_waits = 0;
+    const DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
+        [&](DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+            void *execution_stream) -> bool
+    {
+        EXPECT_EQ(execution_stream, cache.capture_stream);
+        EXPECT_EQ(cache.segments.size(), 1u);
+        if (cache.segments.size() != 1u)
+            return false;
+        auto *capture = dynamic_cast<FakeReplayGraphCapture *>(
+            cache.segments.front().capture.get());
+        EXPECT_NE(capture, nullptr);
+        if (!capture)
+            return false;
+
+        EXPECT_EQ(capture->begin_capture_calls_, 1);
+        EXPECT_EQ(capture->end_capture_calls_, 1)
+            << "The external event join must run only after native capture closes.";
+        EXPECT_EQ(capture->instantiate_calls_, 1);
+        EXPECT_EQ(capture->launch_calls_, static_cast<int>(phases.size()))
+            << "The hook must be the immediate precondition of each launch.";
+
+        if (!gpu_ctx.recordEventChecked(
+                producer_event,
+                gpu_ctx.defaultStream()))
+        {
+            return false;
+        }
+        ++hook_event_records;
+        if (!gpu_ctx.waitEventChecked(producer_event, execution_stream))
+            return false;
+        ++hook_event_waits;
+        phases.push_back(phase);
+        return true;
+    };
+
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        nullptr,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true,
+        /*capture_boundary=*/{},
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph,
+        launch_dependency));
+
+    graph.reset();
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx,
+        nullptr,
+        /*collectives_graph_capturable=*/false,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true,
+        /*capture_boundary=*/{},
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph,
+        launch_dependency));
+
+    ASSERT_EQ(phases.size(), 2u);
+    EXPECT_EQ(
+        phases[0],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction);
+    EXPECT_EQ(
+        phases[1],
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
+    EXPECT_EQ(hook_event_records, 2);
+    EXPECT_EQ(hook_event_waits, 2);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    gpu_ctx.destroyEvent(producer_event);
+}
+
+TEST(Test__GraphSegmentCache, GraphLifecyclePhaseNamesAreCanonical)
+{
+    EXPECT_STREQ(
+        DeviceGraphCaptureController::phaseName(
+            DeviceGraphCaptureController::Phase::Capture),
+        "capture");
+    EXPECT_STREQ(
+        DeviceGraphCaptureController::phaseName(
+            DeviceGraphCaptureController::Phase::Replay),
+        "replay");
+}
+
+TEST(Test__GraphSegmentCache, CapturePlanKeepsStableDenseStagesMonolithic)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "a", true);
@@ -638,50 +3630,50 @@ TEST(Test__GraphSegmentCache, WarmupSegmentsSkipPostWarmupResegmentForStableDens
     graph.addDependency("b", "a");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::executeWarmupPhase(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         nullptr,
         false,
         false);
 
-    EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_FALSE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
     ASSERT_EQ(cache.segments.size(), 1u);
     EXPECT_TRUE(cache.segments[0].capturable);
 }
 
-TEST(Test__GraphSegmentCache, WarmupSegmentsPlanWarmupDependentStagesWithoutResegment)
+TEST(Test__GraphSegmentCache, CapturePlanIncludesLaunchPreparationDependentStages)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "before", true);
     addFakeSegmentStage(
         graph,
-        "warmup_dependent",
+        "launch_preparation_dependent",
         false,
         false,
         ComputeStageType::MOE_EXPERT_FFN,
         true);
     addFakeSegmentStage(graph, "after", true);
-    graph.addDependency("warmup_dependent", "before");
-    graph.addDependency("after", "warmup_dependent");
+    graph.addDependency("launch_preparation_dependent", "before");
+    graph.addDependency("after", "launch_preparation_dependent");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::executeWarmupPhase(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         nullptr,
         false,
         false);
 
-    EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_FALSE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
     ASSERT_EQ(cache.segments.size(), 1u);
     EXPECT_TRUE(cache.segments[0].capturable);
     ASSERT_EQ(cache.segments[0].stage_names.size(), 3u);
 }
 
-TEST(Test__GraphSegmentCache, CapturableStageBeforeAndAfterBoundariesKeepStageExclusive)
+TEST(Test__GraphSegmentCache, CaptureBoundariesCannotSegmentGraphWithoutHeterogeneousCollectives)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "before", true);
@@ -701,38 +3693,94 @@ TEST(Test__GraphSegmentCache, CapturableStageBeforeAndAfterBoundariesKeepStageEx
     graph.addDependency("after", "attention_gate");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
-        graph,
-        cache,
-        nullptr,
-        /*has_collective_nodes=*/false);
-
-    ASSERT_EQ(cache.segments.size(), 3u);
-    EXPECT_TRUE(cache.segments[0].capturable);
-    EXPECT_EQ(cache.segments[0].stage_names,
-              std::vector<std::string>({"before"}));
-    EXPECT_TRUE(cache.segments[1].capturable);
-    EXPECT_EQ(cache.segments[1].stage_names,
-              std::vector<std::string>({"rocm_dynamic_attention"}));
-    EXPECT_TRUE(cache.segments[2].capturable);
-    EXPECT_EQ(cache.segments[2].stage_names,
-              std::vector<std::string>({"attention_gate", "after"}));
+    EXPECT_THROW(
+        DeviceGraphCaptureController::buildCapturePlan(
+            graph,
+            cache,
+            nullptr,
+            /*has_collective_nodes=*/false),
+        std::runtime_error);
 }
 
 TEST(Test__GraphSegmentCache, ResetCanDestroyCaptureStream)
 {
+    FakeReplayGPUContext gpu_ctx;
     DeviceGraphExecutor::GraphSegmentCache cache;
-    cache.capture_stream = reinterpret_cast<void *>(0x1234);
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
 
     cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
 
     EXPECT_EQ(cache.capture_stream, nullptr);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.events_created_, 1);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 1)
+        << "Resource teardown must establish terminal host ownership.";
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 1);
+    EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 1);
 }
 
-TEST(Test__GraphSegmentCache, ResetPreserveSynchronizesExplicitCaptureStreamWithCheckedAPI)
+/**
+ * @brief A retained operation graph may borrow its participant worker stream.
+ *
+ * The cache must still establish a terminal event fence before releasing its
+ * executable and events, but the longer-lived context remains the sole stream
+ * owner. This locks down the no-handoff fast path used by heterogeneous
+ * participant-local MoE graphs.
+ */
+TEST(Test__GraphSegmentCache, ResetFencesButDoesNotDestroyBorrowedCaptureStream)
 {
-    DeviceGraphExecutor::GraphSegmentCache cache;
     FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    void *const worker_stream = gpu_ctx.defaultStream();
+    ASSERT_TRUE(cache.bindBorrowedCaptureStream(
+        &gpu_ctx,
+        worker_stream,
+        DeviceId::cuda(0)));
+    EXPECT_EQ(cache.capture_stream, worker_stream);
+    EXPECT_EQ(
+        cache.capture_stream_ownership,
+        DeviceGraphExecutor::GraphSegmentCache::CaptureStreamOwnership::Borrowed);
+
+    cache.reset(
+        DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+
+    EXPECT_EQ(cache.capture_stream, nullptr);
+    EXPECT_EQ(
+        cache.capture_stream_ownership,
+        DeviceGraphExecutor::GraphSegmentCache::CaptureStreamOwnership::None);
+    EXPECT_EQ(gpu_ctx.events_created_, 1);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 1);
+    EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 0)
+        << "The participant context, not the graph cache, owns this stream.";
+}
+
+TEST(Test__GraphSegmentCache, BorrowedCaptureStreamRejectsIdentityChanges)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    void *const worker_stream = gpu_ctx.defaultStream();
+    ASSERT_TRUE(cache.bindBorrowedCaptureStream(
+        &gpu_ctx,
+        worker_stream,
+        DeviceId::cuda(0)));
+
+    EXPECT_FALSE(cache.bindBorrowedCaptureStream(
+        &gpu_ctx,
+        gpu_ctx.getOrCreateAuxiliaryStream("other"),
+        DeviceId::cuda(0)));
+    EXPECT_FALSE(cache.bindBorrowedCaptureStream(
+        &gpu_ctx,
+        worker_stream,
+        DeviceId::cuda(1)));
+}
+
+TEST(Test__GraphSegmentCache, ResetPreserveFencesExplicitCaptureStreamWithCheckedEvent)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     void *stream = cache.capture_stream;
     ASSERT_NE(stream, nullptr);
@@ -741,38 +3789,50 @@ TEST(Test__GraphSegmentCache, ResetPreserveSynchronizesExplicitCaptureStreamWith
 
     EXPECT_EQ(cache.capture_stream, stream);
     EXPECT_EQ(cache.gpu_ctx_ref, &gpu_ctx);
-    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 1);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
     EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0)
-        << "Graph cache reset must use checked stream sync so poisoned GPU work is visible";
+        << "Graph cache reset must never drain an entire stream";
+    EXPECT_EQ(gpu_ctx.events_created_, 1);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 1);
     EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 0);
 }
 
-TEST(Test__GraphSegmentCache, ResetDestroyClearsCaptureStreamAfterCheckedSyncFailure)
+/**
+ * @brief Prove a rejected capture-stream event fence is process-fatal.
+ *
+ * Destroying a graph or stream after the backend rejected the completion-event
+ * wait can race queued GPU work. The child process must stop at the failed
+ * fence; it may not clear the handle and let inference limp onward.
+ */
+TEST(Test__GraphSegmentCache, ResetStopsProcessAfterCheckedEventFenceFailure)
 {
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    FakeReplayGPUContext gpu_ctx;
-    gpu_ctx.synchronize_stream_checked_result_ = false;
-    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    EXPECT_DEATH(
+        {
+            FakeReplayGPUContext gpu_ctx;
+            DeviceGraphExecutor::GraphSegmentCache cache;
+            gpu_ctx.synchronize_event_checked_result_ = false;
+            if (!cache.ensureCaptureStream(&gpu_ctx))
+                std::abort();
 
-    cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
-
-    EXPECT_EQ(cache.capture_stream, nullptr);
-    EXPECT_EQ(cache.gpu_ctx_ref, nullptr);
-    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 1);
-    EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 1)
-        << "A failed stream sync must not leave the cache with a dangling stream handle";
+            cache.reset(
+                DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+        },
+        "Fatal GPU graph resource lifecycle violation");
 }
 
 TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
 {
+    FakeReplayGPUContext gpu_ctx;
     ForwardGraphCache cache;
-    void *stream = reinterpret_cast<void *>(0x1234);
+    ASSERT_TRUE(cache.segment_cache.ensureCaptureStream(&gpu_ctx));
+    void *stream = cache.segment_cache.capture_stream;
 
-    cache.segment_cache.capture_stream = stream;
     cache.segment_cache.initialized = true;
     cache.gpu_graph_update_failures = 3;
     cache.phase3_active = true;
-    cache.segmented_capture_live_state_epoch = 42;
+    cache.graph_replay_live_state_epoch = 42;
 
     cache.resetReplayState();
 
@@ -780,21 +3840,22 @@ TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
     EXPECT_FALSE(cache.segment_cache.initialized);
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
     EXPECT_FALSE(cache.phase3_active);
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
 }
 
 TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
 {
+    FakeReplayGPUContext gpu_ctx;
     ForwardGraphCache cache;
-    void *stream = reinterpret_cast<void *>(0x1234);
+    ASSERT_TRUE(cache.segment_cache.ensureCaptureStream(&gpu_ctx));
+    void *stream = cache.segment_cache.capture_stream;
 
-    cache.segment_cache.capture_stream = stream;
     cache.segment_cache.initialized = true;
     cache.segment_cache.needs_capture = false;
     cache.gpu_stream_applied = true;
     cache.applied_stream = stream;
     cache.phase3_active = true;
-    cache.segmented_capture_live_state_epoch = 42;
+    cache.graph_replay_live_state_epoch = 42;
 
     cache.markGPUStreamBindingsDirty();
 
@@ -804,7 +3865,7 @@ TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
     EXPECT_FALSE(cache.gpu_stream_applied);
     EXPECT_EQ(cache.applied_stream, nullptr);
     EXPECT_TRUE(cache.phase3_active);
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 42u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 42u);
 }
 
 TEST(Test__ForwardGraphCache, MarkReplayStateSafeForLiveEpochStampsPreservedCapture)
@@ -812,11 +3873,11 @@ TEST(Test__ForwardGraphCache, MarkReplayStateSafeForLiveEpochStampsPreservedCapt
     ForwardGraphCache cache;
     cache.segment_cache.initialized = true;
     cache.segment_cache.needs_capture = false;
-    cache.segmented_capture_live_state_epoch = 17;
+    cache.graph_replay_live_state_epoch = 17;
 
     cache.markReplayStateSafeForLiveEpoch(23);
 
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 23u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 23u);
     EXPECT_TRUE(cache.segment_cache.initialized);
     EXPECT_FALSE(cache.segment_cache.needs_capture);
 }
@@ -831,11 +3892,16 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
     cache.applied_stream = reinterpret_cast<void *>(0x4321);
     cache.gpu_graph_update_failures = 2;
     cache.phase3_active = true;
-    cache.segmented_capture_live_state_epoch = 17;
+    cache.graph_replay_live_state_epoch = 17;
+    cache.last_prefill_graph_observation.valid = true;
+    cache.last_prefill_graph_observation.bucket_seq_len = 600;
+    cache.last_prefill_graph_observation.domain_id = "continuation";
+    cache.last_prefill_graph_observation.participant_id = 1;
+    cache.last_prefill_graph_observation.capture_phase = "replay";
 
     PrefillGraphConfig prefill_config;
     prefill_config.enabled = true;
-    prefill_config.min_seq_len = 1;
+    prefill_config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(prefill_config);
     PrefillGraphCacheKey prefill_key;
     prefill_key.seq_len = 64;
@@ -843,10 +3909,10 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
     cache.prefill_graph_cache->markWarmedUp(prefill_key);
     ASSERT_EQ(cache.prefill_graph_cache->phase(prefill_key), PrefillGraphPhase::Warmup);
 
-    cache.resetSessionStatePreservingSegmentedReplay();
+    cache.resetSessionStatePreservingGraphReplay();
 
     EXPECT_TRUE(cache.segment_cache.initialized)
-        << "Replay-safe decode/verifier segmented captures should stay hot across request reset.";
+        << "Replay-safe decode/verifier cached graph captures should stay hot across request reset.";
     EXPECT_FALSE(cache.segment_cache.needs_capture);
     EXPECT_EQ(cache.segment_cache.decode_step, 9u);
     EXPECT_FALSE(cache.gpu_stream_applied)
@@ -854,33 +3920,96 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
     EXPECT_EQ(cache.applied_stream, nullptr);
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
     EXPECT_TRUE(cache.phase3_active);
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u)
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u)
         << "Request reset clears live-state epoch stamps; only version-safe caches may use this path.";
+    EXPECT_TRUE(cache.last_prefill_graph_observation.valid)
+        << "The retained segmented executable needs its durable probe identity after reset.";
+    EXPECT_EQ(cache.last_prefill_graph_observation.capture_phase, "replay");
+    EXPECT_EQ(cache.last_prefill_graph_observation.domain_id, "continuation");
     EXPECT_EQ(cache.prefill_graph_cache->phase(prefill_key), PrefillGraphPhase::Initialized)
         << "A warmed prefill bucket has no executable graph, so request reset must drop request arming "
            "while preserving lazy stage/kernel initialization for strict re-capture preflight.";
     EXPECT_EQ(cache.prefill_graph_cache->initializedCount(prefill_key), 1u);
 }
 
+/**
+ * @brief A request reset keeps the identity needed to observe a Ready prefill graph.
+ *
+ * The executable is keyed by more than its bucket size.  Domain, participant,
+ * placement epoch, and topology signature must remain available to the runtime
+ * probe after request-local data is cleared, or readiness diagnostics query a
+ * different default key and spuriously recapture the retained graph.
+ */
+TEST(Test__ForwardGraphCache, RequestResetPreservesReadyPrefillProbeIdentity)
+{
+    FakeReplayGPUContext gpu_ctx;
+    ForwardGraphCache cache;
+
+    PrefillGraphConfig prefill_config;
+    prefill_config.enabled = true;
+    prefill_config.minimum_padded_bucket_seq_len = 1;
+    cache.prefill_graph_cache =
+        std::make_unique<PrefillGraphCache>(prefill_config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = 600;
+    key.device_id = DeviceId::cuda(0);
+    key.domain_id = "continuation";
+    key.participant_id = 1;
+    key.placement_epoch = 7;
+    key.topology_signature = 0x12345678u;
+    cache.prefill_graph_cache->markWarmedUp(key);
+    ASSERT_TRUE(cache.prefill_graph_cache->captureAndInstantiate(
+        key,
+        &gpu_ctx,
+        gpu_ctx.defaultStream(),
+        []() { return true; }));
+    ASSERT_TRUE(cache.prefill_graph_cache->launch(key));
+    ASSERT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Ready);
+
+    cache.last_prefill_graph_observation.valid = true;
+    cache.last_prefill_graph_observation.bucket_seq_len = key.seq_len;
+    cache.last_prefill_graph_observation.domain_id = key.domain_id;
+    cache.last_prefill_graph_observation.participant_id = key.participant_id;
+    cache.last_prefill_graph_observation.placement_epoch = key.placement_epoch;
+    cache.last_prefill_graph_observation.topology_signature =
+        key.topology_signature;
+    cache.last_prefill_graph_observation.capture_phase = "replay";
+
+    cache.resetSessionStatePreservingGraphReplay();
+
+    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Ready);
+    EXPECT_TRUE(cache.prefill_graph_cache->hasGraph(key));
+    EXPECT_EQ(cache.prefill_graph_cache->replayCount(key), 1u);
+    EXPECT_TRUE(cache.last_prefill_graph_observation.valid);
+    EXPECT_EQ(cache.last_prefill_graph_observation.domain_id, key.domain_id);
+    EXPECT_EQ(
+        cache.last_prefill_graph_observation.participant_id,
+        key.participant_id);
+    EXPECT_EQ(
+        cache.last_prefill_graph_observation.topology_signature,
+        key.topology_signature);
+}
+
 TEST(Test__ForwardGraphCache, ReplayStateEpochClearsOnStateInvalidatingResets)
 {
     ForwardGraphCache cache;
-    cache.segmented_capture_live_state_epoch = 17;
+    cache.graph_replay_live_state_epoch = 17;
     cache.phase3_active = true;
 
     cache.resetReplayStateAfterWorkspaceRebind();
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
     EXPECT_FALSE(cache.phase3_active);
 
-    cache.segmented_capture_live_state_epoch = 23;
+    cache.graph_replay_live_state_epoch = 23;
     cache.valid = true;
     cache.resetSessionState();
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
 
-    cache.segmented_capture_live_state_epoch = 29;
+    cache.graph_replay_live_state_epoch = 29;
     cache.valid = true;
     cache.invalidate();
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
     EXPECT_FALSE(cache.valid);
 }
 
@@ -889,30 +4018,30 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureAppliesToReadyVersionedDeco
     ForwardGraphCache cache;
     cache.segment_cache.initialized = true;
     cache.segment_cache.needs_capture = false;
-    cache.segmented_capture_live_state_epoch = 7;
+    cache.graph_replay_live_state_epoch = 7;
 
     EXPECT_TRUE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8));
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/7));
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/false,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8))
         << "Single-row decode captures are version-safe and only need fresh dynamic metadata.";
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/false,
+        /*graph_replay_allowed=*/false,
         /*live_state_epoch=*/8));
 
     cache.segment_cache.needs_capture = true;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8))
         << "A graph queued for capture does not need an extra recapture reset.";
 
@@ -920,14 +4049,14 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureAppliesToReadyVersionedDeco
     cache.segment_cache.initialized = false;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8));
 
     cache.segment_cache.initialized = true;
-    cache.segmented_capture_live_state_epoch = 0;
+    cache.graph_replay_live_state_epoch = 0;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8))
         << "Unstamped captures are handled by existing reset paths.";
 }
@@ -963,10 +4092,10 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
     EXPECT_FALSE(isLiveStateVersionedReplayCache(single_token_decode));
     EXPECT_FALSE(isLiveStateVersionedReplayCache(all_position_verifier));
     EXPECT_FALSE(isLiveStateVersionedReplayCache(multirow_all_position_verifier))
-        << "All-position verifier replay publishes row-local state through stage-owned capture slots "
+        << "All-position verifier replay publishes row-local state through workspace-manager-owned capture slots "
            "and refreshes row metadata before every launch.";
     EXPECT_EQ(classifyForwardReplayStateCache(prefill),
-              ForwardReplayStateCacheClass::Other);
+              ForwardReplayStateCacheClass::ExactPrefill);
     EXPECT_EQ(classifyForwardReplayStateCache(bucketed_prefill),
               ForwardReplayStateCacheClass::BucketedPrefill);
 
@@ -1004,7 +4133,51 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
                   ForwardReplayStateMutationKind::GeneralLiveStateMutation,
                   classifyForwardReplayStateCache(all_position_verifier)),
               ForwardReplayStateAction::ResetReplayState)
-        << "Only the MTP correction boundary may preserve verifier replay state.";
+        << "Only typed correction/restore boundaries may preserve verifier replay state.";
+}
+
+TEST(Test__ForwardReplayStatePolicy, PrefixRestorePreservesStableDeviceOwnedGraphClasses)
+{
+    ForwardGraphSignature single_token_decode;
+    single_token_decode.decode = true;
+    single_token_decode.seq_len = 1;
+    single_token_decode.batch_size = 1;
+
+    ForwardGraphSignature multi_token_decode = single_token_decode;
+    multi_token_decode.seq_len = 4;
+
+    ForwardGraphSignature all_position_verifier = multi_token_decode;
+    all_position_verifier.all_position_logits = true;
+
+    ForwardGraphSignature exact_prefill;
+    exact_prefill.decode = false;
+
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            single_token_decode),
+        ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Restored single-token decode reads stable canonical KV/recurrent "
+           "buffers after waiting for the restore event.";
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            all_position_verifier),
+        ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Verifier row slots and launch metadata are refreshed before replay.";
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            exact_prefill),
+        ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Fixed prefill captures consume restored state through stable device "
+           "addresses.";
+    EXPECT_EQ(
+        chooseForwardReplayStateAction(
+            ForwardReplayStateMutationKind::PrefixCheckpointRestore,
+            multi_token_decode),
+        ForwardReplayStateAction::ResetReplayState)
+        << "Multi-token ordinary decode remains explicitly live-state-versioned.";
 }
 
 TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecodeClasses)
@@ -1043,42 +4216,280 @@ TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecod
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
                   prefill),
-              ForwardReplayStateAction::ResetReplayState)
-        << "Non-bucketed prefill remains request-stateful.";
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Exact prefill keeps the captured parity/serving fast path; monolithic prefill graph-cache executables reset separately.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
                   bucketed_prefill),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
-        << "Ready bucketed prefill captures replay from refreshed graph-facing buffers.";
+        << "Bucketed prefill replay remains warm while request-local graph-cache entries are demoted.";
+}
+
+TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesReplaySafeDecodeCachesWithCollectives)
+{
+    ForwardGraphSignature single_token_decode;
+    single_token_decode.decode = true;
+    single_token_decode.seq_len = 1;
+    single_token_decode.batch_size = 1;
+
+    ForwardGraphSignature all_position_verifier = single_token_decode;
+    all_position_verifier.all_position_logits = true;
+
+    ForwardGraphSignature prefill;
+    prefill.decode = false;
+
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  single_token_decode),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  all_position_verifier),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "A captured NCCL/RCCL node is part of the immutable homogeneous graph; "
+           "request reset changes device-owned contents, not graph identity.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  prefill),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Prefill also retains its stable-address graph across request reset.";
+
+    ForwardGraphSignature multi_token_decode = single_token_decode;
+    multi_token_decode.seq_len = 4;
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  multi_token_decode),
+              ForwardReplayStateAction::ResetReplayState)
+        << "Only live-state-versioned multi-row ordinary decode recaptures; "
+           "collective presence does not alter the ownership policy.";
 }
 
 TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)
 {
+    FakeReplayGPUContext gpu_ctx;
     ForwardGraphCache cache;
-    cache.segment_cache.capture_stream = reinterpret_cast<void *>(0x1234);
+    ASSERT_TRUE(cache.segment_cache.ensureCaptureStream(&gpu_ctx));
 
     cache.invalidate();
 
     EXPECT_EQ(cache.segment_cache.capture_stream, nullptr);
+    EXPECT_EQ(gpu_ctx.destroy_stream_calls_, 1);
 }
 
-TEST(Test__GraphSegmentCache, NamedSparseBoundarySplitsCapturedSegments)
+TEST(Test__GraphSegmentCache, DeviceLoopTemplateRequiresOneCompleteReplayUnit)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "first", true);
+    addFakeSegmentStage(graph, "second", true);
+    graph.addDependency("second", "first");
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+
+    DeviceGraphExecutor::GraphSegment segment;
+    segment.stage_names = {"first", "second"};
+    segment.capturable = true;
+    segment.capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    cache.segments.push_back(std::move(segment));
+    cache.initialized = true;
+    cache.needs_capture = false;
+
+    std::string error;
+    const auto view = cache.deviceLoopGraphTemplate(graph, &error);
+    ASSERT_TRUE(view.has_value()) << error;
+    EXPECT_EQ(view->capture, cache.segments.front().capture.get());
+    EXPECT_EQ(view->stream, cache.capture_stream);
+    EXPECT_EQ(view->stage_count, 2u);
+
+    cache.needs_capture = true;
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(error, "graph cache is not replay-ready");
+    cache.needs_capture = false;
+
+    cache.segments.front().stage_names.pop_back();
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(
+        error,
+        "captured replay unit does not cover the complete source graph");
+
+    cache.segments.front().stage_names = {"first", "second"};
+    cache.segments.emplace_back();
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(error, "graph is segmented: replay_units=2");
+}
+
+TEST(Test__GraphSegmentCache,
+     RetainedCaptureUnitTemplatesPreserveEveryCapturedUnitInGraphOrder)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "prefix", true);
+    addFakeSegmentStage(graph, "dispatch", true);
+    addFakeSegmentStage(graph, "return", true);
+    graph.addDependency("dispatch", "prefix");
+    graph.addDependency("return", "dispatch");
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+
+    DeviceGraphExecutor::GraphSegment prefix;
+    prefix.stage_names = {"prefix", "dispatch"};
+    prefix.capturable = true;
+    prefix.capture_wave_ordinal = 3u;
+    prefix.capture_wave_identity = "mapped_dispatch";
+    prefix.capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    cache.segments.push_back(std::move(prefix));
+
+    DeviceGraphExecutor::GraphSegment returned;
+    returned.stage_names = {"return"};
+    returned.capturable = true;
+    returned.capture_wave_ordinal = 4u;
+    returned.capture_wave_identity = "mapped_return";
+    returned.capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    cache.segments.push_back(std::move(returned));
+    cache.initialized = true;
+    cache.needs_capture = false;
+
+    std::string error;
+    const auto views = cache.retainedCaptureUnitTemplates(graph, &error);
+    ASSERT_TRUE(views.has_value()) << error;
+    ASSERT_EQ(views->size(), 2u);
+    EXPECT_EQ((*views)[0].capture, cache.segments[0].capture.get());
+    EXPECT_EQ((*views)[0].stream, cache.capture_stream);
+    EXPECT_EQ((*views)[0].stage_names.size(), 2u);
+    EXPECT_EQ((*views)[0].stage_names.front(), "prefix");
+    EXPECT_EQ((*views)[0].capture_wave_ordinal, 3u);
+    EXPECT_EQ((*views)[0].capture_wave_identity, "mapped_dispatch");
+    EXPECT_EQ((*views)[1].stage_names.size(), 1u);
+    EXPECT_EQ((*views)[1].stage_names.front(), "return");
+    EXPECT_EQ((*views)[1].capture_wave_ordinal, 4u);
+}
+
+TEST(Test__GraphSegmentCache,
+     RetainedCaptureUnitTemplatesRejectManualOrIncompletePlans)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "captured", true);
+    addFakeSegmentStage(graph, "boundary", true);
+    graph.addDependency("boundary", "captured");
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+
+    DeviceGraphExecutor::GraphSegment captured;
+    captured.stage_names = {"captured"};
+    captured.capturable = true;
+    captured.capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    cache.segments.push_back(std::move(captured));
+
+    DeviceGraphExecutor::GraphSegment manual;
+    manual.stage_names = {"boundary"};
+    manual.capturable = false;
+    cache.segments.push_back(std::move(manual));
+    cache.initialized = true;
+    cache.needs_capture = false;
+
+    std::string error;
+    EXPECT_FALSE(cache.retainedCaptureUnitTemplates(graph, &error));
+    EXPECT_EQ(
+        error,
+        "retained capture plan contains a manual replay unit at index 1");
+
+    cache.segments.pop_back();
+    EXPECT_FALSE(cache.retainedCaptureUnitTemplates(graph, &error));
+    EXPECT_EQ(
+        error,
+        "retained capture units do not cover the complete source graph in execution order");
+}
+
+TEST(Test__GraphSegmentCache,
+     AlternatingCaptureHandoffsUseDistinctDirectionalEventsWithoutStreamSync)
+{
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    void *const external_stream = gpu_ctx.defaultStream();
+    ASSERT_NE(external_stream, cache.capture_stream);
+
+    ASSERT_TRUE(cache.orderCaptureStreamAfter(&gpu_ctx, external_stream));
+    ASSERT_TRUE(cache.orderStreamAfterCapture(&gpu_ctx, external_stream));
+    ASSERT_TRUE(cache.orderCaptureStreamAfter(&gpu_ctx, external_stream));
+    ASSERT_TRUE(cache.orderStreamAfterCapture(&gpu_ctx, external_stream));
+
+    EXPECT_EQ(gpu_ctx.events_created_, 2)
+        << "Input and output handoffs need stable, non-aliasing event identities.";
+    EXPECT_NE(cache.sync_event, cache.capture_input_event)
+        << "A later reverse-direction record must not retarget a queued wait.";
+    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
+    EXPECT_EQ(gpu_ctx.events_waited_, 4);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+}
+
+TEST(Test__GraphSegmentCache, DeviceLoopTemplateRejectsExternalReplayPreparation)
+{
+    ComputeGraph graph;
+    addFakeGraphLaunchPrepStage(
+        graph,
+        "host_metadata",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.front().stage_names = {"host_metadata"};
+    cache.segments.front().capturable = true;
+    cache.segments.front().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    cache.initialized = true;
+    cache.needs_capture = false;
+
+    std::string error;
+    EXPECT_FALSE(cache.deviceLoopGraphTemplate(graph, &error));
+    EXPECT_EQ(
+        error,
+        "stage requires external preparation before every replay: host_metadata");
+}
+
+TEST(Test__GraphSegmentCache, HeterogeneousBoundaryPolicyAdmitsNamedSparseBoundary)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "before", true);
-    addFakeSegmentStage(graph, "sparse_dispatch", true, true);
+    addFakeSegmentStage(
+        graph,
+        "sparse_dispatch",
+        true,
+        true,
+        ComputeStageType::COPY,
+        false,
+        false,
+        false,
+        nullptr,
+        DeviceId::cpu(),
+        true);
     addFakeSegmentStage(graph, "after", true);
     graph.addDependency("sparse_dispatch", "before");
     graph.addDependency("after", "sparse_dispatch");
 
     std::unordered_set<std::string> collective_nodes = {"sparse_dispatch"};
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         &collective_nodes,
         /*has_collective_nodes=*/true,
-        /*collectives_graph_capturable=*/false);
+        /*collectives_graph_capturable=*/false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
 
     ASSERT_EQ(cache.segments.size(), 3u);
     EXPECT_TRUE(cache.segments[0].capturable);
@@ -1089,7 +4500,862 @@ TEST(Test__GraphSegmentCache, NamedSparseBoundarySplitsCapturedSegments)
     EXPECT_EQ(cache.segments[2].stage_names, std::vector<std::string>({"after"}));
 }
 
-TEST(Test__GraphSegmentCache, NonCapturableManualBoundarySplitsCapturedSegmentsWithoutNameSet)
+/**
+ * @brief A captured control decorator moves the ticket terminal atomically.
+ *
+ * Model construction first seals the logical tensor producer. ExpertOverlay
+ * then appends a control-only release after every prior leaf. The graph must
+ * move both its explicit terminal and the heterogeneous transaction contract
+ * to that release, leaving the tensor producer unannotated.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketTerminalMovesToCapturedControlLeaf)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "logical_output", true, false, ComputeStageType::LM_HEAD,
+        false, false, false, nullptr, DeviceId::rocm(0));
+    graph.setTerminalNode("logical_output");
+    graph.setHeterogeneousTicketUnitContract(
+        "logical_output",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "heterogeneous_ticket_transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketFollowerTransaction);
+
+    addFakeSegmentStage(
+        graph, "epoch_release", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::rocm(0));
+    graph.addDependency("epoch_release", "logical_output");
+    const std::uint64_t generation_before = graph.topologyGeneration();
+
+    EXPECT_NO_THROW(graph.moveHeterogeneousTicketTransactionTerminal(
+        "logical_output", "epoch_release"));
+    EXPECT_GT(graph.topologyGeneration(), generation_before);
+    EXPECT_EQ(graph.terminalNode(), "epoch_release");
+
+    const ComputeNode *const logical_output =
+        graph.getNode("logical_output");
+    const ComputeNode *const epoch_release = graph.getNode("epoch_release");
+    ASSERT_NE(logical_output, nullptr);
+    ASSERT_NE(epoch_release, nullptr);
+    EXPECT_FALSE(
+        logical_output->heterogeneous_ticket_unit_contract.has_value());
+    ASSERT_TRUE(
+        epoch_release->heterogeneous_ticket_unit_contract.has_value());
+    EXPECT_EQ(
+        epoch_release->heterogeneous_ticket_unit_contract->identity,
+        "heterogeneous_ticket_transaction_terminal");
+    EXPECT_EQ(
+        epoch_release->heterogeneous_ticket_unit_contract->disposition,
+        GraphHeterogeneousTicketUnitDisposition::TransactionTerminal);
+}
+
+/**
+ * @brief Prove the typed ticket envelope admits only its exact segmented plan.
+ *
+ * A GPU producer publishes the immutable ticket, the CPU segment consumes and
+ * completes it, and a GPU consumer resumes captured execution. This is the
+ * production shape used when a mapped GPU tier and a colocated CPU endpoint
+ * coexist in one ExpertOverlay graph.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketEnvelopeRequiresCapturedManualCapturedLifecycle)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "ticket_publish", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "mapped_dispatch", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "mapped_return", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "cpu_ticket_transaction", false, true,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "ticket_consume", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    graph.addDependency("mapped_dispatch", "ticket_publish");
+    graph.addDependency("mapped_return", "mapped_dispatch");
+    graph.addDependency("cpu_ticket_transaction", "mapped_return");
+    graph.addDependency("ticket_consume", "cpu_ticket_transaction");
+    graph.setGraphCaptureWaveContract(
+        "mapped_dispatch",
+        GraphCaptureWaveContract{.identity = "mapped_dispatch_wave"});
+    graph.setGraphCaptureWaveContract(
+        "mapped_return",
+        GraphCaptureWaveContract{.identity = "mapped_return_wave"});
+    graph.setHeterogeneousTicketUnitContract(
+        "mapped_return",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_unit_before_cpu",
+        });
+    graph.setTerminalNode("ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor::DecodeCapturePolicy policy;
+    policy.allow_cached_graph_replay = true;
+    policy.heterogeneous_segmented_enabled = true;
+    std::string error;
+    ASSERT_TRUE(
+        DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
+            graph.nativeCaptureEnvelope(), policy, &error))
+        << error;
+    EXPECT_EQ(
+        policy.graph_replay_plan_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+    EXPECT_TRUE(policy.defer_final_sync);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        policy.graph_replay_plan_policy);
+
+    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        std::vector<std::string>(
+            {"ticket_publish", "mapped_dispatch", "mapped_return"}))
+        << "Mapped fork, wait, and join must remain one multi-stream native unit.";
+    EXPECT_EQ(
+        cache.segments[0].capture_wave_identity,
+        "ticket_unit_before_cpu");
+    EXPECT_FALSE(cache.segments[1].capturable);
+    EXPECT_TRUE(cache.segments[2].capturable);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            PerfStatsCollector::snapshot({"forward_graph"}),
+            "heterogeneous_ticket_transactions",
+            {{"capturable_segments", "2"},
+             {"manual_segments", "1"},
+             {"ticket_publication_authority",
+              "stage_owned_mapped_timeline"},
+             {"unit_boundaries", "1"},
+             {"terminal_units", "1"},
+             {"role", "authority"}}),
+        1.0);
+
+    /*
+     * Exercise the sealed plan as well as inspecting it. This intentionally
+     * reports uncaptured collectives: before the terminal-fence contract was
+     * typed, that graph-wide boolean forced a host event wait after every MTP
+     * sidecar transaction even though the captured terminal already ordered
+     * the complete manual-boundary DAG.
+     */
+    PerfStatsCollector::reset();
+    cache.perf_context = "heterogeneous_ticket_event_terminal_unit";
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx, DeviceId::cuda(0)));
+    std::vector<FakeReplayGraphCapture *> captures;
+    for (auto &segment : cache.segments)
+    {
+        if (!segment.capturable)
+            continue;
+        segment.capture =
+            std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+        captures.push_back(
+            static_cast<FakeReplayGraphCapture *>(segment.capture.get()));
+    }
+    ASSERT_EQ(captures.size(), 2u);
+
+    auto *const manual_stage = dynamic_cast<FakeSegmentStage *>(
+        graph.getNode("cpu_ticket_transaction")->stage.get());
+    ASSERT_NE(manual_stage, nullptr);
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = [&](ComputeNode &node)
+        {
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto replay = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/1,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+    ASSERT_TRUE(replay.success);
+    EXPECT_EQ(captures[0]->launch_calls_, 1);
+    EXPECT_EQ(captures[1]->launch_calls_, 1);
+    EXPECT_EQ(manual_stage->execute_calls_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0)
+        << "The captured transaction terminal, not a host wait, owns completion.";
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.device_synchronize_calls_, 0);
+
+    const auto replay_records =
+        PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags deferred_tags = {
+        {"context", "heterogeneous_ticket_event_terminal_unit"},
+        {"segment_count", "3"},
+        {"stage_count", "5"},
+        {"type", "mixed"}};
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            replay_records,
+            "segmented_replay_final_sync_deferred",
+            deferred_tags),
+        1.0);
+    EXPECT_FALSE(std::any_of(
+        replay_records.begin(),
+        replay_records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.kind == PerfStatRecord::Kind::Timer &&
+                   record.name == "segmented_replay_final_sync";
+        }));
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Extra semantic boundaries do not manufacture extra ticket epochs.
+ *
+ * A stage may introduce a semantic capture boundary for an independent graph
+ * invariant. The heterogeneous lifecycle validator follows typed adjacency
+ * and preserves those bounded units as graph-only compiler shards. They are
+ * imported into one retained parent and do not create another runtime launch
+ * or CPU ticket epoch: the one typed cutpoint still owns one concurrent manual
+ * service program.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketLifecycleAdmitsAdditionalCapturedChildren)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "prefix", true, false, ComputeStageType::COPY, false,
+        false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "scalar_dispatch", true, false, ComputeStageType::COPY,
+        false, false, true, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "local_overlap", true, false,
+        ComputeStageType::MOE_EXPERT_FFN, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "cpu_ticket_service", false, true,
+        ComputeStageType::MOE_LOCAL_EXPERT, false, false, false, nullptr,
+        DeviceId::cpu(), false,
+        ManualGraphBoundaryScheduling::ConcurrentTicketService,
+        ConcurrentManualFailureRole::DeviceIngressPublisher);
+    addFakeSegmentStage(
+        graph, "ticket_consume", true, false, ComputeStageType::COPY,
+        false, false, true, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "scalar_return", true, false, ComputeStageType::COPY,
+        false, true, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "terminal", true, false, ComputeStageType::ADD_RESIDUAL,
+        false, false, false, nullptr, DeviceId::cuda(0));
+
+    graph.addDependency("scalar_dispatch", "prefix");
+    graph.addDependency("local_overlap", "scalar_dispatch");
+    graph.addDependency("cpu_ticket_service", "local_overlap");
+    graph.addDependency("ticket_consume", "cpu_ticket_service");
+    graph.addDependency("scalar_return", "ticket_consume");
+    graph.addDependency("terminal", "scalar_return");
+    graph.setHeterogeneousTicketUnitContract(
+        "local_overlap",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "before_cpu_ticket",
+        });
+    graph.setTerminalNode("terminal");
+    graph.setHeterogeneousTicketUnitContract(
+        "terminal",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    const auto retained_plan = makeMoEOverlayRetainedParentPlan(graph);
+    ASSERT_TRUE(retained_plan.has_value());
+    ASSERT_TRUE(retained_plan->valid());
+    EXPECT_EQ(
+        retained_plan->replay_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            RequireRetainedParentWithConcurrentTicketService);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    EXPECT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        retained_plan->replay_policy));
+    ASSERT_EQ(cache.segments.size(), 5u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        (std::vector<std::string>{
+            "prefix", "scalar_dispatch"}));
+    EXPECT_TRUE(cache.segments[1].capturable);
+    EXPECT_EQ(
+        cache.segments[1].stage_names,
+        std::vector<std::string>{"local_overlap"});
+    EXPECT_EQ(
+        cache.segments[1].capture_wave_identity,
+        "before_cpu_ticket");
+    EXPECT_TRUE(cache.segments[2].capturable);
+    EXPECT_EQ(
+        cache.segments[2].stage_names,
+        std::vector<std::string>{"ticket_consume"});
+    EXPECT_TRUE(cache.segments[3].capturable);
+    EXPECT_EQ(
+        cache.segments[3].stage_names,
+        (std::vector<std::string>{"scalar_return", "terminal"}));
+    EXPECT_EQ(
+        cache.segments[3].capture_wave_identity,
+        "transaction_terminal");
+    EXPECT_FALSE(cache.segments[4].capturable);
+    EXPECT_EQ(
+        cache.segments[4].stage_names,
+        std::vector<std::string>{"cpu_ticket_service"});
+}
+
+/**
+ * @brief Adjacent MoE layers compose around one CPU boundary apiece.
+ *
+ * Ticket ingress, the ordered route fold, dense/shared work, and the next
+ * layer's GPU producer are one retained successor. Closing another unit on
+ * the post-ticket reducer would create seven segments here instead of the
+ * canonical five and reintroduce an avoidable host launch between layers.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketLayersComposeConsumerWithNextProducer)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "layer0_gpu_producer", true, false,
+        ComputeStageType::MOE_EXPERT_FFN, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer0_cpu_ticket", false, true,
+        ComputeStageType::MOE_LOCAL_EXPERT, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "layer0_ticket_consume", true, false,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer0_shared_and_residual", true, false,
+        ComputeStageType::ADD_RESIDUAL, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer1_gpu_producer", true, false,
+        ComputeStageType::MOE_EXPERT_FFN, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "layer1_cpu_ticket", false, true,
+        ComputeStageType::MOE_LOCAL_EXPERT, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "layer1_ticket_consume", true, false,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cuda(0));
+
+    graph.addDependency("layer0_cpu_ticket", "layer0_gpu_producer");
+    graph.addDependency("layer0_ticket_consume", "layer0_cpu_ticket");
+    graph.addDependency(
+        "layer0_shared_and_residual", "layer0_ticket_consume");
+    graph.addDependency(
+        "layer1_gpu_producer", "layer0_shared_and_residual");
+    graph.addDependency("layer1_cpu_ticket", "layer1_gpu_producer");
+    graph.addDependency("layer1_ticket_consume", "layer1_cpu_ticket");
+    graph.setHeterogeneousTicketUnitContract(
+        "layer0_gpu_producer",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "layer0_pre_cpu_ticket",
+        });
+    graph.setHeterogeneousTicketUnitContract(
+        "layer1_gpu_producer",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "layer1_pre_cpu_ticket",
+        });
+    graph.setTerminalNode("layer1_ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "layer1_ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+
+    ASSERT_EQ(cache.segments.size(), 5u);
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        std::vector<std::string>{"layer0_gpu_producer"});
+    EXPECT_FALSE(cache.segments[1].capturable);
+    EXPECT_EQ(
+        cache.segments[2].stage_names,
+        (std::vector<std::string>{
+            "layer0_ticket_consume",
+            "layer0_shared_and_residual",
+            "layer1_gpu_producer"}));
+    EXPECT_FALSE(cache.segments[3].capturable);
+    EXPECT_EQ(
+        cache.segments[4].stage_names,
+        std::vector<std::string>{"layer1_ticket_consume"});
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            PerfStatsCollector::snapshot({"forward_graph"}),
+            "heterogeneous_ticket_transactions",
+            {{"capturable_segments", "3"},
+             {"manual_segments", "2"},
+             {"ticket_publication_authority",
+              "stage_owned_mapped_timeline"},
+             {"unit_boundaries", "2"},
+             {"terminal_units", "1"},
+             {"role", "authority"}}),
+        1.0);
+}
+
+/**
+ * @brief Host route materialization and remote sparse work form one manual unit.
+ *
+ * The immutable device ticket first drives all continuation-local GPU producer
+ * work. Host route materialization then prepares the immediately following CPU
+ * sparse transaction. No capturable node may be interposed between those two
+ * host stages: doing so would manufacture a second manual boundary and force
+ * every LocalTP follower to retain an otherwise meaningless extra executable.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketCoalescesHostPreparationWithSparseTransaction)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "ticket_publish", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "continuation_local_expert", true, false,
+        ComputeStageType::MOE_EXPERT_FFN, false, false, false, nullptr,
+        DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "host_route_materialization", false, true,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "remote_sparse_transaction", false, true,
+        ComputeStageType::MOE_LOCAL_EXPERT, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "ticket_consume", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+
+    graph.addDependency("continuation_local_expert", "ticket_publish");
+    graph.addDependency(
+        "host_route_materialization", "continuation_local_expert");
+    graph.addDependency(
+        "remote_sparse_transaction", "host_route_materialization");
+    graph.addDependency("ticket_consume", "remote_sparse_transaction");
+    graph.setHeterogeneousTicketUnitContract(
+        "continuation_local_expert",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "pre_cpu_ticket_unit",
+        });
+    graph.setTerminalNode("ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+
+    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        (std::vector<std::string>{
+            "ticket_publish", "continuation_local_expert"}));
+    EXPECT_FALSE(cache.segments[1].capturable);
+    EXPECT_EQ(
+        cache.segments[1].stage_names,
+        (std::vector<std::string>{
+            "host_route_materialization", "remote_sparse_transaction"}));
+    EXPECT_TRUE(cache.segments[2].capturable);
+    EXPECT_EQ(
+        cache.segments[2].stage_names,
+        std::vector<std::string>{"ticket_consume"});
+}
+
+/**
+ * @brief A LocalTP sibling follows every ticket wave without host work.
+ *
+ * The authority owns mapped packet and CPU-ticket work. Its sibling retains
+ * only common device stages and closes the corresponding captured unit at its
+ * local-expert terminal. Fine-grained packet wave annotations remain dormant
+ * because splitting a multi-stream fork/join across native graphs is invalid.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketFollowerUsesMatchingCapturedUnits)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "routing", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    addFakeSegmentStage(
+        graph, "local_experts", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    addFakeSegmentStage(
+        graph, "ordered_reduce", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    addFakeSegmentStage(
+        graph, "publication", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    graph.addDependency("local_experts", "routing");
+    graph.addDependency("ordered_reduce", "local_experts");
+    graph.addDependency("publication", "ordered_reduce");
+    graph.setGraphCaptureWaveContract(
+        "routing",
+        GraphCaptureWaveContract{
+            .identity = "ticket",
+            .passive_following_identities = {"mapped_dispatch"},
+        });
+    graph.setGraphCaptureWaveContract(
+        "local_experts",
+        GraphCaptureWaveContract{.identity = "outbound"});
+    graph.setGraphCaptureWaveContract(
+        "ordered_reduce",
+        GraphCaptureWaveContract{
+            .identity = "ordered_reduce",
+            .passive_following_identities = {"mapped_return"},
+        });
+    graph.setGraphCaptureWaveContract(
+        "publication",
+        GraphCaptureWaveContract{.identity = "inbound"});
+    graph.setHeterogeneousTicketUnitContract(
+        "local_experts",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_unit_before_cpu",
+        });
+    graph.setTerminalNode("publication");
+    graph.setHeterogeneousTicketUnitContract(
+        "publication",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketFollowerTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+
+    ASSERT_EQ(cache.segments.size(), 2u);
+    EXPECT_TRUE(std::all_of(
+        cache.segments.begin(),
+        cache.segments.end(),
+        [](const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            return segment.capturable;
+        }));
+    EXPECT_EQ(
+        cache.segments[0].capture_wave_identity,
+        "ticket_unit_before_cpu");
+    EXPECT_TRUE(cache.segments[0].passive_capture_waves_after.empty());
+    EXPECT_TRUE(cache.segments[1].passive_capture_waves_after.empty());
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        std::vector<std::string>({"routing", "local_experts"}));
+    EXPECT_EQ(
+        cache.segments[1].stage_names,
+        std::vector<std::string>({"ordered_reduce", "publication"}));
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            PerfStatsCollector::snapshot({"forward_graph"}),
+            "heterogeneous_ticket_transactions",
+            {{"capturable_segments", "2"},
+             {"manual_segments", "0"},
+             {"ticket_publication_authority",
+              "stage_owned_mapped_timeline"},
+             {"unit_boundaries", "1"},
+             {"terminal_units", "1"},
+             {"role", "follower"}}),
+        1.0);
+
+    const auto retained_plan = makeMoEOverlayRetainedParentPlan(graph);
+    ASSERT_TRUE(retained_plan.has_value());
+    ASSERT_TRUE(retained_plan->valid());
+    EXPECT_EQ(
+        retained_plan->replay_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            RequireRetainedParentComposition)
+        << "A markerless same-domain follower retains one graph-only parent "
+           "and never claims CPU ticket authority";
+
+    DeviceGraphExecutor::GraphSegmentCache retained_cache;
+    EXPECT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        retained_cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        retained_plan->replay_policy));
+    ASSERT_EQ(retained_cache.segments.size(), 2u);
+    EXPECT_TRUE(std::all_of(
+        retained_cache.segments.begin(),
+        retained_cache.segments.end(),
+        [](const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            return segment.capturable;
+        }));
+    EXPECT_EQ(
+        retained_cache.segments[0].stage_names,
+        (std::vector<std::string>{"routing", "local_experts"}));
+    EXPECT_EQ(
+        retained_cache.segments[0].capture_wave_identity,
+        "ticket_unit_before_cpu");
+    EXPECT_EQ(
+        retained_cache.segments[1].stage_names,
+        (std::vector<std::string>{"ordered_reduce", "publication"}));
+    EXPECT_EQ(
+        retained_cache.segments[1].capture_wave_identity,
+        "ticket_transaction_terminal");
+}
+
+/**
+ * @brief Arm one remote ticket before the producer, never before every segment.
+ *
+ * The heterogeneous envelope contains two independently retained native
+ * executables, but they form one logical inference transaction. The external
+ * ticket publication hook must therefore run exactly once before the leading
+ * producer on transaction zero and once before the leading producer on steady
+ * replay. The manual CPU unit and captured consumer inherit graph ordering and
+ * must not republish the transaction.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketLaunchDependencyArmsOnceBeforeProducer)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "ticket_publish", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    addFakeSegmentStage(
+        graph, "cpu_ticket_transaction", false, true,
+        ComputeStageType::COPY, false, false, false, nullptr,
+        DeviceId::cpu(), true);
+    addFakeSegmentStage(
+        graph, "ticket_consume", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(0));
+    graph.addDependency("cpu_ticket_transaction", "ticket_publish");
+    graph.addDependency("ticket_consume", "cpu_ticket_transaction");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_publish",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_unit_before_cpu",
+        });
+    graph.setTerminalNode("ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "heterogeneous_ticket_launch_dependency";
+    FakeReplayGPUContext gpu_ctx(
+        /*device_ordinal=*/0,
+        /*asynchronous_submission=*/false,
+        /*create_graph_only_captures=*/true);
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    std::vector<DeviceGraphExecutor::GraphExecutableLaunchPhase> phases;
+    const DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
+        [&](DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+            void *stream)
+    {
+        EXPECT_EQ(stream, cache.capture_stream);
+        phases.push_back(phase);
+        return true;
+    };
+    const auto submit = [&]
+    {
+        graph.reset();
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            &ctx,
+            cache,
+            gpu_ctx.defaultStream(),
+            &gpu_ctx,
+            /*collective_nodes=*/nullptr,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true,
+            /*capture_boundary=*/{},
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                AllowHeterogeneousBoundarySegmentation,
+            launch_dependency);
+    };
+
+    ASSERT_TRUE(submit());
+    ASSERT_EQ(cache.segments.size(), 3u);
+    ASSERT_EQ(gpu_ctx.created_graph_captures_.size(), 2u);
+    ASSERT_EQ(phases.size(), 1u);
+    EXPECT_EQ(
+        phases.front(),
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction);
+    for (const auto *capture : gpu_ctx.created_graph_captures_)
+    {
+        ASSERT_NE(capture, nullptr);
+        EXPECT_EQ(capture->launch_calls_, 1);
+    }
+
+    ASSERT_TRUE(submit());
+    ASSERT_EQ(phases.size(), 2u)
+        << "The manual boundary and captured consumer must not republish the ticket.";
+    EXPECT_EQ(
+        phases.back(),
+        DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
+    for (const auto *capture : gpu_ctx.created_graph_captures_)
+        EXPECT_EQ(capture->launch_calls_, 2);
+}
+
+/**
+ * @brief Reject a typed ticket transaction when no stage consumes its ticket.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketEnvelopeRejectsUnauthenticatedManualBoundary)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "before", true);
+    addFakeSegmentStage(graph, "manual", false, true);
+    addFakeSegmentStage(graph, "after", true);
+    graph.addDependency("manual", "before");
+    graph.addDependency("after", "manual");
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    EXPECT_THROW(
+        DeviceGraphCaptureController::buildCapturePlan(
+            graph,
+            cache,
+            nullptr,
+            /*has_collective_nodes=*/false,
+            /*collectives_graph_capturable=*/false,
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                AllowHeterogeneousBoundarySegmentation),
+        std::runtime_error);
+}
+
+/**
+ * @brief Reject the ticket envelope before capture when topology did not admit it.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketEnvelopeRejectsHomogeneousReplayPolicy)
+{
+    DeviceGraphExecutor::DecodeCapturePolicy policy;
+    policy.allow_cached_graph_replay = true;
+    policy.heterogeneous_segmented_enabled = false;
+    std::string error;
+    EXPECT_FALSE(
+        DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
+            GraphNativeCaptureEnvelope::
+                HeterogeneousTicketAuthorityTransaction,
+            policy,
+            &error));
+    EXPECT_NE(error.find("topology-admitted"), std::string::npos);
+}
+
+TEST(Test__GraphSegmentCache, NonCollectiveManualBoundaryIsFatal)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "before", true);
@@ -1099,19 +5365,34 @@ TEST(Test__GraphSegmentCache, NonCapturableManualBoundarySplitsCapturedSegmentsW
     graph.addDependency("after", "sparse_return");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
-        graph,
-        cache,
-        nullptr,
-        /*has_collective_nodes=*/false);
+    EXPECT_THROW(
+        DeviceGraphCaptureController::buildCapturePlan(
+            graph,
+            cache,
+            nullptr,
+            /*has_collective_nodes=*/false),
+        std::runtime_error);
+}
 
-    ASSERT_EQ(cache.segments.size(), 3u);
-    EXPECT_TRUE(cache.segments[0].capturable);
-    EXPECT_EQ(cache.segments[0].stage_names, std::vector<std::string>({"before"}));
-    EXPECT_FALSE(cache.segments[1].capturable);
-    EXPECT_EQ(cache.segments[1].stage_names, std::vector<std::string>({"sparse_return"}));
-    EXPECT_TRUE(cache.segments[2].capturable);
-    EXPECT_EQ(cache.segments[2].stage_names, std::vector<std::string>({"after"}));
+TEST(Test__GraphSegmentCache, HomogeneousCollectiveCannotUseSegmentedReplay)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "before", true);
+    addFakeSegmentStage(graph, "collective", false, true);
+    addFakeSegmentStage(graph, "after", true);
+    graph.addDependency("collective", "before");
+    graph.addDependency("after", "collective");
+
+    std::unordered_set<std::string> collective_nodes = {"collective"};
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    EXPECT_THROW(
+        DeviceGraphCaptureController::buildCapturePlan(
+            graph,
+            cache,
+            &collective_nodes,
+            /*has_collective_nodes=*/true,
+            /*collectives_graph_capturable=*/false),
+        std::runtime_error);
 }
 
 TEST(Test__GraphSegmentCache, GraphSafeNamedCollectivesRequireExplicitCapturePermission)
@@ -1125,7 +5406,7 @@ TEST(Test__GraphSegmentCache, GraphSafeNamedCollectivesRequireExplicitCapturePer
 
     std::unordered_set<std::string> collective_nodes = {"graph_safe_collective"};
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
+    DeviceGraphCaptureController::buildCapturePlan(
         graph,
         cache,
         &collective_nodes,
@@ -1138,7 +5419,74 @@ TEST(Test__GraphSegmentCache, GraphSafeNamedCollectivesRequireExplicitCapturePer
               std::vector<std::string>({"before", "graph_safe_collective", "after"}));
 }
 
-TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
+/**
+ * @brief Prove every unconditional collective type shares one canonical policy.
+ *
+ * Capture planning, fast scheduling, and MTP sidecar discovery all consume the
+ * stage contract. This inventory prevents a specialized collective from being
+ * added to the graph enum while remaining invisible to one of those consumers.
+ */
+TEST(Test__GraphSegmentCache, CanonicalCollectiveClassificationCoversSpecializedStages)
+{
+    constexpr std::array collective_types{
+        ComputeStageType::ALLREDUCE,
+        ComputeStageType::ALLGATHER,
+        ComputeStageType::ALLGATHER_V,
+        ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER,
+        ComputeStageType::GDN_LIVE_STATE_ALLGATHER,
+        ComputeStageType::FUSED_ADD_ALLREDUCE,
+    };
+
+    for (const auto stage_type : collective_types)
+    {
+        EXPECT_TRUE(isCollectiveComputeStageType(stage_type))
+            << computeStageTypeName(stage_type);
+    }
+
+    EXPECT_FALSE(isCollectiveComputeStageType(ComputeStageType::COPY));
+    EXPECT_FALSE(isCollectiveComputeStageType(ComputeStageType::GEMM));
+}
+
+/**
+ * @brief Lock the LocalTP MTP KV-state handoff into one captured graph.
+ *
+ * The TP KV-state allgather is an ordinary stream-ordered NCCL/RCCL graph node
+ * on homogeneous LocalTP. It must not split the MTP sidecar into captured
+ * compute plus a manually executed collective.
+ */
+TEST(Test__GraphSegmentCache, TPKVStateAllGatherRemainsInsideWholeCapturedGraph)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "sidecar_before", true);
+    addFakeSegmentStage(
+        graph,
+        "tp_kv_state_allgather",
+        true,
+        false,
+        ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER);
+    addFakeSegmentStage(graph, "sidecar_after", true);
+    graph.addDependency("tp_kv_state_allgather", "sidecar_before");
+    graph.addDependency("sidecar_after", "tp_kv_state_allgather");
+
+    std::unordered_set<std::string> collective_nodes{
+        "tp_kv_state_allgather"};
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        &collective_nodes,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/true);
+
+    ASSERT_EQ(cache.segments.size(), 1u);
+    EXPECT_TRUE(cache.segments.front().capturable);
+    EXPECT_EQ(
+        cache.segments.front().stage_names,
+        std::vector<std::string>(
+            {"sidecar_before", "tp_kv_state_allgather", "sidecar_after"}));
+}
+
+TEST(Test__GraphSegmentCache, UnauthorizedSegmentedPlanPublishesPerfStatsBeforeHardFailure)
 {
     ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
@@ -1151,11 +5499,13 @@ TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
     graph.addDependency("copy", "attention");
 
     DeviceGraphExecutor::GraphSegmentCache cache;
-    DeviceGraphCaptureController::buildWarmupSegments(
-        graph,
-        cache,
-        nullptr,
-        /*has_collective_nodes=*/false);
+    EXPECT_THROW(
+        DeviceGraphCaptureController::buildCapturePlan(
+            graph,
+            cache,
+            nullptr,
+            /*has_collective_nodes=*/false),
+        std::runtime_error);
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
 
@@ -1214,6 +5564,66 @@ TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
         1.0);
 
     PerfStatsCollector::reset();
+    mutableDebugEnv().execution.gpu_graph_defer_captured_collective_final_sync = false;
+}
+
+TEST(Test__GraphSegmentCache, FullGraphPlanPublishesPerfStatsAsGraph)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "gemm", true, false, ComputeStageType::GEMM);
+    addFakeSegmentStage(graph, "lm_head", true, false, ComputeStageType::GEMM);
+    graph.addDependency("lm_head", "gemm");
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_graphs", {{"type", "total"}}), 1.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_graphs", {{"type", "capturable"}}), 1.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_graphs", {{"type", "manual"}}), 0.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_stages", {{"type", "capturable"}}), 2.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_stages", {{"type", "manual"}}), 0.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_max_graph_stages", {{"type", "capturable"}}), 2.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_max_graph_stages", {{"type", "manual"}}), 0.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "full_graph_plan_stage_types",
+            {{"graph_type", "capturable"}, {"stage_type", "GEMM"}}),
+        2.0);
+
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            stage_records,
+            "stage_gpu",
+            "graph_replay_plan_graphs",
+            {{"attribution", "graph_replay_metadata"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"source", "full_graph_capture"},
+             {"type", "total"}}),
+        1.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            stage_records,
+            "stage_gpu",
+            "graph_replay_plan_stage_types",
+            {{"attribution", "graph_replay_metadata"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"graph_type", "capturable"},
+             {"source", "full_graph_capture"},
+             {"stage_type", "GEMM"}}),
+        2.0);
+
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
@@ -1224,19 +5634,22 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
     segment.stage_names = {"gemm", "gdn_projection", "lm_head"};
-    segment.capture = std::make_unique<FakeReplayGraphCapture>();
+    int capture_stream = 0;
+    segment.capture =
+        std::make_unique<FakeReplayGraphCapture>(&capture_stream);
 
     FakeReplayGPUContext gpu_ctx;
     bool post_launch_called = false;
-    int capture_stream = 0;
 
     ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentNormal(
         segment,
         &gpu_ctx,
         &capture_stream,
         /*needs_segment_sync=*/true,
+        /*full_graph_replay=*/true,
         /*perf_context=*/"",
         /*device_name=*/"CUDA:0",
+        /*launch_dependency_cb=*/{},
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -1252,10 +5665,11 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
         {"last_stage", "lm_head"},
         {"type", "capturable"},
         {"stage_count", "3"}};
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_graph_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_post_launch", expected_tags), 1u);
 
     PerfStatsCollector::reset();
+    mutableDebugEnv().execution.gpu_graph_defer_captured_collective_final_sync = false;
 }
 
 TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
@@ -1266,18 +5680,21 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
     segment.stage_names = {"embedding", "attention", "lm_head"};
-    segment.capture = std::make_unique<FakeReplayGraphCapture>();
+    int capture_stream = 0;
+    segment.capture =
+        std::make_unique<FakeReplayGraphCapture>(&capture_stream);
 
     FakeReplayGPUContext gpu_ctx;
-    int capture_stream = 0;
 
     ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentNormal(
         segment,
         &gpu_ctx,
         &capture_stream,
         /*needs_segment_sync=*/false,
+        /*full_graph_replay=*/true,
         /*perf_context=*/"main_verifier",
         /*device_name=*/"CUDA:0",
+        /*launch_dependency_cb=*/{},
         [](DeviceGraphExecutor::GraphSegment &, void *) {}));
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
@@ -1287,35 +5704,43 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
         {"last_stage", "lm_head"},
         {"type", "capturable"},
         {"stage_count", "3"}};
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_graph_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_post_launch", expected_tags), 1u);
 
     PerfStatsCollector::reset();
 }
 
-TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
+TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsRecordFinalCaptureEventFence)
 {
     ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
     ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
     PerfStatsCollector::reset();
 
     ComputeGraph graph;
-    DeviceGraphExecutor::GraphSegmentCache cache;
-
     FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     cache.perf_context = "main_verifier";
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"verifier_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "ROCm:0"));
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -1323,6 +5748,7 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/3,
         hooks);
 
@@ -1331,42 +5757,42 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags capture_tags = {
         {"context", "main_verifier"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
-        {"stream", "capture"},
+        {"stream", "capture_event"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags default_tags = {
         {"context", "main_verifier"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
-        {"stream", "default"},
+        {"stream", "context_default"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags aggregate_tags = {
         {"context", "main_verifier"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags host_aggregate_tags = {
         {"attribution", "host_wall"},
         {"context", "main_verifier"},
-        {"graph_capture_scope", "segmented_replay_host"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_host"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"timing_scope", "final_stream_sync_host_wall"},
         {"type", "capturable"}};
 
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", capture_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", default_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", host_aggregate_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_stream_sync", capture_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_stream_sync", default_tags), 0u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_final_sync", host_aggregate_tags), 1u);
 
     const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
     const PerfStatsCollector::Tags stage_total_tags = {
         {"attribution", "gpu_event"},
         {"context", "main_verifier"},
-        {"graph_capture_scope", "segmented_replay_events"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
         {"timing_scope", "total_replay_gpu_event"},
@@ -1375,22 +5801,25 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
         {"attribution", "gpu_event"},
         {"context", "main_verifier"},
         {"first_stage", "verifier_graph"},
-        {"graph_capture_scope", "segmented_replay_events"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_index", "0"},
         {"last_stage", "verifier_graph"},
-        {"segment_index", "0"},
-        {"source", "segmented_graph_capture"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
-        {"timing_scope", "segment_replay_gpu_event"},
+        {"timing_scope", "graph_replay_gpu_event"},
         {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", stage_total_tags), 1u);
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", stage_segment_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", stage_segment_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.final_sync", aggregate_tags), 0u);
-    EXPECT_EQ(gpu_ctx.events_created_, 4);
-    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
-    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
-    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+    EXPECT_EQ(events_created_during_capture_setup, 32);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup + 1)
+        << "Replay timing events must all be allocated during capture setup; the only "
+           "new event is the cache's ordinary final ownership fence.";
+    EXPECT_EQ(gpu_ctx.events_recorded_, 3);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
 
     PerfStatsCollector::reset();
 }
@@ -1400,20 +5829,24 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
     ComputeGraph graph;
     auto *prep_stage = addFakeGraphLaunchPrepStage(graph, "row_select", DeviceId::cuda(0));
 
-    DeviceGraphExecutor::GraphSegmentCache cache;
     FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"row_select"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
 
-    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -1421,6 +5854,7 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/3,
         hooks);
 
@@ -1434,13 +5868,61 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
     EXPECT_EQ(prep_stage->stream_seen_by_stage_, cache.capture_stream);
 }
 
+TEST(Test__GraphSegmentCache, ReplaySkipsCaptureOnlyPreparation)
+{
+    ComputeGraph graph;
+    auto *prep_stage = addFakeGraphLaunchPrepStage(
+        graph,
+        "capture_only",
+        DeviceId::cuda(0),
+        GraphLaunchPreparationPolicy::CaptureOnly);
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"capture_only"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/3,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(prep_stage->prepare_calls_, 0)
+        << "Capture-only setup must already be embodied by the executable graph.";
+    EXPECT_EQ(prep_stage->execute_calls_, 0);
+}
+
 TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecording)
 {
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
     ComputeGraph graph;
     auto *prep_stage = addFakeGraphLaunchPrepStage(graph, "row_select", DeviceId::rocm(0));
 
-    DeviceGraphExecutor::GraphSegmentCache cache;
     FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "main_verifier";
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
@@ -1448,10 +5930,43 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
+    int prebind_calls = 0;
+    int coherence_calls = 0;
+    std::vector<std::string> transaction_order;
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .prebind_storage = [&](const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            ++prebind_calls;
+            transaction_order.emplace_back("prebind_storage");
+            return segment.stage_names == std::vector<std::string>{"row_select"} &&
+                   prep_stage->prepare_calls_ == 0;
+        },
+        .cohere_inputs = [&](const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            ++coherence_calls;
+            transaction_order.emplace_back("cohere_inputs");
+            return segment.stage_names == std::vector<std::string>{"row_select"} &&
+                   prep_stage->prepare_calls_ == 1;
+        },
+        .execute_node = [&](ComputeNode &node)
+        {
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_manifest = [&]()
+        {
+            transaction_order.emplace_back("prepare_snapshot_manifest");
+            return cache.capture_stream != nullptr &&
+                   prep_stage->prepare_calls_ == 1 &&
+                   coherence_calls == 0;
+        },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+        .capture_boundary = [&](const std::string &, void *stream)
+        {
+            transaction_order.emplace_back("capture_boundary");
+            return stream == cache.capture_stream && coherence_calls == 1;
+        },
+    };
 
     const auto result = DeviceGraphCaptureController::executeCapturePhase(
         graph,
@@ -1463,7 +5978,6 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
         hooks);
 
     ASSERT_TRUE(result.success);
-    EXPECT_FALSE(result.fallback_to_fast_decode);
     EXPECT_FALSE(result.reset_cache);
     EXPECT_EQ(prep_stage->prepare_calls_, 1);
     EXPECT_EQ(prep_stage->execute_calls_, 1);
@@ -1473,6 +5987,285 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
     EXPECT_EQ(prep_stage->last_stream_, cache.capture_stream);
     EXPECT_NE(prep_stage->last_stream_, nullptr);
     EXPECT_EQ(prep_stage->stream_seen_by_stage_, cache.capture_stream);
+    EXPECT_EQ(prebind_calls, 1);
+    EXPECT_EQ(coherence_calls, 1);
+    ASSERT_GE(transaction_order.size(), 4u);
+    EXPECT_EQ(transaction_order.front(), "prebind_storage")
+        << "Stable arena addresses must exist before launch metadata is prepared.";
+    EXPECT_EQ(transaction_order[1], "prepare_snapshot_manifest")
+        << "The complete snapshot arena must bind once after every stage has "
+           "prepared stable launch metadata and before any capture unit begins.";
+    EXPECT_EQ(transaction_order[2], "cohere_inputs");
+    EXPECT_EQ(transaction_order[3], "capture_boundary")
+        << "External producer events must be joined before the domain-level "
+           "capture-begin rendezvous.";
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "full_graph_capture_executable_nodes",
+            {{"attribution", "graph_replay_metadata"},
+             {"backend", "FakeReplay"},
+             {"context", "main_verifier"},
+             {"first_stage", "row_select"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"last_stage", "row_select"},
+             {"source", "full_graph_capture"},
+             {"stage_count", "1"},
+             {"type", "captured_executable"}}),
+        1.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "full_graph_capture_stage_types",
+            {{"attribution", "graph_replay_metadata"},
+             {"context", "main_verifier"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"source", "full_graph_capture"},
+             {"stage_type", "COPY"},
+             {"type", "captured_executable"}}),
+        1.0);
+
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Reject native capture when its exact-stream input preflight is absent.
+ *
+ * A missing hook used to let capture begin and defer coherence discovery to a
+ * stage inside the CUDA/HIP transaction. Importing that external event is
+ * illegal and can strand sibling LocalTP participants in collective teardown.
+ */
+TEST(Test__GraphSegmentCache, CapturePhaseRejectsMissingInputPreflight)
+{
+    ComputeGraph graph;
+    addFakeGraphLaunchPrepStage(graph, "row_select", DeviceId::cuda(0));
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"row_select"};
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .prebind_storage = [](const DeviceGraphExecutor::GraphSegment &)
+        {
+            return true;
+        },
+        .cohere_inputs = nullptr,
+        .execute_node = [&](ComputeNode &node)
+        {
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeCapturePhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*current_step=*/2,
+        hooks);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_TRUE(result.reset_cache);
+    EXPECT_EQ(cache.segments.front().capture, nullptr)
+        << "The backend capture object must not exist before input preflight.";
+}
+
+/**
+ * @brief Prove capture failure closes the backend transaction without recovery.
+ *
+ * The production ROCm long-context regression left a stream capturing after a
+ * stage rejected graph recording, then attempted stream synchronization and
+ * selective eager re-execution. This hardware-free test locks in the required
+ * transaction semantics without initializing a GPU.
+ */
+TEST(Test__GraphSegmentCache, CaptureStageFailureEndsCaptureAndStopsExecution)
+{
+    ComputeGraph graph;
+    auto failing_stage =
+        std::make_unique<FakeCaptureFailureStage>(DeviceId::rocm(0));
+    auto *failing_stage_ptr = failing_stage.get();
+    graph.addNode(
+        "capture_failure",
+        std::move(failing_stage),
+        DeviceId::rocm(0));
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"capture_failure"};
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::rocm(0),
+        ComputeBackendType::GPU_ROCM);
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .prebind_storage = [](const DeviceGraphExecutor::GraphSegment &)
+        {
+            return true;
+        },
+        .cohere_inputs = [](const DeviceGraphExecutor::GraphSegment &)
+        {
+            return true;
+        },
+        .execute_node = [&](ComputeNode &node)
+        {
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeCapturePhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*current_step=*/2,
+        hooks);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_TRUE(result.reset_cache);
+    ASSERT_NE(cache.segments.front().capture, nullptr);
+    auto *capture = dynamic_cast<FakeReplayGraphCapture *>(
+        cache.segments.front().capture.get());
+    ASSERT_NE(capture, nullptr);
+    EXPECT_EQ(capture->begin_capture_calls_, 1);
+    EXPECT_EQ(capture->end_capture_calls_, 1);
+    EXPECT_FALSE(capture->capturing_);
+    EXPECT_EQ(failing_stage_ptr->execute_calls_, 1)
+        << "A capture failure must not re-execute the failed stage eagerly";
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0)
+        << "Capture entry and failure handling must not synchronize the stream";
+    EXPECT_EQ(gpu_ctx.events_created_, 0)
+        << "Native capture entry must not allocate a host-observed fence.";
+    EXPECT_EQ(gpu_ctx.events_recorded_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0)
+        << "Capture failure cleanup must close capture without a host wait.";
+}
+
+TEST(Test__GraphSegmentCache, CaptureManualSegmentRecordsSnapshotsAfterExecuteNodeCallback)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "manual_stage", false);
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = false;
+    cache.segments.back().stage_names = {"manual_stage"};
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    int execute_calls = 0;
+    int prepare_snapshot_calls = 0;
+    int record_snapshot_calls = 0;
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = [&](ComputeNode &node)
+        {
+            ++execute_calls;
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_manifest = [&]()
+        {
+            ++prepare_snapshot_calls;
+            return cache.capture_stream != nullptr;
+        },
+        .record_snapshot_copies = [&](ComputeNode &, void *stream)
+        {
+            ++record_snapshot_calls;
+            return stream == cache.capture_stream;
+        },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeCapturePhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*current_step=*/2,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(execute_calls, 1);
+    EXPECT_EQ(prepare_snapshot_calls, 1)
+        << "Manual-only capture still needs one complete graph snapshot arena "
+           "before it can record point-in-time copies.";
+    EXPECT_EQ(record_snapshot_calls, 1)
+        << "Manual capture segments must snapshot even when they execute through execute_node.";
+}
+
+TEST(Test__GraphSegmentCache, ReplayManualSegmentRecordsSnapshotsAfterExecuteNodeCallback)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "manual_stage", false);
+
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "manual_snapshot_regression";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = false;
+    cache.segments.back().stage_names = {"manual_stage"};
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    int execute_calls = 0;
+    int prepare_snapshot_calls = 0;
+    int record_snapshot_calls = 0;
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = [&](ComputeNode &node)
+        {
+            ++execute_calls;
+            return node.stage && node.stage->execute(&ctx);
+        },
+        .prepare_snapshot_manifest = [&]()
+        {
+            ++prepare_snapshot_calls;
+            return cache.capture_stream != nullptr;
+        },
+        .record_snapshot_copies = [&](ComputeNode &, void *stream)
+        {
+            ++record_snapshot_calls;
+            return stream == cache.capture_stream;
+        },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/3,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(execute_calls, 1);
+    EXPECT_EQ(prepare_snapshot_calls, 0);
+    EXPECT_EQ(record_snapshot_calls, 1)
+        << "Manual replay segments must snapshot even when they execute through execute_node.";
 }
 
 TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapturedEvents)
@@ -1484,22 +6277,30 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
     PerfStatsCollector::reset();
 
     ComputeGraph graph;
-    DeviceGraphExecutor::GraphSegmentCache cache;
-
     FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     cache.perf_context = "main_decode";
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"captured_decode_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "CUDA:0"));
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -1507,6 +6308,7 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/5,
         hooks);
 
@@ -1516,9 +6318,9 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
     const PerfStatsCollector::Tags total_tags = {
         {"attribution", "gpu_event"},
         {"context", "main_decode"},
-        {"graph_capture_scope", "segmented_replay_events"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
         {"timing_scope", "total_replay_gpu_event"},
@@ -1527,48 +6329,72 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
         {"attribution", "gpu_event"},
         {"context", "main_decode"},
         {"first_stage", "captured_decode_graph"},
-        {"graph_capture_scope", "segmented_replay_events"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_index", "0"},
         {"last_stage", "captured_decode_graph"},
-        {"segment_index", "0"},
-        {"source", "segmented_graph_capture"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
-        {"timing_scope", "segment_replay_gpu_event"},
+        {"timing_scope", "graph_replay_gpu_event"},
         {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", segment_tags), 1u);
-    EXPECT_EQ(gpu_ctx.events_created_, 4);
-    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
-    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
-    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
+    EXPECT_EQ(events_created_during_capture_setup, 32);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup + 1);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 3);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
 
     PerfStatsCollector::reset();
 }
 
-TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvents)
+TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseAsynchronousEventReclamation)
 {
     ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
     ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
     PerfStatsCollector::reset();
 
     ComputeGraph graph;
-    DeviceGraphExecutor::GraphSegmentCache cache;
-
     FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
     ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
     cache.perf_context = "mtp_decode_sidecar";
+    cache.replay_workload = {
+        .seq_len = 7,
+        .batch_size = 2,
+        .m = 14,
+        .all_position_rows = 12,
+        .verifier_outcome_mode = static_cast<uint8_t>(
+            MTPVerifierOutcomeGraphMode::StochasticRejection),
+        .position_policy = static_cast<uint8_t>(
+            ForwardPositionPolicy::ExplicitRows),
+        .moe_placement_epoch = 29,
+        .decode = true,
+        .all_position_logits = true,
+        .live_mtp_request_batch_condition = false,
+    };
     cache.segments.emplace_back();
     cache.segments.back().capturable = true;
     cache.segments.back().stage_names = {"sidecar_graph"};
-    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "ROCm:0"));
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
+    gpu_ctx.query_event_ready_ = false;
 
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
-        nullptr,
-        nullptr,
-        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
         graph,
@@ -1576,6 +6402,7 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/7,
         hooks,
         /*force_recapture=*/false,
@@ -1583,48 +6410,380 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
 
     ASSERT_TRUE(result.success);
     EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
-    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup)
+        << "Deferred replay must not allocate timing events in the hot path.";
+    EXPECT_TRUE(PerfStatsCollector::snapshot({"stage_gpu"}).empty())
+        << "An incomplete asynchronous timing interval must remain cache-owned.";
+
+    gpu_ctx.query_event_ready_ = true;
+    ASSERT_TRUE(DeviceGraphCaptureController::reclaimReplayGpuTimingNonblocking(
+        cache,
+        &gpu_ctx));
+
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    const PerfStatsCollector::Tags total_tags = {
+        {"all_position_logits", "true"},
+        {"all_position_rows", "12"},
+        {"attribution", "gpu_event"},
+        {"batch_size", "2"},
+        {"context", "mtp_decode_sidecar"},
+        {"decode", "true"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"m", "14"},
+        {"moe_placement_epoch", "29"},
+        {"position_policy", std::to_string(static_cast<uint8_t>(
+                                ForwardPositionPolicy::ExplicitRows))},
+        {"seq_len", "7"},
+        {"source", "full_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "asynchronous_event_reclaimed"},
+        {"timing_scope", "total_replay_gpu_event"},
+        {"type", "capturable"},
+        {"verifier_outcome_mode", std::to_string(static_cast<uint8_t>(
+                                      MTPVerifierOutcomeGraphMode::StochasticRejection))}};
+    const PerfStatsCollector::Tags segment_tags = {
+        {"all_position_logits", "true"},
+        {"all_position_rows", "12"},
+        {"attribution", "gpu_event"},
+        {"batch_size", "2"},
+        {"context", "mtp_decode_sidecar"},
+        {"decode", "true"},
+        {"first_stage", "sidecar_graph"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_index", "0"},
+        {"last_stage", "sidecar_graph"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"m", "14"},
+        {"moe_placement_epoch", "29"},
+        {"position_policy", std::to_string(static_cast<uint8_t>(
+                                ForwardPositionPolicy::ExplicitRows))},
+        {"seq_len", "7"},
+        {"source", "full_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "asynchronous_event_reclaimed"},
+        {"timing_scope", "graph_replay_gpu_event"},
+        {"type", "capturable"},
+        {"verifier_outcome_mode", std::to_string(static_cast<uint8_t>(
+                                      MTPVerifierOutcomeGraphMode::StochasticRejection))}};
+
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 2);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 1);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 0);
+
+    const auto forward_records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags deferred_tags = {
+        {"all_position_logits", "true"},
+        {"all_position_rows", "12"},
+        {"batch_size", "2"},
+        {"context", "mtp_decode_sidecar"},
+        {"decode", "true"},
+        {"graph_count", "1"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"m", "14"},
+        {"moe_placement_epoch", "29"},
+        {"position_policy", std::to_string(static_cast<uint8_t>(
+                                ForwardPositionPolicy::ExplicitRows))},
+        {"seq_len", "7"},
+        {"stage_count", "1"},
+        {"type", "capturable"},
+        {"verifier_outcome_mode", std::to_string(static_cast<uint8_t>(
+                                      MTPVerifierOutcomeGraphMode::StochasticRejection))}};
+    EXPECT_DOUBLE_EQ(findCounterValue(
+                         forward_records,
+                         "full_graph_replay_final_sync_deferred",
+                         deferred_tags),
+                     1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, DeferredReplayTimingUsesBoundedNonblockingSamplingUnderBurstLoad)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "mtp_shifted_prefill";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"shifted_prefill_graph"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "CUDA:0"));
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
+    gpu_ctx.query_event_ready_ = false;
+
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    constexpr uint64_t kReplayBurst = 20;
+    for (uint64_t replay = 0; replay < kReplayBurst; ++replay)
+    {
+        const auto result = DeviceGraphCaptureController::executeReplayPhase(
+            graph,
+            cache,
+            &ctx,
+            &gpu_ctx,
+            /*has_collective_nodes=*/false,
+            /*collectives_graph_capturable=*/false,
+            /*current_step=*/replay + 1,
+            hooks,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/true);
+        ASSERT_TRUE(result.success) << "replay=" << replay;
+    }
+
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(cache.replay_gpu_timing_busy_samples, 4u);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 32)
+        << "Only the sixteen capture-owned slots may record start/stop pairs.";
+
+    gpu_ctx.query_event_ready_ = true;
+    ASSERT_TRUE(DeviceGraphCaptureController::reclaimReplayGpuTimingNonblocking(
+        cache,
+        &gpu_ctx));
+    EXPECT_EQ(cache.replay_gpu_timing_busy_samples, 0u);
 
     const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
     const PerfStatsCollector::Tags total_tags = {
         {"attribution", "gpu_event"},
-        {"context", "mtp_decode_sidecar"},
-        {"graph_capture_scope", "segmented_replay_events"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"context", "mtp_shifted_prefill"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
-        {"sync_scope", "profiling_event_synchronized"},
+        {"sync_scope", "asynchronous_event_reclaimed"},
         {"timing_scope", "total_replay_gpu_event"},
         {"type", "capturable"}};
-    const PerfStatsCollector::Tags segment_tags = {
-        {"attribution", "gpu_event"},
-        {"context", "mtp_decode_sidecar"},
-        {"first_stage", "sidecar_graph"},
-        {"graph_capture_scope", "segmented_replay_events"},
-        {"last_stage", "sidecar_graph"},
-        {"segment_index", "0"},
-        {"source", "segmented_graph_capture"},
-        {"stage_count", "1"},
-        {"sync_scope", "profiling_event_synchronized"},
-        {"timing_scope", "segment_replay_gpu_event"},
-        {"type", "capturable"}};
+    EXPECT_EQ(
+        findTimerCount(
+            stage_records,
+            "stage_gpu",
+            "graph_replay.total",
+            total_tags),
+        16u);
 
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", segment_tags), 1u);
-    EXPECT_EQ(gpu_ctx.events_created_, 4);
-    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
-    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
-    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+    const auto forward_records =
+        PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags sampling_tags = {
+        {"context", "mtp_shifted_prefill"},
+        {"sampling_policy", "bounded_nonblocking"}};
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            forward_records,
+            "replay_gpu_timing_busy_samples",
+            sampling_tags),
+        4.0);
 
-    const auto forward_records = PerfStatsCollector::snapshot({"forward_graph"});
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, CudaDeferredReplayDoesNotSynchronizeCapturedSegment)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar disable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "0");
+    ScopedEnvVar disable_perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "0");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "moe_rebalance_maintenance";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"maintenance_graph"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/11,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0)
+        << "Deferred CUDA replay must not synchronize the captured segment; "
+           "callers order completion through stream/event dependencies.";
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags deferred_tags = {
-        {"context", "mtp_decode_sidecar"},
-        {"segment_count", "1"},
+        {"context", "moe_rebalance_maintenance"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
         {"type", "capturable"}};
     EXPECT_DOUBLE_EQ(findCounterValue(
-                         forward_records,
-                         "segmented_replay_final_sync_deferred",
+                         records,
+                         "full_graph_replay_final_sync_deferred",
+                         deferred_tags),
+                     1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDefersFinalFenceWithoutOptIn)
+{
+    ScopedEnvVar disable_collective_defer("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC", "0");
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    mutableDebugEnv().execution.reload();
+    PerfStatsCollector::reset();
+    ASSERT_FALSE(debugEnv().execution.gpu_graph_defer_captured_collective_final_sync);
+
+    ComputeGraph graph;
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "main_decode";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"captured_collective_graph"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/true,
+        /*current_step=*/9,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0)
+        << "A fully captured collective graph is one device-owned replay DAG";
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags deferred_tags = {
+        {"context", "main_decode"},
+        {"graph_count", "1"},
+        {"stage_count", "1"},
+        {"type", "capturable"}};
+    EXPECT_DOUBLE_EQ(findCounterValue(
+                         records,
+                         "full_graph_replay_final_sync_deferred",
+                         deferred_tags),
+                     1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn)
+{
+    ScopedEnvVar enable_collective_defer("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC", "1");
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+    mutableDebugEnv().execution.reload();
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "main_decode";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"captured_collective_graph"};
+    cache.segments.back().capture =
+        std::make_unique<FakeReplayGraphCapture>(cache.capture_stream);
+    ASSERT_TRUE(DeviceGraphCaptureController::prepareReplayGpuTiming(
+        cache,
+        &gpu_ctx,
+        "ROCm:0"));
+    const int events_created_during_capture_setup = gpu_ctx.events_created_;
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        .cohere_inputs = nullptr,
+        .execute_node = nullptr,
+        .prepare_snapshot_manifest = []() { return true; },
+        .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+        .post_launch = [](DeviceGraphExecutor::GraphSegment &, void *) {},
+    };
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/true,
+        /*current_step=*/10,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+    EXPECT_EQ(gpu_ctx.events_created_, events_created_during_capture_setup)
+        << "Captured-collective replay must borrow only capture-owned timing events.";
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags deferred_tags = {
+        {"context", "main_decode"},
+        {"graph_count", "1"},
+        {"stage_count", "1"},
+        {"type", "capturable"}};
+    EXPECT_DOUBLE_EQ(findCounterValue(
+                         records,
+                         "full_graph_replay_final_sync_deferred",
                          deferred_tags),
                      1.0);
 
@@ -1644,27 +6803,37 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
         false,
         false,
         false,
-        &variant);
+        &variant,
+        DeviceId::rocm(0));
 
-    DeviceGraphExecutor executor;
-    DeviceGraphExecutor::GraphSegmentCache cache;
     FakeReplayGPUContext gpu_ctx;
+    DeviceGraphExecutor executor;
+    BufferArena arena;
+    executor.setArena(&arena);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    int worker_resolver_calls = 0;
+    executor.setWorkerGPUContextResolver(
+        [&](DeviceId device) -> IWorkerGPUContext *
+        {
+            ++worker_resolver_calls;
+            return device.is_gpu() ? &gpu_ctx : nullptr;
+        });
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph,
         &ctx,
         cache,
         gpu_ctx.defaultStream(),
         &gpu_ctx));
     EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_FALSE(cache.needs_capture);
     EXPECT_EQ(cache.decode_step, 1u);
     const uint64_t first_signature = cache.capture_variant_signature;
     ASSERT_NE(first_signature, 0u);
 
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph,
         &ctx,
         cache,
@@ -1676,7 +6845,7 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
 
     variant = 0x22;
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph,
         &ctx,
         cache,
@@ -1684,23 +6853,36 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
         &gpu_ctx));
 
     EXPECT_TRUE(cache.initialized);
-    EXPECT_TRUE(cache.needs_capture)
-        << "variant changes must go through warmup/capture instead of stale replay";
+    EXPECT_FALSE(cache.needs_capture)
+        << "Variant recapture must atomically install the replacement executable.";
     EXPECT_EQ(cache.decode_step, 1u);
     EXPECT_EQ(cache.variant_recapture_count, 1u);
     EXPECT_NE(cache.capture_variant_signature, first_signature);
+    EXPECT_EQ(worker_resolver_calls, 0)
+        << "Variant recapture already owns an explicit worker and must not resolve a second physical context.";
 }
 
 TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
 {
     ComputeGraph graph;
-    addFakeSegmentStage(graph, "verifier_graph", true);
+    addFakeSegmentStage(
+        graph,
+        "verifier_graph",
+        true,
+        false,
+        ComputeStageType::COPY,
+        false,
+        false,
+        false,
+        nullptr,
+        DeviceId::rocm(0));
 
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
     segment.stage_names = {"verifier_graph"};
     auto capture = std::make_unique<FakeReplayGraphCapture>();
     FakeReplayGraphCapture *capture_ptr = capture.get();
+    capture_ptr->supports_executable_update_ = false;
     segment.capture = std::move(capture);
 
     FakeReplayGPUContext gpu_ctx;
@@ -1715,6 +6897,18 @@ TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
         &gpu_ctx,
         &capture_stream,
         /*segment_index=*/0,
+        /*current_step=*/0,
+        "unit_recapture",
+        [](const DeviceGraphExecutor::GraphSegment &) { return true; },
+        {},
+        [](ComputeNode &) { return true; },
+        DeviceGraphExecutor::GraphCaptureBoundaryHook{},
+        /*auxiliary_branch=*/nullptr,
+        [](ComputeNode &, void *)
+        {
+            return true;
+        },
+        DeviceGraphExecutor::GraphLaunchDependencyHook{},
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -1729,7 +6923,17 @@ TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
 TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
 {
     ComputeGraph graph;
-    addFakeSegmentStage(graph, "verifier_graph", true);
+    addFakeSegmentStage(
+        graph,
+        "verifier_graph",
+        true,
+        false,
+        ComputeStageType::COPY,
+        false,
+        false,
+        false,
+        nullptr,
+        DeviceId::cuda(0));
 
     DeviceGraphExecutor::GraphSegment segment;
     segment.capturable = true;
@@ -1750,6 +6954,18 @@ TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
         &gpu_ctx,
         &capture_stream,
         /*segment_index=*/0,
+        /*current_step=*/0,
+        "unit_recapture",
+        [](const DeviceGraphExecutor::GraphSegment &) { return true; },
+        {},
+        [](ComputeNode &) { return true; },
+        DeviceGraphExecutor::GraphCaptureBoundaryHook{},
+        /*auxiliary_branch=*/nullptr,
+        [](ComputeNode &, void *)
+        {
+            return true;
+        },
+        DeviceGraphExecutor::GraphLaunchDependencyHook{},
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -1759,4 +6975,188 @@ TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
     EXPECT_EQ(capture_ptr->try_update_calls_, 1);
     EXPECT_EQ(capture_ptr->instantiate_calls_, 0);
     EXPECT_EQ(capture_ptr->launch_calls_, 1);
+}
+
+/**
+ * @brief A retained heterogeneous schedule preserves order and proof lifetime.
+ *
+ * Debug-only stage controllers are disabled explicitly so this test exercises
+ * the same direct invocation path used by the Release ExpertOverlay follower.
+ */
+TEST(Test__RetainedMultiDeviceExecutionPlan,
+     ReusesResolvedScheduleAndOnlyRevalidatesMutableWeights)
+{
+    ScopedEnvVar disable_profile("LLAMINAR_PROFILE_KERNELS", "0");
+    ScopedEnvVar disable_dump("LLAMINAR_STAGE_DUMP_ENABLED", "0");
+    ScopedEnvVar disable_input_validation("LLAMINAR_VALIDATE_INPUTS", "0");
+    ScopedEnvVar disable_buffer_validation("LLAMINAR_VALIDATE_BUFFERS", "0");
+    ScopedEnvVar disable_pointer_validation("LLAMINAR_VALIDATE_GPU_PTRS", "0");
+    ScopedEnvVar disable_stage_trace("LLAMINAR_TRACE_STAGES", "0");
+    ScopedEnvVar disable_stage_sync("LLAMINAR_SYNC_EACH_STAGE", "0");
+
+    std::vector<std::string> execution_log;
+    ComputeGraph graph;
+
+    auto immutable = std::make_unique<FakeRetainedScheduleStage>(
+        DeviceId::cpu(),
+        PreparedWeightValidationLifetime::StageLifetime,
+        &execution_log);
+    immutable->name_ = "immutable";
+    FakeRetainedScheduleStage *const immutable_ptr = immutable.get();
+    graph.addNode("immutable", std::move(immutable), DeviceId::cpu());
+
+    auto mutable_stage = std::make_unique<FakeRetainedScheduleStage>(
+        DeviceId::cpu(),
+        PreparedWeightValidationLifetime::PerExecution,
+        &execution_log);
+    mutable_stage->name_ = "mutable";
+    FakeRetainedScheduleStage *const mutable_ptr = mutable_stage.get();
+    graph.addNode("mutable", std::move(mutable_stage), DeviceId::cpu());
+    graph.addDependency("mutable", "immutable");
+
+    llaminar2::testing::MockDeviceContext cpu_context(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+    const std::unordered_map<DeviceId, IDeviceContext *> contexts{
+        {DeviceId::cpu(), &cpu_context}};
+    DeviceGraphExecutor executor;
+    DeviceGraphExecutor::RetainedMultiDeviceExecutionPlan plan;
+    std::string error;
+
+    ASSERT_TRUE(executor.prepareRetainedMultiDeviceExecutionPlan(
+        graph, contexts, plan, &error))
+        << error;
+    EXPECT_EQ(immutable_ptr->validation_calls_, 1);
+    EXPECT_EQ(mutable_ptr->validation_calls_, 1);
+
+    ASSERT_TRUE(executor.executeRetainedMultiDevice(plan, &error)) << error;
+    ASSERT_TRUE(executor.executeRetainedMultiDevice(plan, &error)) << error;
+    EXPECT_EQ(
+        execution_log,
+        (std::vector<std::string>{
+            "immutable", "mutable", "immutable", "mutable"}));
+    EXPECT_EQ(immutable_ptr->execute_calls_, 2);
+    EXPECT_EQ(mutable_ptr->execute_calls_, 2);
+    EXPECT_EQ(immutable_ptr->validation_calls_, 1)
+        << "StageLifetime proof must remain a setup-only operation.";
+    EXPECT_EQ(mutable_ptr->validation_calls_, 3)
+        << "PerExecution proof must run once while sealing and once per replay.";
+}
+
+/**
+ * @brief Distinct-device nodes in one declarative wave execute concurrently.
+ *
+ * The two hardware-free GPU stages rendezvous inside execute(). Calling them
+ * from a flattened host loop makes the first stage time out, while submitting
+ * both to their persistent worker contexts lets the complete wave pass. CPU
+ * dispatch and return nodes retain their declared predecessor ordering.
+ */
+TEST(Test__RetainedMultiDeviceExecutionPlan,
+     SubmitsIndependentDistinctDeviceGPUWaveConcurrently)
+{
+    ScopedEnvVar disable_profile("LLAMINAR_PROFILE_KERNELS", "0");
+    ScopedEnvVar disable_dump("LLAMINAR_STAGE_DUMP_ENABLED", "0");
+    ScopedEnvVar disable_input_validation("LLAMINAR_VALIDATE_INPUTS", "0");
+    ScopedEnvVar disable_buffer_validation("LLAMINAR_VALIDATE_BUFFERS", "0");
+    ScopedEnvVar disable_pointer_validation("LLAMINAR_VALIDATE_GPU_PTRS", "0");
+    ScopedEnvVar disable_stage_trace("LLAMINAR_TRACE_STAGES", "0");
+    ScopedEnvVar disable_stage_sync("LLAMINAR_SYNC_EACH_STAGE", "0");
+
+    FakeReplayGPUContext worker0(/*device_ordinal=*/0,
+                                 /*asynchronous_submission=*/true);
+    FakeReplayGPUContext worker1(/*device_ordinal=*/1,
+                                 /*asynchronous_submission=*/true);
+    RetainedWaveConcurrencyGate gate;
+    ComputeGraph graph;
+
+    auto dispatch = std::make_unique<FakeRetainedScheduleStage>(
+        DeviceId::cpu(), PreparedWeightValidationLifetime::StageLifetime);
+    graph.addNode("dispatch", std::move(dispatch), DeviceId::cpu());
+
+    auto gpu0 = std::make_unique<ConcurrentRetainedGPUStage>(
+        DeviceId::rocm(0), &gate, 2u);
+    gpu0->setGPUStream(worker0.defaultStream());
+    graph.addNode("gpu0", std::move(gpu0), DeviceId::rocm(0));
+    graph.addDependency("gpu0", "dispatch");
+
+    auto gpu1 = std::make_unique<ConcurrentRetainedGPUStage>(
+        DeviceId::rocm(1), &gate, 2u);
+    gpu1->setGPUStream(worker1.defaultStream());
+    graph.addNode("gpu1", std::move(gpu1), DeviceId::rocm(1));
+    graph.addDependency("gpu1", "dispatch");
+
+    auto return_stage = std::make_unique<FakeRetainedScheduleStage>(
+        DeviceId::cpu(), PreparedWeightValidationLifetime::StageLifetime);
+    graph.addNode("return", std::move(return_stage), DeviceId::cpu());
+    graph.addDependency("return", "gpu0");
+    graph.addDependency("return", "gpu1");
+
+    llaminar2::testing::MockDeviceContext cpu_context(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+    llaminar2::testing::MockDeviceContext rocm0_context(
+        DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    llaminar2::testing::MockDeviceContext rocm1_context(
+        DeviceId::rocm(1), ComputeBackendType::GPU_ROCM);
+    const std::unordered_map<DeviceId, IDeviceContext *> contexts{
+        {DeviceId::cpu(), &cpu_context},
+        {DeviceId::rocm(0), &rocm0_context},
+        {DeviceId::rocm(1), &rocm1_context},
+    };
+
+    GraphExecutorConfig config;
+    config.worker_gpu_context_resolver =
+        [&](DeviceId device) -> IWorkerGPUContext *
+    {
+        if (device == DeviceId::rocm(0))
+            return &worker0;
+        if (device == DeviceId::rocm(1))
+            return &worker1;
+        return nullptr;
+    };
+    DeviceGraphExecutor executor(config);
+    DeviceGraphExecutor::RetainedMultiDeviceExecutionPlan plan;
+    std::string error;
+    ASSERT_TRUE(executor.prepareRetainedMultiDeviceExecutionPlan(
+        graph, contexts, plan, &error))
+        << error;
+    ASSERT_EQ(plan.waves.size(), 3u);
+    EXPECT_EQ(plan.concurrent_gpu_wave_count, 1u);
+    EXPECT_EQ(plan.max_wave_width, 2u);
+
+    EXPECT_TRUE(executor.executeRetainedMultiDevice(plan, &error)) << error;
+    EXPECT_EQ(gate.arrivals(), 2u);
+}
+
+/**
+ * @brief Topology mutation invalidates a retained schedule before pointer use.
+ */
+TEST(Test__RetainedMultiDeviceExecutionPlan,
+     RejectsGraphMutationBeforeExecutingBorrowedEntries)
+{
+    ComputeGraph graph;
+    auto first = std::make_unique<FakeRetainedScheduleStage>(
+        DeviceId::cpu(), PreparedWeightValidationLifetime::StageLifetime);
+    FakeRetainedScheduleStage *const first_ptr = first.get();
+    graph.addNode("first", std::move(first), DeviceId::cpu());
+
+    llaminar2::testing::MockDeviceContext cpu_context(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+    const std::unordered_map<DeviceId, IDeviceContext *> contexts{
+        {DeviceId::cpu(), &cpu_context}};
+    DeviceGraphExecutor executor;
+    DeviceGraphExecutor::RetainedMultiDeviceExecutionPlan plan;
+    std::string error;
+    ASSERT_TRUE(executor.prepareRetainedMultiDeviceExecutionPlan(
+        graph, contexts, plan, &error))
+        << error;
+
+    graph.addNode(
+        "late_mutation",
+        std::make_unique<FakeRetainedScheduleStage>(
+            DeviceId::cpu(), PreparedWeightValidationLifetime::StageLifetime),
+        DeviceId::cpu());
+
+    EXPECT_FALSE(executor.executeRetainedMultiDevice(plan, &error));
+    EXPECT_NE(error.find("topology"), std::string::npos) << error;
+    EXPECT_EQ(first_ptr->execute_calls_, 0)
+        << "Generation rejection must happen before a borrowed node is used.";
 }

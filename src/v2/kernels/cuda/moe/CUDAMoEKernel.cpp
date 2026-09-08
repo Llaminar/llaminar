@@ -10,30 +10,227 @@
  */
 
 #include "CUDAMoEKernel.h"
+#include "CUDAMoEBatchInvariantPolicy.h"
+#include "CUDAMoEOverlayActivationPacketKernels.h"
+#include "CUDAMoEOverlayDeviceControllerKernels.h"
+#include "CUDAMoEOverlayEpochKernels.h"
 
+#include "../../../backends/BackendManager.h"
 #include "../gemm/CUDADeviceWorkspace.h"
+#include "../gemm/CUDAMoEGroupedPrefillKernels.h"
+#include "../gemm/CUDAMoEProductionPrefillOverlayGenerated.inc"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../tensors/NativeVnniFormatInfo.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
 
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
-#include <unordered_set>
+#include <unordered_map>
+
+extern "C" bool cudaNativeVNNIInitIQGridTables_tuned();
 
 namespace
 {
+    constexpr const char *kCudaGroupedDownDescriptorLeaseDomain =
+        "cuda_moe_grouped_down_descriptors";
+    constexpr const char *kCudaGroupedGateUpDescriptorLeaseDomain =
+        "cuda_moe_grouped_gateup_descriptors";
+    constexpr const char *kCudaGroupedExpertMaskLeaseDomain =
+        "cuda_moe_grouped_expert_masks";
+    constexpr const char *kCudaRouterQ8GatePublicationDomain =
+        "cuda_moe_router_q8_gate_cache";
+
+    /**
+     * @brief Preserve every router identity component for workspace sharing.
+     */
+    llaminar2::PersistentWorkspacePublicationKey routerPublicationKey(
+        const llaminar2::DeviceResidentRouterGateCacheKey &key) noexcept
+    {
+        return {
+            .word0 = key.workspace_id,
+            .word1 = static_cast<std::uint64_t>(key.source_device_ptr),
+            .word2 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(key.d_model)),
+            .word3 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(key.num_experts)),
+        };
+    }
+
+    /**
+     * @brief Append every semantic descriptor field to an exact identity key.
+     *
+     * Device pointer values are the model-lifetime weight identity consumed by
+     * captured grouped kernels. Recording fields individually avoids comparing
+     * compiler padding and avoids reducing correctness to a collision-prone
+     * digest.
+     */
+    void appendGroupedDescriptorIdentity(
+        std::vector<std::uint64_t> &words,
+        const llaminar2::DeviceNativeVNNIMatrixDesc &descriptor)
+    {
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.payload)));
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.scales)));
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.mins)));
+        words.push_back(static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(descriptor.emins)));
+        words.push_back(static_cast<std::uint64_t>(
+            static_cast<std::uint32_t>(descriptor.n)));
+        words.push_back(static_cast<std::uint64_t>(
+            static_cast<std::uint32_t>(descriptor.k)));
+        words.push_back(
+            static_cast<std::uint64_t>(descriptor.blocks_per_row));
+        words.push_back(
+            static_cast<std::uint64_t>(descriptor.codebook_id) |
+            (static_cast<std::uint64_t>(
+                 descriptor.allocation_payload_bytes_per_block)
+             << 8U) |
+            (static_cast<std::uint64_t>(
+                 descriptor.allocation_has_mins)
+             << 16U) |
+            (static_cast<std::uint64_t>(
+                 descriptor.allocation_has_emins)
+             << 24U));
+        words.push_back(
+            static_cast<std::uint64_t>(descriptor.source_codebook_id) |
+            (static_cast<std::uint64_t>(descriptor.source_is_superblock) << 8U) |
+            (static_cast<std::uint64_t>(descriptor.source_identity_present) << 16U));
+    }
+
+    /**
+     * @brief Build a collision-free identity for one grouped descriptor table.
+     *
+     * @param primary Down descriptors, or gate descriptors for a paired table.
+     * @param secondary Up descriptors for a paired table; null for down tables.
+     * @param num_experts Number of records in each present descriptor array.
+     * @param d_model Model hidden width.
+     * @param intermediate Routed expert intermediate width.
+     */
+    llaminar2::PersistentWorkspacePublicationKey
+    groupedDescriptorPublicationKey(
+        const llaminar2::DeviceNativeVNNIMatrixDesc *primary,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *secondary,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        llaminar2::PersistentWorkspacePublicationKey key{
+            .word0 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(num_experts)),
+            .word1 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(d_model)),
+            .word2 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(intermediate)),
+            .word3 = secondary ? 2U : 1U,
+        };
+        key.identity_words.reserve(
+            static_cast<std::size_t>(num_experts) *
+            (secondary ? 18U : 9U));
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            appendGroupedDescriptorIdentity(
+                key.identity_words,
+                primary[expert]);
+        }
+        if (secondary)
+        {
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                appendGroupedDescriptorIdentity(
+                    key.identity_words,
+                    secondary[expert]);
+            }
+        }
+        return key;
+    }
+
+    /**
+     * @brief Build an exact identity for a contiguous-floating descriptor table.
+     *
+     * Pointer identity is part of captured graph identity: two prepared engines
+     * with equal values but different allocations cannot share a publication
+     * whose replay embeds the former address.
+     */
+    llaminar2::PersistentWorkspacePublicationKey
+    groupedFloatingDescriptorPublicationKey(
+        const llaminar2::DeviceMoEFloatingMatrixDesc *primary,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *secondary,
+        llaminar2::DeviceMoEWeightFormat format,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        llaminar2::PersistentWorkspacePublicationKey key{
+            .word0 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(num_experts)),
+            .word1 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(d_model)),
+            .word2 = static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(intermediate)),
+            .word3 = 0x100U | (secondary ? 2U : 1U) |
+                     (static_cast<std::uint64_t>(format) << 32U),
+        };
+        key.identity_words.reserve(
+            static_cast<std::size_t>(num_experts) *
+            (secondary ? 6U : 3U));
+        auto append = [&](const llaminar2::DeviceMoEFloatingMatrixDesc &desc)
+        {
+            key.identity_words.push_back(static_cast<std::uint64_t>(
+                reinterpret_cast<std::uintptr_t>(desc.data)));
+            key.identity_words.push_back(static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(desc.n)));
+            key.identity_words.push_back(static_cast<std::uint64_t>(
+                static_cast<std::uint32_t>(desc.k)));
+        };
+        for (int expert = 0; expert < num_experts; ++expert)
+            append(primary[expert]);
+        if (secondary)
+        {
+            for (int expert = 0; expert < num_experts; ++expert)
+                append(secondary[expert]);
+        }
+        return key;
+    }
+
+    /**
+     * @brief Validate the stage-owned stream for a device-resident MoE launch.
+     *
+     * Rebalance and LLEP calls must not consult CUDAKernelBase::gpu_stream_:
+     * that member belongs to the legacy device-wide binding and can be
+     * retargeted by another graph capture thread. The immutable context is the
+     * sole stream authority for these migrated primitives.
+     */
+    void *explicitMoELaunchStream(
+        const llaminar2::MoEKernelLaunchContext &launch,
+        const char *operation)
+    {
+        if (!launch.hasExplicitStream())
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << operation
+                                         << " requires an explicit stage-owned CUDA stream");
+            return nullptr;
+        }
+        return launch.stream;
+    }
+
     bool setMoEDevice(int device_ordinal, const char *context)
     {
         cudaError_t err = cudaSetDevice(device_ordinal);
@@ -46,56 +243,45 @@ namespace
         return true;
     }
 
-    llaminar2::TensorBase *asTensorBase(llaminar2::ITensor *tensor, const char *context)
+    llaminar2::ITensor *requireTensor(llaminar2::ITensor *tensor, const char *context)
     {
-        auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor);
-        if (!base)
-            LOG_ERROR("[CUDAMoEKernel] " << context << " requires TensorBase-backed tensor");
-        return base;
+        if (!tensor)
+            LOG_ERROR("[CUDAMoEKernel] " << context << " requires a tensor");
+        return tensor;
     }
 
-    bool ensureTensorOnDevice(llaminar2::ITensor *tensor, llaminar2::DeviceId device, void *stream, const char *name)
+    bool requireTensorOnDevice(llaminar2::ITensor *tensor, llaminar2::DeviceId device, void *stream, const char *name)
     {
-        auto *base = asTensorBase(tensor, name);
-        if (!base)
-            return false;
-        if (!base->gpu_data_ptr() && !base->allocateOnDevice(device, stream))
-        {
-            LOG_ERROR("[CUDAMoEKernel] Failed to allocate tensor '" << name << "' on " << device.to_string());
-            return false;
-        }
-        if (!base->ensureOnDevice(device, stream))
-        {
-            LOG_ERROR("[CUDAMoEKernel] Failed to ensure tensor '" << name << "' on " << device.to_string());
-            return false;
-        }
-        return base->gpu_data_ptr() != nullptr;
+        (void)name;
+        llaminar2::TransferEngine::requireDeviceInput(tensor, device, stream);
+        return true;
     }
 
-    bool ensureOutputOnDevice(llaminar2::ITensor *tensor, llaminar2::DeviceId device, void *stream, const char *name)
+    bool requireOutputOnDevice(llaminar2::ITensor *tensor, llaminar2::DeviceId device, void *stream, const char *name)
     {
-        auto *base = asTensorBase(tensor, name);
-        if (!base)
-            return false;
-        if (!base->gpu_data_ptr() && !base->allocateOnDevice(device, stream))
-        {
-            LOG_ERROR("[CUDAMoEKernel] Failed to allocate output tensor '" << name << "' on " << device.to_string());
-            return false;
-        }
-        return base->gpu_data_ptr() != nullptr;
+        (void)name;
+        llaminar2::TransferEngine::requireDeviceOutput(tensor, device, stream);
+        return true;
     }
 
+    /**
+     * @brief Publish an asynchronous CUDA tensor write through TransferEngine.
+     *
+     * The kernel wrapper supplies the exact producer device and stream. The
+     * transfer service owns concrete tensor validation and the event-backed
+     * coherence transition consumed by later streams.
+     */
     void markDeviceWritten(llaminar2::ITensor *tensor, llaminar2::DeviceId device, void *stream)
     {
-        if (auto *base = dynamic_cast<llaminar2::TensorBase *>(tensor))
-            base->transitionToWithEvent(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
-        else
-            tensor->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        llaminar2::TransferEngine::publishDeviceWrite(
+            tensor,
+            device,
+            stream);
     }
 
     void markSynced(llaminar2::ITensor *tensor)
     {
-        tensor->transitionTo(llaminar2::TensorCoherenceState::SYNCED);
+        llaminar2::TransferEngine::publishSynchronized(tensor);
     }
 
     llaminar2::PerfStatsCollector::Tags groupedDecodeTags(
@@ -155,7 +341,7 @@ namespace
         return false;
     }
 
-    bool requireTensorType(const llaminar2::TensorBase *tensor, llaminar2::TensorType expected,
+    bool requireTensorType(const llaminar2::ITensor *tensor, llaminar2::TensorType expected,
                            const char *name, const char *context)
     {
         if (tensor && tensor->native_type() == expected)
@@ -167,7 +353,7 @@ namespace
         return false;
     }
 
-    bool requireTensorTypeOneOf(const llaminar2::TensorBase *tensor,
+    bool requireTensorTypeOneOf(const llaminar2::ITensor *tensor,
                                 llaminar2::TensorType a,
                                 llaminar2::TensorType b,
                                 const char *name,
@@ -181,6 +367,20 @@ namespace
                                       << ", got "
                                       << (tensor ? llaminar2::tensorTypeName(tensor->native_type()) : "null"));
         return false;
+    }
+
+    /**
+     * @brief True when MoE prefill grouping wrapper tracing is requested.
+     *
+     * This intentionally uses the same environment flag as the stage-level
+     * trace.  The wrapper log is a lower observation point for captured prefill
+     * graphs where the ordinary stage body may not be visible during replay.
+     */
+    bool traceMoEPrefillGroupingWrapperEnabled()
+    {
+        const bool assignment_trace =
+            !llaminar2::DebugEnv::isFalseyEnv("LLAMINAR_MOE_PREFILL_ASSIGNMENT_TRACE");
+        return assignment_trace || llaminar2::debugEnv().execution.prefill_graph_trace;
     }
 
     bool requireTensorElements(const llaminar2::ITensor *tensor, size_t required,
@@ -284,15 +484,187 @@ namespace
             break;
         }
 
-        // MTP verifier prefill runs with M=2..4 rows and must be cheap enough
-        // to beat serial verifier replay.  The compact TM=2 template wins on
-        // CUDA for these tiny active groups because it avoids over-wide blocks
-        // while still covering the full row set through grid.y.
+        // Runtime-M verifier prefill uses fixed-size grouped tiles. The compact
+        // TM=2 template wins for very small active groups; larger groups widen
+        // the tile without changing the row-wise arithmetic contract.
         if (max_tokens_per_expert <= 4)
             return 2;
         if (max_tokens_per_expert <= 8)
             return 8;
         return 16;
+    }
+
+    /** Stable generic width used when an exact production key was not swept. */
+    constexpr int kCUDAMoEGenericGateUpOrderedTileN = 128;
+
+    /** Capture-time launch geometry and its reviewable dispatch provenance. */
+    struct CUDAMoEProductionPrefillPolicy
+    {
+        int gateup_tile_n = 0;
+        llaminar2::cuda::moe::GroupedImmaColumns imma_gateup_columns =
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns32;
+        llaminar2::cuda::moe::GroupedImmaColumns imma_down_columns =
+            llaminar2::cuda::moe::GroupedImmaColumns::Columns32;
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule
+            imma_gateup_schedule = llaminar2::cuda::moe::
+                GroupedImmaGateUpSchedule::ParallelProjections;
+        const char *source = "missing";
+    };
+
+    /** Return whether a width names one compiled arithmetic-neutral candidate. */
+    bool validCUDAMoEGateUpOrderedTileN(int tile_n) noexcept
+    {
+        return tile_n >= 64 && tile_n <= 256 && (tile_n % 32) == 0;
+    }
+
+    /** Return the sole execution codebook represented by a descriptor mask. */
+    int singleCUDAMoECodebook(uint32_t codebook_mask) noexcept
+    {
+        if (codebook_mask == 0 ||
+            (codebook_mask & (codebook_mask - 1U)) != 0U)
+        {
+            return -1;
+        }
+
+        int codebook = 0;
+        while ((codebook_mask >>= 1U) != 0U)
+            ++codebook;
+        return codebook;
+    }
+
+    /**
+     * @brief Format one descriptor-table codebook mask for stable PerfStats.
+     *
+     * CUDA and ROCm route diagnostics intentionally use the same fixed-width
+     * hexadecimal representation. This preserves every descriptor bit, makes
+     * mixed tables visible, and lets benchmark tooling compare backend records
+     * without interpreting signed decimal values or locale-specific output.
+     * Launch policy continues to consume the original integer mask.
+     *
+     * @param codebook_mask Exact OR-reduction of every descriptor codebook id.
+     * @return Lowercase fixed-width hexadecimal in @c 0x00000000 form.
+     */
+    std::string cudaCodebookMaskTag(uint32_t codebook_mask)
+    {
+        char text[11]{};
+        std::snprintf(text, sizeof(text), "0x%08x", codebook_mask);
+        return text;
+    }
+
+    /**
+     * @brief Select the complete CUDA gate/up geometry before graph capture.
+     *
+     * Exact Qwen production keys take precedence over the total generic policy.
+     * Heterogeneous descriptor tables cannot name one exact codebook pair and
+     * therefore retain the generic width explicitly. The Perf__ tournament is
+     * the sole higher-precedence control: its active bit distinguishes a forced
+     * 128-thread candidate from the ordinary generic value 128. Any malformed
+     * selected width remains invalid and causes the production caller to fail;
+     * it is never replaced after selection.
+     */
+    CUDAMoEProductionPrefillPolicy selectCUDAMoEProductionPrefillPolicy(
+        uint32_t gateup_codebook_mask,
+        uint32_t down_codebook_mask,
+        int seq_len,
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k,
+        bool use_gateup_kpart)
+    {
+        if (gateup_codebook_mask == 0 || down_codebook_mask == 0 ||
+            seq_len <= 0 || hidden_size <= 0 || expert_width <= 0 ||
+            expert_count <= 0 || top_k <= 0 || top_k > expert_count)
+        {
+            return {};
+        }
+
+        if (!use_gateup_kpart)
+        {
+            const auto grouped_imma =
+                llaminar2::cuda::moe::selectGroupedImmaLaunchPolicy(
+                    singleCUDAMoECodebook(gateup_codebook_mask),
+                    singleCUDAMoECodebook(down_codebook_mask),
+                    seq_len,
+                    hidden_size,
+                    expert_width,
+                    expert_count,
+                    top_k);
+            CUDAMoEProductionPrefillPolicy policy{
+                .gateup_tile_n = llaminar2::cuda::moe::groupedImmaColumns(
+                    grouped_imma.gate_up_columns),
+                .imma_gateup_columns = grouped_imma.gate_up_columns,
+                .imma_down_columns = grouped_imma.down_columns,
+                .imma_gateup_schedule = grouped_imma.gate_up_schedule,
+                .source = grouped_imma.exact_overlay
+                              ? "tensor_core_imma_exact_overlay"
+                              : "tensor_core_imma_generic",
+            };
+            const auto &gemm = llaminar2::debugEnv().gemm;
+            if (gemm.cuda_moe_imma_geometry_override_active)
+            {
+                policy.imma_gateup_columns =
+                    static_cast<llaminar2::cuda::moe::GroupedImmaColumns>(
+                        gemm.cuda_moe_imma_gateup_columns);
+                policy.imma_down_columns =
+                    static_cast<llaminar2::cuda::moe::GroupedImmaColumns>(
+                        gemm.cuda_moe_imma_down_columns);
+                policy.imma_gateup_schedule = static_cast<
+                    llaminar2::cuda::moe::GroupedImmaGateUpSchedule>(
+                    gemm.cuda_moe_imma_gateup_schedule);
+                policy.gateup_tile_n =
+                    gemm.cuda_moe_imma_gateup_columns;
+                policy.source = "tensor_core_imma_explicit_override";
+            }
+            if (!llaminar2::cuda::moe::validGroupedImmaGateUpColumns(
+                    policy.imma_gateup_columns) ||
+                !llaminar2::cuda::moe::validGroupedImmaDownColumns(
+                    policy.imma_down_columns) ||
+                !llaminar2::cuda::moe::validGroupedImmaGateUpSchedule(
+                    policy.imma_gateup_schedule))
+            {
+                return {};
+            }
+            return policy;
+        }
+
+        CUDAMoEProductionPrefillPolicy policy{
+            .gateup_tile_n = kCUDAMoEGenericGateUpOrderedTileN,
+            .source = "generic_mixed_codebooks",
+        };
+        const int gateup_codebook =
+            singleCUDAMoECodebook(gateup_codebook_mask);
+        const int down_codebook = singleCUDAMoECodebook(down_codebook_mask);
+        if (gateup_codebook >= 0 && down_codebook >= 0)
+        {
+            policy.source = "generic";
+            int exact_tile_n = 0;
+            if (llaminar2::cuda::generated::
+                    selectCUDAMoEProductionPrefillOverlay(
+                        static_cast<uint8_t>(gateup_codebook),
+                        static_cast<uint8_t>(down_codebook),
+                        hidden_size,
+                        expert_width,
+                        expert_count,
+                        top_k,
+                        seq_len,
+                        exact_tile_n))
+            {
+                policy.gateup_tile_n = exact_tile_n;
+                policy.source = "exact_overlay";
+            }
+        }
+
+        const auto &gemm = llaminar2::debugEnv().gemm;
+        if (gemm.cuda_moe_gateup_ordered_kpart_tile_n_override_active)
+        {
+            policy.gateup_tile_n =
+                gemm.cuda_moe_gateup_ordered_kpart_tile_n;
+            policy.source = "explicit_override";
+        }
+        if (!validCUDAMoEGateUpOrderedTileN(policy.gateup_tile_n))
+            return {};
+        return policy;
     }
 
     llaminar2::PerfStatsCollector::Tags groupedPrefillTags(
@@ -322,10 +694,88 @@ namespace
         int active_expert_slots,
         int tile_m,
         int tile_n,
-        bool fuse_swiglu,
-        bool ordered_scatter)
+        uint32_t gateup_codebook_mask,
+        uint32_t down_codebook_mask,
+        uint32_t gateup_policy_codebook_mask,
+        uint32_t down_policy_codebook_mask,
+        bool use_grouped_imma,
+        bool use_gateup_kpart,
+        bool fuse_swiglu_requested,
+        bool use_ordered_down_kpart,
+        bool ordered_scatter,
+        bool canonical_route_publication,
+        int splitk_tile_rows,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_gateup_columns,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_down_columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule
+            imma_gateup_schedule,
+        const char *policy_source)
     {
         auto tags = groupedPrefillTags(seq_len, top_k, num_experts, active_expert_slots, tile_m, tile_n);
+        /*
+         * `tile_m` belongs only to the full-K grouped launcher.  Ordered KPART
+         * instead traverses a bounded row workspace named by
+         * `splitk_tile_rows`; reporting only the legacy numeric fields made a
+         * zero `tile_m` look like missing geometry to downstream gates.  Keep
+         * both legacy dimensions for corpus compatibility, but publish the
+         * authoritative geometry owner so tests and profilers cannot confuse
+         * two launch families with different arithmetic contracts.
+         */
+        tags["gateup_geometry_contract"] = use_grouped_imma
+                                                   ? "tensor_core_imma"
+                                                   : (use_gateup_kpart
+                                                          ? "ordered_split_k"
+                                                          : "full_k");
+        tags["row_tile_source"] = use_grouped_imma
+                                          ? "device_work_directory"
+                                          : (use_gateup_kpart
+                                                 ? "splitk_tile_rows"
+                                                 : "tile_m");
+        if (use_grouped_imma)
+        {
+            tags["work_scheduler"] = "compact_directory_grid";
+            tags["empty_directory_tail"] = "sentinel_cta_exit";
+            tags["imma_gateup_columns"] = std::to_string(
+                llaminar2::cuda::moe::groupedImmaColumns(
+                    imma_gateup_columns));
+            tags["imma_down_columns"] = std::to_string(
+                llaminar2::cuda::moe::groupedImmaColumns(
+                    imma_down_columns));
+            tags["imma_gateup_schedule"] =
+                imma_gateup_schedule == llaminar2::cuda::moe::
+                                               GroupedImmaGateUpSchedule::
+                                                   PairedProjections
+                    ? "paired_projections"
+                    : "parallel_projections";
+        }
+        tags["gateup_codebook_mask"] =
+            cudaCodebookMaskTag(gateup_codebook_mask);
+        tags["down_codebook_mask"] =
+            cudaCodebookMaskTag(down_codebook_mask);
+        tags["gateup_policy_codebook_mask"] =
+            cudaCodebookMaskTag(gateup_policy_codebook_mask);
+        tags["down_policy_codebook_mask"] =
+            cudaCodebookMaskTag(down_policy_codebook_mask);
+        tags["policy_source"] = policy_source ? policy_source : "missing";
+        if (use_gateup_kpart || use_ordered_down_kpart)
+        {
+            tags["splitk_tile_rows"] = std::to_string(splitk_tile_rows);
+            tags["splitk_tile_count"] =
+                std::to_string((seq_len + splitk_tile_rows - 1) / splitk_tile_rows);
+        }
+        if (use_gateup_kpart)
+        {
+            tags["gateup_k_partitions"] = std::to_string(
+                llaminar2::CUDAMoEBatchInvariantPolicy::gate_up_k_partitions);
+            tags["gateup_ordered_tile_n"] = std::to_string(tile_n);
+        }
+        if (use_ordered_down_kpart)
+        {
+            tags["down_k_partitions"] = std::to_string(
+                llaminar2::CUDAMoEBatchInvariantPolicy::down_k_partitions);
+            tags["down_ordered_tile_n"] = std::to_string(
+                llaminar2::debugEnv().gemm.cuda_moe_down_ordered_kpart_tile_n);
+        }
         if (active_expert_slots > 0)
         {
             llaminar2::PerfStatsCollector::addCounter(
@@ -333,12 +783,53 @@ namespace
                 1.0, {}, {}, tags);
         }
 
-        tags["swiglu_path"] = fuse_swiglu ? "fused" : "split";
+        tags["swiglu_path"] = use_grouped_imma
+                                      ? "split_exact_quantizer"
+                                      : ((use_gateup_kpart ||
+                                          fuse_swiglu_requested)
+                                             ? "fused"
+                                             : "split");
+        tags["requested_fused_swiglu"] = fuse_swiglu_requested ? "true" : "false";
         if (active_expert_slots > 0)
         {
-            tags["gateup_route"] = fuse_swiglu ? "kpart_swiglu" : "kpart_prefill";
-            tags["down_route"] = "kpart_prefill";
-            tags["down_accumulation"] = "token_direct";
+            if (use_grouped_imma)
+                tags["gateup_route"] = "grouped_imma_prefill";
+            else if (use_gateup_kpart)
+                tags["gateup_route"] = "kpart_prefill";
+            else
+                tags["gateup_route"] = fuse_swiglu_requested
+                                           ? "fullk_fused_swiglu_prefill"
+                                           : "fullk_prefill";
+
+            tags["down_route"] = use_grouped_imma
+                                         ? "grouped_imma_prefill"
+                                         : (use_ordered_down_kpart
+                                                ? "ordered_kpart_prefill"
+                                                : "grouped_prefill");
+            tags["down_accumulation"] = use_grouped_imma
+                                                ? "serial_m1_kpart_in_cta"
+                                                : (use_ordered_down_kpart
+                                                       ? "row_ordered_kpart"
+                                                       : (ordered_scatter
+                                                              ? "row_ordered"
+                                                              : "slot_scatter"));
+            if (use_grouped_imma)
+            {
+                tags["down_publication"] = canonical_route_publication
+                                                ? "route_major_collective"
+                                                : "ordered_direct";
+            }
+            if (use_ordered_down_kpart)
+            {
+                tags["down_publication"] = canonical_route_publication
+                                                ? "route_major_collective"
+                                                : "fused_direct";
+                if (!canonical_route_publication)
+                {
+                    tags["down_direct_warps"] = std::to_string(
+                        llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(top_k));
+                }
+            }
         }
         else if (ordered_scatter)
         {
@@ -380,6 +871,31 @@ namespace
         return llaminar2::isGraphCaptureActive() || isCudaStreamCapturing(stream);
     }
 
+    /**
+     * @brief Reject host publication or ownership changes while CUDA captures.
+     *
+     * Persistent MoE metadata must be completely owned and populated before
+     * capture begins. Keeping this check in one helper prevents descriptor,
+     * mask, and workspace-rebind paths from gradually acquiring inconsistent
+     * capture rules.
+     *
+     * @param stream Explicit stream whose capture state participates in the
+     *        decision.
+     * @param context Operation name included in the hard-failure diagnostic.
+     * @return true when the caller must stop without mutating metadata.
+     */
+    bool rejectCudaPersistentMetadataMutationDuringCapture(
+        void *stream,
+        const char *context)
+    {
+        if (!isCudaMoEDecodeCaptureActive(stream))
+            return false;
+
+        LOG_ERROR("[CUDAMoEKernel] Persistent metadata mutation '" << context
+                                                                  << "' is forbidden during graph capture");
+        return true;
+    }
+
     int *runtimeTopKExpertIdsDevice(llaminar2::DeviceMoELayerRuntime *runtime_layer)
     {
         auto *base = reinterpret_cast<char *>(runtime_layer);
@@ -390,12 +906,6 @@ namespace
     {
         auto *base = reinterpret_cast<char *>(runtime_layer);
         return reinterpret_cast<float *>(base + offsetof(llaminar2::DeviceMoELayerRuntime, topk_weights));
-    }
-
-    uint64_t *runtimeDecodeHistogramDevice(llaminar2::DeviceMoELayerRuntime *runtime_layer)
-    {
-        auto *base = reinterpret_cast<char *>(runtime_layer);
-        return reinterpret_cast<uint64_t *>(base + offsetof(llaminar2::DeviceMoELayerRuntime, decode_histogram));
     }
 
     bool cudaGroupedPrefillSupportsCodebook(uint8_t cb)
@@ -418,6 +928,7 @@ namespace
         case 16:
         case 17:
         case 19:
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -437,6 +948,7 @@ namespace
         case 14:
         case 16:
         case 17:
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -455,6 +967,46 @@ namespace
         return cb < 32 ? (uint32_t{1} << cb) : 0u;
     }
 
+    /**
+     * @brief Validate source provenance against the physical execution format.
+     *
+     * Expanded INT8+minimum bytes are shared by several compact asymmetric
+     * codebooks. A descriptor using execution codebook 23 therefore cannot
+     * select an exact arithmetic contract unless the producer also publishes
+     * its source identity. Legacy immutable descriptors remain accepted for
+     * self-describing execution formats, while any supplied provenance is
+     * checked against the central NativeVNNI catalog.
+     */
+    bool validateCudaGroupedSourceIdentity(
+        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+    {
+        if (!desc.source_identity_present)
+        {
+            return desc.codebook_id !=
+                   llaminar2::kNativeVnniExpandedInt8MinCodebook;
+        }
+        const auto *source =
+            llaminar2::native_vnni_formats::forSourceIdentity(
+                desc.source_codebook_id,
+                desc.source_is_superblock != 0);
+        return source != nullptr &&
+               llaminar2::deviceVnniExecutionCompatibleWithSource(
+                   *source, desc.codebook_id);
+    }
+
+    /** @return Bit selecting the source arithmetic-policy codebook. */
+    uint32_t cudaGroupedPrefillPolicyCodebookBit(
+        const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+    {
+        if (!validateCudaGroupedSourceIdentity(desc))
+            return 0u;
+        const uint8_t source_codebook = desc.source_identity_present
+                                            ? desc.source_codebook_id
+                                            : desc.codebook_id;
+        return cudaGroupedPrefillCodebookBit(
+            llaminar2::canonicalDeviceVnniCodebookId(source_codebook));
+    }
+
     bool cudaGroupedPrefillMaskNeedsIQTables(uint32_t mask)
     {
         for (uint8_t cb = 11; cb <= 17; ++cb)
@@ -463,6 +1015,65 @@ namespace
                 return true;
         }
         return false;
+    }
+
+    /**
+     * @brief Publish CUDA MoE IQ constants once per native runtime generation.
+     *
+     * `cudaDeviceReset()` invalidates translation-unit constant memory while
+     * leaving host statics intact. Keying only by ordinal would therefore make
+     * the next JIT-loaded model launch with an uninitialized codebook. The
+     * backend generation is the exact primary-context identity that owns these
+     * tables and is shared by every supported IQ codebook (11 through 17).
+     */
+    bool ensureCudaMoEIQGridTablesInitialized(int device_ordinal)
+    {
+        static std::mutex iq_table_mutex;
+        static std::unordered_map<int, std::uint64_t>
+            iq_grid_runtime_generations;
+
+        std::lock_guard<std::mutex> lock(iq_table_mutex);
+        llaminar2::IBackend *const backend =
+            llaminar2::getCUDABackend();
+        const std::uint64_t runtime_generation = backend
+                                                     ? backend->deviceRuntimeGeneration(
+                                                           device_ordinal)
+                                                     : 0u;
+        if (runtime_generation == 0u)
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel] IQ grid initialization has no live CUDA "
+                "runtime generation for device "
+                << device_ordinal);
+            return false;
+        }
+
+        const auto initialized =
+            iq_grid_runtime_generations.find(device_ordinal);
+        if (initialized != iq_grid_runtime_generations.end() &&
+            initialized->second == runtime_generation)
+        {
+            return true;
+        }
+        if (!backend->setDevice(device_ordinal))
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel] Could not select CUDA device "
+                << device_ordinal
+                << " before IQ grid table publication");
+            return false;
+        }
+        if (!cudaNativeVNNIInitIQGridTables_tuned())
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel] IQ grid table publication failed for CUDA:"
+                << device_ordinal << " runtime_generation="
+                << runtime_generation);
+            return false;
+        }
+
+        iq_grid_runtime_generations[device_ordinal] = runtime_generation;
+        return true;
     }
 
     bool validateCudaGroupedDesc(
@@ -489,15 +1100,94 @@ namespace
                desc.n == n &&
                desc.k == k &&
                desc.blocks_per_row == static_cast<uint32_t>(k / 32) &&
+               validateCudaGroupedSourceIdentity(desc) &&
                cudaGroupedPrefillSupportsCodebook(desc.codebook_id) &&
                (!cudaGroupedPrefillRequiresMins(desc.codebook_id) || desc.mins != nullptr) &&
                (!cudaGroupedPrefillRequiresEmins(desc.codebook_id) || desc.emins != nullptr);
+    }
+
+    bool isBlankGroupedDesc(const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+    {
+        return desc.payload == nullptr &&
+               desc.scales == nullptr &&
+               desc.mins == nullptr &&
+               desc.emins == nullptr &&
+               desc.n == 0 &&
+               desc.k == 0 &&
+               desc.blocks_per_row == 0;
+    }
+
+    /** @return Whether a sparse floating descriptor deliberately owns no slot. */
+    bool isBlankGroupedFloatingDesc(
+        const llaminar2::DeviceMoEFloatingMatrixDesc &desc)
+    {
+        return desc.data == nullptr && desc.n == 0 && desc.k == 0;
+    }
+
+    /** @return Whether one floating descriptor exactly matches its projection. */
+    bool validateGroupedFloatingDesc(
+        const llaminar2::DeviceMoEFloatingMatrixDesc &desc,
+        int n,
+        int k)
+    {
+        return desc.valid() && desc.n == n && desc.k == k;
     }
 }
 
 extern "C"
 {
-    bool cudaNativeVNNIInitIQGridTables_tuned();
+    /**
+     * @brief Query the capture-time CUDA production-MoE prefill policy.
+     *
+     * This host-only inspection shares the exact production selector and does
+     * no CUDA work. Integration tests use it to prove exact-overlay precedence
+     * and total generic dispatch for unseen positive M values.
+     *
+     * @param gateup_codebook_id Uniform gate/up execution codebook.
+     * @param down_codebook_id Uniform down execution codebook.
+     * @param m Number of token rows embedded in the captured graph.
+     * @param hidden_size Model hidden width.
+     * @param expert_width Routed expert intermediate width.
+     * @param expert_count Number of routed experts.
+     * @param top_k Number of selected routes per token.
+     * @param gateup_tile_n Receives the ordered gate/up block width.
+     * @param exact_overlay Receives one only when an exact overlay supplied the
+     *        selected width; explicit trainer overrides report zero.
+     * @return true when the selected policy names a compiled launch geometry.
+     */
+    bool cudaMoE_grouped_prefill_query_production_config(
+        uint8_t gateup_codebook_id,
+        uint8_t down_codebook_id,
+        int m,
+        int hidden_size,
+        int expert_width,
+        int expert_count,
+        int top_k,
+        int *gateup_tile_n,
+        int *exact_overlay)
+    {
+        if (gateup_codebook_id >= 32 || down_codebook_id >= 32 ||
+            !gateup_tile_n || !exact_overlay)
+        {
+            return false;
+        }
+        const CUDAMoEProductionPrefillPolicy policy =
+            selectCUDAMoEProductionPrefillPolicy(
+                uint32_t{1} << gateup_codebook_id,
+                uint32_t{1} << down_codebook_id,
+                m,
+                hidden_size,
+                expert_width,
+                expert_count,
+                top_k,
+                /*use_gateup_kpart=*/true);
+        if (!validCUDAMoEGateUpOrderedTileN(policy.gateup_tile_n))
+            return false;
+        *gateup_tile_n = policy.gateup_tile_n;
+        *exact_overlay =
+            std::strcmp(policy.source, "exact_overlay") == 0 ? 1 : 0;
+        return true;
+    }
 
     bool cudaMoE_route_logits(
         const float *hidden, const float *gate_weights, float *logits,
@@ -509,30 +1199,308 @@ extern "C"
         int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_quantize_router_gate_q8(
+        const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
+        int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool cudaMoE_gate_logits_single_token_q8_weights(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool cudaMoE_route_logits_decode_equivalent_rows(
+        const float *hidden, const float *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool cudaMoE_route_logits_bf16_decode_equivalent_rows(
+        const float *hidden, const void *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool cudaMoE_softmax_topk(
-        float *logits, int *expert_indices, float *expert_weights,
+        float *logits, float *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k, bool normalize_weights,
         int device_idx, void *stream,
-        const int *device_effective_seq_len);
+        const int *device_effective_seq_len,
+        void *deferred_selected_route_ledger = nullptr);
 
     bool cudaMoE_softmax_topk_decode_runtime(
-        float *logits, int *runtime_expert_ids, float *runtime_weights,
-        uint64_t *runtime_histogram,
+        float *logits, void *runtime_layer,
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool normalize_weights,
         bool write_legacy_outputs, bool update_runtime_histogram,
+        bool fully_replicated_local_rows,
+        void *runtime_layers,
+        const void *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        void *rebalance_command_header,
+        const void *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const void *rebalance_config,
+        void *rebalance_apply_status,
+        void *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count,
+        const int32_t *absolute_position_ids,
         int device_idx, void *stream);
 
     bool cudaMoE_decode_route_select_runtime(
         const int *expert_indices, const float *expert_weights,
-        int *runtime_expert_ids, float *runtime_weights,
-        uint64_t *runtime_histogram,
+        void *runtime_layer,
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool write_legacy_outputs,
         bool update_runtime_histogram, int device_idx, void *stream);
 
-    bool cudaMoE_int_to_float(const int *input, float *output, int count, int device_idx, void *stream);
+    bool cudaMoE_device_rebalance_controller(
+        void *runtime_layers,
+        const unsigned long long *gathered_histograms,
+        void *status,
+        const void *config,
+        void *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        void *command_header,
+        void *wave_state,
+        void *controller_state,
+        void *llep_layer_plans,
+        void *placement_plan_scratch,
+        uint32_t command_buffer_count,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_histograms(
+        void *runtime_layers,
+        unsigned long long *local_histograms,
+        const void *config,
+        const void *wave_state,
+        const void *controller_state,
+        uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        unsigned long long *previous_activation_counts,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_directory(
+        void *runtime_layers,
+        void *local_directory,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_source_descriptors(
+        void *runtime_layers,
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_source_descriptors,
+        const void *config,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_project_rebalance_domain_commands(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_plan_entries,
+        void *local_command_headers,
+        const void *config,
+        void *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
+        const void *gathered_wave_states,
+        void *local_wave_states,
+        void *runtime_layers,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        void *transfer_slot_claim_index,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_project_prefill_llep_domain_commands(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_plan_entries,
+        uint32_t *local_plan_count,
+        void *local_command_header,
+        const void *config,
+        void *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
+        void *runtime_layers,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        void *transfer_slot_claim_index,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_materialize_prefill_llep_transfer_commands(
+        const void *runtime_layer,
+        void *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        void *command_header,
+        void *status,
+        const void *config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_materialize_prefill_llep_mirrored_domain_commands(
+        const void *runtime_layer,
+        void *mirrored_plan_entries,
+        void *mirrored_command_headers,
+        uint32_t plan_capacity,
+        void *status,
+        const void *config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_compact_payloads(
+        const void *plan_entries,
+        const void *command_headers,
+        uint32_t plan_capacity,
+        const void *local_source_descriptors,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_collective_payloads(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        const void *local_directory,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_unpack_rebalance_collective_payloads(
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *gathered_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_init_rebalance_graph_controller_state(
+        void *controller_state,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_reset_rebalance_graph_transaction_for_request(
+        void *controller_state,
+        void *command_headers,
+        void *wave_states,
+        uint32_t *plan_counts,
+        uint32_t command_buffer_count,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_publish_rebalance_transfer_complete(
+        void *controller_state,
+        const void *command_header,
+        const void *wave_state,
+        const void *copy_status,
+        const void *plan_entries,
+        uint32_t plan_capacity,
+        const void *gathered_copy_status,
+        const void *config,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_apply_ready_rebalance_wave(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        int target_layer,
+        uint32_t command_buffer_count,
+        const void *overlay_reservation_status,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_finalize_overlay_rebalance_publication(
+        void *runtime_layers,
+        uint32_t layer_count,
+        uint32_t expert_count,
+        void *control,
+        uint64_t *candidate_epoch,
+        void *status,
+        const void *apply_status,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_apply_rebalance_arrivals(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        int target_layer,
+        int device_idx,
+        void *stream);
+
     bool cudaMoE_float_to_int(const float *input, int *output, int count, int device_idx, void *stream);
+    bool cudaMoE_float_to_masked_int(
+        const float *input,
+        int *output,
+        const uint8_t *expert_mask,
+        int count,
+        int num_experts,
+        int device_idx,
+        void *stream);
 
     bool cudaMoE_gather_tokens(
         const float *hidden, float *batch_buffer, const int *token_indices,
@@ -581,6 +1549,11 @@ extern "C"
         const int *expert_counts, int *expert_offsets,
         int num_experts, int device_idx, void *stream);
 
+    bool cudaMoE_build_active_expert_list(
+        const int *expert_counts, int *active_expert_ids,
+        int num_experts, int max_active_experts,
+        int device_idx, void *stream);
+
     bool cudaMoE_scatter_tokens(
         const int *routing_indices, const float *routing_weights,
         int *write_heads, const int *expert_offsets,
@@ -625,9 +1598,175 @@ extern "C"
         int *expert_counts,
         int *grouped_token_indices,
         int *original_to_grouped,
+        int *original_expert_ids,
         float *grouped_weights,
         int *active_expert_ids,
         int seq_len,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_group_prefill_routes_runtime(
+        const float *routing_indices,
+        const float *routing_weights,
+        void *runtime,
+        int *original_to_grouped,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
+        const float *routing_indices,
+        const float *routing_weights,
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int filter_to_local_runtime_experts,
+        int retain_routes_for_deferred_commit,
+        llaminar2::DeviceMoEWeightFormat expected_format,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_regroup_prefill_routes_runtime_assignments(
+        void *runtime,
+        int *original_to_grouped,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int retain_routes_for_deferred_commit,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+        void *runtime,
+        int *original_to_grouped,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int *active_expert_ids,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int retain_routes_for_deferred_commit,
+        llaminar2::DeviceMoEWeightFormat expected_format,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_commit_grouped_verifier_histograms(
+        void *runtime,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_assign_prefill_routes_least_loaded_resident(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        const int32_t *absolute_position_ids,
+        const int32_t *active_row_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_plan_prefill_routes_least_loaded_current_batch(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        uint32_t min_chunk_tokens,
+        uint32_t alpha_numerator,
+        uint32_t alpha_denominator,
+        uint32_t lambda_numerator,
+        uint32_t lambda_denominator,
+        uint64_t min_spread_improvement,
+        uint32_t min_spread_improvement_divisor,
+        uint64_t min_spread_improvement_per_critical_path_slot,
+        uint64_t min_foreign_rows_per_critical_path_slot,
+        uint32_t max_weight_transfers,
+        uint32_t max_non_owner_experts_per_participant,
+        int enable_balanced_skip,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_no_transfers(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        const void *transfer_status,
+        const void *apply_status,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
+        const void *runtime,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int num_experts,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_materialize_runtime_floating_descriptor_tables(
+        const void *runtime,
+        llaminar2::DeviceMoEFloatingMatrixDesc *gate_descs,
+        llaminar2::DeviceMoEFloatingMatrixDesc *up_descs,
+        llaminar2::DeviceMoEFloatingMatrixDesc *down_descs,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_prefill_gather_expert_runtime(
+        const void *runtime,
+        const float *hidden,
+        float *batch_buffer,
+        int expert_id,
+        int max_tokens,
+        int d_model,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_prefill_scatter_expert_runtime(
+        float *output,
+        const float *expert_output,
+        const void *runtime,
+        int expert_id,
+        int max_tokens,
+        int d_model,
         int device_idx,
         void *stream);
 
@@ -646,22 +1785,6 @@ extern "C"
         int expert_id, int max_tokens, int d_model,
         int device_idx, void *stream);
 
-    bool cudaMoE_grouped_gate_up_native_vnni_decode_table(
-        const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const int *d_expert_ids,
-        float *const *d_gate_outputs,
-        float *const *d_up_outputs,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        int num_active,
-        int intermediate,
-        int d_model,
-        uint8_t codebook_id,
-        int device_idx,
-        void *stream);
-
     bool cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
         const float *d_hidden,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
@@ -671,6 +1794,7 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        bool hidden_prequantized,
         float *d_gate_partials,
         float *d_up_partials,
         int num_active,
@@ -682,19 +1806,38 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-        const float *const *d_gate_ptrs,
-        const float *const *d_up_ptrs,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+    bool cudaMoE_grouped_gate_up_floating_decode_table(
+        const float *d_hidden,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_up_desc_table,
         const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        float *d_output,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
         int num_active,
-        int d_model,
         int intermediate,
+        int d_model,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int num_active,
+        int intermediate,
+        int d_model,
+        int num_experts,
         uint8_t codebook_id,
+        int k_partitions,
         int device_idx,
         void *stream);
 
@@ -702,6 +1845,42 @@ extern "C"
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_down_partials,
+        float *d_output,
+        float *d_canonical_route_contributions,
+        int num_active,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_grouped_swiglu_down_floating_decode_table(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        float *d_output,
+        float *d_canonical_route_contributions,
+        int num_active,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const void *d_runtime_layer,
         const int *d_expert_ids,
         const float *d_weights,
         int8_t *d_swiglu_int8,
@@ -719,13 +1898,18 @@ extern "C"
 
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
+        const int8_t *d_prequantized_hidden,
+        const float *d_prequantized_hidden_scales,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_down_desc_table,
         const int *d_group_counts,
         const int *d_group_offsets,
+        uint32_t *d_group_work_directory,
+        int group_work_directory_entries,
         const int *d_group_token_indices,
         const int *d_original_to_grouped,
+        const int *d_original_expert_ids,
         const int *d_active_expert_ids,
         const float *d_group_weights,
         int8_t *d_scratch_A_int8,
@@ -736,8 +1920,10 @@ extern "C"
         float *d_up_partials,
         int8_t *d_scratch_swiglu_int8,
         float *d_scratch_swiglu_scales,
+        float *d_down_partials,
         float *d_scratch_down_out,
         float *d_output,
+        float *d_canonical_route_contributions,
         int num_experts,
         int d_model,
         int intermediate,
@@ -745,17 +1931,468 @@ extern "C"
         int total_slots,
         int top_k,
         int active_expert_slots,
+        int grouped_indices_are_route_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         uint32_t gateup_codebook_mask,
         uint32_t down_codebook_mask,
         int gateup_k_partitions,
+        int gateup_ordered_tile_n,
+        int down_k_partitions,
+        int splitk_tile_rows,
+        llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine
+            projection_engine,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_gateup_columns,
+        llaminar2::cuda::moe::GroupedImmaColumns imma_down_columns,
+        llaminar2::cuda::moe::GroupedImmaGateUpSchedule
+            imma_gateup_schedule,
         int device_idx,
         void *stream);
+
+    bool cudaMoE_grouped_floating_prefill_pipeline(
+        const float *d_hidden,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_down_desc_table,
+        const int *d_original_to_grouped,
+        const int *d_original_expert_ids,
+        const float *d_grouped_weights,
+        float *d_grouped_gate,
+        float *d_grouped_up,
+        float *d_output,
+        float *d_canonical_route_contributions,
+        int seq_len,
+        int total_slots,
+        int top_k,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_reduce_canonical_route_contributions(
+        const float *d_route_contributions,
+        float *d_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_publish_shared_expert_rank_bank(
+        const float *d_shared_output,
+        float *d_canonical_publication,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_index,
+        int participant_count,
+        const int *d_effective_seq_len,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_finalize_canonical_publication(
+        const float *d_input,
+        const float *d_gate_inp,
+        const float *d_canonical_publication,
+        float *d_routed_output,
+        float *d_shared_output,
+        float *d_combined_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_count,
+        const int *d_effective_seq_len,
+        int device_idx,
+        void *stream);
+
 }
 
 namespace llaminar2
 {
+    bool CUDAMoEKernel::packMoEOverlayActivationDispatch(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationDispatchPackLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "packMoEOverlayActivationDispatch");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::packMoEOverlayActivationDispatch] complete packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationPackDispatch(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeMoEOverlayActivationDispatch(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationDispatchConsumeLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeMoEOverlayActivationDispatch");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeMoEOverlayActivationDispatch] complete packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationConsumeDispatch(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::packMoEOverlayActivationReturn(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationReturnPackLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "packMoEOverlayActivationReturn");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::packMoEOverlayActivationReturn] complete packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationPackReturn(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeMoEOverlayActivationReturn(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationReturnConsumeLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeMoEOverlayActivationReturn");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeMoEOverlayActivationReturn] complete packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationConsumeReturn(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeMoEOverlayCanonicalRouteTicket(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayCanonicalRouteTicketConsumeLaunch &ticket)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeMoEOverlayCanonicalRouteTicket");
+        if (!stream || !ticket.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeMoEOverlayCanonicalRouteTicket] complete mapped ticket binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayConsumeCanonicalRouteTicket(
+            &ticket, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::packSingleRowMoEOverlayActivationDispatch(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationSingleRowDispatchPackLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "packSingleRowMoEOverlayActivationDispatch");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::packSingleRowMoEOverlayActivationDispatch] complete one-row packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationPackSingleRowDispatch(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeSingleRowMoEOverlayActivationDispatch(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationSingleRowDispatchConsumeLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeSingleRowMoEOverlayActivationDispatch");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeSingleRowMoEOverlayActivationDispatch] complete one-row packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationConsumeSingleRowDispatch(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::packSingleRowMoEOverlayActivationReturn(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationSingleRowReturnPackLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "packSingleRowMoEOverlayActivationReturn");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::packSingleRowMoEOverlayActivationReturn] complete one-row packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationPackSingleRowReturn(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeSingleRowMoEOverlayActivationReturn(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationSingleRowReturnConsumeLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeSingleRowMoEOverlayActivationReturn");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeSingleRowMoEOverlayActivationReturn] complete one-row packet binding and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationConsumeSingleRowReturn(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::packSingleRowMoEOverlayActivationDispatchBatch(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationSingleRowDispatchBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "packSingleRowMoEOverlayActivationDispatchBatch");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::packSingleRowMoEOverlayActivationDispatchBatch] persistent topology batch and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationPackSingleRowDispatchBatch(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeSingleRowMoEOverlayActivationReturnBatch(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationSingleRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeSingleRowMoEOverlayActivationReturnBatch");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeSingleRowMoEOverlayActivationReturnBatch] persistent topology batch, gather scratch, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationConsumeSingleRowReturnBatch(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::consumeMultiRowMoEOverlayActivationReturnBatch(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayActivationMultiRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "consumeMultiRowMoEOverlayActivationReturnBatch");
+        if (!stream || !packet.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::consumeMultiRowMoEOverlayActivationReturnBatch] persistent topology batch, row-index scratch, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayActivationConsumeMultiRowReturnBatch(
+            &packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::publishNodeLocalCanonicalRoutes(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalRoutePublishLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "publishNodeLocalCanonicalRoutes");
+        if (!stream || !publication.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishNodeLocalCanonicalRoutes] complete mapped lane, route assignment, canonical contribution, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayPublishNodeLocalCanonicalRoutes(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::acquireNodeLocalCanonicalRoutes(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalRouteConsumeLaunch &consumption)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "acquireNodeLocalCanonicalRoutes");
+        if (!stream || !consumption.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::acquireNodeLocalCanonicalRoutes] persistent peer bindings, route assignment, validation storage, output, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayAcquireNodeLocalCanonicalRoutes(
+            &consumption, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::stageNodeLocalCanonicalRoutes(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalRouteConsumeLaunch &consumption)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "stageNodeLocalCanonicalRoutes");
+        if (!stream || !consumption.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::stageNodeLocalCanonicalRoutes] mapped sources, root scratch, route assignment, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayStageNodeLocalCanonicalRoutes(
+            &consumption, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::foldNodeLocalCanonicalRoutes(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalRouteConsumeLaunch &consumption)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "foldNodeLocalCanonicalRoutes");
+        if (!stream || !consumption.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::foldNodeLocalCanonicalRoutes] persistent peer bindings, staged payload, route assignment, validation storage, output, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayFoldNodeLocalCanonicalRoutes(
+            &consumption, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::beginNodeLocalDensePublication(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginNodeLocalDensePublication");
+        if (!stream || !publication.valid() ||
+            !publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::beginNodeLocalDensePublication] root binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayBeginNodeLocalDensePublication(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::finishNodeLocalDensePublication(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishNodeLocalDensePublication");
+        if (!stream || !publication.valid() ||
+            !publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::finishNodeLocalDensePublication] root binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayFinishNodeLocalDensePublication(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::beginNodeLocalDensePublicationConsume(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginNodeLocalDensePublicationConsume");
+        if (!stream || !publication.valid() || publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::beginNodeLocalDensePublicationConsume] peer binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayBeginNodeLocalDensePublicationConsume(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::finishNodeLocalDensePublicationConsume(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishNodeLocalDensePublicationConsume");
+        if (!stream || !publication.valid() || publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::finishNodeLocalDensePublicationConsume] peer binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayFinishNodeLocalDensePublicationConsume(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::runMoEOverlayDeviceControllerAction(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayDeviceControllerActionLaunch &action)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "runMoEOverlayDeviceControllerAction");
+        if (!stream || !action.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::runMoEOverlayDeviceControllerAction] a valid mapped controller action and explicit CUDA stream are required");
+            return false;
+        }
+        return cudaMoEOverlayRunDeviceControllerAction(
+            &action, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::beginMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayServiceTelemetrySample *sample)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginMoEOverlayServiceTelemetry");
+        if (!stream || !sample)
+            return false;
+        return cudaMoEOverlayBeginServiceTelemetry(
+            sample, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::finishMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoEOverlayServiceTelemetryCell *layer_telemetry,
+        DeviceMoEOverlayServiceTelemetrySample *sample,
+        std::uint32_t num_experts,
+        MoEOverlayServicePhaseHint hint,
+        const MoEOverlayInferenceGraphRole *runtime_graph_role)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishMoEOverlayServiceTelemetry");
+        if (!stream || !runtime_layer || !layer_telemetry || !sample ||
+            num_experts == 0u)
+        {
+            return false;
+        }
+        return cudaMoEOverlayFinishServiceTelemetry(
+            runtime_layer,
+            layer_telemetry,
+            sample,
+            num_experts,
+            static_cast<std::uint32_t>(hint),
+            runtime_graph_role,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::publishMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoEOverlayServiceTelemetryCell *telemetry,
+        const DeviceMoEOverlayServiceTelemetrySample *samples,
+        std::uint32_t layer_count,
+        std::int32_t participant_id,
+        MoEOverlayDeviceServiceTelemetryPublicationHeader *publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "publishMoEOverlayServiceTelemetry");
+        if (!stream || !telemetry || !samples || !publication ||
+            layer_count == 0u ||
+            participant_id < 0)
+        {
+            return false;
+        }
+        return cudaMoEOverlayPublishServiceTelemetry(
+            telemetry,
+            samples,
+            layer_count,
+            participant_id,
+            publication,
+            device_ordinal_,
+            stream);
+    }
+
     CUDAMoEKernel::CUDAMoEKernel(int device_ordinal)
         : device_ordinal_(device_ordinal)
     {
@@ -781,11 +2418,32 @@ namespace llaminar2
         // reuse as a no-op would preserve stale device sub-buffer pointers.
         const uint64_t next_workspace_id = workspace ? workspace->id() : 0;
         if (workspace_ == workspace && bound_workspace_id_ == next_workspace_id)
+        {
+            const bool needs_descriptor_rebind =
+                workspace_ &&
+                (std::any_of(grouped_down_desc_tables_.begin(), grouped_down_desc_tables_.end(),
+                             [](const GroupedDownDescriptorTable &table)
+                             {
+                                 return table.valid && !table.host_descs.empty() && !table.device_descs;
+                             }) ||
+                 std::any_of(grouped_gateup_desc_tables_.begin(), grouped_gateup_desc_tables_.end(),
+                             [](const GroupedGateUpDescriptorTable &table)
+                             {
+                                 return table.valid &&
+                                        !table.host_gate_descs.empty() &&
+                                        !table.host_up_descs.empty() &&
+                                        (!table.device_gate_descs || !table.device_up_descs);
+                             }));
+            if (needs_descriptor_rebind)
+                (void)rebindGroupedDescriptorTablesToWorkspace("bindWorkspace");
             return;
+        }
 
         CUDAKernelBase::bindWorkspace(workspace);
         bound_workspace_id_ = next_workspace_id;
         clearWorkspaceScratchBindings();
+        if (workspace_)
+            (void)rebindGroupedDescriptorTablesToWorkspace("bindWorkspace");
     }
 
     bool CUDAMoEKernel::bindWorkspaceBuffer(
@@ -826,17 +2484,75 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::bindGroupedDescriptorTableSlot(
+        const char *buffer_name,
+        std::size_t slot,
+        int num_experts,
+        DeviceNativeVNNIMatrixDesc **device_descs,
+        const char *context)
+    {
+        if (!buffer_name || !device_descs || num_experts <= 0 ||
+            slot >= static_cast<std::size_t>(
+                        MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+        {
+            return false;
+        }
+
+        void *base = nullptr;
+        if (!bindWorkspaceBuffer(
+                &base,
+                buffer_name,
+                sizeof(DeviceNativeVNNIMatrixDesc),
+                context))
+        {
+            return false;
+        }
+
+        const std::size_t available = workspace_->getBufferSize(buffer_name);
+        const std::size_t slot_bytes =
+            available /
+            static_cast<std::size_t>(
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+        const std::size_t descriptor_stride =
+            slot_bytes / sizeof(DeviceNativeVNNIMatrixDesc);
+        if (descriptor_stride < static_cast<std::size_t>(num_experts))
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << context
+                                           << " descriptor slot is too narrow in '"
+                                           << buffer_name << "': slot=" << slot
+                                           << " stride=" << descriptor_stride
+                                           << " requested_experts=" << num_experts
+                                           << " workspace_bytes=" << available);
+            return false;
+        }
+
+        const std::size_t descriptor_offset = slot * descriptor_stride;
+        const std::size_t descriptor_capacity =
+            available / sizeof(DeviceNativeVNNIMatrixDesc);
+        if (descriptor_offset + static_cast<std::size_t>(num_experts) >
+            descriptor_capacity)
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << context
+                                           << " descriptor slot exceeds workspace capacity in '"
+                                           << buffer_name << "': offset=" << descriptor_offset
+                                           << " requested_experts=" << num_experts
+                                           << " capacity=" << descriptor_capacity);
+            return false;
+        }
+
+        *device_descs =
+            static_cast<DeviceNativeVNNIMatrixDesc *>(base) + descriptor_offset;
+        return true;
+    }
+
     void CUDAMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
         staging_capacity_ = 0;
         d_route_logits_ = nullptr;
-        d_route_indices_ = nullptr;
-        d_route_weights_ = nullptr;
         route_logits_capacity_ = 0;
-        route_topk_capacity_ = 0;
-        route_buffers_workspace_bound_ = false;
+        route_logits_workspace_bound_ = false;
         d_group_int_indices_ = nullptr;
         d_group_offsets_ = nullptr;
         d_group_counts_ = nullptr;
@@ -846,22 +2562,34 @@ namespace llaminar2
         d_group_write_heads_ = nullptr;
         d_group_weights_ = nullptr;
         d_group_active_expert_ids_ = nullptr;
+        d_group_expert_mask_ = nullptr;
+        group_expert_mask_workspace_lease_.reset();
         group_active_expert_slots_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
+        group_buffers_workspace_bound_ = false;
+        group_expert_mask_cap_ = 0;
+        group_expert_mask_hash_ = 0;
+        group_expert_mask_num_experts_ = 0;
+        group_expert_mask_active_experts_ = 0;
+        group_expert_mask_published_ = false;
         d_prefill_A_int8_ = nullptr;
         d_prefill_A_scales_ = nullptr;
         d_prefill_swiglu_int8_ = nullptr;
         d_prefill_swiglu_scales_ = nullptr;
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
+        d_prefill_imma_directory_ = nullptr;
+        prefill_imma_directory_entries_cap_ = 0;
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
         d_decode_hidden_int8_ = nullptr;
         d_decode_hidden_scales_ = nullptr;
+        invalidateRouterQ8HiddenPublication();
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
+        decode_hidden_rows_cap_ = 0;
         d_grouped_gateup_gate_partials_ = nullptr;
         d_grouped_gateup_up_partials_ = nullptr;
         grouped_gateup_kpart_active_cap_ = 0;
@@ -875,111 +2603,757 @@ namespace llaminar2
         d_decode_swiglu_scales_ = nullptr;
         decode_down_topk_cap_ = 0;
         decode_down_intermediate_cap_ = 0;
-        d_grouped_decode_expert_ids_ = nullptr;
-        d_grouped_decode_weights_ = nullptr;
         d_routing_decode_expert_ids_ = nullptr;
-        grouped_decode_metadata_cap_ = 0;
         routing_decode_metadata_cap_ = 0;
-        grouped_decode_cached_expert_ids_.clear();
-        grouped_decode_cached_weights_.clear();
+        fixed_gateup_metadata_states_.clear();
+        fixed_down_metadata_states_.clear();
+        runtime_pointer_workspace_owners_.reset();
         gateup_pointer_slot_ready_.fill(false);
         down_pointer_slot_ready_.fill(false);
+        for (auto &table : grouped_down_desc_tables_)
+        {
+            table.device_descs = nullptr;
+            table.device_floating_descs = nullptr;
+            table.workspace_publication.reset();
+            table.workspace_slot = 0;
+        }
+        for (auto &table : grouped_gateup_desc_tables_)
+        {
+            table.device_gate_descs = nullptr;
+            table.device_up_descs = nullptr;
+            table.device_floating_gate_descs = nullptr;
+            table.device_floating_up_descs = nullptr;
+            table.workspace_publication.reset();
+            table.workspace_slot = 0;
+        }
+        router_q8_gate_cache_.clear();
         scratch_workspace_bound_ = false;
+    }
+
+    bool CUDAMoEKernel::publishGroupedDownDescriptorTable(
+        GroupedDownDescriptorTable &table,
+        const char *context)
+    {
+        const bool floating = deviceMoEWeightFormatIsFloating(
+            table.weight_format);
+        if (!workspace_ || !table.valid ||
+            (floating ? table.host_floating_descs.empty()
+                      : table.host_descs.empty()) ||
+            table.num_experts <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel] "
+                      << (context ? context : "down descriptor publication")
+                      << " requires a bound workspace and complete host table");
+            return false;
+        }
+        cudaStream_t stream = static_cast<cudaStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[CUDAMoEKernel] "
+                      << (context ? context : "down descriptor publication")
+                      << " requires an explicit CUDA stream");
+            return false;
+        }
+
+        if (floating)
+        {
+            const size_t desc_bytes =
+                static_cast<size_t>(table.num_experts) *
+                sizeof(DeviceMoEFloatingMatrixDesc);
+            const auto publication_result =
+                workspace_->getOrCreatePersistentPublication(
+                    kCudaGroupedDownDescriptorLeaseDomain,
+                    groupedFloatingDescriptorPublicationKey(
+                        table.host_floating_descs.data(),
+                        nullptr,
+                        table.weight_format,
+                        table.num_experts,
+                        table.d_model,
+                        table.intermediate),
+                    MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                    [&](std::size_t slot) -> std::shared_ptr<void>
+                    {
+                        DeviceNativeVNNIMatrixDesc *slot_base = nullptr;
+                        if (!bindGroupedDescriptorTableSlot(
+                                MoEWorkspaceBuffers::CUDA_GROUPED_DOWN_DESC_TABLES,
+                                slot,
+                                table.num_experts,
+                                &slot_base,
+                                "CUDA grouped floating down descriptor publication"))
+                        {
+                            return {};
+                        }
+                        auto *device_descs =
+                            reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(slot_base);
+
+                        cudaEvent_t ready_event = nullptr;
+                        cudaError_t err = cudaEventCreateWithFlags(
+                            &ready_event, cudaEventDisableTiming);
+                        if (err != cudaSuccess || !ready_event)
+                            return {};
+
+                        auto publication =
+                            std::shared_ptr<GroupedDescriptorWorkspacePublication>(
+                                new GroupedDescriptorWorkspacePublication{
+                                    .ready_event = static_cast<void *>(ready_event),
+                                    .primary_descs = device_descs,
+                                    .secondary_descs = nullptr,
+                                    .workspace_slot = slot,
+                                },
+                                [](GroupedDescriptorWorkspacePublication *value)
+                                {
+                                    if (value && value->ready_event)
+                                    {
+                                        (void)cudaEventDestroy(
+                                            static_cast<cudaEvent_t>(value->ready_event));
+                                    }
+                                    delete value;
+                                });
+                        err = cudaMemcpyAsync(
+                            device_descs,
+                            table.host_floating_descs.data(),
+                            desc_bytes,
+                            cudaMemcpyHostToDevice,
+                            stream);
+                        if (err != cudaSuccess)
+                            return {};
+                        err = cudaEventRecord(ready_event, stream);
+                        if (err != cudaSuccess)
+                            std::terminate();
+                        return publication;
+                    });
+            if (!publication_result)
+                return false;
+
+            auto publication = std::static_pointer_cast<
+                GroupedDescriptorWorkspacePublication>(
+                publication_result.publication);
+            const cudaError_t wait_err = cudaStreamWaitEvent(
+                stream,
+                static_cast<cudaEvent_t>(publication->ready_event),
+                0);
+            if (wait_err != cudaSuccess)
+                return false;
+
+            table.device_descs = nullptr;
+            table.device_floating_descs =
+                static_cast<DeviceMoEFloatingMatrixDesc *>(
+                    publication->primary_descs);
+            table.workspace_publication = std::move(publication);
+            table.workspace_slot = publication_result.slot;
+            return true;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(table.num_experts) *
+            sizeof(DeviceNativeVNNIMatrixDesc);
+        const auto publication_result =
+            workspace_->getOrCreatePersistentPublication(
+                kCudaGroupedDownDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    table.host_descs.data(),
+                    nullptr,
+                    table.num_experts,
+                    table.d_model,
+                    table.intermediate),
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+                    if (!bindGroupedDescriptorTableSlot(
+                            MoEWorkspaceBuffers::
+                                CUDA_GROUPED_DOWN_DESC_TABLES,
+                            slot,
+                            table.num_experts,
+                            &device_descs,
+                            "CUDA grouped down descriptor publication"))
+                    {
+                        return {};
+                    }
+
+                    cudaEvent_t ready_event = nullptr;
+                    cudaError_t err = cudaEventCreateWithFlags(
+                        &ready_event,
+                        cudaEventDisableTiming);
+                    if (err != cudaSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel] Failed to create grouped "
+                                  "down descriptor readiness event: "
+                                  << cudaGetErrorString(err));
+                        return {};
+                    }
+                    auto publication =
+                        std::shared_ptr<
+                            GroupedDescriptorWorkspacePublication>(
+                            new GroupedDescriptorWorkspacePublication{
+                                .ready_event =
+                                    static_cast<void *>(ready_event),
+                                .primary_descs = device_descs,
+                                .secondary_descs = nullptr,
+                                .workspace_slot = slot,
+                            },
+                            [](GroupedDescriptorWorkspacePublication *value)
+                            {
+                                if (value && value->ready_event)
+                                {
+                                    (void)cudaEventDestroy(
+                                        static_cast<cudaEvent_t>(
+                                            value->ready_event));
+                                }
+                                delete value;
+                            });
+
+                    err = cudaMemcpyAsync(
+                        device_descs,
+                        table.host_descs.data(),
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel] Grouped down descriptor "
+                                  "H2D publication failed: "
+                                  << cudaGetErrorString(err));
+                        return {};
+                    }
+                    err = cudaEventRecord(ready_event, stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel] Grouped down descriptor "
+                                  "publication cannot record readiness: "
+                                  << cudaGetErrorString(err));
+                        /*
+                         * The H2D producer has already been submitted. Without
+                         * its event there is no coherent slot rollback, and a
+                         * stream/device sync would be a hidden recovery path.
+                         */
+                        std::terminate();
+                    }
+                    return publication;
+                });
+        if (!publication_result)
+        {
+            LOG_ERROR("[CUDAMoEKernel] Failed to publish grouped down "
+                      "descriptor table");
+            return false;
+        }
+
+        auto publication =
+            std::static_pointer_cast<
+                GroupedDescriptorWorkspacePublication>(
+                publication_result.publication);
+        const cudaError_t wait_err = cudaStreamWaitEvent(
+            stream,
+            static_cast<cudaEvent_t>(publication->ready_event),
+            0);
+        if (wait_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel] Failed to adopt grouped down "
+                      "descriptor publication: "
+                      << cudaGetErrorString(wait_err));
+            return false;
+        }
+
+        table.device_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+            publication->primary_descs);
+        table.device_floating_descs = nullptr;
+        table.workspace_publication = std::move(publication);
+        table.workspace_slot = publication_result.slot;
+        return true;
+    }
+
+    bool CUDAMoEKernel::publishGroupedGateUpDescriptorTable(
+        GroupedGateUpDescriptorTable &table,
+        const char *context)
+    {
+        const bool floating = deviceMoEWeightFormatIsFloating(
+            table.weight_format);
+        if (!workspace_ || !table.valid ||
+            (floating ? table.host_floating_gate_descs.empty()
+                      : table.host_gate_descs.empty()) ||
+            (floating ? table.host_floating_up_descs.empty()
+                      : table.host_up_descs.empty()) ||
+            table.num_experts <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel] "
+                      << (context ? context : "gate/up descriptor publication")
+                      << " requires a bound workspace and complete host tables");
+            return false;
+        }
+        cudaStream_t stream = static_cast<cudaStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[CUDAMoEKernel] "
+                      << (context ? context : "gate/up descriptor publication")
+                      << " requires an explicit CUDA stream");
+            return false;
+        }
+
+        if (floating)
+        {
+            const size_t desc_bytes =
+                static_cast<size_t>(table.num_experts) *
+                sizeof(DeviceMoEFloatingMatrixDesc);
+            const auto publication_result =
+                workspace_->getOrCreatePersistentPublication(
+                    kCudaGroupedGateUpDescriptorLeaseDomain,
+                    groupedFloatingDescriptorPublicationKey(
+                        table.host_floating_gate_descs.data(),
+                        table.host_floating_up_descs.data(),
+                        table.weight_format,
+                        table.num_experts,
+                        table.d_model,
+                        table.intermediate),
+                    MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                    [&](std::size_t slot) -> std::shared_ptr<void>
+                    {
+                        DeviceNativeVNNIMatrixDesc *gate_slot_base = nullptr;
+                        DeviceNativeVNNIMatrixDesc *up_slot_base = nullptr;
+                        if (!bindGroupedDescriptorTableSlot(
+                                MoEWorkspaceBuffers::CUDA_GROUPED_GATE_DESC_TABLES,
+                                slot,
+                                table.num_experts,
+                                &gate_slot_base,
+                                "CUDA grouped floating gate descriptor publication") ||
+                            !bindGroupedDescriptorTableSlot(
+                                MoEWorkspaceBuffers::CUDA_GROUPED_UP_DESC_TABLES,
+                                slot,
+                                table.num_experts,
+                                &up_slot_base,
+                                "CUDA grouped floating up descriptor publication"))
+                        {
+                            return {};
+                        }
+                        auto *device_gate_descs =
+                            reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                                gate_slot_base);
+                        auto *device_up_descs =
+                            reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                                up_slot_base);
+
+                        cudaEvent_t ready_event = nullptr;
+                        cudaError_t err = cudaEventCreateWithFlags(
+                            &ready_event, cudaEventDisableTiming);
+                        if (err != cudaSuccess || !ready_event)
+                            return {};
+                        auto publication =
+                            std::shared_ptr<GroupedDescriptorWorkspacePublication>(
+                                new GroupedDescriptorWorkspacePublication{
+                                    .ready_event = static_cast<void *>(ready_event),
+                                    .primary_descs = device_gate_descs,
+                                    .secondary_descs = device_up_descs,
+                                    .workspace_slot = slot,
+                                },
+                                [](GroupedDescriptorWorkspacePublication *value)
+                                {
+                                    if (value && value->ready_event)
+                                    {
+                                        (void)cudaEventDestroy(
+                                            static_cast<cudaEvent_t>(value->ready_event));
+                                    }
+                                    delete value;
+                                });
+                        err = cudaMemcpyAsync(
+                            device_gate_descs,
+                            table.host_floating_gate_descs.data(),
+                            desc_bytes,
+                            cudaMemcpyHostToDevice,
+                            stream);
+                        if (err != cudaSuccess)
+                            return {};
+                        err = cudaMemcpyAsync(
+                            device_up_descs,
+                            table.host_floating_up_descs.data(),
+                            desc_bytes,
+                            cudaMemcpyHostToDevice,
+                            stream);
+                        if (err != cudaSuccess)
+                            std::terminate();
+                        err = cudaEventRecord(ready_event, stream);
+                        if (err != cudaSuccess)
+                            std::terminate();
+                        return publication;
+                    });
+            if (!publication_result)
+                return false;
+            auto publication = std::static_pointer_cast<
+                GroupedDescriptorWorkspacePublication>(
+                publication_result.publication);
+            const cudaError_t wait_err = cudaStreamWaitEvent(
+                stream,
+                static_cast<cudaEvent_t>(publication->ready_event),
+                0);
+            if (wait_err != cudaSuccess)
+                return false;
+
+            table.device_gate_descs = nullptr;
+            table.device_up_descs = nullptr;
+            table.device_floating_gate_descs =
+                static_cast<DeviceMoEFloatingMatrixDesc *>(
+                    publication->primary_descs);
+            table.device_floating_up_descs =
+                static_cast<DeviceMoEFloatingMatrixDesc *>(
+                    publication->secondary_descs);
+            table.workspace_publication = std::move(publication);
+            table.workspace_slot = publication_result.slot;
+            return true;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(table.num_experts) *
+            sizeof(DeviceNativeVNNIMatrixDesc);
+        const auto publication_result =
+            workspace_->getOrCreatePersistentPublication(
+                kCudaGroupedGateUpDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    table.host_gate_descs.data(),
+                    table.host_up_descs.data(),
+                    table.num_experts,
+                    table.d_model,
+                    table.intermediate),
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    DeviceNativeVNNIMatrixDesc *device_gate_descs =
+                        nullptr;
+                    DeviceNativeVNNIMatrixDesc *device_up_descs =
+                        nullptr;
+                    if (!bindGroupedDescriptorTableSlot(
+                            MoEWorkspaceBuffers::
+                                CUDA_GROUPED_GATE_DESC_TABLES,
+                            slot,
+                            table.num_experts,
+                            &device_gate_descs,
+                            "CUDA grouped gate descriptor publication") ||
+                        !bindGroupedDescriptorTableSlot(
+                            MoEWorkspaceBuffers::
+                                CUDA_GROUPED_UP_DESC_TABLES,
+                            slot,
+                            table.num_experts,
+                            &device_up_descs,
+                            "CUDA grouped up descriptor publication"))
+                    {
+                        return {};
+                    }
+
+                    cudaEvent_t ready_event = nullptr;
+                    cudaError_t err = cudaEventCreateWithFlags(
+                        &ready_event,
+                        cudaEventDisableTiming);
+                    if (err != cudaSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel] Failed to create grouped "
+                                  "gate/up descriptor readiness event: "
+                                  << cudaGetErrorString(err));
+                        return {};
+                    }
+                    auto publication =
+                        std::shared_ptr<
+                            GroupedDescriptorWorkspacePublication>(
+                            new GroupedDescriptorWorkspacePublication{
+                                .ready_event =
+                                    static_cast<void *>(ready_event),
+                                .primary_descs = device_gate_descs,
+                                .secondary_descs = device_up_descs,
+                                .workspace_slot = slot,
+                            },
+                            [](GroupedDescriptorWorkspacePublication *value)
+                            {
+                                if (value && value->ready_event)
+                                {
+                                    (void)cudaEventDestroy(
+                                        static_cast<cudaEvent_t>(
+                                            value->ready_event));
+                                }
+                                delete value;
+                            });
+
+                    err = cudaMemcpyAsync(
+                        device_gate_descs,
+                        table.host_gate_descs.data(),
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel] Grouped gate descriptor "
+                                  "H2D publication failed: "
+                                  << cudaGetErrorString(err));
+                        return {};
+                    }
+                    err = cudaMemcpyAsync(
+                        device_up_descs,
+                        table.host_up_descs.data(),
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel] Grouped up descriptor H2D "
+                                  "publication failed after gate submission: "
+                                  << cudaGetErrorString(err));
+                        std::terminate();
+                    }
+                    err = cudaEventRecord(ready_event, stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel] Grouped gate/up descriptor "
+                                  "publication cannot record readiness: "
+                                  << cudaGetErrorString(err));
+                        std::terminate();
+                    }
+                    return publication;
+                });
+        if (!publication_result)
+        {
+            LOG_ERROR("[CUDAMoEKernel] Failed to publish grouped gate/up "
+                      "descriptor table");
+            return false;
+        }
+
+        auto publication =
+            std::static_pointer_cast<
+                GroupedDescriptorWorkspacePublication>(
+                publication_result.publication);
+        const cudaError_t wait_err = cudaStreamWaitEvent(
+            stream,
+            static_cast<cudaEvent_t>(publication->ready_event),
+            0);
+        if (wait_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel] Failed to adopt grouped gate/up "
+                      "descriptor publication: "
+                      << cudaGetErrorString(wait_err));
+            return false;
+        }
+
+        table.device_gate_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+            publication->primary_descs);
+        table.device_up_descs = static_cast<DeviceNativeVNNIMatrixDesc *>(
+            publication->secondary_descs);
+        table.device_floating_gate_descs = nullptr;
+        table.device_floating_up_descs = nullptr;
+        table.workspace_publication = std::move(publication);
+        table.workspace_slot = publication_result.slot;
+        return true;
+    }
+
+    bool CUDAMoEKernel::rebindGroupedDescriptorTablesToWorkspace(const char *context)
+    {
+        if (grouped_down_desc_tables_.empty() && grouped_gateup_desc_tables_.empty())
+            return true;
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "rebind grouped descriptor tables"))
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, context ? context : "rebindGroupedDescriptorTablesToWorkspace"))
+            return false;
+        for (auto &table : grouped_down_desc_tables_)
+        {
+            const bool floating = deviceMoEWeightFormatIsFloating(
+                table.weight_format);
+            if (!table.valid ||
+                (floating ? table.host_floating_descs.empty()
+                          : table.host_descs.empty()) ||
+                table.num_experts <= 0)
+                continue;
+            if (!publishGroupedDownDescriptorTable(table, context))
+                return false;
+        }
+
+        for (auto &table : grouped_gateup_desc_tables_)
+        {
+            const bool floating = deviceMoEWeightFormatIsFloating(
+                table.weight_format);
+            if (!table.valid ||
+                (floating ? table.host_floating_gate_descs.empty()
+                          : table.host_gate_descs.empty()) ||
+                (floating ? table.host_floating_up_descs.empty()
+                          : table.host_up_descs.empty()) ||
+                table.num_experts <= 0)
+            {
+                continue;
+            }
+            if (!publishGroupedGateUpDescriptorTable(table, context))
+                return false;
+        }
+        return true;
     }
 
     void CUDAMoEKernel::resetDynamicState()
     {
-        host_expert_counts_.clear();
-        host_expert_offsets_.clear();
-        host_grouped_indices_.clear();
-        host_grouped_weights_.clear();
-        prepared_num_experts_ = 0;
-        group_active_expert_slots_ = 0;
         /*
-         * Runtime pointer slots are staged during graph warmup.  A dynamic
-         * reset means the next captured graph must restage its deterministic
-         * scoped table slots instead of inheriting bindings from a discarded
-         * graph.
+         * This hook is reached only on hard kernel-dynamic reset boundaries.
+         * Replay-preserving request reset deliberately avoids
+         * KernelFactory::resetAllDynamicState(), because captured CUDA graphs
+         * may still reference workspace-backed pointer tables.  Once the hard
+         * reset path is chosen, grouped prefill/decode scratch, mask upload
+         * hashes, router caches, and descriptor-table handles must all be
+         * treated as invalid so cached stages rebuild them before the next
+         * eager warmup or capture.
          */
-        gateup_pointer_slot_ready_.fill(false);
-        down_pointer_slot_ready_.fill(false);
+        clearWorkspaceScratchBindings();
+        grouped_down_desc_tables_.clear();
+        grouped_gateup_desc_tables_.clear();
+    }
+
+    bool CUDAMoEKernel::acquireMoEOverlayEpoch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochTicket *ticket,
+        DeviceMoEOverlayEpochStatus *status,
+        const std::uint64_t *external_admission_epoch,
+        DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
+        MoEOverlayPeerPlacementEpochBinding peer_placement_epoch)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "acquireMoEOverlayEpoch");
+        if (!stream || !control || !ticket || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::acquireMoEOverlayEpoch] control, ticket, status, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayEpochAcquire(
+            control,
+            ticket,
+            status,
+            external_admission_epoch,
+            admission_barrier,
+            peer_placement_epoch,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::releaseMoEOverlayEpoch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochTicket *ticket,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "releaseMoEOverlayEpoch");
+        if (!stream || !control || !ticket || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::releaseMoEOverlayEpoch] control, ticket, status, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayEpochRelease(
+            control, ticket, status, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::reserveMoEOverlayEpochCandidate(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "reserveMoEOverlayEpochCandidate");
+        if (!stream || !control || !candidate_epoch || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::reserveMoEOverlayEpochCandidate] control, device epoch, status, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayEpochReserveCandidate(
+            control, candidate_epoch, status, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::markMoEOverlayEpochCandidateReady(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "markMoEOverlayEpochCandidateReady");
+        if (!stream || !control || !candidate_epoch || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::markMoEOverlayEpochCandidateReady] control, device epoch, status, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayEpochMarkCandidateReady(
+            control, candidate_epoch, status, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::publishMoEOverlayEpochCandidate(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "publishMoEOverlayEpochCandidate");
+        if (!stream || !control || !candidate_epoch || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishMoEOverlayEpochCandidate] control, device epoch, status, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayEpochPublishCandidate(
+            control, candidate_epoch, status, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::abortMoEOverlayEpochCandidate(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "abortMoEOverlayEpochCandidate");
+        if (!stream || !control || !candidate_epoch || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::abortMoEOverlayEpochCandidate] control, device epoch, status, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayEpochAbortCandidate(
+            control, candidate_epoch, status, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::retireMoEOverlayEpoch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *retiring_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "retireMoEOverlayEpoch");
+        if (!stream || !control || !retiring_epoch || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::retireMoEOverlayEpoch] control, device epoch, status, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayEpochRetire(
+            control, retiring_epoch, status, device_ordinal_, stream);
     }
 
     void CUDAMoEKernel::releaseDeviceBuffers() noexcept
     {
         cudaSetDevice(device_ordinal_);
-        auto release = [](auto *&ptr)
-        {
-            if (ptr)
-            {
-                cudaFree(ptr);
-                ptr = nullptr;
-            }
-        };
-
-        if (scratch_workspace_bound_)
-        {
-            clearWorkspaceScratchBindings();
-        }
-        else
-        {
-            release(d_staging_indices_);
-            release(d_staging_weights_);
-            release(d_route_logits_);
-            release(d_route_indices_);
-            release(d_route_weights_);
-            release(d_group_int_indices_);
-            release(d_group_offsets_);
-            release(d_group_counts_);
-            release(d_group_token_indices_);
-            release(d_group_original_to_grouped_);
-            release(d_group_original_expert_ids_);
-            release(d_group_active_expert_ids_);
-            release(d_group_write_heads_);
-            release(d_group_weights_);
-            release(d_prefill_A_int8_);
-            release(d_prefill_A_scales_);
-            release(d_prefill_swiglu_int8_);
-            release(d_prefill_swiglu_scales_);
-            release(d_prefill_gate_);
-            release(d_prefill_up_);
-            release(d_decode_hidden_int8_);
-            release(d_decode_hidden_scales_);
-            release(d_grouped_gateup_gate_partials_);
-            release(d_grouped_gateup_up_partials_);
-            release(d_grouped_down_partials_);
-            release(d_decode_swiglu_int8_);
-            release(d_decode_swiglu_scales_);
-            release(d_grouped_decode_expert_ids_);
-            release(d_grouped_decode_weights_);
-            release(d_routing_decode_expert_ids_);
-        }
-        for (auto &table : grouped_down_desc_tables_)
-            release(table.device_descs);
-        for (auto &table : grouped_gateup_desc_tables_)
-        {
-            release(table.device_gate_descs);
-            release(table.device_up_descs);
-        }
+        clearWorkspaceScratchBindings();
         staging_capacity_ = 0;
         route_logits_capacity_ = 0;
-        route_topk_capacity_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
         group_active_expert_slots_ = 0;
+        group_expert_mask_cap_ = 0;
+        group_expert_mask_hash_ = 0;
+        group_expert_mask_num_experts_ = 0;
+        group_expert_mask_active_experts_ = 0;
+        group_expert_mask_published_ = false;
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
+        decode_hidden_rows_cap_ = 0;
+        invalidateRouterQ8HiddenPublication();
+        router_q8_gate_cache_.clear();
         grouped_gateup_kpart_active_cap_ = 0;
         grouped_gateup_kpart_partitions_cap_ = 0;
         grouped_gateup_kpart_intermediate_cap_ = 0;
         decode_down_topk_cap_ = 0;
         decode_down_intermediate_cap_ = 0;
-        grouped_decode_metadata_cap_ = 0;
-        grouped_decode_cached_expert_ids_.clear();
-        grouped_decode_cached_weights_.clear();
         grouped_down_kpart_partitions_cap_ = 0;
         grouped_down_kpart_d_model_cap_ = 0;
         grouped_down_kpart_slots_cap_ = 0;
@@ -988,76 +3362,6 @@ namespace llaminar2
         gateup_pointer_slot_ready_.fill(false);
         down_pointer_slot_ready_.fill(false);
 
-        if (router_cublas_handle_)
-        {
-            cublasDestroy(static_cast<cublasHandle_t>(router_cublas_handle_));
-            router_cublas_handle_ = nullptr;
-        }
-    }
-
-    bool CUDAMoEKernel::routeLogitsCuBLAS(const float *hidden, const float *gate_weights, float *logits,
-                                          int seq_len, int d_model, int num_experts)
-    {
-        void *stream = getStream();
-        if (!stream)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] CUDA router requires an explicit stream");
-            return false;
-        }
-
-        if (!router_cublas_handle_)
-        {
-            if (isGraphCaptureActive() || isCudaStreamCapturing(stream))
-            {
-                LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cuBLAS handle was not warmed before graph capture");
-                return false;
-            }
-            if (!setMoEDevice(device_ordinal_, "CUDAMoEKernel::routeLogitsCuBLAS"))
-                return false;
-            cublasHandle_t handle = nullptr;
-            const cublasStatus_t create_status = cublasCreate(&handle);
-            if (create_status != CUBLAS_STATUS_SUCCESS)
-            {
-                LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasCreate failed: "
-                          << static_cast<int>(create_status));
-                return false;
-            }
-            cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
-            router_cublas_handle_ = handle;
-        }
-
-        auto *handle = static_cast<cublasHandle_t>(router_cublas_handle_);
-        cublasStatus_t status = cublasSetStream(handle, static_cast<cudaStream_t>(stream));
-        if (status != CUBLAS_STATUS_SUCCESS)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSetStream failed: "
-                      << static_cast<int>(status));
-            return false;
-        }
-
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        // Row-major logits[S,E] = hidden[S,D] * gate[E,D]^T.
-        // In cuBLAS column-major views this is C^T[E,S] = gate[E,D] * hidden^T[D,S].
-        status = cublasSgemm(
-            handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            num_experts, seq_len, d_model,
-            &alpha,
-            gate_weights, d_model,
-            hidden, d_model,
-            &beta,
-            logits, num_experts);
-        if (status != CUBLAS_STATUS_SUCCESS)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSgemm failed: "
-                      << static_cast<int>(status)
-                      << " seq_len=" << seq_len
-                      << " d_model=" << d_model
-                      << " num_experts=" << num_experts);
-            return false;
-        }
-        return true;
     }
 
     bool CUDAMoEKernel::ensureStagingCapacity(int count)
@@ -1086,53 +3390,59 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureRouteBufferCapacity(size_t logits_count, size_t topk_count)
+    bool CUDAMoEKernel::ensureRouteBufferCapacity(size_t logits_count)
     {
         // Capacity alone is not enough for graph-captured MoE routing.  This
         // kernel is a per-device singleton shared by many stages, so a previous
         // eager or stale binding can leave counters that look large enough while
         // the actual pointers are no longer the current graph workspace buffers.
-        if (route_buffers_workspace_bound_ &&
-            d_route_logits_ && d_route_indices_ && d_route_weights_ &&
-            logits_count <= route_logits_capacity_ && topk_count <= route_topk_capacity_)
+        if (route_logits_workspace_bound_ &&
+            d_route_logits_ && logits_count <= route_logits_capacity_)
         {
             return true;
         }
 
         void *route_logits = nullptr;
-        void *route_indices = nullptr;
-        void *route_weights = nullptr;
-        const bool ok =
-            bindWorkspaceBuffer(&route_logits, MoEWorkspaceBuffers::ROUTE_LOGITS,
-                                logits_count * sizeof(float), "route logits") &&
-            bindWorkspaceBuffer(&route_indices, MoEWorkspaceBuffers::ROUTE_INDICES,
-                                topk_count * sizeof(int), "route indices") &&
-            bindWorkspaceBuffer(&route_weights, MoEWorkspaceBuffers::ROUTE_WEIGHTS,
-                                topk_count * sizeof(float), "route weights");
+        const bool ok = bindWorkspaceBuffer(
+            &route_logits,
+            MoEWorkspaceBuffers::ROUTE_LOGITS,
+            logits_count * sizeof(float),
+            "route logits");
         if (!ok)
         {
             d_route_logits_ = nullptr;
-            d_route_indices_ = nullptr;
-            d_route_weights_ = nullptr;
             route_logits_capacity_ = 0;
-            route_topk_capacity_ = 0;
-            route_buffers_workspace_bound_ = false;
+            route_logits_workspace_bound_ = false;
             return false;
         }
 
         d_route_logits_ = static_cast<float *>(route_logits);
-        d_route_indices_ = static_cast<int *>(route_indices);
-        d_route_weights_ = static_cast<float *>(route_weights);
         route_logits_capacity_ = logits_count;
-        route_topk_capacity_ = topk_count;
-        route_buffers_workspace_bound_ = true;
+        route_logits_workspace_bound_ = true;
         return true;
     }
 
     bool CUDAMoEKernel::ensureGroupingBufferCapacity(int total_slots, int num_experts)
     {
-        if (total_slots <= group_slots_cap_ && num_experts <= group_experts_cap_)
+        /*
+         * Capacity describes only the shape of the last successful binding.
+         * The CUDA MoE kernel is a per-device singleton shared by sibling graph
+         * stages, so workspace replacement can revoke every pointer without
+         * changing the requested shape. Require the complete binding proof and
+         * every pointer before allowing the fast reuse path. This mirrors the
+         * route-buffer contract and prevents a stale 0xff grouping memset from
+         * targeting an arena range owned by another graph buffer.
+         */
+        if (group_buffers_workspace_bound_ &&
+            d_group_int_indices_ && d_group_token_indices_ &&
+            d_group_original_to_grouped_ && d_group_original_expert_ids_ &&
+            d_group_weights_ && d_group_offsets_ && d_group_counts_ &&
+            d_group_active_expert_ids_ && d_group_write_heads_ &&
+            total_slots <= group_slots_cap_ &&
+            num_experts <= group_experts_cap_)
+        {
             return true;
+        }
 
         void *group_int_indices = nullptr;
         void *group_token_indices = nullptr;
@@ -1176,6 +3486,7 @@ namespace llaminar2
             d_group_write_heads_ = nullptr;
             group_slots_cap_ = 0;
             group_experts_cap_ = 0;
+            group_buffers_workspace_bound_ = false;
             return false;
         }
 
@@ -1190,6 +3501,7 @@ namespace llaminar2
         d_group_write_heads_ = static_cast<int *>(group_write_heads);
         group_slots_cap_ = total_slots;
         group_experts_cap_ = num_experts;
+        group_buffers_workspace_bound_ = true;
         return true;
     }
 
@@ -1257,14 +3569,60 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedGateUpDecodeCapacity(int top_k, int d_model)
+    bool CUDAMoEKernel::ensureGroupedImmaDirectoryCapacity(
+        int total_slots,
+        int num_experts)
+    {
+        if (total_slots <= 0 || num_experts <= 0 ||
+            num_experts > cuda::moe::kGroupedImmaMaximumExperts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::ensureGroupedImmaDirectoryCapacity] "
+                      "invalid grouped IMMA geometry total_slots="
+                      << total_slots << " num_experts=" << num_experts);
+            return false;
+        }
+
+        const std::size_t required_entries =
+            cuda::moe::groupedImmaDirectoryEntries(
+                static_cast<std::size_t>(total_slots),
+                static_cast<std::size_t>(num_experts));
+        if (d_prefill_imma_directory_ &&
+            prefill_imma_directory_entries_cap_ >=
+                static_cast<int>(required_entries))
+        {
+            return true;
+        }
+
+        void *directory = nullptr;
+        if (!bindWorkspaceBuffer(
+                &directory,
+                MoEWorkspaceBuffers::CUDA_PREFILL_WORK_DIRECTORY,
+                required_entries * sizeof(uint32_t),
+                "grouped IMMA work directory"))
+        {
+            d_prefill_imma_directory_ = nullptr;
+            prefill_imma_directory_entries_cap_ = 0;
+            return false;
+        }
+
+        d_prefill_imma_directory_ = static_cast<uint32_t *>(directory);
+        prefill_imma_directory_entries_cap_ =
+            static_cast<int>(required_entries);
+        return true;
+    }
+
+    bool CUDAMoEKernel::ensureGroupedGateUpDecodeCapacity(
+        int top_k,
+        int d_model,
+        int hidden_rows)
     {
         if (top_k <= 0 || top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            d_model <= 0 || (d_model % 32) != 0)
+            d_model <= 0 || (d_model % 32) != 0 || hidden_rows <= 0)
             return false;
 
         const bool need_growth = top_k > decode_gateup_topk_cap_ ||
                                  d_model > decode_gateup_d_model_cap_ ||
+                                 hidden_rows > decode_hidden_rows_cap_ ||
                                  !d_decode_hidden_int8_ || !d_decode_hidden_scales_;
         if (!need_growth)
             return true;
@@ -1274,15 +3632,20 @@ namespace llaminar2
         void *decode_hidden_scales = nullptr;
         const bool ok =
             bindWorkspaceBuffer(&decode_hidden_int8, MoEWorkspaceBuffers::DECODE_HIDDEN_INT8,
-                                static_cast<size_t>(d_model) * sizeof(int8_t), "decode hidden int8") &&
+                                static_cast<size_t>(hidden_rows) *
+                                    static_cast<size_t>(d_model) * sizeof(int8_t),
+                                "decode hidden int8") &&
             bindWorkspaceBuffer(&decode_hidden_scales, MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,
-                                static_cast<size_t>(blocks_per_row) * sizeof(float), "decode hidden scales");
+                                static_cast<size_t>(hidden_rows) *
+                                    static_cast<size_t>(blocks_per_row) * sizeof(float),
+                                "decode hidden scales");
         if (!ok)
         {
             d_decode_hidden_int8_ = nullptr;
             d_decode_hidden_scales_ = nullptr;
             decode_gateup_topk_cap_ = 0;
             decode_gateup_d_model_cap_ = 0;
+            decode_hidden_rows_cap_ = 0;
             return false;
         }
 
@@ -1290,25 +3653,418 @@ namespace llaminar2
         d_decode_hidden_scales_ = static_cast<float *>(decode_hidden_scales);
         decode_gateup_topk_cap_ = top_k;
         decode_gateup_d_model_cap_ = d_model;
+        decode_hidden_rows_cap_ = hidden_rows;
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedGateUpKPartScratchCapacity(int top_k, int k_partitions, int intermediate)
+    void CUDAMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
+    {
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::ProducerAndConsumer &&
+            router_q8_hidden_publication_)
+        {
+            router_q8_hidden_publication_->clearPayload();
+        }
+    }
+
+    bool CUDAMoEKernel::bindRouterQ8HiddenPublication(
+        std::shared_ptr<MoERouterQ8HiddenPublication> publication,
+        MoERouterQ8PublicationAccess access)
+    {
+        if (!publication)
+        {
+            LOG_ERROR("[CUDAMoEKernel::bindRouterQ8HiddenPublication] null publication");
+            return false;
+        }
+        if (publication->device_ordinal >= 0 &&
+            (publication->backend != DeviceType::CUDA ||
+             publication->device_ordinal != device_ordinal_))
+        {
+            LOG_ERROR("[CUDAMoEKernel::bindRouterQ8HiddenPublication] device mismatch"
+                      << " publication_backend="
+                      << static_cast<int>(publication->backend)
+                      << " publication_ordinal=" << publication->device_ordinal
+                      << " kernel_ordinal=" << device_ordinal_);
+            return false;
+        }
+
+        publication->backend = DeviceType::CUDA;
+        publication->device_ordinal = device_ordinal_;
+        router_q8_hidden_publication_ = std::move(publication);
+        router_q8_publication_access_ = access;
+        return true;
+    }
+
+    void CUDAMoEKernel::publishRouterQ8Hidden(
+        const float *source,
+        int rows,
+        bool recorded_during_capture) noexcept
+    {
+        if (router_q8_publication_access_ !=
+                MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+            !router_q8_hidden_publication_)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishRouterQ8Hidden] consumer-only kernel attempted publication");
+            return;
+        }
+        if (!source || rows <= 0 || rows > decode_hidden_rows_cap_ ||
+            !d_decode_hidden_int8_ || !d_decode_hidden_scales_)
+        {
+            invalidateRouterQ8HiddenPublication();
+            return;
+        }
+
+        auto &publication = *router_q8_hidden_publication_;
+        publication.backend = DeviceType::CUDA;
+        publication.device_ordinal = device_ordinal_;
+        publication.source_rows = source;
+        publication.quantized_rows = d_decode_hidden_int8_;
+        publication.row_scales = d_decode_hidden_scales_;
+        publication.published_rows = rows;
+        publication.d_model_capacity = decode_gateup_d_model_cap_;
+        publication.blocks_per_row_capacity =
+            (decode_gateup_d_model_cap_ + 31) / 32;
+        publication.capture_recorded = recorded_during_capture;
+    }
+
+    bool CUDAMoEKernel::canReuseRouterQ8Hidden(
+        const float *source,
+        int rows,
+        int d_model) const noexcept
+    {
+        return routerQ8HiddenReuseBlockReason(source, rows, d_model) == nullptr;
+    }
+
+    const char *CUDAMoEKernel::routerQ8HiddenReuseBlockReason(
+        const float *source,
+        int rows,
+        int d_model) const noexcept
+    {
+        if (!debugEnv().gemm.cuda_moe_reuse_router_q8_hidden)
+            return "disabled";
+        if (!router_q8_hidden_publication_)
+            return "not_published";
+        const auto &publication = *router_q8_hidden_publication_;
+        if (!publication.quantized_rows || !publication.row_scales)
+            return "not_published";
+        if (publication.backend != DeviceType::CUDA ||
+            publication.device_ordinal != device_ordinal_)
+            return "device_mismatch";
+        if (publication.source_rows != source)
+            return "source_changed";
+        if (rows <= 0 || publication.published_rows < rows)
+            return "insufficient_rows";
+        if (d_model <= 0 || publication.d_model_capacity < d_model ||
+            publication.blocks_per_row_capacity < ((d_model + 31) / 32))
+            return "insufficient_d_model_capacity";
+        if (publication.capture_recorded &&
+            !isCudaMoEDecodeCaptureActive(getStream()))
+        {
+            return "capture_provenance";
+        }
+        return nullptr;
+    }
+
+    const CUDAMoEKernel::RouterQ8GateCacheEntry *CUDAMoEKernel::getOrCreateQ8RouterGateCache(
+        const float *gate_device_ptr,
+        int d_model,
+        int num_experts)
+    {
+        if (!debugEnv().gemm.cuda_moe_router_q8)
+            return nullptr;
+        if (!gate_device_ptr || d_model <= 0 || num_experts <= 0 ||
+            (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] invalid Q8 router gate request "
+                      "(gate_device_ptr=" << static_cast<const void *>(gate_device_ptr)
+                      << " d_model=" << d_model
+                      << " num_experts=" << num_experts << ")");
+            return nullptr;
+        }
+        if (!workspace_)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] "
+                      "graph-owned workspace is required before cache publication");
+            return nullptr;
+        }
+
+        const DeviceResidentRouterGateCacheKey cache_key =
+            DeviceResidentRouterGateCacheKey::make(
+                workspace_->id(), gate_device_ptr, d_model, num_experts);
+        for (const auto &entry : router_q8_gate_cache_)
+        {
+            if (entry.key == cache_key &&
+                entry.d_gate_weights_q8 && entry.d_gate_scales)
+            {
+                return &entry;
+            }
+        }
+
+        void *stream = getStream();
+        const bool capture_active =
+            isGraphCaptureActive() ||
+            (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
+            isCudaStreamCapturing(stream);
+        if (capture_active)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] Q8 router cache miss during graph capture");
+            return nullptr;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] explicit CUDA stream is required");
+            return nullptr;
+        }
+
+        const size_t d_model_sz = static_cast<size_t>(d_model);
+        const size_t experts_sz = static_cast<size_t>(num_experts);
+        if (d_model_sz > std::numeric_limits<size_t>::max() / experts_sz)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] router gate size overflow");
+            return nullptr;
+        }
+        const size_t element_count = d_model_sz * experts_sz;
+        const int blocks_per_row = d_model / 32;
+        const size_t scale_count = static_cast<size_t>(num_experts) * static_cast<size_t>(blocks_per_row);
+
+        if (!setMoEDevice(device_ordinal_, "getOrCreateQ8RouterGateCache"))
+            return nullptr;
+
+        void *gate_weights_base = nullptr;
+        void *gate_scales_base = nullptr;
+        const size_t weights_payload_bytes = element_count * sizeof(int8_t);
+        const size_t scales_payload_bytes = scale_count * sizeof(float);
+        if (!bindWorkspaceBuffer(&gate_weights_base,
+                                 MoEWorkspaceBuffers::CUDA_ROUTER_Q8_GATE_WEIGHTS,
+                                 weights_payload_bytes,
+                                 "CUDA Q8 router gate weights") ||
+            !bindWorkspaceBuffer(&gate_scales_base,
+                                 MoEWorkspaceBuffers::CUDA_ROUTER_Q8_GATE_SCALES,
+                                 scales_payload_bytes,
+                                 "CUDA Q8 router gate scales"))
+        {
+            return nullptr;
+        }
+
+        /*
+         * Graph-local router/expert pairs intentionally own separate backend
+         * kernel objects. The converted model weight does not: its bytes are
+         * immutable and belong to this workspace allocation. Publish them under
+         * the exact device-weight key so every graph adopts one slot instead of
+         * allocating and reconverting an identical private copy.
+         *
+         * The manager serializes this setup-only factory. Recording the event
+         * before the factory returns means another graph can enqueue a pure
+         * device-side dependency without a host or device synchronization.
+         */
+        const auto publication_result =
+            workspace_->getOrCreatePersistentPublication(
+                kCudaRouterQ8GatePublicationDomain,
+                routerPublicationKey(cache_key),
+                MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                [&](std::size_t slot) -> std::shared_ptr<void>
+                {
+                    void *weights = workspace_->getPersistentSlotBuffer(
+                        MoEWorkspaceBuffers::CUDA_ROUTER_Q8_GATE_WEIGHTS,
+                        MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                        slot,
+                        weights_payload_bytes);
+                    void *scales = workspace_->getPersistentSlotBuffer(
+                        MoEWorkspaceBuffers::CUDA_ROUTER_Q8_GATE_SCALES,
+                        MoEWorkspaceBuffers::kRouterGateCacheSlots,
+                        slot,
+                        scales_payload_bytes);
+                    if (!weights || !scales)
+                        return {};
+
+                    cudaEvent_t ready_event = nullptr;
+                    cudaError_t event_err = cudaEventCreateWithFlags(
+                        &ready_event, cudaEventDisableTiming);
+                    if (event_err != cudaSuccess || !ready_event)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] "
+                                  "failed to create immutable publication event: "
+                                  << cudaGetErrorString(event_err));
+                        return {};
+                    }
+
+                    auto publication =
+                        std::shared_ptr<RouterGateWorkspacePublication>(
+                            new RouterGateWorkspacePublication{
+                                .ready_event = static_cast<void *>(ready_event),
+                                .primary_weights = weights,
+                                .scales = scales,
+                                .workspace_slot = slot,
+                            },
+                            [](RouterGateWorkspacePublication *value)
+                            {
+                                if (value && value->ready_event)
+                                {
+                                    cudaEventDestroy(
+                                        static_cast<cudaEvent_t>(
+                                            value->ready_event));
+                                }
+                                delete value;
+                            });
+
+                    if (!cudaMoE_quantize_router_gate_q8(
+                            gate_device_ptr,
+                            static_cast<int8_t *>(weights),
+                            static_cast<float *>(scales),
+                            d_model,
+                            num_experts,
+                            device_ordinal_,
+                            stream))
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] "
+                                  "FP32->Q8 router gate conversion launch failed");
+                        return {};
+                    }
+
+                    event_err = cudaEventRecord(
+                        ready_event, static_cast<cudaStream_t>(stream));
+                    if (event_err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] "
+                                  "failed to record immutable publication event: "
+                                  << cudaGetErrorString(event_err));
+                        /*
+                         * Device work has already been submitted. Returning to
+                         * ordinary teardown would let another graph observe an
+                         * unpublishable in-flight write, and synchronizing here
+                         * would be a hidden recovery path. This invariant is
+                         * intentionally process-fatal.
+                         */
+                        std::terminate();
+                    }
+                    return publication;
+                });
+        if (!publication_result)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] "
+                      "failed to publish immutable router gate");
+            return nullptr;
+        }
+
+        auto publication =
+            std::static_pointer_cast<RouterGateWorkspacePublication>(
+                publication_result.publication);
+        const cudaError_t wait_err = cudaStreamWaitEvent(
+            static_cast<cudaStream_t>(stream),
+            static_cast<cudaEvent_t>(publication->ready_event),
+            0);
+        if (wait_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] "
+                      "failed to adopt immutable router publication: "
+                      << cudaGetErrorString(wait_err));
+            return nullptr;
+        }
+
+        RouterQ8GateCacheEntry entry{};
+        entry.key = cache_key;
+        entry.blocks_per_row = blocks_per_row;
+        entry.element_count = element_count;
+        entry.scale_count = scale_count;
+        entry.d_gate_weights_q8 =
+            static_cast<int8_t *>(publication->primary_weights);
+        entry.d_gate_scales =
+            static_cast<float *>(publication->scales);
+        entry.workspace_publication = std::move(publication);
+        entry.workspace_slot = publication_result.slot;
+        router_q8_gate_cache_.push_back(std::move(entry));
+
+        LOG_TRACE("[CUDAMoEKernel] Adopted Q8 router gate source_device="
+                  << static_cast<const void *>(gate_device_ptr)
+                  << " workspace_id=" << cache_key.workspace_id
+                  << " slot=" << publication_result.slot
+                  << " created=" << publication_result.created
+                  << " shape=[" << num_experts << "," << d_model << "] payload_bytes="
+                  << element_count << " scale_bytes=" << (scale_count * sizeof(float)));
+        return &router_q8_gate_cache_.back();
+    }
+
+    bool CUDAMoEKernel::tryRouteDecodeLogitsQ8(
+        const float *d_hidden,
+        const float *d_gate,
+        int d_model,
+        int num_experts,
+        int top_k,
+        const char *context)
+    {
+        invalidateRouterQ8HiddenPublication();
+        if (!debugEnv().gemm.cuda_moe_router_q8)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router requested while disabled");
+            return false;
+        }
+        if (!d_hidden || !d_gate || d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] invalid Q8 router shape or pointer state");
+            return false;
+        }
+        if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router hidden scratch unavailable");
+            return false;
+        }
+
+        const auto *q8_gate =
+            getOrCreateQ8RouterGateCache(d_gate, d_model, num_experts);
+        if (!q8_gate)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router gate cache unavailable");
+            return false;
+        }
+
+        void *stream = requireStream(context ? context : "CUDAMoEKernel::tryRouteDecodeLogitsQ8");
+        const bool ok = cudaMoE_gate_logits_single_token_q8_weights(
+            d_hidden,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            q8_gate->d_gate_weights_q8,
+            q8_gate->d_gate_scales,
+            d_route_logits_,
+            d_model,
+            num_experts,
+            device_ordinal_,
+            stream);
+        if (!ok)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router logits kernel failed");
+            return false;
+        }
+
+        publishRouterQ8Hidden(
+            d_hidden,
+            /*rows=*/1,
+            isCudaMoEDecodeCaptureActive(stream));
+        PerfStatsCollector::addCounter(
+            "kernel", "cuda_moe_router_q8_decode_calls", 1.0, {}, {},
+            {{"num_experts", std::to_string(num_experts)},
+             {"d_model", std::to_string(d_model)}});
+        return true;
+    }
+
+    bool CUDAMoEKernel::ensureGroupedGateUpKPartScratchCapacity(
+        int active_slots,
+        int k_partitions,
+        int intermediate)
     {
         // Only the discrete partition counts the kpart launcher accepts are valid.
-        if (top_k <= 0 || intermediate <= 0 ||
+        if (active_slots <= 0 || intermediate <= 0 ||
             !(k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
               k_partitions == 16 || k_partitions == 32))
             return false;
 
         // Fast path: existing buffers already cover the requested shape.
         if (d_grouped_gateup_gate_partials_ && d_grouped_gateup_up_partials_ &&
-            grouped_gateup_kpart_active_cap_ >= top_k &&
+            grouped_gateup_kpart_active_cap_ >= active_slots &&
             grouped_gateup_kpart_partitions_cap_ >= k_partitions &&
             grouped_gateup_kpart_intermediate_cap_ >= intermediate)
             return true;
 
-        const size_t partial_count = static_cast<size_t>(top_k) *
+        const size_t partial_count = static_cast<size_t>(active_slots) *
                                      static_cast<size_t>(k_partitions) *
                                      static_cast<size_t>(intermediate);
         void *gate_partials = nullptr;
@@ -1330,7 +4086,7 @@ namespace llaminar2
 
         d_grouped_gateup_gate_partials_ = static_cast<float *>(gate_partials);
         d_grouped_gateup_up_partials_ = static_cast<float *>(up_partials);
-        grouped_gateup_kpart_active_cap_ = top_k;
+        grouped_gateup_kpart_active_cap_ = active_slots;
         grouped_gateup_kpart_partitions_cap_ = k_partitions;
         grouped_gateup_kpart_intermediate_cap_ = intermediate;
         return true;
@@ -1344,14 +4100,20 @@ namespace llaminar2
               k_partitions == 16))
             return false;
 
-        // The down split-K kernel accumulates all routed experts inside each K-part
-        // and writes a single [k_partitions][d_model] partial buffer.
+        // Every split-K down path stores one partial row per original route.
+        // M=1 decode therefore requests top_k rows, while grouped verifier
+        // prefill requests tile_rows * top_k rows.  Collective and direct
+        // publication deliberately share this capacity contract so changing
+        // the publication destination cannot change the arithmetic layout or
+        // silently make an otherwise valid graph write beyond its workspace.
         if (d_grouped_down_partials_ &&
             grouped_down_kpart_partitions_cap_ >= k_partitions &&
-            grouped_down_kpart_d_model_cap_ >= d_model)
+            grouped_down_kpart_d_model_cap_ >= d_model &&
+            grouped_down_kpart_slots_cap_ >= slots)
             return true;
 
         const size_t partial_count =
+            static_cast<size_t>(slots) *
             static_cast<size_t>(k_partitions) *
             static_cast<size_t>(d_model);
         void *down_partials = nullptr;
@@ -1368,7 +4130,7 @@ namespace llaminar2
         d_grouped_down_partials_ = static_cast<float *>(down_partials);
         grouped_down_kpart_partitions_cap_ = k_partitions;
         grouped_down_kpart_d_model_cap_ = d_model;
-        grouped_down_kpart_slots_cap_ = 1;
+        grouped_down_kpart_slots_cap_ = slots;
         return true;
     }
 
@@ -1408,63 +4170,6 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedDecodeMetadataCapacity(int num_active, bool include_weights)
-    {
-        if (num_active <= 0 ||
-            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK))
-        {
-            return false;
-        }
-
-        const bool capacity_ok =
-            d_grouped_decode_expert_ids_ &&
-            grouped_decode_metadata_cap_ >= num_active &&
-            (!include_weights || d_grouped_decode_weights_);
-        if (capacity_ok)
-            return true;
-
-        if (!setMoEDevice(device_ordinal_, "ensureGroupedDecodeMetadataCapacity"))
-            return false;
-
-        void *decode_expert_ids = nullptr;
-        void *decode_weights = d_grouped_decode_weights_;
-        bool ok = bindWorkspaceBuffer(
-            &decode_expert_ids,
-            MoEWorkspaceBuffers::DECODE_EXPERT_IDS,
-            static_cast<size_t>(num_active) * sizeof(int),
-            "decode expert ids");
-        if (ok && include_weights)
-        {
-            ok = bindWorkspaceBuffer(
-                &decode_weights,
-                MoEWorkspaceBuffers::DECODE_WEIGHTS,
-                static_cast<size_t>(num_active) * sizeof(float),
-                "decode weights");
-        }
-        if (!ok)
-        {
-            d_grouped_decode_expert_ids_ = nullptr;
-            if (include_weights)
-                d_grouped_decode_weights_ = nullptr;
-            grouped_decode_metadata_cap_ = 0;
-            return false;
-        }
-
-        d_grouped_decode_expert_ids_ = static_cast<int *>(decode_expert_ids);
-        if (include_weights)
-            d_grouped_decode_weights_ = static_cast<float *>(decode_weights);
-        grouped_decode_metadata_cap_ = num_active;
-
-        /*
-         * Device-generated metadata invalidates the host-upload cache used by
-         * groupedExpert*FromTable().  Clearing it prevents a later host-table
-         * call from assuming the workspace still contains cached host ids.
-         */
-        grouped_decode_cached_expert_ids_.clear();
-        grouped_decode_cached_weights_.clear();
-        return true;
-    }
-
     bool CUDAMoEKernel::ensureRoutingDecodeMetadataCapacity(int num_active)
     {
         if (num_active <= 0 ||
@@ -1495,124 +4200,238 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedDecodeMetadata(
+    bool CUDAMoEKernel::resolveFixedTableGateUpMetadata(
+        std::size_t persistent_descriptor_slot,
+        RuntimePointerArrayScope scope,
         const int *expert_ids,
-        const float *expert_weights,
         int num_active,
-        bool include_weights)
+        const int **device_expert_ids)
     {
-        if (!expert_ids || num_active <= 0 ||
-            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            (include_weights && !expert_weights))
+        if (!expert_ids || !device_expert_ids || num_active <= 0 ||
+            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK))
+            return false;
+
+        void *raw_stream = requireStream(
+            "CUDAMoEKernel::resolveFixedTableGateUpMetadata");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(raw_stream);
+        std::size_t workspace_slot = 0;
+        if (!runtimePointerWorkspaceSlot(
+                persistent_descriptor_slot,
+                scope,
+                MoERuntimePointerArrayRole::GateUp,
+                capture_active
+                    ? MoERuntimePointerWorkspaceAccess::CaptureExistingOnly
+                    : MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+                &workspace_slot,
+                "fixed-table gate/up metadata"))
         {
             return false;
         }
 
-        const bool ids_match =
-            static_cast<int>(grouped_decode_cached_expert_ids_.size()) == num_active &&
-            std::equal(grouped_decode_cached_expert_ids_.begin(),
-                       grouped_decode_cached_expert_ids_.end(),
-                       expert_ids);
-        const bool weights_match =
-            !include_weights ||
-            (static_cast<int>(grouped_decode_cached_weights_.size()) == num_active &&
-             std::equal(grouped_decode_cached_weights_.begin(),
-                        grouped_decode_cached_weights_.end(),
-                        expert_weights));
-        const bool capacity_ok = d_grouped_decode_expert_ids_ &&
-                                 grouped_decode_metadata_cap_ >= num_active &&
-                                 (!include_weights || d_grouped_decode_weights_);
-        if (capacity_ok && ids_match && weights_match)
-            return true;
-
-        if (!setMoEDevice(device_ordinal_, "ensureGroupedDecodeMetadata"))
+        auto *slot_ids = static_cast<int *>(workspace_->getPersistentSlotBuffer(
+            MoEWorkspaceBuffers::FIXED_DECODE_GATEUP_EXPERT_IDS,
+            kRuntimePointerArrayWorkspaceEntries,
+            workspace_slot,
+            static_cast<std::size_t>(num_active) * sizeof(int)));
+        if (!slot_ids)
             return false;
 
-        if (grouped_decode_metadata_cap_ < num_active || !d_grouped_decode_expert_ids_ ||
-            (include_weights && !d_grouped_decode_weights_))
+        const auto state = fixed_gateup_metadata_states_.find(workspace_slot);
+        if (state != fixed_gateup_metadata_states_.end())
         {
-            void *decode_expert_ids = nullptr;
-            void *decode_weights = nullptr;
-            const bool ok =
-                bindWorkspaceBuffer(&decode_expert_ids, MoEWorkspaceBuffers::DECODE_EXPERT_IDS,
-                                    static_cast<size_t>(num_active) * sizeof(int), "decode expert ids") &&
-                bindWorkspaceBuffer(&decode_weights, MoEWorkspaceBuffers::DECODE_WEIGHTS,
-                                    static_cast<size_t>(num_active) * sizeof(float), "decode weights");
-            if (!ok)
+            const bool matches =
+                state->second.num_active == num_active &&
+                std::equal(
+                    state->second.expert_ids.begin(),
+                    state->second.expert_ids.begin() + num_active,
+                    expert_ids);
+            if (!matches)
             {
-                d_grouped_decode_expert_ids_ = nullptr;
-                d_grouped_decode_weights_ = nullptr;
-                grouped_decode_metadata_cap_ = 0;
+                LOG_ERROR("[CUDAMoEKernel] Fixed-table gate/up metadata is "
+                          "immutable for one captured owner slot; use the "
+                          "device-routed API for changing expert ids");
                 return false;
             }
-
-            d_grouped_decode_expert_ids_ = static_cast<int *>(decode_expert_ids);
-            d_grouped_decode_weights_ = static_cast<float *>(decode_weights);
-            grouped_decode_metadata_cap_ = num_active;
+            *device_expert_ids = slot_ids;
+            return true;
         }
+        if (capture_active)
+        {
+            LOG_ERROR("[CUDAMoEKernel] Fixed-table gate/up metadata was not "
+                      "published before graph capture");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "resolveFixedTableGateUpMetadata"))
+            return false;
 
-        cudaStream_t stream = static_cast<cudaStream_t>(
-            requireStream("CUDAMoEKernel::ensureGroupedDecodeMetadata"));
-        cudaError_t err = cudaMemcpyAsync(d_grouped_decode_expert_ids_, expert_ids,
-                                          static_cast<size_t>(num_active) * sizeof(int),
-                                          cudaMemcpyHostToDevice, stream);
-        if (err == cudaSuccess && include_weights)
-            err = cudaMemcpyAsync(d_grouped_decode_weights_, expert_weights,
-                                  static_cast<size_t>(num_active) * sizeof(float),
-                                  cudaMemcpyHostToDevice, stream);
+        const cudaError_t err = cudaMemcpyAsync(
+            slot_ids,
+            expert_ids,
+            static_cast<std::size_t>(num_active) * sizeof(int),
+            cudaMemcpyHostToDevice,
+            static_cast<cudaStream_t>(raw_stream));
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDAMoEKernel] grouped decode metadata H2D failed: "
+            LOG_ERROR("[CUDAMoEKernel] Fixed-table gate/up metadata publication failed: "
                       << cudaGetErrorString(err));
             return false;
         }
 
-        grouped_decode_cached_expert_ids_.assign(expert_ids, expert_ids + num_active);
-        if (include_weights)
-            grouped_decode_cached_weights_.assign(expert_weights, expert_weights + num_active);
-        else
-            grouped_decode_cached_weights_.clear();
+        FixedGateUpMetadataState published;
+        published.num_active = num_active;
+        std::copy(expert_ids, expert_ids + num_active, published.expert_ids.begin());
+        fixed_gateup_metadata_states_.emplace(workspace_slot, std::move(published));
+        *device_expert_ids = slot_ids;
+        return true;
+    }
+
+    bool CUDAMoEKernel::resolveFixedTableDownMetadata(
+        std::size_t persistent_descriptor_slot,
+        RuntimePointerArrayScope scope,
+        const int *expert_ids,
+        const float *expert_weights,
+        int num_active,
+        const int **device_expert_ids,
+        const float **device_expert_weights)
+    {
+        if (!expert_ids || !expert_weights || !device_expert_ids ||
+            !device_expert_weights || num_active <= 0 ||
+            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK))
+        {
+            return false;
+        }
+
+        void *raw_stream = requireStream(
+            "CUDAMoEKernel::resolveFixedTableDownMetadata");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(raw_stream);
+        std::size_t workspace_slot = 0;
+        if (!runtimePointerWorkspaceSlot(
+                persistent_descriptor_slot,
+                scope,
+                MoERuntimePointerArrayRole::Down,
+                capture_active
+                    ? MoERuntimePointerWorkspaceAccess::CaptureExistingOnly
+                    : MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+                &workspace_slot,
+                "fixed-table down metadata"))
+        {
+            return false;
+        }
+
+        auto *slot_ids = static_cast<int *>(workspace_->getPersistentSlotBuffer(
+            MoEWorkspaceBuffers::FIXED_DECODE_DOWN_EXPERT_IDS,
+            kRuntimePointerArrayWorkspaceEntries,
+            workspace_slot,
+            static_cast<std::size_t>(num_active) * sizeof(int)));
+        auto *slot_weights = static_cast<float *>(workspace_->getPersistentSlotBuffer(
+            MoEWorkspaceBuffers::FIXED_DECODE_DOWN_WEIGHTS,
+            kRuntimePointerArrayWorkspaceEntries,
+            workspace_slot,
+            static_cast<std::size_t>(num_active) * sizeof(float)));
+        if (!slot_ids || !slot_weights)
+            return false;
+
+        const auto state = fixed_down_metadata_states_.find(workspace_slot);
+        if (state != fixed_down_metadata_states_.end())
+        {
+            const bool matches =
+                state->second.num_active == num_active &&
+                std::equal(
+                    state->second.expert_ids.begin(),
+                    state->second.expert_ids.begin() + num_active,
+                    expert_ids) &&
+                std::equal(
+                    state->second.expert_weights.begin(),
+                    state->second.expert_weights.begin() + num_active,
+                    expert_weights);
+            if (!matches)
+            {
+                LOG_ERROR("[CUDAMoEKernel] Fixed-table down metadata is "
+                          "immutable for one captured owner slot; use the "
+                          "device-routed API for changing expert ids or weights");
+                return false;
+            }
+            *device_expert_ids = slot_ids;
+            *device_expert_weights = slot_weights;
+            return true;
+        }
+        if (capture_active)
+        {
+            LOG_ERROR("[CUDAMoEKernel] Fixed-table down metadata was not "
+                      "published before graph capture");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "resolveFixedTableDownMetadata"))
+            return false;
+
+        cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
+        cudaError_t err = cudaMemcpyAsync(
+            slot_ids,
+            expert_ids,
+            static_cast<std::size_t>(num_active) * sizeof(int),
+            cudaMemcpyHostToDevice,
+            stream);
+        if (err == cudaSuccess)
+        {
+            err = cudaMemcpyAsync(
+                slot_weights,
+                expert_weights,
+                static_cast<std::size_t>(num_active) * sizeof(float),
+                cudaMemcpyHostToDevice,
+                stream);
+        }
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel] Fixed-table down metadata publication failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+
+        FixedDownMetadataState published;
+        published.num_active = num_active;
+        std::copy(expert_ids, expert_ids + num_active, published.expert_ids.begin());
+        std::copy(
+            expert_weights,
+            expert_weights + num_active,
+            published.expert_weights.begin());
+        fixed_down_metadata_states_.emplace(workspace_slot, std::move(published));
+        *device_expert_ids = slot_ids;
+        *device_expert_weights = slot_weights;
         return true;
     }
 
     bool CUDAMoEKernel::runtimePointerWorkspaceSlot(
-        int table_id,
+        std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
+        MoERuntimePointerArrayRole role,
+        MoERuntimePointerWorkspaceAccess access,
         std::size_t *workspace_slot,
-        const char *context) const
+        const char *context)
     {
-        if (!workspace_slot || table_id < 0)
+        if (!workspace_slot)
             return false;
 
-        const std::size_t table_slot = static_cast<std::size_t>(table_id);
-        if (table_slot >= kRuntimePointerArrayTableSlots)
+        const auto slot = runtime_pointer_workspace_owners_.resolve(
+            workspace_,
+            role,
+            persistent_descriptor_slot,
+            static_cast<std::size_t>(scope),
+            access,
+            context);
+        if (!slot || *slot >= kRuntimePointerArrayWorkspaceEntries)
         {
-            LOG_ERROR("[CUDAMoEKernel] " << context
-                                         << " pointer workspace table slot exceeded: table_id="
-                                         << table_id << " table_slots="
-                                         << kRuntimePointerArrayTableSlots);
+            LOG_ERROR("[CUDAMoEKernel] "
+                      << (context ? context : "runtime pointer table")
+                      << " could not resolve an exclusive pointer workspace slot");
             return false;
         }
 
-        const std::size_t scope_slot = static_cast<std::size_t>(scope);
-        const std::size_t slot =
-            scope_slot * kRuntimePointerArrayTableSlots + table_slot;
-        if (slot >= kRuntimePointerArrayWorkspaceEntries)
-        {
-            LOG_ERROR("[CUDAMoEKernel] " << context
-                                         << " pointer workspace slot exceeded: scope="
-                                         << scope_slot << " table_id=" << table_id
-                                         << " capacity="
-                                         << kRuntimePointerArrayWorkspaceEntries);
-            return false;
-        }
-
-        *workspace_slot = slot;
+        *workspace_slot = *slot;
         return true;
     }
 
     bool CUDAMoEKernel::ensureRuntimeGateUpPointerArrays(
-        int table_id,
+        std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
         int top_k,
         const std::array<float *, CUDAMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -1620,13 +4439,22 @@ namespace llaminar2
         float ***d_gate_ptrs,
         float ***d_up_ptrs)
     {
-        if (!d_gate_ptrs || !d_up_ptrs || table_id < 0 || top_k <= 0 ||
+        if (!d_gate_ptrs || !d_up_ptrs || top_k <= 0 ||
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
             return false;
 
+        cudaStream_t stream = static_cast<cudaStream_t>(
+            requireStream("CUDAMoEKernel::ensureRuntimeGateUpPointerArrays"));
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         std::size_t workspace_slot = 0;
         if (!runtimePointerWorkspaceSlot(
-                table_id, scope, &workspace_slot,
+                persistent_descriptor_slot,
+                scope,
+                MoERuntimePointerArrayRole::GateUp,
+                capture_active
+                    ? MoERuntimePointerWorkspaceAccess::CaptureExistingOnly
+                    : MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+                &workspace_slot,
                 "grouped gate/up"))
             return false;
         if (!setMoEDevice(device_ordinal_, "ensureRuntimeGateUpPointerArrays"))
@@ -1657,9 +4485,7 @@ namespace llaminar2
             static_cast<float **>(up_ptr_workspace) +
             workspace_slot * kRuntimePointerArrayMaxTopK;
 
-        cudaStream_t stream = static_cast<cudaStream_t>(
-            requireStream("CUDAMoEKernel::ensureRuntimeGateUpPointerArrays"));
-        if (isCudaMoEDecodeCaptureActive(stream))
+        if (capture_active)
         {
             if (!gateup_pointer_slot_ready_[workspace_slot])
             {
@@ -1693,7 +4519,7 @@ namespace llaminar2
     }
 
     bool CUDAMoEKernel::ensureRuntimeDownPointerArrays(
-        int table_id,
+        std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
         int top_k,
         const std::array<const float *, CUDAMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -1701,13 +4527,22 @@ namespace llaminar2
         const float ***d_gate_ptrs,
         const float ***d_up_ptrs)
     {
-        if (!d_gate_ptrs || !d_up_ptrs || table_id < 0 || top_k <= 0 ||
+        if (!d_gate_ptrs || !d_up_ptrs || top_k <= 0 ||
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
             return false;
 
+        cudaStream_t stream = static_cast<cudaStream_t>(
+            requireStream("CUDAMoEKernel::ensureRuntimeDownPointerArrays"));
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         std::size_t workspace_slot = 0;
         if (!runtimePointerWorkspaceSlot(
-                table_id, scope, &workspace_slot,
+                persistent_descriptor_slot,
+                scope,
+                MoERuntimePointerArrayRole::Down,
+                capture_active
+                    ? MoERuntimePointerWorkspaceAccess::CaptureExistingOnly
+                    : MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+                &workspace_slot,
                 "grouped down"))
             return false;
         if (!setMoEDevice(device_ordinal_, "ensureRuntimeDownPointerArrays"))
@@ -1738,9 +4573,7 @@ namespace llaminar2
             static_cast<const float **>(up_ptr_workspace) +
             workspace_slot * kRuntimePointerArrayMaxTopK;
 
-        cudaStream_t stream = static_cast<cudaStream_t>(
-            requireStream("CUDAMoEKernel::ensureRuntimeDownPointerArrays"));
-        if (isCudaMoEDecodeCaptureActive(stream))
+        if (capture_active)
         {
             if (!down_pointer_slot_ready_[workspace_slot])
             {
@@ -1775,10 +4608,13 @@ namespace llaminar2
 
     bool CUDAMoEKernel::routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                                   int seq_len, int d_model, int num_experts, int top_k,
-                                  bool normalize_weights, DeviceRouteBuffers &buffers,
+                                  bool normalize_weights,
+                                  float *output_indices, float *output_weights,
                                   const int *device_effective_seq_len)
     {
-        if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        if (!output_indices || !output_weights ||
+            seq_len <= 0 || d_model <= 0 || num_experts <= 0 ||
+            top_k <= 0 || top_k > num_experts)
             return false;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         const bool gate_is_bf16 = (gate_type == TensorType::BF16);
@@ -1796,19 +4632,22 @@ namespace llaminar2
         }
 
         const size_t logits_count = static_cast<size_t>(seq_len) * num_experts;
-        const size_t topk_count = static_cast<size_t>(seq_len) * top_k;
-        if (!ensureRouteBufferCapacity(logits_count, topk_count))
+        if (!ensureRouteBufferCapacity(logits_count))
             return false;
 
         void *stream = getStream();
         if (!requireAlignedPointer(hidden, 16, "hidden", "routeCore") ||
-            !requireAlignedPointer(d_route_logits_, 16, "route logits", "routeCore"))
+            !requireAlignedPointer(d_route_logits_, 16, "route logits", "routeCore") ||
+            !requireAlignedPointer(output_indices, 16, "output indices", "routeCore") ||
+            !requireAlignedPointer(output_weights, 16, "output weights", "routeCore"))
             return false;
         if (gate_is_fp32 && !requireAlignedPointer(gate_weights, 16, "FP32 gate", "routeCore"))
             return false;
         if (!requireCudaDevicePointer(hidden, device_ordinal_, "hidden", "routeCore", stream) ||
             !requireCudaDevicePointer(gate_weights, device_ordinal_, "gate weights", "routeCore", stream) ||
-            !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream))
+            !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream) ||
+            !requireCudaDevicePointer(output_indices, device_ordinal_, "output indices", "routeCore", stream) ||
+            !requireCudaDevicePointer(output_weights, device_ordinal_, "output weights", "routeCore", stream))
             return false;
         if (device_effective_seq_len &&
             !requireCudaDevicePointer(device_effective_seq_len, device_ordinal_,
@@ -1818,113 +4657,28 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * MTP verifier batches are only M=2..4 rows, and later publication is
-         * judged against ordinary one-row decode.  cuBLAS is a fine router for
-         * prompt prefill, but its reduction order is different enough from the
-         * decode GEMV path to move top-k weights on near-tie MoE routes.  Keep
-         * tiny verifier-sized routing on the same row-independent kernel family
-         * that decode uses so expert outputs and downstream KV/GDN state are
-         * numerically decode-equivalent while still staying device-resident and
-         * graph-capturable.
-         */
-        const bool use_decode_equivalent_small_m =
-            gate_is_fp32 && seq_len >= 2 && seq_len <= 4;
-        const bool route_ok = use_decode_equivalent_small_m
-                                  ? cudaMoE_route_logits(hidden,
-                                                         static_cast<const float *>(gate_weights),
-                                                         d_route_logits_,
+        const bool route_ok = gate_is_fp32
+                                  ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
                                                          seq_len, d_model, num_experts,
                                                          device_ordinal_, stream)
-                                  : (gate_is_fp32
-                                         ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
-                                                                seq_len, d_model, num_experts,
-                                                                device_ordinal_, stream)
-                                         : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
-                                                                     seq_len, d_model, num_experts,
-                                                                     device_ordinal_, stream));
+                                  : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
+                                                              seq_len, d_model, num_experts,
+                                                              device_ordinal_, stream);
         if (!route_ok)
             return false;
-        if (use_decode_equivalent_small_m)
+        if (gate_is_fp32 && seq_len > 1)
         {
             PerfStatsCollector::addCounter(
-                "kernel", "cuda_moe_router_decode_equivalent_small_m_calls", 1.0, {}, {},
+                "kernel", "cuda_moe_router_tiled_prefill_calls", 1.0, {}, {},
                 {{"seq_len", std::to_string(seq_len)},
                  {"d_model", std::to_string(d_model)},
                  {"num_experts", std::to_string(num_experts)}});
         }
-        if (gate_is_fp32 && seq_len >= 16)
-        {
-            PerfStatsCollector::addCounter(
-                "kernel", "cuda_moe_router_cublas_prefill_calls", 1.0, {}, {},
-                {{"seq_len", std::to_string(seq_len)},
-                 {"d_model", std::to_string(d_model)},
-                 {"num_experts", std::to_string(num_experts)}});
-        }
-        if (!cudaMoE_softmax_topk(d_route_logits_, d_route_indices_, d_route_weights_,
+        if (!cudaMoE_softmax_topk(d_route_logits_, output_indices, output_weights,
                                   seq_len, num_experts, top_k, normalize_weights,
                                   device_ordinal_, getStream(),
                                   device_effective_seq_len))
             return false;
-
-        buffers.d_logits = d_route_logits_;
-        buffers.d_indices = d_route_indices_;
-        buffers.d_weights = d_route_weights_;
-        buffers.logits_count = logits_count;
-        buffers.topk_count = topk_count;
-        return true;
-    }
-
-    bool CUDAMoEKernel::route(const float *hidden, const float *gate_weights,
-                              int seq_len, int d_model, int num_experts, int top_k,
-                              bool normalize_weights, MoERoutingResult &result)
-    {
-        result.expert_indices.resize(static_cast<size_t>(seq_len) * top_k);
-        result.expert_weights.resize(static_cast<size_t>(seq_len) * top_k);
-        result.router_logits.resize(static_cast<size_t>(seq_len) * num_experts);
-
-        std::vector<int> indices(num_experts);
-        for (int token = 0; token < seq_len; ++token)
-        {
-            const float *row = hidden + static_cast<size_t>(token) * d_model;
-            float *logits = result.router_logits.data() + static_cast<size_t>(token) * num_experts;
-            for (int expert = 0; expert < num_experts; ++expert)
-            {
-                const float *gate = gate_weights + static_cast<size_t>(expert) * d_model;
-                float dot = 0.0f;
-                for (int i = 0; i < d_model; ++i)
-                    dot += row[i] * gate[i];
-                logits[expert] = dot;
-            }
-
-            const float max_logit = *std::max_element(logits, logits + num_experts);
-            float sum = 0.0f;
-            for (int expert = 0; expert < num_experts; ++expert)
-            {
-                logits[expert] = std::exp(logits[expert] - max_logit);
-                sum += logits[expert];
-            }
-            for (int expert = 0; expert < num_experts; ++expert)
-                logits[expert] = (sum > 0.0f) ? logits[expert] / sum : 0.0f;
-
-            std::iota(indices.begin(), indices.end(), 0);
-            std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-                              [logits](int lhs, int rhs)
-                              { return logits[lhs] > logits[rhs]; });
-
-            float topk_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k)
-                topk_sum += logits[indices[k]];
-
-            for (int k = 0; k < top_k; ++k)
-            {
-                const size_t out = static_cast<size_t>(token) * top_k + k;
-                result.expert_indices[out] = indices[k];
-                result.expert_weights[out] = normalize_weights && topk_sum > 0.0f
-                                                 ? logits[indices[k]] / topk_sum
-                                                 : logits[indices[k]];
-            }
-        }
         return true;
     }
 
@@ -1980,10 +4734,10 @@ namespace llaminar2
     {
         void *stream = requireStream(context);
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
-            !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights") ||
-            !ensureOutputOnDevice(output_indices, device, stream, "output_indices") ||
-            !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
+        if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireTensorOnDevice(gate_weights, device, stream, "gate_weights") ||
+            !requireOutputOnDevice(output_indices, device, stream, "output_indices") ||
+            !requireOutputOnDevice(output_weights, device, stream, "output_weights"))
             return false;
 
         if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
@@ -1994,10 +4748,10 @@ namespace llaminar2
             return false;
         }
 
-        auto *hidden_base = asTensorBase(hidden, "routeWithTensors hidden");
-        auto *gate_base = asTensorBase(gate_weights, "routeWithTensors gate_weights");
-        auto *indices_base = asTensorBase(output_indices, "routeWithTensors output_indices");
-        auto *weights_base = asTensorBase(output_weights, "routeWithTensors output_weights");
+        auto *hidden_base = requireTensor(hidden, "routeWithTensors hidden");
+        auto *gate_base = requireTensor(gate_weights, "routeWithTensors gate_weights");
+        auto *indices_base = requireTensor(output_indices, "routeWithTensors output_indices");
+        auto *weights_base = requireTensor(output_weights, "routeWithTensors output_weights");
         if (!hidden_base || !gate_base || !indices_base || !weights_base)
             return false;
 
@@ -2025,91 +4779,24 @@ namespace llaminar2
         if (!d_hidden || !d_gate || !d_idx || !d_wt)
             return false;
 
-        DeviceRouteBuffers buffers;
         if (!routeCore(d_hidden, d_gate, gate_base->native_type(),
-                       seq_len, d_model, num_experts, top_k, normalize_weights, buffers,
+                       seq_len, d_model, num_experts, top_k, normalize_weights,
+                       d_idx, d_wt,
                        device_effective_seq_len))
             return false;
-
-        if (!cudaMoE_int_to_float(buffers.d_indices, d_idx, static_cast<int>(buffers.topk_count), device_ordinal_, stream))
-            return false;
-        cudaError_t err = cudaMemcpyAsync(d_wt, buffers.d_weights,
-                                          buffers.topk_count * sizeof(float),
-                                          cudaMemcpyDeviceToDevice,
-                                          static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[" << context << "] D2D weights failed: " << cudaGetErrorString(err));
-            return false;
-        }
 
         host_result.expert_indices.clear();
         host_result.expert_weights.clear();
         host_result.router_logits.clear();
 
-        float *h_idx = nullptr;
-        float *h_wt = nullptr;
-        const bool capture_active = isGraphCaptureActive() || isCudaStreamCapturing(stream);
-        const bool needs_decode_host_topk = (seq_len == 1);
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-        const bool needs_snapshot_host_topk = true;
-#else
-        const bool needs_snapshot_host_topk = false;
-#endif
-        const bool needs_host_topk = !capture_active && (needs_decode_host_topk || needs_snapshot_host_topk);
-        if (needs_host_topk)
-        {
-            h_idx = static_cast<float *>(output_indices->raw_mutable_data());
-            h_wt = static_cast<float *>(output_weights->raw_mutable_data());
-            if (!h_idx || !h_wt)
-                return false;
-
-            err = cudaMemcpyAsync(h_idx, d_idx, buffers.topk_count * sizeof(float),
-                                  cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream));
-            if (err != cudaSuccess)
-                return false;
-            err = cudaMemcpyAsync(h_wt, d_wt, buffers.topk_count * sizeof(float),
-                                  cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream));
-            if (err != cudaSuccess)
-                return false;
-        }
-
-#ifdef ENABLE_PIPELINE_SNAPSHOTS
-        if (!capture_active)
-        {
-            host_result.router_logits.resize(buffers.logits_count);
-            err = cudaMemcpyAsync(host_result.router_logits.data(), buffers.d_logits,
-                                  buffers.logits_count * sizeof(float),
-                                  cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream));
-            if (err != cudaSuccess)
-                return false;
-        }
-#endif
-
-        if (needs_host_topk || !host_result.router_logits.empty())
-        {
-            err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("[" << context << "] stream sync failed: " << cudaGetErrorString(err));
-                return false;
-            }
-        }
-
-        if (needs_host_topk)
-        {
-            host_result.expert_indices.resize(buffers.topk_count);
-            host_result.expert_weights.assign(h_wt, h_wt + buffers.topk_count);
-            for (size_t i = 0; i < buffers.topk_count; ++i)
-                host_result.expert_indices[i] = static_cast<int>(h_idx[i]);
-            markSynced(output_indices);
-            markSynced(output_weights);
-        }
-        else
-        {
-            markDeviceWritten(output_indices, device, stream);
-            markDeviceWritten(output_weights, device, stream);
-        }
+        /*
+         * Routing tensors are authoritative on the device for both eager
+         * execution and graph replay.  Snapshotting drains the published
+         * device tensors at its own explicit host-observation boundary; this
+         * production routing API must not create a second host mirror.
+         */
+        markDeviceWritten(output_indices, device, stream);
+        markDeviceWritten(output_weights, device, stream);
 
         return true;
     }
@@ -2151,24 +4838,316 @@ namespace llaminar2
                                     "CUDAMoEKernel::routeWithTensorsEffectiveSeqLen");
     }
 
+    bool CUDAMoEKernel::prepareRouteLaunch(
+        ITensor *gate_weights,
+        const MoERouteLaunchPlan &plan)
+    {
+        constexpr const char *kContext = "CUDAMoEKernel::prepareRouteLaunch";
+        void *stream = requireStream(kContext);
+        if (!stream)
+            return false;
+        if (!plan.valid() ||
+            (plan.kind == MoERouteLaunchKind::RuntimeDecode &&
+             plan.physical_rows != 1))
+        {
+            LOG_ERROR("[" << kContext << "] invalid route launch plan"
+                      << " kind=" << static_cast<int>(plan.kind)
+                      << " rows=" << plan.physical_rows
+                      << " d_model=" << plan.d_model
+                      << " num_experts=" << plan.num_experts
+                      << " top_k=" << plan.top_k);
+            return false;
+        }
+
+        const DeviceId device = deviceId();
+        if (!requireTensorOnDevice(
+                gate_weights, device, stream, "gate_weights"))
+        {
+            return false;
+        }
+
+        auto *gate_base = requireTensor(
+            gate_weights, "prepared route gate_weights");
+        if (!gate_base ||
+            !requireTensorTypeOneOf(
+                gate_base,
+                TensorType::FP32,
+                TensorType::BF16,
+                "gate_weights",
+                kContext) ||
+            !requireMatrixCapacity(
+                gate_weights,
+                plan.num_experts,
+                plan.d_model,
+                "gate_weights",
+                kContext))
+        {
+            return false;
+        }
+
+        const size_t logits_count =
+            static_cast<size_t>(plan.physical_rows) *
+            static_cast<size_t>(plan.num_experts);
+        if (!ensureRouteBufferCapacity(logits_count))
+        {
+            LOG_ERROR("[" << kContext << "] failed to bind persistent route scratch");
+            return false;
+        }
+
+        const bool uses_decode_row_math =
+            plan.kind == MoERouteLaunchKind::RuntimeDecode ||
+            plan.kind == MoERouteLaunchKind::DecodeEquivalentVerifier;
+        const bool q8_router_requested =
+            uses_decode_row_math &&
+            gate_base->native_type() == TensorType::FP32 &&
+            debugEnv().gemm.cuda_moe_router_q8;
+        if (!q8_router_requested)
+            return true;
+        if ((plan.d_model % 32) != 0)
+        {
+            LOG_ERROR("[" << kContext << "] Q8 decode-row routing requires "
+                      "d_model to be a multiple of 32, got " << plan.d_model);
+            return false;
+        }
+        if (!ensureGroupedGateUpDecodeCapacity(
+                plan.top_k,
+                plan.d_model,
+                plan.physical_rows))
+        {
+            LOG_ERROR("[" << kContext << "] failed to bind persistent Q8 hidden-row scratch");
+            return false;
+        }
+
+        const auto *q8_gate = getOrCreateQ8RouterGateCache(
+            static_cast<const float *>(gate_weights->gpu_data_ptr()),
+            plan.d_model,
+            plan.num_experts);
+        if (!q8_gate)
+        {
+            LOG_ERROR("[" << kContext << "] failed to publish immutable Q8 router gate");
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDAMoEKernel::routeVerifierRowsDecodeEquivalent(
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        const int *device_effective_seq_len,
+        DeviceMoELayerRuntime *deferred_selected_route_ledger)
+    {
+        constexpr const char *kContext = "CUDAMoEKernel::routeVerifierRowsDecodeEquivalent";
+        void *stream = requireStream(kContext);
+        const DeviceId device = deviceId();
+        if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireTensorOnDevice(gate_weights, device, stream, "gate_weights") ||
+            !requireOutputOnDevice(output_indices, device, stream, "output_indices") ||
+            !requireOutputOnDevice(output_weights, device, stream, "output_weights"))
+        {
+            return false;
+        }
+
+        if (seq_len < 1 || d_model <= 0 ||
+            num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        {
+            LOG_ERROR("[" << kContext << "] invalid verifier routing shape seq_len="
+                          << seq_len << " d_model=" << d_model
+                          << " num_experts=" << num_experts
+                          << " top_k=" << top_k);
+            return false;
+        }
+
+        auto *hidden_base = requireTensor(hidden, "verifier route hidden");
+        auto *gate_base = requireTensor(gate_weights, "verifier route gate_weights");
+        auto *indices_base = requireTensor(output_indices, "verifier route output_indices");
+        auto *weights_base = requireTensor(output_weights, "verifier route output_weights");
+        if (!hidden_base || !gate_base || !indices_base || !weights_base)
+            return false;
+
+        if (!requireTensorType(hidden_base, TensorType::FP32, "hidden", kContext) ||
+            !requireTensorTypeOneOf(gate_base, TensorType::FP32, TensorType::BF16, "gate_weights", kContext) ||
+            !requireTensorType(indices_base, TensorType::FP32, "output_indices", kContext) ||
+            !requireTensorType(weights_base, TensorType::FP32, "output_weights", kContext))
+        {
+            return false;
+        }
+
+        const size_t required_hidden =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_gate =
+            static_cast<size_t>(num_experts) * static_cast<size_t>(d_model);
+        const size_t required_topk =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (!requireMatrixCapacity(hidden, seq_len, d_model, "hidden", kContext) ||
+            !requireMatrixCapacity(gate_weights, num_experts, d_model, "gate_weights", kContext) ||
+            !requireTensorElements(hidden, required_hidden, "hidden", kContext) ||
+            !requireTensorElements(gate_weights, required_gate, "gate_weights", kContext) ||
+            !requireTensorElements(output_indices, required_topk, "output_indices", kContext) ||
+            !requireTensorElements(output_weights, required_topk, "output_weights", kContext))
+        {
+            return false;
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        const void *d_gate = gate_weights->gpu_data_ptr();
+        float *d_idx = static_cast<float *>(output_indices->gpu_data_ptr());
+        float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
+        if (!d_hidden || !d_gate || !d_idx || !d_wt)
+        {
+            LOG_ERROR("[" << kContext << "] null device pointer hidden="
+                          << static_cast<const void *>(d_hidden)
+                          << " gate=" << d_gate
+                          << " indices=" << static_cast<void *>(d_idx)
+                          << " weights=" << static_cast<void *>(d_wt));
+            return false;
+        }
+
+        const bool gate_is_fp32 = (gate_base->native_type() == TensorType::FP32);
+        const bool q8_router_requested = gate_is_fp32 && debugEnv().gemm.cuda_moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[" << kContext << "] Q8 verifier router requires d_model to be a multiple of 32, got "
+                          << d_model);
+            return false;
+        }
+
+        const size_t logits_count =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(num_experts);
+        if (!ensureRouteBufferCapacity(logits_count))
+        {
+            LOG_ERROR("[" << kContext << "] route scratch allocation failed");
+            return false;
+        }
+        invalidateRouterQ8HiddenPublication();
+
+        /*
+         * Route all verifier rows as one grouped transaction while preserving
+         * serial decode math inside each row.  The Q8, FP32, and BF16 kernels
+         * all use expert-owned grouped blocks that share gate loads across
+         * verifier rows while preserving each row's serial K/reduction order.
+         */
+        if (q8_router_requested)
+        {
+            if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model, seq_len))
+            {
+                LOG_ERROR("[" << kContext << "] Q8 router hidden scratch unavailable");
+                return false;
+            }
+            const auto *q8_gate = getOrCreateQ8RouterGateCache(
+                static_cast<const float *>(d_gate), d_model, num_experts);
+            if (!q8_gate)
+            {
+                LOG_ERROR("[" << kContext << "] Q8 router gate cache unavailable");
+                return false;
+            }
+            if (!cudaMoE_gate_logits_q8_weights_decode_equivalent_rows(
+                    d_hidden,
+                    d_decode_hidden_int8_,
+                    d_decode_hidden_scales_,
+                    q8_gate->d_gate_weights_q8,
+                    q8_gate->d_gate_scales,
+                    d_route_logits_,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                LOG_ERROR("[" << kContext << "] grouped Q8 decode-equivalent logits failed");
+                return false;
+            }
+
+            publishRouterQ8Hidden(
+                d_hidden,
+                seq_len,
+                isCudaMoEDecodeCaptureActive(stream));
+        }
+        else if (gate_is_fp32)
+        {
+            if (!cudaMoE_route_logits_decode_equivalent_rows(
+                    d_hidden,
+                    static_cast<const float *>(d_gate),
+                    d_route_logits_,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                LOG_ERROR("[" << kContext << "] grouped FP32 decode-equivalent logits failed");
+                return false;
+            }
+        }
+        else if (!cudaMoE_route_logits_bf16_decode_equivalent_rows(
+                     d_hidden,
+                     d_gate,
+                     d_route_logits_,
+                     seq_len,
+                     d_model,
+                     num_experts,
+                     device_ordinal_,
+                     stream))
+        {
+            LOG_ERROR("[" << kContext << "] grouped BF16 decode-equivalent logits failed");
+            return false;
+        }
+
+        if (!cudaMoE_softmax_topk(
+                d_route_logits_,
+                d_idx,
+                d_wt,
+                seq_len,
+                num_experts,
+                top_k,
+                normalize_weights,
+                device_ordinal_,
+                stream,
+                device_effective_seq_len,
+                static_cast<void *>(deferred_selected_route_ledger)))
+        {
+            LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
+            return false;
+        }
+
+        markDeviceWritten(output_indices, device, stream);
+        markDeviceWritten(output_weights, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_moe_router_decode_equivalent_runtime_m_calls",
+            1.0,
+            {},
+            {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"d_model", std::to_string(d_model)},
+             {"num_experts", std::to_string(num_experts)},
+             {"top_k", std::to_string(top_k)},
+             {"route", q8_router_requested ? "grouped_decode_equivalent_q8"
+                                            : "grouped_decode_equivalent"}});
+        return true;
+    }
+
     bool CUDAMoEKernel::decodeRouteSelect(DeviceMoELayerRuntime *runtime_layer,
                                           ITensor *hidden, ITensor *gate_weights,
                                           int d_model, int num_experts, int top_k,
                                           bool normalize_weights,
                                           ITensor *output_indices, ITensor *output_weights,
                                           bool write_legacy_outputs,
-                                          bool update_runtime_histogram)
+                                          bool update_runtime_histogram,
+                                          const int32_t *absolute_position_ids_device,
+                                          RoutedExpertRowExecutionPolicy row_execution_policy)
     {
         void *stream = requireStream("CUDAMoEKernel::decodeRouteSelect");
         const DeviceId device = deviceId();
         if (!runtime_layer || !hidden || !gate_weights)
             return false;
-        if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
-            !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights"))
+        if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireTensorOnDevice(gate_weights, device, stream, "gate_weights"))
             return false;
 
-        auto *hidden_base = asTensorBase(hidden, "decodeRouteSelect hidden");
-        auto *gate_base = asTensorBase(gate_weights, "decodeRouteSelect gate_weights");
+        auto *hidden_base = requireTensor(hidden, "decodeRouteSelect hidden");
+        auto *gate_base = requireTensor(gate_weights, "decodeRouteSelect gate_weights");
         if (!hidden_base || !gate_base)
             return false;
         if (hidden_base->native_type() != TensorType::FP32)
@@ -2192,8 +5171,8 @@ namespace llaminar2
         if (write_legacy_outputs)
         {
             if (!output_indices || !output_weights ||
-                !ensureOutputOnDevice(output_indices, device, stream, "output_indices") ||
-                !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
+                !requireOutputOnDevice(output_indices, device, stream, "output_indices") ||
+                !requireOutputOnDevice(output_weights, device, stream, "output_weights"))
                 return false;
             legacy_indices = static_cast<float *>(output_indices->gpu_data_ptr());
             legacy_weights = static_cast<float *>(output_weights->gpu_data_ptr());
@@ -2204,7 +5183,7 @@ namespace llaminar2
         if (!d_hidden || !d_gate)
             return false;
 
-        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), static_cast<size_t>(top_k)))
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts)))
             return false;
         if (!requireAlignedPointer(d_hidden, 16, "hidden", "decodeRouteSelect") ||
             !requireAlignedPointer(d_route_logits_, 16, "route logits", "decodeRouteSelect"))
@@ -2212,22 +5191,56 @@ namespace llaminar2
         if (gate_is_fp32 && !requireAlignedPointer(d_gate, 16, "FP32 gate", "decodeRouteSelect"))
             return false;
 
-        const bool route_ok = gate_is_fp32
-                                  ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
-                                                         /*seq_len=*/1, d_model, num_experts,
-                                                         device_ordinal_, stream)
-                                  : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
-                                                              /*seq_len=*/1, d_model, num_experts,
-                                                              device_ordinal_, stream);
-        if (!route_ok)
+        bool logits_ready = false;
+        const bool q8_router_requested = gate_is_fp32 && debugEnv().gemm.cuda_moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] Q8 router requires d_model to be a multiple of 32, got "
+                      << d_model);
             return false;
+        }
+        if (q8_router_requested)
+        {
+            if (!tryRouteDecodeLogitsQ8(
+                d_hidden, static_cast<const float *>(d_gate),
+                d_model, num_experts, top_k, "CUDAMoEKernel::decodeRouteSelect"))
+            {
+                return false;
+            }
+            logits_ready = true;
+        }
+        if (!logits_ready)
+        {
+            invalidateRouterQ8HiddenPublication();
+            const bool route_ok = gate_is_fp32
+                                      ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
+                                                             /*seq_len=*/1, d_model, num_experts,
+                                                             device_ordinal_, stream)
+                                      : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
+                                                                  /*seq_len=*/1, d_model, num_experts,
+                                                                  device_ordinal_, stream);
+            if (!route_ok)
+                return false;
+        }
         if (!cudaMoE_softmax_topk_decode_runtime(d_route_logits_,
-                                                 runtimeTopKExpertIdsDevice(runtime_layer),
-                                                 runtimeTopKWeightsDevice(runtime_layer),
-                                                 runtimeDecodeHistogramDevice(runtime_layer),
+                                                 runtime_layer,
                                                  legacy_indices, legacy_weights,
                                                  num_experts, top_k, normalize_weights,
                                                  write_legacy_outputs, update_runtime_histogram,
+                                                 row_execution_policy ==
+                                                     RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
+                                                 nullptr,
+                                                 nullptr,
+                                                 0u,
+                                                 nullptr,
+                                                 nullptr,
+                                                 0u,
+                                                 nullptr,
+                                                 nullptr,
+                                                 nullptr,
+                                                 -1,
+                                                 1u,
+                                                 absolute_position_ids_device,
                                                  device_ordinal_, stream))
             return false;
 
@@ -2239,10 +5252,959 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply(
+        DeviceMoELayerRuntime *runtime_layers,
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *hidden, ITensor *gate_weights,
+        int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
+        const DeviceMoERebalancePlanEntry *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *rebalance_command_header,
+        const DeviceMoEExpertDirectoryEntry *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &rebalance_config,
+        DeviceMoERebalanceApplyStatus *rebalance_apply_status,
+        DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count,
+        const int32_t *absolute_position_ids_device,
+        RoutedExpertRowExecutionPolicy row_execution_policy)
+    {
+        void *stream = requireStream("CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply");
+        const DeviceId device = deviceId();
+        if (!runtime_layers || !runtime_layer || !hidden || !gate_weights ||
+            !rebalance_plan_entries || rebalance_plan_capacity == 0 ||
+            !rebalance_command_header || !rebalance_apply_status ||
+            !rebalance_controller_state ||
+            !validateDeviceMoERebalanceConfig(rebalance_config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] invalid runtime or rebalance binding");
+            return false;
+        }
+        if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireTensorOnDevice(gate_weights, device, stream, "gate_weights"))
+            return false;
+
+        auto *hidden_base = requireTensor(hidden, "decodeRouteSelectWithReadyRebalanceApply hidden");
+        auto *gate_base = requireTensor(gate_weights, "decodeRouteSelectWithReadyRebalanceApply gate_weights");
+        if (!hidden_base || !gate_base)
+            return false;
+        if (hidden_base->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] hidden must be FP32, got "
+                      << tensorTypeName(hidden_base->native_type()));
+            return false;
+        }
+        const TensorType gate_type = gate_base->native_type();
+        const bool gate_is_fp32 = (gate_type == TensorType::FP32);
+        const bool gate_is_bf16 = (gate_type == TensorType::BF16);
+        if (!gate_is_fp32 && !gate_is_bf16)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] CUDA runtime router supports FP32 or BF16 gate weights, got "
+                      << tensorTypeName(gate_type));
+            return false;
+        }
+
+        float *legacy_indices = nullptr;
+        float *legacy_weights = nullptr;
+        if (write_legacy_outputs)
+        {
+            if (!output_indices || !output_weights ||
+                !requireOutputOnDevice(output_indices, device, stream, "output_indices") ||
+                !requireOutputOnDevice(output_weights, device, stream, "output_weights"))
+                return false;
+            legacy_indices = static_cast<float *>(output_indices->gpu_data_ptr());
+            legacy_weights = static_cast<float *>(output_weights->gpu_data_ptr());
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        const void *d_gate = gate_weights->gpu_data_ptr();
+        if (!d_hidden || !d_gate)
+            return false;
+
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts)))
+            return false;
+        if (!requireAlignedPointer(d_hidden, 16, "hidden", "decodeRouteSelectWithReadyRebalanceApply") ||
+            !requireAlignedPointer(d_route_logits_, 16, "route logits", "decodeRouteSelectWithReadyRebalanceApply"))
+            return false;
+        if (gate_is_fp32 && !requireAlignedPointer(d_gate, 16, "FP32 gate", "decodeRouteSelectWithReadyRebalanceApply"))
+            return false;
+
+        bool logits_ready = false;
+        const bool q8_router_requested = gate_is_fp32 && debugEnv().gemm.cuda_moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router requires d_model to be a multiple of 32, got "
+                      << d_model);
+            return false;
+        }
+        if (q8_router_requested)
+        {
+            if (!tryRouteDecodeLogitsQ8(
+                d_hidden, static_cast<const float *>(d_gate),
+                d_model, num_experts, top_k,
+                "CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply"))
+            {
+                return false;
+            }
+            logits_ready = true;
+        }
+        if (!logits_ready)
+        {
+            invalidateRouterQ8HiddenPublication();
+            const bool route_ok = gate_is_fp32
+                                      ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
+                                                             /*seq_len=*/1, d_model, num_experts,
+                                                             device_ordinal_, stream)
+                                      : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
+                                                                  /*seq_len=*/1, d_model, num_experts,
+                                                                  device_ordinal_, stream);
+            if (!route_ok)
+                return false;
+        }
+        if (!cudaMoE_softmax_topk_decode_runtime(
+                d_route_logits_,
+                runtime_layer,
+                legacy_indices, legacy_weights,
+                num_experts, top_k, normalize_weights,
+                write_legacy_outputs, update_runtime_histogram,
+                row_execution_policy ==
+                    RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
+                runtime_layers,
+                rebalance_plan_entries,
+                rebalance_plan_capacity,
+                rebalance_command_header,
+                rebalance_local_transfer_slots,
+                rebalance_local_transfer_slot_count,
+                &rebalance_config,
+                rebalance_apply_status,
+                rebalance_controller_state,
+                rebalance_target_layer,
+                rebalance_command_buffer_count,
+                absolute_position_ids_device,
+                device_ordinal_, stream))
+            return false;
+
+        if (write_legacy_outputs)
+        {
+            markDeviceWritten(output_indices, device, stream);
+            markDeviceWritten(output_weights, device, stream);
+        }
+        return true;
+    }
+
+    bool CUDAMoEKernel::runDeviceRebalanceController(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        const uint64_t *gathered_histograms,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceWaveState *wave_state,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        DeviceMoELLEPLayerPlanScratch *llep_layer_plans,
+        DeviceMoEPlacementBank *placement_plan_scratch)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
+            return false;
+        }
+        const bool deferred_planning = hasDeviceMoERebalanceFlag(
+            config.flags,
+            DeviceMoERebalanceFlags::DeferRuntimeApply);
+        if (!runtime_layers || !gathered_histograms || !status ||
+            !controller_state ||
+            (deferred_planning && !placement_plan_scratch))
+        {
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, status, controller state, and placement planner scratch must be non-null");
+            return false;
+        }
+        if (config.routed_assignment_policy ==
+                kDeviceMoERebalanceAssignmentLeastLoadedResident &&
+            !llep_layer_plans)
+        {
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] LLEP requires graph-lifetime parallel planner scratch");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "runDeviceRebalanceController");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "runDeviceRebalanceController"))
+            return false;
+
+        return cudaMoE_device_rebalance_controller(
+            runtime_layers,
+            reinterpret_cast<const unsigned long long *>(gathered_histograms),
+            status,
+            &config,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            payload_slot_capacity,
+            command_header,
+            wave_state,
+            controller_state,
+            llep_layer_plans,
+            placement_plan_scratch,
+            command_buffer_count,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::finalizeMoEOverlayRebalancePublication(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        std::uint32_t layer_count,
+        std::uint32_t expert_count,
+        DeviceMoEOverlayEpochControl *control,
+        std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *reservation_and_publication_status,
+        const DeviceMoERebalanceApplyStatus *apply_status)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finalizeMoEOverlayRebalancePublication");
+        if (!runtime_layers || layer_count == 0u || expert_count == 0u ||
+            !control || !candidate_epoch ||
+            !reservation_and_publication_status || !apply_status || !stream)
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel::finalizeMoEOverlayRebalancePublication] "
+                "runtime family, epoch state, apply status, and explicit stream are required");
+            return false;
+        }
+        if (!setMoEDevice(
+                device_ordinal_,
+                "finalizeMoEOverlayRebalancePublication"))
+        {
+            return false;
+        }
+        return cudaMoE_finalize_overlay_rebalance_publication(
+            runtime_layers,
+            layer_count,
+            expert_count,
+            control,
+            candidate_epoch,
+            reservation_and_publication_status,
+            apply_status,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceHistograms(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        uint64_t *local_histograms,
+        const DeviceMoERebalanceConfig &config,
+        const DeviceMoERebalanceWaveState *wave_state,
+        const DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        uint64_t *previous_activation_counts)
+    {
+        if (!validateDeviceMoERebalanceConfig(config) ||
+            !moe_runtime_abi::validHistogramSourceMask(
+                histogram_source_mask))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config or histogram source mask");
+            return false;
+        }
+        if (!runtime_layers || !local_histograms)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceHistograms] runtime layers and local histograms must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceHistograms");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceHistograms"))
+            return false;
+
+        return cudaMoE_pack_rebalance_histograms(
+            runtime_layers,
+            reinterpret_cast<unsigned long long *>(local_histograms),
+            &config,
+            wave_state,
+            controller_state,
+            command_buffer_count,
+            histogram_source_mask,
+            reinterpret_cast<unsigned long long *>(
+                previous_activation_counts),
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceDirectory(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        DeviceMoEExpertDirectoryEntry *local_directory,
+        const DeviceMoERebalanceConfig &config)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceDirectory] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !local_directory)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceDirectory] runtime layers and local directory must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceDirectory");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceDirectory"))
+            return false;
+
+        return cudaMoE_pack_rebalance_directory(
+            runtime_layers,
+            local_directory,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceSourceDescriptors(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *command_headers,
+        uint32_t plan_capacity,
+        DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceSourceDescriptors] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || !command_headers ||
+            !local_source_descriptors)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceSourceDescriptors] runtime, projected plans, headers, and source descriptor output must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceSourceDescriptors");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceSourceDescriptors"))
+            return false;
+
+        return cudaMoE_pack_rebalance_source_descriptors(
+            runtime_layers,
+            plan_entries,
+            command_headers,
+            plan_capacity,
+            local_source_descriptors,
+            &config,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::projectDeviceRebalanceDomainCommands(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalancePlanEntry *local_plan_entries,
+        DeviceMoERebalanceCommandBufferHeader *local_command_headers,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceStatus *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
+        const DeviceMoERebalanceWaveState *gathered_wave_states,
+        DeviceMoERebalanceWaveState *local_wave_states,
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        DeviceMoETransferSlotClaimIndex *transfer_slot_claim_index)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectDeviceRebalanceDomainCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_plan_entries || !local_command_headers ||
+            !runtime_layers || !local_transfer_slots ||
+            !transfer_slot_claim_index ||
+            plan_capacity == 0 || local_transfer_slot_count == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectDeviceRebalanceDomainCommands] gathered/local commands, runtime layers, and transfer directory must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "projectDeviceRebalanceDomainCommands");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "projectDeviceRebalanceDomainCommands"))
+            return false;
+
+        return cudaMoE_project_rebalance_domain_commands(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_plan_entries,
+            local_command_headers,
+            &config,
+            status,
+            payload_slot_capacity,
+            command_buffer_count,
+            gathered_wave_states,
+            local_wave_states,
+            runtime_layers,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            transfer_slot_claim_index,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::projectPrefillLeastLoadedDomainCommands(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalancePlanEntry *local_plan_entries,
+        uint32_t *local_plan_count,
+        DeviceMoERebalanceCommandBufferHeader *local_command_header,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceStatus *status,
+        uint32_t payload_slot_capacity,
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        DeviceMoETransferSlotClaimIndex *transfer_slot_claim_index,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectPrefillLeastLoadedDomainCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_plan_entries || !local_plan_count || !local_command_header ||
+            !status || !runtime_layers || !local_transfer_slots ||
+            !transfer_slot_claim_index ||
+            plan_capacity == 0 || payload_slot_capacity == 0 ||
+            local_transfer_slot_count == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectPrefillLeastLoadedDomainCommands] gathered commands, local command output, runtime layers, transfer directory, status, and payload capacity are required");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "projectPrefillLeastLoadedDomainCommands");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "projectPrefillLeastLoadedDomainCommands"))
+            return false;
+
+        return cudaMoE_project_prefill_llep_domain_commands(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_plan_entries,
+            local_plan_count,
+            local_command_header,
+            &config,
+            status,
+            payload_slot_capacity,
+            command_buffer_count,
+            runtime_layers,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            transfer_slot_claim_index,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::materializePrefillLeastLoadedMirroredDomainCommands(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *mirrored_plan_entries,
+        DeviceMoERebalanceCommandBufferHeader *mirrored_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedMirroredDomainCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layer || !mirrored_plan_entries ||
+            !mirrored_command_headers || !status || plan_capacity == 0 ||
+            payload_slot_capacity == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedMirroredDomainCommands] runtime, mirrored command buffers, status, and payload capacity are required");
+            return false;
+        }
+        if (layer_idx >= config.num_layers)
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedMirroredDomainCommands] layer index out of range"
+                      << " layer=" << layer_idx
+                      << " num_layers=" << config.num_layers);
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "materializePrefillLeastLoadedMirroredDomainCommands");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(
+                device_ordinal_,
+                "materializePrefillLeastLoadedMirroredDomainCommands"))
+        {
+            return false;
+        }
+
+        return cudaMoE_materialize_prefill_llep_mirrored_domain_commands(
+            runtime_layer,
+            mirrored_plan_entries,
+            mirrored_command_headers,
+            plan_capacity,
+            status,
+            &config,
+            payload_slot_capacity,
+            layer_idx,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layer || !plan_entries || !plan_count || !command_header || !status ||
+            plan_capacity == 0 || payload_slot_capacity == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands] runtime, command buffers, status, and payload capacity are required");
+            return false;
+        }
+        if (layer_idx >= config.num_layers)
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands] layer index out of range"
+                      << " layer=" << layer_idx << " num_layers=" << config.num_layers);
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "materializePrefillLeastLoadedTransferCommands");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "materializePrefillLeastLoadedTransferCommands"))
+            return false;
+
+        return cudaMoE_materialize_prefill_llep_transfer_commands(
+            runtime_layer,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            status,
+            &config,
+            payload_slot_capacity,
+            layer_idx,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceCompactPayloads(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCompactPayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!plan_entries || !command_headers ||
+            !local_source_descriptors || !local_payload || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCompactPayloads] plans, headers, source descriptors, payload, and status must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceCompactPayloads");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCompactPayloads"))
+            return false;
+
+        return cudaMoE_pack_rebalance_compact_payloads(
+            plan_entries,
+            command_headers,
+            plan_capacity,
+            local_source_descriptors,
+            local_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::applyDeviceRebalanceArrivals(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        int target_layer)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyDeviceRebalanceArrivals] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !local_transfer_slots || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyDeviceRebalanceArrivals] runtime, plan, transfer slots, and status must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "applyDeviceRebalanceArrivals");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "applyDeviceRebalanceArrivals"))
+            return false;
+
+        return cudaMoE_apply_rebalance_arrivals(
+            runtime_layers,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            target_layer,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceCollectivePayloads(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_directory,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCollectivePayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_directory || !local_payload || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCollectivePayloads] gathered plans, headers, local directory, payload, and status must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "packDeviceRebalanceCollectivePayloads");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCollectivePayloads"))
+            return false;
+
+        return cudaMoE_pack_rebalance_collective_payloads(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_directory,
+            local_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::unpackDeviceRebalanceCollectivePayloads(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        const uint8_t *gathered_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::unpackDeviceRebalanceCollectivePayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!plan_entries || (!plan_count && !command_header) ||
+            !gathered_payload || !local_transfer_slots || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
+        {
+            LOG_ERROR("[CUDAMoEKernel::unpackDeviceRebalanceCollectivePayloads] plan, gathered payload, transfer slots, and status must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "unpackDeviceRebalanceCollectivePayloads");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "unpackDeviceRebalanceCollectivePayloads"))
+            return false;
+
+        return cudaMoE_unpack_rebalance_collective_payloads(
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            gathered_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::initializeDeviceRebalanceGraphController(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        const DeviceMoERebalanceConfig &config)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::initializeDeviceRebalanceGraphController] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state)
+        {
+            LOG_ERROR("[CUDAMoEKernel::initializeDeviceRebalanceGraphController] controller state must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "initializeDeviceRebalanceGraphController");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "initializeDeviceRebalanceGraphController"))
+            return false;
+
+        return cudaMoE_init_rebalance_graph_controller_state(
+            controller_state,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::resetDeviceRebalanceGraphTransactionForRequest(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceCommandBufferHeader *command_headers,
+        DeviceMoERebalanceWaveState *wave_states,
+        uint32_t *plan_counts,
+        uint32_t command_buffer_count,
+        const DeviceMoERebalanceConfig &config)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::resetDeviceRebalanceGraphTransactionForRequest] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state || !command_headers || !wave_states ||
+            !plan_counts || command_buffer_count == 0u ||
+            command_buffer_count > 2u)
+        {
+            LOG_ERROR("[CUDAMoEKernel::resetDeviceRebalanceGraphTransactionForRequest] transaction buffers must be non-null and command-buffer count must be one or two");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "resetDeviceRebalanceGraphTransactionForRequest");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(
+                device_ordinal_,
+                "resetDeviceRebalanceGraphTransactionForRequest"))
+        {
+            return false;
+        }
+
+        return cudaMoE_reset_rebalance_graph_transaction_for_request(
+            controller_state,
+            command_headers,
+            wave_states,
+            plan_counts,
+            command_buffer_count,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::publishDeviceRebalanceTransferComplete(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        const DeviceMoERebalanceWaveState *wave_state,
+        const DeviceMoERebalanceApplyStatus *copy_status,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceApplyStatus *gathered_copy_status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishDeviceRebalanceTransferComplete] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state || !command_header || !wave_state || !copy_status ||
+            !plan_entries || plan_capacity == 0u || !gathered_copy_status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishDeviceRebalanceTransferComplete] controller state, command header, wave state, copy status, plan entries, and gathered copy status must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "publishDeviceRebalanceTransferComplete");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "publishDeviceRebalanceTransferComplete"))
+            return false;
+
+        return cudaMoE_publish_rebalance_transfer_complete(
+            controller_state,
+            command_header,
+            wave_state,
+            copy_status,
+            plan_entries,
+            plan_capacity,
+            gathered_copy_status,
+            &config,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::applyReadyDeviceRebalanceWave(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        int target_layer,
+        uint32_t command_buffer_count,
+        const DeviceMoEOverlayEpochStatus *overlay_reservation_status)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyReadyDeviceRebalanceWave] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !status || !controller_state)
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyReadyDeviceRebalanceWave] runtime, plan, status, controller state, and command ABI must be non-null");
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "applyReadyDeviceRebalanceWave");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "applyReadyDeviceRebalanceWave"))
+            return false;
+
+        return cudaMoE_apply_ready_rebalance_wave(
+            runtime_layers,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            controller_state,
+            target_layer,
+            command_buffer_count,
+            overlay_reservation_status,
+            device_ordinal_,
+            stream);
+    }
+
     void CUDAMoEKernel::zeroBuffer(ITensor *tensor, size_t bytes)
     {
         void *stream = requireStream("CUDAMoEKernel::zeroBuffer");
-        if (!ensureOutputOnDevice(tensor, deviceId(), stream, "zeroBuffer"))
+        if (!requireOutputOnDevice(tensor, deviceId(), stream, "zeroBuffer"))
             return;
         void *ptr = tensor->gpu_data_ptr();
         cudaError_t err = cudaMemsetAsync(ptr, 0, bytes, static_cast<cudaStream_t>(stream));
@@ -2261,8 +6223,8 @@ namespace llaminar2
             return;
         void *stream = requireStream("CUDAMoEKernel::gatherTokenBatchFromTensors");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
-            !ensureOutputOnDevice(batch_buffer, device, stream, "batch_buffer") ||
+        if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireOutputOnDevice(batch_buffer, device, stream, "batch_buffer") ||
             !ensureStagingCapacity(num_tokens))
             return;
 
@@ -2286,8 +6248,8 @@ namespace llaminar2
             return false;
         void *stream = requireStream("CUDAMoEKernel::copyTokenRowFromTensor");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(source, device, stream, "source") ||
-            !ensureOutputOnDevice(row_buffer, device, stream, "row_buffer"))
+        if (!requireTensorOnDevice(source, device, stream, "source") ||
+            !requireOutputOnDevice(row_buffer, device, stream, "row_buffer"))
         {
             return false;
         }
@@ -2309,8 +6271,8 @@ namespace llaminar2
             return;
         void *stream = requireStream("CUDAMoEKernel::scatterAddWeightedFromTensors");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(output, device, stream, "output") ||
-            !ensureTensorOnDevice(expert_output, device, stream, "expert_output") ||
+        if (!requireTensorOnDevice(output, device, stream, "output") ||
+            !requireTensorOnDevice(expert_output, device, stream, "expert_output") ||
             !ensureStagingCapacity(num_tokens))
             return;
 
@@ -2340,8 +6302,8 @@ namespace llaminar2
             return false;
         void *stream = requireStream("CUDAMoEKernel::writeTokenRowToTensor");
         const DeviceId device = deviceId();
-        if (!ensureOutputOnDevice(destination, device, stream, "destination") ||
-            !ensureTensorOnDevice(row_buffer, device, stream, "row_buffer"))
+        if (!requireOutputOnDevice(destination, device, stream, "destination") ||
+            !requireTensorOnDevice(row_buffer, device, stream, "row_buffer"))
         {
             return false;
         }
@@ -2362,9 +6324,9 @@ namespace llaminar2
             return;
         void *stream = requireStream("CUDAMoEKernel::sharedExpertGateFromTensors");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(input, device, stream, "input") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output"))
+        if (!requireTensorOnDevice(input, device, stream, "input") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output"))
             return;
         sharedExpertGate(static_cast<const float *>(input->gpu_data_ptr()),
                          static_cast<const float *>(gate_inp->gpu_data_ptr()),
@@ -2388,9 +6350,9 @@ namespace llaminar2
 
         void *stream = requireStream("CUDAMoEKernel::sharedExpertGateFromTensorsEffectiveSeqLen");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(input, device, stream, "input") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output"))
+        if (!requireTensorOnDevice(input, device, stream, "input") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output"))
             return false;
 
         const auto *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -2423,11 +6385,11 @@ namespace llaminar2
 
         void *stream = requireStream("CUDAMoEKernel::sharedExpertGateAddFromTensors");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(input, device, stream, "input") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output") ||
-            !ensureTensorOnDevice(routed_residual, device, stream, "routed_residual") ||
-            !ensureOutputOnDevice(combined_output, device, stream, "combined_output"))
+        if (!requireTensorOnDevice(input, device, stream, "input") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output") ||
+            !requireTensorOnDevice(routed_residual, device, stream, "routed_residual") ||
+            !requireOutputOnDevice(combined_output, device, stream, "combined_output"))
             return;
 
         const auto *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -2467,11 +6429,11 @@ namespace llaminar2
 
         void *stream = requireStream("CUDAMoEKernel::sharedExpertGateAddFromTensorsEffectiveSeqLen");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(input, device, stream, "input") ||
-            !ensureTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
-            !ensureTensorOnDevice(shared_output, device, stream, "shared_output") ||
-            !ensureTensorOnDevice(routed_residual, device, stream, "routed_residual") ||
-            !ensureOutputOnDevice(combined_output, device, stream, "combined_output"))
+        if (!requireTensorOnDevice(input, device, stream, "input") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !requireTensorOnDevice(shared_output, device, stream, "shared_output") ||
+            !requireTensorOnDevice(routed_residual, device, stream, "routed_residual") ||
+            !requireOutputOnDevice(combined_output, device, stream, "combined_output"))
             return false;
 
         const auto *in = static_cast<const float *>(input->gpu_data_ptr());
@@ -2503,8 +6465,8 @@ namespace llaminar2
             return;
         void *stream = requireStream("CUDAMoEKernel::swiGLUFromTensors");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(gate, device, stream, "gate") ||
-            !ensureTensorOnDevice(up, device, stream, "up"))
+        if (!requireTensorOnDevice(gate, device, stream, "gate") ||
+            !requireTensorOnDevice(up, device, stream, "up"))
             return;
         swiGLU(static_cast<float *>(gate->gpu_data_ptr()),
                static_cast<const float *>(up->gpu_data_ptr()), count);
@@ -2517,8 +6479,8 @@ namespace llaminar2
             return;
         void *stream = requireStream("CUDAMoEKernel::weightedAddFromTensors");
         const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(output, device, stream, "output") ||
-            !ensureTensorOnDevice(input, device, stream, "input"))
+        if (!requireTensorOnDevice(output, device, stream, "output") ||
+            !requireTensorOnDevice(input, device, stream, "input"))
             return;
         weightedAdd(static_cast<float *>(output->gpu_data_ptr()),
                     static_cast<const float *>(input->gpu_data_ptr()), weight, count);
@@ -2544,7 +6506,7 @@ namespace llaminar2
         /*
          * Padded prefill replay deliberately marks bucket-tail routes invalid
          * with expert_id=-1.  The deterministic scatter kernel only writes a
-         * mapping for valid routes, so the ordered down-scatter must start from
+        * mapping for valid routes, so the ordered down-scatter must start from
          * an all-invalid map every request.  Otherwise graph replay can reuse
          * stale slot mappings from the previous real sequence length and write
          * arbitrary expert output into padded rows.
@@ -2559,10 +6521,29 @@ namespace llaminar2
                               static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)
             return false;
+        /*
+         * Masked/padded routing can compact fewer rows than total_slots.  The
+         * grouped prefill gather still launches over total_slots, so stale token
+         * ids from a previous larger request must not survive in unused rows.
+         */
+        err = cudaMemsetAsync(d_grouped_token_indices, 0,
+                              static_cast<size_t>(total_slots) * sizeof(int),
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
+        err = cudaMemsetAsync(d_grouped_weights, 0,
+                              static_cast<size_t>(total_slots) * sizeof(float),
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
         return cudaMoE_count_per_expert(d_routing_indices, d_expert_counts, total_slots,
                                         num_experts, device_ordinal_, stream) &&
                cudaMoE_exclusive_scan(d_expert_counts, d_expert_offsets,
                                        num_experts, device_ordinal_, stream) &&
+               cudaMoE_build_active_expert_list(
+                   d_expert_counts, d_group_active_expert_ids_,
+                   num_experts, std::min(total_slots, num_experts),
+                   device_ordinal_, stream) &&
                cudaMoE_scatter_tokens_deterministic(
                    d_routing_indices, d_routing_weights,
                    d_expert_offsets, d_expert_counts,
@@ -2574,99 +6555,728 @@ namespace llaminar2
                    device_ordinal_, stream);
     }
 
-    bool CUDAMoEKernel::prepareExpertGroups(ITensor *routing_indices, ITensor *routing_weights,
-                                            int seq_len, int num_experts, int top_k)
+    bool CUDAMoEKernel::groupPrefillRoutes(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        bool filter_to_local_runtime_experts,
+        bool retain_routes_for_deferred_commit)
     {
-        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+        if (!runtime_layer || !routing_indices || !routing_weights)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] null runtime or routing tensor");
             return false;
-        void *stream = requireStream("CUDAMoEKernel::prepareExpertGroups");
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::groupPrefillRoutes");
         const DeviceId device = deviceId();
-        const int total_slots = seq_len * top_k;
-        if (!ensureTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
-            !ensureTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
-            !ensureGroupingBufferCapacity(total_slots, num_experts))
+        const int max_slots = max_tokens * top_k;
+        if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
+            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
+            !ensureGroupingBufferCapacity(max_slots, num_experts))
+        {
+            return false;
+        }
+
+        const float *d_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!d_indices || !d_weights)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupPrefillRoutes] routing tensors have no device pointers");
+            return false;
+        }
+
+        if (traceMoEPrefillGroupingWrapperEnabled())
+        {
+            LOG_TRACE("[CUDAMoEKernel] prefill grouping wrapper trace"
+                     << " tag=groupPrefillRoutes"
+                     << " device=" << device.to_string()
+                     << " current_tokens=" << current_tokens
+                     << " max_tokens=" << max_tokens
+                     << " num_experts=" << num_experts
+                     << " top_k=" << top_k
+                     << " runtime_layer=" << static_cast<void *>(runtime_layer)
+                     << " routing_indices=" << static_cast<const void *>(d_indices)
+                     << " routing_weights=" << static_cast<const void *>(d_weights));
+        }
+
+        return cudaMoE_group_prefill_routes_runtime(
+            d_indices,
+            d_weights,
+            static_cast<void *>(runtime_layer),
+            d_group_original_to_grouped_,
+            current_tokens * top_k,
+            max_slots,
+            num_experts,
+            top_k,
+            filter_to_local_runtime_experts ? 1 : 0,
+            retain_routes_for_deferred_commit ? 1 : 0,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::regroupPrefillRoutesForDiagnostics(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        bool retain_routes_for_deferred_commit)
+    {
+        if (!runtime_layer ||
+            current_tokens < 0 || max_tokens <= 0 ||
+            current_tokens > max_tokens || num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel::regroupPrefillRoutesForDiagnostics] "
+                "invalid route-only diagnostic contract");
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::regroupPrefillRoutesForDiagnostics");
+        const int max_slots = max_tokens * top_k;
+        if (!ensureGroupingBufferCapacity(max_slots, num_experts))
+            return false;
+        return cudaMoE_regroup_prefill_routes_runtime_assignments(
+            static_cast<void *>(runtime_layer),
+            d_group_original_to_grouped_,
+            current_tokens * top_k,
+            max_slots,
+            num_experts,
+            top_k,
+            retain_routes_for_deferred_commit ? 1 : 0,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        bool filter_to_local_runtime_experts,
+        bool retain_routes_for_deferred_commit)
+    {
+        if (!runtime_layer || !routing_indices || !routing_weights ||
+            current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0 ||
+            gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter] "
+                      "invalid complete-plan contract");
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if (!gateup_table.valid || !gateup_table.deviceReady() ||
+            !down_table.valid || !down_table.deviceReady() ||
+            gateup_table.weight_format != down_table.weight_format ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter] "
+                      "descriptor table does not match the expert domain");
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRouter");
+        const DeviceId device = deviceId();
+        const int max_slots = max_tokens * top_k;
+        if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
+            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
+            !ensureGroupingBufferCapacity(max_slots, num_experts))
+        {
+            return false;
+        }
+
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "CUDA complete runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "CUDA complete runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "CUDA complete runtime prefill down descriptors"))
+        {
+            return false;
+        }
+
+        const auto *device_indices =
+            static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const auto *device_weights =
+            static_cast<const float *>(routing_weights->gpu_data_ptr());
+        const int max_active_experts = std::min(max_slots, num_experts);
+        return device_indices && device_weights &&
+               cudaMoE_group_prefill_routes_and_materialize_plan_runtime(
+                   device_indices,
+                   device_weights,
+                   static_cast<void *>(runtime_layer),
+                   d_group_original_to_grouped_,
+                   runtime_gate_descs,
+                   runtime_up_descs,
+                   runtime_down_descs,
+                   d_group_active_expert_ids_,
+                   current_tokens * top_k,
+                   max_slots,
+                   num_experts,
+                   top_k,
+                   max_active_experts,
+                   filter_to_local_runtime_experts ? 1 : 0,
+                   retain_routes_for_deferred_commit ? 1 : 0,
+                   gateup_table.weight_format,
+                   device_ordinal_,
+                   stream);
+    }
+
+    bool CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        bool retain_routes_for_deferred_commit)
+    {
+        if (!runtime_layer ||
+            current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0 ||
+            gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments] "
+                      "invalid complete-plan contract");
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if (!gateup_table.valid || !gateup_table.deviceReady() ||
+            !down_table.valid || !down_table.deviceReady() ||
+            gateup_table.weight_format != down_table.weight_format ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments] "
+                      "descriptor table does not match the expert domain");
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::publishCompleteGroupedPrefillPlanFromRuntimeAssignments");
+        const int max_slots = max_tokens * top_k;
+        if (!ensureGroupingBufferCapacity(max_slots, num_experts))
             return false;
 
-        const float *d_float_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
-        const float *d_float_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
-        if (!d_float_indices || !d_float_weights)
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "CUDA assigned runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "CUDA assigned runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "CUDA assigned runtime prefill down descriptors"))
+        {
             return false;
+        }
 
-        if (!cudaMoE_float_to_int(d_float_indices, d_group_int_indices_, total_slots, device_ordinal_, stream))
-            return false;
-        if (!groupTokensByExpertDevice(d_group_int_indices_, d_float_weights,
-                                       seq_len, num_experts, top_k,
-                                       d_group_offsets_, d_group_counts_,
-                                       d_group_token_indices_, d_group_weights_))
-            return false;
+        return cudaMoE_regroup_prefill_routes_and_materialize_plan_runtime(
+            static_cast<void *>(runtime_layer),
+            d_group_original_to_grouped_,
+            runtime_gate_descs,
+            runtime_up_descs,
+            runtime_down_descs,
+            d_group_active_expert_ids_,
+            current_tokens * top_k,
+            max_slots,
+            num_experts,
+            top_k,
+            std::min(max_slots, num_experts),
+            retain_routes_for_deferred_commit ? 1 : 0,
+            gateup_table.weight_format,
+            device_ordinal_,
+            stream);
+    }
 
-        host_expert_counts_.resize(num_experts);
-        host_expert_offsets_.resize(num_experts);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        cudaError_t err = cudaMemcpyAsync(host_expert_counts_.data(), d_group_counts_,
-                                          static_cast<size_t>(num_experts) * sizeof(int),
-                                          cudaMemcpyDeviceToHost, cuda_stream);
-        if (err != cudaSuccess)
+    bool CUDAMoEKernel::commitGroupedVerifierHistograms(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        const int32_t *accepted_state_counts_device,
+        const int32_t *publication_ok_flags_device,
+        int request_count,
+        int rows_per_request,
+        int total_rows,
+        int num_experts,
+        int top_k)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "commitGroupedVerifierHistograms");
+        if (!stream)
             return false;
-        err = cudaMemcpyAsync(host_expert_offsets_.data(), d_group_offsets_,
-                              static_cast<size_t>(num_experts) * sizeof(int),
-                              cudaMemcpyDeviceToHost, cuda_stream);
-        if (err != cudaSuccess)
+        if (!runtime_layer ||
+            !accepted_state_counts_device ||
+            !publication_ok_flags_device ||
+            request_count <= 0 ||
+            rows_per_request <= 0 ||
+            total_rows != request_count * rows_per_request ||
+            num_experts <= 0 ||
+            top_k <= 0)
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel::commitGroupedVerifierHistograms] invalid "
+                "device publication contract");
             return false;
-        err = cudaStreamSynchronize(cuda_stream);
-        if (err != cudaSuccess)
-            return false;
+        }
 
-        prepared_num_experts_ = num_experts;
-        return true;
+        return cudaMoE_commit_grouped_verifier_histograms(
+            static_cast<void *>(runtime_layer),
+            accepted_state_counts_device,
+            publication_ok_flags_device,
+            request_count,
+            rows_per_request,
+            total_rows,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::assignPrefillRoutesLeastLoadedResident(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        const int32_t *absolute_position_ids_device,
+        const int32_t *active_row_count_device)
+    {
+        if (!runtime_layer || !absolute_position_ids_device ||
+            !active_row_count_device)
+        {
+            LOG_ERROR(
+                "[CUDAMoEKernel::assignPrefillRoutesLeastLoadedResident] "
+                "runtime, device position row, and device active-row count "
+                "must be non-null");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesLeastLoadedResident] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        void *stream = explicitMoELaunchStream(launch, "assignPrefillRoutesLeastLoadedResident");
+        if (!stream)
+            return false;
+        return cudaMoE_assign_prefill_routes_least_loaded_resident(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            absolute_position_ids_device,
+            active_row_count_device,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        if (config.expert_count != static_cast<uint32_t>(num_experts) ||
+            config.participant_count == 0u ||
+            config.alpha_numerator == 0u ||
+            config.alpha_denominator == 0u ||
+            config.lambda_numerator == 0u ||
+            config.lambda_denominator == 0u)
+        {
+            LOG_ERROR("[CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] invalid LLEP config");
+            return false;
+        }
+
+        void *stream = explicitMoELaunchStream(launch, "planPrefillRoutesLeastLoadedCurrentBatch");
+        if (!stream)
+            return false;
+        return cudaMoE_plan_prefill_routes_least_loaded_current_batch(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            config.min_chunk_tokens,
+            config.alpha_numerator,
+            config.alpha_denominator,
+            config.lambda_numerator,
+            config.lambda_denominator,
+            config.min_spread_improvement,
+            config.min_spread_improvement_divisor,
+            config.min_spread_improvement_per_critical_path_slot,
+            config.min_foreign_rows_per_critical_path_slot,
+            config.max_weight_transfers,
+            config.max_non_owner_experts_per_participant,
+            config.enable_balanced_skip ? 1 : 0,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers");
+        if (!stream)
+            return false;
+        return cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_no_transfers(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        const DeviceMoERebalanceStatus *transfer_status,
+        const DeviceMoERebalanceApplyStatus *apply_status)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] null runtime");
+            return false;
+        }
+        if (!transfer_status || !apply_status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] transfer and apply status are required");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+
+        void *stream = explicitMoELaunchStream(
+            launch,
+            "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers");
+        if (!stream)
+            return false;
+        if (!requireCudaDevicePointer(
+                runtime_layer,
+                device_ordinal_,
+                "runtime_layer",
+                "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers",
+                stream) ||
+            !requireCudaDevicePointer(
+                transfer_status,
+                device_ordinal_,
+                "transfer_status",
+                "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers",
+                stream) ||
+            !requireCudaDevicePointer(
+                apply_status,
+                device_ordinal_,
+                "apply_status",
+                "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers",
+                stream))
+        {
+            return false;
+        }
+        return cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            transfer_status,
+            apply_status,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::gatherPrefillExpertBatchFromRuntime(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *hidden,
+        ITensor *batch_buffer,
+        int expert_id,
+        int max_tokens,
+        int d_model)
+    {
+        if (!runtime_layer || !hidden || !batch_buffer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::gatherPrefillExpertBatchFromRuntime] null runtime/input/output tensor");
+            return false;
+        }
+        if (expert_id < 0 || max_tokens <= 0 || d_model <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::gatherPrefillExpertBatchFromRuntime] invalid arguments expert_id="
+                      << expert_id << " max_tokens=" << max_tokens << " d_model=" << d_model);
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::gatherPrefillExpertBatchFromRuntime");
+        const DeviceId device = deviceId();
+        if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireOutputOnDevice(batch_buffer, device, stream, "batch_buffer"))
+        {
+            return false;
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        float *d_batch = static_cast<float *>(batch_buffer->gpu_data_ptr());
+        if (!d_hidden || !d_batch)
+        {
+            LOG_ERROR("[CUDAMoEKernel::gatherPrefillExpertBatchFromRuntime] tensors have no device pointers");
+            return false;
+        }
+
+        const bool ok = cudaMoE_prefill_gather_expert_runtime(
+            static_cast<const void *>(runtime_layer),
+            d_hidden,
+            d_batch,
+            expert_id,
+            max_tokens,
+            d_model,
+            device_ordinal_,
+            stream);
+        if (ok)
+            markDeviceWritten(batch_buffer, device, stream);
+        return ok;
+    }
+
+    bool CUDAMoEKernel::scatterPrefillExpertResultsFromRuntime(
+        ITensor *output,
+        ITensor *expert_results,
+        DeviceMoELayerRuntime *runtime_layer,
+        int expert_id,
+        int max_tokens,
+        int d_model)
+    {
+        if (!output || !expert_results || !runtime_layer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::scatterPrefillExpertResultsFromRuntime] null runtime/input/output tensor");
+            return false;
+        }
+        if (expert_id < 0 || max_tokens <= 0 || d_model <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::scatterPrefillExpertResultsFromRuntime] invalid arguments expert_id="
+                      << expert_id << " max_tokens=" << max_tokens << " d_model=" << d_model);
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::scatterPrefillExpertResultsFromRuntime");
+        const DeviceId device = deviceId();
+        if (!requireOutputOnDevice(output, device, stream, "output") ||
+            !requireTensorOnDevice(expert_results, device, stream, "expert_results"))
+        {
+            return false;
+        }
+
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        const float *d_expert_output = static_cast<const float *>(expert_results->gpu_data_ptr());
+        if (!d_output || !d_expert_output)
+        {
+            LOG_ERROR("[CUDAMoEKernel::scatterPrefillExpertResultsFromRuntime] tensors have no device pointers");
+            return false;
+        }
+
+        const bool ok = cudaMoE_prefill_scatter_expert_runtime(
+            d_output,
+            d_expert_output,
+            static_cast<const void *>(runtime_layer),
+            expert_id,
+            max_tokens,
+            d_model,
+            device_ordinal_,
+            stream);
+        if (ok)
+            markDeviceWritten(output, device, stream);
+        return ok;
     }
 
     int CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable(
         const DeviceNativeVNNIMatrixDesc *down_descs,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!down_descs || num_experts <= 0 || d_model <= 0 || intermediate <= 0 || (intermediate % 32) != 0)
             return -1;
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "upload grouped down descriptor table"))
+        {
+            return -1;
+        }
         if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertDownDescriptorTable"))
             return -1;
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
+        const bool runtime_mutable =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!runtime_mutable &&
+            descriptor_source !=
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
+        {
+            return -1;
+        }
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
+            if (isBlankGroupedDesc(desc))
+                continue;
+
             if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
             {
                 LOG_DEBUG("[CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable] Invalid descriptor for expert "
                           << expert_id);
                 return -1;
             }
-            codebook_mask |= cudaGroupedPrefillCodebookBit(desc.codebook_id);
-            if (expert_id == 0)
+            if (!addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable))
             {
-                codebook_id = desc.codebook_id;
+                return -1;
             }
         }
-        if (codebook_mask == 0)
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
+        if (codebook_mask == 0 || policy_codebook_mask == 0)
             return -1;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kCudaMoEMixedCodebookSentinel;
+        for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
+        {
+            if ((codebook_mask & nativeVnniCodebookMaskBit(codebook)) != 0u &&
+                !cudaGroupedPrefillSupportsCodebook(codebook))
+            {
+                return -1;
+            }
+        }
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
 
         if (cudaGroupedPrefillMaskNeedsIQTables(codebook_mask))
         {
-            static std::mutex iq_table_mutex;
-            static std::unordered_set<int> iq_init_devices;
-            std::lock_guard<std::mutex> lock(iq_table_mutex);
-            if (!iq_init_devices.count(device_ordinal_))
+            if (!ensureCudaMoEIQGridTablesInitialized(device_ordinal_))
             {
-                if (!cudaNativeVNNIInitIQGridTables_tuned())
-                {
-                    LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable] IQ grid table init failed");
-                    return -1;
-                }
-                iq_init_devices.insert(device_ordinal_);
+                LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable] IQ grid table init failed");
+                return -1;
             }
         }
 
@@ -2683,12 +7293,15 @@ namespace llaminar2
         {
             const auto &existing = grouped_down_desc_tables_[index];
             if (!existing.valid ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
                 !existing.device_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
                 existing.intermediate != intermediate ||
                 existing.codebook_id != codebook_id ||
                 existing.codebook_mask != codebook_mask ||
+                existing.policy_codebook_mask != policy_codebook_mask ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_descs.size() != static_cast<size_t>(num_experts))
             {
                 continue;
@@ -2706,25 +7319,16 @@ namespace llaminar2
         table.intermediate = intermediate;
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
-
-        DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
-        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&device_descs),
-                                     desc_bytes);
-        if (err == cudaSuccess)
-            err = cudaMemcpyAsync(device_descs, table.host_descs.data(),
-                                  desc_bytes,
-                                  cudaMemcpyHostToDevice, static_cast<cudaStream_t>(getStream()));
-        if (err != cudaSuccess)
+        table.policy_codebook_mask = policy_codebook_mask;
+        table.descriptor_source = descriptor_source;
+        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.valid = true;
+        if (!publishGroupedDownDescriptorTable(
+                table,
+                "upload grouped expert down descriptor table"))
         {
-            LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable] descriptor upload failed: "
-                      << cudaGetErrorString(err));
-            if (device_descs)
-                cudaFree(device_descs);
             return -1;
         }
-
-        table.device_descs = device_descs;
-        table.valid = true;
         grouped_down_desc_tables_.push_back(std::move(table));
         return static_cast<int>(grouped_down_desc_tables_.size() - 1);
     }
@@ -2734,19 +7338,44 @@ namespace llaminar2
         const DeviceNativeVNNIMatrixDesc *up_descs,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!gate_descs || !up_descs || num_experts <= 0 || d_model <= 0 || intermediate <= 0 || (d_model % 32) != 0)
             return -1;
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "upload grouped gate/up descriptor tables"))
+        {
+            return -1;
+        }
         if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertGateUpDescriptorTables"))
             return -1;
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
+        const bool runtime_mutable =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!runtime_mutable &&
+            descriptor_source !=
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
+        {
+            return -1;
+        }
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
             const auto &up_desc = up_descs[expert_id];
+            const bool gate_blank = isBlankGroupedDesc(gate_desc);
+            const bool up_blank = isBlankGroupedDesc(up_desc);
+            if (gate_blank || up_blank)
+            {
+                if (gate_blank && up_blank)
+                    continue;
+                LOG_DEBUG("[CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Incomplete sparse descriptor pair for expert "
+                          << expert_id);
+                return -1;
+            }
+
             if (!gate_desc.valid() || !up_desc.valid() ||
                 gate_desc.codebook_id != up_desc.codebook_id ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
@@ -2756,30 +7385,52 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            codebook_mask |= cudaGroupedPrefillCodebookBit(gate_desc.codebook_id);
-            if (expert_id == 0)
+            const auto add_descriptor = [&](
+                                            const DeviceNativeVNNIMatrixDesc &desc)
             {
-                codebook_id = gate_desc.codebook_id;
+                return addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable);
+            };
+            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            {
+                return -1;
             }
         }
-        if (codebook_mask == 0)
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
+        if (codebook_mask == 0 || policy_codebook_mask == 0)
             return -1;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kCudaMoEMixedCodebookSentinel;
+        for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
+        {
+            if ((codebook_mask & nativeVnniCodebookMaskBit(codebook)) != 0u &&
+                !cudaGroupedPrefillSupportsCodebook(codebook))
+            {
+                return -1;
+            }
+        }
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
 
         if (cudaGroupedPrefillMaskNeedsIQTables(codebook_mask))
         {
-            static std::mutex iq_table_mutex;
-            static std::unordered_set<int> iq_init_devices;
-            std::lock_guard<std::mutex> lock(iq_table_mutex);
-            if (!iq_init_devices.count(device_ordinal_))
+            if (!ensureCudaMoEIQGridTablesInitialized(device_ordinal_))
             {
-                if (!cudaNativeVNNIInitIQGridTables_tuned())
-                {
-                    LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables] IQ grid table init failed");
-                    return -1;
-                }
-                iq_init_devices.insert(device_ordinal_);
+                LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables] IQ grid table init failed");
+                return -1;
             }
         }
 
@@ -2795,6 +7446,7 @@ namespace llaminar2
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
             if (!existing.valid ||
+                existing.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
                 !existing.device_gate_descs ||
                 !existing.device_up_descs ||
                 existing.num_experts != num_experts ||
@@ -2802,6 +7454,8 @@ namespace llaminar2
                 existing.intermediate != intermediate ||
                 existing.codebook_id != codebook_id ||
                 existing.codebook_mask != codebook_mask ||
+                existing.policy_codebook_mask != policy_codebook_mask ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_gate_descs.size() != static_cast<size_t>(num_experts) ||
                 existing.host_up_descs.size() != static_cast<size_t>(num_experts))
             {
@@ -2822,38 +7476,701 @@ namespace llaminar2
         table.intermediate = intermediate;
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
-
-        DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
-        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&device_gate_descs),
-                                     desc_bytes);
-        if (err == cudaSuccess)
-            err = cudaMalloc(reinterpret_cast<void **>(&device_up_descs),
-                             desc_bytes);
-        if (err == cudaSuccess)
-            err = cudaMemcpyAsync(device_gate_descs, table.host_gate_descs.data(),
-                                  desc_bytes,
-                                  cudaMemcpyHostToDevice, static_cast<cudaStream_t>(getStream()));
-        if (err == cudaSuccess)
-            err = cudaMemcpyAsync(device_up_descs, table.host_up_descs.data(),
-                                  desc_bytes,
-                                  cudaMemcpyHostToDevice, static_cast<cudaStream_t>(getStream()));
-        if (err != cudaSuccess)
+        table.policy_codebook_mask = policy_codebook_mask;
+        table.descriptor_source = descriptor_source;
+        table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        table.valid = true;
+        if (!publishGroupedGateUpDescriptorTable(
+                table,
+                "upload grouped expert gate/up descriptor tables"))
         {
-            LOG_ERROR("[CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables] descriptor upload failed: "
-                      << cudaGetErrorString(err));
-            if (device_gate_descs)
-                cudaFree(device_gate_descs);
-            if (device_up_descs)
-                cudaFree(device_up_descs);
+            return -1;
+        }
+        grouped_gateup_desc_tables_.push_back(std::move(table));
+        return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
+    }
+
+    int CUDAMoEKernel::uploadGroupedExpertFloatingDownDescriptorTable(
+        const DeviceMoEFloatingMatrixDesc *down_descs,
+        DeviceMoEWeightFormat weight_format,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!down_descs ||
+            !deviceMoEWeightFormatIsFloating(weight_format) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0)
+        {
+            return -1;
+        }
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "upload grouped floating down descriptor table") ||
+            !setMoEDevice(
+                device_ordinal_,
+                "uploadGroupedExpertFloatingDownDescriptorTable"))
+        {
             return -1;
         }
 
-        table.device_gate_descs = device_gate_descs;
-        table.device_up_descs = device_up_descs;
+        bool any_live = false;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const auto &desc = down_descs[expert];
+            if (isBlankGroupedFloatingDesc(desc))
+                continue;
+            if (!validateGroupedFloatingDesc(desc, d_model, intermediate))
+                return -1;
+            any_live = true;
+        }
+        if (!any_live)
+            return -1;
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) *
+            sizeof(DeviceMoEFloatingMatrixDesc);
+        for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
+        {
+            const auto &existing = grouped_down_desc_tables_[index];
+            if (!existing.valid || existing.weight_format != weight_format ||
+                !existing.device_floating_descs ||
+                existing.num_experts != num_experts ||
+                existing.d_model != d_model ||
+                existing.intermediate != intermediate ||
+                existing.host_floating_descs.size() !=
+                    static_cast<size_t>(num_experts))
+            {
+                continue;
+            }
+            if (std::memcmp(
+                    existing.host_floating_descs.data(),
+                    down_descs,
+                    desc_bytes) == 0)
+            {
+                return static_cast<int>(index);
+            }
+        }
+
+        GroupedDownDescriptorTable table;
+        table.host_floating_descs.assign(
+            down_descs, down_descs + num_experts);
+        table.num_experts = num_experts;
+        table.d_model = d_model;
+        table.intermediate = intermediate;
+        table.weight_format = weight_format;
         table.valid = true;
+        if (!publishGroupedDownDescriptorTable(
+                table,
+                "upload grouped floating expert down descriptor table"))
+        {
+            return -1;
+        }
+        grouped_down_desc_tables_.push_back(std::move(table));
+        return static_cast<int>(grouped_down_desc_tables_.size() - 1);
+    }
+
+    int CUDAMoEKernel::uploadGroupedExpertFloatingGateUpDescriptorTables(
+        const DeviceMoEFloatingMatrixDesc *gate_descs,
+        const DeviceMoEFloatingMatrixDesc *up_descs,
+        DeviceMoEWeightFormat weight_format,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!gate_descs || !up_descs ||
+            !deviceMoEWeightFormatIsFloating(weight_format) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0)
+        {
+            return -1;
+        }
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "upload grouped floating gate/up descriptor tables") ||
+            !setMoEDevice(
+                device_ordinal_,
+                "uploadGroupedExpertFloatingGateUpDescriptorTables"))
+        {
+            return -1;
+        }
+
+        bool any_live = false;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const bool gate_blank = isBlankGroupedFloatingDesc(gate_descs[expert]);
+            const bool up_blank = isBlankGroupedFloatingDesc(up_descs[expert]);
+            if (gate_blank || up_blank)
+            {
+                if (gate_blank && up_blank)
+                    continue;
+                return -1;
+            }
+            if (!validateGroupedFloatingDesc(
+                    gate_descs[expert], intermediate, d_model) ||
+                !validateGroupedFloatingDesc(
+                    up_descs[expert], intermediate, d_model))
+            {
+                return -1;
+            }
+            any_live = true;
+        }
+        if (!any_live)
+            return -1;
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) *
+            sizeof(DeviceMoEFloatingMatrixDesc);
+        for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
+        {
+            const auto &existing = grouped_gateup_desc_tables_[index];
+            if (!existing.valid || existing.weight_format != weight_format ||
+                !existing.device_floating_gate_descs ||
+                !existing.device_floating_up_descs ||
+                existing.num_experts != num_experts ||
+                existing.d_model != d_model ||
+                existing.intermediate != intermediate ||
+                existing.host_floating_gate_descs.size() !=
+                    static_cast<size_t>(num_experts) ||
+                existing.host_floating_up_descs.size() !=
+                    static_cast<size_t>(num_experts))
+            {
+                continue;
+            }
+            if (std::memcmp(
+                    existing.host_floating_gate_descs.data(),
+                    gate_descs,
+                    desc_bytes) == 0 &&
+                std::memcmp(
+                    existing.host_floating_up_descs.data(),
+                    up_descs,
+                    desc_bytes) == 0)
+            {
+                return static_cast<int>(index);
+            }
+        }
+
+        GroupedGateUpDescriptorTable table;
+        table.host_floating_gate_descs.assign(
+            gate_descs, gate_descs + num_experts);
+        table.host_floating_up_descs.assign(
+            up_descs, up_descs + num_experts);
+        table.num_experts = num_experts;
+        table.d_model = d_model;
+        table.intermediate = intermediate;
+        table.weight_format = weight_format;
+        table.valid = true;
+        if (!publishGroupedGateUpDescriptorTable(
+                table,
+                "upload grouped floating expert gate/up descriptor tables"))
+        {
+            return -1;
+        }
         grouped_gateup_desc_tables_.push_back(std::move(table));
         return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
+    }
+
+    bool CUDAMoEKernel::updateGroupedExpertDownDescriptorTable(
+        int descriptor_table_id,
+        const DeviceNativeVNNIMatrixDesc *down_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!down_descs || descriptor_table_id < 0 ||
+            descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
+            (intermediate % 32) != 0)
+        {
+            return false;
+        }
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "update grouped down descriptor table"))
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "updateGroupedExpertDownDescriptorTable"))
+            return false;
+
+        auto &table = grouped_down_desc_tables_[static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid ||
+            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            !table.device_descs ||
+            !table.workspace_publication ||
+            table.num_experts != num_experts ||
+            table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        const bool runtime_mutable =
+            table.descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        NativeVnniExecutionFormatEnvelope format_envelope;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &desc = down_descs[expert_id];
+            if (isBlankGroupedDesc(desc))
+                continue;
+            if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
+                return false;
+            if (!addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable))
+            {
+                return false;
+            }
+        }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
+        if (codebook_mask == 0 || policy_codebook_mask == 0)
+            return false;
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
+        if (table.codebook_id != codebook_id ||
+            table.codebook_mask != codebook_mask ||
+            table.policy_codebook_mask != policy_codebook_mask)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertDownDescriptorTable] refusing in-place update "
+                      "with changed codebook semantics");
+            return false;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        const cudaStream_t stream =
+            static_cast<cudaStream_t>(getStream());
+        if (!workspace_->rewritePersistentPublication(
+                kCudaGroupedDownDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    down_descs,
+                    nullptr,
+                    num_experts,
+                    d_model,
+                    intermediate),
+                table.workspace_publication,
+                table.workspace_slot,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&]()
+                {
+                    cudaError_t err = cudaMemcpyAsync(
+                        table.device_descs,
+                        down_descs,
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertDownDescriptorTable] "
+                                  "descriptor refresh failed: "
+                                  << cudaGetErrorString(err));
+                        return false;
+                    }
+                    err = cudaEventRecord(
+                        static_cast<cudaEvent_t>(
+                            table.workspace_publication->ready_event),
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertDownDescriptorTable] "
+                                  "cannot publish refreshed descriptor readiness: "
+                                  << cudaGetErrorString(err));
+                        std::terminate();
+                    }
+                    return true;
+                }))
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertDownDescriptorTable] "
+                      "cannot rewrite refreshed descriptor publication");
+            return false;
+        }
+
+        table.host_descs.assign(down_descs, down_descs + num_experts);
+        return true;
+    }
+
+    bool CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables(
+        int descriptor_table_id,
+        const DeviceNativeVNNIMatrixDesc *gate_descs,
+        const DeviceNativeVNNIMatrixDesc *up_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!gate_descs || !up_descs || descriptor_table_id < 0 ||
+            descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
+            (d_model % 32) != 0)
+        {
+            return false;
+        }
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "update grouped gate/up descriptor tables"))
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "updateGroupedExpertGateUpDescriptorTables"))
+            return false;
+
+        auto &table = grouped_gateup_desc_tables_[static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid ||
+            table.weight_format != DeviceMoEWeightFormat::NativeVNNI ||
+            !table.device_gate_descs ||
+            !table.device_up_descs || !table.workspace_publication ||
+            table.num_experts != num_experts ||
+            table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        const bool runtime_mutable =
+            table.descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        NativeVnniExecutionFormatEnvelope format_envelope;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &gate_desc = gate_descs[expert_id];
+            const auto &up_desc = up_descs[expert_id];
+            const bool gate_blank = isBlankGroupedDesc(gate_desc);
+            const bool up_blank = isBlankGroupedDesc(up_desc);
+            if (gate_blank || up_blank)
+            {
+                if (gate_blank && up_blank)
+                    continue;
+                return false;
+            }
+            if (!gate_desc.valid() || !up_desc.valid() ||
+                gate_desc.codebook_id != up_desc.codebook_id ||
+                !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
+                !validateCudaGroupedDescShape(up_desc, intermediate, d_model))
+            {
+                return false;
+            }
+            const auto add_descriptor = [&](
+                                            const DeviceNativeVNNIMatrixDesc &desc)
+            {
+                return addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable);
+            };
+            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            {
+                return false;
+            }
+        }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
+        if (codebook_mask == 0 || policy_codebook_mask == 0)
+            return false;
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
+        if (table.codebook_id != codebook_id ||
+            table.codebook_mask != codebook_mask ||
+            table.policy_codebook_mask != policy_codebook_mask)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables] refusing in-place update "
+                      "with changed codebook semantics");
+            return false;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        const cudaStream_t stream =
+            static_cast<cudaStream_t>(getStream());
+        if (!workspace_->rewritePersistentPublication(
+                kCudaGroupedGateUpDescriptorLeaseDomain,
+                groupedDescriptorPublicationKey(
+                    gate_descs,
+                    up_descs,
+                    num_experts,
+                    d_model,
+                    intermediate),
+                table.workspace_publication,
+                table.workspace_slot,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&]()
+                {
+                    cudaError_t err = cudaMemcpyAsync(
+                        table.device_gate_descs,
+                        gate_descs,
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                                  "gate descriptor refresh failed: "
+                                  << cudaGetErrorString(err));
+                        return false;
+                    }
+                    err = cudaMemcpyAsync(
+                        table.device_up_descs,
+                        up_descs,
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                                  "up refresh failed after gate submission: "
+                                  << cudaGetErrorString(err));
+                        std::terminate();
+                    }
+                    err = cudaEventRecord(
+                        static_cast<cudaEvent_t>(
+                            table.workspace_publication->ready_event),
+                        stream);
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                                  "cannot publish refreshed descriptor readiness: "
+                                  << cudaGetErrorString(err));
+                        std::terminate();
+                    }
+                    return true;
+                }))
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables] "
+                      "cannot rewrite refreshed descriptor publication");
+            return false;
+        }
+
+        table.host_gate_descs.assign(gate_descs, gate_descs + num_experts);
+        table.host_up_descs.assign(up_descs, up_descs + num_experts);
+        return true;
+    }
+
+    bool CUDAMoEKernel::updateGroupedExpertFloatingDownDescriptorTable(
+        int descriptor_table_id,
+        const DeviceMoEFloatingMatrixDesc *down_descs,
+        DeviceMoEWeightFormat weight_format,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!down_descs ||
+            !deviceMoEWeightFormatIsFloating(weight_format) ||
+            descriptor_table_id < 0 ||
+            descriptor_table_id >=
+                static_cast<int>(grouped_down_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "update grouped floating down descriptor table") ||
+            !setMoEDevice(
+                device_ordinal_,
+                "updateGroupedExpertFloatingDownDescriptorTable"))
+        {
+            return false;
+        }
+
+        auto &table = grouped_down_desc_tables_[
+            static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid || table.weight_format != weight_format ||
+            !table.device_floating_descs || !table.workspace_publication ||
+            table.num_experts != num_experts || table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        bool any_live = false;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const auto &desc = down_descs[expert];
+            if (isBlankGroupedFloatingDesc(desc))
+                continue;
+            if (!validateGroupedFloatingDesc(desc, d_model, intermediate))
+                return false;
+            any_live = true;
+        }
+        if (!any_live)
+            return false;
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) *
+            sizeof(DeviceMoEFloatingMatrixDesc);
+        const cudaStream_t stream = static_cast<cudaStream_t>(getStream());
+        if (!stream)
+            return false;
+        if (!workspace_->rewritePersistentPublication(
+                kCudaGroupedDownDescriptorLeaseDomain,
+                groupedFloatingDescriptorPublicationKey(
+                    down_descs,
+                    nullptr,
+                    weight_format,
+                    num_experts,
+                    d_model,
+                    intermediate),
+                table.workspace_publication,
+                table.workspace_slot,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&]()
+                {
+                    cudaError_t err = cudaMemcpyAsync(
+                        table.device_floating_descs,
+                        down_descs,
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                        return false;
+                    err = cudaEventRecord(
+                        static_cast<cudaEvent_t>(
+                            table.workspace_publication->ready_event),
+                        stream);
+                    if (err != cudaSuccess)
+                        std::terminate();
+                    return true;
+                }))
+        {
+            return false;
+        }
+        table.host_floating_descs.assign(
+            down_descs, down_descs + num_experts);
+        return true;
+    }
+
+    bool CUDAMoEKernel::updateGroupedExpertFloatingGateUpDescriptorTables(
+        int descriptor_table_id,
+        const DeviceMoEFloatingMatrixDesc *gate_descs,
+        const DeviceMoEFloatingMatrixDesc *up_descs,
+        DeviceMoEWeightFormat weight_format,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!gate_descs || !up_descs ||
+            !deviceMoEWeightFormatIsFloating(weight_format) ||
+            descriptor_table_id < 0 ||
+            descriptor_table_id >=
+                static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                getStream(), "update grouped floating gate/up descriptor tables") ||
+            !setMoEDevice(
+                device_ordinal_,
+                "updateGroupedExpertFloatingGateUpDescriptorTables"))
+        {
+            return false;
+        }
+
+        auto &table = grouped_gateup_desc_tables_[
+            static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid || table.weight_format != weight_format ||
+            !table.device_floating_gate_descs ||
+            !table.device_floating_up_descs ||
+            !table.workspace_publication ||
+            table.num_experts != num_experts || table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        bool any_live = false;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const bool gate_blank = isBlankGroupedFloatingDesc(gate_descs[expert]);
+            const bool up_blank = isBlankGroupedFloatingDesc(up_descs[expert]);
+            if (gate_blank || up_blank)
+            {
+                if (gate_blank && up_blank)
+                    continue;
+                return false;
+            }
+            if (!validateGroupedFloatingDesc(
+                    gate_descs[expert], intermediate, d_model) ||
+                !validateGroupedFloatingDesc(
+                    up_descs[expert], intermediate, d_model))
+            {
+                return false;
+            }
+            any_live = true;
+        }
+        if (!any_live)
+            return false;
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) *
+            sizeof(DeviceMoEFloatingMatrixDesc);
+        const cudaStream_t stream = static_cast<cudaStream_t>(getStream());
+        if (!stream)
+            return false;
+        if (!workspace_->rewritePersistentPublication(
+                kCudaGroupedGateUpDescriptorLeaseDomain,
+                groupedFloatingDescriptorPublicationKey(
+                    gate_descs,
+                    up_descs,
+                    weight_format,
+                    num_experts,
+                    d_model,
+                    intermediate),
+                table.workspace_publication,
+                table.workspace_slot,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                [&]()
+                {
+                    cudaError_t err = cudaMemcpyAsync(
+                        table.device_floating_gate_descs,
+                        gate_descs,
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                        return false;
+                    err = cudaMemcpyAsync(
+                        table.device_floating_up_descs,
+                        up_descs,
+                        desc_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream);
+                    if (err != cudaSuccess)
+                        std::terminate();
+                    err = cudaEventRecord(
+                        static_cast<cudaEvent_t>(
+                            table.workspace_publication->ready_event),
+                        stream);
+                    if (err != cudaSuccess)
+                        std::terminate();
+                    return true;
+                }))
+        {
+            return false;
+        }
+        table.host_floating_gate_descs.assign(
+            gate_descs, gate_descs + num_experts);
+        table.host_floating_up_descs.assign(
+            up_descs, up_descs + num_experts);
+        return true;
     }
 
     bool CUDAMoEKernel::prepareExpertGroupsAsync(ITensor *routing_indices, ITensor *routing_weights,
@@ -2864,8 +8181,8 @@ namespace llaminar2
         void *stream = requireStream("CUDAMoEKernel::prepareExpertGroupsAsync");
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
-        if (!ensureTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
-            !ensureTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
+        if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
+            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
             !ensureGroupingBufferCapacity(total_slots, num_experts))
             return false;
 
@@ -2904,7 +8221,6 @@ namespace llaminar2
             }
 
             group_active_expert_slots_ = active_expert_slots;
-            prepared_num_experts_ = num_experts;
             PerfStatsCollector::addCounter(
                 "kernel", "cuda_moe_small_prefill_grouping_calls", 1.0, {}, {},
                 {{"seq_len", std::to_string(seq_len)},
@@ -2922,7 +8238,222 @@ namespace llaminar2
                                        d_group_token_indices_, d_group_weights_))
             return false;
 
-        prepared_num_experts_ = num_experts;
+        group_active_expert_slots_ = std::min(total_slots, num_experts);
+        /*
+         * Runtime-M verifier batches above the compact planner's fixed work
+         * envelope use the scalable count/scan/scatter pipeline.  Publish a
+         * distinct counter so correctness tests can prove an extended-depth
+         * row batch did not accidentally reuse the M<=4 planner or skip
+         * grouping altogether.
+         */
+        PerfStatsCollector::addCounter(
+            "kernel", "cuda_moe_general_prefill_grouping_calls", 1.0, {}, {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"num_experts", std::to_string(num_experts)},
+             {"total_slots", std::to_string(total_slots)}});
+        return true;
+    }
+
+    bool CUDAMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask(
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int seq_len,
+        int num_experts,
+        int top_k)
+    {
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+            return false;
+        void *stream = requireStream(
+            "CUDAMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask");
+        const DeviceId device = deviceId();
+        const int total_slots = seq_len * top_k;
+        if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
+            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
+            !ensureGroupingBufferCapacity(total_slots, num_experts))
+            return false;
+
+        const float *d_float_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *d_float_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!d_float_indices || !d_float_weights)
+            return false;
+
+        /*
+         * Mask publication is intentionally not recoverable from this method.
+         * A missing or mismatched publication means the stage lifecycle is
+         * invalid; copying a host mask here would make graph replay depend on
+         * transient host memory and recreate the coherence bug this contract
+         * exists to prevent.
+         */
+        if (!group_expert_mask_published_ ||
+            !d_group_expert_mask_ ||
+            group_expert_mask_cap_ < num_experts ||
+            group_expert_mask_num_experts_ != num_experts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::prepareExpertGroupsAsyncUsingPublishedMask] "
+                      "fixed-topology expert mask was not published for the current "
+                      "workspace and expert count before graph execution"
+                      << " requested_experts=" << num_experts
+                      << " published_experts=" << group_expert_mask_num_experts_
+                      << " capacity=" << group_expert_mask_cap_);
+            return false;
+        }
+
+        group_active_expert_slots_ = 0;
+        if (!cudaMoE_float_to_masked_int(
+                d_float_indices,
+                d_group_int_indices_,
+                d_group_expert_mask_,
+                total_slots,
+                num_experts,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        if (!groupTokensByExpertDevice(d_group_int_indices_, d_float_weights,
+                                       seq_len, num_experts, top_k,
+                                       d_group_offsets_, d_group_counts_,
+                                       d_group_token_indices_, d_group_weights_))
+            return false;
+
+        /*
+         * The active-id list is compacted in expert order and padded with -1.
+         * A LocalTP participant can never execute more distinct experts than
+         * its static ownership mask contains, so use that tighter graph-stable
+         * upper bound for the grouped expert grid.  The old num_experts bound
+         * launched known-nonlocal no-op expert planes and made masked telemetry
+         * indistinguishable from the unmasked route.
+         */
+        group_active_expert_slots_ =
+            std::min(total_slots, group_expert_mask_active_experts_);
+        PerfStatsCollector::addCounter(
+            "kernel", "cuda_moe_masked_prefill_grouping_calls", 1.0, {}, {},
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"num_experts", std::to_string(num_experts)},
+             {"mask_active_experts", std::to_string(group_expert_mask_active_experts_)},
+             {"expert_grid_slots", std::to_string(group_active_expert_slots_)}});
+        return true;
+    }
+
+    bool CUDAMoEKernel::updateGroupedPrefillExpertMask(
+        const uint8_t *expert_mask,
+        int num_experts)
+    {
+        if (num_experts <= 0 || !expert_mask)
+            return false;
+
+        void *stream = requireStream("CUDAMoEKernel::updateGroupedPrefillExpertMask");
+        if (!stream)
+            return false;
+
+        uint64_t mask_hash = 1469598103934665603ull;
+        int active_experts = 0;
+        for (int i = 0; i < num_experts; ++i)
+        {
+            mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
+            mask_hash *= 1099511628211ull;
+            active_experts += expert_mask[i] != 0u ? 1 : 0;
+        }
+        mask_hash ^= static_cast<uint64_t>(num_experts);
+        mask_hash *= 1099511628211ull;
+
+        /*
+         * Captured decode may consume an immutable mask published during
+         * warmup.  Check that exact identity before applying the mutation
+         * guard: reusing an already-published device table performs no host
+         * transfer and is therefore a valid graph-construction operation.
+         */
+        if (group_expert_mask_published_ &&
+            group_expert_mask_hash_ == mask_hash &&
+            group_expert_mask_num_experts_ == num_experts)
+            return true;
+
+        if (rejectCudaPersistentMetadataMutationDuringCapture(
+                stream, "update grouped prefill expert mask"))
+        {
+            return false;
+        }
+
+        if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
+        {
+            if (!workspace_)
+            {
+                LOG_ERROR("[CUDAMoEKernel::updateGroupedPrefillExpertMask] "
+                          "graph-owned workspace is required before mask publication");
+                return false;
+            }
+
+            auto lease = workspace_->acquirePersistentSlot(
+                kCudaGroupedExpertMaskLeaseDomain,
+                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            void *mask_table = nullptr;
+            const size_t required_table_bytes =
+                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) *
+                static_cast<size_t>(num_experts) * sizeof(uint8_t);
+            if (!lease ||
+                !bindWorkspaceBuffer(
+                    &mask_table,
+                    MoEWorkspaceBuffers::GROUP_EXPERT_MASK,
+                    required_table_bytes,
+                    "updateGroupedPrefillExpertMask(group_expert_mask_table)"))
+            {
+                d_group_expert_mask_ = nullptr;
+                group_expert_mask_workspace_lease_.reset();
+                group_expert_mask_cap_ = 0;
+                group_expert_mask_hash_ = 0;
+                group_expert_mask_num_experts_ = 0;
+                group_expert_mask_active_experts_ = 0;
+                group_expert_mask_published_ = false;
+                return false;
+            }
+
+            const size_t table_bytes =
+                workspace_->getBufferSize(MoEWorkspaceBuffers::GROUP_EXPERT_MASK);
+            const size_t slot_stride =
+                table_bytes /
+                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+            if (slot_stride < static_cast<size_t>(num_experts))
+            {
+                LOG_ERROR("[CUDAMoEKernel::updateGroupedPrefillExpertMask] "
+                          "leased expert-mask slot is too narrow: stride="
+                          << slot_stride << " requested_experts=" << num_experts);
+                d_group_expert_mask_ = nullptr;
+                group_expert_mask_workspace_lease_.reset();
+                group_expert_mask_cap_ = 0;
+                group_expert_mask_published_ = false;
+                return false;
+            }
+
+            d_group_expert_mask_ =
+                static_cast<uint8_t *>(mask_table) + lease->slot() * slot_stride;
+            group_expert_mask_workspace_lease_ = std::move(lease);
+            group_expert_mask_cap_ = static_cast<int>(slot_stride);
+            group_expert_mask_hash_ = 0;
+            group_expert_mask_num_experts_ = 0;
+            group_expert_mask_active_experts_ = 0;
+            group_expert_mask_published_ = false;
+        }
+
+        cudaError_t err = cudaMemcpyAsync(
+            d_group_expert_mask_,
+            expert_mask,
+            static_cast<size_t>(num_experts) * sizeof(uint8_t),
+            cudaMemcpyHostToDevice,
+            static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedPrefillExpertMask] H2D mask copy failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+
+        group_expert_mask_hash_ = mask_hash;
+        group_expert_mask_num_experts_ = num_experts;
+        group_expert_mask_active_experts_ = active_experts;
+        group_expert_mask_published_ = true;
         return true;
     }
 
@@ -2938,6 +8469,7 @@ namespace llaminar2
                 d_group_counts_,
                 d_group_token_indices_,
                 d_group_original_to_grouped_,
+                d_group_original_expert_ids_,
                 d_group_weights_,
                 d_group_active_expert_ids_,
                 seq_len,
@@ -2946,7 +8478,6 @@ namespace llaminar2
         {
             return false;
         }
-        prepared_num_experts_ = 1;
         group_active_expert_slots_ = 1;
         PerfStatsCollector::addCounter(
             "kernel", "cuda_moe_shared_expert_prefill_group_calls", 1.0, {}, {},
@@ -2961,7 +8492,8 @@ namespace llaminar2
         int gateup_desc_table_id,
         int down_desc_table_id,
         int seq_len, int d_model, int intermediate,
-        int num_experts, int top_k)
+        int num_experts, int top_k,
+        ITensor *canonical_route_contributions)
     {
         if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
@@ -2976,7 +8508,11 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
-        if (!gateup_table.valid || !down_table.valid ||
+        const bool floating = deviceMoEWeightFormatIsFloating(
+            gateup_table.weight_format);
+        if (!gateup_table.valid || !gateup_table.deviceReady() ||
+            !down_table.valid || !down_table.deviceReady() ||
+            gateup_table.weight_format != down_table.weight_format ||
             gateup_table.num_experts != num_experts ||
             down_table.num_experts != num_experts ||
             gateup_table.d_model != d_model ||
@@ -2992,40 +8528,260 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
+        const int splitk_tile_rows =
+            std::min(seq_len, MoEWorkspaceBuffers::kVerifierSplitKTileRows);
+        const int splitk_route_slots = splitk_tile_rows * top_k;
         const int active_expert_slots = group_active_expert_slots_;
         const int *d_active_expert_ids =
             (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
-        const bool use_gateup_kpart =
-            active_expert_slots > 0 &&
-            max_tokens_per_expert <= 4 &&
-            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-            ensureGroupedGateUpKPartScratchCapacity(
+
+        /*
+         * Floating experts retain the same ordered grouping transaction but
+         * consume their typed descriptor family directly. The fixed-tree
+         * kernels deliberately bypass router-Q8 reuse and codebook policy:
+         * neither is meaningful for a contiguous FP16/BF16/FP32 matrix.
+         */
+        if (floating)
+        {
+            ITensor *publication_output = canonical_route_contributions
+                                              ? canonical_route_contributions
+                                              : output;
+            const char *publication_output_name =
+                canonical_route_contributions
+                    ? "canonical_route_contributions"
+                    : "output";
+            if (!d_group_original_to_grouped_ ||
+                !d_group_original_expert_ids_ || !d_group_weights_ ||
+                !ensureGroupedPrefillScratchCapacity(
+                    total_slots, d_model, intermediate) ||
+                !requireTensorOnDevice(hidden, device, stream, "hidden") ||
+                !requireOutputOnDevice(
+                    publication_output,
+                    device,
+                    stream,
+                    publication_output_name))
+            {
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                          "floating grouped-prefill publication is incomplete");
+                return false;
+            }
+
+            const bool ok = cudaMoE_grouped_floating_prefill_pipeline(
+                static_cast<const float *>(hidden->gpu_data_ptr()),
+                gateup_table.device_floating_gate_descs,
+                gateup_table.device_floating_up_descs,
+                down_table.device_floating_descs,
+                d_group_original_to_grouped_,
+                d_group_original_expert_ids_,
+                d_group_weights_,
+                d_prefill_gate_,
+                d_prefill_up_,
+                canonical_route_contributions
+                    ? nullptr
+                    : static_cast<float *>(output->gpu_data_ptr()),
+                canonical_route_contributions
+                    ? static_cast<float *>(
+                          canonical_route_contributions->gpu_data_ptr())
+                    : nullptr,
+                seq_len,
                 total_slots,
-                debugEnv().gemm.cuda_moe_gateup_kparts,
-                intermediate);
+                top_k,
+                d_model,
+                intermediate,
+                num_experts,
+                gateup_table.weight_format,
+                device_ordinal_,
+                stream);
+            if (!ok)
+            {
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                          "floating grouped CUDA pipeline failed");
+                return false;
+            }
+            markDeviceWritten(publication_output, device, stream);
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_floating_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"active_expert_slots", std::to_string(active_expert_slots)},
+                 {"descriptor_source", "static_table"},
+                 {"weight_format", std::to_string(static_cast<uint32_t>(
+                                       gateup_table.weight_format))}});
+            return true;
+        }
+
+        const auto projection_engine =
+            CUDAMoEBatchInvariantPolicy::groupedProjectionEngine(seq_len);
+        const bool use_grouped_imma =
+            projection_engine ==
+            CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine::
+                TensorCoreImmaPrefill;
+        const bool use_gateup_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
+        CUDAMoEProductionPrefillPolicy prefill_policy =
+            selectCUDAMoEProductionPrefillPolicy(
+                gateup_table.codebook_mask,
+                down_table.codebook_mask,
+                seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k,
+                use_gateup_kpart);
+        if (use_gateup_kpart &&
+            !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "capture-time prefill policy is invalid"
+                      << " seq_len=" << seq_len
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate
+                      << " num_experts=" << num_experts
+                      << " top_k=" << top_k);
+            return false;
+        }
+        if (use_grouped_imma &&
+            (!cuda::moe::validGroupedImmaGateUpColumns(
+                 prefill_policy.imma_gateup_columns) ||
+             !cuda::moe::validGroupedImmaDownColumns(
+                 prefill_policy.imma_down_columns) ||
+             !cuda::moe::validGroupedImmaGateUpSchedule(
+                 prefill_policy.imma_gateup_schedule)))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "capture-time IMMA geometry is invalid");
+            return false;
+        }
+        if (use_gateup_kpart &&
+            !ensureGroupedGateUpKPartScratchCapacity(
+                splitk_route_slots,
+                CUDAMoEBatchInvariantPolicy::gate_up_k_partitions,
+                intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "verifier grouped gate/up split-K scratch allocation failed");
+            return false;
+        }
+        if (active_expert_slots > 0 &&
+            (!d_group_original_to_grouped_ || !d_group_original_expert_ids_))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "decode-equivalent grouped prefill requires ordered route maps");
+            return false;
+        }
+        const bool use_down_ordered_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
+        const bool publishes_canonical_routes =
+            canonical_route_contributions != nullptr;
+        if (use_down_ordered_kpart && publishes_canonical_routes &&
+            !ensureGroupedDownKPartScratchCapacity(
+                CUDAMoEBatchInvariantPolicy::down_k_partitions,
+                d_model,
+                splitk_route_slots))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "verifier grouped down split-K scratch allocation failed");
+            return false;
+        }
+        ITensor *publication_output = canonical_route_contributions
+                                          ? canonical_route_contributions
+                                          : output;
+        const char *publication_output_name = canonical_route_contributions
+                                                  ? "canonical_route_contributions"
+                                                  : "output";
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
-            !ensureTensorOnDevice(hidden, device, stream, "hidden") ||
-            !ensureOutputOnDevice(output, device, stream, "output"))
+            (use_grouped_imma &&
+             !ensureGroupedImmaDirectoryCapacity(total_slots, num_experts)) ||
+            !requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireOutputOnDevice(
+                publication_output,
+                device,
+                stream,
+                publication_output_name))
             return false;
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        if (!d_hidden || !d_output)
+        float *d_output = canonical_route_contributions
+                              ? nullptr
+                              : static_cast<float *>(output->gpu_data_ptr());
+        float *d_canonical_route_contributions =
+            canonical_route_contributions
+                ? static_cast<float *>(
+                      canonical_route_contributions->gpu_data_ptr())
+                : nullptr;
+        if (!d_hidden ||
+            (!d_output && !d_canonical_route_contributions))
             return false;
+        const char *router_q8_reuse_block_reason =
+            routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
+        const bool reuse_router_q8_hidden =
+            active_expert_slots > 0 &&
+            router_q8_reuse_block_reason == nullptr;
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::RequiredConsumer &&
+            !reuse_router_q8_hidden)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] required "
+                      "router Q8 publication is unavailable: "
+                      << (router_q8_reuse_block_reason
+                              ? router_q8_reuse_block_reason
+                              : "no_active_experts"));
+            return false;
+        }
+        if (!reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_blocked_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "static_table"},
+                 {"reason", active_expert_slots <= 0
+                                ? "no_active_experts"
+                                : (router_q8_reuse_block_reason
+                                       ? router_q8_reuse_block_reason
+                                       : "unpublished")}});
+        }
 
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         /*
-         * Ordered scatter overwrites every output element, including the shared
-         * expert identity-map case.  Only the atomic scatter fallback needs a
-         * zeroed destination before accumulation.
+         * Ordered scatter is the only active-route publication path. Every
+         * token/column has one owner, so no floating-point atomic accumulation
+         * or destination pre-zero is involved. A participant with no local
+         * routes still publishes an all-zero contribution for the following
+         * collective; that no-work case is the sole reason to clear output.
          */
         const bool ordered_scatter_overwrites_output =
             active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
-        if (!ordered_scatter_overwrites_output)
+        if (active_expert_slots > 0 && !ordered_scatter_overwrites_output)
         {
-            cudaError_t err = cudaMemsetAsync(d_output, 0,
-                                              static_cast<size_t>(seq_len) * d_model * sizeof(float),
-                                              cuda_stream);
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] "
+                      "active grouped prefill routes require ordered scatter ownership");
+            return false;
+        }
+        if (active_expert_slots == 0)
+        {
+            cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+            float *clear_target = d_canonical_route_contributions
+                                      ? d_canonical_route_contributions
+                                      : d_output;
+            const size_t clear_count =
+                static_cast<size_t>(seq_len) *
+                static_cast<size_t>(d_model) *
+                (d_canonical_route_contributions
+                     ? static_cast<size_t>(top_k)
+                     : size_t{1});
+            cudaError_t err = cudaMemsetAsync(
+                clear_target,
+                0,
+                clear_count * sizeof(float),
+                cuda_stream);
             if (err != cudaSuccess)
             {
                 LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] output memset failed: "
@@ -3036,13 +8792,26 @@ namespace llaminar2
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
+            reuse_router_q8_hidden
+                ? router_q8_hidden_publication_->quantized_rows
+                : nullptr,
+            reuse_router_q8_hidden
+                ? router_q8_hidden_publication_->row_scales
+                : nullptr,
             gateup_table.device_gate_descs,
             gateup_table.device_up_descs,
             down_table.device_descs,
             d_group_counts_,
             d_group_offsets_,
+            use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
+            use_grouped_imma
+                ? prefill_imma_directory_entries_cap_
+                : 0,
             d_group_token_indices_,
             ordered_scatter_overwrites_output ? d_group_original_to_grouped_ : nullptr,
+            use_gateup_kpart || use_down_ordered_kpart
+                ? d_group_original_expert_ids_
+                : nullptr,
             d_active_expert_ids,
             d_group_weights_,
             d_prefill_A_int8_,
@@ -3053,8 +8822,12 @@ namespace llaminar2
             use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
+            use_down_ordered_kpart && publishes_canonical_routes
+                ? d_grouped_down_partials_
+                : nullptr,
             d_prefill_gate_,
             d_output,
+            d_canonical_route_contributions,
             num_experts,
             d_model,
             intermediate,
@@ -3062,11 +8835,19 @@ namespace llaminar2
             total_slots,
             top_k,
             active_expert_slots,
+            0,
             gateup_table.codebook_id,
             down_table.codebook_id,
             gateup_table.codebook_mask,
             down_table.codebook_mask,
-            use_gateup_kpart ? debugEnv().gemm.cuda_moe_gateup_kparts : 0,
+            use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
+            prefill_policy.gateup_tile_n,
+            use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
+            splitk_tile_rows,
+            projection_engine,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
             device_ordinal_,
             stream);
         if (!ok)
@@ -3075,11 +8856,33 @@ namespace llaminar2
             return false;
         }
 
-        markDeviceWritten(output, device, stream);
-        const int selected_tile_m = selectGroupedPrefillTileM(
-            debugEnv().gemm.cuda_moe_prefill_tile_m, max_tokens_per_expert);
-        const int selected_tile_n =
-            (active_expert_slots > 0 && max_tokens_per_expert <= 4) ? 64 : 128;
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "static_table"}});
+        }
+
+        markDeviceWritten(
+            canonical_route_contributions
+                ? canonical_route_contributions
+                : output,
+            device,
+            stream);
+        const int selected_tile_m = use_grouped_imma
+                                        ? cuda::moe::kGroupedImmaTileRows
+                                        : (use_gateup_kpart
+                                               ? 0
+                                               : selectGroupedPrefillTileM(
+                                                     debugEnv().gemm.cuda_moe_prefill_tile_m,
+                                                     max_tokens_per_expert));
+        const int selected_tile_n = prefill_policy.gateup_tile_n;
         recordGroupedPrefillCounters(
             seq_len,
             top_k,
@@ -3087,8 +8890,716 @@ namespace llaminar2
             active_expert_slots,
             selected_tile_m,
             selected_tile_n,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
+            gateup_table.policy_codebook_mask,
+            down_table.policy_codebook_mask,
+            use_grouped_imma,
+            use_gateup_kpart,
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
-            ordered_scatter_overwrites_output);
+            use_down_ordered_kpart,
+            ordered_scatter_overwrites_output,
+            canonical_route_contributions != nullptr,
+            splitk_tile_rows,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
+            prefill_policy.source);
+        return true;
+    }
+
+    bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(
+        DeviceMoELayerRuntime *device_runtime_layer,
+        const DeviceMoELayerRuntime &runtime_host_layer,
+        ITensor *hidden, ITensor *output,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        int seq_len, int d_model, int intermediate,
+        int num_experts, int top_k,
+        ITensor *canonical_route_contributions)
+    {
+        if (!device_runtime_layer)
+            return false;
+        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top_k <= 0)
+            return false;
+        if (runtime_host_layer.expert_count != static_cast<uint32_t>(num_experts) ||
+            runtime_host_layer.top_k != static_cast<uint32_t>(top_k) ||
+            runtime_host_layer.prefill_token_capacity < static_cast<uint32_t>(seq_len) ||
+            runtime_host_layer.prefill_route_capacity < static_cast<uint32_t>(seq_len * top_k) ||
+            !runtime_host_layer.expert_counts ||
+            !runtime_host_layer.expert_offsets ||
+            !runtime_host_layer.grouped_token_ids ||
+            !runtime_host_layer.grouped_route_weights)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid runtime scratch contract"
+                      << " expert_count=" << runtime_host_layer.expert_count
+                      << " expected_experts=" << num_experts
+                      << " top_k=" << runtime_host_layer.top_k
+                      << " expected_top_k=" << top_k
+                      << " token_capacity=" << runtime_host_layer.prefill_token_capacity
+                      << " seq_len=" << seq_len
+                      << " route_capacity=" << runtime_host_layer.prefill_route_capacity
+                      << " total_slots=" << (seq_len * top_k));
+            return false;
+        }
+        if (gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] invalid descriptor table id");
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        const bool floating = deviceMoEWeightFormatIsFloating(
+            gateup_table.weight_format);
+        if (!gateup_table.valid || !gateup_table.deviceReady() ||
+            !down_table.valid || !down_table.deviceReady() ||
+            gateup_table.weight_format != down_table.weight_format ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts ||
+            gateup_table.d_model != d_model ||
+            down_table.d_model != d_model ||
+            gateup_table.intermediate != intermediate ||
+            down_table.intermediate != intermediate)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] descriptor table shape mismatch");
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan");
+        const DeviceId device = deviceId();
+        const int total_slots = seq_len * top_k;
+        const int max_tokens_per_expert = seq_len;
+        const int splitk_tile_rows =
+            std::min(seq_len, MoEWorkspaceBuffers::kVerifierSplitKTileRows);
+        const int splitk_route_slots = splitk_tile_rows * top_k;
+        const int active_expert_slots = std::min(total_slots, num_experts);
+
+        if (floating)
+        {
+            if (!runtime_host_layer.route_expert_ids ||
+                !ensureGroupingBufferCapacity(total_slots, num_experts) ||
+                !ensureGroupedPrefillScratchCapacity(
+                    total_slots, d_model, intermediate))
+            {
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                          "floating runtime grouping workspace is incomplete");
+                return false;
+            }
+
+            ITensor *publication_output = canonical_route_contributions
+                                              ? canonical_route_contributions
+                                              : output;
+            const char *publication_output_name =
+                canonical_route_contributions
+                    ? "canonical_route_contributions"
+                    : "output";
+            if (!requireTensorOnDevice(hidden, device, stream, "hidden") ||
+                !requireOutputOnDevice(
+                    publication_output,
+                    device,
+                    stream,
+                    publication_output_name))
+            {
+                return false;
+            }
+
+            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    num_experts,
+                    &runtime_gate_descs,
+                    "CUDA floating runtime prefill gate descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    num_experts,
+                    &runtime_up_descs,
+                    "CUDA floating runtime prefill up descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                    down_table.workspace_slot,
+                    num_experts,
+                    &runtime_down_descs,
+                    "CUDA floating runtime prefill down descriptors"))
+            {
+                return false;
+            }
+
+            group_active_expert_slots_ = active_expert_slots;
+            const bool ok = cudaMoE_grouped_floating_prefill_pipeline(
+                static_cast<const float *>(hidden->gpu_data_ptr()),
+                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                    runtime_gate_descs),
+                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                    runtime_up_descs),
+                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                    runtime_down_descs),
+                d_group_original_to_grouped_,
+                runtime_host_layer.route_expert_ids,
+                runtime_host_layer.grouped_route_weights,
+                d_prefill_gate_,
+                d_prefill_up_,
+                canonical_route_contributions
+                    ? nullptr
+                    : static_cast<float *>(output->gpu_data_ptr()),
+                canonical_route_contributions
+                    ? static_cast<float *>(
+                          canonical_route_contributions->gpu_data_ptr())
+                    : nullptr,
+                seq_len,
+                total_slots,
+                top_k,
+                d_model,
+                intermediate,
+                num_experts,
+                gateup_table.weight_format,
+                device_ordinal_,
+                stream);
+            if (!ok)
+            {
+                LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                          "floating grouped CUDA pipeline failed");
+                return false;
+            }
+            markDeviceWritten(publication_output, device, stream);
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_floating_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"active_expert_slots", std::to_string(active_expert_slots)},
+                 {"descriptor_source", "runtime_table"},
+                 {"weight_format", std::to_string(static_cast<uint32_t>(
+                                       gateup_table.weight_format))}});
+            return true;
+        }
+
+        const auto projection_engine =
+            CUDAMoEBatchInvariantPolicy::groupedProjectionEngine(seq_len);
+        const bool use_grouped_imma =
+            projection_engine ==
+            CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine::
+                TensorCoreImmaPrefill;
+        const bool use_gateup_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
+        CUDAMoEProductionPrefillPolicy prefill_policy =
+            selectCUDAMoEProductionPrefillPolicy(
+                gateup_table.codebook_mask,
+                down_table.codebook_mask,
+                seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k,
+                use_gateup_kpart);
+        if (use_gateup_kpart &&
+            !validCUDAMoEGateUpOrderedTileN(prefill_policy.gateup_tile_n))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "capture-time prefill policy is invalid"
+                      << " seq_len=" << seq_len
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate
+                      << " num_experts=" << num_experts
+                      << " top_k=" << top_k);
+            return false;
+        }
+        if (use_grouped_imma &&
+            (!cuda::moe::validGroupedImmaGateUpColumns(
+                 prefill_policy.imma_gateup_columns) ||
+             !cuda::moe::validGroupedImmaDownColumns(
+                 prefill_policy.imma_down_columns) ||
+             !cuda::moe::validGroupedImmaGateUpSchedule(
+                 prefill_policy.imma_gateup_schedule)))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "capture-time IMMA geometry is invalid");
+            return false;
+        }
+        /*
+         * Runtime grouped verifier prefill must mirror the public M=1 runtime
+         * decode route.  CUDA serial decode uses split-K gate/up for tiny MoE
+         * rows by default, so every runtime-M publication has to use the same
+         * split-K partial ordering before it evaluates SwiGLU and quantizes the
+         * down input. Fixed-size row tiles bound scratch independently of M;
+         * this remains one grouped, graph-capturable device sequence rather
+         * than serial row replay.
+         */
+        if (use_gateup_kpart &&
+            !ensureGroupedGateUpKPartScratchCapacity(
+                splitk_route_slots,
+                CUDAMoEBatchInvariantPolicy::gate_up_k_partitions,
+                intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "verifier grouped gate/up split-K scratch allocation failed");
+            return false;
+        }
+        const bool use_down_ordered_kpart =
+            active_expert_slots > 0 && !use_grouped_imma;
+        const bool publishes_canonical_routes =
+            canonical_route_contributions != nullptr;
+        if ((use_gateup_kpart || use_down_ordered_kpart) &&
+            !runtime_host_layer.route_expert_ids)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "verifier grouped down split-K requires runtime route expert ids");
+            return false;
+        }
+        if (use_down_ordered_kpart && publishes_canonical_routes &&
+            !ensureGroupedDownKPartScratchCapacity(
+                CUDAMoEBatchInvariantPolicy::down_k_partitions,
+                d_model,
+                splitk_route_slots))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "verifier grouped down split-K scratch allocation failed");
+            return false;
+        }
+        ITensor *publication_output = canonical_route_contributions
+                                          ? canonical_route_contributions
+                                          : output;
+        const char *publication_output_name = canonical_route_contributions
+                                                  ? "canonical_route_contributions"
+                                                  : "output";
+        if (!ensureGroupingBufferCapacity(total_slots, num_experts) ||
+            !ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
+            (use_grouped_imma &&
+             !ensureGroupedImmaDirectoryCapacity(total_slots, num_experts)) ||
+            !requireTensorOnDevice(hidden, device, stream, "hidden") ||
+            !requireOutputOnDevice(
+                publication_output,
+                device,
+                stream,
+                publication_output_name))
+        {
+            return false;
+        }
+
+        /*
+         * Complete plan publication has already written these graph-owned
+         * descriptor slots. The compute consumer resolves the same immutable
+         * slot identities without launching a hidden materialization step.
+         */
+        DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+        if (!bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_gate_descs,
+                "CUDA runtime prefill gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gateup_table.workspace_slot,
+                num_experts,
+                &runtime_up_descs,
+                "CUDA runtime prefill up descriptors") ||
+            !bindGroupedDescriptorTableSlot(
+                MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down_table.workspace_slot,
+                num_experts,
+                &runtime_down_descs,
+                "CUDA runtime prefill down descriptors"))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] "
+                      "failed to bind graph-owned runtime descriptor slots");
+            return false;
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        float *d_output = canonical_route_contributions
+                              ? nullptr
+                              : static_cast<float *>(output->gpu_data_ptr());
+        float *d_canonical_route_contributions =
+            canonical_route_contributions
+                ? static_cast<float *>(
+                      canonical_route_contributions->gpu_data_ptr())
+                : nullptr;
+        if (!d_hidden ||
+            (!d_output && !d_canonical_route_contributions))
+            return false;
+        const char *router_q8_reuse_block_reason =
+            routerQ8HiddenReuseBlockReason(d_hidden, seq_len, d_model);
+        const bool reuse_router_q8_hidden =
+            active_expert_slots > 0 &&
+            router_q8_reuse_block_reason == nullptr;
+        if (!reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_blocked_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "runtime_table"},
+                 {"reason", active_expert_slots <= 0
+                                ? "no_active_experts"
+                                : (router_q8_reuse_block_reason
+                                       ? router_q8_reuse_block_reason
+                                       : "unpublished")}});
+        }
+
+        group_active_expert_slots_ = active_expert_slots;
+
+        /*
+         * groupPrefillRoutes() or the post-assignment regroup transaction has
+         * already published d_group_original_to_grouped_ beside counts, offsets,
+         * and grouped rows. Treating those arrays as one ordered transaction
+         * prevents a consumer from observing a grouping table with a stale
+         * inverse map and removes reconstruction work from every MoE layer.
+         */
+
+        const bool ok = cudaMoE_grouped_prefill_pipeline(
+            d_hidden,
+            reuse_router_q8_hidden ? d_decode_hidden_int8_ : nullptr,
+            reuse_router_q8_hidden ? d_decode_hidden_scales_ : nullptr,
+            runtime_gate_descs,
+            runtime_up_descs,
+            runtime_down_descs,
+            runtime_host_layer.expert_counts,
+            runtime_host_layer.expert_offsets,
+            use_grouped_imma ? d_prefill_imma_directory_ : nullptr,
+            use_grouped_imma
+                ? prefill_imma_directory_entries_cap_
+                : 0,
+            runtime_host_layer.grouped_token_ids,
+            d_group_original_to_grouped_,
+            use_gateup_kpart || use_down_ordered_kpart
+                ? runtime_host_layer.route_expert_ids
+                : nullptr,
+            d_group_active_expert_ids_,
+            runtime_host_layer.grouped_route_weights,
+            d_prefill_A_int8_,
+            d_prefill_A_scales_,
+            d_prefill_gate_,
+            d_prefill_up_,
+            use_gateup_kpart ? d_grouped_gateup_gate_partials_ : nullptr,
+            use_gateup_kpart ? d_grouped_gateup_up_partials_ : nullptr,
+            d_prefill_swiglu_int8_,
+            d_prefill_swiglu_scales_,
+            use_down_ordered_kpart && publishes_canonical_routes
+                ? d_grouped_down_partials_
+                : nullptr,
+            d_prefill_gate_,
+            d_output,
+            d_canonical_route_contributions,
+            num_experts,
+            d_model,
+            intermediate,
+            max_tokens_per_expert,
+            total_slots,
+            top_k,
+            active_expert_slots,
+            1,
+            gateup_table.codebook_id,
+            down_table.codebook_id,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
+            use_gateup_kpart ? CUDAMoEBatchInvariantPolicy::gate_up_k_partitions : 0,
+            prefill_policy.gateup_tile_n,
+            use_down_ordered_kpart ? CUDAMoEBatchInvariantPolicy::down_k_partitions : 0,
+            splitk_tile_rows,
+            projection_engine,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
+            device_ordinal_,
+            stream);
+        if (!ok)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan] grouped CUDA pipeline failed");
+            return false;
+        }
+
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_router_q8_reuse_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                {{"seq_len", std::to_string(seq_len)},
+                 {"top_k", std::to_string(top_k)},
+                 {"descriptor_source", "runtime_table"}});
+        }
+
+        markDeviceWritten(
+            canonical_route_contributions
+                ? canonical_route_contributions
+                : output,
+            device,
+            stream);
+        recordGroupedPrefillCounters(
+            seq_len,
+            top_k,
+            num_experts,
+            active_expert_slots,
+            use_grouped_imma
+                ? cuda::moe::kGroupedImmaTileRows
+                : (use_gateup_kpart
+                       ? 0
+                       : selectGroupedPrefillTileM(
+                             debugEnv().gemm.cuda_moe_prefill_tile_m,
+                             max_tokens_per_expert)),
+            prefill_policy.gateup_tile_n,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
+            gateup_table.policy_codebook_mask,
+            down_table.policy_codebook_mask,
+            use_grouped_imma,
+            use_gateup_kpart,
+            debugEnv().gemm.cuda_moe_prefill_fuse_swiglu,
+            use_down_ordered_kpart,
+            true,
+            canonical_route_contributions != nullptr,
+            splitk_tile_rows,
+            prefill_policy.imma_gateup_columns,
+            prefill_policy.imma_down_columns,
+            prefill_policy.imma_gateup_schedule,
+            prefill_policy.source);
+        return true;
+    }
+
+    bool CUDAMoEKernel::reduceCanonicalRouteContributions(
+        ITensor *canonical_route_contributions,
+        ITensor *output,
+        int seq_len,
+        int top_k,
+        int d_model)
+    {
+        if (!canonical_route_contributions || !output ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0)
+        {
+            return false;
+        }
+
+        void *stream =
+            requireStream("CUDAMoEKernel::reduceCanonicalRouteContributions");
+        const DeviceId device = deviceId();
+        if (!setMoEDevice(
+                device_ordinal_,
+                "reduceCanonicalRouteContributions") ||
+            !requireTensorOnDevice(
+                canonical_route_contributions,
+                device,
+                stream,
+                "canonical_route_contributions") ||
+            !requireOutputOnDevice(output, device, stream, "output"))
+        {
+            return false;
+        }
+
+        const float *d_contributions = static_cast<const float *>(
+            canonical_route_contributions->gpu_data_ptr());
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!cudaMoE_reduce_canonical_route_contributions(
+                d_contributions,
+                d_output,
+                seq_len,
+                top_k,
+                d_model,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        markDeviceWritten(output, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_moe_canonical_route_reduce_calls",
+            1.0,
+            "moe",
+            device.to_string(),
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"d_model", std::to_string(d_model)}});
+        return true;
+    }
+
+    bool CUDAMoEKernel::publishSharedExpertRankBank(
+        ITensor *shared_output,
+        ITensor *canonical_publication,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_index,
+        int participant_count,
+        const int *device_effective_seq_len)
+    {
+        if (!shared_output || !canonical_publication ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_count <= 0 || participant_index < 0 ||
+            participant_index >= participant_count)
+        {
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::publishSharedExpertRankBank");
+        const DeviceId device = deviceId();
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_elements =
+            row_elements *
+            (static_cast<size_t>(top_k) +
+             static_cast<size_t>(participant_count));
+        if (shared_output->numel() < row_elements ||
+            canonical_publication->numel() < required_elements ||
+            !setMoEDevice(device_ordinal_, "publishSharedExpertRankBank") ||
+            !requireTensorOnDevice(
+                shared_output,
+                device,
+                stream,
+                "shared_output") ||
+            !requireTensorOnDevice(
+                canonical_publication,
+                device,
+                stream,
+                "canonical_publication"))
+        {
+            return false;
+        }
+
+        if (!cudaMoE_publish_shared_expert_rank_bank(
+                static_cast<const float *>(shared_output->gpu_data_ptr()),
+                static_cast<float *>(canonical_publication->gpu_data_ptr()),
+                seq_len,
+                top_k,
+                d_model,
+                participant_index,
+                participant_count,
+                device_effective_seq_len,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        markDeviceWritten(canonical_publication, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_moe_shared_rank_bank_publish_calls",
+            1.0,
+            "moe",
+            device.to_string(),
+            {{"seq_len", std::to_string(seq_len)},
+             {"participants", std::to_string(participant_count)}});
+        return true;
+    }
+
+    bool CUDAMoEKernel::finalizeCanonicalMoEPublication(
+        ITensor *input,
+        ITensor *gate_inp,
+        ITensor *canonical_publication,
+        ITensor *routed_output,
+        ITensor *shared_output,
+        ITensor *combined_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_count,
+        const int *device_effective_seq_len)
+    {
+        if (!input || !gate_inp || !canonical_publication ||
+            !routed_output || !shared_output || !combined_output ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_count <= 0)
+        {
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::finalizeCanonicalMoEPublication");
+        const DeviceId device = deviceId();
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_elements =
+            row_elements *
+            (static_cast<size_t>(top_k) +
+             static_cast<size_t>(participant_count));
+        if (input->numel() < row_elements ||
+            gate_inp->numel() < static_cast<size_t>(d_model) ||
+            canonical_publication->numel() < required_elements ||
+            routed_output->numel() < row_elements ||
+            shared_output->numel() < row_elements ||
+            combined_output->numel() < row_elements ||
+            !setMoEDevice(
+                device_ordinal_,
+                "finalizeCanonicalMoEPublication") ||
+            !requireTensorOnDevice(input, device, stream, "input") ||
+            !requireTensorOnDevice(gate_inp, device, stream, "gate_inp") ||
+            !requireTensorOnDevice(
+                canonical_publication,
+                device,
+                stream,
+                "canonical_publication") ||
+            !requireOutputOnDevice(
+                routed_output,
+                device,
+                stream,
+                "routed_output") ||
+            !requireOutputOnDevice(
+                shared_output,
+                device,
+                stream,
+                "shared_output") ||
+            !requireOutputOnDevice(
+                combined_output,
+                device,
+                stream,
+                "combined_output"))
+        {
+            return false;
+        }
+
+        if (!cudaMoE_finalize_canonical_publication(
+                static_cast<const float *>(input->gpu_data_ptr()),
+                static_cast<const float *>(gate_inp->gpu_data_ptr()),
+                static_cast<const float *>(
+                    canonical_publication->gpu_data_ptr()),
+                static_cast<float *>(routed_output->gpu_data_ptr()),
+                static_cast<float *>(shared_output->gpu_data_ptr()),
+                static_cast<float *>(combined_output->gpu_data_ptr()),
+                seq_len,
+                top_k,
+                d_model,
+                participant_count,
+                device_effective_seq_len,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        markDeviceWritten(routed_output, device, stream);
+        markDeviceWritten(shared_output, device, stream);
+        markDeviceWritten(combined_output, device, stream);
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_moe_canonical_publication_finalize_calls",
+            1.0,
+            "moe",
+            device.to_string(),
+            {{"seq_len", std::to_string(seq_len)},
+             {"top_k", std::to_string(top_k)},
+             {"participants", std::to_string(participant_count)}});
         return true;
     }
 
@@ -3105,25 +9616,47 @@ namespace llaminar2
         if (!input || !expert_ids || table_id < 0 || num_active <= 0 ||
             !gate_outputs || !up_outputs || d_model <= 0 || intermediate <= 0)
             return false;
-        if (num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            (d_model % 32) != 0)
+        if (num_active > static_cast<int>(kRuntimePointerArrayMaxTopK))
             return false;
         if (table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
             return false;
 
         const auto &table = grouped_gateup_desc_tables_[table_id];
-        if (!table.valid || !table.device_gate_descs || !table.device_up_descs ||
+        const bool floating =
+            deviceMoEWeightFormatIsFloating(table.weight_format);
+        if (!table.valid || !table.deviceReady() || table.num_experts <= 0 ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] descriptor table mismatch");
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] "
+                      "descriptor table mismatch"
+                      << " table_id=" << table_id
+                      << " valid=" << table.valid
+                      << " device_ready=" << table.deviceReady()
+                      << " format="
+                      << static_cast<std::uint32_t>(table.weight_format)
+                      << " table_d_model=" << table.d_model
+                      << " requested_d_model=" << d_model
+                      << " table_intermediate=" << table.intermediate
+                      << " requested_intermediate=" << intermediate);
             return false;
         }
+        /* NativeVNNI quantizes in 32-element blocks; contiguous floating
+         * tables use the exact published K width and do not inherit that
+         * packing constraint. */
+        if (!floating && (d_model % 32) != 0)
+            return false;
         for (int slot = 0; slot < num_active; ++slot)
         {
             if (expert_ids[slot] < 0 || expert_ids[slot] >= table.num_experts)
                 return false;
         }
-        if (!ensureGroupedDecodeMetadata(expert_ids, nullptr, num_active, false))
+        const int *fixed_device_expert_ids = nullptr;
+        if (!resolveFixedTableGateUpMetadata(
+                table.workspace_slot,
+                RuntimePointerArrayScope::TableDecode,
+                expert_ids,
+                num_active,
+                &fixed_device_expert_ids))
             return false;
 
         void *stream = requireStream("CUDAMoEKernel::groupedExpertGateUpDecodeFromTable");
@@ -3136,9 +9669,16 @@ namespace llaminar2
             !requireTensorElements(input, static_cast<size_t>(d_model), "input", "groupedExpertGateUpDecodeFromTable"))
             return false;
 
-        const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-                               ensureGroupedGateUpKPartScratchCapacity(num_active, k_partitions, intermediate);
+        const int k_partitions =
+            CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        if (!floating &&
+            !ensureGroupedGateUpKPartScratchCapacity(
+                num_active, k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] "
+                      "mandatory K-part gate/up scratch allocation failed");
+            return false;
+        }
         if (!ensureGroupedGateUpDecodeCapacity(num_active, d_model))
             return false;
 
@@ -3148,25 +9688,43 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] input upload required during graph capture");
             return false;
         }
-        if (!d_hidden)
+        if (!capture_active)
         {
-            auto *mutable_input = const_cast<TensorBase *>(input);
-            if (!mutable_input->ensureOnDevice(device, stream))
+            if (!requireTensorOnDevice(
+                    const_cast<TensorBase *>(input),
+                    device,
+                    stream,
+                    "input"))
                 return false;
-            d_hidden = static_cast<const float *>(mutable_input->gpu_data_ptr());
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
         if (!d_hidden)
             return false;
-        const int blocks_per_row = d_model / 32;
-        if (!requireCudaDevicePointer(d_hidden, device_ordinal_, "input", "groupedExpertGateUpDecodeFromTable", stream) ||
-            !requireCudaDevicePointer(d_decode_hidden_int8_, device_ordinal_, "decode hidden int8", "groupedExpertGateUpDecodeFromTable", stream) ||
-            !requireCudaDevicePointer(d_decode_hidden_scales_, device_ordinal_, "decode hidden scales", "groupedExpertGateUpDecodeFromTable", stream))
+        if (!requireCudaDevicePointer(
+                d_hidden, device_ordinal_, "input",
+                "groupedExpertGateUpDecodeFromTable", stream))
             return false;
-        if (use_kpart &&
-            (!requireCudaDevicePointer(d_grouped_gateup_gate_partials_, device_ordinal_, "gate partials", "groupedExpertGateUpDecodeFromTable", stream) ||
-             !requireCudaDevicePointer(d_grouped_gateup_up_partials_, device_ordinal_, "up partials", "groupedExpertGateUpDecodeFromTable", stream)))
+        if (!floating &&
+            (!requireCudaDevicePointer(
+                 d_decode_hidden_int8_, device_ordinal_,
+                 "decode hidden int8",
+                 "groupedExpertGateUpDecodeFromTable", stream) ||
+             !requireCudaDevicePointer(
+                 d_decode_hidden_scales_, device_ordinal_,
+                 "decode hidden scales",
+                 "groupedExpertGateUpDecodeFromTable", stream) ||
+             !requireCudaDevicePointer(
+                 d_grouped_gateup_gate_partials_, device_ordinal_,
+                 "gate partials",
+                 "groupedExpertGateUpDecodeFromTable", stream) ||
+             !requireCudaDevicePointer(
+                 d_grouped_gateup_up_partials_, device_ordinal_,
+                 "up partials",
+                 "groupedExpertGateUpDecodeFromTable", stream)))
             return false;
-        if (!requireTensorElements(input, static_cast<size_t>(blocks_per_row) * 32u, "input", "groupedExpertGateUpDecodeFromTable"))
+        if (!requireTensorElements(
+                input, static_cast<size_t>(d_model), "input",
+                "groupedExpertGateUpDecodeFromTable"))
             return false;
 
         std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
@@ -3181,11 +9739,11 @@ namespace llaminar2
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] output allocation required during graph capture");
                 return false;
             }
-            if (!ensureOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
-                !ensureOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
+            if (!requireOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
+                !requireOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
                 return false;
-            auto *gate_output_base = asTensorBase(gate_outputs[slot], "groupedExpertGateUpDecodeFromTable gate_output");
-            auto *up_output_base = asTensorBase(up_outputs[slot], "groupedExpertGateUpDecodeFromTable up_output");
+            auto *gate_output_base = requireTensor(gate_outputs[slot], "groupedExpertGateUpDecodeFromTable gate_output");
+            auto *up_output_base = requireTensor(up_outputs[slot], "groupedExpertGateUpDecodeFromTable up_output");
             if (!requireTensorType(gate_output_base, TensorType::FP32, "gate_output", "groupedExpertGateUpDecodeFromTable") ||
                 !requireTensorType(up_output_base, TensorType::FP32, "up_output", "groupedExpertGateUpDecodeFromTable") ||
                 !requireTensorElements(gate_outputs[slot], static_cast<size_t>(intermediate), "gate_output", "groupedExpertGateUpDecodeFromTable") ||
@@ -3204,46 +9762,48 @@ namespace llaminar2
 
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(table_id, RuntimePointerArrayScope::TableDecode,
+        if (!ensureRuntimeGateUpPointerArrays(table.workspace_slot, RuntimePointerArrayScope::TableDecode,
                                               num_active, gate_ptrs, up_ptrs,
                                               &d_gate_ptrs, &d_up_ptrs))
             return false;
 
-        const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  num_active,
-                                  intermediate,
-                                  d_model,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  num_active,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
+        /* Both descriptor families use the same graph-owned expert-id and
+         * output-pointer publications. Only the arithmetic kernel differs. */
+        const bool ok = floating
+            ? cudaMoE_grouped_gate_up_floating_decode_table(
+                  d_hidden,
+                  table.device_floating_gate_descs,
+                  table.device_floating_up_descs,
+                  fixed_device_expert_ids,
+                  d_gate_ptrs,
+                  d_up_ptrs,
+                  num_active,
+                  intermediate,
+                  d_model,
+                  table.num_experts,
+                  table.weight_format,
+                  device_ordinal_,
+                  stream)
+            : cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                  d_hidden,
+                  table.device_gate_descs,
+                  table.device_up_descs,
+                  fixed_device_expert_ids,
+                  d_gate_ptrs,
+                  d_up_ptrs,
+                  d_decode_hidden_int8_,
+                  d_decode_hidden_scales_,
+                  false,
+                  d_grouped_gateup_gate_partials_,
+                  d_grouped_gateup_up_partials_,
+                  num_active,
+                  intermediate,
+                  d_model,
+                  table.num_experts,
+                  table.codebook_id,
+                  k_partitions,
+                  device_ordinal_,
+                  stream);
         if (ok)
         {
             for (int slot = 0; slot < num_active; ++slot)
@@ -3253,7 +9813,8 @@ namespace llaminar2
             }
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_gateup_calls", "table", num_active,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate,
+                floating ? "floating_fixed_tree" : "kpart");
         }
         return ok;
     }
@@ -3273,25 +9834,47 @@ namespace llaminar2
             table_id < 0 || num_active <= 0 || !output ||
             d_model <= 0 || intermediate <= 0)
             return false;
-        if (num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            (intermediate % 32) != 0)
+        if (num_active > static_cast<int>(kRuntimePointerArrayMaxTopK))
             return false;
         if (table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
             return false;
 
         const auto &table = grouped_down_desc_tables_[table_id];
-        if (!table.valid || !table.device_descs ||
+        const bool floating =
+            deviceMoEWeightFormatIsFloating(table.weight_format);
+        if (!table.valid || !table.deviceReady() || table.num_experts <= 0 ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] descriptor table mismatch");
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] "
+                      "descriptor table mismatch"
+                      << " table_id=" << table_id
+                      << " valid=" << table.valid
+                      << " device_ready=" << table.deviceReady()
+                      << " format="
+                      << static_cast<std::uint32_t>(table.weight_format)
+                      << " table_d_model=" << table.d_model
+                      << " requested_d_model=" << d_model
+                      << " table_intermediate=" << table.intermediate
+                      << " requested_intermediate=" << intermediate);
             return false;
         }
+        if (!floating && (intermediate % 32) != 0)
+            return false;
         for (int slot = 0; slot < num_active; ++slot)
         {
             if (expert_ids[slot] < 0 || expert_ids[slot] >= table.num_experts)
                 return false;
         }
-        if (!ensureGroupedDecodeMetadata(expert_ids, expert_weights, num_active, true))
+        const int *fixed_device_expert_ids = nullptr;
+        const float *fixed_device_expert_weights = nullptr;
+        if (!resolveFixedTableDownMetadata(
+                table.workspace_slot,
+                RuntimePointerArrayScope::TableDecode,
+                expert_ids,
+                expert_weights,
+                num_active,
+                &fixed_device_expert_ids,
+                &fixed_device_expert_weights))
             return false;
 
         void *stream = requireStream("CUDAMoEKernel::groupedExpertDownDecodeFromTable");
@@ -3318,32 +9901,53 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] output allocation required during graph capture");
             return false;
         }
-        if (!ensureOutputOnDevice(output, device, stream, "moe_output"))
+        if (!requireOutputOnDevice(output, device, stream, "moe_output"))
             return false;
-
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(table_id, RuntimePointerArrayScope::TableDecode,
+        if (!ensureRuntimeDownPointerArrays(table.workspace_slot, RuntimePointerArrayScope::TableDecode,
                                             num_active, gate_ptrs, up_ptrs,
                                             &d_gate_ptrs, &d_up_ptrs))
             return false;
 
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode &&
-                               ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, num_active);
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
+        if (!floating &&
+            !ensureGroupedDownKPartScratchCapacity(
+                k_partitions, d_model, num_active))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] "
+                      "mandatory K-part down scratch allocation failed");
+            return false;
+        }
 
-        const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+        const bool ok = floating
+            ? cudaMoE_grouped_swiglu_down_floating_decode_table(
+                  d_gate_ptrs,
+                  d_up_ptrs,
+                  table.device_floating_descs,
+                  fixed_device_expert_ids,
+                  fixed_device_expert_weights,
+                  d_output,
+                  nullptr,
+                  num_active,
+                  d_model,
+                  intermediate,
+                  table.num_experts,
+                  table.weight_format,
+                  device_ordinal_,
+                  stream)
+            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
                   d_gate_ptrs,
                   d_up_ptrs,
                   table.device_descs,
-                  d_grouped_decode_expert_ids_,
-                  d_grouped_decode_weights_,
+                  fixed_device_expert_ids,
+                  fixed_device_expert_weights,
                   d_decode_swiglu_int8_,
                   d_decode_swiglu_scales_,
                   d_grouped_down_partials_,
                   d_output,
+                  nullptr,
                   num_active,
                   d_model,
                   intermediate,
@@ -3351,28 +9955,14 @@ namespace llaminar2
                   table.codebook_id,
                   k_partitions,
                   device_ordinal_,
-                  stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_grouped_decode_expert_ids_,
-                  d_grouped_decode_weights_,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_output,
-                  num_active,
-                  d_model,
-                  intermediate,
-                  table.codebook_id,
-                  device_ordinal_,
                   stream);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_down_calls", "table", num_active,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate,
+                floating ? "floating_fixed_tree" : "kpart");
         }
         return ok;
     }
@@ -3385,7 +9975,8 @@ namespace llaminar2
         ITensor *const *gate_outputs,
         ITensor *const *up_outputs,
         int d_model,
-        int intermediate)
+        int intermediate,
+        const uint8_t *expert_mask)
     {
         if (!input || !routing_indices || table_id < 0 || top_k <= 0 ||
             !gate_outputs || !up_outputs || d_model <= 0 || intermediate <= 0)
@@ -3419,9 +10010,13 @@ namespace llaminar2
             return false;
         }
 
-        const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-                               ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate);
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        if (!ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting] "
+                      "mandatory K-part gate/up scratch allocation failed");
+            return false;
+        }
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         if (!d_hidden && capture_active)
@@ -3429,12 +10024,15 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting] input upload required during graph capture");
             return false;
         }
-        if (!d_hidden)
+        if (!capture_active)
         {
-            auto *mutable_input = const_cast<TensorBase *>(input);
-            if (!mutable_input->ensureOnDevice(device, stream))
+            if (!requireTensorOnDevice(
+                    const_cast<TensorBase *>(input),
+                    device,
+                    stream,
+                    "input"))
                 return false;
-            d_hidden = static_cast<const float *>(mutable_input->gpu_data_ptr());
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
 
         if (!routing_indices->gpu_data_ptr() && capture_active)
@@ -3442,7 +10040,7 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting] routing upload required during graph capture");
             return false;
         }
-        if (!ensureTensorOnDevice(routing_indices, device, stream, "routing_indices"))
+        if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices"))
             return false;
         const float *d_routing_indices =
             static_cast<const float *>(routing_indices->gpu_data_ptr());
@@ -3452,12 +10050,36 @@ namespace llaminar2
             return false;
         }
 
-        if (!cudaMoE_float_to_int(
-                d_routing_indices,
-                d_routing_decode_expert_ids_,
-                top_k,
-                device_ordinal_,
-                stream))
+        /*
+         * Dynamic/LLEP verifier rows still consume the device-owned routing
+         * tensor, but each LocalTP participant must contribute only the experts
+         * it owns.  The masked conversion preserves the original routing tensor
+         * for histograms/runtime publication and marks nonlocal top-k slots as
+         * inactive in backend-owned scratch.  The grouped kernels already treat
+         * expert id -1 as a no-op slot.
+         */
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(expert_mask, table.num_experts))
+                return false;
+            if (!cudaMoE_float_to_masked_int(
+                    d_routing_indices,
+                    d_routing_decode_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (!cudaMoE_float_to_int(
+                     d_routing_indices,
+                     d_routing_decode_expert_ids_,
+                     top_k,
+                     device_ordinal_,
+                     stream))
         {
             return false;
         }
@@ -3478,8 +10100,8 @@ namespace llaminar2
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting] output allocation required during graph capture");
                 return false;
             }
-            if (!ensureOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
-                !ensureOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
+            if (!requireOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
+                !requireOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
             {
                 return false;
             }
@@ -3493,48 +10115,33 @@ namespace llaminar2
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
         if (!ensureRuntimeGateUpPointerArrays(
-                table_id, RuntimePointerArrayScope::TableDecode,
+                table.workspace_slot, RuntimePointerArrayScope::TableDecode,
                 top_k, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
         {
             return false;
         }
 
-        const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_routing_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_routing_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
+        const bool ok = cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+            d_hidden,
+            table.device_gate_descs,
+            table.device_up_descs,
+            d_routing_decode_expert_ids_,
+            d_gate_ptrs,
+            d_up_ptrs,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            false,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            top_k,
+            intermediate,
+            d_model,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
         if (ok)
         {
             for (int slot = 0; slot < top_k; ++slot)
@@ -3544,7 +10151,7 @@ namespace llaminar2
             }
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_gateup_calls", "routing", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }
@@ -3558,7 +10165,8 @@ namespace llaminar2
         int top_k,
         ITensor *output,
         int d_model,
-        int intermediate)
+        int intermediate,
+        const uint8_t *expert_mask)
     {
         if (!gate_tensors || !up_tensors || !routing_indices || !routing_weights ||
             table_id < 0 || top_k <= 0 || !output ||
@@ -3599,8 +10207,8 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRouting] routing upload required during graph capture");
             return false;
         }
-        if (!ensureTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
-            !ensureTensorOnDevice(routing_weights, device, stream, "routing_weights"))
+        if (!requireTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
+            !requireTensorOnDevice(routing_weights, device, stream, "routing_weights"))
         {
             return false;
         }
@@ -3615,12 +10223,28 @@ namespace llaminar2
             return false;
         }
 
-        if (!cudaMoE_float_to_int(
-                d_routing_indices,
-                d_routing_decode_expert_ids_,
-                top_k,
-                device_ordinal_,
-                stream))
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(expert_mask, table.num_experts))
+                return false;
+            if (!cudaMoE_float_to_masked_int(
+                    d_routing_indices,
+                    d_routing_decode_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (!cudaMoE_float_to_int(
+                     d_routing_indices,
+                     d_routing_decode_expert_ids_,
+                     top_k,
+                     device_ordinal_,
+                     stream))
         {
             return false;
         }
@@ -3650,13 +10274,13 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRouting] output allocation required during graph capture");
             return false;
         }
-        if (!ensureOutputOnDevice(output, device, stream, "moe_output"))
+        if (!requireOutputOnDevice(output, device, stream, "moe_output"))
             return false;
 
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
         if (!ensureRuntimeDownPointerArrays(
-                table_id, RuntimePointerArrayScope::TableDecode,
+                table.workspace_slot, RuntimePointerArrayScope::TableDecode,
                 top_k, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
         {
@@ -3667,52 +10291,476 @@ namespace llaminar2
         if (!d_output)
             return false;
 
-        const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode &&
-                               ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k);
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
+        if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRouting] "
+                      "mandatory K-part down scratch allocation failed");
+            return false;
+        }
 
-        const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_routing_decode_expert_ids_,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_grouped_down_partials_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.num_experts,
-                  table.codebook_id,
-                  k_partitions,
-                  device_ordinal_,
-                  stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_routing_decode_expert_ids_,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.codebook_id,
-                  device_ordinal_,
-                  stream);
+        const bool ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+            d_gate_ptrs,
+            d_up_ptrs,
+            table.device_descs,
+            d_routing_decode_expert_ids_,
+            d_weights,
+            d_decode_swiglu_int8_,
+            d_decode_swiglu_scales_,
+            d_grouped_down_partials_,
+            d_output,
+            nullptr,
+            top_k,
+            d_model,
+            intermediate,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_down_calls", "routing", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
+    }
+
+    bool CUDAMoEKernel::groupedExpertDecodeFromRouting(
+        const TensorBase *input,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int gateup_table_id,
+        int down_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate,
+        const uint8_t *expert_mask,
+        ITensor *canonical_route_contributions,
+        DeviceMoELayerRuntime *runtime_layer,
+        MoEDecodeDescriptorSource descriptor_source)
+    {
+        if (!input || !routing_indices || !routing_weights ||
+            gateup_table_id < 0 || down_table_id < 0 || top_k <= 0 ||
+            !output || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
+        {
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        if (!gateup_table.valid || gateup_table.num_experts <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "gate/up descriptor table is unavailable");
+            return false;
+        }
+        const bool use_runtime_descriptors =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if ((use_runtime_descriptors && (!runtime_layer || expert_mask)) ||
+            (!use_runtime_descriptors && runtime_layer))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "runtime placement requires exactly one runtime layer and no host mask");
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::groupedExpertDecodeFromRouting");
+        const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
+        const DeviceId device = deviceId();
+        if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRouting") ||
+            !ensureRoutingDecodeMetadataCapacity(top_k))
+        {
+            return false;
+        }
+
+        if ((!routing_indices->gpu_data_ptr() || !routing_weights->gpu_data_ptr()) &&
+            capture_active)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "routing upload is forbidden during graph capture");
+            return false;
+        }
+        if (!requireTensorOnDevice(
+                routing_indices, device, stream, "routing_indices") ||
+            !requireTensorOnDevice(
+                routing_weights, device, stream, "routing_weights"))
+        {
+            return false;
+        }
+
+        const float *device_routing_indices =
+            static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *device_routing_weights =
+            static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!device_routing_indices || !device_routing_weights)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "routing tensors have no device publication");
+            return false;
+        }
+
+        if (expert_mask)
+        {
+            if (!updateGroupedPrefillExpertMask(
+                    expert_mask, gateup_table.num_experts) ||
+                !cudaMoE_float_to_masked_int(
+                    device_routing_indices,
+                    d_routing_decode_expert_ids_,
+                    d_group_expert_mask_,
+                    top_k,
+                    gateup_table.num_experts,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+        }
+        else if (!cudaMoE_float_to_int(
+                     device_routing_indices,
+                     d_routing_decode_expert_ids_,
+                     top_k,
+                     device_ordinal_,
+                     stream))
+        {
+            return false;
+        }
+
+        const int *resolved_expert_ids = d_routing_decode_expert_ids_;
+        const float *resolved_weights = device_routing_weights;
+        if (use_runtime_descriptors)
+        {
+            /*
+             * The explicit packet remains the route-value producer, while the
+             * epoch-pinned runtime bank is the sole placement authority. This
+             * existing selector drops non-local experts, publishes compact
+             * runtime top-k state, and increments selected/local histograms in
+             * the same captured stream transaction.
+             */
+            if (!cudaMoE_decode_route_select_runtime(
+                    d_routing_decode_expert_ids_,
+                    device_routing_weights,
+                    runtime_layer,
+                    /*legacy_indices=*/nullptr,
+                    /*legacy_weights=*/nullptr,
+                    gateup_table.num_experts,
+                    top_k,
+                    /*write_legacy_outputs=*/false,
+                    /*update_runtime_histogram=*/true,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+            resolved_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
+            resolved_weights = runtimeTopKWeightsDevice(runtime_layer);
+        }
+
+        return groupedExpertDecodeResolved(
+            runtime_layer,
+            input,
+            gateup_table_id,
+            down_table_id,
+            top_k,
+            output,
+            d_model,
+            intermediate,
+            resolved_expert_ids,
+            resolved_weights,
+            use_runtime_descriptors,
+            /*allow_router_q8_reuse=*/false,
+            use_runtime_descriptors ? "routing_runtime" : "routing",
+            canonical_route_contributions);
+    }
+
+    bool CUDAMoEKernel::prepareGroupedRuntimeDecodeLaunchState(
+        int gateup_table_id,
+        int down_table_id,
+        int top_k,
+        int d_model,
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
+    {
+        void *stream = requireStream(
+            "CUDAMoEKernel::prepareGroupedRuntimeDecodeLaunchState");
+        if (isCudaMoEDecodeCaptureActive(stream))
+        {
+            LOG_ERROR("[CUDAMoEKernel] Runtime grouped-decode launch state must be "
+                      "prepared before graph capture begins");
+            return false;
+        }
+        if (gateup_table_id < 0 || down_table_id < 0 || top_k <= 0 ||
+            top_k > static_cast<int>(kDeviceMoEMaxTopK) ||
+            top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            d_model <= 0 || intermediate <= 0 ||
+            gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            return false;
+        }
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        const bool floating = deviceMoEWeightFormatIsFloating(
+            gateup_table.weight_format);
+        if (!gateup_table.valid || !gateup_table.deviceReady() ||
+            !down_table.valid || !down_table.deviceReady() ||
+            gateup_table.weight_format != down_table.weight_format ||
+            gateup_table.d_model != d_model ||
+            gateup_table.intermediate != intermediate ||
+            down_table.d_model != d_model ||
+            down_table.intermediate != intermediate ||
+            !setMoEDevice(device_ordinal_,
+                          "prepareGroupedRuntimeDecodeLaunchState"))
+        {
+            return false;
+        }
+        if (!floating &&
+            ((d_model % 32) != 0 || (intermediate % 32) != 0))
+        {
+            return false;
+        }
+
+        const int gateup_k_partitions =
+            CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        const int down_k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
+        if ((!floating &&
+             (!ensureGroupedGateUpKPartScratchCapacity(
+                  top_k, gateup_k_partitions, intermediate) ||
+              !ensureGroupedDownKPartScratchCapacity(
+                  down_k_partitions, d_model, top_k))) ||
+            !ensureGroupedPrefillScratchCapacity(
+                top_k, d_model, intermediate) ||
+            !ensureGroupedGateUpDecodeCapacity(top_k, d_model) ||
+            !ensureGroupedDownDecodeCapacity(top_k, intermediate))
+        {
+            return false;
+        }
+
+        if (descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable)
+        {
+            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_gate_descs,
+                    "CUDA runtime decode gate descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_up_descs,
+                    "CUDA runtime decode up descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                    down_table.workspace_slot,
+                    down_table.num_experts,
+                    &runtime_down_descs,
+                    "CUDA runtime decode down descriptors"))
+            {
+                return false;
+            }
+        }
+
+        const int max_dim = std::max(d_model, intermediate);
+        std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
+        std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_gate_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_up_ptrs = {};
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            gate_ptrs[slot] =
+                d_prefill_gate_ + static_cast<size_t>(slot) * max_dim;
+            up_ptrs[slot] =
+                d_prefill_up_ + static_cast<size_t>(slot) * intermediate;
+            const_gate_ptrs[slot] = gate_ptrs[slot];
+            const_up_ptrs[slot] = up_ptrs[slot];
+        }
+
+        float **device_gate_ptrs = nullptr;
+        float **device_up_ptrs = nullptr;
+        const float **device_down_gate_ptrs = nullptr;
+        const float **device_down_up_ptrs = nullptr;
+        return ensureRuntimeGateUpPointerArrays(
+                   gateup_table.workspace_slot,
+                   RuntimePointerArrayScope::RuntimeFused,
+                   top_k,
+                   gate_ptrs,
+                   up_ptrs,
+                   &device_gate_ptrs,
+                   &device_up_ptrs) &&
+               ensureRuntimeDownPointerArrays(
+                   down_table.workspace_slot,
+                   RuntimePointerArrayScope::RuntimeFused,
+                   top_k,
+                   const_gate_ptrs,
+                   const_up_ptrs,
+                   &device_down_gate_ptrs,
+                   &device_down_up_ptrs);
+    }
+
+    bool CUDAMoEKernel::prepareGroupedTableDecodeLaunchState(
+        const int *expert_ids,
+        const float *expert_weights,
+        int gateup_table_id,
+        int down_table_id,
+        int num_active,
+        ITensor *const *gate_outputs,
+        ITensor *const *up_outputs,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        void *stream = requireStream(
+            "CUDAMoEKernel::prepareGroupedTableDecodeLaunchState");
+        if (isCudaMoEDecodeCaptureActive(stream))
+        {
+            LOG_ERROR("[CUDAMoEKernel] Fixed-table grouped-decode launch state "
+                      "must be prepared before graph capture begins");
+            return false;
+        }
+        if (!expert_ids || !expert_weights || !gate_outputs || !up_outputs ||
+            !output || gateup_table_id < 0 || down_table_id < 0 ||
+            num_active <= 0 ||
+            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            d_model <= 0 || intermediate <= 0 ||
+            gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            return false;
+        }
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        const bool floating = deviceMoEWeightFormatIsFloating(
+            gateup_table.weight_format);
+        if (!gateup_table.valid || !gateup_table.deviceReady() ||
+            !down_table.valid || !down_table.deviceReady() ||
+            gateup_table.weight_format != down_table.weight_format ||
+            gateup_table.d_model != d_model ||
+            gateup_table.intermediate != intermediate ||
+            down_table.d_model != d_model ||
+            down_table.intermediate != intermediate ||
+            !setMoEDevice(device_ordinal_,
+                          "prepareGroupedTableDecodeLaunchState"))
+        {
+            return false;
+        }
+        if (!floating &&
+            ((d_model % 32) != 0 || (intermediate % 32) != 0))
+        {
+            return false;
+        }
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            if (expert_ids[slot] < 0 ||
+                expert_ids[slot] >= gateup_table.num_experts ||
+                expert_ids[slot] >= down_table.num_experts)
+            {
+                return false;
+            }
+        }
+
+        const int gateup_k_partitions =
+            CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        const int down_k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
+        const int *fixed_gateup_expert_ids = nullptr;
+        const int *fixed_down_expert_ids = nullptr;
+        const float *fixed_down_expert_weights = nullptr;
+        if ((!floating &&
+             (!ensureGroupedGateUpKPartScratchCapacity(
+                  num_active, gateup_k_partitions, intermediate) ||
+              !ensureGroupedDownKPartScratchCapacity(
+                  down_k_partitions, d_model, num_active))) ||
+            !ensureGroupedGateUpDecodeCapacity(num_active, d_model) ||
+            !ensureGroupedDownDecodeCapacity(num_active, intermediate) ||
+            !resolveFixedTableGateUpMetadata(
+                gateup_table.workspace_slot,
+                RuntimePointerArrayScope::TableDecode,
+                expert_ids,
+                num_active,
+                &fixed_gateup_expert_ids) ||
+            !resolveFixedTableDownMetadata(
+                down_table.workspace_slot,
+                RuntimePointerArrayScope::TableDecode,
+                expert_ids,
+                expert_weights,
+                num_active,
+                &fixed_down_expert_ids,
+                &fixed_down_expert_weights))
+        {
+            return false;
+        }
+        // Preparation publishes metadata addresses; execution consumes them.
+        (void)fixed_gateup_expert_ids;
+        (void)fixed_down_expert_ids;
+        (void)fixed_down_expert_weights;
+
+        std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
+        std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_gate_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK>
+            const_up_ptrs = {};
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            gate_ptrs[slot] = gate_outputs[slot]
+                                  ? static_cast<float *>(
+                                        gate_outputs[slot]->gpu_data_ptr())
+                                  : nullptr;
+            up_ptrs[slot] = up_outputs[slot]
+                                ? static_cast<float *>(
+                                      up_outputs[slot]->gpu_data_ptr())
+                                : nullptr;
+            if (!gate_ptrs[slot] || !up_ptrs[slot])
+            {
+                LOG_ERROR("[CUDAMoEKernel] Fixed-table grouped decode has no "
+                          "persistent gate/up scratch pointer for slot "
+                          << slot);
+                return false;
+            }
+            const_gate_ptrs[slot] = gate_ptrs[slot];
+            const_up_ptrs[slot] = up_ptrs[slot];
+        }
+        if (!output->gpu_data_ptr())
+        {
+            LOG_ERROR("[CUDAMoEKernel] Fixed-table grouped decode output is not "
+                      "bound to persistent device storage before capture");
+            return false;
+        }
+
+        float **device_gate_ptrs = nullptr;
+        float **device_up_ptrs = nullptr;
+        const float **device_down_gate_ptrs = nullptr;
+        const float **device_down_up_ptrs = nullptr;
+        return ensureRuntimeGateUpPointerArrays(
+                   gateup_table.workspace_slot,
+                   RuntimePointerArrayScope::TableDecode,
+                   num_active,
+                   gate_ptrs,
+                   up_ptrs,
+                   &device_gate_ptrs,
+                   &device_up_ptrs) &&
+               ensureRuntimeDownPointerArrays(
+                   down_table.workspace_slot,
+                   RuntimePointerArrayScope::TableDecode,
+                   num_active,
+                   const_gate_ptrs,
+                   const_up_ptrs,
+                   &device_down_gate_ptrs,
+                   &device_down_up_ptrs);
     }
 
     bool CUDAMoEKernel::groupedExpertDecodeFromRuntime(
@@ -3723,10 +10771,53 @@ namespace llaminar2
         int top_k,
         ITensor *output,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source,
+        ITensor *canonical_route_contributions)
     {
-        if (!runtime_layer || !input || gateup_table_id < 0 || down_table_id < 0 ||
+        if (!runtime_layer)
+            return false;
+
+        return groupedExpertDecodeResolved(
+            runtime_layer,
+            input,
+            gateup_table_id,
+            down_table_id,
+            top_k,
+            output,
+            d_model,
+            intermediate,
+            runtimeTopKExpertIdsDevice(runtime_layer),
+            runtimeTopKWeightsDevice(runtime_layer),
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable,
+            /*allow_router_q8_reuse=*/true,
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable
+                ? "runtime"
+                : "runtime_static_table",
+            canonical_route_contributions);
+    }
+
+    bool CUDAMoEKernel::groupedExpertDecodeResolved(
+        DeviceMoELayerRuntime *runtime_layer,
+        const TensorBase *input,
+        int gateup_table_id,
+        int down_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate,
+        const int *d_expert_ids,
+        const float *d_weights,
+        bool use_runtime_descriptors,
+        bool allow_router_q8_reuse,
+        const char *counter_source,
+        ITensor *canonical_route_contributions)
+    {
+        if (!input || gateup_table_id < 0 || down_table_id < 0 ||
             top_k <= 0 || !output || d_model <= 0 || intermediate <= 0)
+            return false;
+        if (!d_expert_ids || !d_weights ||
+            (use_runtime_descriptors && !runtime_layer))
             return false;
         if (top_k > static_cast<int>(kDeviceMoEMaxTopK) ||
             top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
@@ -3738,8 +10829,11 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_table_id];
-        if (!gateup_table.valid || !gateup_table.device_gate_descs || !gateup_table.device_up_descs ||
-            !down_table.valid || !down_table.device_descs ||
+        const bool floating = deviceMoEWeightFormatIsFloating(
+            gateup_table.weight_format);
+        if (!gateup_table.valid || !gateup_table.deviceReady() ||
+            !down_table.valid || !down_table.deviceReady() ||
+            gateup_table.weight_format != down_table.weight_format ||
             gateup_table.d_model != d_model || gateup_table.intermediate != intermediate ||
             down_table.d_model != d_model || down_table.intermediate != intermediate)
         {
@@ -3753,19 +10847,124 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRuntime"))
             return false;
 
-        const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_gateup_kpart =
-            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-            ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate);
-        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_down_kpart =
-            debugEnv().gemm.cuda_moe_down_kpart_decode &&
-            ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model, top_k);
+        const int gateup_k_partitions =
+            CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        if (!floating && !ensureGroupedGateUpKPartScratchCapacity(
+                             top_k, gateup_k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "mandatory K-part gate/up scratch allocation failed");
+            return false;
+        }
+        const int down_k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
+        if (!floating && !ensureGroupedDownKPartScratchCapacity(
+                             down_k_partitions, d_model, top_k))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "mandatory K-part down scratch allocation failed");
+            return false;
+        }
 
         if (!ensureGroupedPrefillScratchCapacity(top_k, d_model, intermediate) ||
             !ensureGroupedGateUpDecodeCapacity(top_k, d_model) ||
             !ensureGroupedDownDecodeCapacity(top_k, intermediate))
             return false;
+
+        /*
+         * Mutable placement publishes descriptor values from the active device
+         * runtime bank while immutable placement reads the uploaded model
+         * tables. Keep both modes on the same compact-table GEMV launch path:
+         * the runtime mode first materializes its active bank into stable
+         * graph-owned workspace slots on this exact producer stream.
+         *
+         * Besides avoiding a cache-hostile walk through the complete runtime
+         * object from every output lane, this gives CUDA and ROCm one placement
+         * contract. A descriptor is executable only when the active bank says
+         * the expert is both locally computable and resident on this
+         * participant. DeviceMoERuntimeTable enforces that invariant when it
+         * publishes a bank; the materializer preserves it during every graph
+         * replay without host inspection, allocation, or synchronization.
+         */
+        const DeviceNativeVNNIMatrixDesc *decode_gate_descs =
+            gateup_table.device_gate_descs;
+        const DeviceNativeVNNIMatrixDesc *decode_up_descs =
+            gateup_table.device_up_descs;
+        const DeviceNativeVNNIMatrixDesc *decode_down_descs =
+            down_table.device_descs;
+        const DeviceMoEFloatingMatrixDesc *decode_floating_gate_descs =
+            gateup_table.device_floating_gate_descs;
+        const DeviceMoEFloatingMatrixDesc *decode_floating_up_descs =
+            gateup_table.device_floating_up_descs;
+        const DeviceMoEFloatingMatrixDesc *decode_floating_down_descs =
+            down_table.device_floating_descs;
+        if (use_runtime_descriptors)
+        {
+            DeviceNativeVNNIMatrixDesc *runtime_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_up_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *runtime_down_descs = nullptr;
+            if (!bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_gate_descs,
+                    "CUDA runtime decode gate descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE,
+                    gateup_table.workspace_slot,
+                    gateup_table.num_experts,
+                    &runtime_up_descs,
+                    "CUDA runtime decode up descriptors") ||
+                !bindGroupedDescriptorTableSlot(
+                    MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                    down_table.workspace_slot,
+                    down_table.num_experts,
+                    &runtime_down_descs,
+                    "CUDA runtime decode down descriptors"))
+            {
+                LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "failed to bind graph-owned runtime descriptor slots");
+                return false;
+            }
+            const bool materialized = floating
+                ? cudaMoE_materialize_runtime_floating_descriptor_tables(
+                      runtime_layer,
+                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                          runtime_gate_descs),
+                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                          runtime_up_descs),
+                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                          runtime_down_descs),
+                      gateup_table.num_experts,
+                      gateup_table.weight_format,
+                      device_ordinal_,
+                      stream)
+                : cudaMoE_materialize_runtime_prefill_descriptor_tables(
+                      runtime_layer,
+                      runtime_gate_descs,
+                      runtime_up_descs,
+                      runtime_down_descs,
+                      gateup_table.num_experts,
+                      device_ordinal_,
+                      stream);
+            if (!materialized)
+            {
+                LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "failed to materialize compact runtime descriptor tables");
+                return false;
+            }
+            decode_gate_descs = runtime_gate_descs;
+            decode_up_descs = runtime_up_descs;
+            decode_down_descs = runtime_down_descs;
+            decode_floating_gate_descs =
+                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                    runtime_gate_descs);
+            decode_floating_up_descs =
+                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                    runtime_up_descs);
+            decode_floating_down_descs =
+                reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
+                    runtime_down_descs);
+        }
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         if (!d_hidden && capture_active)
@@ -3773,23 +10972,40 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] input upload required during graph capture");
             return false;
         }
-        if (!d_hidden)
+        if (!capture_active)
         {
-            auto *mutable_input = const_cast<TensorBase *>(input);
-            if (!mutable_input->ensureOnDevice(device, stream))
+            if (!requireTensorOnDevice(
+                    const_cast<TensorBase *>(input),
+                    device,
+                    stream,
+                    "input"))
                 return false;
-            d_hidden = static_cast<const float *>(mutable_input->gpu_data_ptr());
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
         if (!d_hidden || !d_prefill_gate_ || !d_prefill_up_)
             return false;
 
-        if (!output->gpu_data_ptr() && capture_active)
+        ITensor *publication_output = canonical_route_contributions
+                                          ? canonical_route_contributions
+                                          : output;
+        const char *publication_output_name = canonical_route_contributions
+                                                  ? "canonical_route_contributions"
+                                                  : "moe_output";
+        if (!publication_output->gpu_data_ptr() && capture_active)
         {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] output allocation required during graph capture");
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                      << publication_output_name
+                      << " allocation required during graph capture");
             return false;
         }
-        if (!ensureOutputOnDevice(output, device, stream, "moe_output"))
+        if (!requireOutputOnDevice(
+                publication_output,
+                device,
+                stream,
+                publication_output_name))
+        {
             return false;
+        }
 
         const int max_dim = std::max(d_model, intermediate);
         std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
@@ -3806,106 +11022,130 @@ namespace llaminar2
 
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(gateup_table_id, RuntimePointerArrayScope::RuntimeFused,
+        if (!ensureRuntimeGateUpPointerArrays(gateup_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
                                               top_k, gate_ptrs, up_ptrs,
                                               &d_gate_ptrs, &d_up_ptrs))
             return false;
         const float **d_down_gate_ptrs = nullptr;
         const float **d_down_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(down_table_id, RuntimePointerArrayScope::RuntimeFused,
+        if (!ensureRuntimeDownPointerArrays(down_table.workspace_slot, RuntimePointerArrayScope::RuntimeFused,
                                             top_k, const_gate_ptrs, const_up_ptrs,
                                             &d_down_gate_ptrs, &d_down_up_ptrs))
             return false;
 
-        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
-        const float *d_weights = runtimeTopKWeightsDevice(runtime_layer);
-        float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        if (!d_expert_ids || !d_weights || !d_output)
+        float *d_output = canonical_route_contributions
+                              ? nullptr
+                              : static_cast<float *>(output->gpu_data_ptr());
+        float *d_canonical_route_contributions =
+            canonical_route_contributions
+                ? static_cast<float *>(
+                      canonical_route_contributions->gpu_data_ptr())
+                : nullptr;
+        if (!d_expert_ids || !d_weights ||
+            (!d_output && !d_canonical_route_contributions))
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] missing runtime/output device pointer");
             return false;
         }
 
-        const bool gateup_ok = use_gateup_kpart
-                                   ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                         d_hidden,
-                                         gateup_table.device_gate_descs,
-                                         gateup_table.device_up_descs,
-                                         d_expert_ids,
-                                         d_gate_ptrs,
-                                         d_up_ptrs,
-                                         d_decode_hidden_int8_,
-                                         d_decode_hidden_scales_,
-                                         d_grouped_gateup_gate_partials_,
-                                         d_grouped_gateup_up_partials_,
-                                         top_k,
-                                         intermediate,
-                                         d_model,
-                                         gateup_table.num_experts,
-                                         gateup_table.codebook_id,
-                                         gateup_k_partitions,
-                                         device_ordinal_,
-                                         stream)
-                                   : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                         d_hidden,
-                                         gateup_table.device_gate_descs,
-                                         gateup_table.device_up_descs,
-                                         d_expert_ids,
-                                         d_gate_ptrs,
-                                         d_up_ptrs,
-                                         d_decode_hidden_int8_,
-                                         d_decode_hidden_scales_,
-                                         top_k,
-                                         intermediate,
-                                         d_model,
-                                         gateup_table.codebook_id,
-                                         device_ordinal_,
-                                         stream);
+        const bool reuse_router_q8_hidden =
+            !floating && allow_router_q8_reuse &&
+            canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel", "cuda_moe_gateup_reused_router_q8_hidden_calls", 1.0, {}, {},
+                {{"top_k", std::to_string(top_k)},
+                 {"d_model", std::to_string(d_model)}});
+        }
+        const bool gateup_ok = floating
+            ? cudaMoE_grouped_gate_up_floating_decode_table(
+                  d_hidden,
+                  decode_floating_gate_descs,
+                  decode_floating_up_descs,
+                  d_expert_ids,
+                  d_gate_ptrs,
+                  d_up_ptrs,
+                  top_k,
+                  intermediate,
+                  d_model,
+                  gateup_table.num_experts,
+                  gateup_table.weight_format,
+                  device_ordinal_,
+                  stream)
+            : cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                  d_hidden,
+                  decode_gate_descs,
+                  decode_up_descs,
+                  d_expert_ids,
+                  d_gate_ptrs,
+                  d_up_ptrs,
+                  d_decode_hidden_int8_,
+                  d_decode_hidden_scales_,
+                  reuse_router_q8_hidden,
+                  d_grouped_gateup_gate_partials_,
+                  d_grouped_gateup_up_partials_,
+                  top_k,
+                  intermediate,
+                  d_model,
+                  gateup_table.num_experts,
+                  gateup_table.codebook_id,
+                  gateup_k_partitions,
+                  device_ordinal_,
+                  stream);
         if (!gateup_ok)
             return false;
 
-        const bool down_ok = use_down_kpart
-                                 ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       down_table.device_descs,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_decode_swiglu_int8_,
-                                       d_decode_swiglu_scales_,
-                                       d_grouped_down_partials_,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.num_experts,
-                                       down_table.codebook_id,
-                                       down_k_partitions,
-                                       device_ordinal_,
-                                       stream)
-                                 : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       down_table.device_descs,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_decode_swiglu_int8_,
-                                       d_decode_swiglu_scales_,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.codebook_id,
-                                       device_ordinal_,
-                                       stream);
+        const bool down_ok = floating
+            ? cudaMoE_grouped_swiglu_down_floating_decode_table(
+                  d_down_gate_ptrs,
+                  d_down_up_ptrs,
+                  decode_floating_down_descs,
+                  d_expert_ids,
+                  d_weights,
+                  d_output,
+                  d_canonical_route_contributions,
+                  top_k,
+                  d_model,
+                  intermediate,
+                  down_table.num_experts,
+                  down_table.weight_format,
+                  device_ordinal_,
+                  stream)
+            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+                  d_down_gate_ptrs,
+                  d_down_up_ptrs,
+                  decode_down_descs,
+                  d_expert_ids,
+                  d_weights,
+                  d_decode_swiglu_int8_,
+                  d_decode_swiglu_scales_,
+                  d_grouped_down_partials_,
+                  d_output,
+                  d_canonical_route_contributions,
+                  top_k,
+                  d_model,
+                  intermediate,
+                  down_table.num_experts,
+                  down_table.codebook_id,
+                  down_k_partitions,
+                  device_ordinal_,
+                  stream);
         if (!down_ok)
             return false;
 
-        markDeviceWritten(output, device, stream);
+        markDeviceWritten(
+            canonical_route_contributions
+                ? canonical_route_contributions
+                : output,
+            device,
+            stream);
         recordGroupedDecodeCounter(
-            "cuda_moe_grouped_decode_fused_calls", "runtime", top_k,
-            d_model, intermediate, "fused_block_down");
-        if (!capture_active)
+            "cuda_moe_grouped_decode_fused_calls",
+            counter_source,
+            top_k, d_model, intermediate,
+            floating ? "floating_fixed_tree" : "fused_block_down");
+        if (!capture_active && !floating)
         {
             recordFusedDecodeTimer("cuda_moe_fused_decode_hidden_quantize", top_k, d_model, intermediate);
             recordFusedDecodeTimer("cuda_moe_fused_decode_gateup_kpart", top_k, d_model, intermediate);
@@ -3950,12 +11190,15 @@ namespace llaminar2
         if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
             return false;
 
-        // Decide whether to use the split-K (kpart) decode path. It requires
-        // pre-sized partials scratch; if the scratch cannot be ensured (e.g. the
-        // shape grew during graph capture), fall back to the serial kernel.
-        const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-                               ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate);
+        // Ordered K-part decode is the production contract. If its partial
+        // scratch cannot be sized, fail instead of changing arithmetic.
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::gate_up_k_partitions;
+        if (!ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
+                      "mandatory K-part gate/up scratch allocation failed");
+            return false;
+        }
 
         if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromRuntime"))
             return false;
@@ -3968,7 +11211,11 @@ namespace llaminar2
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] input upload required during graph capture");
                 return false;
             }
-            if (!const_cast<TensorBase *>(input)->ensureOnDevice(device, stream))
+            if (!requireTensorOnDevice(
+                    const_cast<TensorBase *>(input),
+                    device,
+                    stream,
+                    "input"))
                 return false;
             d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         }
@@ -3989,8 +11236,8 @@ namespace llaminar2
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] output allocation required during graph capture");
                 return false;
             }
-            if (!ensureOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
-                !ensureOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
+            if (!requireOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
+                !requireOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
                 return false;
 
             gate_ptrs[slot] = static_cast<float *>(gate_outputs[slot]->gpu_data_ptr());
@@ -4005,7 +11252,7 @@ namespace llaminar2
 
         float **d_gate_ptrs = nullptr;
         float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+        if (!ensureRuntimeGateUpPointerArrays(table.workspace_slot, RuntimePointerArrayScope::RuntimeTwoStep,
                                               top_k, gate_ptrs, up_ptrs,
                                               &d_gate_ptrs, &d_up_ptrs))
             return false;
@@ -4017,41 +11264,35 @@ namespace llaminar2
             return false;
         }
 
-        const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.num_experts,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_expert_ids,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  top_k,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
+        const bool reuse_router_q8_hidden =
+            canReuseRouterQ8Hidden(d_hidden, /*rows=*/1, d_model);
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel", "cuda_moe_gateup_reused_router_q8_hidden_calls", 1.0, {}, {},
+                {{"top_k", std::to_string(top_k)},
+                 {"d_model", std::to_string(d_model)}});
+        }
+
+        const bool ok = cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+            d_hidden,
+            runtime_layer,
+            d_expert_ids,
+            d_gate_ptrs,
+            d_up_ptrs,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            reuse_router_q8_hidden,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            top_k,
+            intermediate,
+            d_model,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
 
         if (ok)
         {
@@ -4062,7 +11303,7 @@ namespace llaminar2
             }
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_gateup_calls", "runtime", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
     }
@@ -4128,12 +11369,12 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRuntime] output allocation required during graph capture");
             return false;
         }
-        if (!ensureOutputOnDevice(output, device, stream, "moe_output"))
+        if (!requireOutputOnDevice(output, device, stream, "moe_output"))
             return false;
 
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(table_id, RuntimePointerArrayScope::RuntimeTwoStep,
+        if (!ensureRuntimeDownPointerArrays(table.workspace_slot, RuntimePointerArrayScope::RuntimeTwoStep,
                                             top_k, gate_ptrs, up_ptrs,
                                             &d_gate_ptrs, &d_up_ptrs))
             return false;
@@ -4147,101 +11388,43 @@ namespace llaminar2
             return false;
         }
 
-        // Split-K (K-partition) path raises occupancy by multiplying the block
-        // count by k_partitions; fall back to the serial full-K path when the
-        // toggle is off or the partial scratch cannot be sized.
-        const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode &&
-                               ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k);
+        // Split-K raises occupancy while its ordered reduction preserves the
+        // serial-decode arithmetic tree used by grouped verifier batches.
+        const int k_partitions = CUDAMoEBatchInvariantPolicy::down_k_partitions;
+        if (!ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRuntime] "
+                      "mandatory K-part down scratch allocation failed");
+            return false;
+        }
 
-        const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_expert_ids,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_grouped_down_partials_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.num_experts,
-                  table.codebook_id,
-                  k_partitions,
-                  device_ordinal_,
-                  stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_expert_ids,
-                  d_weights,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_output,
-                  top_k,
-                  d_model,
-                  intermediate,
-                  table.codebook_id,
-                  device_ordinal_,
-                  stream);
+        const bool ok = cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+            d_gate_ptrs,
+            d_up_ptrs,
+            runtime_layer,
+            d_expert_ids,
+            d_weights,
+            d_decode_swiglu_int8_,
+            d_decode_swiglu_scales_,
+            d_grouped_down_partials_,
+            d_output,
+            top_k,
+            d_model,
+            intermediate,
+            table.num_experts,
+            table.codebook_id,
+            k_partitions,
+            device_ordinal_,
+            stream);
 
         if (ok)
         {
             markDeviceWritten(output, device, stream);
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_down_calls", "runtime", top_k,
-                d_model, intermediate, use_kpart ? "kpart" : "serial");
+                d_model, intermediate, "kpart");
         }
         return ok;
-    }
-
-    int CUDAMoEKernel::getExpertTokenCount(int expert_id) const
-    {
-        if (expert_id < 0 || expert_id >= prepared_num_experts_)
-            return 0;
-        return host_expert_counts_[expert_id];
-    }
-
-    void CUDAMoEKernel::gatherExpertBatch(ITensor *hidden, ITensor *batch_buffer,
-                                          int expert_id, int d_model)
-    {
-        const int count = getExpertTokenCount(expert_id);
-        if (count <= 0)
-            return;
-        void *stream = requireStream("CUDAMoEKernel::gatherExpertBatch");
-        const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
-            !ensureOutputOnDevice(batch_buffer, device, stream, "batch_buffer"))
-            return;
-        const int offset = host_expert_offsets_[expert_id];
-        gatherTokenBatch(static_cast<const float *>(hidden->gpu_data_ptr()),
-                         static_cast<float *>(batch_buffer->gpu_data_ptr()),
-                         d_group_token_indices_ + offset, count, d_model);
-        markDeviceWritten(batch_buffer, device, stream);
-    }
-
-    void CUDAMoEKernel::scatterExpertResults(ITensor *output, ITensor *expert_results,
-                                             int expert_id, int d_model)
-    {
-        const int count = getExpertTokenCount(expert_id);
-        if (count <= 0)
-            return;
-        void *stream = requireStream("CUDAMoEKernel::scatterExpertResults");
-        const DeviceId device = deviceId();
-        if (!ensureTensorOnDevice(output, device, stream, "output") ||
-            !ensureTensorOnDevice(expert_results, device, stream, "expert_results"))
-            return;
-        const int offset = host_expert_offsets_[expert_id];
-        scatterAddWeighted(static_cast<float *>(output->gpu_data_ptr()),
-                           static_cast<const float *>(expert_results->gpu_data_ptr()),
-                           d_group_token_indices_ + offset,
-                           d_group_weights_ + offset,
-                           count, d_model);
-        markDeviceWritten(output, device, stream);
     }
 
 } // namespace llaminar2

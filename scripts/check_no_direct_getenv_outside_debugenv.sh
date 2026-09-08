@@ -16,9 +16,6 @@ pattern='(^|[^[:alnum:]_])(std::)?getenv[[:space:]]*\('
 # before DebugEnv is safe or appropriate to use.
 allowed_exception_files=(
     "src/v2/app/RuntimeInitPhase.cpp"
-    "src/v2/backends/ComputeBackend.cpp"
-    "src/v2/backends/cuda/NvidiaContextFactory.cu"
-    "src/v2/backends/rocm/AMDContextFactory.cpp"
     "src/v2/utils/CPUFeatures.h"
 )
 

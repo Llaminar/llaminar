@@ -30,6 +30,7 @@
 
 #include "WeightManagerConfig.h"
 #include "WeightTypes.h"
+#include "MmapReclaimLifecycle.h"
 #include "../backends/DeviceId.h"
 
 #include <vector>
@@ -298,10 +299,13 @@ namespace llaminar2
          *                          packing and upload. Set false for nested
          *                          TP-in-PP setups where a later PP stage on
          *                          a different device still needs host copies.
+         * @param include_expert_jobs If false, defer routed MoE expert GEMM
+         *                            preparation to an explicit overlay/cache pass.
          * @return true on success
          */
         virtual bool finalizeForDevices(const std::vector<DeviceId> & /*devices*/,
-                                         bool /*release_host_data*/ = true) { return true; }
+                                         bool /*release_host_data*/ = true,
+                                         bool /*include_expert_jobs*/ = true) { return true; }
 
         // =========================================================================
         // Internal Lifecycle (called by prepareWeightsForDevice/finalizeForDevice)
@@ -335,7 +339,10 @@ namespace llaminar2
          *
          * Called after the first forward pass completes, when GPU kernels have
          * uploaded their own device copies (e.g., embedding repack+upload to workspace).
-         * At that point, the host data is no longer needed.
+         * At that point, the host data is no longer needed. This phase must not
+         * reclaim mmap pages itself: scheduleMmapReclaim() follows it and lets
+         * the background worker unregister every surviving mapped view from the
+         * accelerator runtime before backing-aware advice.
          *
          * @return Number of tensors whose host data was released
          */
@@ -348,13 +355,36 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Advise the OS to reclaim mmap physical pages
+         * @brief Submit post-first-prefill mmap reclamation to its owner worker.
          *
-         * Safe to call after all GEMM engines have packed their weight data.
+         * Concrete model loaders perform host-registration retirement followed
+         * by backing-aware page advice. Mock/in-memory managers have no mapping,
+         * so their default result is already complete.
          *
-         * @return Total bytes advised
+         * @return Typed exactly-once submission outcome.
          */
-        virtual size_t adviseMmapDontneed() { return 0; }
+        virtual MmapReclaimLifecycle::Submission scheduleMmapReclaim()
+        {
+            return MmapReclaimLifecycle::Submission::AlreadyComplete;
+        }
+
+        /**
+         * @brief Cross the mmap-reclaim barrier before a dependent host allocation.
+         *
+         * Ordinary inference must never wait here. Model/JIT admission and owner
+         * teardown use this edge only when they need the capacity promised by an
+         * earlier reclaim submission.
+         *
+         * @return Terminal reclaim state and bytes actually advised.
+         */
+        virtual MmapReclaimLifecycle::Completion
+        awaitMmapReclaimBeforeHostAllocation()
+        {
+            return {
+                .state = MmapReclaimLifecycle::State::Complete,
+                .advised_bytes = 0,
+            };
+        }
 
         /**
          * @brief Set expert weight payload provider for metadata-based host retention

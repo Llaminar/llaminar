@@ -9,9 +9,11 @@
 #include <atomic>
 #include <cctype>
 #include <cstring>
+#include <cstdint>
 #include <optional>
 
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "execution/moe/DeviceMoERebalancePolicyShared.h"
 
 /**
  * @file DebugEnv.h
@@ -80,12 +82,25 @@ namespace llaminar2
             static const std::vector<const char *> names = {
                 "LLAMINAR_PREFILL_GRAPH_BUCKETS",
                 "LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
+                "LLAMINAR_PREFILL_GRAPH_REQUIRED",
                 "LLAMINAR_GPU_GRAPHS",
+                "LLAMINAR_ALLREDUCE_PRECISION",
                 "LLAMINAR_MOE_REBALANCE",
                 "LLAMINAR_MOE_REBALANCE_WINDOW",
                 "LLAMINAR_MOE_REBALANCE_MAX_WINDOW",
                 "LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH",
+                "LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE",
+                "LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE",
+                "LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER",
+                "LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE",
+                "LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS",
                 "LLAMINAR_MOE_REBALANCE_REPLICAS",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE",
             };
             return names;
         }
@@ -105,6 +120,9 @@ namespace llaminar2
         bool no_color_output = false;         ///< Disable ANSI color when NO_COLOR or LLAMINAR_NO_COLOR is present.
         bool assert_thread_affinity = false;  ///< Fail affinity verification only when LLAMINAR_ASSERT_THREAD_AFFINITY=1.
         bool benchmark_memory_log = false;    ///< Emit benchmark GPU memory snapshots when LLAMINAR_BENCH_MEM_LOG is present.
+        int benchmark_iterations = 3;         ///< Measured benchmark iterations (LLAMINAR_BENCHMARK_ITERATIONS, default 3).
+        int benchmark_warmup_iterations = 1;  ///< Benchmark warmup iterations (LLAMINAR_BENCHMARK_WARMUP_ITERATIONS, default 1).
+        bool profiler_normal_exit = false;    ///< Permit profiler finalizers instead of `_exit(0)` when LLAMINAR_PROFILER_NORMAL_EXIT is truthy.
         bool rope_on_read = true;             ///< Enable RoPE-on-read unless LLAMINAR_ROPE_ON_READ parses to 0.
         bool sync_after_stage = false;        ///< Synchronize GPU after every stage when LLAMINAR_SYNC_AFTER_STAGE is present.
         bool serialize_tp_forward = false;    ///< Serialize local TP forwards when LLAMINAR_SERIALIZE_TP_FORWARD is present.
@@ -112,9 +130,15 @@ namespace llaminar2
         bool layer_trace = false;             ///< Emit temporary per-layer residual trace when LLAMINAR_LAYER_TRACE is present.
         bool trace_generated_tokens = false;  ///< Trace streamed/generated token text when LLAMINAR_TRACE_GENERATED_TOKENS is truthy.
         bool moe_grouped_verifier_snapshot_diagnostic = false; ///< Emit grouped MoE verifier routing-row diagnostics.
+        bool mtp_publication_diagnostics = false; ///< Emit opt-in device-owned MTP/KV publication diagnostics.
+        bool mtp_device_phase_snapshots = false; ///< Preserve device-only logical-state phase snapshots until a fatal diagnostic boundary.
+        bool mtp_condition_graph_contract_trace = false; ///< Trace only the participant/cache/graph lifecycle of resident MTP condition advances.
+        bool gpu_graph_kernel_inventory = false; ///< Export captured kernel names/geometries to PerfStats during graph setup.
+        bool cuda_gdn_pointer_trace = false;      ///< Emit CUDA GDN grouped-row pointer diagnostics.
         bool allow_numa_bind_fallback = false; ///< Allow requested NUMA bind failures to continue when explicitly enabled.
         bool stage_checksum_trace = false;     ///< Emit per-stage checksum traces when LLAMINAR_STAGE_CHECKSUM_TRACE is truthy.
         std::string stage_checksum_filter;     ///< Optional substring filter for stage checksum traces.
+        std::optional<std::string> nccl_graph_mixing_support; ///< Exact external NCCL graph-mixing override, when present.
 
         RuntimeDebugConfig()
         {
@@ -128,6 +152,9 @@ namespace llaminar2
             no_color_output = isPresent("NO_COLOR") || isPresent("LLAMINAR_NO_COLOR");
             assert_thread_affinity = isExactlyOne("LLAMINAR_ASSERT_THREAD_AFFINITY");
             benchmark_memory_log = isPresent("LLAMINAR_BENCH_MEM_LOG");
+            benchmark_iterations = readIntClamped("LLAMINAR_BENCHMARK_ITERATIONS", 3, 1, 100);
+            benchmark_warmup_iterations = readIntClamped("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", 1, 0, 100);
+            profiler_normal_exit = readTruthy("LLAMINAR_PROFILER_NORMAL_EXIT");
             rope_on_read = readBoolDefaultTrue("LLAMINAR_ROPE_ON_READ");
             sync_after_stage = isPresent("LLAMINAR_SYNC_AFTER_STAGE");
             serialize_tp_forward = isPresent("LLAMINAR_SERIALIZE_TP_FORWARD");
@@ -136,9 +163,22 @@ namespace llaminar2
             trace_generated_tokens = readTruthy("LLAMINAR_TRACE_GENERATED_TOKENS");
             moe_grouped_verifier_snapshot_diagnostic =
                 readTruthy("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC");
+            mtp_publication_diagnostics =
+                readTruthy("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS");
+            mtp_device_phase_snapshots =
+                readTruthy("LLAMINAR_MTP_DEVICE_PHASE_SNAPSHOTS");
+            mtp_condition_graph_contract_trace =
+                readTruthy(
+                    "LLAMINAR_MTP_CONDITION_GRAPH_CONTRACT_TRACE");
+            gpu_graph_kernel_inventory =
+                readTruthy("LLAMINAR_GPU_GRAPH_KERNEL_INVENTORY");
+            cuda_gdn_pointer_trace =
+                readTruthy("LLAMINAR_CUDA_GDN_PTR_TRACE");
             allow_numa_bind_fallback = readTruthy("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK");
             stage_checksum_trace = readTruthy("LLAMINAR_STAGE_CHECKSUM_TRACE");
             stage_checksum_filter = readString("LLAMINAR_STAGE_CHECKSUM_FILTER");
+            nccl_graph_mixing_support =
+                readOptionalString("NCCL_GRAPH_MIXING_SUPPORT");
         }
 
     private:
@@ -180,6 +220,28 @@ namespace llaminar2
         {
             const char *value = std::getenv(name);
             return value != nullptr ? std::string(value) : std::string{};
+        }
+
+        /// @brief Read a string while preserving the distinction between unset and empty.
+        static std::optional<std::string> readOptionalString(const char *name)
+        {
+            const char *value = std::getenv(name);
+            if (value == nullptr)
+                return std::nullopt;
+            return std::string(value);
+        }
+
+        /// @brief Read an integer environment override and clamp to a conservative range.
+        static int readIntClamped(const char *name, int default_value, int min_value, int max_value)
+        {
+            const char *value = std::getenv(name);
+            if (!value || value[0] == '\0')
+                return default_value;
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value)
+                return default_value;
+            return std::clamp(static_cast<int>(parsed), min_value, max_value);
         }
     };
 
@@ -252,12 +314,17 @@ namespace llaminar2
     /**
      * @brief Kernel profiling configuration group
      *
-     * Controls per-operation timing instrumentation for performance analysis.
-     * When disabled, profiling methods have zero overhead (compile-time elimination).
+     * Controls the legacy hand-instrumented per-kernel timing tables.
+     *
+     * `LLAMINAR_PROFILING` is intentionally not consumed here.  The unified
+     * profiling switch is deprecated and now aliases the graph-safe
+     * `PerfStatsCollector` path, so enabling it must never alter executor or
+     * kernel execution topology.  Use `LLAMINAR_PROFILE_KERNELS` only when a
+     * focused legacy kernel table is explicitly required.
      */
     struct ProfileConfig
     {
-        bool enabled = false;       ///< Enable profiling (LLAMINAR_PROFILING=1 or legacy LLAMINAR_PROFILE_KERNELS=1)
+        bool enabled = false;       ///< Enable legacy hand-instrumented kernel timing (LLAMINAR_PROFILE_KERNELS=1)
         bool per_layer = false;     ///< Breakdown by layer index (LLAMINAR_PROFILE_PER_LAYER=1)
         bool per_iteration = false; ///< Print stats per decode iteration (LLAMINAR_PROFILE_PER_ITER=1)
         int print_interval = 0;     ///< Print every N iterations (0=only at end)
@@ -269,17 +336,15 @@ namespace llaminar2
 
         void reload()
         {
-            // New unified env var - enables all profiling
-            const char *unified_env = std::getenv("LLAMINAR_PROFILING");
-            if (unified_env)
-            {
-                enabled = (std::atoi(unified_env) != 0);
-            }
-            // Legacy env var - still supported for backward compatibility
+            enabled = false;
+            per_layer = false;
+            per_iteration = false;
+            print_interval = 0;
+
             const char *enabled_env = std::getenv("LLAMINAR_PROFILE_KERNELS");
             if (enabled_env)
             {
-                enabled = enabled || (std::atoi(enabled_env) != 0);
+                enabled = (std::atoi(enabled_env) != 0);
             }
 
             const char *per_layer_env = std::getenv("LLAMINAR_PROFILE_PER_LAYER");
@@ -337,16 +402,17 @@ namespace llaminar2
         int gemm_n_tile = 0;                ///< N-dimension tile size (0=no tiling is optimal for large batches)
 
         bool deterministic = false;               ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
-        bool cuda_cublas_gemm = false;            ///< Use cuBLAS FP16 GEMM path only when LLAMINAR_CUBLAS_GEMM=1.
-        bool cuda_gemv_rowpar = true;             ///< Enable CUDA GEMV row-parallel layout unless LLAMINAR_CUDA_GEMV_ROWPAR starts with '0'.
         int cuda_bk256_mode = 0;                  ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
-        int cuda_stream_k_mode = 0;               ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
         int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
-        int cuda_force_prefill_split_k = 0;       ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
-        bool cuda_moe_gateup_kpart_decode = true; ///< Enable K-partitioned grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        int cuda_moe_gateup_kparts = 16;          ///< K partitions for grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, default 16)
-        bool cuda_moe_down_kpart_decode = true;   ///< Enable K-partitioned grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        int cuda_moe_down_kparts = 16;            ///< K partitions for grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, default 16)
+        int cuda_moe_gateup_ordered_kpart_tile_n = 128; ///< Warp-aligned output columns per ordered split-K CUDA gate/up producer block (LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
+        bool cuda_moe_gateup_ordered_kpart_tile_n_override_active = false; ///< True only when an explicit environment or trainer override must supersede generated capture-time dispatch.
+        int cuda_moe_down_ordered_kpart_tile_n = 128;   ///< Warp-aligned output columns per ordered split-K CUDA down producer block used for canonical route publication (LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N, valid 64..256 in steps of 32, proven default 128)
+        int cuda_moe_imma_gateup_columns = 32;  ///< Capture-time grouped-IMMA fused gate/up output width (LLAMINAR_CUDA_MOE_IMMA_GATEUP_COLUMNS, valid 32|64|128).
+        int cuda_moe_imma_down_columns = 32;    ///< Capture-time grouped-IMMA down output width (LLAMINAR_CUDA_MOE_IMMA_DOWN_COLUMNS, valid 32|64|128|256).
+        int cuda_moe_imma_gateup_schedule = 0;  ///< Gate/up warp ownership (LLAMINAR_CUDA_MOE_IMMA_GATEUP_SCHEDULE, 0=parallel banks, 1=paired projections).
+        bool cuda_moe_imma_geometry_override_active = false; ///< True only when a profiler/trainer or explicit environment overrides installed IMMA dispatch.
+        bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8)
+        bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
         bool cuda_moe_prefill_fuse_swiglu = true; ///< Fuse SwiGLU + blockwise int8 quant into the grouped MoE prefill gate/up GEMM epilogue, eliminating the FP32 gate/up global round-trip + separate swiglu_quantize launch (LLAMINAR_CUDA_MOE_PREFILL_FUSE_SWIGLU, default ON)
 
@@ -465,66 +531,102 @@ namespace llaminar2
             deterministic = deterministic_env && std::atoi(deterministic_env) != 0;
             if (deterministic)
             {
+                /*
+                 * Large-M prefill candidates may select a different tiling or
+                 * reduction policy, so deterministic execution keeps that
+                 * experimental scheduler disabled.  Fused M=1 decode and
+                 * grouped verifier projections are different: every projection
+                 * retains its canonical fixed reduction and writes disjoint
+                 * output/scratch storage.  Their persistent-stream fork/join
+                 * changes only launch overlap, not arithmetic order, and is
+                 * covered by captured all-codebook byte-equivalence tests.
+                 */
                 cuda_concurrent_prefill = false;
-                cuda_concurrent_decode = false;
             }
 
-            const char *cublas_gemm_env = std::getenv("LLAMINAR_CUBLAS_GEMM");
-            cuda_cublas_gemm = cublas_gemm_env && std::atoi(cublas_gemm_env) == 1;
-
-            const char *gemv_rowpar_env = std::getenv("LLAMINAR_CUDA_GEMV_ROWPAR");
-            cuda_gemv_rowpar = !(gemv_rowpar_env && gemv_rowpar_env[0] == '0');
 
             const char *bk256_env = std::getenv("LLAMINAR_BK256_MODE");
             cuda_bk256_mode = bk256_env ? std::atoi(bk256_env) : 0;
 
-            const char *stream_k_env = std::getenv("LLAMINAR_STREAM_K");
-            cuda_stream_k_mode = stream_k_env ? std::atoi(stream_k_env) : 0;
-
             const char *force_tile_env = std::getenv("LLAMINAR_FORCE_PREFILL_TILE");
             cuda_force_prefill_tile = force_tile_env ? std::atoi(force_tile_env) : -1;
 
-            const char *force_split_k_env = std::getenv("LLAMINAR_FORCE_PREFILL_SPLIT_K");
-            cuda_force_prefill_split_k = force_split_k_env ? std::atoi(force_split_k_env) : 0;
-
-            // CUDA grouped MoE gate/up split-K (kpart) decode toggle + partition count.
-            cuda_moe_gateup_kpart_decode = true;
-            cuda_moe_gateup_kparts = 16;
-            const char *moe_gateup_kpart_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE");
-            if (moe_gateup_kpart_env)
-                cuda_moe_gateup_kpart_decode = (std::atoi(moe_gateup_kpart_env) != 0);
-            const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPARTS");
-            if (moe_gateup_kparts_env)
+            // Gate/up and canonical down publication are independent kernels.
+            // Their block widths affect occupancy but not arithmetic, so keep
+            // the two launch-policy axes explicit instead of forcing both
+            // projections through one historical shared knob. Both values are
+            // capture-time geometry and therefore remain whole-warp widths in
+            // the practical Ampere occupancy range.
+            cuda_moe_gateup_ordered_kpart_tile_n = 128;
+            cuda_moe_gateup_ordered_kpart_tile_n_override_active = false;
+            const char *moe_gateup_ordered_tile_n_env =
+                std::getenv("LLAMINAR_CUDA_MOE_GATEUP_ORDERED_KPART_TILE_N");
+            if (moe_gateup_ordered_tile_n_env)
             {
-                const int requested = std::atoi(moe_gateup_kparts_env);
-                // gate/up GEMV has K=2048 (64 K-blocks); allow up to 32 partitions
-                // to raise block/wave occupancy on the under-utilized decode grid.
-                if (requested == 2 || requested == 4 || requested == 8 ||
-                    requested == 16 || requested == 32)
-                    cuda_moe_gateup_kparts = requested;
+                const int requested = std::atoi(moe_gateup_ordered_tile_n_env);
+                if (requested >= 64 && requested <= 256 &&
+                    (requested % 32) == 0)
+                {
+                    cuda_moe_gateup_ordered_kpart_tile_n = requested;
+                    cuda_moe_gateup_ordered_kpart_tile_n_override_active = true;
+                }
             }
-            // Split-K reduction reorders the accumulation; disable for determinism.
-            if (deterministic)
-                cuda_moe_gateup_kpart_decode = false;
-
-            // CUDA grouped MoE SwiGLU down split-K (kpart) decode toggle + partition count.
-            cuda_moe_down_kpart_decode = true;
-            cuda_moe_down_kparts = 16;
-            const char *moe_down_kpart_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE");
-            if (moe_down_kpart_env)
-                cuda_moe_down_kpart_decode = (std::atoi(moe_down_kpart_env) != 0);
-            const char *moe_down_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPARTS");
-            if (moe_down_kparts_env)
+            cuda_moe_down_ordered_kpart_tile_n = 128;
+            const char *moe_down_ordered_tile_n_env =
+                std::getenv("LLAMINAR_CUDA_MOE_DOWN_ORDERED_KPART_TILE_N");
+            if (moe_down_ordered_tile_n_env)
             {
-                const int requested = std::atoi(moe_down_kparts_env);
-                // down GEMV has K=512 (16 K-blocks); allow up to 16 partitions.
-                if (requested == 2 || requested == 4 || requested == 8 ||
-                    requested == 16)
-                    cuda_moe_down_kparts = requested;
+                const int requested = std::atoi(moe_down_ordered_tile_n_env);
+                if (requested >= 64 && requested <= 256 &&
+                    (requested % 32) == 0)
+                {
+                    cuda_moe_down_ordered_kpart_tile_n = requested;
+                }
             }
-            // Split-K reduction reorders the accumulation; disable for determinism.
-            if (deterministic)
-                cuda_moe_down_kpart_decode = false;
+
+            cuda_moe_imma_gateup_columns = 32;
+            cuda_moe_imma_down_columns = 32;
+            cuda_moe_imma_gateup_schedule = 0;
+            cuda_moe_imma_geometry_override_active = false;
+            const char *moe_imma_gateup_columns_env =
+                std::getenv("LLAMINAR_CUDA_MOE_IMMA_GATEUP_COLUMNS");
+            const char *moe_imma_down_columns_env =
+                std::getenv("LLAMINAR_CUDA_MOE_IMMA_DOWN_COLUMNS");
+            const char *moe_imma_gateup_schedule_env =
+                std::getenv("LLAMINAR_CUDA_MOE_IMMA_GATEUP_SCHEDULE");
+            if (moe_imma_gateup_columns_env || moe_imma_down_columns_env ||
+                moe_imma_gateup_schedule_env)
+            {
+                cuda_moe_imma_gateup_columns = moe_imma_gateup_columns_env
+                                                   ? std::atoi(
+                                                         moe_imma_gateup_columns_env)
+                                                   : 32;
+                cuda_moe_imma_down_columns = moe_imma_down_columns_env
+                                                 ? std::atoi(
+                                                       moe_imma_down_columns_env)
+                                                 : 32;
+                cuda_moe_imma_gateup_schedule =
+                    moe_imma_gateup_schedule_env
+                        ? std::atoi(moe_imma_gateup_schedule_env)
+                        : 0;
+                cuda_moe_imma_geometry_override_active = true;
+            }
+            // CUDA MoE decode router Q8 path mirrors ROCm's cached Q8 router.
+            // It reduces router GEMV traffic and lets the grouped gate/up decode
+            // reuse the same hidden quantization in production runtime-table flow.
+            cuda_moe_router_q8 = true;
+            cuda_moe_reuse_router_q8_hidden = true;
+            const char *moe_router_q8_env = std::getenv("LLAMINAR_CUDA_MOE_ROUTER_Q8");
+            if (moe_router_q8_env)
+                cuda_moe_router_q8 = (std::atoi(moe_router_q8_env) != 0);
+            const char *moe_reuse_router_q8_hidden_env = std::getenv("LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN");
+            if (moe_reuse_router_q8_hidden_env)
+                cuda_moe_reuse_router_q8_hidden = (std::atoi(moe_reuse_router_q8_hidden_env) != 0);
+            /*
+             * Router Q8 publication has a fixed quantizer and immutable
+             * producer/consumer ordering, so deterministic execution keeps it
+             * enabled. Explicit backend overrides remain authoritative.
+             */
 
             // CUDA grouped MoE prefill tokens-per-block (kTileM). Default auto
             // chooses 2/4 for MTP verifier rows and 16 for larger prompt prefill.
@@ -687,23 +789,17 @@ namespace llaminar2
         bool debug_kv_append_source_snapshot = false;         ///< Capture source K/V tensors before append when LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT is non-zero.
         std::optional<int> debug_kv_append_source_layer;      ///< Selected layer for source K/V snapshots; nullopt means all layers.
         int cuda_fa2_tile_kv = 0;                             ///< CUDA FA2 KV tile override (LLAMINAR_FA2_TILE_KV, default 0=auto).
+        int cuda_fa2_q_warp_groups = 0;                       ///< CUDA FA2 16-row Q groups per block (LLAMINAR_FA2_Q_WARP_GROUPS; 0=geometry policy, positive values select a compiled tournament candidate).
+        int cuda_fa2_hd256_pv_warps = 4;                      ///< CUDA HD256 FA2 P@V warps per 16-row Q group (LLAMINAR_FA2_HD256_PV_WARPS; valid: 1, 2, or 4; default 4).
 
         // Wo projection mode (JIT backend only)
         // When enabled, Wo weights are expected to be passed as packed QuantisedPackedWeights
         // and Wo projection is executed via gemm (AVX-512 VNNI) with on-the-fly activation quantization.
         bool wo_vnni_packed = false;
 
-        // CPU flash attention KV tile overrides (0 or negative = disabled)
-        int flash_kv_tile_decode = -1;  ///< Override decode kv tile (LLAMINAR_FLASH_ATTN_KV_TILE_DECODE)
-        int flash_kv_tile_prefill = -1; ///< Override prefill kv tile (LLAMINAR_FLASH_ATTN_KV_TILE_PREFILL)
-
-        // CPU flash attention prefill INT16 (12-bit effective) Q·K path
-        bool flash_prefill_i16_i12 = true;            ///< Enable prefill INT16(i12) Q·K path (LLAMINAR_FLASH_PREFILL_I16_I12)
-        int flash_prefill_i16_i12_min_seq = 128;      ///< Minimum seq_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ)
-        int flash_prefill_i16_i12_min_kv = 128;       ///< Minimum kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV)
-        int64_t flash_prefill_i16_i12_min_work = 0;   ///< Minimum seq_len*kv_len for INT16(i12) path (LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK)
-        int flash_prefill_i16_i12_qmax = 2047;        ///< Effective quant range cap (LLAMINAR_FLASH_PREFILL_I16_I12_QMAX)
-        int flash_prefill_i16_i12_max_head_dim = 256; ///< Max head_dim for safe INT32 accumulation (LLAMINAR_FLASH_PREFILL_I16_I12_MAX_HEAD_DIM)
+        // CPU flash attention K/V tile override (0 or negative = disabled).
+        // One value governs every regime because tile order is observable math.
+        int flash_kv_tile = -1; ///< Override the common CPU tile (LLAMINAR_FLASH_ATTN_KV_TILE).
 
         AttentionConfig()
         {
@@ -742,55 +838,12 @@ namespace llaminar2
                 wo_vnni_packed = (std::atoi(wo_vnni_env) != 0);
             }
 
-            const char *flash_decode_tile_env = std::getenv("LLAMINAR_FLASH_ATTN_KV_TILE_DECODE");
-            if (flash_decode_tile_env)
+            flash_kv_tile = -1;
+            const char *flash_tile_env = std::getenv("LLAMINAR_FLASH_ATTN_KV_TILE");
+            if (flash_tile_env)
             {
-                const int parsed = std::atoi(flash_decode_tile_env);
-                flash_kv_tile_decode = parsed > 0 ? parsed : -1;
-            }
-
-            const char *flash_prefill_tile_env = std::getenv("LLAMINAR_FLASH_ATTN_KV_TILE_PREFILL");
-            if (flash_prefill_tile_env)
-            {
-                const int parsed = std::atoi(flash_prefill_tile_env);
-                flash_kv_tile_prefill = parsed > 0 ? parsed : -1;
-            }
-
-            const char *flash_i16_i12_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12");
-            if (flash_i16_i12_env)
-            {
-                flash_prefill_i16_i12 = (std::atoi(flash_i16_i12_env) != 0);
-            }
-
-            const char *flash_i16_min_seq_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_SEQ");
-            if (flash_i16_min_seq_env)
-            {
-                flash_prefill_i16_i12_min_seq = std::max(1, std::atoi(flash_i16_min_seq_env));
-            }
-
-            const char *flash_i16_min_kv_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_KV");
-            if (flash_i16_min_kv_env)
-            {
-                flash_prefill_i16_i12_min_kv = std::max(1, std::atoi(flash_i16_min_kv_env));
-            }
-
-            const char *flash_i16_min_work_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MIN_WORK");
-            if (flash_i16_min_work_env)
-            {
-                flash_prefill_i16_i12_min_work = std::max<int64_t>(0, std::atoll(flash_i16_min_work_env));
-            }
-
-            const char *flash_i16_qmax_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_QMAX");
-            if (flash_i16_qmax_env)
-            {
-                const int parsed = std::atoi(flash_i16_qmax_env);
-                flash_prefill_i16_i12_qmax = std::max(1, std::min(parsed, 32767));
-            }
-
-            const char *flash_i16_max_hd_env = std::getenv("LLAMINAR_FLASH_PREFILL_I16_I12_MAX_HEAD_DIM");
-            if (flash_i16_max_hd_env)
-            {
-                flash_prefill_i16_i12_max_head_dim = std::max(1, std::atoi(flash_i16_max_hd_env));
+                const int parsed = std::atoi(flash_tile_env);
+                flash_kv_tile = parsed > 0 ? parsed : -1;
             }
 
             const char *effective_kv_snapshot_env = std::getenv("LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT");
@@ -810,10 +863,22 @@ namespace llaminar2
 
             const char *kv_append_source_snapshot_env = std::getenv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT");
             debug_kv_append_source_snapshot = kv_append_source_snapshot_env && std::atoi(kv_append_source_snapshot_env) != 0;
-            debug_kv_append_source_layer = selectedLayerFromEnv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_LAYER");
+            debug_kv_append_source_layer = selectedLayerFromEnv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT_LAYER");
 
             const char *cuda_fa2_tile_kv_env = std::getenv("LLAMINAR_FA2_TILE_KV");
             cuda_fa2_tile_kv = cuda_fa2_tile_kv_env ? std::atoi(cuda_fa2_tile_kv_env) : 0;
+
+            const char *cuda_fa2_q_warp_groups_env =
+                std::getenv("LLAMINAR_FA2_Q_WARP_GROUPS");
+            cuda_fa2_q_warp_groups = cuda_fa2_q_warp_groups_env
+                                         ? std::atoi(cuda_fa2_q_warp_groups_env)
+                                         : 0;
+
+            const char *cuda_fa2_hd256_pv_warps_env =
+                std::getenv("LLAMINAR_FA2_HD256_PV_WARPS");
+            cuda_fa2_hd256_pv_warps = cuda_fa2_hd256_pv_warps_env
+                                          ? std::atoi(cuda_fa2_hd256_pv_warps_env)
+                                          : 4;
         }
 
     private:
@@ -903,8 +968,11 @@ namespace llaminar2
      *   LLAMINAR_AUTO_WEIGHT_TRANSFER      - Auto-transfer weights to target device (default: 1)
      *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use DeviceGraphBufferManager for buffers (default: 1 - ON)
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
-     *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
-     *                                        containing collectives (default: 0 - OFF, experimental)
+     *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Opt a proven heterogeneous mixed-device
+     *                                        collective domain into segmented replay (default: 0 - OFF).
+     *                                        This flag never authorizes homogeneous segmentation.
+     *   LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES - Capture homogeneous LocalTP NCCL/RCCL collectives directly
+     *                                        into decode GPU graphs (default: 1 - ON)
      *
      * Device Placement / Heterogeneous Execution:
      *   LLAMINAR_CPU_PREFILL_PARTICIPATE   - Enable CPU participation in PREFILL phase (default: 0 - OFF)
@@ -946,21 +1014,23 @@ namespace llaminar2
         bool gpu_graph_verify = false;                                         ///< Verify graph replay vs direct execution (default: OFF, env: LLAMINAR_GPU_GRAPH_VERIFY)
         bool gpu_graph_recapture = false;                                      ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
         int gpu_graph_max_stages = 0;                                          ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
-        bool gpu_graph_collective_segmented = false;                           ///< Enable segmented replay for collective decode graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
-        std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist for segmented collective capture (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
+        bool gpu_graph_collective_segmented = false;                           ///< Admit segmented replay only after a mixed-device collective topology proof (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
+        bool gpu_graph_capture_collectives = true;                             ///< Capture homogeneous LocalTP NCCL/RCCL collectives inside decode GPU graphs (default: ON, env: LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=0 to opt out)
+        bool gpu_graph_defer_captured_collective_final_sync = false;           ///< Allow final-sync deferral when collective nodes are captured in the replay graph (env: LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC)
+        std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist inside an already admitted heterogeneous collective segmented plan (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
         bool gpu_graph_stream_only = false;                                    ///< Execute segmented path on stream-only mode (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY)
         bool gpu_graph_stream_only_default = false;                            ///< Stream-only mode uses default stream (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT)
-        bool gpu_graph_trace_replay = false;                                   ///< Trace per-segment progress during graph replay (env: LLAMINAR_GPU_GRAPH_TRACE_REPLAY)
         bool force_mpi_collective_context = false;                             ///< Force MPI-backed CollectiveContext in GLOBAL TP (env: LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT)
 
         // =================================================================
         // Prefill Graph Capture Configuration
         // =================================================================
-        int prefill_graph_min_seq = 256;                                                                                                                               ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
+        int prefill_graph_min_seq = 256;                                                                                                                               ///< Minimum padded raw-prompt graph bucket; never an eager-execution threshold (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
         bool prefill_graph_trace = false;                                                                                                                              ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
+        bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)
         std::vector<int> prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes(); ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
-        int prefill_graph_max_cached_buckets = 10;                                                                                                                     ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
+        int prefill_graph_max_cached_buckets = static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);                                                                 ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
         int prefill_graph_pad_token_id = 0;                                                                                                                            ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
         // =================================================================
@@ -1043,6 +1113,18 @@ namespace llaminar2
 
         void reload()
         {
+            fast_decode = true;
+            executor_profiling = false;
+            gpu_graphs = true;
+            gpu_graph_verify = false;
+            gpu_graph_recapture = false;
+            gpu_graph_max_stages = 0;
+            gpu_graph_collective_segmented = false;
+            gpu_graph_capture_collectives = true;
+            gpu_graph_defer_captured_collective_final_sync = false;
+            gpu_graph_stream_only = false;
+            gpu_graph_stream_only_default = false;
+
             const char *use_exec_env = std::getenv("LLAMINAR_USE_LAYER_EXECUTOR");
             if (use_exec_env)
             {
@@ -1055,17 +1137,10 @@ namespace llaminar2
                 execution_mode = mode_env;
             }
 
-            // New unified env var - enables all profiling including executor profiling
-            const char *unified_env = std::getenv("LLAMINAR_PROFILING");
-            if (unified_env)
-            {
-                executor_profiling = (std::atoi(unified_env) != 0);
-            }
-            // Legacy env var - still supported for backward compatibility
             const char *prof_env = std::getenv("LLAMINAR_EXECUTOR_PROFILING");
             if (prof_env)
             {
-                executor_profiling = executor_profiling || (std::atoi(prof_env) != 0);
+                executor_profiling = (std::atoi(prof_env) != 0);
             }
 
             const char *valid_env = std::getenv("LLAMINAR_EXECUTOR_VALIDATION");
@@ -1128,6 +1203,20 @@ namespace llaminar2
                 gpu_graph_collective_segmented = (std::atoi(gpu_graph_collective_segmented_env) != 0);
             }
 
+            const char *gpu_graph_capture_collectives_env = std::getenv("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES");
+            if (gpu_graph_capture_collectives_env)
+            {
+                gpu_graph_capture_collectives = (std::atoi(gpu_graph_capture_collectives_env) != 0);
+            }
+
+            const char *gpu_graph_defer_captured_collective_sync_env =
+                std::getenv("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC");
+            if (gpu_graph_defer_captured_collective_sync_env)
+            {
+                gpu_graph_defer_captured_collective_final_sync =
+                    (std::atoi(gpu_graph_defer_captured_collective_sync_env) != 0);
+            }
+
             gpu_graph_collective_segmented_capture_allow.clear();
             const char *gpu_graph_collective_segmented_allow_env = std::getenv("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW");
             if (gpu_graph_collective_segmented_allow_env && *gpu_graph_collective_segmented_allow_env)
@@ -1157,11 +1246,6 @@ namespace llaminar2
                 gpu_graph_stream_only_default = (std::atoi(gpu_graph_stream_only_default_env) != 0);
             }
 
-            const char *gpu_graph_trace_replay_env = std::getenv("LLAMINAR_GPU_GRAPH_TRACE_REPLAY");
-            if (gpu_graph_trace_replay_env)
-            {
-                gpu_graph_trace_replay = (std::atoi(gpu_graph_trace_replay_env) != 0);
-            }
 
             const char *force_mpi_collective_ctx_env = std::getenv("LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT");
             if (force_mpi_collective_ctx_env)
@@ -1186,6 +1270,16 @@ namespace llaminar2
             if (prefill_graph_buckets_env)
             {
                 prefill_graph_buckets = (std::atoi(prefill_graph_buckets_env) != 0);
+            }
+
+            const char *prefill_graph_required_env = std::getenv("LLAMINAR_PREFILL_GRAPH_REQUIRED");
+            if (prefill_graph_required_env)
+            {
+                prefill_graph_required = (std::atoi(prefill_graph_required_env) != 0);
+            }
+            else
+            {
+                prefill_graph_required = false;
             }
 
             prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes();
@@ -1213,7 +1307,8 @@ namespace llaminar2
                     prefill_graph_bucket_sizes.end());
             }
 
-            prefill_graph_max_cached_buckets = 10;
+            prefill_graph_max_cached_buckets =
+                static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);
             const char *prefill_graph_max_buckets_env = std::getenv("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS");
             if (prefill_graph_max_buckets_env)
             {
@@ -1325,9 +1420,6 @@ namespace llaminar2
      *   LLAMINAR_SNAPSHOT_DUMP_LAYERS=21 \
      *   LLAMINAR_SNAPSHOT_DUMP_STAGES=FFN_INPUT_RESIDUAL,FFN_DOWN,FFN_RESIDUAL \
      *   ./run_llaminar.sh -m model.gguf -p "test"
-     *
-     *   # Enable zero-copy mapped memory for snapshots
-     *   LLAMINAR_SNAPSHOT_USE_MAPPED=1 ./run_llaminar.sh -m model.gguf -p "test"
      */
     struct SnapshotConfig
     {
@@ -1338,7 +1430,6 @@ namespace llaminar2
         int dump_rank = 0;                                   ///< MPI rank to dump (-1=all)
         bool dump_all_layers = true;                         ///< Whether to dump all layers
         bool dump_all_stages = true;                         ///< Whether to dump all stages
-        bool use_mapped_memory = false;                      ///< Use mapped memory for zero-copy snapshots
 
         SnapshotConfig()
         {
@@ -1351,16 +1442,6 @@ namespace llaminar2
             if (enabled_env)
             {
                 tensor_dump_enabled = (std::atoi(enabled_env) != 0);
-            }
-
-            // LLAMINAR_SNAPSHOT_USE_MAPPED - Enable mapped memory for zero-copy snapshots
-            // When enabled, FP32 activation buffers are allocated using mapped memory
-            // (hipHostMallocMapped/cudaHostAllocMapped) which enables zero-copy access
-            // from both host and device without memcpy.
-            const char *mapped_env = std::getenv("LLAMINAR_SNAPSHOT_USE_MAPPED");
-            if (mapped_env)
-            {
-                use_mapped_memory = (std::atoi(mapped_env) != 0);
             }
 
             const char *dir_env = std::getenv("LLAMINAR_SNAPSHOT_DUMP_DIR");
@@ -2476,6 +2557,85 @@ namespace llaminar2
     };
 
     /**
+     * @brief Process-wide accelerator startup and discovery policy.
+     *
+     * These switches are operational topology inputs rather than diagnostic
+     * hints. Every path that can enumerate a GPU backend, create one of its
+     * runtime contexts, or construct one of its collective backends must use
+     * this one parsed snapshot. Keeping the decision here prevents a rank that
+     * participates only in another backend from accidentally materializing a
+     * foreign primary context and consuming that backend's memory.
+     */
+    struct BackendStartupConfig
+    {
+        /// Skip every accelerator backend when the integer environment toggle is non-zero.
+        bool force_cpu_only = false;
+        /// Skip CUDA discovery and context-factory registration when non-zero.
+        bool skip_cuda = false;
+        /// Skip ROCm discovery and context-factory registration when non-zero.
+        bool skip_rocm = false;
+
+        /**
+         * @brief Capture the process environment when the configuration is constructed.
+         */
+        BackendStartupConfig()
+        {
+            reload();
+        }
+
+        /**
+         * @brief Reload all backend-startup switches from the process environment.
+         *
+         * The parser deliberately preserves the historical non-zero integer
+         * semantics of these operational variables. Production launchers set
+         * them before process creation; tests that mutate them must explicitly
+         * reload the global DebugEnv snapshot.
+         */
+        void reload()
+        {
+            force_cpu_only = readNonZeroInteger("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
+            skip_cuda = readNonZeroInteger("LLAMINAR_SKIP_CUDA_STARTUP");
+            skip_rocm = readNonZeroInteger("LLAMINAR_SKIP_ROCM_STARTUP");
+        }
+
+        /**
+         * @brief Whether this process may initialize any accelerator backend.
+         */
+        [[nodiscard]] bool acceleratorsEnabled() const noexcept
+        {
+            return !force_cpu_only;
+        }
+
+        /**
+         * @brief Whether CUDA discovery and runtime-context creation are allowed.
+         */
+        [[nodiscard]] bool cudaEnabled() const noexcept
+        {
+            return acceleratorsEnabled() && !skip_cuda;
+        }
+
+        /**
+         * @brief Whether ROCm discovery and runtime-context creation are allowed.
+         */
+        [[nodiscard]] bool rocmEnabled() const noexcept
+        {
+            return acceleratorsEnabled() && !skip_rocm;
+        }
+
+    private:
+        /**
+         * @brief Parse one legacy integer switch without broadening its accepted syntax.
+         * @param name Environment-variable name.
+         * @return True exactly when the variable exists and `std::atoi` is non-zero.
+         */
+        static bool readNonZeroInteger(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value != nullptr && std::atoi(value) != 0;
+        }
+    };
+
+    /**
      * @brief MPI bootstrap environment snapshot
      */
     struct MPIBootstrapEnvConfig
@@ -2588,32 +2748,30 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_VARIANT=<id>` - Force IQ4-codebook ratio prefill tile variant (`-1`=use global/auto)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_KB=<n>` - Force IQ4-codebook ratio prefill split-K blocks (`0`=use global/auto)
      * - `LLAMINAR_ROCM_REPACK_SLOTS=<n>` - Ring-buffer slot count for startup GPU repack pipeline
-     * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - VRAM budget cap for startup GPU repack staging buffers
+     * - `LLAMINAR_GPU_LOAD_STAGING_MB=<mb>` - Per-GPU pinned-host startup staging cap, mirrored by per-GPU device scratch (default 512 MiB, 0=unlimited)
+     * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - Legacy alias for the startup staging cap
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
      * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
-     * - `LLAMINAR_ROCM_NVNNI_Q8_DIRECT=1` - Force Q8_0 native-VNNI GEMV direct path (KB=1, no reduce kernel)
+     * - `LLAMINAR_ROCM_NVNNI_FULL_TILES=<-1|0|1>` - Select automatic, checked, or divisibility-proven full-tile NativeVNNI GEMM specialization
      * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
-     * - `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` - Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (default: off)
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=0` - Disable multi-stream GDN decode projection GEMVs (default: on outside deterministic mode)
-     * - `LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE=1` - Enable experimental shared-expert decode through MoE grouped FFN kernels (default: off)
      * - `LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER=0` - Disable grouped MoE decode router logits path (default: on)
-     * - `LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE=0` - Disable parallel-expert grouped MoE decode down projection
-     * - `LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE=0` - Disable K-partitioned grouped MoE gate/up decode projection
-     * - `LLAMINAR_ROCM_MOE_GATEUP_KPARTS=<2|4|8|16>` - K partitions for grouped MoE gate/up decode projection (default: 4)
-     * - `LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED=0` - Disable grouped gate/up K-part reduction fused directly into SwiGLU Q8 quantization (default: on)
-     * - `LLAMINAR_ROCM_MOE_PREFILL_TILE_M=<0|2|4|8>` - Force grouped MoE prefill verifier row tile size (`0` = auto)
      * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=0` - Disable cached Q8 router gate weights for ROCm MoE decode routing (default: on)
      * - `LLAMINAR_ROCM_MOE_ROUTER_FP16=1` - Enable cached FP16 router gate weights for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
      * - `LLAMINAR_ROCM_MOE_ROUTER_KPARTS=<2|4|8|16>` - K partitions for FP32 router logits decode routing (default: 8)
      * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=256 experts (default: on)
      * - `LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN=0` - Disable router Q8 hidden/scales reuse for grouped gate/up decode when the hidden row pointer matches (default: on)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_M=<4|8|12|16>` - Force expert-row tile for grouped gate/up prefill training (`-1` = generated policy)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_N=<64|128|256>` - Force output-column tile for grouped gate/up prefill training (`-1` = generated policy)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_M=<4|8|12|16>` - Force expert-row tile for grouped down prefill training (`-1` = generated policy)
+     * - `LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_N=<64|128|256>` - Force output-column tile for grouped down prefill training (`-1` = generated policy)
      * - `LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS=<0|16|32|64|128>` - Override batched Qwen-style top-k partial block cap (`0` = auto)
      *
      * @code
      *   LLAMINAR_ROCM_TRACE_COHERENCE=1 \
-     *   ./build_v2_e2e_release/llaminar2 -m model.gguf -p "test"
+     *   ./build_v2_release/llaminar2 -m model.gguf -p "test"
      * @endcode
      */
     struct ROCmConfig
@@ -2660,10 +2818,9 @@ namespace llaminar2
         int nvnni_min_blocks = -1;                 ///< Native-VNNI MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NVNNI_MIN_BLOCKS)
         bool nvnni_force_n64 = false;              ///< Force N64 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N64)
         bool nvnni_force_n128 = false;             ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
+        int nvnni_full_tiles = -1;                 ///< Native-VNNI edge specialization (-1=auto, 0=checked, 1=full tiles) (LLAMINAR_ROCM_NVNNI_FULL_TILES)
         int nvnni_gemv_kb = -1;                    ///< Native-VNNI GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NVNNI_GEMV_KB)
         int nvnni_gemv_target_waves = -1;          ///< Native-VNNI GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES)
-        bool nvnni_q8_direct = false;              ///< Force Q8_0 native-VNNI GEMV KB=1 direct path (LLAMINAR_ROCM_NVNNI_Q8_DIRECT)
-        bool nvnni_atomic_reduce = false;          ///< Fuse GEMV reduce via atomicAdd (eliminates reduce kernel) (LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE)
         bool nvnni_disable_generated = false;      ///< Disable generated ROCm NativeVNNI dispatch tables for trainer sweeps (LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED)
         int ratio_prefill_variant = -1;            ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;                  ///< Ratio prefill split-K blocks override (0=auto)
@@ -2673,29 +2830,25 @@ namespace llaminar2
         int ratio_prefill_iq4_kb = 0;              ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
         bool concurrent_prefill = true;            ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
         bool concurrent_decode = false;            ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
-        bool concurrent_m2_rows = false;           ///< Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (LLAMINAR_ROCM_CONCURRENT_M2_ROWS)
         bool gdn_concurrent_decode = true;         ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        bool shared_expert_grouped_decode = false; ///< Enable shared-expert decode through grouped MoE FFN kernels (LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE)
         bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
         bool moe_grouped_decode_router = true;     ///< Enable grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER, disabled by LLAMINAR_DETERMINISTIC)
-        bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
+        bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8)
         bool moe_router_fp16 = false;              ///< Enable cached FP16 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_FP16, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_router_kpart_decode = false;      ///< Enable K-partitioned FP32 router logits for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
         bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
-        bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
-        bool moe_parallel_down_decode = true;      ///< Enable parallel-expert grouped MoE decode down projection (LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        bool moe_gateup_kpart_decode = true;       ///< Enable K-partitioned grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
-        int moe_gateup_kparts = 4;                 ///< K partitions for grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPARTS)
-        bool moe_gateup_swiglu_quant_fused = true; ///< Fuse K-part gate/up reduce into grouped SwiGLU Q8 quantization (LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED, disabled by LLAMINAR_DETERMINISTIC)
+        bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN)
+        int moe_prefill_gateup_tile_m = -1;        ///< Grouped prefill gate/up expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
+        int moe_prefill_gateup_tile_n = -1;        ///< Grouped prefill gate/up output-column tile override (-1=generated policy; 64/128/256 valid)
+        int moe_prefill_down_tile_m = -1;          ///< Grouped prefill down expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
+        int moe_prefill_down_tile_n = -1;          ///< Grouped prefill down output-column tile override (-1=generated policy; 64/128/256 valid)
         bool moe_device_routed_decode = true;      ///< Enable runtime-table device routed MoE decode (LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE)
-        bool moe_grouped_prefill = true;           ///< Enable grouped MoE prefill path when supported (LLAMINAR_ROCM_MOE_GROUPED_PREFILL)
-        int moe_prefill_tile_m = 0;                ///< Tokens-per-block override for grouped MoE prefill on ROCm (LLAMINAR_ROCM_MOE_PREFILL_TILE_M, valid 0|2|4|8, default 0=auto)
         int topk_smallk_partial_blocks = 0;        ///< Override small-k top-k partial block cap (LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS, valid 0|16|32|64|128; 0=auto)
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
         int repack_slots = 3;     ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
-        int repack_budget_mb = 0; ///< VRAM budget cap for startup GPU repack staging buffers, 0=unlimited (LLAMINAR_ROCM_REPACK_BUDGET_MB)
+        int repack_budget_mb = 512; ///< Per-GPU pinned-host startup staging cap in MiB, mirrored by per-GPU device scratch; 0=unlimited (LLAMINAR_GPU_LOAD_STAGING_MB, legacy LLAMINAR_ROCM_REPACK_BUDGET_MB)
         int repack_streams = 3;   ///< H2D stream count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_STREAMS)
 
         ROCmConfig()
@@ -2747,10 +2900,9 @@ namespace llaminar2
             nvnni_min_blocks = -1;
             nvnni_force_n64 = false;
             nvnni_force_n128 = false;
+            nvnni_full_tiles = -1;
             nvnni_gemv_kb = -1;
             nvnni_gemv_target_waves = -1;
-            nvnni_q8_direct = false;
-            nvnni_atomic_reduce = false;
             nvnni_disable_generated = false;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
@@ -2760,9 +2912,7 @@ namespace llaminar2
             ratio_prefill_iq4_kb = 0;
             concurrent_prefill = true;
             concurrent_decode = false;
-            concurrent_m2_rows = false;
             gdn_concurrent_decode = true;
-            shared_expert_grouped_decode = false;
             moe_grouped_decode = true;
             moe_grouped_decode_router = true;
             moe_router_q8 = true;
@@ -2771,16 +2921,14 @@ namespace llaminar2
             moe_router_kparts = 8;
             moe_router_wave_topk = true;
             moe_reuse_router_q8_hidden = true;
-            moe_parallel_down_decode = true;
-            moe_gateup_kpart_decode = true;
-            moe_gateup_kparts = 4;
-            moe_gateup_swiglu_quant_fused = true;
+            moe_prefill_gateup_tile_m = -1;
+            moe_prefill_gateup_tile_n = -1;
+            moe_prefill_down_tile_m = -1;
+            moe_prefill_down_tile_n = -1;
             moe_device_routed_decode = true;
-            moe_grouped_prefill = true;
-            moe_prefill_tile_m = 0;
             topk_smallk_partial_blocks = 0;
             repack_slots = 3;
-            repack_budget_mb = 0;
+            repack_budget_mb = 512;
             repack_streams = 3;
 
             const char *trace_coh_env = std::getenv("LLAMINAR_ROCM_TRACE_COHERENCE");
@@ -3033,6 +3181,12 @@ namespace llaminar2
                 nvnni_force_n128 = (std::atoi(nvnni_force_n128_env) != 0);
             }
 
+            const char *nvnni_full_tiles_env = std::getenv("LLAMINAR_ROCM_NVNNI_FULL_TILES");
+            if (nvnni_full_tiles_env)
+            {
+                nvnni_full_tiles = std::clamp(std::atoi(nvnni_full_tiles_env), -1, 1);
+            }
+
             const char *nvnni_gemv_kb_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_KB");
             if (nvnni_gemv_kb_env)
             {
@@ -3043,18 +3197,6 @@ namespace llaminar2
             if (nvnni_gemv_target_waves_env)
             {
                 nvnni_gemv_target_waves = std::clamp(std::atoi(nvnni_gemv_target_waves_env), -1, 64);
-            }
-
-            const char *nvnni_q8_direct_env = std::getenv("LLAMINAR_ROCM_NVNNI_Q8_DIRECT");
-            if (nvnni_q8_direct_env)
-            {
-                nvnni_q8_direct = (std::atoi(nvnni_q8_direct_env) != 0);
-            }
-
-            const char *nvnni_atomic_reduce_env = std::getenv("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE");
-            if (nvnni_atomic_reduce_env)
-            {
-                nvnni_atomic_reduce = (std::atoi(nvnni_atomic_reduce_env) != 0);
             }
 
             const char *nvnni_disable_generated_env = std::getenv("LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED");
@@ -3111,23 +3253,12 @@ namespace llaminar2
                 concurrent_decode = (std::atoi(concurrent_decode_env) != 0);
             }
 
-            const char *concurrent_m2_rows_env = std::getenv("LLAMINAR_ROCM_CONCURRENT_M2_ROWS");
-            if (concurrent_m2_rows_env)
-            {
-                concurrent_m2_rows = (std::atoi(concurrent_m2_rows_env) != 0);
-            }
-
             const char *gdn_concurrent_decode_env = std::getenv("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
             if (gdn_concurrent_decode_env)
             {
                 gdn_concurrent_decode = (std::atoi(gdn_concurrent_decode_env) != 0);
             }
 
-            const char *shared_expert_grouped_decode_env = std::getenv("LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE");
-            if (shared_expert_grouped_decode_env)
-            {
-                shared_expert_grouped_decode = (std::atoi(shared_expert_grouped_decode_env) != 0);
-            }
 
             const char *moe_grouped_decode_env = std::getenv("LLAMINAR_ROCM_MOE_GROUPED_DECODE");
             if (moe_grouped_decode_env)
@@ -3180,48 +3311,30 @@ namespace llaminar2
                 moe_reuse_router_q8_hidden = (std::atoi(moe_reuse_router_q8_hidden_env) != 0);
             }
 
-            const char *moe_parallel_down_decode_env = std::getenv("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE");
-            if (moe_parallel_down_decode_env)
+            const auto read_moe_prefill_tile = [](const char *name, int default_value)
             {
-                moe_parallel_down_decode = (std::atoi(moe_parallel_down_decode_env) != 0);
-            }
+                const char *value = std::getenv(name);
+                return value ? std::atoi(value) : default_value;
+            };
+            moe_prefill_gateup_tile_m = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_M", -1);
+            moe_prefill_gateup_tile_n = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_GATEUP_TILE_N", -1);
+            moe_prefill_down_tile_m = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_M", -1);
+            moe_prefill_down_tile_n = read_moe_prefill_tile(
+                "LLAMINAR_ROCM_MOE_PREFILL_DOWN_TILE_N", -1);
 
-            const char *moe_gateup_kpart_decode_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE");
-            if (moe_gateup_kpart_decode_env)
-            {
-                moe_gateup_kpart_decode = (std::atoi(moe_gateup_kpart_decode_env) != 0);
-            }
-            const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_KPARTS");
-            if (moe_gateup_kparts_env)
-            {
-                const int requested = std::atoi(moe_gateup_kparts_env);
-                if (requested == 2 || requested == 4 || requested == 8 || requested == 16)
-                {
-                    moe_gateup_kparts = requested;
-                }
-            }
-            const char *moe_gateup_swiglu_quant_fused_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED");
-            if (moe_gateup_swiglu_quant_fused_env)
-            {
-                moe_gateup_swiglu_quant_fused = (std::atoi(moe_gateup_swiglu_quant_fused_env) != 0);
-            }
             const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
             if (deterministic_env && std::atoi(deterministic_env) != 0)
             {
-                nvnni_atomic_reduce = false;
                 concurrent_prefill = false;
                 concurrent_decode = false;
-                concurrent_m2_rows = false;
                 gdn_concurrent_decode = false;
-                moe_router_q8 = false;
                 moe_router_fp16 = false;
                 moe_router_kpart_decode = false;
                 moe_router_wave_topk = false;
                 moe_grouped_decode_router = false;
-                moe_reuse_router_q8_hidden = false;
-                moe_parallel_down_decode = false;
-                moe_gateup_kpart_decode = false;
-                moe_gateup_swiglu_quant_fused = false;
             }
 
             const char *moe_device_routed_decode_env = std::getenv("LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE");
@@ -3230,20 +3343,6 @@ namespace llaminar2
                 moe_device_routed_decode = (std::atoi(moe_device_routed_decode_env) != 0);
             }
 
-            const char *moe_grouped_prefill_env = std::getenv("LLAMINAR_ROCM_MOE_GROUPED_PREFILL");
-            if (moe_grouped_prefill_env)
-            {
-                moe_grouped_prefill = (std::atoi(moe_grouped_prefill_env) != 0);
-            }
-            const char *moe_prefill_tile_m_env = std::getenv("LLAMINAR_ROCM_MOE_PREFILL_TILE_M");
-            if (moe_prefill_tile_m_env)
-            {
-                const int requested = std::atoi(moe_prefill_tile_m_env);
-                if (requested == 0 || requested == 2 || requested == 4 || requested == 8)
-                {
-                    moe_prefill_tile_m = requested;
-                }
-            }
             const char *topk_partial_blocks_env = std::getenv("LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS");
             if (topk_partial_blocks_env)
             {
@@ -3261,7 +3360,11 @@ namespace llaminar2
                 repack_slots = std::clamp(std::atoi(repack_slots_env), 1, 8);
             }
 
-            const char *repack_budget_env = std::getenv("LLAMINAR_ROCM_REPACK_BUDGET_MB");
+            const char *repack_budget_env = std::getenv("LLAMINAR_GPU_LOAD_STAGING_MB");
+            if (!repack_budget_env)
+            {
+                repack_budget_env = std::getenv("LLAMINAR_ROCM_REPACK_BUDGET_MB");
+            }
             if (repack_budget_env)
             {
                 repack_budget_mb = std::max(0, std::atoi(repack_budget_env));
@@ -3366,6 +3469,7 @@ namespace llaminar2
         TransferTracingConfig transfer_tracing;    ///< Memory transfer tracing for H2D/D2H debugging
         LoggerConfig logger;                       ///< Logger environment configuration
         TopologyEnvConfig topology;                ///< Topology-related environment configuration
+        BackendStartupConfig backend_startup;      ///< Authoritative accelerator discovery/context policy.
         MPIBootstrapEnvConfig mpi_bootstrap;       ///< MPI bootstrap environment snapshot
 
         /// MoE expert rebalancing configuration
@@ -3379,11 +3483,169 @@ namespace llaminar2
             int max_window_size = 4096;
             /// Window growth factor after each rebalance (from LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH)
             float window_growth_factor = 1.5f;
+            /// Shared Dynamic policy imbalance trigger, in permille max_load/min_load.
+            /// 1300 means the overloaded participant must be at least 1.3x the underloaded
+            /// participant. (env: LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE)
+            int dynamic_imbalance_threshold_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille);
+            /// Shared Dynamic policy minimum ratio improvement for an ownership swap.
+            /// 50 means the projected ratio must improve by at least 5%.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE)
+            int dynamic_min_improvement_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille);
+            /// Shared Dynamic policy paired ownership swaps per layer.
+            /// One accepted swap emits two expert movements.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER)
+            int dynamic_max_swaps_per_layer =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer);
+            /// Shared Dynamic policy command entries per wave/cycle.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE)
+            int dynamic_max_plan_entries_per_wave =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave);
+            /// Minimum routed activations in a window before Dynamic considers movement.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS)
+            uint64_t dynamic_min_window_activations =
+                moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
             /// Max experts to replicate per socket (0 = auto: 2×top_k) (from LLAMINAR_MOE_REBALANCE_REPLICAS)
             int max_replicas = 0;
             /// Routed experts per layer to cache on GPU in mixed CPU/GPU MoE domains.
             /// 0 disables cross-domain GPU-cache placement. (from LLAMINAR_MOE_GPU_EXPERT_CACHE)
             int gpu_cache_experts_per_layer = 0;
+            /// Experts per rolling GPU-direct transfer wave.
+            /// (env: LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS)
+            ///
+            /// Keep the default tight: larger captured payload waves reduce
+            /// overflows but regressed Qwen3.6 CUDA2 512-token decode in the
+            /// device-controller path.
+            int gpu_direct_transfer_wave_experts = 2;
+            /// Number of transfer staging waves to reserve. 2 enables double buffering.
+            /// (env: LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS)
+            int gpu_direct_transfer_buffers = 2;
+            /// Run graph-stable GPU rebalance planning/copy as a captured
+            /// maintenance graph instead of embedding the producer in decode.
+            /// Enabled by default with the device-side controller so histogram
+            /// traffic stays off per-token decode collectives. Set the env var
+            /// to 0 only for host-path diagnostics. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH)
+            bool device_rebalance_maintenance_graph = true;
+            /// Obsolete legacy collective-allgather transfer fallback. The
+            /// graph-side rebalance selector now rejects this path because it
+            /// moves fixed payload arenas with empty expert slots. (env:
+            /// LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER)
+            bool allow_legacy_collective_rebalance_transfer = false;
+            /// Obsolete fixed-size expert payload arena sideband. The graph-side
+            /// rebalance selector now rejects this path because it moves empty
+            /// expert slots; a future payload lane must transfer only compact
+            /// non-empty arrivals. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND)
+            bool device_rebalance_payload_sideband = false;
+            /// Layers planned by each captured device-side rebalance replay.
+            /// 0 means the whole configured layer window. The default is a
+            /// small bounded wave so the controller can see useful early
+            /// layers in long one-shot generations without turning each
+            /// maintenance replay into a full-model policy pass. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE)
+            int device_rebalance_layer_wave_count = 4;
+            /// Captured compact payload slots per maintenance replay. This is
+            /// separate from the physical staging pool so the pool can remain
+            /// double-buffered while the graph-captured NCCL/RCCL payload lane
+            /// moves a tighter bucket. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS)
+            int device_rebalance_compact_payload_slots = 1;
+            /// Keep a ready-wave apply poll in the steady decode graph while
+            /// async maintenance graph mode is active. Disabled by default so
+            /// no-op maintenance does not add a per-token decode-stage launch;
+            /// enable only when measuring immediate post-transfer visibility.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_DECODE_APPLY_POLL)
+            bool device_rebalance_decode_apply_poll = false;
+            /// Extra decode forwards to wait before launching the async
+            /// maintenance graph. The device-side readiness gate still uses
+            /// the configured rebalance window. Defaulting to one token avoids
+            /// replaying a maintenance graph on a nearly-full rolling histogram
+            /// window; CUDA2 Qwen3.6 probes saw 2047/2048 routed slots at zero
+            /// slack and action-producing windows at one-token slack.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS)
+            int device_rebalance_maintenance_slack_tokens = 1;
+            /// Minimum decode-token period for async maintenance graph replay
+            /// after the optional first replay. The rebalance policy window
+            /// still controls readiness; this only prevents over-frequent
+            /// host-scheduled graph replays while the device-side graph
+            /// scheduler is not yet the steady-state owner. Set to 0 to run
+            /// exactly at window+slack cadence. CUDA2/ROCm2 Qwen3.6 clean
+            /// 512-token probes recovered the healthiest shared cadence with
+            /// a delayed first replay at 321 tokens and a 512-token floor.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS)
+            int device_rebalance_min_maintenance_period_tokens = 512;
+            /// Optional first async maintenance graph replay period. When set
+            /// above zero, the first replay happens at this decode-token count,
+            /// then later replays use the normal minimum maintenance period.
+            /// The default waits until the first observed 512-token Qwen3.6
+            /// decode window contains enough stable signal for both CUDA and
+            /// ROCm hot-cache placement. Set to 0 to use the regular cadence
+            /// from token zero. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS)
+            int device_rebalance_initial_maintenance_period_tokens = 321;
+            /// Number of scheduled maintenance periods to skip after a
+            /// completed maintenance replay selects no replicas/arrivals. This
+            /// is an interim host-scheduler guard until device-selected
+            /// zero/payload bucket graph bodies remove empty payload-lane
+            /// replays entirely. Set to 0 to disable. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS)
+            int device_rebalance_no_work_backoff_periods = 1;
+            /// Compute projected pre/post participant load-spread diagnostics
+            /// inside the device-side controller. Disabled by default because
+            /// it adds per-expert policy work on the rebalance path. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS)
+            bool device_rebalance_collect_load_stats = false;
+            /// Additional absolute spread improvement required before
+            /// scheduling a GPU rebalance arrival. The default is zero so
+            /// Dynamic uses the shared admission floor
+            /// `max(2, window/16)`. Set this only as an extra GPU cost gate.
+            /// (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT)
+            int device_rebalance_min_load_spread_improvement = 0;
+            /// Additional relative spread-improvement floor:
+            /// required >= current_total / divisor. Set to 0 to disable.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR)
+            int device_rebalance_min_load_spread_improvement_divisor =
+                static_cast<int>(
+                    moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor);
+            /// Optional wave-level transfer value gate. When nonzero, a
+            /// transfer-backed maintenance wave must have at least this much
+            /// accepted load-spread improvement per requested compact payload
+            /// slot before publishing arrivals. CUDA2/ROCm2 Qwen3.6 probes
+            /// showed 256 keeps high-value ROCm 2048 transfers while pruning
+            /// CUDA 1024 hot-cache transfer churn. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT)
+            int device_rebalance_min_wave_spread_improvement_per_payload_slot = 256;
+            /// Optional LLEP useful-work gate. When nonzero, the shared
+            /// least-loaded assignment planner requires at least this many
+            /// foreign routed rows per serialized critical-path payload slot.
+            /// Reciprocal and independent lanes overlap; multiple payloads on
+            /// one participant lane remain additive. This avoids paying an
+            /// expert payload move for tiny dispatch wins without double
+            /// charging concurrent edges. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT)
+            int device_rebalance_min_foreign_rows_per_critical_path_payload_slot = 0;
+            /// Realized router-benefit gate. When nonzero and the
+            /// current wave already has active local hot-cache replicas, the
+            /// previous router window must have produced at least this much
+            /// spread improvement per requested compact payload slot before
+            /// scheduling another transfer-backed wave. This keeps bootstrap
+            /// arrivals allowed while rejecting steady-state transfer churn
+            /// that the router is not using. Qwen3.6 CUDA2/ROCm2 traces showed
+            /// low-value hot-cache transfer waves regressing 1024/2048 decode,
+            /// while resident-only hot assignments remained the cheap path to
+            /// preserve. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT)
+            int device_rebalance_min_router_spread_improvement_per_payload_slot = 128;
+            /// Maximum projected post-policy participant-load spread for a
+            /// transfer-backed maintenance wave, measured in permille of the
+            /// projected routed load. This rejects moves that improve spread
+            /// numerically but still leave the domain badly imbalanced after
+            /// paying transfer cost. Set to 0 to disable. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE)
+            int device_rebalance_max_post_wave_load_spread_per_mille = 100;
             /// Release raw expert weight data after eager packed-weight preparation.
             /// Enabled by default; set LLAMINAR_MOE_RELEASE_RAW_WEIGHTS=0 to opt out.
             bool release_raw_weights = true;
@@ -3443,15 +3705,19 @@ namespace llaminar2
         /// FP16/BF16 halves PCIe transfer bandwidth; FP32 is lossless but slower on bandwidth-limited links.
         std::string allreduce_precision = "fp32";
 
-        /// Timeout in ms for tensor-parallel coordination waits and blocking MPI collectives
+        /// Minimum element count required before an FP32 tensor requested as FP16
+        /// actually takes the cast-to-FP16 collective path.
+        /// (env: LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS, default: 8192)
+        /// Tiny decode reductions can be faster in FP32 because the two cast kernels
+        /// cost more than the bandwidth savings.
+        size_t allreduce_fp16_min_elements = 8192;
+
+        /// Timeout in ms for tensor-parallel collective/rendezvous waits,
+        /// blocking MPI collectives, and their enclosing participant-worker
+        /// joins. The canonical default is 30 seconds; non-positive overrides
+        /// are normalized back to that safety bound by CollectiveTimeoutPolicy.
         /// (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS).
-        /// Debug/Integration builds default to a 30s safety net to avoid deadlocked tests;
-        /// Release builds default to 0 (wait forever) for production runs.
-#if LLAMINAR_ASSERTIONS_ACTIVE
         int tp_collect_timeout_ms = 30000;
-#else
-        int tp_collect_timeout_ms = 0;
-#endif
 
         /// Enable model weight lifecycle trace events (env: LLAMINAR_WEIGHT_LIFECYCLE_TRACE=1)
         bool weight_lifecycle_trace = false;
@@ -3459,6 +3725,10 @@ namespace llaminar2
         /// Emit coarse GPU VRAM checkpoints around major allocation phases.
         /// (env: LLAMINAR_VRAM_TRACE=1)
         bool vram_trace = false;
+
+        /// Emit per-buffer VRAM bill-of-materials rows for allocation diagnosis.
+        /// (env: LLAMINAR_VRAM_BOM=1)
+        bool vram_bom = false;
 
         static const char *envValue(const char *name)
         {
@@ -3542,12 +3812,16 @@ namespace llaminar2
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
             if (ar_prec)
                 allreduce_precision = ar_prec;
+            allreduce_fp16_min_elements = 8192;
+            if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
+                allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
+            vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
@@ -3572,6 +3846,32 @@ namespace llaminar2
             const char *moe_reb_growth = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH");
             if (moe_reb_growth)
                 moe_rebalance.window_growth_factor = std::atof(moe_reb_growth);
+            if (const char *moe_dynamic_threshold =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE"))
+                moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_threshold));
+            if (const char *moe_dynamic_improvement =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE"))
+                moe_rebalance.dynamic_min_improvement_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_improvement));
+            if (const char *moe_dynamic_swaps =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER"))
+                moe_rebalance.dynamic_max_swaps_per_layer =
+                    std::max(0, std::atoi(moe_dynamic_swaps));
+            if (const char *moe_dynamic_entries =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE"))
+                moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    std::max(0, std::atoi(moe_dynamic_entries));
+            if (const char *moe_dynamic_min_activations =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS"))
+            {
+                char *end = nullptr;
+                const unsigned long long parsed =
+                    std::strtoull(moe_dynamic_min_activations, &end, 10);
+                if (end != moe_dynamic_min_activations)
+                    moe_rebalance.dynamic_min_window_activations =
+                        static_cast<uint64_t>(parsed);
+            }
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
                 moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
@@ -3580,6 +3880,76 @@ namespace llaminar2
                 moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
             if (moe_gpu_cache)
                 moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
+            if (const char *moe_wave = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS"))
+                moe_rebalance.gpu_direct_transfer_wave_experts = std::max(1, std::atoi(moe_wave));
+            if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
+                moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
+            if (const char *moe_maintenance_graph = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH"))
+                moe_rebalance.device_rebalance_maintenance_graph =
+                    (std::atoi(moe_maintenance_graph) != 0);
+            if (const char *moe_legacy_collective_transfer =
+                    std::getenv("LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER"))
+                moe_rebalance.allow_legacy_collective_rebalance_transfer =
+                    (std::atoi(moe_legacy_collective_transfer) != 0);
+            if (const char *moe_payload_sideband =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND"))
+                moe_rebalance.device_rebalance_payload_sideband =
+                    (std::atoi(moe_payload_sideband) != 0);
+            if (const char *moe_layer_wave = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE"))
+                moe_rebalance.device_rebalance_layer_wave_count =
+                    std::max(0, std::atoi(moe_layer_wave));
+            if (const char *moe_payload_slots =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS"))
+                moe_rebalance.device_rebalance_compact_payload_slots =
+                    std::max(1, std::atoi(moe_payload_slots));
+            if (const char *moe_decode_apply_poll =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_DECODE_APPLY_POLL"))
+                moe_rebalance.device_rebalance_decode_apply_poll =
+                    (std::atoi(moe_decode_apply_poll) != 0);
+            if (const char *moe_maintenance_slack =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS"))
+                moe_rebalance.device_rebalance_maintenance_slack_tokens =
+                    std::max(0, std::atoi(moe_maintenance_slack));
+            if (const char *moe_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_min_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_maintenance_period));
+            if (const char *moe_initial_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_initial_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_initial_maintenance_period));
+            if (const char *moe_no_work_backoff =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS"))
+                moe_rebalance.device_rebalance_no_work_backoff_periods =
+                    std::max(0, std::atoi(moe_no_work_backoff));
+            if (const char *moe_load_stats = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS"))
+                moe_rebalance.device_rebalance_collect_load_stats =
+                    (std::atoi(moe_load_stats) != 0);
+            if (const char *moe_min_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement =
+                    std::max(0, std::atoi(moe_min_improvement));
+            if (const char *moe_min_improvement_divisor =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement_divisor =
+                    std::max(0, std::atoi(moe_min_improvement_divisor));
+            if (const char *moe_min_wave_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_wave_improvement));
+            if (const char *moe_min_foreign_rows =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT"))
+                moe_rebalance
+                    .device_rebalance_min_foreign_rows_per_critical_path_payload_slot =
+                    std::max(0, std::atoi(moe_min_foreign_rows));
+            if (const char *moe_min_router_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_router_improvement));
+            if (const char *moe_max_post_spread =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE"))
+                moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille =
+                    std::max(0, std::atoi(moe_max_post_spread));
             const char *moe_reb_release_ctor = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release_ctor)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release_ctor) != 0);
@@ -3604,12 +3974,16 @@ namespace llaminar2
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
             if (ar_prec)
                 allreduce_precision = ar_prec;
+            allreduce_fp16_min_elements = 8192;
+            if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
+                allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
+            vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             activation_rotation = true; // default on
@@ -3640,6 +4014,42 @@ namespace llaminar2
             const char *moe_reb_growth = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH");
             if (moe_reb_growth)
                 moe_rebalance.window_growth_factor = std::atof(moe_reb_growth);
+            moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille);
+            if (const char *moe_dynamic_threshold =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE"))
+                moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_threshold));
+            moe_rebalance.dynamic_min_improvement_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille);
+            if (const char *moe_dynamic_improvement =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE"))
+                moe_rebalance.dynamic_min_improvement_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_improvement));
+            moe_rebalance.dynamic_max_swaps_per_layer =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer);
+            if (const char *moe_dynamic_swaps =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER"))
+                moe_rebalance.dynamic_max_swaps_per_layer =
+                    std::max(0, std::atoi(moe_dynamic_swaps));
+            moe_rebalance.dynamic_max_plan_entries_per_wave =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave);
+            if (const char *moe_dynamic_entries =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE"))
+                moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    std::max(0, std::atoi(moe_dynamic_entries));
+            moe_rebalance.dynamic_min_window_activations =
+                moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
+            if (const char *moe_dynamic_min_activations =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS"))
+            {
+                char *end = nullptr;
+                const unsigned long long parsed =
+                    std::strtoull(moe_dynamic_min_activations, &end, 10);
+                if (end != moe_dynamic_min_activations)
+                    moe_rebalance.dynamic_min_window_activations =
+                        static_cast<uint64_t>(parsed);
+            }
             moe_rebalance.max_replicas = 0;
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
@@ -3650,6 +4060,98 @@ namespace llaminar2
                 moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
             if (moe_gpu_cache)
                 moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
+            moe_rebalance.gpu_direct_transfer_wave_experts = 2;
+            if (const char *moe_wave = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS"))
+                moe_rebalance.gpu_direct_transfer_wave_experts = std::max(1, std::atoi(moe_wave));
+            moe_rebalance.gpu_direct_transfer_buffers = 2;
+            if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
+                moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
+            moe_rebalance.device_rebalance_maintenance_graph = true;
+            if (const char *moe_maintenance_graph = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH"))
+                moe_rebalance.device_rebalance_maintenance_graph =
+                    (std::atoi(moe_maintenance_graph) != 0);
+            moe_rebalance.allow_legacy_collective_rebalance_transfer = false;
+            if (const char *moe_legacy_collective_transfer =
+                    std::getenv("LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER"))
+                moe_rebalance.allow_legacy_collective_rebalance_transfer =
+                    (std::atoi(moe_legacy_collective_transfer) != 0);
+            moe_rebalance.device_rebalance_payload_sideband = false;
+            if (const char *moe_payload_sideband =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND"))
+                moe_rebalance.device_rebalance_payload_sideband =
+                    (std::atoi(moe_payload_sideband) != 0);
+            moe_rebalance.device_rebalance_layer_wave_count = 4;
+            if (const char *moe_layer_wave = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE"))
+                moe_rebalance.device_rebalance_layer_wave_count =
+                    std::max(0, std::atoi(moe_layer_wave));
+            moe_rebalance.device_rebalance_compact_payload_slots = 1;
+            if (const char *moe_payload_slots =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS"))
+                moe_rebalance.device_rebalance_compact_payload_slots =
+                    std::max(1, std::atoi(moe_payload_slots));
+            moe_rebalance.device_rebalance_decode_apply_poll = false;
+            if (const char *moe_decode_apply_poll =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_DECODE_APPLY_POLL"))
+                moe_rebalance.device_rebalance_decode_apply_poll =
+                    (std::atoi(moe_decode_apply_poll) != 0);
+            moe_rebalance.device_rebalance_maintenance_slack_tokens = 1;
+            if (const char *moe_maintenance_slack =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS"))
+                moe_rebalance.device_rebalance_maintenance_slack_tokens =
+                    std::max(0, std::atoi(moe_maintenance_slack));
+            moe_rebalance.device_rebalance_min_maintenance_period_tokens = 512;
+            if (const char *moe_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_min_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_maintenance_period));
+            moe_rebalance.device_rebalance_initial_maintenance_period_tokens = 321;
+            if (const char *moe_initial_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_initial_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_initial_maintenance_period));
+            moe_rebalance.device_rebalance_no_work_backoff_periods = 1;
+            if (const char *moe_no_work_backoff =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS"))
+                moe_rebalance.device_rebalance_no_work_backoff_periods =
+                    std::max(0, std::atoi(moe_no_work_backoff));
+            moe_rebalance.device_rebalance_collect_load_stats = false;
+            if (const char *moe_load_stats = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS"))
+                moe_rebalance.device_rebalance_collect_load_stats =
+                    (std::atoi(moe_load_stats) != 0);
+            moe_rebalance.device_rebalance_min_load_spread_improvement = 0;
+            if (const char *moe_min_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement =
+                    std::max(0, std::atoi(moe_min_improvement));
+            moe_rebalance.device_rebalance_min_load_spread_improvement_divisor =
+                static_cast<int>(
+                    moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor);
+            if (const char *moe_min_improvement_divisor =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement_divisor =
+                    std::max(0, std::atoi(moe_min_improvement_divisor));
+            moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot = 256;
+            if (const char *moe_min_wave_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_wave_improvement));
+            moe_rebalance
+                .device_rebalance_min_foreign_rows_per_critical_path_payload_slot = 0;
+            if (const char *moe_min_foreign_rows =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT"))
+                moe_rebalance
+                    .device_rebalance_min_foreign_rows_per_critical_path_payload_slot =
+                    std::max(0, std::atoi(moe_min_foreign_rows));
+            moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot = 128;
+            if (const char *moe_min_router_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_router_improvement));
+            moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille = 100;
+            if (const char *moe_max_post_spread =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE"))
+                moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille =
+                    std::max(0, std::atoi(moe_max_post_spread));
             moe_rebalance.release_raw_weights = true;
             const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release)
@@ -3672,6 +4174,7 @@ namespace llaminar2
             transfer_tracing.reload();
             logger.reload();
             topology.reload();
+            backend_startup.reload();
             mpi_bootstrap.reload();
         }
     };

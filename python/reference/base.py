@@ -432,6 +432,15 @@ class HuggingFaceReferenceModel(AbstractReferenceModel):
             show_progress=self.verbose,
         )
 
+        # Model families may carry graph-external tensors in the same GGUF.
+        # Qwen3.6, for example, stores its next-token-prediction sidecar after
+        # the ordinary decoder blocks.  Give the family implementation one
+        # typed preparation boundary before Hugging Face consumes the main
+        # state dict; the hook may retain those tensors for an independent
+        # reference graph, but must return the exact state dict to load into
+        # the main model.
+        state_dict = self._prepare_gguf_state_dict(config_dict, state_dict)
+
         # PERF: Skip torch's random weight initialization (normal_ / uniform_ /
         # kaiming_uniform_) during model construction. Profiling showed that
         # for a 4B Qwen3.5 model, ~50s of the 82s wall-clock generation time
@@ -462,6 +471,18 @@ class HuggingFaceReferenceModel(AbstractReferenceModel):
         # Tokenizer resolution: local dir → model-specific fallbacks
         self._resolve_tokenizer(gguf_path)
         print("✓ GGUF model loaded successfully")
+
+    def _prepare_gguf_state_dict(self, config_dict: dict, state_dict: dict) -> dict:
+        """Prepare family-owned GGUF tensors before loading the main HF graph.
+
+        The default implementation is deliberately identity-only.  A model
+        family may override this to retain auxiliary graph weights (such as a
+        Qwen3.6 MTP sidecar) or normalize a family-specific tensor layout.
+        Returning a separate dictionary is supported, but callers must not
+        silently discard weights required by the main Hugging Face model.
+        """
+        del config_dict
+        return state_dict
 
     def _resolve_tokenizer(self, gguf_path: str) -> None:
         """Try to load tokenizer from local dir, then HF cache, then network."""

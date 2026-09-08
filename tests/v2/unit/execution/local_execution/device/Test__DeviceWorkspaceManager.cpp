@@ -14,16 +14,83 @@
 #include <cstdlib>
 #include <set>
 #include <cstring>
+#include <map>
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/AlignedWorkspaceSlices.h"
+#include "execution/moe/MoERuntimePointerWorkspaceOwners.h"
 #include "backends/BackendManager.h"
+#include "kernels/common/DeviceResidentRouterGateCache.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
 using namespace llaminar2;
 
+/** @brief Exercise all stream counts against non-divisible merged envelopes. */
+TEST(Test__AlignedWorkspaceSlices, MergedCapacityPreservesAlignmentAndIsolation)
+{
+    alignas(256) std::byte storage[8192];
+    for (size_t alignment : {size_t{4}, size_t{16}, size_t{256}})
+        for (size_t count = 1; count <= 8; ++count)
+            for (size_t bytes = 2048; bytes <= sizeof(storage); bytes += 17)
+            {
+                AlignedWorkspaceSlices slices(bytes, count, alignment);
+                EXPECT_EQ(slices.strideBytes() % alignment, 0u);
+                EXPECT_LE(slices.strideBytes() * count, bytes);
+                EXPECT_LT(bytes - slices.strideBytes() * count, count * alignment);
+                for (size_t index = 0; index < count; ++index)
+                {
+                    const auto view = slices.slice(storage, index, 1u);
+                    EXPECT_EQ(view.data(), storage + index * slices.strideBytes());
+                    EXPECT_EQ(view.size(), slices.strideBytes());
+                    EXPECT_EQ(reinterpret_cast<uintptr_t>(view.data()) % alignment, 0u);
+                }
+            }
+}
+
+/** @brief Reject invalid geometry without allocation or wraparound arithmetic. */
+TEST(Test__AlignedWorkspaceSlices, RejectsInvalidGeometryAndPayload)
+{
+    alignas(256) std::byte storage[4096];
+    EXPECT_THROW((AlignedWorkspaceSlices{4096, 0, 4}), std::invalid_argument);
+    EXPECT_THROW((AlignedWorkspaceSlices{4096, 3, 0}), std::invalid_argument);
+    EXPECT_THROW((AlignedWorkspaceSlices{4096, 3, 3}), std::invalid_argument);
+    EXPECT_THROW((AlignedWorkspaceSlices{3, 3, 4}), std::invalid_argument);
+    const AlignedWorkspaceSlices slices(sizeof(storage), 3, alignof(float));
+    EXPECT_THROW(slices.slice(nullptr, 0, 4), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage + 1, 0, 4), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage, 3, 4), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage, 0, 0), std::invalid_argument);
+    EXPECT_THROW(slices.slice(storage, 0, slices.strideBytes() + 1), std::invalid_argument);
+    const AlignedWorkspaceSlices enormous(SIZE_MAX, SIZE_MAX / 256, 256);
+    EXPECT_EQ(enormous.strideBytes(), 256u);
+}
+
 namespace
 {
+    /** @brief Build one rank-local CPU workspace admission for focused tests. */
+    std::shared_ptr<PhysicalMemoryAuthority> workspaceAuthority(
+        size_t workspace_bytes,
+        PhysicalMemoryOwner owner =
+            PhysicalMemoryOwner::ExecutionWorkspace)
+    {
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 16u * 1024u * 1024u,
+                .admission_available_bytes = 16u * 1024u * 1024u,
+            },
+            owner,
+            workspace_bytes);
+        const auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            builder.build());
+        return std::make_shared<PhysicalMemoryAuthority>(
+            admission, 0);
+    }
+
     class ScopedEnv
     {
     public:
@@ -137,6 +204,119 @@ TEST_F(Test__DeviceWorkspaceManager, ManagerIdsAreUniqueAcrossInstances)
         << "Kernel workspace scratch caches depend on manager identity, not just host pointer equality";
 }
 
+TEST_F(Test__DeviceWorkspaceManager,
+       CanonicalAuthorityTracksPrimaryBlockThroughReusableSealAndFree)
+{
+    constexpr size_t kWorkspaceBytes = 4096u;
+    auto authority = workspaceAuthority(kWorkspaceBytes);
+    DeviceWorkspaceManager manager(
+        device, kWorkspaceBytes, authority);
+    WorkspaceRequirements requirements;
+    requirements.buffers.push_back(
+        {"authority_owned", kWorkspaceBytes, 256u, true});
+
+    ASSERT_TRUE(manager.allocate(requirements));
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kWorkspaceBytes);
+    EXPECT_EQ(
+        authority->remainingAdmittedNewAllocationBytes(
+            device, PhysicalMemoryOwner::ExecutionWorkspace),
+        0u);
+
+    std::string seal_error;
+    ASSERT_TRUE(manager.sealPrimaryBlockForReuse(&seal_error))
+        << seal_error;
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kWorkspaceBytes)
+        << "Sealing retires graph names, not the retained physical block";
+
+    manager.release();
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+    EXPECT_EQ(
+        authority->remainingAdmittedNewAllocationBytes(
+            device, PhysicalMemoryOwner::ExecutionWorkspace),
+        kWorkspaceBytes);
+}
+
+TEST_F(Test__DeviceWorkspaceManager,
+       IndependentManagersCannotOvercommitOneWorkspaceOwnerLine)
+{
+    auto authority = workspaceAuthority(1024u);
+    DeviceWorkspaceManager first(device, 1024u, authority);
+    DeviceWorkspaceManager second(device, 1024u, authority);
+    WorkspaceRequirements first_requirements;
+    first_requirements.buffers.push_back(
+        {"first", 768u, 1u, true});
+    WorkspaceRequirements second_requirements;
+    second_requirements.buffers.push_back(
+        {"second", 512u, 1u, true});
+
+    ASSERT_TRUE(first.allocate(first_requirements));
+    EXPECT_FALSE(second.allocate(second_requirements));
+    EXPECT_FALSE(second.isAllocated());
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        768u);
+
+    first.release();
+    ASSERT_TRUE(second.allocate(second_requirements));
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        512u);
+}
+
+TEST_F(Test__DeviceWorkspaceManager,
+       StableArenaCanChargeItsExactNonWorkspaceOwner)
+{
+    constexpr size_t kStateBytes = 2048u;
+    auto authority = workspaceAuthority(
+        kStateBytes, PhysicalMemoryOwner::RecurrentLiveState);
+    DeviceWorkspaceManager manager(
+        device,
+        kStateBytes,
+        authority,
+        PhysicalMemoryOwner::RecurrentLiveState);
+    WorkspaceRequirements requirements;
+    requirements.buffers.push_back(
+        {"recurrent_state", kStateBytes, 256u, true});
+
+    ASSERT_TRUE(manager.allocate(requirements));
+    EXPECT_EQ(
+        manager.physicalMemoryOwner(),
+        PhysicalMemoryOwner::RecurrentLiveState);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::RecurrentLiveState,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        kStateBytes);
+    EXPECT_EQ(
+        authority->claimedBytes(
+            device,
+            PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),
+        0u);
+}
+
 // ============================================================================
 // Simple Allocation Tests
 // ============================================================================
@@ -190,6 +370,239 @@ TEST_F(Test__DeviceWorkspaceManager, AllocateMultipleBuffers)
     EXPECT_EQ(mgr.getBufferSize("buffer_a"), 1024);
     EXPECT_EQ(mgr.getBufferSize("buffer_b"), 2048);
     EXPECT_EQ(mgr.getBufferSize("buffer_c"), 4096);
+}
+
+/**
+ * @brief Joint family planning removes order-dependent insertion fragmentation.
+ *
+ * Incremental placement of the prefill participant below leaves two 300-byte
+ * holes around the common 400-byte interval. The later 600-byte verifier bank
+ * cannot fit either hole even though both complete participants require exactly
+ * 1000 bytes. A pre-capture family plan moves the common interval behind the
+ * mutually exclusive banks and publishes all four stable names at once.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SerialFamilyPlannerOverlaysSplitPrefillAndVerifierIntervals)
+{
+    WorkspaceRequirements prefill;
+    prefill.buffers = {
+        {"prefill_left", 300, 1, true,
+         WorkspaceExecutionRegime::PrefillOnly},
+        {"common", 400, 1, true, WorkspaceExecutionRegime::Any},
+        {"prefill_right", 300, 1, true,
+         WorkspaceExecutionRegime::PrefillOnly},
+    };
+    WorkspaceRequirements verifier;
+    verifier.buffers = {
+        {"common", 400, 1, true, WorkspaceExecutionRegime::Any},
+        {"grouped_kpar", 600, 1, true,
+         WorkspaceExecutionRegime::CompactDecodeOnly},
+    };
+
+    const SerialWorkspaceFamilyPlan plan =
+        DeviceWorkspaceManager::planSerialFamily({prefill, verifier});
+    ASSERT_TRUE(plan.valid()) << plan.error;
+    ASSERT_EQ(plan.total_bytes, 1000u)
+        << "The family should need the common interval plus the larger of the "
+           "mutually exclusive prefill and verifier banks.";
+
+    const auto intervalFor =
+        [&](const char *name) -> std::pair<size_t, size_t>
+    {
+        const auto *placement = plan.find(name);
+        EXPECT_NE(placement, nullptr) << name;
+        if (!placement)
+            return {};
+        return {
+            placement->offset,
+            placement->offset + placement->descriptor.size_bytes};
+    };
+    const auto overlaps =
+        [](const std::pair<size_t, size_t> &lhs,
+           const std::pair<size_t, size_t> &rhs)
+    {
+        return lhs.first < rhs.second && rhs.first < lhs.second;
+    };
+
+    const auto common = intervalFor("common");
+    const auto grouped = intervalFor("grouped_kpar");
+    const auto prefill_left = intervalFor("prefill_left");
+    const auto prefill_right = intervalFor("prefill_right");
+    EXPECT_FALSE(overlaps(common, grouped));
+    EXPECT_FALSE(overlaps(common, prefill_left));
+    EXPECT_FALSE(overlaps(common, prefill_right));
+    EXPECT_FALSE(overlaps(prefill_left, prefill_right));
+    EXPECT_TRUE(
+        overlaps(grouped, prefill_left) ||
+        overlaps(grouped, prefill_right))
+        << "The verifier bank must reuse bytes owned only by prefill.";
+
+    DeviceWorkspaceManager manager(device, plan.total_bytes);
+    ASSERT_TRUE(manager.allocateSerialFamily(plan));
+    EXPECT_EQ(manager.primaryBlockSize(), 1000u);
+    EXPECT_EQ(manager.used(), 1000u);
+    EXPECT_EQ(manager.getBufferSize("grouped_kpar"), 600u);
+    EXPECT_TRUE(manager.bindSerialParticipant(prefill));
+    EXPECT_TRUE(manager.bindSerialParticipant(verifier));
+}
+
+/**
+ * @brief A retired graph family can republish names over the same allocation.
+ *
+ * Sealing removes every graph-visible name but retains exactly one physical
+ * block. The next family must reuse that address, while an oversized family is
+ * rejected without allocating around the model-context capacity contract.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SealedPrimaryBlockReplansInPlaceAndRejectsGrowth)
+{
+    WorkspaceRequirements first_requirements;
+    first_requirements.buffers = {
+        {"first_family", 4096, 256, true},
+    };
+    const SerialWorkspaceFamilyPlan first_plan =
+        DeviceWorkspaceManager::planSerialFamily({first_requirements});
+    ASSERT_TRUE(first_plan.valid()) << first_plan.error;
+
+    DeviceWorkspaceManager manager(device, 8192);
+    ASSERT_TRUE(manager.allocateSerialFamily(first_plan));
+    void *const original_pointer = manager.getBuffer("first_family");
+    ASSERT_NE(original_pointer, nullptr);
+    const size_t original_block_bytes = manager.primaryBlockSize();
+    ASSERT_EQ(original_block_bytes, 4096u);
+
+    std::string seal_error;
+    ASSERT_TRUE(manager.sealPrimaryBlockForReuse(&seal_error)) << seal_error;
+    EXPECT_TRUE(manager.hasReusablePrimaryBlock());
+    EXPECT_TRUE(manager.isAllocated());
+    EXPECT_EQ(manager.used(), 0u);
+    EXPECT_EQ(manager.bufferCount(), 0u);
+    EXPECT_FALSE(manager.hasBuffer("first_family"));
+    EXPECT_EQ(manager.primaryBlockSize(), original_block_bytes);
+
+    WorkspaceRequirements second_requirements;
+    second_requirements.buffers = {
+        {"second_family", 2048, 256, true},
+    };
+    const SerialWorkspaceFamilyPlan second_plan =
+        DeviceWorkspaceManager::planSerialFamily({second_requirements});
+    ASSERT_TRUE(second_plan.valid()) << second_plan.error;
+    ASSERT_TRUE(manager.reusePrimaryBlockForSerialFamily(second_plan));
+    EXPECT_FALSE(manager.hasReusablePrimaryBlock());
+    EXPECT_EQ(manager.getBuffer("second_family"), original_pointer)
+        << "A reusable lease must preserve the physical allocation address";
+    EXPECT_EQ(manager.primaryBlockSize(), original_block_bytes);
+
+    ASSERT_TRUE(manager.sealPrimaryBlockForReuse(&seal_error)) << seal_error;
+    WorkspaceRequirements oversized_requirements;
+    oversized_requirements.buffers = {
+        {"oversized_family", original_block_bytes + 256u, 256, true},
+    };
+    const SerialWorkspaceFamilyPlan oversized_plan =
+        DeviceWorkspaceManager::planSerialFamily({oversized_requirements});
+    ASSERT_TRUE(oversized_plan.valid()) << oversized_plan.error;
+    EXPECT_FALSE(manager.reusePrimaryBlockForSerialFamily(oversized_plan));
+    EXPECT_TRUE(manager.hasReusablePrimaryBlock());
+    EXPECT_EQ(manager.bufferCount(), 0u);
+    EXPECT_EQ(manager.primaryBlockSize(), original_block_bytes);
+}
+
+/**
+ * @brief Family planning is deterministic and publishes maximum name capacity.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SerialFamilyPlannerIsOrderIndependentAndPromotesSharedNames)
+{
+    WorkspaceRequirements first;
+    first.buffers = {
+        {"shared", 128, 64, true},
+        {"first_only", 256, 64, true},
+    };
+    WorkspaceRequirements second;
+    second.buffers = {
+        {"second_only", 384, 64, true},
+        {"shared", 512, 64, true},
+    };
+
+    const SerialWorkspaceFamilyPlan forward =
+        DeviceWorkspaceManager::planSerialFamily({first, second});
+    const SerialWorkspaceFamilyPlan reverse =
+        DeviceWorkspaceManager::planSerialFamily({second, first});
+    ASSERT_TRUE(forward.valid()) << forward.error;
+    ASSERT_TRUE(reverse.valid()) << reverse.error;
+    ASSERT_EQ(forward.total_bytes, reverse.total_bytes);
+    ASSERT_EQ(forward.placements.size(), reverse.placements.size());
+
+    for (const auto &placement : forward.placements)
+    {
+        const auto *other =
+            reverse.find(placement.descriptor.name);
+        ASSERT_NE(other, nullptr);
+        EXPECT_EQ(other->offset, placement.offset);
+        EXPECT_EQ(
+            other->descriptor.size_bytes,
+            placement.descriptor.size_bytes);
+    }
+    ASSERT_NE(forward.find("shared"), nullptr);
+    EXPECT_EQ(forward.find("shared")->descriptor.size_bytes, 512u);
+}
+
+/**
+ * @brief Initialize-once contents cannot be overlaid by another serial graph.
+ *
+ * Captured kernels retain stable pointers, but an immutable lookup table also
+ * retains live bytes after its own participant completes. A participant that
+ * does not mention the table must therefore be unable to reuse its interval.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    SerialFamilyPlannerPreservesPersistentContentAcrossParticipants)
+{
+    WorkspaceRequirements first;
+    first.buffers = {
+        {"immutable_table",
+         128,
+         1,
+         true,
+         WorkspaceExecutionRegime::Any,
+         WorkspaceContentLifetime::SerialGraphFamily},
+        {"first_scratch", 256, 1, true},
+    };
+    WorkspaceRequirements second;
+    second.buffers = {
+        {"second_scratch", 384, 1, true},
+    };
+
+    const SerialWorkspaceFamilyPlan plan =
+        DeviceWorkspaceManager::planSerialFamily({first, second});
+    ASSERT_TRUE(plan.valid()) << plan.error;
+    ASSERT_EQ(plan.total_bytes, 512u)
+        << "Persistent bytes should coexist with the larger mutually exclusive scratch interval";
+
+    const auto *table = plan.find("immutable_table");
+    const auto *first_scratch = plan.find("first_scratch");
+    const auto *second_scratch = plan.find("second_scratch");
+    ASSERT_NE(table, nullptr);
+    ASSERT_NE(first_scratch, nullptr);
+    ASSERT_NE(second_scratch, nullptr);
+    EXPECT_EQ(
+        table->descriptor.content_lifetime,
+        WorkspaceContentLifetime::SerialGraphFamily);
+
+    const auto overlaps = [](const SerialWorkspaceBufferPlacement &lhs,
+                             const SerialWorkspaceBufferPlacement &rhs)
+    {
+        const size_t lhs_end = lhs.offset + lhs.descriptor.size_bytes;
+        const size_t rhs_end = rhs.offset + rhs.descriptor.size_bytes;
+        return lhs.offset < rhs_end && rhs.offset < lhs_end;
+    };
+    EXPECT_FALSE(overlaps(*table, *first_scratch));
+    EXPECT_FALSE(overlaps(*table, *second_scratch));
+    EXPECT_TRUE(overlaps(*first_scratch, *second_scratch))
+        << "Ordinary participant-local scratch should remain overlayable";
 }
 
 TEST_F(Test__DeviceWorkspaceManager, EmitsStructuredMemoryCountersForWorkspaceLayout)
@@ -575,6 +988,59 @@ TEST_F(Test__DeviceWorkspaceManager, DoubleAllocateWithoutReleaseFails)
     EXPECT_FALSE(mgr.hasBuffer("second"));
 }
 
+/**
+ * @brief Append-only growth preserves every address a captured graph can own.
+ */
+TEST_F(Test__DeviceWorkspaceManager, ExtendRetainsOldStorageAndStableNames)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+
+    WorkspaceRequirements initial;
+    initial.buffers.push_back({"growing", 1024, 64, true});
+    initial.buffers.push_back({"stable", 1024, 64, true});
+    ASSERT_TRUE(mgr.allocate(initial));
+
+    auto *old_growing =
+        static_cast<unsigned char *>(mgr.getBuffer("growing"));
+    auto *old_stable =
+        static_cast<unsigned char *>(mgr.getBuffer("stable"));
+    ASSERT_NE(old_growing, nullptr);
+    ASSERT_NE(old_stable, nullptr);
+    old_growing[0] = 0x5a;
+    old_stable[0] = 0xa5;
+
+    WorkspaceRequirements extension;
+    extension.buffers.push_back({"growing", 4096, 64, true});
+    extension.buffers.push_back({"stable", 1024, 64, true});
+    extension.buffers.push_back({"new_name", 2048, 64, true});
+    ASSERT_TRUE(mgr.extend(extension));
+
+    EXPECT_NE(mgr.getBuffer("growing"), old_growing);
+    EXPECT_EQ(mgr.getBufferSize("growing"), 4096u);
+    EXPECT_EQ(mgr.getBuffer("stable"), old_stable);
+    EXPECT_EQ(mgr.getBufferSize("stable"), 1024u);
+    EXPECT_NE(mgr.getBuffer("new_name"), nullptr);
+    EXPECT_EQ(old_growing[0], 0x5a)
+        << "Superseded storage must remain live for captured graph executables";
+    EXPECT_EQ(old_stable[0], 0xa5);
+}
+
+TEST_F(Test__DeviceWorkspaceManager, ExtendFailsClosedWhenRequiredGrowthExceedsBudget)
+{
+    DeviceWorkspaceManager mgr(device, 4096);
+
+    WorkspaceRequirements initial;
+    initial.buffers.push_back({"initial", 3072, 64, true});
+    ASSERT_TRUE(mgr.allocate(initial));
+    void *initial_address = mgr.getBuffer("initial");
+
+    WorkspaceRequirements extension;
+    extension.buffers.push_back({"required_growth", 2048, 64, true});
+    EXPECT_FALSE(mgr.extend(extension));
+    EXPECT_EQ(mgr.getBuffer("initial"), initial_address);
+    EXPECT_FALSE(mgr.hasBuffer("required_growth"));
+}
+
 // ============================================================================
 // Buffer Content Tests
 // ============================================================================
@@ -602,6 +1068,532 @@ TEST_F(Test__DeviceWorkspaceManager, BuffersAreIndependent)
         EXPECT_EQ(static_cast<unsigned char>(a[i]), 0xAA);
         EXPECT_EQ(static_cast<unsigned char>(b[i]), 0xBB);
     }
+}
+
+// ============================================================================
+// Persistent Graph Metadata Slot Tests
+// ============================================================================
+
+TEST_F(Test__DeviceWorkspaceManager, PersistentMetadataLeasesAreExclusiveAndReusable)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+
+    auto first = mgr.acquirePersistentSlot("moe_gateup_descriptors", 2);
+    auto second = mgr.acquirePersistentSlot("moe_gateup_descriptors", 2);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(first->slot(), 0u);
+    EXPECT_EQ(second->slot(), 1u);
+    EXPECT_EQ(
+        mgr.acquirePersistentSlot("moe_gateup_descriptors", 2),
+        nullptr)
+        << "A full graph-metadata domain must fail closed instead of aliasing "
+           "an address already captured by another kernel";
+
+    first.reset();
+    auto replacement = mgr.acquirePersistentSlot("moe_gateup_descriptors", 2);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_EQ(replacement->slot(), 0u)
+        << "Destroying an owner must return its immutable metadata slot";
+
+    auto independent_domain =
+        mgr.acquirePersistentSlot("moe_down_descriptors", 2);
+    ASSERT_NE(independent_domain, nullptr);
+    EXPECT_EQ(independent_domain->slot(), 0u)
+        << "Separate physical descriptor tables have separate ownership domains";
+}
+
+/**
+ * @brief Mutable pointer tables remain exclusive when weight descriptors are shared.
+ *
+ * Two captured graph owners may adopt the same immutable descriptor identity,
+ * but their gate/up scratch arrays must resolve to different physical slots.
+ * Capture is lookup-only and cannot silently acquire an unprepared owner slot.
+ */
+TEST_F(Test__DeviceWorkspaceManager, RuntimePointerOwnersDoNotAliasSharedDescriptors)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    MoERuntimePointerWorkspaceOwners first_graph;
+    MoERuntimePointerWorkspaceOwners second_graph;
+    MoERuntimePointerWorkspaceOwners cold_graph;
+
+    constexpr std::size_t shared_descriptor_slot = 17;
+    constexpr std::size_t table_decode_scope = 0;
+    const auto first_slot = first_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "first graph gate/up");
+    const auto first_slot_again = first_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::CaptureExistingOnly,
+        "first graph gate/up capture");
+    const auto second_slot = second_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "second graph gate/up");
+
+    ASSERT_TRUE(first_slot.has_value());
+    ASSERT_TRUE(first_slot_again.has_value());
+    ASSERT_TRUE(second_slot.has_value());
+    EXPECT_EQ(*first_slot_again, *first_slot);
+    EXPECT_NE(*second_slot, *first_slot)
+        << "A descriptor publication slot is not mutable pointer-array ownership";
+
+    EXPECT_FALSE(cold_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::CaptureExistingOnly,
+        "cold graph capture").has_value())
+        << "Capture must fail closed when warmup did not reserve its exact slot";
+
+    // Gate/up and down have distinct physical buffers and ownership domains.
+    const auto down_slot = first_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::Down,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "first graph down");
+    ASSERT_TRUE(down_slot.has_value());
+
+    first_graph.reset();
+    const auto replacement_slot = cold_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "replacement graph gate/up");
+    ASSERT_TRUE(replacement_slot.has_value());
+    EXPECT_EQ(*replacement_slot, *first_slot)
+        << "Retiring a graph must return its pointer slot to the RAII registry";
+}
+
+TEST_F(Test__DeviceWorkspaceManager, PersistentSlotAddressesUseTheDeclaredTableStride)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({"persistent_router_table", 1024, 256, true});
+    ASSERT_TRUE(mgr.allocate(reqs));
+
+    auto first = mgr.acquirePersistentSlot("router_gate", 2);
+    auto second = mgr.acquirePersistentSlot("router_gate", 2);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    void *small_payload = mgr.getPersistentSlotBuffer(
+        "persistent_router_table",
+        /*slot_capacity=*/2,
+        first->slot(),
+        /*payload_bytes=*/64);
+    void *large_payload = mgr.getPersistentSlotBuffer(
+        "persistent_router_table",
+        /*slot_capacity=*/2,
+        second->slot(),
+        /*payload_bytes=*/384);
+    ASSERT_NE(small_payload, nullptr);
+    ASSERT_NE(large_payload, nullptr);
+
+    const auto byte_distance =
+        static_cast<char *>(large_payload) -
+        static_cast<char *>(small_payload);
+    EXPECT_EQ(byte_distance, 512)
+        << "Different payload sizes must not change the common slot stride";
+    EXPECT_EQ(
+        mgr.getPersistentSlotBuffer(
+            "persistent_router_table",
+            /*slot_capacity=*/2,
+            second->slot(),
+            /*payload_bytes=*/513),
+        nullptr)
+        << "A payload wider than its fixed slot must fail before publication";
+}
+
+TEST_F(Test__DeviceWorkspaceManager, RouterGateIdentityIgnoresRequestLocalTensorWrappers)
+{
+    constexpr std::uint64_t kWorkspaceGeneration = 37;
+    const void *const device_weight =
+        reinterpret_cast<const void *>(std::uintptr_t{0x100000});
+    const auto expected = DeviceResidentRouterGateCacheKey::make(
+        kWorkspaceGeneration,
+        device_weight,
+        /*model_width=*/2048,
+        /*expert_count=*/256);
+
+    /*
+     * Rebuilt graph views may have arbitrary host addresses. Simulate many
+     * requests and prove none of those wrapper identities can alter the
+     * prepared device-weight key.
+     */
+    for (int request = 0; request < 256; ++request)
+    {
+        int request_local_tensor_wrapper = request;
+        (void)request_local_tensor_wrapper;
+        EXPECT_EQ(
+            DeviceResidentRouterGateCacheKey::make(
+                kWorkspaceGeneration,
+                device_weight,
+                /*model_width=*/2048,
+                /*expert_count=*/256),
+            expected);
+    }
+
+    EXPECT_NE(
+        DeviceResidentRouterGateCacheKey::make(
+            kWorkspaceGeneration + 1,
+            device_weight,
+            /*model_width=*/2048,
+            /*expert_count=*/256),
+        expected);
+    EXPECT_NE(
+        DeviceResidentRouterGateCacheKey::make(
+            kWorkspaceGeneration,
+            reinterpret_cast<const void *>(std::uintptr_t{0x200000}),
+            /*model_width=*/2048,
+            /*expert_count=*/256),
+        expected);
+    EXPECT_NE(
+        DeviceResidentRouterGateCacheKey::make(
+            kWorkspaceGeneration,
+            device_weight,
+            /*model_width=*/4096,
+            /*expert_count=*/256),
+        expected);
+}
+
+TEST_F(Test__DeviceWorkspaceManager, ImmutablePublicationIsSharedAcrossGraphLocalOwners)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey router_gate{
+        .word0 = mgr.id(),
+        .word1 = 0x100000,
+        .word2 = 2048,
+        .word3 = 256,
+    };
+    int factory_calls = 0;
+
+    /*
+     * A long-context server run constructs many graph-local routed-pipeline
+     * kernel owners. All of them consume the same immutable router conversion;
+     * ownership must therefore converge on one workspace publication rather
+     * than exhausting one slot per graph object.
+     */
+    std::shared_ptr<void> expected_publication;
+    for (int graph_owner = 0; graph_owner < 256; ++graph_owner)
+    {
+        const auto result = mgr.getOrCreatePersistentPublication(
+            "rocm_moe_router_q8_gate_cache",
+            router_gate,
+            /*slot_capacity=*/2,
+            [&](size_t slot) -> std::shared_ptr<void>
+            {
+                ++factory_calls;
+                EXPECT_EQ(slot, 0u);
+                return std::make_shared<int>(17);
+            });
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.slot, 0u);
+        EXPECT_EQ(result.created, graph_owner == 0);
+        if (!expected_publication)
+            expected_publication = result.publication;
+        EXPECT_EQ(result.publication, expected_publication);
+    }
+    EXPECT_EQ(factory_calls, 1)
+        << "The immutable device bytes must be published once, not once per graph-local kernel";
+
+    const auto second = mgr.getOrCreatePersistentPublication(
+        "rocm_moe_router_q8_gate_cache",
+        PersistentWorkspacePublicationKey{
+            .word0 = mgr.id(),
+            .word1 = 0x200000,
+            .word2 = 2048,
+            .word3 = 256,
+        },
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 1u);
+            return std::make_shared<int>(23);
+        });
+    ASSERT_TRUE(second);
+    EXPECT_TRUE(second.created);
+    EXPECT_EQ(second.slot, 1u);
+
+    EXPECT_FALSE(mgr.getOrCreatePersistentPublication(
+        "rocm_moe_router_q8_gate_cache",
+        PersistentWorkspacePublicationKey{
+            .word0 = mgr.id(),
+            .word1 = 0x300000,
+            .word2 = 2048,
+            .word3 = 256,
+        },
+        /*slot_capacity=*/2,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            return std::make_shared<int>(29);
+        }))
+        << "A genuinely distinct immutable weight must still fail closed when "
+           "the physical table is full";
+}
+
+TEST_F(Test__DeviceWorkspaceManager, FailedImmutablePublicationRollsBackItsSlot)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey key{
+        .word0 = mgr.id(),
+        .word1 = 0x100000,
+        .word2 = 2048,
+        .word3 = 256,
+    };
+
+    EXPECT_FALSE(mgr.getOrCreatePersistentPublication(
+        "cuda_moe_router_q8_gate_cache",
+        key,
+        /*slot_capacity=*/1,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            return {};
+        }));
+
+    const auto retry = mgr.getOrCreatePersistentPublication(
+        "cuda_moe_router_q8_gate_cache",
+        key,
+        /*slot_capacity=*/1,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 0u);
+            return std::make_shared<int>(31);
+        });
+    ASSERT_TRUE(retry);
+    EXPECT_TRUE(retry.created);
+    EXPECT_EQ(retry.slot, 0u)
+        << "A failed event or conversion setup must not poison the immutable publication namespace";
+}
+
+/**
+ * @brief Variable-width publication identity remains collision-free.
+ *
+ * MoE descriptor tables share matrix geometry across model layers. Their
+ * complete per-expert device-pointer records therefore live in the key's exact
+ * identity tail; a fixed four-word prefix or digest cannot distinguish them
+ * safely.
+ */
+TEST_F(Test__DeviceWorkspaceManager, ImmutablePublicationComparesExactIdentityTail)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey first_key{
+        .word0 = 256,
+        .word1 = 2048,
+        .word2 = 512,
+        .word3 = 2,
+        .identity_words = {11, 12, 13, 14},
+    };
+    const PersistentWorkspacePublicationKey second_key{
+        .word0 = 256,
+        .word1 = 2048,
+        .word2 = 512,
+        .word3 = 2,
+        .identity_words = {11, 12, 13, 15},
+    };
+
+    const auto first = mgr.getOrCreatePersistentPublication(
+        "exact_descriptor_identity",
+        first_key,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 0u);
+            return std::make_shared<int>(11);
+        });
+    ASSERT_TRUE(first);
+    EXPECT_TRUE(first.created);
+
+    const auto adopted = mgr.getOrCreatePersistentPublication(
+        "exact_descriptor_identity",
+        first_key,
+        /*slot_capacity=*/2,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            ADD_FAILURE()
+                << "An exact identity must adopt the existing publication";
+            return {};
+        });
+    ASSERT_TRUE(adopted);
+    EXPECT_FALSE(adopted.created);
+    EXPECT_EQ(adopted.slot, first.slot);
+
+    const auto distinct = mgr.getOrCreatePersistentPublication(
+        "exact_descriptor_identity",
+        second_key,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 1u);
+            return std::make_shared<int>(15);
+        });
+    ASSERT_TRUE(distinct);
+    EXPECT_TRUE(distinct.created);
+    EXPECT_NE(distinct.slot, first.slot);
+}
+
+/**
+ * @brief Proves graph-family cardinality cannot consume descriptor capacity.
+ *
+ * Dynamic MTP materializes many graph-local MoE kernel owners for verifier
+ * depths and prefill buckets. Those owners all reference the same immutable
+ * prepared-weight descriptor bytes. Descriptor capacity therefore scales with
+ * unique tables, never with the number of captured graph objects.
+ */
+TEST_F(
+    Test__DeviceWorkspaceManager,
+    ExactDescriptorPublicationDoesNotScaleWithGraphOwnerCount)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey descriptor_key{
+        .word0 = 256,
+        .word1 = 2048,
+        .word2 = 512,
+        .word3 = 2,
+        .identity_words = {100, 200, 300, 400, 500, 600},
+    };
+
+    constexpr int kGraphOwnerCount = 2048;
+    int factory_calls = 0;
+    std::shared_ptr<void> canonical_publication;
+    for (int graph_owner = 0; graph_owner < kGraphOwnerCount; ++graph_owner)
+    {
+        const auto result = mgr.getOrCreatePersistentPublication(
+            "cuda_moe_grouped_gateup_descriptors",
+            descriptor_key,
+            /*slot_capacity=*/1,
+            [&](size_t slot) -> std::shared_ptr<void>
+            {
+                EXPECT_EQ(slot, 0u);
+                ++factory_calls;
+                return std::make_shared<int>(graph_owner);
+            });
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result.slot, 0u);
+        if (!canonical_publication)
+        {
+            EXPECT_TRUE(result.created);
+            canonical_publication = result.publication;
+        }
+        else
+        {
+            EXPECT_FALSE(result.created);
+            EXPECT_EQ(result.publication, canonical_publication);
+        }
+    }
+
+    EXPECT_EQ(factory_calls, 1)
+        << "Only the first graph owner may publish immutable descriptor bytes";
+}
+
+/**
+ * @brief Ordered mutation removes the obsolete exact identity.
+ *
+ * Dynamic expert descriptors keep their captured address while transfer-slot
+ * contents change. A graph requesting the old descriptor identity afterward
+ * must receive fresh storage, while the replacement identity adopts the
+ * re-recorded publication.
+ */
+TEST_F(Test__DeviceWorkspaceManager, OrderedPublicationWriteReindexesExactIdentity)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    const PersistentWorkspacePublicationKey before{
+        .word0 = 40,
+        .identity_words = {100, 200},
+    };
+    const PersistentWorkspacePublicationKey after{
+        .word0 = 40,
+        .identity_words = {100, 300},
+    };
+
+    const auto original = mgr.getOrCreatePersistentPublication(
+        "dynamic_descriptor_table",
+        before,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 0u);
+            return std::make_shared<int>(1);
+        });
+    ASSERT_TRUE(original);
+    int rewrite_calls = 0;
+    ASSERT_TRUE(mgr.rewritePersistentPublication(
+        "dynamic_descriptor_table",
+        after,
+        original.publication,
+        original.slot,
+        /*slot_capacity=*/2,
+        [&]()
+        {
+            ++rewrite_calls;
+            return true;
+        }));
+    EXPECT_EQ(rewrite_calls, 1);
+
+    const auto adopted_after = mgr.getOrCreatePersistentPublication(
+        "dynamic_descriptor_table",
+        after,
+        /*slot_capacity=*/2,
+        [](size_t) -> std::shared_ptr<void>
+        {
+            ADD_FAILURE()
+                << "Replacement identity must adopt the ordered publication";
+            return {};
+        });
+    ASSERT_TRUE(adopted_after);
+    EXPECT_FALSE(adopted_after.created);
+    EXPECT_EQ(adopted_after.publication, original.publication);
+
+    const auto recreated_before = mgr.getOrCreatePersistentPublication(
+        "dynamic_descriptor_table",
+        before,
+        /*slot_capacity=*/2,
+        [](size_t slot) -> std::shared_ptr<void>
+        {
+            EXPECT_EQ(slot, 1u);
+            return std::make_shared<int>(2);
+        });
+    ASSERT_TRUE(recreated_before);
+    EXPECT_TRUE(recreated_before.created);
+    EXPECT_NE(recreated_before.publication, original.publication);
+}
+
+TEST_F(Test__DeviceWorkspaceManager, ReleaseInvalidatesOldMetadataLeaseNamespace)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+
+    auto old_lease = mgr.acquirePersistentSlot("moe_expert_masks", 1);
+    ASSERT_NE(old_lease, nullptr);
+    EXPECT_EQ(old_lease->slot(), 0u);
+
+    mgr.release();
+
+    auto new_lease = mgr.acquirePersistentSlot("moe_expert_masks", 1);
+    ASSERT_NE(new_lease, nullptr);
+    EXPECT_EQ(new_lease->slot(), 0u)
+        << "A replacement device allocation must not inherit occupied slots "
+           "from graph owners tied to the released allocation";
+
+    old_lease.reset();
+    EXPECT_EQ(
+        mgr.acquirePersistentSlot("moe_expert_masks", 1),
+        nullptr)
+        << "Destroying an obsolete lease must not release a slot in the new namespace";
 }
 
 // ============================================================================

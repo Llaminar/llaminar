@@ -5,13 +5,20 @@
  * Endpoints:
  *   GET  /health                  — Liveness check
  *   POST /v1/chat/completions     — OpenAI-compatible chat completion (streaming + non-streaming)
+ *
+ * The resolved request authority, not MPI rank zero, owns HTTP serving.
+ * Every rank publishes its immutable membership in PerfStats so an external
+ * certificate can require complete participant evidence without steering
+ * inference or adding a diagnostic collective to the execution lifecycle.
  */
 
 #include "app/modes/ServerMode.h"
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/AppContext.h"
 #include "app/MPIShutdown.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 
 // cpp-httplib (header-only)
 #include "httplib.h"
@@ -27,6 +34,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <thread>
 #ifdef __linux__
 #include <malloc.h>
 #include <fstream>
@@ -295,13 +303,31 @@ namespace llaminar2
             LOG_TRACE("[HTTP] response\n" << formatResponseTrace(res, context));
         }
 
+        void flushPerfStatsFromEnv()
+        {
+            if (!PerfStatsCollector::flushFromEnv())
+            {
+                LOG_WARN("[ServerMode] Failed to flush PerfStats artifact(s)");
+            }
+        }
+
+        bool shutdownEndpointEnabled()
+        {
+            return DebugEnv::isTruthyEnvValue(
+                DebugEnv::envValue("LLAMINAR_ENABLE_SERVER_SHUTDOWN_ENDPOINT"));
+        }
+
         int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
-            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
-            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+            const bool is_authority =
+                ctx.runner &&
+                ctx.coordinatedRequestRole() ==
+                    CoordinatedRequestRole::Authority;
+            const bool notify_workers =
+                has_mpi && ctx.mpi_ctx->world_size() > 1 && is_authority;
 
-            if (is_root)
+            if (is_authority)
                 LOG_ERROR("Server mode failed with unhandled exception: " << detail);
 
             if (ctx.runner)
@@ -310,6 +336,7 @@ namespace llaminar2
                     ctx.runner->abortMPIWorkers(detail);
                 ctx.runner->shutdown();
             }
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 1;
         }
@@ -344,33 +371,62 @@ namespace llaminar2
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
 
-        if (mpi_ctx->world_size() > 1 && mpi_ctx->rank() != 0)
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        const bool is_authority =
+            ctx.coordinatedRequestRole() ==
+            CoordinatedRequestRole::Authority;
+        // Copy immutable topology only for observation. This runs once before
+        // serving/participating; graph and request decisions never consult it.
+        PerfStatsCollector::addCounter(
+            "server", "rank_membership", 1.0, "startup", {},
+            {{"rank", std::to_string(mpi_ctx->rank())},
+             {"world_size", std::to_string(mpi_ctx->world_size())},
+             {"authority_rank", std::to_string(runner->coordinatedRootRank())}});
+        if (mpi_coordinated && !is_authority)
         {
-            // Non-root ranks: enter MPI worker loop to participate in
-            // inference collectives (allreduce for Global TP) when rank 0
-            // initiates them. Returns when rank 0 sends SHUTDOWN.
+            // Followers enter the MPI command loop and participate in the
+            // exact graph/collective sequence admitted by the authority.
             LOG_DEBUG("Rank " << mpi_ctx->rank()
                               << " entering MPI worker loop for inference participation");
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 0;
         }
 
+        // The authority must open the command channel before any early-exit
+        // path so followers blocked in their receive loop can always observe a
+        // terminal command.
+        if (mpi_coordinated)
+            runner->setMPICoordinatedMode(true);
+
         if (!tokenizer->hasChatTemplate())
         {
             LOG_ERROR("Server mode requires a model with a chat template.");
-            if (mpi_ctx->world_size() > 1)
+            if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 1;
         }
 
-        // Enable coordinated mode so rank 0 broadcasts commands to workers
-        if (mpi_ctx->world_size() > 1)
-            runner->setMPICoordinatedMode(true);
+        /* Do not bind or advertise the HTTP endpoint until the same generic
+         * production-readiness lifecycle used by benchmark mode is complete. */
+        if (!runner->prepareForInference())
+        {
+            LOG_ERROR(
+                "Inference runtime did not become ready for serving: "
+                << runner->lastError());
+            if (mpi_coordinated)
+                runner->shutdownMPIWorkers();
+            runner->shutdown();
+            flushPerfStatsFromEnv();
+            mpiShutdown();
+            return 1;
+        }
 
         // Extract model name from path for response metadata
         std::string model_name = std::filesystem::path(config.model_path).stem().string();
@@ -388,6 +444,12 @@ namespace llaminar2
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);
         std::signal(SIGTERM, signal_handler);
+#ifdef SIGPIPE
+        // HTTP clients can close a connection while the server is still
+        // writing a response. Treat that as an ordinary request failure path
+        // instead of letting the process die from SIGPIPE.
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
 
         svr.set_pre_routing_handler(
             [&request_log_state](const httplib::Request &req, httplib::Response &) {
@@ -420,6 +482,24 @@ namespace llaminar2
                 {
             json response = {{"status", "ok"}};
             res.set_content(response.dump(), "application/json"); });
+
+        if (shutdownEndpointEnabled())
+        {
+            svr.Post("/admin/shutdown",
+                     [](const httplib::Request &, httplib::Response &res)
+                     {
+                         json response = {{"status", "shutting_down"}};
+                         res.status = 202;
+                         res.set_content(response.dump(), "application/json");
+
+                         std::thread([] {
+                             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                             g_shutdown_requested.store(true);
+                             if (g_server_ptr)
+                                 g_server_ptr->stop();
+                         }).detach();
+                     });
+        }
 
         // ─── POST /v1/chat/completions ───────────────────────────────
         ChatCompletionHandler handler(*runner, *tokenizer, model_name);
@@ -497,9 +577,10 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to start server on " << serve_endpoint);
             }
-            if (mpi_ctx->world_size() > 1)
+            if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
+            flushPerfStatsFromEnv();
             mpiShutdown();
             return 1;
         }
@@ -528,9 +609,10 @@ namespace llaminar2
             if (!g_shutdown_requested.load())
             {
                 LOG_ERROR("Server stopped unexpectedly while serving on " << serve_endpoint);
-                if (mpi_ctx->world_size() > 1)
+                if (mpi_coordinated)
                     runner->shutdownMPIWorkers();
                 runner->shutdown();
+                flushPerfStatsFromEnv();
                 mpiShutdown();
                 return 1;
             }
@@ -539,11 +621,12 @@ namespace llaminar2
         LOG_INFO("Server shut down.");
         g_server_ptr = nullptr;
 
-        // Signal non-root ranks to exit their worker loops
-        if (mpi_ctx->world_size() > 1)
+        // Release every follower from the coordinated command loop.
+        if (mpi_coordinated)
             runner->shutdownMPIWorkers();
 
         runner->shutdown();
+        flushPerfStatsFromEnv();
         mpiShutdown();
         return 0;
     }

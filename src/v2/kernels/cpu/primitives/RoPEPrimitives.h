@@ -176,6 +176,34 @@ namespace llaminar2::primitives
         RoPEPersistentState *persistent_state = nullptr);
 
     /**
+     * @brief Apply grouped BF16 verifier rows with serial-decode angle state.
+     *
+     * The helper advances the same persistent FP32 sin/cos recurrence used by
+     * one-token BF16 decode, materializes M=2..4 angle rows, and executes one
+     * grouped row/head workshare over native BF16 storage. This preserves both
+     * decode bytes and grouped economics without dequantizing whole tensors.
+     *
+     * @param q_bf16 Query rows in native BF16 storage, modified in-place.
+     * @param k_bf16 Optional key rows in native BF16 storage, modified in-place.
+     * @param position_ids Optional absolute position for each verifier row.
+     * @param verifier_rows Number of grouped rows; production MTP uses 2..4.
+     * @param head_dim Physical values per attention head.
+     * @param q_heads Number of query heads in each row.
+     * @param k_heads Number of key heads in each row.
+     * @param pos_offset First contiguous position when position_ids is null.
+     * @param freq_base Model RoPE frequency base.
+     * @param persistent_state Decode recurrence state owned by the kernel.
+     */
+    void apply_rope_bf16_decode_equivalent_rows(
+        uint16_t *q_bf16, uint16_t *k_bf16,
+        const int *position_ids,
+        int verifier_rows,
+        int head_dim,
+        int q_heads, int k_heads,
+        int pos_offset, float freq_base,
+        RoPEPersistentState *persistent_state);
+
+    /**
      * @brief Apply RoPE to Q and K tensors (native FP16 implementation)
      *
      * Operates directly on FP16 buffers without intermediate FP32 conversion.
@@ -197,6 +225,34 @@ namespace llaminar2::primitives
         int q_heads, int k_heads,
         int n_past, float freq_base,
         RoPEPersistentState *persistent_state = nullptr);
+
+    /**
+     * @brief Apply grouped FP16 verifier rows with serial-decode angle state.
+     *
+     * This is the native-FP16 counterpart to
+     * apply_rope_bf16_decode_equivalent_rows(). It preserves the exact cached
+     * angle values and FP16 conversion instructions used by one-token decode,
+     * but schedules every verifier row and head in one grouped workshare.
+     *
+     * @param q_fp16 Query rows in native FP16 storage, modified in-place.
+     * @param k_fp16 Optional key rows in native FP16 storage, modified in-place.
+     * @param position_ids Optional absolute position for each verifier row.
+     * @param verifier_rows Number of grouped rows; production MTP uses 2..4.
+     * @param head_dim Physical values per attention head.
+     * @param q_heads Number of query heads in each row.
+     * @param k_heads Number of key heads in each row.
+     * @param pos_offset First contiguous position when position_ids is null.
+     * @param freq_base Model RoPE frequency base.
+     * @param persistent_state Decode recurrence state owned by the kernel.
+     */
+    void apply_rope_fp16_decode_equivalent_rows(
+        uint16_t *q_fp16, uint16_t *k_fp16,
+        const int *position_ids,
+        int verifier_rows,
+        int head_dim,
+        int q_heads, int k_heads,
+        int pos_offset, float freq_base,
+        RoPEPersistentState *persistent_state);
 
     /**
      * @brief Apply RoPE to Q and K tensors (INT32 not supported)
@@ -466,6 +522,37 @@ namespace llaminar2::primitives
         int head_dim,
         float rope_theta,
         RoPEPersistentState *persistent_state = nullptr);
+
+    /**
+     * @brief Apply grouped Q8_1 verifier rows with serial-decode Q15 angles.
+     *
+     * Serial Q8_1 decode advances FP32 angle recurrence state and then converts
+     * each angle to Q15 before pure-integer rotation. This grouped primitive
+     * performs that state advance once for all M rows, stores the exact Q15
+     * values, and runs one native block workshare over Q and K.
+     *
+     * @param Q Query rows as Q8_1 blocks, modified in-place.
+     * @param K Optional key rows as Q8_1 blocks, modified in-place.
+     * @param position_ids Optional absolute position for each verifier row.
+     * @param verifier_rows Number of grouped rows; production MTP uses 2..4.
+     * @param n_heads Number of query heads in each row.
+     * @param n_kv_heads Number of key heads in each row.
+     * @param head_dim Logical values per head; must be Q8-block aligned.
+     * @param pos_offset First contiguous position when position_ids is null.
+     * @param rope_theta Model RoPE frequency base.
+     * @param persistent_state Decode recurrence state owned by the kernel.
+     */
+    void apply_rope_q8_1_decode_equivalent_rows(
+        Q8_1Block *Q,
+        Q8_1Block *K,
+        const int *position_ids,
+        int verifier_rows,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int pos_offset,
+        float rope_theta,
+        RoPEPersistentState *persistent_state);
 
     /**
      * @brief Apply RoPE to Q8_1 input, output to FP32 (Hybrid mode)

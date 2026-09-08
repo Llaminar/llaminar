@@ -1,7 +1,10 @@
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
+#include "loaders/GPUVramPreflight.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include "backends/IBackend.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/VramBillOfMaterials.h"
 
 /**
  * @file WeightVRAMPool.cpp
@@ -49,6 +52,7 @@ namespace llaminar2
           staging_region_bytes_(other.staging_region_bytes_),
           staging_slot_count_(other.staging_slot_count_),
           max_staging_slot_bytes_(other.max_staging_slot_bytes_),
+          staging_slot_stride_bytes_(other.staging_slot_stride_bytes_),
           backend_(other.backend_),
           device_id_(other.device_id_),
           allocated_(other.allocated_),
@@ -64,6 +68,7 @@ namespace llaminar2
         other.staging_region_bytes_ = 0;
         other.staging_slot_count_ = 0;
         other.max_staging_slot_bytes_ = 0;
+        other.staging_slot_stride_bytes_ = 0;
         other.backend_ = nullptr;
     }
 
@@ -79,6 +84,7 @@ namespace llaminar2
             staging_region_bytes_ = other.staging_region_bytes_;
             staging_slot_count_ = other.staging_slot_count_;
             max_staging_slot_bytes_ = other.max_staging_slot_bytes_;
+            staging_slot_stride_bytes_ = other.staging_slot_stride_bytes_;
             backend_ = other.backend_;
             device_id_ = other.device_id_;
             allocated_ = other.allocated_;
@@ -93,6 +99,7 @@ namespace llaminar2
             other.staging_region_bytes_ = 0;
             other.staging_slot_count_ = 0;
             other.max_staging_slot_bytes_ = 0;
+            other.staging_slot_stride_bytes_ = 0;
             other.backend_ = nullptr;
         }
         return *this;
@@ -128,39 +135,48 @@ namespace llaminar2
             throw std::runtime_error("WeightVRAMPool: duplicate weight name '" + name + "'");
         }
 
-        const int blocks_per_row = K / 32;
-
         WeightPlan plan;
         plan.N = N;
         plan.K = K;
         plan.staging_bytes = raw_gguf_bytes;
 
-        // Payload region
-        plan.payload_bytes = static_cast<size_t>(blocks_per_row) * N * payload_bytes_per_block;
+        const NativeVnniFormatInfo format{
+            .codebook_id = 0,
+            .payload_bytes = payload_bytes_per_block,
+            .is_asymmetric = is_asymmetric,
+            .is_superblock = false,
+            .has_emins = has_emins,
+            .max_abs_factor = 0.0f,
+        };
+        const NativeVnniPackedRegionSizes regions =
+            nativeVnniPackedRegionSizes(
+                static_cast<size_t>(N),
+                static_cast<size_t>(K),
+                format);
+
+        // Every persistent region uses the canonical native-VNNI layout.
+        plan.payload_bytes = regions.payload_bytes;
         plan.payload_offset = allocateRegion(plan.payload_bytes);
 
-        // Scales region (FP16 = uint16_t)
-        plan.scales_bytes = static_cast<size_t>(blocks_per_row) * N * sizeof(uint16_t);
+        plan.scales_bytes = regions.scales_bytes;
         plan.scales_offset = allocateRegion(plan.scales_bytes);
 
-        // Mins region (asymmetric only)
-        if (is_asymmetric)
+        if (regions.mins_bytes > 0)
         {
-            plan.mins_bytes = plan.scales_bytes; // Same size as scales
+            plan.mins_bytes = regions.mins_bytes;
             plan.mins_offset = allocateRegion(plan.mins_bytes);
         }
 
-        // Emins region (Q2_K only)
-        if (has_emins)
+        if (regions.emins_bytes > 0)
         {
-            plan.emins_bytes = static_cast<size_t>(blocks_per_row) * N * sizeof(uint32_t);
+            plan.emins_bytes = regions.emins_bytes;
             plan.emins_offset = allocateRegion(plan.emins_bytes);
         }
 
         plans_[name] = plan;
         weight_order_.push_back(name);
 
-        LOG_DEBUG("Planned weight '" << name << "' N=" << N << " K=" << K
+        LOG_TRACE("Planned weight '" << name << "' N=" << N << " K=" << K
                                      << " payload=" << plan.payload_bytes
                                      << " scales=" << plan.scales_bytes
                                      << " mins=" << plan.mins_bytes
@@ -193,11 +209,12 @@ namespace llaminar2
         plans_[name] = plan;
         weight_order_.push_back(name);
 
-        LOG_DEBUG("Planned raw weight '" << name << "' N=" << N << " K=" << K
+        LOG_TRACE("Planned raw weight '" << name << "' N=" << N << " K=" << K
                                          << " bytes=" << raw_bytes);
     }
 
-    bool WeightVRAMPool::allocate(IBackend *backend, int device_id, int staging_slot_count)
+    bool WeightVRAMPool::allocate(IBackend *backend, int device_id, int staging_slot_count,
+                                  size_t staging_slot_bytes)
     {
         if (allocated_)
         {
@@ -211,7 +228,8 @@ namespace llaminar2
         // The persistent weight allocation is aligned independently so every
         // offset returned by getSlot() remains stable for the lifetime of kernels.
         size_t max_staging = 0;
-        weight_region_bytes_ = alignUp(current_offset_, kAlignment);
+        weight_region_bytes_ =
+            alignGPUWeightLoadAllocation(current_offset_);
 
         // Staging is temporary upload scratch. It uses its own allocation so
         // LoadOrchestrator::finalize() can free it after all pipeline streams drain.
@@ -221,7 +239,29 @@ namespace llaminar2
             {
                 max_staging = std::max(max_staging, plan.staging_bytes);
             }
-            staging_region_bytes_ = max_staging * staging_slot_count;
+            if (staging_slot_bytes > 0)
+            {
+                max_staging = std::min(max_staging, staging_slot_bytes);
+            }
+
+            /**
+             * Slot capacity and slot stride are intentionally different
+             * quantities. Capacity controls row chunking and therefore stays
+             * inside the configured staging budget. Stride controls pointer
+             * geometry and is rounded up independently so lane 1 and later
+             * cannot inherit an odd or otherwise under-aligned address.
+             *
+             * This matters for packed GGUF formats such as Q6_K and IQ3_S:
+             * their kernels issue 16-, 32-, and wider-bit source loads. A
+             * A configured per-GPU budget divided across three lanes can yield
+             * an odd byte capacity. Using that value as the old physical stride
+             * made the first non-zero lane fault with a misaligned-address
+             * error.
+             */
+            staging_slot_stride_bytes_ =
+                alignGPUWeightLoadAllocation(max_staging);
+            staging_region_bytes_ =
+                staging_slot_stride_bytes_ * static_cast<size_t>(staging_slot_count);
         }
         staging_slot_count_ = staging_slot_count;
         max_staging_slot_bytes_ = max_staging;
@@ -256,6 +296,7 @@ namespace llaminar2
                     staging_region_bytes_ = 0;
                     staging_slot_count_ = 0;
                     max_staging_slot_bytes_ = 0;
+                    staging_slot_stride_bytes_ = 0;
                     return false;
                 }
                 logVramTrace(backend_, device_id_, "weight_pool.after_persistent_allocate", weight_region_bytes_);
@@ -278,6 +319,7 @@ namespace llaminar2
                     staging_region_bytes_ = 0;
                     staging_slot_count_ = 0;
                     max_staging_slot_bytes_ = 0;
+                    staging_slot_stride_bytes_ = 0;
                     return false;
                 }
                 logVramTrace(backend_, device_id_, "weight_pool.after_staging_allocate", staging_region_bytes_);
@@ -290,6 +332,50 @@ namespace llaminar2
         }
 
         allocated_ = true;
+        const std::string backend_name = backend_ ? backend_->backendName() : "none";
+        logVramBomLine(
+            "weight_pool_summary",
+            "backend=" + backend_name +
+                " device_id=" + std::to_string(device_id_) +
+                " weights=" + std::to_string(plans_.size()) +
+                " persistent_bytes=" + std::to_string(weight_region_bytes_) +
+                " persistent_mib=" + vramBomMiB(weight_region_bytes_) +
+                " staging_bytes=" + std::to_string(staging_region_bytes_) +
+                " staging_mib=" + vramBomMiB(staging_region_bytes_) +
+                " staging_slots=" + std::to_string(staging_slot_count_) +
+                " staging_slot_capacity_bytes=" + std::to_string(max_staging_slot_bytes_) +
+                " staging_slot_mib=" + vramBomMiB(max_staging_slot_bytes_) +
+                " staging_slot_stride_bytes=" + std::to_string(staging_slot_stride_bytes_) +
+                " total_bytes=" + std::to_string(total_bytes_) +
+                " total_mib=" + vramBomMiB(total_bytes_));
+        for (const auto &name : weight_order_)
+        {
+            const auto it = plans_.find(name);
+            if (it == plans_.end())
+                continue;
+            const auto &plan = it->second;
+            const size_t persistent_bytes =
+                plan.payload_bytes + plan.scales_bytes + plan.mins_bytes + plan.emins_bytes;
+            logVramBomLine(
+                "weight_pool_weight",
+                "backend=" + backend_name +
+                    " device_id=" + std::to_string(device_id_) +
+                    " name=" + name +
+                    " N=" + std::to_string(plan.N) +
+                    " K=" + std::to_string(plan.K) +
+                    " payload_bytes=" + std::to_string(plan.payload_bytes) +
+                    " payload_mib=" + vramBomMiB(plan.payload_bytes) +
+                    " scales_bytes=" + std::to_string(plan.scales_bytes) +
+                    " scales_mib=" + vramBomMiB(plan.scales_bytes) +
+                    " mins_bytes=" + std::to_string(plan.mins_bytes) +
+                    " mins_mib=" + vramBomMiB(plan.mins_bytes) +
+                    " emins_bytes=" + std::to_string(plan.emins_bytes) +
+                    " emins_mib=" + vramBomMiB(plan.emins_bytes) +
+                    " persistent_bytes=" + std::to_string(persistent_bytes) +
+                    " persistent_mib=" + vramBomMiB(persistent_bytes) +
+                    " raw_staging_bytes=" + std::to_string(plan.staging_bytes) +
+                    " raw_staging_mib=" + vramBomMiB(plan.staging_bytes));
+        }
         LOG_DEBUG("WeightVRAMPool: allocated " << total_bytes_ << " bytes on device "
                                                << device_id_ << " for " << plans_.size() << " weights"
                                                << " (staging: " << staging_region_bytes_ << " bytes, "
@@ -311,6 +397,9 @@ namespace llaminar2
 
         WeightSlot slot;
         slot.payload_bytes = plan.payload_bytes;
+        slot.scales_bytes = plan.scales_bytes;
+        slot.mins_bytes = plan.mins_bytes;
+        slot.emins_bytes = plan.emins_bytes;
         slot.staging_bytes = plan.staging_bytes;
 
         if (base)
@@ -330,6 +419,17 @@ namespace llaminar2
             return total_bytes_;
         // Before allocation: current_offset_ tracks the weight regions planned so far
         return current_offset_;
+    }
+
+    size_t WeightVRAMPool::maximumPlannedStagingBytes() const
+    {
+        size_t maximum = 0;
+        for (const auto &[name, plan] : plans_)
+        {
+            (void)name;
+            maximum = std::max(maximum, plan.staging_bytes);
+        }
+        return maximum;
     }
 
     size_t WeightVRAMPool::numPlannedWeights() const { return plans_.size(); }
@@ -380,6 +480,11 @@ namespace llaminar2
 
         if (released_bytes > 0)
         {
+            logVramBomLine(
+                "weight_pool_staging_release",
+                "backend=" + std::string(backend_ ? backend_->backendName() : "none") +
+                    " device_id=" + std::to_string(device_id_) +
+                    " " + vramBomBytes(released_bytes));
             total_bytes_ = total_bytes_ >= released_bytes ? total_bytes_ - released_bytes : weight_region_bytes_;
             LOG_DEBUG("WeightVRAMPool: released " << released_bytes
                                                   << " bytes of temporary staging on device " << device_id_);
@@ -389,6 +494,7 @@ namespace llaminar2
         staging_region_bytes_ = 0;
         staging_slot_count_ = 0;
         max_staging_slot_bytes_ = 0;
+        staging_slot_stride_bytes_ = 0;
     }
 
     uint8_t *WeightVRAMPool::getStagingSlot(int slot_index) const
@@ -398,11 +504,16 @@ namespace llaminar2
         if (max_staging_slot_bytes_ == 0)
             return nullptr;
         auto *base = static_cast<uint8_t *>(d_staging_base_);
-        return base + static_cast<size_t>(slot_index) * max_staging_slot_bytes_;
+        return base + static_cast<size_t>(slot_index) * staging_slot_stride_bytes_;
     }
 
     int WeightVRAMPool::stagingSlotCount() const { return staging_slot_count_; }
 
     size_t WeightVRAMPool::maxStagingSlotBytes() const { return max_staging_slot_bytes_; }
+
+    size_t WeightVRAMPool::stagingSlotStrideBytes() const
+    {
+        return staging_slot_stride_bytes_;
+    }
 
 } // namespace llaminar2

@@ -86,6 +86,19 @@ namespace llaminar2
          */
         bool isAvailable() const override { return true; }
 
+        /**
+         * @brief Report the HostBackend's explicitly synchronous completion.
+         *
+         * GPU copies in this backend stage through host memory and synchronize
+         * each affected device stream before the collective call returns.
+         */
+        [[nodiscard]] CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const override
+        {
+            (void)device;
+            return CollectiveSubmissionReceipt::alreadyComplete();
+        }
+
         // =====================================================================
         // Lifecycle
         // =====================================================================
@@ -299,6 +312,28 @@ namespace llaminar2
 
         std::string lastError() const override { return last_error_; }
 
+        /**
+         * @brief Reduce one host buffer into an existing host accumulator.
+         *
+         * The caller controls participant order by invoking this method once per
+         * source buffer.  Each element is independent, so SIMD worksharing does
+         * not alter the fixed cross-participant arithmetic order.  This utility
+         * is shared with the asynchronous mixed-vendor bridge to keep synchronous
+         * diagnostics and production collectives numerically identical.
+         *
+         * @param dst Existing accumulator in @p dtype storage.
+         * @param src Next participant buffer in the same storage format.
+         * @param count Number of logical elements.
+         * @param dtype Element representation.
+         * @param op Reduction operation.
+         */
+        static void reduceOnHost(
+            void *dst,
+            const void *src,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op);
+
     private:
         /// Device group this backend operates on
         DeviceGroup group_;
@@ -350,17 +385,6 @@ namespace llaminar2
          * @return true on success
          */
         bool copyFromHost(void *device_dst, const void *host_src, DeviceId device, size_t bytes);
-
-        /**
-         * @brief Perform reduction on host buffers
-         * @param dst Destination buffer (accumulator)
-         * @param src Source buffer to reduce into dst
-         * @param count Number of elements
-         * @param dtype Data type
-         * @param op Reduction operation
-         */
-        void reduceOnHost(void *dst, const void *src, size_t count,
-                          CollectiveDataType dtype, CollectiveOp op);
 
         /**
          * @brief Ensure staging buffer is large enough

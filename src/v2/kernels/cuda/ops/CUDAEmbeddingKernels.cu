@@ -4,6 +4,7 @@
  *
  * Supports:
  * - FP32 embedding tables (simple row lookup, for tensors already on GPU)
+ * - Native FP16/BF16 embedding tables converted to FP32 at lookup time
  * - EmbedQ8 quantized embedding tables (universal format, handles all GGUF quant types)
  *
  * The EmbedQ8 path works with ANY quantized embedding format (Q4_0, Q8_0, Q6_K,
@@ -85,6 +86,104 @@ extern "C"
         embedding_lookup_kernel<<<grid_size, block_size, 0, stream>>>(
             embed_data, token_ids, output, num_tokens, d_model, vocab_size, vocab_offset);
 
+        return cudaGetLastError();
+    }
+
+    // =========================================================================
+    // Native 16-bit Floating Embedding Tables
+    // =========================================================================
+
+    /** @brief Convert native FP16 table elements to FP32 during lookup. */
+    __global__ void embedding_lookup_fp16_source_kernel(
+        const uint16_t *__restrict__ embed_data,
+        const int *__restrict__ token_ids,
+        float *__restrict__ output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total_elements = num_tokens * d_model;
+        if (idx >= total_elements)
+            return;
+
+        const int token_idx = idx / d_model;
+        const int dim_idx = idx % d_model;
+        const int local_id = token_ids[token_idx] - vocab_offset;
+        if (local_id < 0 || local_id >= vocab_size)
+        {
+            output[idx] = 0.0f;
+            return;
+        }
+
+        const uint16_t source_bits = embed_data[local_id * d_model + dim_idx];
+        output[idx] = __half2float(*reinterpret_cast<const __half *>(&source_bits));
+    }
+
+    /** @brief Convert native BF16 table elements to FP32 during lookup. */
+    __global__ void embedding_lookup_bf16_source_kernel(
+        const uint16_t *__restrict__ embed_data,
+        const int *__restrict__ token_ids,
+        float *__restrict__ output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total_elements = num_tokens * d_model;
+        if (idx >= total_elements)
+            return;
+
+        const int token_idx = idx / d_model;
+        const int dim_idx = idx % d_model;
+        const int local_id = token_ids[token_idx] - vocab_offset;
+        if (local_id < 0 || local_id >= vocab_size)
+        {
+            output[idx] = 0.0f;
+            return;
+        }
+
+        const uint16_t source_bits = embed_data[local_id * d_model + dim_idx];
+        output[idx] = __uint_as_float(static_cast<uint32_t>(source_bits) << 16);
+    }
+
+    /** @brief Launch native FP16-table to FP32 embedding lookup. */
+    cudaError_t launch_embedding_lookup_fp16_source(
+        const uint16_t *embed_data,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset,
+        cudaStream_t stream)
+    {
+        const int total_elements = num_tokens * d_model;
+        constexpr int block_size = 256;
+        const int grid_size = (total_elements + block_size - 1) / block_size;
+        embedding_lookup_fp16_source_kernel<<<grid_size, block_size, 0, stream>>>(
+            embed_data, token_ids, output, num_tokens, d_model, vocab_size, vocab_offset);
+        return cudaGetLastError();
+    }
+
+    /** @brief Launch native BF16-table to FP32 embedding lookup. */
+    cudaError_t launch_embedding_lookup_bf16_source(
+        const uint16_t *embed_data,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset,
+        cudaStream_t stream)
+    {
+        const int total_elements = num_tokens * d_model;
+        constexpr int block_size = 256;
+        const int grid_size = (total_elements + block_size - 1) / block_size;
+        embedding_lookup_bf16_source_kernel<<<grid_size, block_size, 0, stream>>>(
+            embed_data, token_ids, output, num_tokens, d_model, vocab_size, vocab_offset);
         return cudaGetLastError();
     }
 

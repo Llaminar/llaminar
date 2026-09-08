@@ -40,7 +40,7 @@ Relevant dirty files observed in this area include:
 - `src/v2/kernels/rocm/moe/ROCmMoEKernels.hip`
 - `src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip`
 - `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
-- `src/v2/kernels/rocm/ROCmWeightPacker.cpp`
+- `src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp`
 - `tests/v2/integration/kernels/rocm/Test__ROCmMoEKernel.cpp`
 
 Also present are unrelated graph-capture and orchestration changes. Always check:
@@ -365,7 +365,7 @@ if (params_.device_id.is_rocm() && params_.seq_len > 1)
     return false;
 ```
 
-This hard-fail is why `LLAMINAR_ROCM_MOE_GROUPED_PREFILL=0` alone does not provide an A/B oracle today.
+This hard-fail is why disabling the shared GPU grouped-prefill gate (`LLAMINAR_GPU_MOE_GROUPED_PREFILL=0`) alone does not provide an A/B oracle today.
 
 ### ROCm MoE Kernel
 
@@ -504,7 +504,7 @@ Potential files:
 - `tests/v2/integration/parity/qwen35moe/Test__Qwen35MoE_SingleDevice_Parity.cpp`
 - `src/v2/loaders/ModelLoader.cpp`
 - `src/v2/execution/moe/MoEExpertWeightService.cpp`
-- `src/v2/kernels/rocm/ROCmWeightPacker.cpp`
+- `src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp`
 - `src/v2/kernels/rocm/repack/VnniRepackKernels.hip`
 
 ## Commands Worth Reusing

@@ -24,6 +24,7 @@ Usage:
 import os
 import sys
 import argparse
+import json
 from pathlib import Path
 from typing import Optional, Set
 
@@ -41,6 +42,21 @@ for path_to_add in [str(python_dir), str(workspace_dir)]:
 
 from python.reference import create_reference_model, PipelineStage
 from python.reference.pipeline_stages import stage_to_string
+from python.reference.snapshot_metadata import (
+    build_reference_identity,
+    write_metadata_atomically,
+)
+from python.reference.mtp_sidecar_reference import (
+    normalize_mtp_branch_override_batches,
+    promote_mtp_sidecar_metadata,
+)
+
+
+# Recursive depth semantics are shared by dense and MoE Qwen3.6 sidecars.
+# Schema 5 means MTP1/MTP2 consume the preceding predictor's shared-head-
+# normalized hidden result; earlier experimental packs chained the raw decoder
+# residual and are not valid production parity oracles.
+QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA = 5
 
 
 def save_snapshots_as_npy(
@@ -104,39 +120,48 @@ def write_metadata(
     token_ids: list,
     decode_steps: int,
     decode_tokens: Optional[list] = None,
+    extra_metadata_lines: Optional[list[str]] = None,
 ):
-    """Write metadata.txt compatible with parity test loader."""
+    """Publish metadata binding this pack to its exact inference inputs."""
     config = model.hf_model.config
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = output_dir / "metadata.txt"
-    with open(metadata_path, "w") as f:
-        # Snapshot version: bumped when the snapshot format or V-head
-        # reversal semantics change. The C++ parity test framework checks
-        # this version and regenerates snapshots automatically when stale.
-        #   v1: original format
-        #   v2: MoE-only V-head reversal (dense models skip reversal)
-        #   v3: Qwen3.5 prefill GDN conv and Q/K norm snapshots match C++ layout
-        #   v4: GDN alpha/beta projection snapshots are emitted for recurrence debugging
-        f.write(f"snapshot_version: 4\n")
-        f.write(f"Model: {model_path}\n")
-        arch = getattr(config, "architectures", [config.__class__.__name__])
-        f.write(f"Architecture: {arch[0] if arch else config.__class__.__name__}\n")
-        f.write(f"n_layers: {config.num_hidden_layers}\n")
-        f.write(f"n_heads: {config.num_attention_heads}\n")
-        n_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        f.write(f"n_kv_heads: {n_kv_heads}\n")
-        f.write(f"d_model: {config.hidden_size}\n")
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        f.write(f"d_head: {head_dim}\n")
-        # MoE configs use moe_intermediate_size instead of intermediate_size
-        d_ff = getattr(config, "intermediate_size", None) or getattr(config, "moe_intermediate_size", 0)
-        f.write(f"d_ff: {d_ff}\n")
-        f.write(f"vocab_size: {config.vocab_size}\n")
-        f.write(f"prompt: {prompt}\n")
-        f.write(f"token_ids: {','.join(map(str, token_ids))}\n")
-        f.write(f"decode_steps: {decode_steps}\n")
-        if decode_tokens:
-            f.write(f"decode_tokens: {','.join(map(str, decode_tokens))}\n")
+    identity = build_reference_identity(
+        model_path, prompt, token_ids, decode_steps
+    )
+    arch = getattr(config, "architectures", [config.__class__.__name__])
+    n_kv_heads = getattr(
+        config, "num_key_value_heads", config.num_attention_heads
+    )
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    # MoE configs use moe_intermediate_size instead of intermediate_size.
+    d_ff = getattr(config, "intermediate_size", None) or getattr(
+        config, "moe_intermediate_size", 0
+    )
+    lines = [
+        # v4 emits GDN alpha/beta projections for recurrence diagnostics.
+        "snapshot_version: 4",
+        f"Model: {model_path}",
+        f"Architecture: {arch[0] if arch else config.__class__.__name__}",
+        f"n_layers: {config.num_hidden_layers}",
+        f"n_heads: {config.num_attention_heads}",
+        f"n_kv_heads: {n_kv_heads}",
+        f"d_model: {config.hidden_size}",
+        f"d_head: {head_dim}",
+        f"d_ff: {d_ff}",
+        f"vocab_size: {config.vocab_size}",
+        # Keep token_ids immediately after prompt for the legacy multiline
+        # prompt reader; SHA-256 is the production identity authority.
+        f"prompt: {prompt}",
+        f"token_ids: {','.join(map(str, token_ids))}",
+        *identity.metadata_lines(),
+        *(extra_metadata_lines or []),
+    ]
+    if decode_tokens:
+        lines.append(f"decode_tokens: {','.join(map(str, decode_tokens))}")
+    write_metadata_atomically(metadata_path, lines)
 
 
 def run_prefill_and_decode(
@@ -295,6 +320,40 @@ Examples:
         help="Save decode-step snapshots but skip prefill snapshots",
     )
     parser.add_argument(
+        "--mtp-sidecar-snapshots",
+        action="store_true",
+        help=(
+            "Also save recursive Qwen3.6 MTP checkpoints from the "
+            "GGUF's real trailing nextn weights"
+        ),
+    )
+    parser.add_argument(
+        "--mtp-max-draft-depth",
+        type=int,
+        default=3,
+        help=(
+            "Maximum recursive MTP draft depth to materialize when sidecar "
+            "snapshots are enabled (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--mtp-branch-overrides",
+        type=Path,
+        default=None,
+        help=(
+            "JSON mapping decode steps to production recursive MTP condition "
+            "tokens; generate additive branch-qualified sidecar snapshots"
+        ),
+    )
+    parser.add_argument(
+        "--mtp-sidecar-only",
+        action="store_true",
+        help=(
+            "Add canonical recursive MTP snapshots to an authenticated dense "
+            "main-model pack using only the bounded sidecar context"
+        ),
+    )
+    parser.add_argument(
         "--snapshot-decode-steps",
         type=str,
         default="",
@@ -317,7 +376,40 @@ Examples:
     print(f"  Decode steps: {args.decode_steps}")
     print(f"  Metadata only: {args.metadata_only}")
     print(f"  Decode snapshots only: {args.decode_snapshots_only}")
+    print(f"  MTP sidecar snapshots: {args.mtp_sidecar_snapshots}")
+    print(f"  MTP maximum draft depth: {args.mtp_max_draft_depth}")
+    print(f"  MTP branch overrides: {args.mtp_branch_overrides}")
+    print(f"  MTP sidecar only: {args.mtp_sidecar_only}")
     print(f"  Snapshot decode steps: {args.snapshot_decode_steps or '<all>'}")
+
+    if args.mtp_max_draft_depth < 1 or args.mtp_max_draft_depth > 15:
+        raise ValueError("--mtp-max-draft-depth must be in [1, 15]")
+    if args.mtp_sidecar_only and not args.mtp_sidecar_snapshots:
+        raise ValueError("--mtp-sidecar-only requires --mtp-sidecar-snapshots")
+    if args.mtp_sidecar_only and args.metadata_only:
+        raise ValueError("--mtp-sidecar-only is incompatible with --metadata-only")
+    if args.mtp_sidecar_only and args.decode_snapshots_only:
+        raise ValueError(
+            "--mtp-sidecar-only is incompatible with --decode-snapshots-only"
+        )
+    if args.mtp_sidecar_only and args.mtp_branch_overrides is not None:
+        raise ValueError(
+            "--mtp-sidecar-only is canonical generation and cannot be combined "
+            "with branch overrides"
+        )
+
+    branch_override_batches = None
+    if args.mtp_branch_overrides is not None:
+        raw_overrides = json.loads(
+            args.mtp_branch_overrides.read_text(encoding="utf-8")
+        )
+        branch_override_batches = normalize_mtp_branch_override_batches(
+            raw_overrides
+        )
+        if not args.mtp_sidecar_snapshots:
+            raise ValueError(
+                "--mtp-branch-overrides requires --mtp-sidecar-snapshots"
+            )
 
     snapshot_decode_steps: Optional[Set[int]] = None
     if args.snapshot_decode_steps:
@@ -339,34 +431,92 @@ Examples:
                 )
             snapshot_decode_steps.add(step)
 
-    # Create and load model via registry
+    # Additive branches and canonical depth repair need only the graph-external
+    # sidecar allocation plus the authenticated main trajectory already stored
+    # in the output pack.
     print("\nLoading model...")
-    model = create_reference_model("qwen35", args.model)
+    sidecar_context = (
+        args.mtp_sidecar_only or branch_override_batches is not None
+    )
+    reference_kwargs = (
+        {"mtp_sidecar_reference_pack": args.output}
+        if sidecar_context
+        else {}
+    )
+    model = create_reference_model("qwen35", args.model, **reference_kwargs)
     print("Model loaded successfully")
 
     # Run inference and save snapshots
-    total, token_ids, decode_tokens = run_prefill_and_decode(
-        model,
-        args.prompt,
-        args.decode_steps,
-        args.output,
-        verbose=args.verbose,
-        save_snapshots=not args.metadata_only,
-        save_prefill_snapshots=not args.decode_snapshots_only,
-        save_decode_snapshots=True,
-        snapshot_decode_steps=snapshot_decode_steps,
-    )
+    if not sidecar_context:
+        total, token_ids, decode_tokens = run_prefill_and_decode(
+            model,
+            args.prompt,
+            args.decode_steps,
+            args.output,
+            verbose=args.verbose,
+            save_snapshots=not args.metadata_only,
+            save_prefill_snapshots=not args.decode_snapshots_only,
+            save_decode_snapshots=True,
+            snapshot_decode_steps=snapshot_decode_steps,
+        )
+    else:
+        if not args.output.is_dir() or not (args.output / "metadata.txt").is_file():
+            raise ValueError(
+                "Dense sidecar-context generation requires an existing "
+                "canonical pack"
+            )
+        total = 0
+        token_ids = []
+        decode_tokens = []
+
+    if args.mtp_sidecar_snapshots and not args.metadata_only:
+        mtp_total = 0
+        batches = branch_override_batches or [None]
+        for branch_overrides in batches:
+            mtp_total += model.generate_mtp_sidecar_decode_snapshots(
+                args.prompt,
+                args.decode_steps,
+                args.output,
+                max_draft_depth=args.mtp_max_draft_depth,
+                verbose=args.verbose,
+                draft_token_overrides=branch_overrides,
+                reuse_canonical_main_trajectory=args.mtp_sidecar_only,
+            )
+        total += mtp_total
+        (args.output / "mtp_sidecar_snapshot_schema.txt").write_text(
+            f"{QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA}\n", encoding="ascii"
+        )
+        print(f"  Captured {mtp_total} MTP sidecar snapshots")
+        if branch_override_batches is not None:
+            (args.output / "mtp_sidecar_branch_overrides.json").write_text(
+                json.dumps(branch_override_batches, sort_keys=True, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
 
     # Write metadata
-    write_metadata(
-        args.output,
-        args.model,
-        model,
-        args.prompt,
-        token_ids,
-        args.decode_steps,
-        decode_tokens,
-    )
+    if not sidecar_context:
+        write_metadata(
+            args.output,
+            args.model,
+            model,
+            args.prompt,
+            token_ids,
+            args.decode_steps,
+            decode_tokens,
+            extra_metadata_lines=(
+                [
+                    "mtp_sidecar_max_draft_depth: "
+                    f"{args.mtp_max_draft_depth}"
+                ]
+                if args.mtp_sidecar_snapshots
+                else []
+            ),
+        )
+    elif args.mtp_sidecar_only:
+        promote_mtp_sidecar_metadata(
+            args.output / "metadata.txt", args.mtp_max_draft_depth
+        )
 
     print(f"\n✓ Done! {total} snapshots saved to: {args.output}")
 

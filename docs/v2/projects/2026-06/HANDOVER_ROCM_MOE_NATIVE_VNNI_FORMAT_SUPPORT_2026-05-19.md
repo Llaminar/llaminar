@@ -26,7 +26,7 @@ Files directly involved in this investigation:
 - `src/v2/kernels/rocm/moe/ROCmMoEKernel.h`
 - `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
 - `src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip`
-- `src/v2/kernels/rocm/ROCmWeightPacker.cpp`
+- `src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp`
 - `tests/v2/integration/kernels/rocm/Test__ROCmMoEKernel.cpp`
 
 There are many other dirty files in the workspace, including graph-capture files and stage/orchestrator changes. Check `git status --short` before editing and keep changes scoped.
@@ -255,7 +255,7 @@ The synthetic K-quant tests now inject nonzero mins but still use friendly rando
 Targets:
 
 - `src/v2/kernels/rocm/repack/VnniRepackKernels.hip`
-- `src/v2/kernels/rocm/ROCmWeightPacker.cpp`
+- `src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp`
 - `src/v2/tensors/Q4_KTensor.cpp`
 - `src/v2/tensors/Q5_KTensor.cpp`
 

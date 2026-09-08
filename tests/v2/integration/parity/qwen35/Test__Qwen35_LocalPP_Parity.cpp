@@ -1,286 +1,198 @@
 /**
  * @file Test__Qwen35_LocalPP_Parity.cpp
- * @brief Local Pipeline Parallelism Qwen3.5 parity tests
+ * @brief Generated rank-local pipeline-parity matrix for dense Qwen3.5.
  *
- * Tests that Local PP inference (layers split across devices within a single
- * node with activation transfer between stages) produces results matching
- * PyTorch reference outputs for Qwen3.5 models with GDN + FA hybrid
- * architecture.
- *
- * Configurations (Qwen3.5-0.8B Q4_0):
- *   - LocalPP_HOST_2xCPU_08B:        2x CPU via HOST backend
- *   - LocalPP_NCCL_2xCUDA_08B:       2x NVIDIA GPU via NCCL (skipped: no GPU kernels)
- *   - LocalPP_RCCL_2xROCm_08B:       2x AMD GPU via RCCL (skipped: no GPU kernels)
- *   - LocalPP_HOST_CUDA_ROCm_08B:    Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
- *
- * Configurations (Qwen3.5-4B Q8_0):
- *   - LocalPP_HOST_2xCPU_4B:         2x CPU via HOST backend
- *   - LocalPP_NCCL_2xCUDA_4B:        2x NVIDIA GPU via NCCL (skipped: no GPU kernels)
- *   - LocalPP_RCCL_2xROCm_4B:        2x AMD GPU via RCCL (skipped: no GPU kernels)
- *   - LocalPP_HOST_CUDA_ROCm_4B:     Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
- *
- * Configurations (Qwen3.5-27B Q4_K_M — dense 64-layer hybrid GDN+FA):
- *   - LocalPP_NCCL_2xCUDA_27B:       2x NVIDIA GPU via NCCL
- *   - LocalPP_RCCL_2xROCm_27B:       2x AMD GPU via RCCL
- *   - LocalPP_HETEROGENEOUS_CUDA_ROCm_27B: Heterogeneous CUDA+ROCm via HOST
- *
- * @author David Sanftenberg
- * @date 2026
+ * Each definition names the real participant addresses and pipeline layer
+ * policy consumed by the production runner. The canonical campaign expands
+ * precision axes and proves fresh, full-prefix, and partial-prefix execution
+ * without a topology-specific test lifecycle.
  */
+
+#include "Qwen35ModelParityDefinitions.h"
+#include "Qwen35ParityTestBase.h"
+
+#include "backends/GPUDeviceContextPool.h"
+#include "collective/BackendRouter.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
-#include "Qwen35ParityTestBase.h"
-#include "collective/BackendRouter.h"
-#include "backends/GPUDeviceContextPool.h"
+
+#include <array>
+#include <iostream>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen35;
 
-// =============================================================================
-// Test Configuration Definitions — Qwen3.5-0.8B (Q4_0)
-// =============================================================================
-
-static const auto kQwen35_08B_PP_Thresholds = BackendThresholds{
-    .cosine_threshold = 0.96f,        // Observed min: 0.989 (RCCL), was 0.95
-    .decode_cosine_threshold = 0.95f, // Observed min: 0.983 avg decode, was 0.90
-    .early_layers_count = 6,
-    .min_early_layers_passed = 4,
-    .kl_threshold = 0.06f, // Observed max: 0.017 (RCCL), was 0.20 = 12x over-relaxed
-};
-
-static const auto kQwen35_4B_PP_Thresholds = BackendThresholds{
-    .cosine_threshold = 0.96f,        // Observed min: 0.990 (RCCL), was 0.95
-    .decode_cosine_threshold = 0.95f, // Observed min: 0.991 avg decode, was 0.90
-    .early_layers_count = 6,
-    .min_early_layers_passed = 4,
-    .kl_threshold = 0.05f, // Observed max: 0.014 (HETERO), was 0.20 = 14x over-relaxed
-};
-
-// Q4_K_M quantization diverges more than Q8_0 due to lower precision; 64 layers
-// accumulate more drift so thresholds are relaxed relative to 4B/0.8B configs.
-// Empirical results: min cosine ~0.9996, KL ~0.0001 across CUDA/ROCm/heterogeneous.
-static const auto kQwen35_27B_PP_Thresholds = BackendThresholds{
-    .cosine_threshold = 0.998f,        // Observed: 0.9996+ across all configs
-    .decode_cosine_threshold = 0.996f, // Observed: 0.9996+ in decode steps
-    .early_layers_count = 8,
-    .min_early_layers_passed = 7,
-    .kl_threshold = 0.01f, // Observed: 0.0001-0.0002
-};
-
-static const std::vector<TestConfig> kLocalPPConfigs = {
-    // =========================================================================
-    // Qwen3.5-0.8B (Q4_0) — CPU-only PP (HOST backend)
-    // =========================================================================
-    {
-        .name = "LocalPP_HOST_2xCPU_08B",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_08B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    // =========================================================================
-    // Qwen3.5-0.8B (Q4_0) — GPU configs (skipped: no GPU kernels yet)
-    // =========================================================================
-    {
-        .name = "LocalPP_NCCL_2xCUDA_08B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_08B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalPP_RCCL_2xROCm_08B",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_08B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalPP_HETEROGENEOUS_CUDA_ROCm_08B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_08B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    // =========================================================================
-    // Qwen3.5-4B (Q8_0) — CPU-only PP (HOST backend)
-    // =========================================================================
-    {
-        .name = "LocalPP_HOST_2xCPU_4B",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_4B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    // =========================================================================
-    // Qwen3.5-4B (Q8_0) — GPU configs (skipped: no GPU kernels yet)
-    // =========================================================================
-    {
-        .name = "LocalPP_NCCL_2xCUDA_4B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_4B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalPP_RCCL_2xROCm_4B",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_4B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalPP_HETEROGENEOUS_CUDA_ROCm_4B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_4B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    // =========================================================================
-    // Qwen3.5-27B (Q4_K_M) — dense 64-layer hybrid GDN+FA, pipeline split 0-31 / 32-63
-    // Critical for validating large-model PP correctness with Q4 quantization
-    // on production GPU configurations (CUDA and ROCm).
-    // =========================================================================
-    {
-        .name = "LocalPP_NCCL_2xCUDA_27B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_27B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-27B-Q4_K_M.gguf",
-        .snapshot_dir = "pytorch_qwen35_27b_q4km_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalPP_RCCL_2xROCm_27B",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_27B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-27B-Q4_K_M.gguf",
-        .snapshot_dir = "pytorch_qwen35_27b_q4km_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalPP_HETEROGENEOUS_CUDA_ROCm_27B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = kQwen35_27B_PP_Thresholds,
-        .model_path = "models/Qwen3.5-27B-Q4_K_M.gguf",
-        .snapshot_dir = "pytorch_qwen35_27b_q4km_snapshots",
-        .pp_weights = {0.31f, 0.69f}, // CUDA gets ~20 layers, ROCm gets ~44 (CUDA has less VRAM)
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-};
-
-// =============================================================================
-// Parameterized Test Fixture
-// =============================================================================
-
-class Qwen35LocalPPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35LocalPPParityTest>,
-                                public ::testing::WithParamInterface<TestConfig>
+namespace
 {
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+    /** @return Established Qwen3.5-0.8B pipeline numerical contract. */
+    BackendThresholds qwen35_08BPPThresholds()
+    {
+        return BackendThresholds{
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.95f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.06f,
+        };
+    }
 
-// =============================================================================
-// Test Cases
-// =============================================================================
+    /** @return Established Qwen3.5-4B pipeline numerical contract. */
+    BackendThresholds qwen35_4BPPThresholds()
+    {
+        return BackendThresholds{
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.95f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.05f,
+        };
+    }
 
-TEST_P(Qwen35LocalPPParityTest, PrefillParity)
+    /** @return Established Qwen3.5-27B Q4_K_M pipeline contract. */
+    BackendThresholds qwen35_27BPPThresholds()
+    {
+        return BackendThresholds{
+            .cosine_threshold = 0.998f,
+            .decode_cosine_threshold = 0.996f,
+            .early_layers_count = 8,
+            .min_early_layers_passed = 7,
+            .kl_threshold = 0.01f,
+        };
+    }
+
+    /** @return One typed two-stage rank-local pipeline definition. */
+    ModelParityDefinition makeQwen35LocalPPDefinition(
+        ModelParityModelDefinition model,
+        std::string topology_id,
+        GlobalDeviceAddress first,
+        GlobalDeviceAddress second,
+        BackendThresholds thresholds,
+        std::vector<float> pipeline_weights = {})
+    {
+        auto definition = qwen35ParityDefinition(
+            std::move(model),
+            ModelParityTopologyDefinition{
+                .test_id = std::move(topology_id),
+                .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+                .participants = {
+                    {std::move(first), 0},
+                    {std::move(second), 0},
+                },
+                .collective = Collective::None,
+                .mpi_ranks = 1,
+                .pipeline_stage_sizes = {1, 1},
+                .pipeline_weights = std::move(pipeline_weights),
+            },
+            std::move(thresholds));
+        return definition;
+    }
+
+    /** @return Canonically expanded dense Qwen3.5 local-pipeline cases. */
+    const std::vector<ModelParityCase> &qwen35LocalPPCases()
+    {
+        static const auto cases = []
+        {
+            const std::array definitions = {
+                makeQwen35LocalPPDefinition(
+                    qwen35_08B_Q40ParityModel(), "LocalPP_HOST_2xCPU",
+                    GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1),
+                    qwen35_08BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_08B_Q40ParityModel(), "LocalPP_NCCL_2xCUDA",
+                    GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1),
+                    qwen35_08BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_08B_Q40ParityModel(), "LocalPP_RCCL_2xROCm",
+                    GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1),
+                    qwen35_08BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_08B_Q40ParityModel(),
+                    "LocalPP_Heterogeneous_CUDA_ROCm",
+                    GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0),
+                    qwen35_08BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_4B_Q80ParityModel(), "LocalPP_HOST_2xCPU",
+                    GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1),
+                    qwen35_4BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_4B_Q80ParityModel(), "LocalPP_NCCL_2xCUDA",
+                    GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1),
+                    qwen35_4BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_4B_Q80ParityModel(), "LocalPP_RCCL_2xROCm",
+                    GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1),
+                    qwen35_4BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_4B_Q80ParityModel(),
+                    "LocalPP_Heterogeneous_CUDA_ROCm",
+                    GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0),
+                    qwen35_4BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_27B_Q4KMParityModel(), "LocalPP_NCCL_2xCUDA",
+                    GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1),
+                    qwen35_27BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_27B_Q4KMParityModel(), "LocalPP_RCCL_2xROCm",
+                    GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1),
+                    qwen35_27BPPThresholds()),
+                makeQwen35LocalPPDefinition(
+                    qwen35_27B_Q4KMParityModel(),
+                    "LocalPP_Heterogeneous_CUDA_ROCm",
+                    GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0),
+                    qwen35_27BPPThresholds(), {0.31f, 0.69f}),
+            };
+
+            std::vector<ModelParityCase> expanded;
+            for (const auto &definition : definitions)
+            {
+                auto definition_cases =
+                    expandModelParityDefinition(definition);
+                expanded.insert(
+                    expanded.end(),
+                    std::make_move_iterator(definition_cases.begin()),
+                    std::make_move_iterator(definition_cases.end()));
+            }
+            return expanded;
+        }();
+        return cases;
+    }
+} // namespace
+
+class Qwen35LocalPPParityTest
+    : public Qwen35ConfigDrivenParityTest<Qwen35LocalPPParityTest>,
+      public ModelParityCaseParameter
+{};
+
+TEST_P(Qwen35LocalPPParityTest, ProductionParity)
 {
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runPrefillParity();
-    assertParity(summary);
+    runProductionParityCampaign();
 }
-
-TEST_P(Qwen35LocalPPParityTest, DecodeParity)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen35LocalPPParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
-}
-
-// =============================================================================
-// Test Instantiation
-// =============================================================================
 
 INSTANTIATE_TEST_SUITE_P(
     Qwen35,
     Qwen35LocalPPParityTest,
-    ::testing::ValuesIn(kLocalPPConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
-    {
-        return info.param.name;
-    });
-
-// =============================================================================
-// Custom Main with MPI Initialization
-// =============================================================================
+    ::testing::ValuesIn(qwen35LocalPPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
+    { return info.param.testName(); });
 
 int main(int argc, char **argv)
 {
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
-    int result = RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
 
-    // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
-    // NCCLCoordinator cleanup happens while CUDA runtime is still active.
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();
-
     MPI_Finalize();
 
-    // Skip static destructors — see Test__Qwen2_SingleDevice_Parity.cpp for rationale.
     std::cout.flush();
     std::cerr.flush();
     _exit(result);

@@ -6,8 +6,8 @@
  * This validation runs AFTER model loading but BEFORE weight sharding begins.
  *
  * Validation Categories:
- * 1. Head Divisibility - KV heads and Q heads must divide evenly by TP degree
- * 2. Dimension Divisibility - FFN, embedding, vocab must divide evenly
+ * 1. Rank-local TP - validate the exact uneven/GQA-aware sharding assignment
+ * 2. Uniform TP - validate cross-rank head/dimension divisibility
  * 3. PP Layer Assignment - Layers must divide evenly across PP stages
  * 4. Domain Configuration - Named domains must have valid head assignments
  * 5. Proportional TP - Weighted splits must result in integer head counts
@@ -19,6 +19,7 @@
 #pragma once
 
 #include "OrchestrationConfig.h"
+#include "TensorParallelConfig.h"
 #include "../interfaces/IModelContext.h"
 #include <vector>
 #include <string>
@@ -127,9 +128,16 @@ namespace llaminar2
 
             if (config.tp_degree > 1)
             {
-                validateTPHeadDivisibility(config, model, result);
-                validateTPDimensionDivisibility(config, model, result);
-                validateTPProportionalWeights(config, model, result);
+                if (config.tp_scope == TPScope::RANK_LOCAL)
+                {
+                    validateRankLocalTPAssignment(config, model, result);
+                }
+                else
+                {
+                    validateTPHeadDivisibility(config, model, result);
+                    validateTPDimensionDivisibility(config, model, result);
+                    validateTPProportionalWeights(config, model, result);
+                }
             }
 
             // =====================================================================
@@ -163,6 +171,74 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Validate the exact assignment production LocalTP will consume.
+         *
+         * Rank-local TP supports uneven query-head partitions and replicates
+         * KV heads when GQA exposes fewer KV heads than participants. The old
+         * divisibility preflight contradicted that implementation and rejected
+         * configurations after capacity planning had already admitted them.
+         * Reusing @ref TensorParallelConfig makes admission and weight slicing
+         * share one accounting authority.
+         */
+        static void validateRankLocalTPAssignment(
+            const OrchestrationConfig &config,
+            const IModelContext &model,
+            TPPPValidationResult &result)
+        {
+            try
+            {
+                TensorParallelConfig assignment;
+                if (config.tp_weights.empty())
+                {
+                    assignment = TensorParallelConfig::equalSplit(
+                        config.tp_degree,
+                        model.headCount(),
+                        model.headCountKV(),
+                        model.feedForwardLength(),
+                        model.vocabSize());
+                }
+                else
+                {
+                    std::vector<DeviceId> devices;
+                    devices.reserve(
+                        static_cast<std::size_t>(config.tp_degree));
+                    for (int rank = 0; rank < config.tp_degree; ++rank)
+                        devices.push_back(DeviceId::cuda(rank));
+                    assignment = TensorParallelConfig::proportionalSplit(
+                        devices,
+                        config.tp_weights,
+                        model.headCount(),
+                        model.headCountKV(),
+                        model.feedForwardLength(),
+                        model.vocabSize());
+                }
+
+                const std::string error = assignment.validationError();
+                if (!error.empty())
+                {
+                    result.addError(
+                        "Rank-local TP assignment is incompatible with the model: " +
+                        error);
+                    return;
+                }
+                if (assignment.totalHeads() != model.headCount() ||
+                    assignment.totalKVHeads() != model.headCountKV() ||
+                    assignment.totalDFF() != model.feedForwardLength() ||
+                    assignment.totalVocab() != model.vocabSize())
+                {
+                    result.addError(
+                        "Rank-local TP assignment does not cover the complete model geometry");
+                }
+            }
+            catch (const std::exception &error)
+            {
+                result.addError(
+                    std::string("Rank-local TP assignment is incompatible with the model: ") +
+                    error.what());
+            }
+        }
+
         static int decoderLayerCountExcludingTrailingMTP(const IModelContext &model)
         {
             int n_layers = model.blockCount();

@@ -12,6 +12,11 @@
  * 3. Handles tensor type introspection in multiply_tensor()
  * 4. Manages lazy weight conversion to INT8 + scales
  *
+ * Concurrent projections borrow disjoint aligned slices of the admitted
+ * workspace envelope. A merged graph-family capacity need not be divisible by
+ * a particular stage's fan-out, so slice offsets are computed in element
+ * alignment units, never by truncating an arbitrary byte division.
+ *
  * **Weight Conversion Pipeline**:
  * 1. Dequantize original quantized weights to FP32
  * 2. Per-column symmetric quantization to INT8
@@ -23,30 +28,39 @@
  */
 
 #include "CUDAQuantisedGemmKernel.h"
+#include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h" // DeviceManager
+#include "backends/BackendManager.h"
 #include "backends/DeviceId.h"       // DeviceId
+#include "backends/GPUDeviceContextPool.h"
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
 #include "tensors/TensorSlice.h"     // TensorSlice - for unwrapping sliced biases
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
+#include "transfer/TransferEngine.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/AlignedWorkspaceSlices.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h" // isGraphCaptureActive()
+#include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 
 #include <cuda_runtime.h>
 
 #include <stdexcept>
+#include <array>
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <memory>
 #include <unordered_map>
@@ -64,18 +78,6 @@ namespace llaminar2
         // These functions are implemented in CUDAQuantisedGemmKernel_CUTLASS.cu
         extern "C"
         {
-            void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
-            bool cudaNativeVNNIPrefill_getDeterministicMode();
-
-            // Upload work buffers for activation quantization
-            bool cudaQuantGemm_ensureWorkBuffers(
-                int8_t **d_A_int8,   // [M x K] quantized activations
-                float **d_scales_A,  // [M] per-row scales
-                int32_t **d_C_int32, // [M x N] INT32 accumulator
-                int *work_buffer_M,  // Current capacity
-                int M, int K, int N,
-                int cuda_device_id);
-
             // Quantize FP32 activations to INT8 with per-block-of-32 scales
             bool cudaQuantGemm_quantizeActivationsBlockwise(
                 const float *d_A_fp32,       // [M x K]
@@ -89,13 +91,13 @@ namespace llaminar2
                 const float *d_A_fp32,       // [M x K]
                 int8_t *d_A_int8,            // [M x K] output
                 float *d_scales_A_blockwise, // [M x (K/32)] output
-                int32_t *d_sums_A_blockwise, // [M x (K/32)] output
+                int32_t *d_sums_A_blockwise, // [(K/32) x M] block-major output
                 int M, int K,
                 int cuda_device_id,
                 void *stream = nullptr);
 
             // Free device memory
-            void cudaQuantGemm_freeDevice(void *d_ptr);
+            void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
 
             // Fused SwiGLU + blockwise quantization (from CUDAFusedOpsKernels.cu)
             bool cudaOps_fused_swiglu_quantize_blockwise(
@@ -128,8 +130,7 @@ namespace llaminar2
             // Upload raw bytes from host to device (nvcc-compiled for CUDA runtime consistency)
             bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
 
-            // Memory management helpers for fused tensor projections
-            bool cudaQuantGemm_allocFloat(float **d_ptr, size_t count, int cuda_device_id);
+            // Memory movement helpers for prepared tensor projections.
             bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id);
             bool cudaQuantGemm_copyDeviceToHost(float *h_dst, const float *d_src, size_t count, int cuda_device_id);
             bool cudaQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int cuda_device_id);
@@ -166,7 +167,8 @@ namespace llaminar2
                 CUDAGemvContext *gemv_ctx,
                 CUDARowMajorWeights **rm_slot);
 
-            bool cudaNativeVNNIGemvTuned_m2_fp32(
+            /** Execute physical M=1 bytes under source-format arithmetic policy. */
+            bool cudaNativeVNNIGemvTuned_fp32_withPolicy(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const uint16_t *d_scales,
@@ -179,6 +181,7 @@ namespace llaminar2
                 const float *d_C_existing,
                 const float *d_bias,
                 uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
                 int cuda_device_id,
                 void *stream,
                 CUDAGemvContext *gemv_ctx,
@@ -205,6 +208,20 @@ namespace llaminar2
 
             void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int enabled);
             int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
+            void cudaNativeVNNIGemvTuned_setSerialPartitionN(int n);
+            int cudaNativeVNNIGemvTuned_getSerialPartitionN();
+
+            /**
+             * @brief Query the exact ordered-reduction scratch contract used by
+             *        production graph-captured M=1 decode.
+             */
+            bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                uint8_t codebook_id,
+                int n,
+                int k,
+                int sm_count,
+                int *uses_ordered_reducer,
+                int *k_partitions);
 
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
@@ -227,12 +244,35 @@ namespace llaminar2
                 void *stream,
                 CUDAPrefillContext *prefill_ctx);
 
+            /**
+             * @brief Execute physical NativeVNNI bytes with a source policy.
+             *
+             * Expert promotion may normalize the byte decoder to codebook 23
+             * while retaining a compact source codebook's reduction order.
+             */
+            bool cudaNativeVNNIPrefill_fp32_withPolicy(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                const int32_t *d_sums_A_block,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
+                int cuda_device_id,
+                void *stream,
+                CUDAPrefillContext *prefill_ctx);
+
             void cudaPrefillContext_bindWorkspace(
                 CUDAPrefillContext *ctx,
-                float *splitk_partials,
-                size_t splitk_partials_bytes,
-                float *streamk_fixup,
-                size_t streamk_fixup_bytes);
+                float *canonical_kpart_partials,
+                size_t canonical_kpart_partials_bytes);
 
             bool cudaNativeVNNIPrefill_getWorkspacePlan(
                 uint8_t codebook_id,
@@ -240,29 +280,42 @@ namespace llaminar2
                 int N,
                 int K,
                 int cuda_device_id,
-                size_t *splitk_partials_bytes,
-                size_t *streamk_fixup_bytes,
-                int *planned_split_k,
-                int *planned_streamk);
+                size_t *canonical_kpart_partials_bytes,
+                int *planned_k_partitions);
+
+            bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+                uint8_t codebook_id,
+                int max_M,
+                int N,
+                int K,
+                int cuda_device_id,
+                size_t *canonical_kpart_partials_bytes,
+                int *planned_k_partitions,
+                int *planned_rows);
+
+            /** @brief Plan prefill scratch for distinct decoder/policy IDs. */
+            bool cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
+                int max_M,
+                int N,
+                int K,
+                int cuda_device_id,
+                size_t *canonical_kpart_partials_bytes,
+                int *planned_k_partitions,
+                int *planned_rows);
 
             void cudaNativeVNNIPrefill_getLastLaunchSelection(
                 int *tile_id,
-                int *split_k,
+                int *k_partitions,
                 int *used_bk256,
-                int *used_streamk);
+                int *used_canonical_kpart);
 
-            // cuBLAS FP16 GEMM for Q4_0 native VNNI weights (CUDAcuBLASQuantGemm.cu)
-            bool cudaCuBLAS_fp16_gemm_q40(
-                const uint8_t *d_payload,
-                const uint16_t *d_scales_B,
-                const float *d_A_fp32,
-                float *d_C_fp32,
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                int cuda_device_id,
-                void *stream,
-                CUDACuBLASContext *cublas_ctx);
+            int cudaNativeVNNIPrefill_getBK256Mode();
+            bool cudaNativeVNNIPrefill_getExactOverlayEnabled();
+            bool cudaNativeVNNIPrefill_getCanonicalKPartitionMode();
+            void cudaNativeVNNIPrefill_getForceTile(int *tile_id);
+
         }
 
         // =====================================================================
@@ -283,49 +336,123 @@ namespace llaminar2
         // reuse a slot after that slot's completion event is observed.
         constexpr int kCudaConcurrentDecodeWorkspaceSlots = 8;
 
+        thread_local bool g_cuda_native_vnni_verifier_scope_active = false;
+
         /**
-         * @brief Select serial-decode-shaped CUDA NativeVNNI dispatch inside verifier hooks.
+         * @brief Mark CUDA NativeVNNI calls as publication-sensitive verifier work.
          *
-         * The normal CUDA generated table optimizes M=2..4 grouped GEMV rows
-         * independently from the M=1 decode route.  That is fine for throughput
-         * microbenchmarks, but MTP verifier rows can be published into live KV
-         * and GDN state.  While this scope is active, small-M grouped kernels
-         * keep batching rows but choose the generated M=1 dispatch policy.  The
-         * scope also disables CUDA prefill/concurrent decode paths that would
-         * otherwise need extra verifier-only workspace and reorder reductions.
-         * Together these choices give each codebook the same reduction contract
-         * as serial decode without turning on process-wide deterministic mode.
+         * One scope binds both the tensor-adapter route and the raw generated
+         * M1 arithmetic selector. A caller may launch a fused bundle or a raw
+         * grouped operation without relying on a second, hidden helper scope.
+         * Nested scopes restore both selectors together. They affect graph
+         * recording only; device replay retains the chosen ordered kernels.
          */
         class ScopedNativeVNNIDecodeEquivalentDispatch final : public ITensorGemm::VerifierKernelModeScope
         {
         public:
-            ScopedNativeVNNIDecodeEquivalentDispatch()
-                : previous_gemv_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config()),
-                  previous_prefill_(cudaNativeVNNIPrefill_getDeterministicMode())
+            /** @brief Atomically bind the adapter/raw launch policy for this scope. */
+            explicit ScopedNativeVNNIDecodeEquivalentDispatch(std::optional<DeviceRowRange> rows)
+                : VerifierKernelModeScope(rows),
+                  previous_scope_(g_cuda_native_vnni_verifier_scope_active),
+                  previous_policy_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
             {
+                g_cuda_native_vnni_verifier_scope_active = true;
                 cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
-                cudaNativeVNNIPrefill_setDeterministicMode(true);
             }
 
+            /** @brief Restore the enclosing capture policy, including raw dispatch. */
             ~ScopedNativeVNNIDecodeEquivalentDispatch()
             {
-                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_gemv_);
-                cudaNativeVNNIPrefill_setDeterministicMode(previous_prefill_);
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_policy_);
+                g_cuda_native_vnni_verifier_scope_active = previous_scope_;
             }
 
             ScopedNativeVNNIDecodeEquivalentDispatch(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
             ScopedNativeVNNIDecodeEquivalentDispatch &operator=(const ScopedNativeVNNIDecodeEquivalentDispatch &) = delete;
 
         private:
-            int previous_gemv_ = 0;
-            bool previous_prefill_ = false;
+            bool previous_scope_ = false;
+            int previous_policy_ = 0; ///< Enclosing generated-policy selector.
         };
 
-        bool useCanonicalM1SmallMDecode()
+        /**
+         * @brief Bind generated NativeVNNI policy to the serial TP shard width.
+         *
+         * Only generated-policy lookup observes this value. Device pointers,
+         * launch extents, and output strides retain the full replicated width.
+         */
+        class ScopedNativeVNNISerialPartition final
+            : public ITensorGemm::OutputPartitionEquivalenceScope
         {
-            return debugEnv().gemm.deterministic ||
-                   cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config() != 0;
+        public:
+            explicit ScopedNativeVNNISerialPartition(int serial_partition_n)
+                : previous_(cudaNativeVNNIGemvTuned_getSerialPartitionN())
+            {
+                cudaNativeVNNIGemvTuned_setSerialPartitionN(serial_partition_n);
+            }
+
+            ~ScopedNativeVNNISerialPartition() override
+            {
+                cudaNativeVNNIGemvTuned_setSerialPartitionN(previous_);
+            }
+
+            ScopedNativeVNNISerialPartition(
+                const ScopedNativeVNNISerialPartition &) = delete;
+            ScopedNativeVNNISerialPartition &operator=(
+                const ScopedNativeVNNISerialPartition &) = delete;
+
+        private:
+            int previous_ = 0;
+        };
+
+        bool useCanonicalM1Decode()
+        {
+            /*
+             * CUDA NativeVNNI M=1 decode is part of the MTP verifier oracle, not
+             * merely a fast approximate GEMV.  The canonical transaction is the
+             * ordinary generated M=1 decode GEMV that serial inference uses after
+             * activation quantization.  Grouped verifier paths may batch their
+             * outer loop, but any row that can be published to live state must
+             * enter this exact M=1 reduction contract.
+             */
+            return true;
         }
+
+        bool explicitSmallMVerifierScopeActive()
+        {
+            return g_cuda_native_vnni_verifier_scope_active;
+        }
+
+        /**
+         * @brief Resolve grouped verifier work through public-M1 dispatch.
+         *
+         * CUDA NativeVNNI has one ordered K-partition arithmetic contract. The
+         * thread-local scope selects the public-M1 family, tile, and exact K
+         * partition for a grouped launch; it does not enable a slower or
+         * alternate reduction implementation.
+         */
+        class ScopedNativeVNNIGemvDecodeEquivalentM1Config final
+        {
+        public:
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config()
+                : previous_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
+            {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+            }
+
+            ~ScopedNativeVNNIGemvDecodeEquivalentM1Config()
+            {
+                cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_);
+            }
+
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config(
+                const ScopedNativeVNNIGemvDecodeEquivalentM1Config &) = delete;
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config &operator=(
+                const ScopedNativeVNNIGemvDecodeEquivalentM1Config &) = delete;
+
+        private:
+            int previous_ = 0;
+        };
 
         struct CUDAConcurrentPrefillPool
         {
@@ -384,6 +511,8 @@ namespace llaminar2
 
         struct CUDAQuantisedGemmKernel::Impl
         {
+            int cuda_device_id = -1;
+
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
             uint8_t *d_weights_native_vnni = nullptr;
             uint16_t *d_weights_native_scales = nullptr;
@@ -391,11 +520,13 @@ namespace llaminar2
             uint32_t *d_weights_native_emins = nullptr;
             uint8_t native_codebook_id = 0;
             uint32_t native_blocks_per_row = 0;
+            NativeVnniSourceIdentity native_source_identity;
+            NativeVnniReusableDeviceAllocationFormat native_allocation_format;
+            CUDARowMajorWeights *rowmajor = nullptr;
 
             // Per-device contexts (replaces process-global static state)
             mutable CUDAGemvContext *gemv_ctx = nullptr;
             mutable CUDAPrefillContext *prefill_ctx = nullptr;
-            mutable CUDACuBLASContext *cublas_ctx = nullptr;
 
             // Work buffers - ALWAYS from workspace (never owned by kernel)
             // These pointers are set from workspace in validateWorkspace()
@@ -412,13 +543,13 @@ namespace llaminar2
                 if (owns_weight_memory)
                 {
                     if (d_weights_native_vnni)
-                        cudaQuantGemm_freeDevice(d_weights_native_vnni);
+                        cudaQuantGemm_freeDevice(d_weights_native_vnni, cuda_device_id);
                     if (d_weights_native_scales)
-                        cudaQuantGemm_freeDevice(d_weights_native_scales);
+                        cudaQuantGemm_freeDevice(d_weights_native_scales, cuda_device_id);
                     if (d_weights_native_mins)
-                        cudaQuantGemm_freeDevice(d_weights_native_mins);
+                        cudaQuantGemm_freeDevice(d_weights_native_mins, cuda_device_id);
                     if (d_weights_native_emins)
-                        cudaQuantGemm_freeDevice(d_weights_native_emins);
+                        cudaQuantGemm_freeDevice(d_weights_native_emins, cuda_device_id);
                 }
                 // Per-device contexts
                 if (gemv_ctx)
@@ -431,10 +562,10 @@ namespace llaminar2
                     cudaPrefillContext_destroy(prefill_ctx);
                     prefill_ctx = nullptr;
                 }
-                if (cublas_ctx)
+                if (rowmajor)
                 {
-                    cudaCuBLASContext_destroy(cublas_ctx);
-                    cublas_ctx = nullptr;
+                    cudaRowMajorWeights_destroy(rowmajor);
+                    rowmajor = nullptr;
                 }
                 // Work buffers are NEVER owned by kernel - they come from workspace
             }
@@ -454,14 +585,178 @@ namespace llaminar2
                            : 1ULL;
             }
 
-            size_t paddedSplitKPartialBytes(int m, int n, int split_k)
+            size_t paddedCanonicalKpartBytes(
+                int m,
+                int n,
+                int k_partitions)
             {
-                if (m <= 0 || n <= 0 || split_k <= 1)
+                if (m <= 0 || n <= 0 || k_partitions <= 1)
                     return 0;
-                return static_cast<size_t>(split_k) *
+                return static_cast<size_t>(k_partitions) *
                        paddedNativePrefillM(m) *
                        static_cast<size_t>(n) *
                        sizeof(float);
+            }
+
+            struct NativePrefillWorkspaceBounds
+            {
+                size_t canonical_kpart_partials_bytes = 0;
+                int canonical_kpart_rows = 0;
+                int planned_k_partitions = 1;
+            };
+
+            struct NativePrefillWorkspaceCacheKey
+            {
+                uint8_t codebook_id = 0;
+                uint8_t arithmetic_policy_codebook_id = 0;
+                int max_m = 0;
+                int n = 0;
+                int k = 0;
+                int cuda_device_id = 0;
+                int bk256_mode = 0;
+                int canonical_kpart_mode = 0;
+                int exact_overlay_enabled = 1;
+                int force_tile = -1;
+
+                bool operator==(const NativePrefillWorkspaceCacheKey &other) const
+                {
+                    return codebook_id == other.codebook_id &&
+                           arithmetic_policy_codebook_id ==
+                               other.arithmetic_policy_codebook_id &&
+                           max_m == other.max_m &&
+                           n == other.n &&
+                           k == other.k &&
+                           cuda_device_id == other.cuda_device_id &&
+                           bk256_mode == other.bk256_mode &&
+                           canonical_kpart_mode == other.canonical_kpart_mode &&
+                           exact_overlay_enabled == other.exact_overlay_enabled &&
+                           force_tile == other.force_tile;
+                }
+            };
+
+            struct NativePrefillWorkspaceCacheKeyHash
+            {
+                size_t operator()(const NativePrefillWorkspaceCacheKey &key) const
+                {
+                    size_t h = 1469598103934665603ULL;
+                    auto mix = [&h](size_t v)
+                    {
+                        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                    };
+                    mix(static_cast<size_t>(key.codebook_id));
+                    mix(static_cast<size_t>(
+                        key.arithmetic_policy_codebook_id));
+                    mix(static_cast<size_t>(key.max_m));
+                    mix(static_cast<size_t>(key.n));
+                    mix(static_cast<size_t>(key.k));
+                    mix(static_cast<size_t>(key.cuda_device_id));
+                    mix(static_cast<size_t>(key.bk256_mode));
+                    mix(static_cast<size_t>(key.canonical_kpart_mode));
+                    mix(static_cast<size_t>(key.exact_overlay_enabled));
+                    mix(static_cast<size_t>(key.force_tile + 2));
+                    return h;
+                }
+            };
+
+            std::mutex &nativePrefillWorkspaceCacheMutex()
+            {
+                static std::mutex m;
+                return m;
+            }
+
+            std::unordered_map<NativePrefillWorkspaceCacheKey,
+                               NativePrefillWorkspaceBounds,
+                               NativePrefillWorkspaceCacheKeyHash> &
+            nativePrefillWorkspaceCache()
+            {
+                static std::unordered_map<NativePrefillWorkspaceCacheKey,
+                                          NativePrefillWorkspaceBounds,
+                                          NativePrefillWorkspaceCacheKeyHash>
+                    cache;
+                return cache;
+            }
+
+            NativePrefillWorkspaceBounds maxNativePrefillWorkspaceForRowsUpTo(
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
+                int max_m,
+                int n,
+                int k,
+                int cuda_device_id)
+            {
+                int force_tile = -1;
+                cudaNativeVNNIPrefill_getForceTile(&force_tile);
+
+                const NativePrefillWorkspaceCacheKey key{
+                    .codebook_id = codebook_id,
+                    .arithmetic_policy_codebook_id =
+                        arithmetic_policy_codebook_id,
+                    .max_m = max_m,
+                    .n = n,
+                    .k = k,
+                    .cuda_device_id = cuda_device_id,
+                    .bk256_mode = cudaNativeVNNIPrefill_getBK256Mode(),
+                    .canonical_kpart_mode =
+                        cudaNativeVNNIPrefill_getCanonicalKPartitionMode() ? 1 : 0,
+                    .exact_overlay_enabled =
+                        cudaNativeVNNIPrefill_getExactOverlayEnabled() ? 1 : 0,
+                    .force_tile = force_tile,
+                };
+
+                {
+                    std::lock_guard<std::mutex> lock(nativePrefillWorkspaceCacheMutex());
+                    auto &cache = nativePrefillWorkspaceCache();
+                    auto it = cache.find(key);
+                    if (it != cache.end())
+                        return it->second;
+                }
+
+                NativePrefillWorkspaceBounds best;
+                size_t canonical_kpart_partials_bytes = 0;
+                int planned_k_partitions = 1;
+                int planned_rows = 0;
+                if (!cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+                        codebook_id,
+                        arithmetic_policy_codebook_id,
+                        max_m,
+                        n,
+                        k,
+                        cuda_device_id,
+                        &canonical_kpart_partials_bytes,
+                        &planned_k_partitions,
+                        &planned_rows))
+                {
+                    throw std::runtime_error(
+                        "[CUDAQuantisedGemmKernel] NativeVNNI prefill "
+                        "workspace-envelope planning failed [codebook=" +
+                        std::to_string(static_cast<int>(codebook_id)) +
+                        ", arithmetic_policy_codebook=" +
+                        std::to_string(static_cast<int>(
+                            arithmetic_policy_codebook_id)) +
+                        ", max_M=" + std::to_string(max_m) +
+                        ", N=" + std::to_string(n) +
+                        ", K=" + std::to_string(k) +
+                        ", cuda_device=" + std::to_string(cuda_device_id) +
+                        ", exact_overlay=" +
+                        std::to_string(key.exact_overlay_enabled) +
+                        ", force_tile=" + std::to_string(key.force_tile) +
+                        ", force_canonical_kpart=" +
+                        std::to_string(key.canonical_kpart_mode) +
+                        ", bk256_mode=" + std::to_string(key.bk256_mode) +
+                        "]");
+                }
+                best.canonical_kpart_partials_bytes = std::max(
+                    canonical_kpart_partials_bytes,
+                    paddedCanonicalKpartBytes(
+                        planned_rows,
+                        n,
+                        planned_k_partitions));
+                best.canonical_kpart_rows = planned_rows;
+                best.planned_k_partitions = planned_k_partitions;
+
+                std::lock_guard<std::mutex> lock(nativePrefillWorkspaceCacheMutex());
+                nativePrefillWorkspaceCache().emplace(key, best);
+                return best;
             }
 
             template <typename T>
@@ -486,16 +781,18 @@ namespace llaminar2
                 return true;
             }
 
-            void freeDeviceUploadNativeBuffers(CUDAPackedWeights::DeviceUpload &upload)
+            void freeDeviceUploadNativeBuffers(
+                CUDAPackedWeights::DeviceUpload &upload,
+                int cuda_device_id)
             {
                 if (upload.d_native_vnni)
-                    cudaQuantGemm_freeDevice(upload.d_native_vnni);
+                    cudaQuantGemm_freeDevice(upload.d_native_vnni, cuda_device_id);
                 if (upload.d_native_scales)
-                    cudaQuantGemm_freeDevice(upload.d_native_scales);
+                    cudaQuantGemm_freeDevice(upload.d_native_scales, cuda_device_id);
                 if (upload.d_native_mins)
-                    cudaQuantGemm_freeDevice(upload.d_native_mins);
+                    cudaQuantGemm_freeDevice(upload.d_native_mins, cuda_device_id);
                 if (upload.d_native_emins)
-                    cudaQuantGemm_freeDevice(upload.d_native_emins);
+                    cudaQuantGemm_freeDevice(upload.d_native_emins, cuda_device_id);
 
                 upload.d_native_vnni = nullptr;
                 upload.d_native_scales = nullptr;
@@ -513,7 +810,7 @@ namespace llaminar2
                     !uploadHostArrayToDevice(packed.native_mins, &upload.d_native_mins, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_emins, &upload.d_native_emins, cuda_device_id))
                 {
-                    freeDeviceUploadNativeBuffers(upload);
+                    freeDeviceUploadNativeBuffers(upload, cuda_device_id);
                     return false;
                 }
 
@@ -563,6 +860,7 @@ namespace llaminar2
                 case 16:
                 case 17:
                 case 19:
+                case kNativeVnniExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -576,6 +874,7 @@ namespace llaminar2
                 case 5:  // Q4_1 / Q4_K
                 case 7:  // Q5_1 / Q5_K
                 case 16: // IQ1_S
+                case kNativeVnniExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -605,10 +904,27 @@ namespace llaminar2
                 }
 
                 static std::mutex iq_table_mutex;
-                static std::unordered_set<int> iq_init_devices;
+                static std::unordered_map<int, std::uint64_t>
+                    iq_grid_runtime_generations;
 
                 std::lock_guard<std::mutex> lock(iq_table_mutex);
-                if (iq_init_devices.count(cuda_device_id))
+                IBackend *const backend = getCUDABackend();
+                const std::uint64_t runtime_generation = backend
+                                                             ? backend->deviceRuntimeGeneration(
+                                                                   cuda_device_id)
+                                                             : 0u;
+                if (runtime_generation == 0u)
+                {
+                    LOG_ERROR(
+                        "[CUDAQuantisedGemmKernel] " << context
+                        << " has no live CUDA runtime generation for device "
+                        << cuda_device_id);
+                    return false;
+                }
+                const auto initialized =
+                    iq_grid_runtime_generations.find(cuda_device_id);
+                if (initialized != iq_grid_runtime_generations.end() &&
+                    initialized->second == runtime_generation)
                 {
                     return true;
                 }
@@ -628,7 +944,8 @@ namespace llaminar2
                     return false;
                 }
 
-                iq_init_devices.insert(cuda_device_id);
+                iq_grid_runtime_generations[cuda_device_id] =
+                    runtime_generation;
                 return true;
             }
 
@@ -653,6 +970,12 @@ namespace llaminar2
                     return false;
                 }
 
+                const uint8_t arithmetic_policy_codebook_id =
+                    impl->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              impl->native_source_identity.codebook_id)
+                        : impl->native_codebook_id;
+
                 if (!ensureNativeVNNIIQGridTablesInitialized(
                         impl->native_codebook_id,
                         cuda_device_id,
@@ -673,7 +996,8 @@ namespace llaminar2
                     if (!impl->gemv_ctx)
                         impl->gemv_ctx = cudaGemvContext_create(cuda_device_id);
 
-                    const bool gemv_ok = cudaNativeVNNIGemvTuned_fp32(
+                    const bool gemv_ok =
+                        cudaNativeVNNIGemvTuned_fp32_withPolicy(
                         d_A_int8,
                         impl->d_weights_native_vnni,
                         impl->d_weights_native_scales,
@@ -686,6 +1010,7 @@ namespace llaminar2
                         d_C_existing,
                         d_bias,
                         impl->native_codebook_id,
+                        arithmetic_policy_codebook_id,
                         cuda_device_id,
                         stream,
                         impl->gemv_ctx,
@@ -713,11 +1038,11 @@ namespace llaminar2
                     std::call_once(native_vnni_prefill_once, [&]()
                                    { LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
 
-                    // Lazy-create per-device prefill context (stream-K fixup buffer + SM count)
+                    // Lazy-create the per-device prefill context and SM-count cache.
                     if (!impl->prefill_ctx)
                         impl->prefill_ctx = cudaPrefillContext_create(cuda_device_id);
 
-                    if (cudaNativeVNNIPrefill_fp32(
+                    if (cudaNativeVNNIPrefill_fp32_withPolicy(
                             d_A_int8,
                             impl->d_weights_native_vnni,
                             impl->d_weights_native_scales,
@@ -731,6 +1056,7 @@ namespace llaminar2
                             d_C_existing,
                             d_bias,
                             impl->native_codebook_id,
+                            arithmetic_policy_codebook_id,
                             cuda_device_id,
                             stream,
                             impl->prefill_ctx))
@@ -739,31 +1065,27 @@ namespace llaminar2
                     }
 
                     int tile_id = -99;
-                    int split_k = -1;
+                    int k_partitions = -1;
                     int used_bk256 = 0;
-                    int used_streamk = 0;
+                    int used_canonical_kpart = 0;
                     cudaNativeVNNIPrefill_getLastLaunchSelection(
-                        &tile_id, &split_k, &used_bk256, &used_streamk);
+                        &tile_id,
+                        &k_partitions,
+                        &used_bk256,
+                        &used_canonical_kpart);
                     LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel failed for codebook "
                               << static_cast<int>(impl->native_codebook_id)
                               << " M=" << m << " N=" << n << " K=" << k
                               << " tile_id=" << tile_id
-                              << " split_k=" << split_k
+                              << " k_partitions=" << k_partitions
                               << " bk256=" << used_bk256
-                              << " streamk=" << used_streamk
+                              << " canonical_kpart=" << used_canonical_kpart
                               << " (no fallback available — TC/CUTLASS paths have been removed)");
                 }
 
                 return false;
             }
         }
-
-        // Static method stubs kept for ABI compatibility but are no-ops.
-        // NativeVNNI is now always enabled; CUTLASS fallback no longer exists.
-        void CUDAQuantisedGemmKernel::setNativeVNNIEnabled(bool /*enabled*/) {}
-        bool CUDAQuantisedGemmKernel::isNativeVNNIEnabled() { return true; }
-        void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool /*enabled*/) {}
-        bool CUDAQuantisedGemmKernel::isForceCutlassFallback() { return false; }
 
         // =====================================================================
         // Constructor / Destructor
@@ -779,6 +1101,7 @@ namespace llaminar2
               owns_weight_memory_(true), // Legacy path owns weight memory
               impl_(std::make_unique<Impl>())
         {
+            impl_->cuda_device_id = cuda_device_id_;
             if (!weights)
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Null weight tensor");
@@ -821,7 +1144,21 @@ namespace llaminar2
 
             impl_->owns_weight_memory = true; // Legacy constructor owns weight memory
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
+            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+            const NativeVnniFormatInfo *format =
+                unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!format)
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Quantized tensor has no NativeVNNI source identity");
+            }
+            impl_->native_source_identity = {
+                .codebook_id = format->codebook_id,
+                .is_superblock = format->is_superblock,
+                .present = true,
+            };
+
+            LOG_TRACE("[CUDAQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
                                                                         << ") on CUDA device " << cuda_device_id_);
         }
@@ -836,6 +1173,7 @@ namespace llaminar2
               owns_weight_memory_(false), // CUDAPackedWeights owns the memory
               impl_(std::make_unique<Impl>())
         {
+            impl_->cuda_device_id = cuda_device_id_;
             if (!packed)
             {
                 throw std::runtime_error("[CUDAQuantisedGemmKernel] Null packed weights");
@@ -845,8 +1183,14 @@ namespace llaminar2
             K_ = static_cast<size_t>(packed->K);
 
             impl_->owns_weight_memory = false; // Packed cache owns weight memory
+            impl_->native_source_identity = packed->native_source_identity;
+            if (!impl_->native_source_identity.present)
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Pre-packed weights lost NativeVNNI source identity");
+            }
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
+            LOG_TRACE("[CUDAQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on CUDA device " << cuda_device_id_);
         }
 
@@ -854,7 +1198,9 @@ namespace llaminar2
             int N, int K, int cuda_device_id,
             uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
             uint8_t codebook_id, uint32_t blocks_per_row,
-            std::shared_ptr<void> lifetime_owner)
+            std::shared_ptr<void> lifetime_owner,
+            NativeVnniSourceIdentity source_identity,
+            NativeVnniReusableDeviceAllocationFormat allocation_format)
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
@@ -865,15 +1211,58 @@ namespace llaminar2
               owns_weight_memory_(false), // Shared batch allocation owns it
               impl_(std::make_unique<Impl>())
         {
+            impl_->cuda_device_id = cuda_device_id_;
             impl_->d_weights_native_vnni = d_vnni;
             impl_->d_weights_native_scales = d_scales;
             impl_->d_weights_native_mins = d_mins;
             impl_->d_weights_native_emins = d_emins;
             impl_->native_codebook_id = codebook_id;
             impl_->native_blocks_per_row = blocks_per_row;
+            const NativeVnniFormatInfo *source_format =
+                source_identity.present
+                    ? native_vnni_formats::forSourceIdentity(
+                          source_identity.codebook_id,
+                          source_identity.is_superblock)
+                    : nullptr;
+            if (!source_format ||
+                !deviceVnniExecutionCompatibleWithSource(
+                    *source_format, codebook_id) ||
+                (codebook_id == kNativeVnniExpandedInt8MinCodebook &&
+                 d_mins == nullptr))
+            {
+                throw std::invalid_argument(
+                    "[CUDAQuantisedGemmKernel] Direct device weights require an exact, "
+                    "execution-compatible NativeVNNI source identity");
+            }
+            impl_->native_source_identity = source_identity;
+            if (allocation_format.payload_bytes_per_block != 0)
+            {
+                const auto execution_format =
+                    codebook_id == canonicalDeviceVnniCodebookId(
+                                       source_format->codebook_id)
+                        ? NativeVnniMigrationStableDeviceFormat{
+                              .codebook_id = codebook_id,
+                              .payload_bytes_per_block = static_cast<uint8_t>(
+                                  source_format->payload_bytes),
+                              .is_asymmetric = source_format->is_asymmetric,
+                              .has_emins = source_format->has_emins,
+                          }
+                        : migrationStableDeviceVnniFormat(*source_format);
+                if (allocation_format.payload_bytes_per_block <
+                        execution_format.payload_bytes_per_block ||
+                    (execution_format.is_asymmetric &&
+                     !allocation_format.has_mins) ||
+                    (execution_format.has_emins &&
+                     !allocation_format.has_emins))
+                {
+                    throw std::invalid_argument(
+                        "[CUDAQuantisedGemmKernel] Reusable allocation cannot represent its live execution format");
+                }
+            }
+            impl_->native_allocation_format = allocation_format;
             impl_->owns_weight_memory = false;
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel] Created (MoE batch) for " << N_ << "x" << K_
+            LOG_TRACE("[CUDAQuantisedGemmKernel] Created (MoE batch) for " << N_ << "x" << K_
                                                                            << " on CUDA device " << cuda_device_id_);
         }
 
@@ -889,6 +1278,31 @@ namespace llaminar2
         // ---------------------------------------------------------------------
         namespace
         {
+            /**
+             * @brief Publish a successful asynchronous CUDA tensor write.
+             *
+             * Tensor GEMM entry points are also composed directly by grouped
+             * verifier and shared-expert pipelines, outside a stage wrapper
+             * that could repair coherence afterward.  Publication therefore
+             * belongs at the producer boundary: consumers on another stream
+             * join this event, while a host observation performs the one
+             * explicit D2H boundary required by an integration test.
+             *
+             * @param output Tensor whose device storage was written.
+             * @param device_id CUDA ordinal that owns the storage.
+             * @param stream Exact stream on which the final write was queued.
+             */
+            void publishCUDATensorWrite(
+                TensorBase &output,
+                int device_id,
+                void *stream)
+            {
+                TransferEngine::publishDeviceWrite(
+                    &output,
+                    DeviceId::cuda(device_id),
+                    stream);
+            }
+
             std::mutex &sharedPrefillPoolsMutex()
             {
                 static std::mutex m;
@@ -910,6 +1324,18 @@ namespace llaminar2
                 {
                     it = pools.emplace(cuda_device_id, std::make_unique<CUDAConcurrentPrefillPool>()).first;
                 }
+                if (!it->second->initialized)
+                {
+                    if (isGraphCaptureActive())
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Capture began before the CUDA projection "
+                            "stream/event pool was initialized");
+                    }
+                    it->second->init(
+                        cuda_device_id,
+                        CUDAConcurrentPrefillPool::MAX_STREAMS);
+                }
                 return *it->second;
             }
         } // namespace
@@ -918,6 +1344,26 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> lk(sharedPrefillPoolsMutex());
             sharedPrefillPools().clear();
+        }
+
+        bool CUDAQuantisedGemmKernel::prepareFusedProjectionGraphCapture(
+            size_t projection_count)
+        {
+            if (projection_count == 0)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Fused projection capture "
+                          "preparation requires positive fan-out");
+                return false;
+            }
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Fused projection resources "
+                          "must be prepared before graph capture begins");
+                return false;
+            }
+
+            auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
+            return pool.initialized && pool.count > 0;
         }
 
         void CUDAQuantisedGemmKernel::resetDynamicState()
@@ -959,7 +1405,67 @@ namespace llaminar2
                     N_ > 0 &&
                     K_ > 0 &&
                     impl_->native_blocks_per_row > 0 &&
-                    nativeVNNIPrefillSupportsCodebook(impl_->native_codebook_id));
+                   nativeVNNIPrefillSupportsCodebook(impl_->native_codebook_id));
+        }
+
+        void CUDAQuantisedGemmKernel::prepareWeights()
+        {
+            ensureWeightsConverted();
+            if (!impl_ ||
+                !cudaNativeVNNIGemvTuned_policyRequiresRowMajor(
+                    impl_->native_codebook_id,
+                    static_cast<int>(N_),
+                    static_cast<int>(K_)))
+            {
+                return;
+            }
+
+            void *const setup_stream =
+                GPUDeviceContextPool::instance()
+                    .getNvidiaContext(cuda_device_id_)
+                    .defaultStream();
+            prepareRowMajorWeights(setup_stream);
+        }
+
+        void CUDAQuantisedGemmKernel::prepareRowMajorWeights(void *stream)
+        {
+            ensureWeightsConverted();
+            if (!impl_ || impl_->rowmajor)
+                return;
+            if (!stream)
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] ROWPAR preparation requires an explicit CUDA stream");
+            }
+
+            cudaStreamCaptureStatus capture_status =
+                cudaStreamCaptureStatusNone;
+            const cudaError_t capture_query = cudaStreamIsCapturing(
+                static_cast<cudaStream_t>(stream),
+                &capture_status);
+            if (capture_query != cudaSuccess ||
+                capture_status != cudaStreamCaptureStatusNone ||
+                isGraphCaptureActive())
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] ROWPAR preparation is forbidden during graph capture");
+            }
+
+            impl_->rowmajor = cudaRowMajorWeights_createForCodebook(
+                impl_->d_weights_native_vnni,
+                impl_->d_weights_native_scales,
+                impl_->d_weights_native_mins,
+                impl_->d_weights_native_emins,
+                static_cast<int>(N_),
+                static_cast<int>(K_),
+                impl_->native_codebook_id,
+                cuda_device_id_,
+                stream);
+            if (!impl_->rowmajor)
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Failed to prepare policy-required ROWPAR weights");
+            }
         }
 
         bool CUDAQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
@@ -990,7 +1496,31 @@ namespace llaminar2
             out.k = static_cast<int>(K_);
             out.blocks_per_row = impl_->native_blocks_per_row;
             out.codebook_id = impl_->native_codebook_id;
+            out.allocation_payload_bytes_per_block =
+                impl_->native_allocation_format.payload_bytes_per_block;
+            out.allocation_has_mins = static_cast<uint8_t>(
+                impl_->native_allocation_format.has_mins);
+            out.allocation_has_emins = static_cast<uint8_t>(
+                impl_->native_allocation_format.has_emins);
+            out.source_codebook_id = impl_->native_source_identity.codebook_id;
+            out.source_is_superblock = static_cast<uint8_t>(
+                impl_->native_source_identity.is_superblock);
+            out.source_identity_present = static_cast<uint8_t>(
+                impl_->native_source_identity.present);
             return out.valid();
+        }
+
+        bool CUDAQuantisedGemmKernel::exportNativeVNNISourceIdentity(
+            NativeVnniSourceIdentity &out) const
+        {
+            if (!impl_ || !impl_->native_source_identity.present)
+            {
+                out = {};
+                return false;
+            }
+            out = impl_->native_source_identity;
+            return native_vnni_formats::forSourceIdentity(
+                       out.codebook_id, out.is_superblock) != nullptr;
         }
 
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAQuantisedGemmKernel &&other) noexcept
@@ -1033,9 +1563,27 @@ namespace llaminar2
         }
 
         std::unique_ptr<ITensorGemm::VerifierKernelModeScope>
-        CUDAQuantisedGemmKernel::beginVerifierDecodeEquivalentScope()
+        CUDAQuantisedGemmKernel::beginVerifierDecodeEquivalentScope(
+            std::optional<DeviceRowRange> rows)
         {
-            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>();
+            return std::make_unique<ScopedNativeVNNIDecodeEquivalentDispatch>(rows);
+        }
+
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+        CUDAQuantisedGemmKernel::beginOutputPartitionEquivalenceScope(
+            int actual_output_columns,
+            int serial_partition_columns)
+        {
+            if (actual_output_columns <= 0 ||
+                serial_partition_columns <= 0 ||
+                actual_output_columns != static_cast<int>(N_) ||
+                serial_partition_columns > actual_output_columns)
+            {
+                throw std::invalid_argument(
+                    "[CUDAQuantisedGemmKernel] Invalid replicated-output serial partition contract");
+            }
+            return std::make_unique<ScopedNativeVNNISerialPartition>(
+                serial_partition_columns);
         }
 
         // =====================================================================
@@ -1044,7 +1592,7 @@ namespace llaminar2
 
         void CUDAQuantisedGemmKernel::ensureWeightsConverted()
         {
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Entry: N_=" << N_ << " K_=" << K_
+            LOG_TRACE("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Entry: N_=" << N_ << " K_=" << K_
                                                                                      << " weights_converted_=" << weights_converted_
                                                                                      << " d_native_vnni=" << (impl_ ? (void *)impl_->d_weights_native_vnni : nullptr)
                                                                                      << " d_native_scales=" << (impl_ ? (void *)impl_->d_weights_native_scales : nullptr));
@@ -1093,6 +1641,7 @@ namespace llaminar2
                 impl_->d_weights_native_emins = upload.d_native_emins;
                 impl_->native_codebook_id = packed_->native_codebook_id;
                 impl_->native_blocks_per_row = packed_->native_blocks_per_row;
+                impl_->native_source_identity = packed_->native_source_identity;
                 weights_converted_ = true;
 
                 // Release host-side packing buffers — data is now on GPU.
@@ -1171,6 +1720,7 @@ namespace llaminar2
             impl_->d_weights_native_emins = legacy_packed.device_uploads[cuda_device_id_].d_native_emins;
             impl_->native_codebook_id = legacy_packed.native_codebook_id;
             impl_->native_blocks_per_row = legacy_packed.native_blocks_per_row;
+            impl_->native_source_identity = legacy_packed.native_source_identity;
 
             weights_converted_ = true;
             LOG_DEBUG("[CUDAQuantisedGemmKernel] Weight conversion complete (legacy)");
@@ -1236,14 +1786,26 @@ namespace llaminar2
             }
             if (impl_->gemv_ctx)
             {
-                float *kpar_partials = nullptr;
-                size_t kpar_partials_bytes = 0;
-                if (workspace_->hasBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS))
+                if (!workspace_->hasBuffer(
+                        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS))
                 {
-                    kpar_partials = static_cast<float *>(
-                        workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
-                    kpar_partials_bytes =
-                        workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                    throw std::runtime_error(
+                        "[CUDAQuantisedGemmKernel] Workspace is missing the "
+                        "required persistent serial/grouped KPAR arena: " +
+                        std::string(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+                }
+
+                auto *kpar_partials = static_cast<float *>(
+                    workspace_->getBuffer(
+                        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+                const size_t kpar_partials_bytes =
+                    workspace_->getBufferSize(
+                        GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                if (!kpar_partials || kpar_partials_bytes == 0)
+                {
+                    throw std::runtime_error(
+                        "[CUDAQuantisedGemmKernel] Persistent serial/grouped "
+                        "KPAR arena has no device storage");
                 }
 
                 cudaGemvContext_bindWorkspace(
@@ -1253,32 +1815,22 @@ namespace llaminar2
             }
             if (impl_->prefill_ctx)
             {
-                float *splitk_partials = nullptr;
-                size_t splitk_partials_bytes = 0;
-                if (workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS))
+                float *canonical_kpart_partials = nullptr;
+                size_t canonical_kpart_partials_bytes = 0;
+                if (workspace_->hasBuffer(
+                        GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS))
                 {
-                    splitk_partials = static_cast<float *>(
-                        workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS));
-                    splitk_partials_bytes =
-                        workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-                }
-
-                float *streamk_fixup = nullptr;
-                size_t streamk_fixup_bytes = 0;
-                if (workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP))
-                {
-                    streamk_fixup = static_cast<float *>(
-                        workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP));
-                    streamk_fixup_bytes =
-                        workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
+                    canonical_kpart_partials = static_cast<float *>(
+                        workspace_->getBuffer(
+                            GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS));
+                    canonical_kpart_partials_bytes = workspace_->getBufferSize(
+                        GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
                 }
 
                 cudaPrefillContext_bindWorkspace(
                     impl_->prefill_ctx,
-                    splitk_partials,
-                    splitk_partials_bytes,
-                    streamk_fixup,
-                    streamk_fixup_bytes);
+                    canonical_kpart_partials,
+                    canonical_kpart_partials_bytes);
             }
         }
 
@@ -1291,26 +1843,24 @@ namespace llaminar2
             if (!impl_ || !impl_->prefill_ctx || !workspace_ || m <= 1)
                 return;
 
-            size_t splitk_bytes = 0;
-            size_t streamk_bytes = 0;
-            int planned_split_k = 1;
-            int planned_streamk = 0;
+            size_t canonical_kpart_bytes = 0;
+            int planned_k_partitions = 1;
             if (!cudaNativeVNNIPrefill_getWorkspacePlan(
                     impl_->native_codebook_id,
                     m,
                     n,
                     k,
                     cuda_device_id_,
-                    &splitk_bytes,
-                    &streamk_bytes,
-                    &planned_split_k,
-                    &planned_streamk))
+                    &canonical_kpart_bytes,
+                    &planned_k_partitions))
             {
                 return;
             }
 
-            splitk_bytes = std::max(splitk_bytes, paddedSplitKPartialBytes(m, n, planned_split_k));
-            if (splitk_bytes == 0 && streamk_bytes == 0)
+            canonical_kpart_bytes = std::max(
+                canonical_kpart_bytes,
+                paddedCanonicalKpartBytes(m, n, planned_k_partitions));
+            if (canonical_kpart_bytes == 0)
                 return;
 
             if (stream_idx < 0 || stream_idx >= kCudaConcurrentPrefillWorkspaceSlots)
@@ -1320,64 +1870,42 @@ namespace llaminar2
                     std::to_string(stream_idx) + " is outside the declared workspace slot range");
             }
 
-            float *splitk_ptr = nullptr;
-            size_t splitk_slot_bytes = 0;
-            if (splitk_bytes > 0)
+            void *buffer = workspace_->getBuffer(
+                GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+            const size_t total_bytes = workspace_->getBufferSize(
+                GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS);
+            const AlignedWorkspaceSlices slices(
+                total_bytes, kCudaConcurrentPrefillWorkspaceSlots, alignof(float));
+            const size_t slot_bytes = slices.strideBytes();
+            const size_t required_total =
+                canonical_kpart_bytes *
+                static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+            if (!buffer || total_bytes < required_total ||
+                slot_bytes < canonical_kpart_bytes)
             {
-                void *buffer = workspace_->getBuffer(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-                const size_t total_bytes = workspace_->getBufferSize(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
-                splitk_slot_bytes = total_bytes / static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                const size_t required_total =
-                    splitk_bytes * static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                if (!buffer || total_bytes < required_total || splitk_slot_bytes < splitk_bytes)
-                {
-                    throw std::runtime_error(
-                        "[ConcurrentPrefill] " +
-                        std::string(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS) +
-                        " workspace is missing or undersized for concurrent split-K projection: need total " +
-                        std::to_string(required_total) + " bytes (" +
-                        std::to_string(splitk_bytes) + " per slot), have " +
-                        std::to_string(total_bytes));
-                }
-                auto *base = static_cast<unsigned char *>(buffer);
-                splitk_ptr = reinterpret_cast<float *>(
-                    base + static_cast<size_t>(stream_idx) * splitk_slot_bytes);
+                throw std::runtime_error(
+                    "[ConcurrentPrefill] canonical public-M1 K-partition "
+                    "workspace is missing or undersized: need total " +
+                    std::to_string(required_total) + " bytes (" +
+                    std::to_string(canonical_kpart_bytes) +
+                    " per slot), have " + std::to_string(total_bytes) +
+                    " [M=" + std::to_string(m) +
+                    ", N=" + std::to_string(n) +
+                    ", K=" + std::to_string(k) +
+                    ", codebook=" + std::to_string(static_cast<int>(
+                        impl_->native_codebook_id)) +
+                    ", k_partitions=" + std::to_string(planned_k_partitions) +
+                    ", stream_idx=" + std::to_string(stream_idx) +
+                    ", slots=" + std::to_string(
+                        kCudaConcurrentPrefillWorkspaceSlots) + "]");
             }
-
-            float *streamk_ptr = nullptr;
-            size_t streamk_slot_bytes = 0;
-            if (streamk_bytes > 0)
-            {
-                void *buffer = workspace_->getBuffer(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
-                const size_t total_bytes = workspace_->getBufferSize(
-                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
-                streamk_slot_bytes = total_bytes / static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                const size_t required_total =
-                    streamk_bytes * static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
-                if (!buffer || total_bytes < required_total || streamk_slot_bytes < streamk_bytes)
-                {
-                    throw std::runtime_error(
-                        "[ConcurrentPrefill] " +
-                        std::string(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP) +
-                        " workspace is missing or undersized for concurrent stream-K projection: need total " +
-                        std::to_string(required_total) + " bytes (" +
-                        std::to_string(streamk_bytes) + " per slot), have " +
-                        std::to_string(total_bytes));
-                }
-                auto *base = static_cast<unsigned char *>(buffer);
-                streamk_ptr = reinterpret_cast<float *>(
-                    base + static_cast<size_t>(stream_idx) * streamk_slot_bytes);
-            }
+            auto *canonical_kpart_ptr = reinterpret_cast<float *>(
+                slices.slice(buffer, stream_idx, canonical_kpart_bytes).data());
 
             cudaPrefillContext_bindWorkspace(
                 impl_->prefill_ctx,
-                splitk_ptr,
-                splitk_slot_bytes,
-                streamk_ptr,
-                streamk_slot_bytes);
+                canonical_kpart_ptr,
+                slot_bytes);
         }
 
         void CUDAQuantisedGemmKernel::bindConcurrentNativeDecodeScratch(
@@ -1439,7 +1967,12 @@ namespace llaminar2
                 const size_t total_bytes = workspace_->getBufferSize(
                     GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
                 const int extra_slots = active_slots - 1;
-                slot_bytes = total_bytes / static_cast<size_t>(extra_slots);
+                // Other stages may enlarge this shared name using a different
+                // stream count. Partition complete FP32 elements, preserving
+                // alignment without allocating or disabling side streams.
+                const AlignedWorkspaceSlices slices(
+                    total_bytes, extra_slots, alignof(float));
+                slot_bytes = slices.strideBytes();
                 if (!buffer || slot_bytes < required_bytes ||
                     stream_idx > extra_slots)
                 {
@@ -1452,9 +1985,8 @@ namespace llaminar2
                         std::to_string(slot_bytes));
                 }
 
-                auto *base = static_cast<unsigned char *>(buffer);
                 partials = reinterpret_cast<float *>(
-                    base + static_cast<size_t>(stream_idx - 1) * slot_bytes);
+                    slices.slice(buffer, stream_idx - 1, required_bytes).data());
             }
 
             cudaGemvContext_bindWorkspace(
@@ -1534,6 +2066,37 @@ namespace llaminar2
             // Ensure weights are converted
             ensureWeightsConverted();
 
+            /*
+             * Tensor-level calls may need a final device-to-device copy when
+             * logits or other outputs are backed by host-mapped memory.  Keep
+             * that post-GEMM copy on the same explicit stream captured before
+             * any child GEMM can race with request-scoped dynamic-state reset.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor] "
+                          "CUDA tensor GEMM requires an explicit CUDA stream");
+                return false;
+            }
+
+            /*
+             * Tensor kernels never own placement. The graph executor or a
+             * direct-kernel harness prepares storage first; this boundary only
+             * validates exact residency and joins the producer event.
+             */
+            const DeviceId target_device = DeviceId::cuda(cuda_device_id_);
+            TransferEngine::requireDeviceInput(
+                const_cast<TensorBase *>(A),
+                target_device,
+                execution_stream);
+            if (beta != 0.0f)
+                TransferEngine::requireDeviceInput(
+                    C, target_device, execution_stream);
+            else
+                TransferEngine::requireDeviceOutput(
+                    C, target_device, execution_stream);
+
             // Type dispatch based on A and C types
             TensorType a_type = A->native_type();
             TensorType c_type = C->native_type();
@@ -1595,8 +2158,10 @@ namespace llaminar2
                     success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
-                        cuda_device_id_, gpu_stream_);
+                        cuda_device_id_, execution_stream);
                 }
+                if (success)
+                    publishCUDATensorWrite(*C, cuda_device_id_, execution_stream);
                 return success;
             }
             else if (a_type == TensorType::FP32 && c_type == TensorType::FP32)
@@ -1649,8 +2214,10 @@ namespace llaminar2
                     success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
-                        cuda_device_id_, gpu_stream_);
+                        cuda_device_id_, execution_stream);
                 }
+                if (success)
+                    publishCUDATensorWrite(*C, cuda_device_id_, execution_stream);
                 return success;
             }
             else if (a_type == TensorType::Q8_1 && c_type == TensorType::Q8_1)
@@ -1668,6 +2235,8 @@ namespace llaminar2
                 Q8_1Block *d_C_q8 = static_cast<Q8_1Block *>(q8_C->gpu_data_ptr());
 
                 bool success = multiply_q8_to_q8(d_A_q8, d_C_q8, m, n, k);
+                if (success)
+                    publishCUDATensorWrite(*C, cuda_device_id_, execution_stream);
                 return success;
             }
             else if (a_type == TensorType::FP32 && c_type == TensorType::Q8_1)
@@ -1684,6 +2253,8 @@ namespace llaminar2
                 Q8_1Block *d_C_q8 = static_cast<Q8_1Block *>(q8_C->gpu_data_ptr());
 
                 bool success = multiply_fp32_to_q8(d_A, d_C_q8, m, n, k);
+                if (success)
+                    publishCUDATensorWrite(*C, cuda_device_id_, execution_stream);
                 return success;
             }
             else
@@ -1726,9 +2297,9 @@ namespace llaminar2
             const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
-            if (m <= 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier projection requires M=2..4, got M="
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier projection requires M>=1, got M="
                           << m);
                 return false;
             }
@@ -1753,11 +2324,47 @@ namespace llaminar2
                 return false;
             }
 
-            if (!gpu_stream_)
-                cudaQuantGemm_setDevice(cuda_device_id_);
+            /*
+             * Capture the caller's stream once for this fused transaction.  The
+             * KernelFactory dynamic-state reset is request-scoped and may run
+             * on a sibling LocalTP worker while this projection group is still
+             * executing.  From this point on, decode-equivalent MTP publication
+             * must use the captured stream value instead of rereading the
+             * mutable gpu_stream_ member that resetDynamicState() clears.
+             */
+            void *execution_stream = gpu_stream_;
+
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                          "Fused CUDA projection launch requires an explicit CUDA stream");
+                return false;
+            }
+            cudaQuantGemm_setDevice(cuda_device_id_);
             DeviceId target_device = DeviceId::cuda(cuda_device_id_);
 
-            // Step 1: Ensure input is on the GPU
+            // Step 1: join the input producer to this exact fused stream.
+            TransferEngine::requireDeviceInput(
+                const_cast<TensorBase *>(input),
+                target_device,
+                execution_stream);
+
+            auto publish_projection_outputs = [&]()
+            {
+                for (const auto &projection : projections)
+                {
+                    if (!projection.output)
+                    {
+                        throw std::logic_error(
+                            "Successful CUDA fused projection has a null output tensor");
+                    }
+                    publishCUDATensorWrite(
+                        *projection.output,
+                        cuda_device_id_,
+                        execution_stream);
+                }
+            };
+
             const float *d_input = nullptr;
             if (input->native_type() == TensorType::FP32)
             {
@@ -1770,7 +2377,7 @@ namespace llaminar2
                 // Coherence handled automatically by DeviceGraphExecutor
                 d_input = static_cast<const float *>(fp32_input->gpu_data_ptr());
                 // NOTE: Don't log fp32_input->data() here - it triggers D2H transfer!
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Input GPU ptr=" << d_input);
             }
             else
             {
@@ -1785,12 +2392,14 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1 && m <= 4)
+            const bool explicit_small_m_verifier =
+                explicitSmallMVerifierScopeActive() && m > 1;
+            if (explicit_small_m_verifier)
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
                           << m << " projections=" << projections.size());
 
-                if (!gpu_stream_)
+                if (!execution_stream)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path requires an explicit CUDA stream");
                     return false;
@@ -1858,30 +2467,21 @@ namespace llaminar2
                         }
 
                         auto current_dev = fp32_bias->current_device();
-                        if (current_dev.has_value() && current_dev.value() == target_device)
-                        {
-                            d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
-                        }
-                        else if (current_dev.has_value() && current_dev->is_gpu())
+                        if (current_dev.has_value() &&
+                            current_dev->is_gpu() &&
+                            current_dev.value() != target_device)
                         {
                             LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
                                       << i << " bias is on " << current_dev->to_string()
                                       << " but CUDA:" << cuda_device_id_ << " is required");
                             return false;
                         }
-                        else
-                        {
-                            if (!fp32_bias->ensureOnDevice(target_device, gpu_stream_))
-                            {
-                                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
-                                          << i << " failed to upload bias to CUDA:" << cuda_device_id_);
-                                return false;
-                            }
-                            d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
-                        }
+                        TransferEngine::requireDeviceInput(
+                            fp32_bias, target_device, execution_stream);
+                        d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
                     }
 
-                    cuda_kernel->setGPUStream(gpu_stream_);
+                    cuda_kernel->setGPUStream(execution_stream);
                     cuda_kernel->validateWorkspace();
                     cuda_kernel->ensureWeightsConverted();
                     if (!canUseNativeVNNIBlockwise(cuda_kernel->impl_.get(), 1, k))
@@ -1904,11 +2504,15 @@ namespace llaminar2
                         proj.name});
                 }
 
-                // All small-M verifier projections share the same activation rows.
-                // Quantize those rows once, then feed the same quantized block into
-                // each decode-equivalent GEMV. This removes repeated hot-path work
-                // while preserving the exact per-projection GEMV kernels and
-                // accumulator order used by the serial verifier path.
+                /*
+                 * The verifier publication path is a true grouped implementation:
+                 * one activation-quantize pass writes an [M,K] Q8_1 activation
+                 * matrix, and each projection consumes all verifier rows through
+                 * the grouped small-M native-VNNI GEMV.  The all-format CUDA
+                 * regression compares every produced row to the public M=1 decode
+                 * entry point, so this route stays in production only while it is
+                 * decode-equivalent rather than merely "close enough".
+                 */
                 validateWorkspace();
                 int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
                 float *d_scales_A_blockwise =
@@ -1926,140 +2530,314 @@ namespace llaminar2
                         m,
                         k,
                         cuda_device_id_,
-                        gpu_stream_))
+                        execution_stream))
                 {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier shared activation quantization failed");
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                              "Small-M verifier grouped activation quantization failed");
                     return false;
                 }
 
-                /*
-                 * Small verifier batches are decode-equivalent because each
-                 * projection still uses the same NativeVNNI small-M GEMV kernel
-                 * and the same serial-M1 dispatch policy selected by
-                 * beginVerifierDecodeEquivalentScope().  The projections are
-                 * independent once the activation rows are quantized, so we can
-                 * overlap them on explicit side streams as long as every stream
-                 * has a distinct declared K-parallel partial arena.
+                /**
+                 * Grouped verifier projections use one production schedule:
+                 * concurrent launches on persistent streams. Stream zero uses
+                 * the ordinary KPAR arena; the other streams use the bounded
+                 * side-stream arena declared by the fused stage before graph
+                 * capture. An explicit debug-policy opt-out may request the
+                 * ordered schedule, but missing production workspace is fatal
+                 * rather than an invisible performance fallback.
                  */
-                const bool concurrent_small_m =
-                    bindings.size() >= 2 &&
-                    debugEnv().gemm.cuda_concurrent_decode &&
-                    !debugEnv().gemm.deterministic;
+                enum class GroupedVerifierProjectionSchedule
+                {
+                    OrderedOnRootStream,
+                    ConcurrentOnPersistentStreams,
+                };
 
-                if (concurrent_small_m)
+                struct VerifierScratchSlot
+                {
+                    void *arena = nullptr;
+                    size_t arena_bytes = 0;
+                    int stream_index = 0;
+                    size_t required_bytes = 0;
+                    size_t offset_bytes = 0;
+                };
+
+                struct VerifierProjectionPlan
+                {
+                    int stream_index = 0;
+                    bool uses_ordered_reducer = false;
+                    size_t required_bytes = 0;
+                    size_t slot_index = 0;
+                };
+
+                GroupedVerifierProjectionSchedule verifier_schedule =
+                    GroupedVerifierProjectionSchedule::OrderedOnRootStream;
+                std::vector<VerifierScratchSlot> scratch_slots;
+                std::vector<VerifierProjectionPlan> projection_plans(
+                    bindings.size());
+                CUDAConcurrentPrefillPool *verifier_pool = nullptr;
+
+                if (debugEnv().gemm.cuda_concurrent_decode &&
+                    bindings.size() >= 2)
                 {
                     auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
-                    if (isGraphCaptureActive() && !pool.initialized)
+                    verifier_pool = &pool;
+                    const int active_streams = std::min(
+                        static_cast<int>(bindings.size()), pool.count);
+
+                    int sm_count = 0;
+                    const cudaError_t sm_status = cudaDeviceGetAttribute(
+                        &sm_count,
+                        cudaDevAttrMultiProcessorCount,
+                        cuda_device_id_);
+                    if (sm_status != cudaSuccess || sm_count <= 0)
                     {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
-                                  "Small-M verifier concurrent projection path entered graph capture "
-                                  "before its stream pool was initialized. Warmup must initialize "
-                                  "the pool so capture never creates streams or events.");
-                        return false;
+                        throw std::runtime_error(
+                            "[GroupedVerifier] Cannot resolve the physical SM "
+                            "count required by the canonical reduction policy");
                     }
-                    if (!pool.initialized)
-                        pool.init(cuda_device_id_, static_cast<int>(bindings.size()));
 
-                    const int active_slots =
-                        std::min(static_cast<int>(bindings.size()), kCudaConcurrentDecodeWorkspaceSlots);
-                    cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
-
-                    for (int pi = 0; pi < static_cast<int>(bindings.size()); ++pi)
+                    bool complete_plan = true;
+                    for (size_t pi = 0; pi < bindings.size(); ++pi)
                     {
-                        const auto &binding = bindings[static_cast<size_t>(pi)];
-                        const int stream_idx = pi % active_slots;
+                        auto &binding = bindings[pi];
+                        auto &plan = projection_plans[pi];
+                        plan.stream_index =
+                            static_cast<int>(pi) % active_streams;
 
-                        if (pi >= active_slots)
-                            cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]);
-                        cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.quant_ready);
-
-                        try
-                        {
-                            binding.kernel->bindConcurrentNativeDecodeScratch(
-                                m,
+                        const uint8_t policy_codebook =
+                            binding.kernel->impl_->native_source_identity.present
+                                ? canonicalDeviceVnniCodebookId(
+                                      binding.kernel->impl_
+                                          ->native_source_identity.codebook_id)
+                                : binding.kernel->impl_->native_codebook_id;
+                        int uses_ordered_reducer = 0;
+                        int k_partitions = 0;
+                        if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
+                                policy_codebook,
                                 binding.n,
                                 k,
-                                stream_idx,
-                                active_slots);
-                        }
-                        catch (const std::exception &ex)
+                                sm_count,
+                                &uses_ordered_reducer,
+                                &k_partitions))
                         {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
-                                      "Small-M verifier concurrent scratch binding failed for projection "
-                                      << pi << " (" << (binding.name ? binding.name : "unnamed")
-                                      << "): " << ex.what());
-                            return false;
+                            throw std::runtime_error(
+                                "[GroupedVerifier] Missing canonical M=1 "
+                                "scratch policy for projection " +
+                                std::to_string(pi));
                         }
 
-                        void *saved_stream = binding.kernel->getGPUStream();
-                        binding.kernel->setGPUStream(pool.streams[stream_idx]);
-                        const bool projection_ok = binding.kernel->multiply_quantized_small_m_gemv(
-                            d_A_int8,
-                            d_scales_A_blockwise,
-                            binding.output,
-                            binding.bias,
-                            m,
-                            binding.n,
-                            k,
-                            1.0f,
-                            0.0f);
-                        binding.kernel->setGPUStream(saved_stream);
+                        plan.uses_ordered_reducer =
+                            uses_ordered_reducer != 0;
+                        if (!plan.uses_ordered_reducer)
+                            continue;
 
-                        if (!projection_ok)
+                        const int scratch_rows =
+                            nativeVNNIPersistentVerifierWorkspaceRows(
+                                m, binding.n, k);
+                        plan.required_bytes =
+                            static_cast<size_t>(k_partitions) *
+                            static_cast<size_t>(scratch_rows) *
+                            static_cast<size_t>(binding.n) * sizeof(float);
+
+                        const char *arena_name =
+                            plan.stream_index == 0
+                                ? GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS
+                                : GemmWorkspaceBuffers::
+                                      CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS;
+                        void *arena =
+                            binding.kernel->workspace_->getBuffer(arena_name);
+                        const size_t arena_bytes =
+                            binding.kernel->workspace_->getBufferSize(arena_name);
+                        if (!arena || plan.required_bytes == 0)
                         {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
-                                      "Small-M verifier concurrent GEMV failed for projection "
-                                      << pi << " (" << (binding.name ? binding.name : "unnamed")
-                                      << ") stream_slot=" << stream_idx);
-                            return false;
+                            complete_plan = false;
+                            break;
                         }
 
-                        cudaQuantGemm_recordEvent(pool.completion[stream_idx], pool.streams[stream_idx]);
+                        auto slot = std::find_if(
+                            scratch_slots.begin(),
+                            scratch_slots.end(),
+                            [&](const VerifierScratchSlot &candidate)
+                            {
+                                return candidate.arena == arena &&
+                                       candidate.stream_index ==
+                                           plan.stream_index;
+                            });
+                        if (slot == scratch_slots.end())
+                        {
+                            scratch_slots.push_back(VerifierScratchSlot{
+                                arena,
+                                arena_bytes,
+                                plan.stream_index,
+                                plan.required_bytes,
+                                0});
+                            plan.slot_index = scratch_slots.size() - 1;
+                        }
+                        else
+                        {
+                            slot->required_bytes = std::max(
+                                slot->required_bytes,
+                                plan.required_bytes);
+                            plan.slot_index = static_cast<size_t>(
+                                std::distance(scratch_slots.begin(), slot));
+                        }
                     }
 
-                    for (int si = 0; si < active_slots; ++si)
-                        cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
-
-                    if (PerfStatsCollector::isEnabled())
+                    /*
+                     * Lay out slots independently inside each physical arena.
+                     * Projections assigned to the same persistent stream may
+                     * reuse a slot because their launches are ordered there.
+                     */
+                    constexpr size_t kScratchAlignment = 256;
+                    for (size_t si = 0;
+                         complete_plan && si < scratch_slots.size(); ++si)
                     {
-                        PerfStatsCollector::addCounter(
-                            "kernel",
-                            "cuda_native_vnni_small_m_concurrent_projection_groups",
-                            1.0,
-                            "gemm",
-                            "cuda:" + std::to_string(cuda_device_id_),
-                            PerfStatsCollector::Tags{
-                                {"m", std::to_string(m)},
-                                {"k", std::to_string(k)},
-                                {"projections", std::to_string(bindings.size())},
-                                {"streams", std::to_string(active_slots)}});
+                        auto &slot = scratch_slots[si];
+                        size_t cursor = 0;
+                        for (size_t previous = 0; previous < si; ++previous)
+                        {
+                            const auto &prior = scratch_slots[previous];
+                            if (prior.arena != slot.arena)
+                                continue;
+                            cursor = std::max(
+                                cursor,
+                                prior.offset_bytes + prior.required_bytes);
+                        }
+                        cursor = (cursor + kScratchAlignment - 1) &
+                                 ~(kScratchAlignment - 1);
+                        slot.offset_bytes = cursor;
+                        if (cursor > slot.arena_bytes ||
+                            slot.required_bytes > slot.arena_bytes - cursor)
+                        {
+                            complete_plan = false;
+                        }
                     }
 
-                    return true;
+                    if (!complete_plan)
+                    {
+                        throw std::runtime_error(
+                            "[GroupedVerifier] Concurrent projection scratch "
+                            "is missing or undersized; the workspace family "
+                            "must declare every side-stream KPAR slice before "
+                            "capture");
+                    }
+                    verifier_schedule =
+                        GroupedVerifierProjectionSchedule::
+                            ConcurrentOnPersistentStreams;
                 }
 
-                for (size_t i = 0; i < bindings.size(); ++i)
+                auto launch_projection = [&](int pi, void *projection_stream)
                 {
-                    const auto &binding = bindings[i];
-                    binding.kernel->setGPUStream(gpu_stream_);
-                    if (!binding.kernel->multiply_quantized_small_m_gemv(
-                            d_A_int8,
-                            d_scales_A_blockwise,
-                            binding.output,
-                            binding.bias,
-                            m,
-                            binding.n,
-                            k,
-                            1.0f,
-                            0.0f))
+                    const auto &binding = bindings[static_cast<size_t>(pi)];
+                    void *saved_stream = binding.kernel->getGPUStream();
+                    binding.kernel->setGPUStream(projection_stream);
+                    const bool projection_ok = binding.kernel->multiply_quantized_small_m_gemv(
+                        d_A_int8,
+                        d_scales_A_blockwise,
+                        binding.output,
+                        binding.bias,
+                        m,
+                        binding.n,
+                        k,
+                        1.0f,
+                        0.0f,
+                        true,
+                        projection_stream);
+                    binding.kernel->setGPUStream(saved_stream);
+
+                    if (!projection_ok)
                     {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV failed for projection "
-                                  << i << " (" << (binding.name ? binding.name : "unnamed") << ")");
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] "
+                                  "Grouped small-M native-VNNI GEMV failed for projection "
+                                  << pi << " (" << (binding.name ? binding.name : "unnamed") << ")");
                         return false;
                     }
+                    return true;
+                };
+
+                if (verifier_schedule ==
+                    GroupedVerifierProjectionSchedule::
+                        ConcurrentOnPersistentStreams)
+                {
+                    if (!verifier_pool)
+                        throw std::logic_error(
+                            "Concurrent grouped verifier schedule has no "
+                            "persistent stream pool");
+
+                    const int active_streams = std::min(
+                        static_cast<int>(bindings.size()),
+                        verifier_pool->count);
+                    if (!cudaQuantGemm_recordEvent(
+                            verifier_pool->quant_ready, execution_stream))
+                    {
+                        throw std::runtime_error(
+                            "[GroupedVerifier] Failed to publish quantized "
+                            "activations to projection streams");
+                    }
+                    for (int si = 0; si < active_streams; ++si)
+                    {
+                        if (!cudaQuantGemm_streamWaitEvent(
+                                verifier_pool->streams[si],
+                                verifier_pool->quant_ready))
+                        {
+                            throw std::runtime_error(
+                                "[GroupedVerifier] Projection stream failed "
+                                "to wait for quantized activations");
+                        }
+                    }
+
+                    for (int pi = 0;
+                         pi < static_cast<int>(bindings.size()); ++pi)
+                    {
+                        const auto &plan =
+                            projection_plans[static_cast<size_t>(pi)];
+                        auto &binding = bindings[static_cast<size_t>(pi)];
+                        if (plan.uses_ordered_reducer)
+                        {
+                            const auto &slot =
+                                scratch_slots[plan.slot_index];
+                            auto *slice = reinterpret_cast<float *>(
+                                static_cast<std::byte *>(slot.arena) +
+                                slot.offset_bytes);
+                            cudaGemvContext_bindWorkspace(
+                                binding.kernel->impl_->gemv_ctx,
+                                slice,
+                                slot.required_bytes);
+                        }
+                        if (!launch_projection(
+                                pi,
+                                verifier_pool->streams[plan.stream_index]))
+                        {
+                            return false;
+                        }
+                    }
+
+                    for (int si = 0; si < active_streams; ++si)
+                    {
+                        if (!cudaQuantGemm_recordEvent(
+                                verifier_pool->completion[si],
+                                verifier_pool->streams[si]) ||
+                            !cudaQuantGemm_streamWaitEvent(
+                                execution_stream,
+                                verifier_pool->completion[si]))
+                        {
+                            throw std::runtime_error(
+                                "[GroupedVerifier] Failed to join a projection "
+                                "producer to the root publication stream");
+                        }
+                    }
+                }
+                else
+                {
+                    for (int pi = 0;
+                         pi < static_cast<int>(bindings.size()); ++pi)
+                    {
+                        if (!launch_projection(pi, execution_stream))
+                            return false;
+                    }
                 }
 
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -2071,9 +2849,16 @@ namespace llaminar2
                             {"m", std::to_string(m)},
                             {"k", std::to_string(k)},
                             {"projections", std::to_string(projections.size())},
-                            {"route", "shared_quantized_activation"}});
+                            {"route", "specialized"},
+                            {"projection_schedule",
+                             verifier_schedule ==
+                                     GroupedVerifierProjectionSchedule::
+                                         ConcurrentOnPersistentStreams
+                                 ? "concurrent"
+                                 : "ordered"}});
                 }
 
+                publish_projection_outputs();
                 return true;
             }
 
@@ -2122,16 +2907,16 @@ namespace llaminar2
                 d_sums_A_blockwise = needs_block_sums
                                          ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
                                          : nullptr;
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise quantizing activations once, m=" << m << " k=" << k);
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise quantizing activations once, m=" << m << " k=" << k);
 
                 // Blockwise quantize activations ONCE (shared across all projections)
                 const bool quantized = d_sums_A_blockwise
                                            ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
                                                  d_input, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_)
+                                                 m, k, cuda_device_id_, execution_stream)
                                            : cudaQuantGemm_quantizeActivationsBlockwise(
                                                  d_input, d_A_int8, d_scales_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_);
+                                                 m, k, cuda_device_id_, execution_stream);
                 if (!quantized)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise activation quantization failed");
@@ -2139,24 +2924,13 @@ namespace llaminar2
                 }
             }
 
-            // Step 4: Try concurrent multi-stream dispatch for prefill
-            // Deterministic parity mode intentionally disables this path. We
-            // also avoid it for very small prefill M, which is the regime where
-            // the multi-stream fused path still proved unstable in local-PP
-            // parity runs. Keep the fast path for larger prompt lengths where
-            // concurrent projection dispatch is most useful.
-            const bool deterministic_prefill = cudaNativeVNNIPrefill_getDeterministicMode() ||
-                                               debugEnv().gemm.deterministic;
-            const bool small_m_stage_stream = (gpu_stream_ != nullptr) && (m <= 16);
-
-            // Prefill concurrency: larger prompt M, multi-stream fused projections.
-            // The small-M regime (m <= 16) is intentionally excluded here because the
-            // multi-stream fused path proved unstable in local-PP parity runs.
+            // Prefill concurrency is an output-schedule choice and therefore
+            // cannot change any projection's canonical K reduction. Small M is
+            // excluded only because separate stream launches are uneconomical
+            // there; it is not a correctness or determinism fallback.
             const bool prefill_concurrent_eligible = use_blockwise && m > 16 &&
                                                      projections.size() >= 2 &&
-                                                     debugEnv().gemm.cuda_concurrent_prefill &&
-                                                     !deterministic_prefill &&
-                                                     !small_m_stage_stream;
+                                                     debugEnv().gemm.cuda_concurrent_prefill;
 
             // Decode concurrency: m == 1 GEMV projections (e.g. the GDN q/k/v/z and the
             // tiny alpha/beta gates) dispatched on separate streams so the small,
@@ -2167,29 +2941,16 @@ namespace llaminar2
             // partial arenas declared by the fused stage that knows projection fan-out.
             const bool decode_concurrent_eligible = use_blockwise && m == 1 &&
                                                     projections.size() >= 2 &&
-                                                    debugEnv().gemm.cuda_concurrent_decode &&
-                                                    !deterministic_prefill;
+                                                    debugEnv().gemm.cuda_concurrent_decode;
 
             const bool concurrent_eligible = prefill_concurrent_eligible || decode_concurrent_eligible;
             const bool concurrent_decode = decode_concurrent_eligible;
 
-            // CUDA stream/event creation (pool.init) is illegal while a graph capture is
-            // active. The pool is initialized during the eager warmup step (step 0) that
-            // precedes capture, so by the time the captured decode runs it is already
-            // initialized. Guard defensively: if capture is active and the pool has not
-            // yet been initialized, fall back to the sequential path rather than issue an
-            // illegal allocation inside the capture.
-            bool concurrent_safe = concurrent_eligible;
-            if (concurrent_eligible && isGraphCaptureActive())
-            {
-                auto &pool_check = getSharedCUDAPrefillPool(cuda_device_id_);
-                if (!pool_check.initialized)
-                {
-                    LOG_DEBUG("[ConcurrentGemm] Graph capture active but stream pool not "
-                              "initialized; using sequential fallback");
-                    concurrent_safe = false;
-                }
-            }
+            // Stream/event creation is illegal while a graph capture is active.
+            // Fused projection stages provision the shared pool through their
+            // CaptureOnly prepareGraphLaunch() contract. The accessor retains a
+            // fail-closed check for direct kernel callers and eager execution.
+            const bool concurrent_safe = concurrent_eligible;
 
             if (concurrent_safe)
             {
@@ -2203,10 +2964,70 @@ namespace llaminar2
                         std::to_string(num_proj));
                 }
                 auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
-                pool.init(cuda_device_id_, num_proj);
+
+                /*
+                 * The projection streams fork from `execution_stream` by
+                 * waiting on `quant_ready`.  Join every optional bias producer
+                 * to that root stream before recording the fork event.  This
+                 * makes the exact dependency DAG
+                 *
+                 *   bias producer -> root stream -> quant_ready -> side stream
+                 *
+                 * explicit for eager execution and for one monolithic native
+                 * graph capture.  Asking TransferEngine to join a bias directly
+                 * to a side stream after beginCapture() is both too late for an
+                 * external event and inconsistent with the capture ledger's
+                 * root-stream ownership.
+                 */
+                for (int pi = 0; pi < num_proj; ++pi)
+                {
+                    const auto &projection = projections[pi];
+                    if (!projection.bias)
+                        continue;
+
+                    const TensorBase *bias_tensor = projection.bias;
+                    if (auto *slice =
+                            dynamic_cast<const TensorSlice *>(projection.bias))
+                    {
+                        bias_tensor = slice->inner();
+                    }
+
+                    auto *fp32_bias = dynamic_cast<FP32Tensor *>(
+                        const_cast<TensorBase *>(bias_tensor));
+                    if (!fp32_bias)
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Projection " +
+                            std::to_string(pi) + " bias is not FP32Tensor");
+                    }
+
+                    const auto current_device = fp32_bias->current_device();
+                    if (current_device.has_value() &&
+                        current_device->is_gpu() &&
+                        current_device.value() != target_device)
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Projection " +
+                            std::to_string(pi) + " bias is resident on " +
+                            current_device->to_string() + " instead of " +
+                            target_device.toString());
+                    }
+
+                    TransferEngine::requireDeviceInput(
+                        fp32_bias,
+                        target_device,
+                        execution_stream);
+                    if (!fp32_bias->gpu_data_ptr())
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Projection " +
+                            std::to_string(pi) +
+                            " bias has no device storage after root-stream join");
+                    }
+                }
 
                 // Record event after quantization completes on main stream
-                cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
+                cudaQuantGemm_recordEvent(pool.quant_ready, execution_stream);
 
                 for (int pi = 0; pi < num_proj; ++pi)
                 {
@@ -2272,8 +3093,10 @@ namespace llaminar2
                                 GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
                             const size_t extra_bytes = cuda_kernel->workspace_->getBufferSize(
                                 GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
-                            const size_t extra_slot_bytes =
-                                extra_bytes / static_cast<size_t>(kCudaConcurrentPrefillExtraAccumulatorSlots);
+                            const AlignedWorkspaceSlices slices(
+                                extra_bytes, kCudaConcurrentPrefillExtraAccumulatorSlots,
+                                alignof(int32_t));
+                            const size_t extra_slot_bytes = slices.strideBytes();
                             const size_t needed_bytes = acc_elements * sizeof(int32_t);
                             if (!extra_buffer || extra_slot_bytes < needed_bytes ||
                                 stream_idx > kCudaConcurrentPrefillExtraAccumulatorSlots)
@@ -2287,9 +3110,8 @@ namespace llaminar2
                                     std::to_string(extra_slot_bytes) + " bytes");
                             }
 
-                            auto *extra_bytes_ptr = static_cast<unsigned char *>(extra_buffer);
                             proj_d_C_int32 = reinterpret_cast<int32_t *>(
-                                extra_bytes_ptr + static_cast<size_t>(stream_idx - 1) * extra_slot_bytes);
+                                slices.slice(extra_buffer, stream_idx - 1, needed_bytes).data());
                         }
 
                         cuda_kernel->validateWorkspace();
@@ -2319,16 +3141,29 @@ namespace llaminar2
                             bias_tensor = slice->inner();
 
                         auto *fp32_bias = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(bias_tensor));
-                        if (fp32_bias)
+                        if (!fp32_bias)
                         {
-                            auto current_dev = fp32_bias->current_device();
-                            if (current_dev.has_value() && current_dev.value() == target_device)
-                                d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
-                            else if (!current_dev.has_value() || !current_dev->is_gpu())
-                            {
-                                fp32_bias->ensureOnDevice(target_device);
-                                d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
-                            }
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                                " bias is not FP32Tensor");
+                        }
+                        auto current_dev = fp32_bias->current_device();
+                        if (current_dev.has_value() &&
+                            current_dev->is_gpu() &&
+                            current_dev.value() != target_device)
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                                " bias is resident on " + current_dev->to_string() +
+                                " instead of CUDA:" + std::to_string(cuda_device_id_));
+                        }
+                        d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                        if (!d_bias)
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Projection " +
+                                std::to_string(pi) +
+                                " bias lost its prejoined device storage");
                         }
                     }
 
@@ -2341,7 +3176,7 @@ namespace llaminar2
                     if (pi >= pool.count)
                         cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]);
 
-                    LOG_DEBUG("[ConcurrentPrefill] Projection " << pi
+                    LOG_TRACE("[ConcurrentPrefill] Projection " << pi
                                                                 << " (" << (proj.name ? proj.name : "?")
                                                                 << ") M=" << m << " N=" << n << " K=" << k
                                                                 << " on stream " << stream_idx);
@@ -2371,9 +3206,32 @@ namespace llaminar2
                 // All projections dispatched — main stream waits for completion
                 for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                 {
-                    cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
+                    cudaQuantGemm_streamWaitEvent(execution_stream, pool.completion[si]);
                 }
-                LOG_DEBUG("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
+                /*
+                 * This counter is the executable proof that an integration
+                 * test reached the real persistent side-stream fan-out. A
+                 * concurrency test that merely enables the policy but falls
+                 * through to sequential projection dispatch is not evidence.
+                 */
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_fused_projection_stream_pool_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"mode", concurrent_decode ? "decode" : "prefill"},
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(num_proj)},
+                            {"streams", std::to_string(
+                                 std::min(num_proj, pool.count))}});
+                }
+                LOG_TRACE("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
+                publish_projection_outputs();
                 return true;
             }
 
@@ -2400,7 +3258,7 @@ namespace llaminar2
                 }
 
                 const int n = proj.n;
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                          << " (" << (proj.name ? proj.name : "unnamed") << "): m=" << m << " n=" << n << " k=" << k);
 
                 // Ensure the projection's weights are converted
@@ -2477,33 +3335,21 @@ namespace llaminar2
                     DeviceId target_device = DeviceId::cuda(cuda_device_id_);
                     auto current_dev = fp32_bias->current_device();
 
-                    if (current_dev.has_value() && current_dev.value() == target_device)
-                    {
-                        // Already on correct device - use directly
-                        d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
-                    }
-                    else if (current_dev.has_value() && current_dev->is_gpu())
+                    if (current_dev.has_value() &&
+                        current_dev->is_gpu() &&
+                        current_dev.value() != target_device)
                     {
                         // Tensor is on a DIFFERENT GPU - this is a multi-GPU race condition!
-                        // Do NOT call ensureOnDevice() as it would free the other GPU's memory.
-                        // The correct fix is to ensure each device has its own bias tensor clone.
+                        // Each device must own its own bias tensor clone.
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] MULTI-GPU CONFLICT: Bias tensor is on "
                                   << current_dev->to_string() << " but we need CUDA:" << cuda_device_id_
                                   << ". Ensure WeightPreloader::uploadNonGemmWeights() was called for this device.");
                         all_success = false;
                         break;
                     }
-                    else
-                    {
-                        // Tensor is on CPU or not uploaded yet - safe to upload to this device
-                        if (!fp32_bias->ensureOnDevice(target_device))
-                        {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Failed to upload bias to CUDA:" << cuda_device_id_);
-                            all_success = false;
-                            break;
-                        }
-                        d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
-                    }
+                    TransferEngine::requireDeviceInput(
+                        fp32_bias, target_device, execution_stream);
+                    d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
 
                     if (!d_bias)
                     {
@@ -2518,7 +3364,7 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
                                                                                              << " using bias ptr=" << static_cast<const void *>(d_bias));
                 }
 
@@ -2529,7 +3375,7 @@ namespace llaminar2
                     // Diagnostic: checksum weight data to detect weight corruption
                     if (trace_fused && cuda_kernel->impl_)
                     {
-                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(execution_stream));
                         const void *wt_ptr = cuda_kernel->impl_->d_weights_native_vnni;
                         if (wt_ptr)
                         {
@@ -2547,9 +3393,9 @@ namespace llaminar2
                         }
                     }
 
-                    if (m == 1 && useCanonicalM1SmallMDecode())
+                    if (m == 1 && useCanonicalM1Decode())
                     {
-                        const bool canonical_ok = cuda_kernel->multiply_quantized_m1_via_small_m_gemv(
+                        const bool canonical_ok = cuda_kernel->multiply_quantized_m1_decode_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
                             d_output,
@@ -2557,10 +3403,11 @@ namespace llaminar2
                             n,
                             k,
                             1.0f,
-                            0.0f);
+                            0.0f,
+                            execution_stream);
                         if (!canonical_ok)
                         {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Deterministic canonical M=1 small-M GEMV failed for projection "
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Canonical M=1 decode GEMV failed for projection "
                                       << i << " (" << (proj.name ? proj.name : "unnamed") << ")");
                             all_success = false;
                             break;
@@ -2587,7 +3434,7 @@ namespace llaminar2
                         1.0f, 0.0f,
                         nullptr,
                         d_bias,
-                        cuda_device_id_, gpu_stream_,
+                        cuda_device_id_, execution_stream,
                         nullptr,
                         nativeVNNIUsesAsymmetricCorrection(cuda_kernel->impl_->native_codebook_id)
                             ? d_sums_A_blockwise
@@ -2613,7 +3460,7 @@ namespace llaminar2
                         // LLAMINAR_CUDA_FUSED_GEMM_TRACE must not be running under capture.
                         if (trace_fused)
                         {
-                            cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                            cudaStreamSynchronize(static_cast<cudaStream_t>(execution_stream));
                             const size_t total = static_cast<size_t>(m) * n;
                             std::vector<float> host_all(total);
                             cudaMemcpy(host_all.data(), d_output, total * sizeof(float),
@@ -2654,13 +3501,15 @@ namespace llaminar2
                     size_t copy_count = std::min(static_cast<size_t>(m) * static_cast<size_t>(n), static_cast<size_t>(8));
                     std::vector<float> h_output(copy_count);
                     cudaQuantGemm_copyDeviceToHost(h_output.data(), d_output, h_output.size(), cuda_device_id_);
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] " << (proj.name ? proj.name : "unnamed")
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fused_tensor] " << (proj.name ? proj.name : "unnamed")
                                                                                   << " output[0:4]=" << h_output[0] << "," << (h_output.size() > 1 ? h_output[1] : 0.f) << ","
                                                                                   << (h_output.size() > 2 ? h_output[2] : 0.f) << "," << (h_output.size() > 3 ? h_output[3] : 0.f));
                 }
 #endif
             }
 
+            if (all_success)
+                publish_projection_outputs();
             return all_success;
         }
 
@@ -2694,16 +3543,25 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] m=" << m << " n=" << n << " k=" << k);
+            LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] m=" << m << " n=" << n << " k=" << k);
 
             validateWorkspace();
 
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
 
             ensureWeightsConverted();
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                          "Fused SwiGLU launch requires an explicit CUDA stream");
+                return false;
+            }
+            cudaQuantGemm_setDevice(cuda_device_id_);
 
             const bool verifier_small_m =
-                (m > 1 && m <= 4) &&
+                explicitSmallMVerifierScopeActive() &&
+                (m > 1) &&
                 (k % 32 == 0) &&
                 canUseNativeVNNIBlockwise(impl_.get(), 1, k);
             const bool use_blockwise =
@@ -2719,22 +3577,39 @@ namespace llaminar2
                         ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
                         : nullptr;
 
-                // Fused SwiGLU + blockwise quantization: replaces separate SwiGLU + quant kernels
-                const bool quantized = d_sums_A_blockwise
-                                           ? cudaOps_fused_swiglu_quantize_blockwise_with_sums(
-                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_)
-                                           : cudaOps_fused_swiglu_quantize_blockwise(
-                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_);
-                if (!quantized)
-                {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU+quantize failed");
-                    return false;
-                }
-
                 if (verifier_small_m)
                 {
+                    if (beta != 0.0f)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                                  "Decode-equivalent verifier rows do not support beta accumulation");
+                        return false;
+                    }
+
+                    /*
+                     * Quantized FFN-down uses the same grouped verifier
+                     * contract as projections: compute silu(gate)*up and
+                     * quantize all verifier rows in one kernel, then consume the
+                     * resulting [M,K] activation matrix with the grouped
+                     * small-M native-VNNI GEMV.  The regression suite compares
+                     * every row against M=1 serial decode, so this grouped route
+                     * must be mathematically identical, not just close.
+                     */
+                    if (!cudaOps_fused_swiglu_quantize_blockwise(
+                            d_gate,
+                            d_up,
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            m,
+                            k,
+                            cuda_device_id_,
+                            execution_stream))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                                  "Verifier grouped fused SwiGLU+quantize failed");
+                        return false;
+                    }
+
                     if (!multiply_quantized_small_m_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
@@ -2744,14 +3619,62 @@ namespace llaminar2
                             n,
                             k,
                             alpha,
-                            beta,
-                            true))
+                            0.0f,
+                            true,
+                            execution_stream))
                     {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU small-M NativeVNNI GEMV failed");
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                                  "Verifier grouped small-M down GEMV failed");
                         return false;
                     }
 
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (small-M native GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                              "Complete (grouped small-M decode-equivalent SwiGLU/down)");
+                    return true;
+                }
+
+                // Fused SwiGLU + blockwise quantization: replaces separate SwiGLU + quant kernels
+                const bool quantized = d_sums_A_blockwise
+                                           ? cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
+                                                 m, k, cuda_device_id_, execution_stream)
+                                           : cudaOps_fused_swiglu_quantize_blockwise(
+                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise,
+                                                 m, k, cuda_device_id_, execution_stream);
+                if (!quantized)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU+quantize failed");
+                    return false;
+                }
+
+                if (m == 1 && useCanonicalM1Decode())
+                {
+                    /*
+                     * Fused SwiGLU/down is the first FFN stage whose output can
+                     * diverge after otherwise bitwise-identical MTP verifier
+                     * rows.  The generic NativeVNNI blockwise route may select a
+                     * fast GEMV dispatch family whose first launch and later
+                     * launch differ by a few ULPs for Qwen3.6-sized FFN-down
+                     * matrices.  Feed the already-quantized SwiGLU activation
+                     * through the same canonical direct M=1 GEMV helper used by
+                     * projection decode so serial replay has a single oracle.
+                     */
+                    if (!multiply_quantized_m1_decode_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            d_C,
+                            nullptr,
+                            n,
+                            k,
+                            alpha,
+                            beta,
+                            execution_stream))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU canonical M=1 NativeVNNI GEMV failed");
+                        return false;
+                    }
+
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (canonical M=1 native GEMV)");
                     return true;
                 }
 
@@ -2762,16 +3685,16 @@ namespace llaminar2
                         impl_.get(),
                         d_A_int8, nullptr, d_C, d_scales_A_blockwise,
                         m, n, k, alpha, beta, d_C_existing, nullptr,
-                        cuda_device_id_, gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr,
+                        cuda_device_id_, execution_stream,
+                        impl_ ? &impl_->rowmajor : nullptr,
                         d_sums_A_blockwise))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
 
                     // Diagnostic: checksum FFN_DOWN output (NativeVNNI path)
                     if (debugEnv().gemm.cuda_fused_gemm_trace)
                     {
-                        cudaStreamSynchronize(static_cast<cudaStream_t>(gpu_stream_));
+                        cudaStreamSynchronize(static_cast<cudaStream_t>(execution_stream));
                         const size_t total = static_cast<size_t>(m) * n;
                         std::vector<float> host_all(total);
                         cudaMemcpy(host_all.data(), d_C, total * sizeof(float),
@@ -2828,6 +3751,29 @@ namespace llaminar2
                 return result;
             }
 
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                          "Fused SwiGLU tensor GEMM requires an explicit CUDA stream");
+                return false;
+            }
+            const DeviceId target_device = DeviceId::cuda(cuda_device_id_);
+            TransferEngine::requireDeviceInput(
+                const_cast<TensorBase *>(gate),
+                target_device,
+                execution_stream);
+            TransferEngine::requireDeviceInput(
+                const_cast<TensorBase *>(up),
+                target_device,
+                execution_stream);
+            if (beta != 0.0f)
+                TransferEngine::requireDeviceInput(
+                    output, target_device, execution_stream);
+            else
+                TransferEngine::requireDeviceOutput(
+                    output, target_device, execution_stream);
+
             // Get device pointers (tensors must already be on GPU via DeviceGraphExecutor coherence)
             const float *d_gate = static_cast<const float *>(gate->gpu_data_ptr());
             const float *d_up = static_cast<const float *>(up->gpu_data_ptr());
@@ -2842,7 +3788,11 @@ namespace llaminar2
                 return false;
             }
 
-            return multiply_with_fused_swiglu(d_gate, d_up, d_C, m, n, k, alpha, beta);
+            const bool success =
+                multiply_with_fused_swiglu(d_gate, d_up, d_C, m, n, k, alpha, beta);
+            if (success)
+                publishCUDATensorWrite(*output, cuda_device_id_, execution_stream);
+            return success;
         }
 
         bool CUDAQuantisedGemmKernel::multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
@@ -2853,9 +3803,9 @@ namespace llaminar2
             float beta,
             DeviceWorkspaceManager *workspace)
         {
-            if (m <= 1 || m > 4)
+            if (m < 1)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier SwiGLU requires M=2..4, got M="
+                LOG_ERROR("[CUDAQuantisedGemmKernel] grouped verifier SwiGLU requires M>=1, got M="
                           << m);
                 return false;
             }
@@ -2874,7 +3824,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Null input or output");
                 return false;
             }
-            if (m <= 1 || m > 4 || n <= 0 || k <= 0)
+            if (m <= 1 || n <= 0 || k <= 0)
             {
                 return false;
             }
@@ -2885,6 +3835,21 @@ namespace llaminar2
 
             validateWorkspace();
             ensureWeightsConverted();
+
+            /*
+             * Capture the stream once before quantizing rows.  This helper is
+             * used by verifier publication tests and can run while a sibling
+             * LocalTP worker reaches request cleanup, so every launch in the
+             * helper must use the same stream value even if resetDynamicState()
+             * clears gpu_stream_ before the final GEMV dispatch.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] "
+                          "Small-M verifier GEMV requires an explicit CUDA stream");
+                return false;
+            }
 
             if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
             {
@@ -2902,7 +3867,7 @@ namespace llaminar2
                     m,
                     k,
                     cuda_device_id_,
-                    gpu_stream_))
+                    execution_stream))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Blockwise activation quantization failed");
                 return false;
@@ -2917,7 +3882,9 @@ namespace llaminar2
                 n,
                 k,
                 alpha,
-                beta);
+                beta,
+                true,
+                execution_stream);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv(
@@ -2927,21 +3894,34 @@ namespace llaminar2
             const float *d_bias,
             int m, int n, int k,
             float alpha, float beta,
-            bool use_specialized_small_m_kernel)
+            bool use_specialized_small_m_kernel,
+            void *execution_stream)
         {
             if (!d_A_int8 || !d_scales_A_blockwise || !d_C)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Null input, scale, or output");
                 return false;
             }
-            if (m <= 1 || m > 4 || n <= 0 || k <= 0 || (k % 32) != 0)
+            if (m <= 1 || n <= 0 || k <= 0 || (k % 32) != 0)
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Invalid dimensions: M="
                           << m << " N=" << n << " K=" << k);
                 return false;
             }
+            void *stream_handle = execution_stream ? execution_stream : gpu_stream_;
+            if (!stream_handle)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] "
+                          "NativeVNNI small-M GEMV requires an explicit CUDA stream");
+                return false;
+            }
 
             ensureWeightsConverted();
+            const uint8_t arithmetic_policy_codebook_id =
+                impl_->native_source_identity.present
+                    ? canonicalDeviceVnniCodebookId(
+                          impl_->native_source_identity.codebook_id)
+                    : impl_->native_codebook_id;
             if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] NativeVNNI GEMV unsupported for codebook "
@@ -2957,10 +3937,9 @@ namespace llaminar2
                 return false;
             }
 
-            const int blocks_per_row = k / 32;
             auto record_small_m_route = [&](const char *route)
             {
-                if (!PerfStatsCollector::isEnabled())
+                if (!PerfStatsCollector::isDomainEnabled("kernel"))
                     return;
 
                 PerfStatsCollector::addCounter(
@@ -2976,28 +3955,35 @@ namespace llaminar2
                         {"k", std::to_string(k)},
                         {"route", route}});
 
-                if (m == 2)
-                {
-                    PerfStatsCollector::addCounter(
-                        "kernel",
-                        "cuda_native_vnni_m2_calls",
-                        1.0,
-                        "gemm",
-                        "cuda:" + std::to_string(cuda_device_id_),
-                        PerfStatsCollector::Tags{
-                            {"codebook", std::to_string(static_cast<int>(impl_->native_codebook_id))},
-                            {"n", std::to_string(n)},
-                            {"k", std::to_string(k)},
-                            {"route", route}});
-                }
             };
 
-            if (use_specialized_small_m_kernel)
+            if (!use_specialized_small_m_kernel)
             {
-                if (!impl_->gemv_ctx)
-                    impl_->gemv_ctx = cudaGemvContext_create(cuda_device_id_);
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] "
+                          "Rowwise small-M replay has been retired; grouped specialized NativeVNNI is required");
+                return false;
+            }
 
-                const bool ok = cudaNativeVNNIGemvTuned_small_m_fp32(
+            if (!impl_->gemv_ctx)
+                impl_->gemv_ctx = cudaGemvContext_create(cuda_device_id_);
+
+            auto launch_small_m = [&]
+            {
+                /*
+                 * Canonical serial M=1 decode intentionally passes no lazy
+                 * row-major weight slot: large-K generated KPAR shapes must
+                 * keep their fixed two-phase reduction instead of changing to
+                 * ROWPAR after an auxiliary transpose happens to exist.  The
+                 * grouped verifier must make the same dispatch decision for
+                 * every row. It remains one economical runtime-M launch; only
+                 * the incompatible ROWPAR promotion is suppressed while the
+                 * explicit decode-equivalent scope is active.
+                 */
+                CUDARowMajorWeights **rowmajor_slot =
+                    explicitSmallMVerifierScopeActive()
+                        ? nullptr
+                        : (impl_ ? &impl_->rowmajor : nullptr);
+                return cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
                     d_A_int8,
                     impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
@@ -3013,167 +3999,134 @@ namespace llaminar2
                     beta != 0.0f ? d_C : nullptr,
                     d_bias,
                     impl_->native_codebook_id,
+                    arithmetic_policy_codebook_id,
                     cuda_device_id_,
-                    gpu_stream_,
+                    stream_handle,
                     impl_->gemv_ctx,
-                    packed_ ? &packed_->rowmajor_ : nullptr);
-                if (!ok)
-                {
-                    if (cudaNativeVNNIGemvSweep_isActive())
-                    {
-                        return false;
-                    }
+                    rowmajor_slot,
+                    VerifierKernelModeScope::rowsFor(m));
+            };
 
-                    cudaError_t le = cudaPeekAtLastError();
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI small-M GEMV failed"
-                              << " M=" << m
-                              << " codebook=" << static_cast<int>(impl_->native_codebook_id)
-                              << " N=" << n << " K=" << k
-                              << " stream=" << gpu_stream_
-                              << " cuda_error=" << cudaGetErrorName(le)
-                              << " (" << cudaGetErrorString(le) << ")"
-                              << " rowmajor_slot=" << (packed_ && packed_->rowmajor_ ? "present" : "absent"));
-                    return false;
-                }
-
-                record_small_m_route("specialized");
-                return true;
-            }
-
-            for (int row = 0; row < m; ++row)
+            /*
+             * The grouped verifier entry point batches rows, but each row must
+             * inherit the family, tile, and fixed K-partition contract of public
+             * M=1 decode. The scope changes dispatch identity only; both paths
+             * use the same ordered publication implementation.
+             */
+            // The public verifier scope owns both adapter and raw policy.
+            const bool ok = launch_small_m();
+            if (!ok)
             {
-                const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
-                const float *row_scales =
-                    d_scales_A_blockwise + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
-                float *row_C = d_C + static_cast<size_t>(row) * static_cast<size_t>(n);
-                const float *row_existing = (beta != 0.0f) ? row_C : nullptr;
-
-                if (!runNativeVNNIBlockwiseIfSupported(
-                        impl_.get(),
-                        row_A,
-                        nullptr,
-                        row_C,
-                        row_scales,
-                        1,
-                        n,
-                        k,
-                        alpha,
-                        beta,
-                        row_existing,
-                        d_bias,
-                        cuda_device_id_,
-                        gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr))
+                if (cudaNativeVNNIGemvSweep_isActive())
                 {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Row "
-                              << row << " native-VNNI GEMV failed");
                     return false;
                 }
+
+                cudaError_t le = cudaPeekAtLastError();
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI small-M GEMV failed"
+                          << " M=" << m
+                          << " codebook=" << static_cast<int>(impl_->native_codebook_id)
+                          << " N=" << n << " K=" << k
+                          << " stream=" << stream_handle
+                          << " cuda_error=" << cudaGetErrorName(le)
+                          << " (" << cudaGetErrorString(le) << ")"
+                          << " rowmajor_slot=" << (impl_ && impl_->rowmajor ? "present" : "absent"));
+                return false;
             }
 
-            record_small_m_route("rowwise");
-
+            record_small_m_route("specialized");
             return true;
         }
 
-        bool CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv(
+        bool CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv(
             const int8_t *d_A_int8,
             const float *d_scales_A_blockwise,
             float *d_C,
             const float *d_bias,
             int n, int k,
-            float alpha, float beta)
+            float alpha, float beta,
+            void *execution_stream)
         {
-            if (!useCanonicalM1SmallMDecode())
+            if (!useCanonicalM1Decode())
                 return false;
             if (!d_A_int8 || !d_scales_A_blockwise || !d_C || n <= 0 || k <= 0 || (k % 32) != 0)
                 return false;
             if (beta != 0.0f)
                 return false;
-            if (!gpu_stream_)
+            void *stream_handle = execution_stream ? execution_stream : gpu_stream_;
+            if (!stream_handle)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] "
-                          "Deterministic canonical M=1 GEMV requires an explicit CUDA stream");
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv] "
+                          "Canonical M=1 decode GEMV requires an explicit CUDA stream");
                 return false;
             }
 
             validateWorkspace();
             ensureWeightsConverted();
+            const uint8_t arithmetic_policy_codebook_id =
+                impl_->native_source_identity.present
+                    ? canonicalDeviceVnniCodebookId(
+                          impl_->native_source_identity.codebook_id)
+                    : impl_->native_codebook_id;
             if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
                 return false;
 
-            auto *scratch = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
-            const size_t scratch_bytes = workspace_->getBufferSize(tempCFp32BufferName());
-            const size_t required_scratch_bytes = static_cast<size_t>(2) * static_cast<size_t>(n) * sizeof(float);
-            if (!scratch || scratch_bytes < required_scratch_bytes)
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] "
-                          << tempCFp32BufferName() << " workspace is missing or undersized: need "
-                          << required_scratch_bytes << " bytes, have " << scratch_bytes);
-                return false;
-            }
-
-            const int blocks_per_row = k / 32;
-            auto *mutable_A = const_cast<int8_t *>(d_A_int8);
-            auto *mutable_scales = const_cast<float *>(d_scales_A_blockwise);
-            cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
-            cudaError_t err = cudaMemsetAsync(
-                mutable_A + static_cast<size_t>(k),
-                0,
-                static_cast<size_t>(k) * sizeof(int8_t),
-                stream);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to clear padded A row: "
-                          << cudaGetErrorString(err));
-                return false;
-            }
-
-            err = cudaMemsetAsync(
-                mutable_scales + static_cast<size_t>(blocks_per_row),
-                0,
-                static_cast<size_t>(blocks_per_row) * sizeof(float),
-                stream);
-            if (err != cudaSuccess)
-            {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to clear padded scale row: "
-                          << cudaGetErrorString(err));
-                return false;
-            }
-
-            if (!multiply_quantized_small_m_gemv(
-                    d_A_int8,
-                    d_scales_A_blockwise,
-                    scratch,
-                    d_bias,
-                    2,
-                    n,
-                    k,
-                    alpha,
-                    0.0f,
-                    true))
+            if (!ensureNativeVNNIIQGridTablesInitialized(
+                    impl_->native_codebook_id,
+                    cuda_device_id_,
+                    "NativeVNNI canonical M=1 route"))
             {
                 return false;
             }
 
-            err = cudaMemcpyAsync(
+            /*
+             * Serial decode already has the exact numerical contract the MTP
+             * verifier must preserve.  Launching through the raw M=1 generated
+             * route avoids the padded small-M scratch/copy transaction that
+             * produced one-ULP repeat drift in Q4_0 focused tests.
+             *
+             * Pass a null row-major slot for the canonical verifier oracle.  The
+             * optional ROWPAR auxiliary view is materialized lazily, so comparing
+             * a first decode token against a later token can otherwise compare two
+             * different dispatch families.  Once ROWPAR preparation becomes an
+             * explicit graph warmup step, it can earn its way back through the
+             * same first-call repeat tests.
+             */
+            ScopedNativeVNNIGemvDecodeEquivalentM1Config decode_equivalent_m1_scope;
+            const bool ok = cudaNativeVNNIGemvTuned_fp32_withPolicy(
+                d_A_int8,
+                impl_->d_weights_native_vnni,
+                impl_->d_weights_native_scales,
+                impl_->d_weights_native_mins,
+                impl_->d_weights_native_emins,
                 d_C,
-                scratch,
-                static_cast<size_t>(n) * sizeof(float),
-                cudaMemcpyDeviceToDevice,
-                stream);
-            if (err != cudaSuccess)
+                d_scales_A_blockwise,
+                n,
+                k,
+                alpha,
+                beta,
+                nullptr,
+                d_bias,
+                impl_->native_codebook_id,
+                arithmetic_policy_codebook_id,
+                cuda_device_id_,
+                stream_handle,
+                impl_->gemv_ctx,
+                nullptr);
+            if (!ok)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to copy canonical row output: "
-                          << cudaGetErrorString(err));
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv] "
+                          "Canonical M=1 decode GEMV failed"
+                          << " codebook=" << static_cast<int>(impl_->native_codebook_id)
+                          << " N=" << n << " K=" << k);
                 return false;
             }
 
-            if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
-                    "cuda_native_vnni_m1_canonical_small_m_calls",
+                    "cuda_native_vnni_m1_canonical_decode_calls",
                     1.0,
                     "gemm",
                     "cuda:" + std::to_string(cuda_device_id_),
@@ -3191,7 +4144,7 @@ namespace llaminar2
             int m, int n, int k,
             float alpha, float beta)
         {
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] m=" << m << " n=" << n << " k=" << k
+            LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] m=" << m << " n=" << n << " k=" << k
                                                                             << " alpha=" << alpha << " beta=" << beta
                                                                             << " d_A=" << static_cast<const void *>(d_A)
                                                                             << " d_C=" << static_cast<void *>(d_C));
@@ -3206,56 +4159,34 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            // ──── cuBLAS FP16 GEMM path (LLAMINAR_CUBLAS_GEMM=1) ────────────
-            // Dequant Q4_0 native VNNI weights → FP16 per-call,
-            // convert FP32 activations → FP16,
-            // then cuBLAS FP16 tensor-core GEMM with FP32 accumulation.
-            static const bool use_cublas_gemm = []()
+            /*
+             * All launches in this public GEMM transaction must use the same
+             * stream.  KernelFactory::resetAllDynamicState() is allowed to
+             * clear the member stream at request boundaries, and LocalTP
+             * workers can reach that boundary at slightly different wall-clock
+             * times.  Capturing here prevents a later branch from accidentally
+             * falling onto a null/default stream after earlier work was queued.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
             {
-                return debugEnv().gemm.cuda_cublas_gemm;
-            }();
-
-            if (use_cublas_gemm && m > 1 && impl_->d_weights_native_vnni && impl_->d_weights_native_scales)
-            {
-                static std::once_flag cublas_gemm_once;
-                std::call_once(cublas_gemm_once, []()
-                               { LOG_DEBUG("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM path active (Q4_0 native dequant)"); });
-
-                const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM, gpu_stream_);
-                // Lazy-create per-device cuBLAS context
-                if (!impl_->cublas_ctx)
-                    impl_->cublas_ctx = cudaCuBLASContext_create(cuda_device_id_);
-
-                bool ok = cudaCuBLAS_fp16_gemm_q40(
-                    impl_->d_weights_native_vnni,
-                    impl_->d_weights_native_scales,
-                    d_A, d_C,
-                    m, n, k,
-                    alpha, beta,
-                    d_C_existing,
-                    cuda_device_id_, gpu_stream_,
-                    impl_->cublas_ctx);
-                if (ok)
-                {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (cuBLAS FP16 Q4_0)");
-                    return true;
-                }
-                LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] "
+                          "CUDA GEMM requires an explicit CUDA stream");
+                return false;
             }
 
-            if (m > 1 && m <= 4)
+            if (explicitSmallMVerifierScopeActive() && m > 1)
             {
                 if (multiply_fp32_to_fp32_small_m_gemv(
                         d_A, d_C, nullptr, m, n, k, alpha, beta))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (small-M row-wise native payload GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (small-M row-wise native payload GEMV)");
                     return true;
                 }
 
                 if (cudaNativeVNNIGemvSweep_isActive())
                 {
-                    // Training sweeps must fail closed for M=2..4. Falling
+                    // Training sweeps must fail closed for grouped runtime-M. Falling
                     // through to the generic M>1 GEMM path would time a
                     // different kernel family while labelling the CSV row as
                     // the requested small-M candidate.
@@ -3281,10 +4212,10 @@ namespace llaminar2
                 const bool quantized = d_sums_A_blockwise
                                            ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
                                                  d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_)
+                                                 m, k, cuda_device_id_, execution_stream)
                                            : cudaQuantGemm_quantizeActivationsBlockwise(
                                                  d_A, d_A_int8, d_scales_A_blockwise,
-                                                 m, k, cuda_device_id_, gpu_stream_);
+                                                 m, k, cuda_device_id_, execution_stream);
                 if (!quantized)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
@@ -3292,9 +4223,9 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (m == 1 && useCanonicalM1SmallMDecode())
+                if (m == 1 && useCanonicalM1Decode())
                 {
-                    if (multiply_quantized_m1_via_small_m_gemv(
+                    if (multiply_quantized_m1_decode_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
                             d_C,
@@ -3302,13 +4233,14 @@ namespace llaminar2
                             n,
                             k,
                             alpha,
-                            beta))
+                            beta,
+                            execution_stream))
                     {
-                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (deterministic canonical M=1 small-M GEMV)");
+                        LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (canonical M=1 decode GEMV)");
                         return true;
                     }
 
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Deterministic M=1 native-VNNI canonical small-M GEMV failed");
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Canonical M=1 native-VNNI decode GEMV failed");
                     return false;
                 }
 
@@ -3322,11 +4254,11 @@ namespace llaminar2
                         alpha, beta,
                         d_C_existing,
                         nullptr,
-                        cuda_device_id_, gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr,
+                        cuda_device_id_, execution_stream,
+                        impl_ ? &impl_->rowmajor : nullptr,
                         d_sums_A_blockwise))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
                     return true;
                 }
 
@@ -3356,11 +4288,25 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            if (m > 1 && m <= 4 &&
+            /*
+             * Bias and non-bias FP32 paths share the same stream lifetime
+             * contract: snapshot the explicit stage stream once and never
+             * consult the mutable gpu_stream_ member after work begins.
+             */
+            void *execution_stream = gpu_stream_;
+            if (!execution_stream)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
+                          "CUDA GEMM with bias requires an explicit CUDA stream");
+                return false;
+            }
+
+            if (explicitSmallMVerifierScopeActive() &&
+                m > 1 &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, d_bias, m, n, k, alpha, beta))
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (small-M row-wise native payload GEMV)");
+                LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (small-M row-wise native payload GEMV)");
                 return true;
             }
 
@@ -3378,14 +4324,14 @@ namespace llaminar2
 
                 // Step 1: Blockwise quantize activations
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::QUANTIZE_ACTIVATIONS, gpu_stream_);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::QUANTIZE_ACTIVATIONS, execution_stream);
                     const bool quantized = d_sums_A_blockwise
                                                ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
                                                      d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
-                                                     m, k, cuda_device_id_, gpu_stream_)
+                                                     m, k, cuda_device_id_, execution_stream)
                                                : cudaQuantGemm_quantizeActivationsBlockwise(
                                                      d_A, d_A_int8, d_scales_A_blockwise,
-                                                     m, k, cuda_device_id_, gpu_stream_);
+                                                     m, k, cuda_device_id_, execution_stream);
                     if (!quantized)
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
@@ -3394,9 +4340,9 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (m == 1 && useCanonicalM1SmallMDecode())
+                if (m == 1 && useCanonicalM1Decode())
                 {
-                    if (multiply_quantized_m1_via_small_m_gemv(
+                    if (multiply_quantized_m1_decode_gemv(
                             d_A_int8,
                             d_scales_A_blockwise,
                             d_C,
@@ -3404,13 +4350,14 @@ namespace llaminar2
                             n,
                             k,
                             alpha,
-                            beta))
+                            beta,
+                            execution_stream))
                     {
-                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (deterministic canonical M=1 small-M GEMV)");
+                        LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (canonical M=1 decode GEMV)");
                         return true;
                     }
 
-                    LOG_ERROR("[CUDAQuantisedGemmKernel] Deterministic M=1 native-VNNI canonical small-M GEMV with bias failed");
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Canonical M=1 native-VNNI decode GEMV with bias failed");
                     return false;
                 }
 
@@ -3424,11 +4371,11 @@ namespace llaminar2
                         alpha, beta,
                         d_C_existing,
                         d_bias,
-                        cuda_device_id_, gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr,
+                        cuda_device_id_, execution_stream,
+                        impl_ ? &impl_->rowmajor : nullptr,
                         d_sums_A_blockwise))
                 {
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
+                    LOG_TRACE("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
                     return true;
                 }
 
@@ -3538,13 +4485,13 @@ namespace llaminar2
             // the same buffers as full tiles. Size by tile-padded M so a short
             // prompt cannot leave the CUDA workspace under-provisioned while
             // keeping active/bucket sizing for the rest of the graph.
-            const bool deterministic_m1 = (m == 1 && useCanonicalM1SmallMDecode());
+            const bool deterministic_m1 = (m == 1 && useCanonicalM1Decode());
             const int workspace_m = deterministic_m1 ? 2 : ((m > 1) ? ((m + 127) & ~127) : m);
 
             // INT8 path needs quantization + accumulator buffers
             size_t quant_a_bytes = static_cast<size_t>(workspace_m) * k * sizeof(int8_t);
             size_t scales_a_bytes = static_cast<size_t>(workspace_m) * sizeof(float);
-            // NativeVNNI doesn't use INT32 accumulator split-K, so 1 chunk is sufficient.
+            // NativeVNNI owns its ordered FP32 reduction and needs one INT32 chunk.
             constexpr size_t partial_chunk_blocks = 1;
             size_t acc_int32_bytes = static_cast<size_t>(workspace_m) * n * partial_chunk_blocks * sizeof(int32_t);
             size_t concurrent_prefill_acc_bytes =
@@ -3552,16 +4499,29 @@ namespace llaminar2
 
             reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
+            reqs.buffers.push_back({
+                GemmWorkspaceBuffers::ACC_INT32,
+                acc_int32_bytes,
+                256,
+                true,
+                WorkspaceExecutionRegime::PrefillOnly});
             reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32,
-                                    concurrent_prefill_acc_bytes, 256, true});
+                                    concurrent_prefill_acc_bytes,
+                                    256,
+                                    true,
+                                    WorkspaceExecutionRegime::PrefillOnly});
 
             // Blockwise activation quantization scales: one float per 32-element block
             size_t num_blocks_per_row = static_cast<size_t>((k + 31) / 32);
             size_t scales_a_blockwise_bytes = static_cast<size_t>(workspace_m) * num_blocks_per_row * sizeof(float);
             size_t sums_a_blockwise_bytes = static_cast<size_t>(workspace_m) * num_blocks_per_row * sizeof(int32_t);
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, sums_a_blockwise_bytes, 256, true});
+            reqs.buffers.push_back({
+                GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
+                sums_a_blockwise_bytes,
+                256,
+                true,
+                WorkspaceExecutionRegime::PrefillOnly});
 
             // FP32 output workspace for mapped memory redirect
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
@@ -3571,14 +4531,25 @@ namespace llaminar2
 
             bool has_native_codebook = false;
             uint8_t native_codebook_id = 0;
+            uint8_t native_arithmetic_policy_codebook_id = 0;
             if (packed_)
             {
                 native_codebook_id = packed_->native_codebook_id;
+                native_arithmetic_policy_codebook_id =
+                    packed_->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              packed_->native_source_identity.codebook_id)
+                        : native_codebook_id;
                 has_native_codebook = true;
             }
             else if (weights_converted_ && impl_ && impl_->d_weights_native_vnni)
             {
                 native_codebook_id = impl_->native_codebook_id;
+                native_arithmetic_policy_codebook_id =
+                    impl_->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              impl_->native_source_identity.codebook_id)
+                        : native_codebook_id;
                 has_native_codebook = true;
             }
             else if (weights_)
@@ -3587,7 +4558,9 @@ namespace llaminar2
                 {
                     if (const auto *info = unpackable->vnniFormatInfo())
                     {
-                        native_codebook_id = info->codebook_id;
+                        native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+                        native_arithmetic_policy_codebook_id =
+                            canonicalDeviceVnniCodebookId(info->codebook_id);
                         has_native_codebook = true;
                     }
                 }
@@ -3595,62 +4568,71 @@ namespace llaminar2
 
             if (has_native_codebook && workspace_m > 1)
             {
-                size_t splitk_partials_bytes = 0;
-                size_t streamk_fixup_bytes = 0;
-                int planned_split_k = 1;
-                int planned_streamk = 0;
-                if (cudaNativeVNNIPrefill_getWorkspacePlan(
+                const NativePrefillWorkspaceBounds prefill_bounds =
+                    maxNativePrefillWorkspaceForRowsUpTo(
                         native_codebook_id,
+                        native_arithmetic_policy_codebook_id,
                         m,
                         n,
                         k,
-                        cuda_device_id_,
-                        &splitk_partials_bytes,
-                        &streamk_fixup_bytes,
-                        &planned_split_k,
-                        &planned_streamk))
+                        cuda_device_id_);
+                const size_t prefill_scratch_slots =
+                    concurrentPrefillScratchSlotsForM(m);
+
+                if (prefill_bounds.canonical_kpart_partials_bytes > 0)
                 {
-                    if (planned_split_k > 1)
-                    {
-                        splitk_partials_bytes = std::max(
-                            splitk_partials_bytes,
-                            paddedSplitKPartialBytes(m, n, planned_split_k));
-                    }
-
-                    const size_t prefill_scratch_slots = concurrentPrefillScratchSlotsForM(m);
-
-                    if (splitk_partials_bytes > 0)
-                    {
-                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS,
-                                                splitk_partials_bytes * prefill_scratch_slots, 256, true});
-                    }
-                    if (streamk_fixup_bytes > 0)
-                    {
-                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
-                                                streamk_fixup_bytes * prefill_scratch_slots, 256, true});
-                    }
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
-                              << static_cast<int>(native_codebook_id)
-                              << " split_k=" << planned_split_k
-                              << " streamk=" << planned_streamk
-                              << " splitk_partials=" << (splitk_partials_bytes / 1024) << "KB"
-                              << " streamk_fixup=" << (streamk_fixup_bytes / 1024) << "KB");
+                    reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS,
+                                            prefill_bounds.canonical_kpart_partials_bytes * prefill_scratch_slots,
+                                            256,
+                                            true,
+                                            WorkspaceExecutionRegime::PrefillOnly});
                 }
+                LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
+                          << static_cast<int>(native_codebook_id)
+                          << " arithmetic_policy_codebook="
+                          << static_cast<int>(
+                                 native_arithmetic_policy_codebook_id)
+                          << " max_rows=" << m
+                          << " canonical_kpart_rows="
+                          << prefill_bounds.canonical_kpart_rows
+                          << " k_partitions="
+                          << prefill_bounds.planned_k_partitions
+                          << " canonical_kpart_partials="
+                          << (prefill_bounds.canonical_kpart_partials_bytes / 1024)
+                          << "KB");
             }
 
-            // GEMV KPAR partials for decode/verifier reductions. The caller's
-            // declared graph shape owns the bound; dynamic-depth graph users
-            // must request their max verifier M explicitly.
-            const int gemv_workspace_m = (m == 1 && useCanonicalM1SmallMDecode()) ? 2 : m;
-            if (gemv_workspace_m > 0 && gemv_workspace_m <= 4)
+            /*
+             * GEMV KPAR partials are needed by public M=1 decode and by
+             * grouped MTP verifier rows even when this workspace was originally
+             * sized for a larger prefill call. Prepared kernels are cached
+             * across prefill/decode phase boundaries, so a workspace that only
+             * declares large-M prefill scratch can otherwise leave the later
+             * canonical decode GEMV with no reduction arena.
+             */
+            /*
+             * This sizing call receives the prompt bucket during graph
+             * planning, but GEMV K-partials belong only to serial decode and
+             * grouped verifier execution. Keep one persistent verifier tile;
+             * runtime M values beyond that tile are processed by the grouped
+             * launcher in several device kernels using the same arena.
+             */
+            const int gemv_workspace_m =
+                nativeVNNIPersistentVerifierWorkspaceRows(m, n, k);
+            if (gemv_workspace_m > 0)
             {
                 const int k_groups = (k + 31) / 32;
                 const size_t kpar_bytes =
                     static_cast<size_t>(k_groups) * static_cast<size_t>(gemv_workspace_m) * n * sizeof(float);
-                reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, true});
+                reqs.buffers.push_back({
+                    GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS,
+                    kpar_bytes,
+                    256,
+                    true,
+                    WorkspaceExecutionRegime::CompactDecodeOnly});
             }
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
+            LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
                       << "scales_a=" << (scales_a_bytes) << "B, "
                       << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B, "
@@ -3662,6 +4644,93 @@ namespace llaminar2
             return reqs;
         }
 
+        void CUDAQuantisedGemmKernel::appendFusedProjectionWorkspaceRequirements(
+            WorkspaceRequirements &requirements,
+            int m,
+            std::span<const int> projection_columns,
+            int k) const
+        {
+            if (m <= 1 || projection_columns.size() <= 1)
+                return;
+            if (k <= 0)
+            {
+                throw std::invalid_argument(
+                    "CUDA fused verifier workspace requires positive K");
+            }
+
+            const size_t stream_count = std::min(
+                projection_columns.size(),
+                static_cast<size_t>(kCudaConcurrentDecodeWorkspaceSlots));
+            std::array<size_t, kCudaConcurrentDecodeWorkspaceSlots>
+                stream_bytes{};
+            const size_t k_groups = static_cast<size_t>((k + 31) / 32);
+
+            for (size_t projection = 0;
+                 projection < projection_columns.size(); ++projection)
+            {
+                const int columns = projection_columns[projection];
+                if (columns <= 0)
+                {
+                    throw std::invalid_argument(
+                        "CUDA fused verifier projection widths must be positive");
+                }
+                const int rows = nativeVNNIPersistentVerifierWorkspaceRows(
+                    m, columns, k);
+                if (rows <= 0)
+                    continue;
+
+                const size_t width = static_cast<size_t>(columns);
+                const size_t row_count = static_cast<size_t>(rows);
+                if (k_groups > std::numeric_limits<size_t>::max() / row_count ||
+                    k_groups * row_count >
+                        std::numeric_limits<size_t>::max() / width ||
+                    k_groups * row_count * width >
+                        std::numeric_limits<size_t>::max() / sizeof(float))
+                {
+                    throw std::overflow_error(
+                        "CUDA fused verifier workspace size overflow");
+                }
+                const size_t bytes =
+                    k_groups * row_count * width * sizeof(float);
+                const size_t stream = projection % stream_count;
+                stream_bytes[stream] = std::max(stream_bytes[stream], bytes);
+            }
+
+            /*
+             * Stream zero owns the ordinary serial arena. Side streams share
+             * one compact-decode descriptor whose aligned slices are selected
+             * by the runtime planner. A later projection reusing a stream is
+             * ordered behind that stream's completion event and therefore only
+             * needs the maximum slot for that stream, not another allocation.
+             */
+            constexpr size_t kScratchAlignment = 256;
+            size_t side_bytes = 0;
+            for (size_t stream = 1; stream < stream_count; ++stream)
+            {
+                const size_t aligned =
+                    (side_bytes + kScratchAlignment - 1) &
+                    ~(kScratchAlignment - 1);
+                if (aligned < side_bytes ||
+                    stream_bytes[stream] >
+                        std::numeric_limits<size_t>::max() - aligned)
+                {
+                    throw std::overflow_error(
+                        "CUDA fused verifier side-stream workspace overflow");
+                }
+                side_bytes = aligned + stream_bytes[stream];
+            }
+            if (side_bytes == 0)
+                return;
+
+            requirements.buffers.push_back({
+                GemmWorkspaceBuffers::
+                    CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,
+                side_bytes,
+                kScratchAlignment,
+                true,
+                WorkspaceExecutionRegime::CompactDecodeOnly});
+        }
+
         void CUDAQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
         {
             if (workspace_ && workspace_ != workspace)
@@ -3671,12 +4740,12 @@ namespace llaminar2
             workspace_ = workspace;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
+                LOG_TRACE("[CUDAQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace
                                                                                   << ", entering managed mode");
             }
             else
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
+                LOG_TRACE("[CUDAQuantisedGemmKernel] Unbound workspace, returning to legacy mode");
             }
         }
 

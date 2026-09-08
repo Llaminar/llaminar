@@ -43,6 +43,7 @@ CHAT_PATH = "/v1/chat/completions"
 EXPECTED_JSON_KEYS = {"alpha", "middle", "omega"}
 MIN_RECALL_RECORDS = 32
 ESTIMATED_TOKENS_PER_RECALL_RECORD = 42
+THINK_OFF_MARKER = "<|think_off|>"
 CODE_WORDS_A = (
     "amber",
     "basil",
@@ -159,11 +160,14 @@ class CheckRunner:
     def __init__(self, tag: str) -> None:
         self.tag = tag
         self.failures: list[str] = []
+        self.results: list[dict[str, Any]] = []
 
     def pass_(self, name: str, detail: str) -> None:
+        self.results.append({"name": name, "passed": True, "detail": detail})
         print(f"PASS [{self.tag}] {name}: {detail}", flush=True)
 
     def fail(self, name: str, detail: str) -> None:
+        self.results.append({"name": name, "passed": False, "detail": detail})
         self.failures.append(f"{name}: {detail}")
         print(f"FAIL [{self.tag}] {name}: {detail}", flush=True)
 
@@ -228,8 +232,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def tier_settings(tier: str, long_max_tokens: int) -> TierSettings:
     usable_max = max(1, long_max_tokens - 1)
     if tier == "lite":
-        min_lines = max(8, min(32, long_max_tokens // 16))
-        requested_lines = max(50, min(90, long_max_tokens // 6))
+        # A short numbered sentence costs roughly 8-16 model tokens once the
+        # line number and delimiter are included. Keep both the requested and
+        # accepted line counts inside the configured completion budget; a
+        # 128-token smoke run cannot physically emit the old fixed request for
+        # 50 lines.
+        min_lines = max(1, min(32, usable_max // 16))
+        requested_lines = max(
+            min_lines,
+            min(90, max(1, usable_max // 8)),
+        )
         min_completion = max(64, int(long_max_tokens * 0.45))
         return TierSettings(
             min_numbered_lines=min_lines,
@@ -239,10 +251,26 @@ def tier_settings(tier: str, long_max_tokens: int) -> TierSettings:
         )
 
     # Full-tier structured generation is primarily an anti-degeneration and
-    # long-completion check. Some large MoE models spend more tokens per line,
-    # so leave headroom while still requiring sustained numbered output.
-    min_lines = max(40, min(120, long_max_tokens // 18))
-    requested_lines = max(140, min(220, long_max_tokens // 6))
+    # long-completion check. Preserve the ten-line and forty-line evidence
+    # floors at 128 and 512 tokens, respectively. Above 512 tokens, budget for
+    # up to sixteen model tokens per formatted sentence. Real Qwen MoE output
+    # includes the line prefix, punctuation, and tokenizer-dependent word
+    # pieces, so a twelve-token assumption can reject a healthy completion
+    # solely because it reaches the requested token boundary. The independent
+    # completion-token gate below still proves that the model generated a long
+    # response rather than satisfying this structural check with a short one.
+    min_lines = max(
+        1,
+        min(
+            120,
+            usable_max // 12,
+            max(40, usable_max // 16),
+        ),
+    )
+    requested_lines = max(
+        min_lines,
+        min(220, max(1, usable_max // 8)),
+    )
     min_completion = max(256, int(long_max_tokens * 0.65))
     return TierSettings(
         min_numbered_lines=min_lines,
@@ -287,6 +315,12 @@ def make_chat_payload(messages: list[dict[str, str]], max_tokens: int) -> dict[s
         "temperature": 0.0,
         "enable_thinking": False,
     }
+
+
+def system_message(content: str) -> dict[str, str]:
+    """Build deterministic-check system messages with template-level thinking disabled."""
+
+    return {"role": "system", "content": f"{THINK_OFF_MARKER}\n{content}"}
 
 
 def preview(text: str, limit: int = 160) -> str:
@@ -455,9 +489,9 @@ def build_needle_prompt(
         "end": "omega",
     }
     target_value_by_placement = {
-        "beginning": "LCJSON-ALPHA-314159",
-        "middle": "LCJSON-MIDDLE-271828",
-        "end": "LCJSON-OMEGA-161803",
+        "beginning": "TUNDRA-84QX",
+        "middle": "COBALT-27LM",
+        "end": "RIVER-93RN",
     }
     target_key = target_key_by_placement[placement]
     target_value = target_value_by_placement[placement]
@@ -490,10 +524,11 @@ def build_needle_prompt(
             "Return exactly one minified JSON object and no prose.",
             'The object shape is {"answer":"VALUE_FROM_LEDGER"}.',
             f"Use the exact REQUIRED_JSON_FIELD value for {target_key} from the ledger.",
+            "Copy every letter, digit, and hyphen in the value; never shorten a value to a suffix.",
         ]
     )
     messages = [
-        {"role": "system", "content": "You are a strict JSON renderer. Output JSON only."},
+        system_message("You are a strict JSON renderer. Output JSON only."),
         {"role": "user", "content": user_prompt},
     ]
     return messages, codes[target_index], distractors, count
@@ -552,9 +587,9 @@ def build_multi_needle_prompt(
 ) -> tuple[list[dict[str, str]], dict[str, str], int]:
     count = record_count_for_context(min_prompt_tokens, context_length, max_tokens, tier)
     sentinels = {
-        "alpha": "LCJSON-ALPHA-314159",
-        "middle": "LCJSON-MIDDLE-271828",
-        "omega": "LCJSON-OMEGA-161803",
+        "alpha": "REDWOOD-47QK",
+        "middle": "HARBOR-92MJ",
+        "omega": "JUNIPER-63VX",
     }
     positions = {
         "alpha": min(3, count - 1),
@@ -579,19 +614,23 @@ def build_multi_needle_prompt(
                 break
         if not inserted:
             code = deterministic_code("LCJSON-FILL", index)
-            lines.append(
-                f"Ledger item {index:04d}: filler code {code}; phase stable; checksum {7000 + index}."
-            )
+            # The shared record-count policy is calibrated for audit records.
+            # A shorter multi-needle-only filler used the same count but fell
+            # below the mandatory prompt-token floor (3587 vs 4096 on Qwen3.8).
+            # Use the same distractor geometry as single-needle recall; never
+            # weaken the server-reported token-length assertion.
+            lines.append(make_audit_record(index, code, "LCJSON-FILL"))
     lines.extend(
         [
             "Return exactly one minified JSON object and no prose.",
             'The object shape is {"alpha":"VALUE_FROM_LEDGER","middle":"VALUE_FROM_LEDGER","omega":"VALUE_FROM_LEDGER"}.',
             "Use the exact REQUIRED_JSON_FIELD values from the ledger.",
+            "Copy every letter, digit, and hyphen in each value; never shorten a value to a suffix.",
             "Do not omit omega. Do not add keys. Do not use markdown fences.",
         ]
     )
     messages = [
-        {"role": "system", "content": "You are a strict JSON renderer. Output JSON only."},
+        system_message("You are a strict JSON renderer. Output JSON only."),
         {"role": "user", "content": "\n".join(lines)},
     ]
     return messages, sentinels, count
@@ -674,7 +713,7 @@ def structured_prompt(settings: TierSettings) -> tuple[list[dict[str, str]], str
         "If the token limit interrupts the report, stop wherever the limit occurs.",
     ]
     messages = [
-        {"role": "system", "content": "You produce deterministic machine-checkable reports."},
+        system_message("You produce deterministic machine-checkable reports."),
         {"role": "user", "content": "\n".join(lines)},
     ]
     return messages, cache_sentinel
@@ -847,7 +886,7 @@ def run_structured_generation(args: argparse.Namespace, settings: TierSettings) 
 
 def run_cache_reset_probe(args: argparse.Namespace, prior_sentinels: Iterable[str]) -> str:
     messages = [
-        {"role": "system", "content": "You are a calculator. Reply only with the numeric answer."},
+        system_message("You are a calculator. Reply only with the numeric answer."),
         {"role": "user", "content": "What is 6+7? Reply with only 13."},
     ]
     response = post_json(args.base_url, CHAT_PATH, make_chat_payload(messages, 8), args.request_timeout)
@@ -876,7 +915,7 @@ def boundary_messages(word_count: int, answer: str) -> list[dict[str, str]]:
         f"Padding ends. Reply with only {answer}."
     )
     return [
-        {"role": "system", "content": "You answer boundary probes exactly and briefly."},
+        system_message("You answer boundary probes exactly and briefly."),
         {"role": "user", "content": user},
     ]
 
@@ -970,6 +1009,14 @@ def expected_sentinels(args: argparse.Namespace, settings: TierSettings) -> list
 def run_self_test() -> int:
     assert strip_optional_code_fence('```json\n{"alpha":"a"}\n```') == '{"alpha":"a"}'
     assert strip_optional_code_fence('{"alpha":"a"}') == '{"alpha":"a"}'
+    assert system_message("json only")["content"].startswith(f"{THINK_OFF_MARKER}\n")
+
+    single_needle_values = [
+        build_needle_prompt(placement, 900, 4096, needle_max_tokens(512), "full")[1]
+        for placement in ("beginning", "middle", "end")
+    ]
+    assert all(not value.startswith("LCJSON-") for value in single_needle_values)
+    assert len({value.split("-", 1)[0] for value in single_needle_values}) == len(single_needle_values)
 
     lite_4k_count = record_count_for_context(900, 4096, 128, "lite")
     full_4k_count = record_count_for_context(900, 4096, 128, "full")
@@ -995,6 +1042,18 @@ def run_self_test() -> int:
     assert ok
     ok, detail = validate_number_progression([1, 2, 1, 2, 1, 2, 1])
     assert not ok, detail
+
+    for budget in (64, 128, 512, 2048):
+        lite = tier_settings("lite", budget)
+        full = tier_settings("full", budget)
+        assert 1 <= lite.min_numbered_lines <= lite.requested_numbered_lines
+        assert 1 <= full.min_numbered_lines <= full.requested_numbered_lines
+        assert lite.min_completion_tokens < budget
+        assert full.min_completion_tokens < budget
+        assert full.min_numbered_lines >= lite.min_numbered_lines
+    assert tier_settings("full", 128).min_numbered_lines == 10
+    assert tier_settings("full", 512).min_numbered_lines >= 40
+    assert tier_settings("full", 1024).min_numbered_lines == 63
 
     print("PASS [self-test] helper pure-function checks", flush=True)
     return 0
@@ -1031,6 +1090,20 @@ def main(argv: list[str]) -> int:
     runner.run("cache-reset probe", lambda: run_cache_reset_probe(args, sentinels))
     runner.run("valid near-boundary context", lambda: run_valid_boundary(args, settings))
     runner.run("oversized context rejection", lambda: run_oversized_boundary(args))
+
+    # A shell exit code alone cannot prove the full helper actually ran.
+    # Preserve per-scenario positive and negative evidence for certification.
+    artifact_dir = os.environ.get("LLAMINAR_E2E_LONG_CONTEXT_ARTIFACT_DIR")
+    if artifact_dir:
+        path = pathlib.Path(artifact_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "long_context_results.json").write_text(json.dumps({
+            "schema": 1, "tier": args.tier, "context_length": args.context_length,
+            "minimum_prompt_tokens": args.min_prompt_tokens,
+            "generation_tokens": args.long_max_tokens,
+            "complete": len(runner.results) == 8,
+            "results": runner.results,
+        }, indent=2) + "\n", encoding="utf-8")
 
     if runner.failures:
         print(f"FAIL [{args.tag}] summary: {len(runner.failures)} check(s) failed", flush=True)

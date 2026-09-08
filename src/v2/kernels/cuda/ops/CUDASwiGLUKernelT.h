@@ -69,10 +69,11 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // ===== ITensorSwiGLU interface =====
             bool apply(
@@ -145,7 +146,13 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
-            // ===== Typed API =====
+            /**
+             * @brief Enqueue FP32 SwiGLU on the bound CUDA stream.
+             *
+             * The launch is asynchronous and requires an explicit non-null
+             * stream. Consumers must be ordered by stream order or a published
+             * event; this API never performs a host-blocking synchronization.
+             */
             bool apply_typed(
                 const float *gate,
                 const float *up,
@@ -191,10 +198,11 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // ===== ITensorSwiGLU interface =====
             bool apply(
@@ -267,7 +275,13 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
-            // ===== Typed API =====
+            /**
+             * @brief Enqueue BF16 SwiGLU on the bound CUDA stream.
+             *
+             * The launch is asynchronous and requires an explicit non-null
+             * stream. Consumers must be ordered by stream order or a published
+             * event; this API never performs a host-blocking synchronization.
+             */
             bool apply_typed(
                 const uint16_t *gate,
                 const uint16_t *up,
@@ -313,10 +327,11 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // ===== ITensorSwiGLU interface =====
             bool apply(
@@ -389,7 +404,13 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
-            // ===== Typed API =====
+            /**
+             * @brief Enqueue FP16 SwiGLU on the bound CUDA stream.
+             *
+             * The launch is asynchronous and requires an explicit non-null
+             * stream. Consumers must be ordered by stream order or a published
+             * event; this API never performs a host-blocking synchronization.
+             */
             bool apply_typed(
                 const uint16_t *gate,
                 const uint16_t *up,

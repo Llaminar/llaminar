@@ -869,9 +869,9 @@ namespace llaminar2
         /**
          * @brief Construct timer and record start event
          * @param type Kernel type for profiling categorization
-         * @param stream CUDA stream (nullptr = default stream)
+         * @param stream Exact CUDA producer stream. Must not be null.
          */
-        ScopedCUDAKernelTimer(CUDAKernelType type, cudaStream_t stream = nullptr);
+        ScopedCUDAKernelTimer(CUDAKernelType type, cudaStream_t stream);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
@@ -901,9 +901,9 @@ namespace llaminar2
 
         /**
          * @brief Record start event
-         * @param stream CUDA stream (nullptr = default stream)
+         * @param stream Exact CUDA producer stream. Must not be null.
          */
-        void begin(cudaStream_t stream = nullptr);
+        void begin(cudaStream_t stream);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
@@ -930,29 +930,10 @@ namespace llaminar2
 // ============================================================================
 
 /**
- * @brief Scoped CUDA kernel profiling (RAII-based, synchronous)
- *
- * Usage:
- *   {
- *       CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
- *       cudaKernel<<<grid, block>>>(args...);
- *   } // Timer synchronizes and records here
- */
-#define CUDA_KERNEL_PROFILE_SCOPE(kernel_type) \
-    ::llaminar2::ScopedCUDAKernelTimer _cuda_timer_##__LINE__(kernel_type)
-
-/**
  * @brief Scoped CUDA kernel profiling with stream
  */
 #define CUDA_KERNEL_PROFILE_SCOPE_STREAM(kernel_type, stream) \
     ::llaminar2::ScopedCUDAKernelTimer _cuda_timer_##__LINE__(kernel_type, static_cast<cudaStream_t>(stream))
-
-/**
- * @brief Manual CUDA kernel profiling begin
- */
-#define CUDA_KERNEL_PROFILE_BEGIN(timer_name)      \
-    ::llaminar2::ManualCUDAKernelTimer timer_name; \
-    timer_name.begin()
 
 #define CUDA_KERNEL_PROFILE_BEGIN_STREAM(timer_name, stream) \
     ::llaminar2::ManualCUDAKernelTimer timer_name;           \

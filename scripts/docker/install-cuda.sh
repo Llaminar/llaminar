@@ -7,6 +7,10 @@
 # MODE=full     (default) — minimal builder set: nvcc + CUDA runtime,
 #                            cuBLAS/NCCL headers and shared libraries.
 # MODE=runtime             — shared libraries only. Slim runtime stage.
+# INSTALL_CUDA_PROFILERS=1 — additionally install the CUDA-series-matched
+#                            Nsight Compute, Nsight Systems, and CUPTI packages.
+#                            Development images enable this; release builders
+#                            remain deliberately lean.
 #
 # The host driver is injected at container run time via
 # `--gpus=all` + nvidia-container-toolkit; we never install drivers inside
@@ -14,6 +18,7 @@
 set -euo pipefail
 
 MODE="${MODE:-full}"
+INSTALL_CUDA_PROFILERS="${INSTALL_CUDA_PROFILERS:-0}"
 export DEBIAN_FRONTEND=noninteractive
 
 APT_OPTS=(
@@ -40,6 +45,17 @@ if [[ "${MODE}" == "full" ]]; then
         libcublas-dev-13-0 \
         "libnccl2=*+cuda13.0" \
         "libnccl-dev=*+cuda13.0"
+
+    # The package supplies tooling; production loads the separately named,
+    # pinned source build that supports repeated capture into a native parent.
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/install-nccl.sh"
+
+    if [[ "${INSTALL_CUDA_PROFILERS}" == "1" ]]; then
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+            cuda-cupti-13-0 \
+            cuda-nsight-compute-13-0 \
+            cuda-nsight-systems-13-0
+    fi
 else
     # Runtime libraries only. These are the minimum a dynamically-linked
     # CUDA-enabled llaminar2 binary needs at process start. The host driver is
@@ -47,8 +63,7 @@ else
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         --allow-change-held-packages \
         cuda-cudart-13-0 \
-        libcublas-13-0 \
-        "libnccl2=*+cuda13.0"
+        libcublas-13-0
 fi
 
 rm -rf /var/lib/apt/lists/*

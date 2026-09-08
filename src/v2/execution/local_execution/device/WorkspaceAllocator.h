@@ -30,13 +30,109 @@ namespace llaminar2
     class IComputeStage;
     class IWorkspaceConsumer;
     class IBackend;
+    class PhysicalMemoryAuthority;
+
+    /**
+     * @brief Declares the physical lifetime relationship between executable graphs.
+     *
+     * GPU graph executables and CPU stage objects both retain raw workspace
+     * addresses. The policy therefore describes both the sizing surface that
+     * must be known before capture/materialization and whether another graph may
+     * use the same physical bytes.
+     *
+     * A serial device family includes ordinary prefill/decode, MTP sidecars,
+     * grouped verification, accepted-state publication, and decode catch-up on
+     * one device. Producer events order every transition between those graphs,
+     * so their graph-local layouts may alias one primary allocation. A
+     * participant whose state survives that transition instead declares
+     * @ref WorkspaceGraphParticipantLifetime::PersistentAcrossParticipants;
+     * its buffers remain disjoint while graph-local siblings still alias.
+     */
+    enum class WorkspaceGraphFamilyPolicy : uint8_t
+    {
+        /**
+         * @brief Storage may overlap other serial participants; size this graph
+         *        from its exact declared rows plus decode/compact regimes.
+         */
+        SerialDeviceFamilyExactParticipant,
+
+        /**
+         * @brief Storage may overlap other serial participants; additionally
+         *        size row-scaled main-forward scratch for the largest bucket.
+         */
+        SerialDeviceFamilyLargestParticipant,
+
+        /**
+         * @brief Storage can remain live while another graph executes.
+         *
+         * Late requirements in this class receive append-only storage. This is
+         * intentionally exceptional and must be selected explicitly.
+         */
+        ExclusiveLifetime,
+    };
+
+    /**
+     * @brief Mathematical execution role of one materialized family graph.
+     *
+     * Row count cannot identify graph semantics: an M=16 prompt is prefill,
+     * while an M=16 speculative continuation is grouped decode. Workspace
+     * descriptors use this role to retain prefill-only or compact-only buffers
+     * without inferring policy from tensor geometry.
+     */
+    enum class WorkspaceGraphParticipantRole : uint8_t
+    {
+        Prefill,                 ///< Prompt rows and prefill-only workspace.
+        Decode,                  ///< Ordinary one-row autoregressive decode.
+        GroupedVerifier,         ///< Compact serial-row-equivalent MTP verification.
+        MTPCondition,            ///< One device-resident main-model row per active request.
+        MoERebalanceMaintenance, ///< Device-owned asynchronous MoE maintenance transaction.
+    };
+
+    /**
+     * @brief Physical lifetime of one graph participant's workspace contents.
+     *
+     * Execution order alone does not prove that a completed graph's storage is
+     * dead. Device MoE maintenance, for example, publishes status and controller
+     * records that remain device-owned until a request epilogue exports them.
+     * This closed enum makes that retained lifetime part of family declaration
+     * instead of relying on buffer names or delayed host behavior.
+     */
+    enum class WorkspaceGraphParticipantLifetime : uint8_t
+    {
+        /**
+         * @brief Every workspace value is dead after the participant handoff.
+         */
+        SerialGraphLocal,
+
+        /**
+         * @brief Workspace contents remain live while other family graphs run.
+         */
+        PersistentAcrossParticipants,
+    };
+
+    /**
+     * @brief Typed non-owning declaration of one exact graph-family member.
+     */
+    struct WorkspaceGraphParticipant
+    {
+        const ComputeGraph *graph = nullptr; ///< Materialized production topology.
+        WorkspaceGraphParticipantRole role =
+            WorkspaceGraphParticipantRole::Decode; ///< Explicit execution semantics.
+        WorkspaceGraphParticipantLifetime lifetime =
+            WorkspaceGraphParticipantLifetime::
+                SerialGraphLocal; ///< Whether this participant may physically alias siblings.
+    };
 
     /**
      * @brief Configuration for workspace memory budget calculation
      *
      * Controls how WorkspaceAllocator computes workspace budgets for GPU and CPU
      * devices. The budget is calculated as:
-     *   budget = min(max(available * fraction - headroom, min_budget), max_budget)
+     *   budget = min(max(available * fraction, min_budget), max_budget)
+     *
+     * This is an initial allocation-policy ceiling, not an unnamed memory
+     * reserve. Production graph-family planning raises it to the exact declared
+     * requirement when that requirement fits the live device observation.
      */
     struct WorkspaceBudgetConfig
     {
@@ -44,7 +140,6 @@ namespace llaminar2
         float cpu_fraction = 0.3f;                     ///< Fraction of free CPU memory to use (conservative)
         size_t min_budget = 64 * 1024 * 1024;          ///< Minimum budget (64MB)
         size_t max_budget = 4ULL * 1024 * 1024 * 1024; ///< Maximum budget (4GB)
-        size_t headroom = 128 * 1024 * 1024;           ///< Reserved headroom (128MB)
     };
 
     /**
@@ -55,11 +150,92 @@ namespace llaminar2
     struct WorkspaceSizingHints
     {
         int max_seq_len = 4096;
+        /**
+         * @brief Largest row count that any serial forward graph may execute.
+         *
+         * This field is consulted only when @ref graph_family_policy is
+         * `SerialDeviceFamilyLargestParticipant`. It is separate from
+         * `max_seq_len`, which remains the exact shape of the graph currently
+         * being bound.
+         */
+        int serial_family_max_rows = 0;
+        /**
+         * @brief Largest compact decode-equivalent row group in this family.
+         *
+         * Workspace demand is not monotonic in M: a large prefill may select a
+         * GEMM that needs no K-partition partials while M=2..16 selects grouped
+         * GEMV and needs a larger reduction bank. Querying this explicit regime
+         * before the first capture keeps common names address-stable for every
+         * configured MTP depth.
+         */
+        int serial_family_max_compact_rows = 0;
+        /**
+         * @brief Largest output width owned by a terminal projection in this family.
+         *
+         * A phase-split LocalTP family can capture column-parallel prefill
+         * first and bind a replicated full-vocabulary LM head for decode or
+         * grouped MTP verification later. Those graph participants share
+         * stable workspace names even though their output widths differ.
+         * Advertising the family envelope before the first capture lets the
+         * allocator publish one address with enough capacity for every
+         * participant; changing that address after capture remains forbidden.
+         *
+         * Zero preserves the consumer's own prepared width. A positive value
+         * is an envelope, not an unconditional replacement: callers that
+         * already declare a wider projection keep that wider value.
+         */
+        int serial_family_max_terminal_projection_columns = 0;
+
+        /**
+         * @brief Resolve a participant's terminal projection width.
+         *
+         * This pure helper makes the width-envelope policy independently
+         * testable without constructing a GPU graph or allocating device
+         * memory. The returned zero retains the existing
+         * `IWorkspaceConsumer` convention that the prepared kernel supplies
+         * its own N dimension.
+         *
+         * @param participant_columns Width explicitly declared by the current
+         *        graph participant, or zero to use the prepared kernel width.
+         * @return The widest declared participant/family projection width.
+         */
+        [[nodiscard]] constexpr int resolveTerminalProjectionColumns(
+            int participant_columns) const noexcept
+        {
+            return serial_family_max_terminal_projection_columns >
+                           participant_columns
+                       ? serial_family_max_terminal_projection_columns
+                       : participant_columns;
+        }
+
         int n_heads = 0;
         int head_dim = 0;
         int d_model = 0;
         int batch_size = 1;
         int vocab_size = 0;
+        WorkspaceGraphFamilyPolicy graph_family_policy =
+            WorkspaceGraphFamilyPolicy::ExclusiveLifetime;
+    };
+
+    /**
+     * @brief Defines how an explicit workspace consumer interprets its M value.
+     *
+     * Most kernel workspaces use M as graph token rows and must be queried for
+     * each serial participant. Control-plane workspaces can use M for another
+     * dimension, such as request count; substituting prompt or verifier rows in
+     * that case silently changes the declared data structure.
+     */
+    enum class WorkspaceConsumerShapePolicy : uint8_t
+    {
+        /**
+         * @brief Replace M with each prefill/decode/verifier participant's rows.
+         */
+        GraphParticipantRows,
+
+        /**
+         * @brief Preserve the request's explicit M, N, and K for every participant.
+         */
+        FixedDeclaredShape,
     };
 
     /**
@@ -72,6 +248,8 @@ namespace llaminar2
         int m = 4096;
         int n = 0;
         int k = 0;
+        WorkspaceConsumerShapePolicy shape_policy =
+            WorkspaceConsumerShapePolicy::GraphParticipantRows;
     };
 
     /**
@@ -100,7 +278,17 @@ namespace llaminar2
     class WorkspaceAllocator
     {
     public:
+        /** @brief Construct an unbound allocator for device-free/unit tests. */
         WorkspaceAllocator() = default;
+
+        /**
+         * @brief Construct the production allocator under one memory authority.
+         * @param physical_memory_authority Rank-bound CPU/GPU allocation ledger.
+         * @throws std::invalid_argument for a null authority.
+         */
+        explicit WorkspaceAllocator(
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority);
         ~WorkspaceAllocator() = default;
 
         // Non-copyable
@@ -110,6 +298,24 @@ namespace llaminar2
         // Movable
         WorkspaceAllocator(WorkspaceAllocator &&) = default;
         WorkspaceAllocator &operator=(WorkspaceAllocator &&) = default;
+
+        /**
+         * @brief Bind a test-created or retained allocator before allocation.
+         *
+         * Reinstalling the same object is idempotent. Replacing an authority,
+         * or binding after a manager exists, is rejected because either would
+         * split accounting for live backend blocks.
+         */
+        void installPhysicalMemoryAuthority(
+            std::shared_ptr<PhysicalMemoryAuthority>
+                physical_memory_authority);
+
+        /** @return Installed production authority, or null for test-only use. */
+        [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority>
+        physicalMemoryAuthority() const noexcept
+        {
+            return physical_memory_authority_;
+        }
 
         // =====================================================================
         // Memory Query
@@ -161,6 +367,46 @@ namespace llaminar2
             const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});
 
         /**
+         * @brief Allocate one stable workspace for a complete serial graph family.
+         *
+         * GPU graph executables retain the raw addresses returned by
+         * DeviceWorkspaceManager.  Consequently every graph that can run in the
+         * same event-ordered request lifetime must participate in the first
+         * layout decision. This method treats @p primary_graph according to its
+         * explicit mathematical role, including any configured family envelope,
+         * and treats every graph in
+         * @p exact_serial_participants as a distinct exact-shape participant
+         * with an explicit mathematical execution role.
+         *
+         * Distinct participants may reuse physical bytes because their producer
+         * and consumer events serialize execution.  Shared workspace names
+         * nevertheless receive one family-wide capacity and address, so a later
+         * graph capture cannot observe a smaller allocation than it requires.
+         * All participant consumers are bound only after the complete layout has
+         * been allocated successfully.
+         *
+         * @param primary_graph Main forward graph whose sizing policy is
+         *        described by @p hints.
+         * @param primary_role Mathematical role of the primary graph. This may
+         *        not be inferred from M because prompt and verifier M overlap.
+         * @param exact_serial_participants Additional already-materialized
+         *        graph topologies, each queried at its own declared stage shape.
+         * @param hints Model and graph-family sizing policy.
+         * @param extra_consumers Non-graph consumers that share the primary
+         *        participant lifetime.
+         * @param config Workspace budget policy.
+         * @return true when one stable allocation covers and binds every member.
+         */
+        bool allocateForGraphFamily(
+            const ComputeGraph &primary_graph,
+            WorkspaceGraphParticipantRole primary_role,
+            const std::vector<WorkspaceGraphParticipant> &
+                exact_serial_participants,
+            const WorkspaceSizingHints &hints,
+            const std::vector<WorkspaceConsumerRequest> &extra_consumers = {},
+            const WorkspaceBudgetConfig &config = WorkspaceBudgetConfig{});
+
+        /**
          * @brief Allocate workspace for a flat list of stages
          *
          * @param stages Stages to scan for IWorkspaceConsumer
@@ -174,6 +420,19 @@ namespace llaminar2
          * @brief Release all workspace allocations
          */
         void releaseAll();
+
+        /**
+         * @brief Retire every graph-visible workspace mapping for model reuse.
+         *
+         * The caller must first destroy every graph executable and stage that
+         * borrowed a workspace pointer. Successful sealing retains only each
+         * manager's primary backend allocation; a later exclusive runner may
+         * publish a different serial-family layout over those bytes.
+         *
+         * @param error Optional first rejection diagnostic.
+         * @return True when every device manager reached reusable-backing state.
+         */
+        bool sealReusablePrimaryBlocks(std::string *error = nullptr) noexcept;
 
         // =====================================================================
         // Access
@@ -212,12 +471,19 @@ namespace llaminar2
          */
         size_t deviceAllocated(DeviceId device) const;
 
+        /** @return Primary bytes retained for a future exclusive runner. */
+        size_t retainedPrimaryBytes() const noexcept;
+
         /**
          * @brief Number of devices with workspace allocated
          */
         size_t deviceCount() const { return device_workspaces_.size(); }
 
     private:
+        /** Sole authority retained by every physical workspace block. */
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority_;
+
         /// Per-device workspace managers
         std::unordered_map<DeviceId, std::unique_ptr<DeviceWorkspaceManager>> device_workspaces_;
 
@@ -239,6 +505,12 @@ namespace llaminar2
          * @brief Compute model-aware minimum budget floor
          */
         size_t computeModelAwareBudgetFloor(const WorkspaceSizingHints &hints) const;
+
+        /** @brief Construct one manager with the installed authority identity. */
+        [[nodiscard]] std::unique_ptr<DeviceWorkspaceManager>
+        createDeviceWorkspaceManager(
+            DeviceId device,
+            size_t budget_bytes) const;
     };
 
 } // namespace llaminar2

@@ -35,6 +35,7 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../attention/AttentionWorkspaceContract.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/MPIContext.h"
@@ -48,6 +49,27 @@ namespace llaminar2
 
     namespace rocm
     {
+        namespace fa2_policy
+        {
+            struct ROCmFA2PhysicalDeviceProperties;
+        }
+
+        /**
+         * @brief Query immutable ROCm properties used by FA2 graph planning.
+         *
+         * This backend boundary deliberately returns a runtime-neutral policy
+         * type. Callers that also compile CUDA support therefore never need to
+         * include HIP headers in the same translation unit as CUDA headers.
+         * Invalid device ordinals and failed property queries are fatal because
+         * capture must never guess a launch geometry.
+         *
+         * @param device_idx Participant-local HIP device ordinal.
+         * @return Valid compute-unit and per-workgroup LDS capacities.
+         * @throws std::runtime_error when HIP cannot provide exact properties.
+         */
+        [[nodiscard]] fa2_policy::ROCmFA2PhysicalDeviceProperties
+        queryROCmFlashAttentionDeviceProperties(int device_idx);
+
         // =============================================================================
         // Attention Workspace Buffer Names
         // =============================================================================
@@ -59,17 +81,21 @@ namespace llaminar2
         namespace AttentionWorkspaceBuffers
         {
             /// Partial attention output [batch × n_heads × num_splits × head_dim] FP32
-            constexpr const char *PARTIAL_OUTPUT = "attn_partial_output";
+            constexpr const char *PARTIAL_OUTPUT =
+                attention_workspace::kPartialOutput;
             /// Max scores per split [batch × n_heads × num_splits] FP32
-            constexpr const char *PARTIAL_M = "attn_partial_m";
+            constexpr const char *PARTIAL_M = attention_workspace::kPartialM;
             /// Logsumexp per split [batch × n_heads × num_splits] FP32
-            constexpr const char *PARTIAL_L = "attn_partial_l";
+            constexpr const char *PARTIAL_L = attention_workspace::kPartialL;
             /// Device-resident dynamic params (kv_len, position_offset, mask_stride)
-            constexpr const char *DEVICE_PARAMS = "attn_device_params";
+            constexpr const char *DEVICE_PARAMS =
+                attention_workspace::kDeviceParams;
             /// Temporary FP32 K buffer for mixed-precision KV conversion
-            constexpr const char *K_TMP_FP32 = "attn_k_tmp_fp32";
+            constexpr const char *K_TMP_FP32 =
+                attention_workspace::kKeyTemporaryFP32;
             /// Temporary FP32 V buffer for mixed-precision KV conversion
-            constexpr const char *V_TMP_FP32 = "attn_v_tmp_fp32";
+            constexpr const char *V_TMP_FP32 =
+                attention_workspace::kValueTemporaryFP32;
         }
 
         // Forward declaration of precision element type mapping
@@ -141,7 +167,8 @@ namespace llaminar2
                 return device_idx >= 0; // GPU only
             }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { stream_ = nullptr; }
 
             /**
              * @brief Compute single-sequence attention
@@ -279,7 +306,9 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {},
+                const attention::AttentionKVLogicalView &kv_logical_view = {}) override;
 
         private:
             int device_idx_;
@@ -318,7 +347,8 @@ namespace llaminar2
             /**
              * @brief Create ROCm Flash Attention kernel using device context
              *
-             * Uses the device context's stream for kernel execution.
+             * The context supplies device resources only. The executor must
+             * bind the exact producer stream before kernel execution.
              *
              * @param ctx Device context (must outlive this kernel)
              * @throws std::runtime_error if ctx is null or not initialized
@@ -334,7 +364,18 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override
+            {
+                if (stream_ != stream.get())
+                    dynamic_attn_device_valid_ = false;
+                stream_ = stream.get();
+            }
+
+            void clearGPUStreamBinding() override
+            {
+                dynamic_attn_device_valid_ = false;
+                stream_ = nullptr;
+            }
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -400,17 +441,18 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {},
+                const attention::AttentionKVLogicalView &kv_logical_view = {}) override;
 
             /**
              * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
              *
-             * This is the graph-stage proof boundary for M=2..4 verifier rows.
-             * It prepares row-local attention parameters for the whole verifier
-             * span, then invokes one small-M attention dispatch.  ROCm currently
-             * preserves serial decode math with row-local flash-decode launches
-             * inside that dispatch; Phase 9.8 still tracks the true grouped
-             * attention kernel as the economics target.
+             * This is the graph-stage proof boundary for M=2..16 verifier rows.
+             * One grouped phase grid and one grouped reduction grid consume the
+             * shared K/V bank.  Device-resident row metadata selects each row's
+             * visible prefix, scalar split partition, and scalar wavefront
+             * count, preserving byte identity without row replay.
              */
             bool compute_verifier_rows_decode_equivalent(
                 const ITensor *Q,
@@ -427,18 +469,64 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 int head_start = 0,
+                int gqa_n_rep = 0,
+                const attention::AttentionKVLogicalView &kv_logical_view = {},
+                const attention::AttentionExecutionPolicy &execution_policy = {}) override;
+
+            /**
+             * @brief Decode independent fixed-stride request banks in one HIP grid.
+             *
+             * K/V use the request-major resident layout emitted by
+             * ROCmRingKVCache.  Canonical post-append counts remain on device;
+             * a captured metadata kernel derives one row-local parameter record
+             * per request/query row before the grouped attention phase.  The
+             * method performs no D2H count read and no per-request launch loop.
+             *
+             * @param Q FP32 request-major query rows.
+             * @param K Fixed-stride resident K cache view.
+             * @param V Fixed-stride resident V cache view.
+             * @param post_append_cached_tokens_device Device count per request.
+             * @param output FP32 request-major output rows.
+             * @param request_count Number of independent request banks.
+             * @param query_rows Consecutive decode rows per request.
+             * @param max_kv_len Physical row stride for every request bank.
+             * @return true only when the grouped device path launches.
+             */
+            bool compute_device_request_batch_decode_equivalent(
+                const ITensor *Q,
+                const ITensor *K,
+                const ITensor *V,
+                const int *post_append_cached_tokens_device,
+                ITensor *output,
+                int request_count,
+                int query_rows,
+                int max_kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal,
+                int window_size = -1,
+                const IMPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
                 int gqa_n_rep = 0) override;
 
             /// Update device-side attention params for graph-capture replay
             void setDynamicAttnParams(int kv_len, int position_offset) override;
             void setDynamicAttnParams(int kv_len, int position_offset, int query_rows) override;
             bool prepareDynamicAttnParams(
-                int kv_len, int position_offset, int query_rows, void *stream) override;
+                int kv_len, int position_offset, int query_rows, void *stream,
+                int kv_stride = -1) override;
             bool prepareDynamicAttnParamsFromDeviceSequenceState(
                 const int *post_append_cached_tokens_device,
                 int seq_len,
                 int query_rows,
-                void *stream) override;
+                void *stream,
+                int kv_stride,
+                const int *active_query_rows_device = nullptr,
+                const attention::AttentionPrefillCaptureGeometry &prefill_capture = {},
+                const int *device_ring_head = nullptr,
+                int ring_capacity = 0) override;
             void resetDynamicState() override;
 
             // =========================================================================
@@ -518,20 +606,28 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host staging for pre-capture attention-param uploads
-            attention::AttentionDeviceParams *h_attn_params_ = nullptr;
-            int h_attn_params_capacity_ = 0;
             int small_decode_rows_ = 0;
+            /// Last explicit geometry associated with the device parameter block.
             int dynamic_attn_kv_len_ = 0;
+            int dynamic_attn_kv_stride_ = 0;
             int dynamic_attn_position_offset_ = 0;
             int dynamic_attn_query_rows_ = 1;
             int dynamic_attn_param_rows_ = 1;
-            bool dynamic_attn_host_valid_ = false;
             bool dynamic_attn_device_valid_ = false;
             bool dynamic_attn_device_derived_ = false;
 
-            bool ensureHostAttnParamsCapacity(int capacity);
-            bool uploadDynamicAttnParams(void *stream);
+            /**
+             * @brief Enqueue explicit geometry into DEVICE_PARAMS on @p stream.
+             *
+             * The operation is a tiny graph-capturable HIP kernel. It never
+             * allocates host storage and never records a host-to-device memcpy.
+             */
+            bool writeDynamicAttnParams(
+                int kv_len,
+                int kv_stride,
+                int position_offset,
+                int query_rows,
+                void *stream);
             bool dynamicAttnParamsReady(
                 int kv_len, int position_offset, int query_rows) const;
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
@@ -569,7 +665,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { stream_ = nullptr; }
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -633,7 +730,9 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {},
+                const attention::AttentionKVLogicalView &kv_logical_view = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -706,7 +805,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            void setGPUStream(void *stream) override { stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { stream_ = nullptr; }
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,
@@ -770,7 +870,9 @@ namespace llaminar2
                 int head_start = 0,
                 int local_n_heads = -1,
                 int local_n_kv_heads = -1,
-                int gqa_n_rep = 0) override;
+                int gqa_n_rep = 0,
+                const attention::AttentionExecutionPolicy &execution_policy = {},
+                const attention::AttentionKVLogicalView &kv_logical_view = {}) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface

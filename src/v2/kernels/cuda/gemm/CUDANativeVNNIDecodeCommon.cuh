@@ -1,9 +1,24 @@
+/**
+ * @file CUDANativeVNNIDecodeCommon.cuh
+ * @brief Shared byte-exact CUDA NativeVNNI decode and contribution primitives.
+ *
+ * CUDA GEMV, grouped verifier, and prefill kernels include this header so that
+ * every execution regime decodes quantized weights and publishes FP32 block
+ * contributions with the same arithmetic order. IQ lookup tables are copied
+ * once during backend initialization and remain immutable device-owned state
+ * throughout graph capture and replay.
+ */
+
 #pragma once
 
 #include "tensors/IQQuantTables.h"
+#include "tensors/NativeVnniFormatInfo.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include "kernels/common/DeviceNativeVNNIContributionContract.h"
+#include "kernels/common/NativeVNNIPackedBits.h"
 
 #include <cstdint>
 #include <iterator>
@@ -42,6 +57,7 @@ namespace llaminar2::cuda_native_vnni
             return false;
         if (!copyHostArrayToDeviceSymbol(d_iq2s_grid, iq2s_grid, std::size(iq2s_grid)))
             return false;
+
         if (!copyHostArrayToDeviceSymbol(d_iq2xs_grid, iq2xs_grid, std::size(iq2xs_grid)))
             return false;
         if (!copyHostArrayToDeviceSymbol(d_iq2xxs_grid, iq2xxs_grid, std::size(iq2xxs_grid)))
@@ -58,13 +74,17 @@ namespace llaminar2::cuda_native_vnni
         static constexpr bool is_iq2_grid = (CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 15);
         static constexpr bool is_iq1_grid = (CODEBOOK_ID == 16 || CODEBOOK_ID == 17);
         static constexpr bool is_iq_grid = is_iq3_grid || is_iq2_grid || is_iq1_grid;
-        static constexpr bool is_asymmetric = (CODEBOOK_ID == 5 || CODEBOOK_ID == 7 || CODEBOOK_ID == 16);
+        static constexpr bool is_asymmetric =
+            CODEBOOK_ID == 5 || CODEBOOK_ID == 7 || CODEBOOK_ID == 16 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook;
         static constexpr bool is_dual_scale = (CODEBOOK_ID == 8 || CODEBOOK_ID == 9 || CODEBOOK_ID == 10 ||
                                                CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 17);
         static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
         static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
         static constexpr int payload_bytes =
-            (CODEBOOK_ID == 19)                        ? 32
+            (CODEBOOK_ID == 19 ||
+             CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
+                                                        ? 32
             : (CODEBOOK_ID == 6 || CODEBOOK_ID == 7)   ? 20
             : (CODEBOOK_ID == 8)                       ? 24
             : (CODEBOOK_ID == 9)                       ? 12
@@ -87,6 +107,152 @@ namespace llaminar2::cuda_native_vnni
         const int8_t *vals = reinterpret_cast<const int8_t *>(&packed);
         return static_cast<int>(vals[0]) + static_cast<int>(vals[1]) +
                static_cast<int>(vals[2]) + static_cast<int>(vals[3]);
+    }
+
+    /**
+     * @brief Convert one exact INT8 dot-product block into its canonical FP32
+     *        NativeVNNI contribution.
+     *
+     * CUDA has several economical engines capable of producing the same exact
+     * integer dot products: serial DP4A decode, grouped DP4A verification, and
+     * grouped tensor-core MMA. Integer equality is not sufficient for MTP,
+     * however. Re-parenthesizing the scale, asymmetric-minimum, or IQ1_M delta
+     * terms changes FP32 result bytes and can change later sampling decisions.
+     *
+     * This function is therefore the single arithmetic publication contract
+     * shared by every CUDA NativeVNNI engine. Callers may obtain the integer
+     * terms differently, but they must pass those exact terms here before
+     * adding the returned contribution to an output accumulator. Every
+     * multiply and add names round-to-nearest explicitly so nvcc cannot fuse
+     * or reassociate one kernel family differently from another.
+     *
+     * Unused correction arguments are compiled away for codebooks that do not
+     * need them. Keeping one complete signature is intentional: it makes a new
+     * format's correction requirements visible at every execution engine and
+     * prevents a tensor-core-only approximation from quietly appearing. The
+     * final scale/correction tree delegates to the cross-backend contribution
+     * contract, so expert residency cannot select a different expression.
+     *
+     * @tparam CODEBOOK_ID NativeVNNI codebook identifier.
+     * @param dot_lo Integer dot product for the low or complete 32-value block.
+     * @param dot_hi Integer dot product for the high dual-scale half.
+     * @param activation_scale FP32 scale for the quantized activation block.
+     * @param scale_bits FP16 weight scale bits for the low or complete block.
+     * @param secondary_bits FP16 asymmetric minimum or high-half scale bits.
+     * @param emin_bits Packed Q2_K low/high asymmetric-minimum FP16 bits.
+     * @param activation_sum Sum of all 32 quantized activation values.
+     * @param activation_sum_lo Sum of the low sixteen activation values.
+     * @param activation_sum_hi Sum of the high sixteen activation values.
+     * @param iq1m_qh Packed IQ1_M delta-sign bytes from the weight payload.
+     * @param subgroup_sum0 Sum of IQ1_M activation values 0 through 7.
+     * @param subgroup_sum1 Sum of IQ1_M activation values 8 through 15.
+     * @param subgroup_sum2 Sum of IQ1_M activation values 16 through 23.
+     * @param subgroup_sum3 Sum of IQ1_M activation values 24 through 31.
+     * @return Canonically rounded FP32 contribution for this 32-value block.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ float
+    native_vnni_block_contribution_from_reduced_terms_rn(
+        int dot_lo,
+        int dot_hi,
+        float activation_scale,
+        uint16_t scale_bits,
+        uint16_t secondary_bits,
+        uint32_t emin_bits,
+        int activation_sum,
+        int activation_sum_lo,
+        int activation_sum_hi,
+        uint16_t iq1m_qh,
+        int subgroup_sum0,
+        int subgroup_sum1,
+        int subgroup_sum2,
+        int subgroup_sum3)
+    {
+        using Traits = CodebookTraits<CODEBOOK_ID>;
+
+        if constexpr (Traits::is_dual_scale)
+        {
+            const float scale_lo = fp16_bits_to_float(scale_bits);
+            const float scale_hi = fp16_bits_to_float(secondary_bits);
+            float contribution =
+                device_native_vnni_contract::dualScaleBlock(
+                    dot_lo,
+                    dot_hi,
+                    scale_lo,
+                    scale_hi,
+                    activation_scale);
+
+            if constexpr (Traits::is_dual_scale_asym)
+            {
+                const float min_lo =
+                    fp16_bits_to_float(static_cast<uint16_t>(emin_bits));
+                const float min_hi =
+                    fp16_bits_to_float(static_cast<uint16_t>(emin_bits >> 16));
+                contribution = device_native_vnni_contract::accumulate(
+                    contribution,
+                    device_native_vnni_contract::dualScaleCorrection(
+                        activation_sum_lo,
+                        activation_sum_hi,
+                        min_lo,
+                        min_hi,
+                        activation_scale));
+            }
+
+            if constexpr (Traits::is_iq1_m)
+            {
+                constexpr float kIQ1MDelta = 0.125f;
+                const uint8_t qh0 = static_cast<uint8_t>(iq1m_qh);
+                const uint8_t qh1 =
+                    static_cast<uint8_t>(iq1m_qh >> 8);
+                const float delta0 =
+                    (qh0 & 0x08) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta1 =
+                    (qh0 & 0x80) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta2 =
+                    (qh1 & 0x08) ? -kIQ1MDelta : kIQ1MDelta;
+                const float delta3 =
+                    (qh1 & 0x80) ? -kIQ1MDelta : kIQ1MDelta;
+                contribution = device_native_vnni_contract::accumulate(
+                    contribution,
+                    device_native_vnni_contract::iq1MDeltaCorrection(
+                        subgroup_sum0,
+                        subgroup_sum1,
+                        subgroup_sum2,
+                        subgroup_sum3,
+                        delta0,
+                        delta1,
+                        delta2,
+                        delta3,
+                        scale_lo,
+                        scale_hi,
+                        activation_scale));
+            }
+
+            return contribution;
+        }
+        else
+        {
+            const float weight_scale = fp16_bits_to_float(scale_bits);
+            float contribution =
+                device_native_vnni_contract::singleScaleBlock(
+                    dot_lo,
+                    weight_scale,
+                    activation_scale);
+
+            if constexpr (Traits::is_asymmetric)
+            {
+                const float weight_min =
+                    fp16_bits_to_float(secondary_bits);
+                contribution = device_native_vnni_contract::accumulate(
+                    contribution,
+                    device_native_vnni_contract::singleScaleCorrection(
+                        activation_sum,
+                        weight_min,
+                        activation_scale));
+            }
+
+            return contribution;
+        }
     }
 
     __device__ __forceinline__ uint32_t load_payload_word(const uint8_t *payload, int group_idx)
@@ -132,10 +298,17 @@ namespace llaminar2::cuda_native_vnni
         return static_cast<int8_t>((packed >> shift) & 0xFFu);
     }
 
-    // Per-word IQ4_NL decode: processes both low and high nibbles of a raw uint32
-    // word in one call, producing 2 packed int8 outputs (8 decoded values total).
-    // Computes PRMT selectors and blend masks directly from the raw word using
-    // efficient bitwise packing, avoiding per-nibble extraction overhead.
+    /**
+     * @brief Expand eight IQ4_NL codes with register-only byte permutations.
+     * @param w Four packed bytes, each containing a low and high nibble code.
+     * @param out_lo Four signed lookup bytes for the low nibble of each input byte.
+     * @param out_hi Four signed lookup bytes for the high nibble of each input byte.
+     *
+     * IQ4_NL and IQ4_XS share this physical lookup after weight preparation.
+     * Decode adjacent nibbles before separating their destinations: this avoids
+     * building two packed selectors and two byte-wise blend masks. No scale,
+     * integer dot product, or FP32 reduction arithmetic changes at any caller.
+     */
     __device__ __forceinline__ void iq4nl_decode_word(
         uint32_t w, uint32_t &out_lo, uint32_t &out_hi)
     {
@@ -144,34 +317,23 @@ namespace llaminar2::cuda_native_vnni
         constexpr uint32_t kLut2 = 0x26190d01u; // vals[8..11]
         constexpr uint32_t kLut3 = 0x71594535u; // vals[12..15]
 
-        // --- Low nibbles: bits [3:0] of each byte ---
-        // Pack 4 low nibbles from 8-bit stride to 4-bit PRMT selector:
-        //   byte0[3:0] → sel[3:0], byte1[3:0] → sel[7:4],
-        //   byte2[3:0] → sel[11:8], byte3[3:0] → sel[15:12]
-        const uint32_t w_lo = w & 0x0F0F0F0Fu;
-        const uint32_t lo_merged = (w_lo | (w_lo >> 4)) & 0x00FF00FFu;
-        const uint32_t sel_lo = (lo_merged | (lo_merged >> 8)) & 0xFFFFu;
+        // __byte_perm indexes eight source bytes with each selector's low
+        // three bits. Look up both halves of the sixteen-entry table, then
+        // use each code's bit 3 to choose the corresponding result byte.
+        // 0x3210 preserves positions; OR-ing 4 selects the upper table half.
+        const uint32_t halves = 0x32103210u | ((w >> 1) & 0x44444444u);
+        const uint32_t first = __byte_perm(
+            __byte_perm(kLut0, kLut1, w),
+            __byte_perm(kLut2, kLut3, w), halves);
+        const uint32_t last = __byte_perm(
+            __byte_perm(kLut0, kLut1, w >> 16),
+            __byte_perm(kLut2, kLut3, w >> 16), halves >> 16);
 
-        // --- High nibbles: bits [7:4] of each byte ---
-        const uint32_t w_hi = (w >> 4) & 0x0F0F0F0Fu;
-        const uint32_t hi_merged = (w_hi | (w_hi >> 4)) & 0x00FF00FFu;
-        const uint32_t sel_hi = (hi_merged | (hi_merged >> 8)) & 0xFFFFu;
-
-        // PRMT lookups from both LUT halves
-        const uint32_t lo_from_lo = __byte_perm(kLut0, kLut1, sel_lo);
-        const uint32_t lo_from_hi = __byte_perm(kLut2, kLut3, sel_lo);
-        const uint32_t hi_from_lo = __byte_perm(kLut0, kLut1, sel_hi);
-        const uint32_t hi_from_hi = __byte_perm(kLut2, kLut3, sel_hi);
-
-        // Blend masks from bit 3 of each nibble (bit3==1 means index >= 8)
-        const uint32_t mask_lo = __vsub4(0u, (w >> 3) & 0x01010101u);
-        const uint32_t mask_hi = __vsub4(0u, (w >> 7) & 0x01010101u);
-
-        // Blend: (from_hi & mask) | (from_lo & ~mask) via LOP3 truth table 0xE4
-        asm("lop3.b32 %0, %1, %2, %3, 0xE4;"
-            : "=r"(out_lo) : "r"(lo_from_hi), "r"(lo_from_lo), "r"(mask_lo));
-        asm("lop3.b32 %0, %1, %2, %3, 0xE4;"
-            : "=r"(out_hi) : "r"(hi_from_hi), "r"(hi_from_lo), "r"(mask_hi));
+        // The two intermediate words hold codes [0..3] and [4..7] in nibble
+        // order. Gather even codes into low bytes and odd codes into high
+        // bytes, retaining the packed dp4a operand layout used by all callers.
+        out_lo = __byte_perm(first, last, 0x6420);
+        out_hi = __byte_perm(first, last, 0x7531);
     }
 
     __device__ __forceinline__ uint32_t centered_sub_16(uint32_t value)
@@ -198,14 +360,40 @@ namespace llaminar2::cuda_native_vnni
                ((hb4 & 0x8u) << 23);
     }
 
-    __device__ __forceinline__ uint32_t iq_apply_signs_4(uint32_t grid4, uint8_t sign_lo4)
+    /**
+     * @brief Apply four IQ sign bits with exact packed-byte arithmetic.
+     *
+     * Expanding this operation as four scalar ternaries makes nvcc emit a long
+     * predicate/negate/permute chain in every IQ-grid decoder. Instead, first
+     * spread the four sign bits into the low bit of four independent bytes.
+     * `__vsub4(0, bits)` then turns each selected byte into `0xff`, and
+     * `(value ^ mask) - mask` performs two's-complement negation independently
+     * in each byte. The result is byte-identical to the scalar expression while
+     * avoiding cross-byte borrows and keeping all four values vectorized.
+     *
+     * IQ grids contain representable signed magnitudes, so negation cannot
+     * encounter the exceptional INT8_MIN value.
+     *
+     * @param grid4 Four positive grid magnitudes packed as signed INT8 bytes.
+     * @param sign_lo4 One sign selector bit for each packed byte.
+     * @return Four signed grid values packed in their original byte order.
+     */
+    __device__ __forceinline__ uint32_t iq_apply_signs_4(
+        uint32_t grid4,
+        uint8_t sign_lo4)
     {
-        const int8_t *grid = reinterpret_cast<const int8_t *>(&grid4);
-        return static_cast<uint32_t>(pack_i8x4(
-            (sign_lo4 & 0x1) ? static_cast<int8_t>(-grid[0]) : grid[0],
-            (sign_lo4 & 0x2) ? static_cast<int8_t>(-grid[1]) : grid[1],
-            (sign_lo4 & 0x4) ? static_cast<int8_t>(-grid[2]) : grid[2],
-            (sign_lo4 & 0x8) ? static_cast<int8_t>(-grid[3]) : grid[3]));
+        /*
+         * Multiplication by 0x00204081 places nibble bit i at bit 8*i;
+         * masking retains exactly those four byte-low predicates. This is the
+         * same bit expansion as the former shift/OR chain, expressed as one
+         * integer multiply plus one mask so every IQ-grid decoder performs less
+         * scalar address-generation work before the vector byte subtraction.
+         */
+        const uint32_t sign_bits =
+            (static_cast<uint32_t>(sign_lo4 & 0x0Fu) * 0x00204081u) &
+            0x01010101u;
+        const uint32_t sign_mask = __vsub4(0u, sign_bits);
+        return __vsub4(grid4 ^ sign_mask, sign_mask);
     }
 
     template <uint8_t CODEBOOK_ID>
@@ -261,6 +449,16 @@ namespace llaminar2::cuda_native_vnni
         return CodebookTraits<CODEBOOK_ID>::payload_bytes;
     }
 
+    /**
+     * @brief Decode one compact source block into eight exact INT8 words.
+     * @tparam CODEBOOK_ID Compile-time source payload/centering contract.
+     * @param payload One immutable 32-element native block.
+     * @param packed_groups Receives the original element order, four per word.
+     *
+     * Bit-plane expansion is integer-only. Scaling and signed/asymmetric
+     * contribution arithmetic remain in the shared FP32 contract, so every
+     * ordinary, grouped, and tensor-core caller observes the same values.
+     */
     template <uint8_t CODEBOOK_ID>
     __device__ __forceinline__ void decode_groups(const uint8_t *payload, int32_t (&packed_groups)[8])
     {
@@ -304,10 +502,12 @@ namespace llaminar2::cuda_native_vnni
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
                 const uint32_t hb4_lo = (qh_bits >> (g * 4)) & 0xFu;
                 const uint32_t hb4_hi = (qh_bits >> (g * 4 + 16)) & 0xFu;
-                const uint32_t hb_lo = ((hb4_lo & 1u) << 4) | ((hb4_lo & 2u) << 11) |
-                                       ((hb4_lo & 4u) << 18) | ((hb4_lo & 8u) << 25);
-                const uint32_t hb_hi = ((hb4_hi & 1u) << 4) | ((hb4_hi & 2u) << 11) |
-                                       ((hb4_hi & 4u) << 18) | ((hb4_hi & 8u) << 25);
+                // The same integer high plane serves Q5_0, Q5_1 and Q5_K.
+                // Signed centering and all FP32 contribution order stay below.
+                const uint32_t hb_lo =
+                    native_vnni::q5HighBitsToPackedBytes(hb4_lo);
+                const uint32_t hb_hi =
+                    native_vnni::q5HighBitsToPackedBytes(hb4_hi);
                 uint32_t lo = (raw & 0x0F0F0F0Fu) | hb_lo;
                 uint32_t hi = ((raw >> 4) & 0x0F0F0F0Fu) | hb_hi;
                 if constexpr (CODEBOOK_ID == 6)
@@ -432,8 +632,12 @@ namespace llaminar2::cuda_native_vnni
             packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
         }
-        else if constexpr (CODEBOOK_ID == 19) // Q8_0: 32 raw int8 values → direct copy
+        else if constexpr (
+            CODEBOOK_ID == 19 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
         {
+            // Both normalized INT8 formats store 32 signed bytes directly;
+            // codebook 23 adds its minimum only in the contribution helper.
 #pragma unroll
             for (int g = 0; g < 8; ++g)
             {
@@ -497,8 +701,12 @@ namespace llaminar2::cuda_native_vnni
                 decode_groups<CODEBOOK_ID>(payload, packed_groups);
             }
         }
-        else if constexpr (CODEBOOK_ID == 19) // Q8_0: 32 bytes — two 128-bit loads
+        else if constexpr (
+            CODEBOOK_ID == 19 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
         {
+            // Payload layout is identical; asymmetric correction consumes the
+            // separate minimum plane after these vectorized loads.
             const int4 v0 = *reinterpret_cast<const int4 *>(payload);
             const int4 v1 = *reinterpret_cast<const int4 *>(payload + 16);
             packed_groups[0] = v0.x;

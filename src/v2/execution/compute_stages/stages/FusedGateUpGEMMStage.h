@@ -1,9 +1,11 @@
-/**
- * @file FusedGateUpGEMMStage.h
+/** @file FusedGateUpGEMMStage.h
  * @brief Fused Gate/Up projection stage for FFN
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #pragma once
+
+#include "kernels/common/DeviceRowRange.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -87,6 +89,8 @@ namespace llaminar2
              * replay.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            /// Immutable verifier geometry; its borrowed count is ordered by the graph producer.
+            std::optional<DeviceRowRange> verifier_row_range;
         };
 
         explicit FusedGateUpGEMMStage(Params params);
@@ -106,12 +110,23 @@ namespace llaminar2
         // =============================================================================
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void resetSessionState() override;
+        void resetSessionStatePreservingCapturedReplay() override;
+        void resetSessionStatePreservingLazyInitialization() override;
+
+        /** @brief Provision gate/up side-stream resources before capture. */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
 
     private:
         Params params_;
         ITensorFusedGateUpGemm *cached_kernel_ = nullptr; ///< Cached for workspace binding
 
         ITensorFusedGateUpGemm *resolvePreparedKernel(const char *caller);
+        void clearCachedKernelStream();
         bool executeDecodeEquivalentVerifierPrefill(
             IDeviceContext *ctx,
             const TensorBase *input,
@@ -119,9 +134,6 @@ namespace llaminar2
             TensorBase *output_up,
             ITensorFusedGateUpGemm *kernel);
 
-        std::shared_ptr<FP32Tensor> verifier_input_row_;
-        std::shared_ptr<FP32Tensor> verifier_gate_row_;
-        std::shared_ptr<FP32Tensor> verifier_up_row_;
     };
 
 } // namespace llaminar2

@@ -17,6 +17,7 @@
 #include <memory>
 #include <cmath>
 #include <numeric>
+#include <stdexcept>
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
@@ -60,6 +61,17 @@ namespace llaminar2
                 if (layer < 0 || layer >= num_layers_)
                     return 0;
                 return cached_tokens_[layer];
+            }
+
+            KVCacheSequenceState sequenceState(int layer, int seq_idx) const override
+            {
+                if (seq_idx != 0 || layer < 0 || layer >= num_layers_)
+                    return {};
+                return {
+                    .cached_tokens = cached_tokens_[layer],
+                    .implementation_head = 0,
+                    .wrapped = false,
+                };
             }
 
             bool get_kv(int layer, int seq_idx, ITensor **out_k, ITensor **out_v, int *out_kv_len = nullptr) override
@@ -111,9 +123,15 @@ namespace llaminar2
                                   int *out_kv_len = nullptr,
                                   const KVReadParams *rope = nullptr) override
             {
+                (void)layer;
+                (void)seq_idx;
                 (void)target;
+                (void)out_k;
+                (void)out_v;
+                (void)out_kv_len;
                 (void)rope;
-                return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+                throw std::logic_error(
+                    "CPU attention must consume the cache's native logical view");
             }
 
             ITensor *get_k(int layer, int seq_idx = 0) override
@@ -157,18 +175,32 @@ namespace llaminar2
                 cached_tokens_[layer] += num_tokens;
                 return true;
             }
-            void clear() override
+            bool resetRequestState(const StateResetContext &) override
             {
                 for (auto &c : cached_tokens_)
                     c = 0;
+                return true;
             }
-            void clear_sequence(int, int) override {}
-            void clear_layer(int) override {}
+            bool resetSequenceState(int, const StateResetContext &) override
+            {
+                return true;
+            }
+            bool resetLayerSequenceState(
+                int,
+                int,
+                const StateResetContext &) override
+            {
+                return true;
+            }
+            bool resetLayerState(int, const StateResetContext &) override
+            {
+                return true;
+            }
             void evict_oldest(int) override {}
             void evict_oldest_from_sequence(int, int) override {}
-            DeviceId get_layer_device(int) const override { return DeviceId::cpu(); }
             int get_total_evicted() const override { return 0; }
             void reset_eviction_counter() override {}
+            DeviceId get_layer_device(int) const override { return DeviceId::cpu(); }
             int gather_kv_batched(int, int, TensorBase *, TensorBase *, std::vector<int> &) override { return 0; }
             bool is_sharded() const override { return false; }
             int n_kv_heads() const override { return kv_dim_ / 32; }

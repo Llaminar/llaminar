@@ -32,6 +32,7 @@ namespace llaminar2
 {
     class ITensorGemm;
     class ITensorFusedGateUpGemm;
+    class PhysicalMemoryAuthority;
     class TensorBase;
 
     /**
@@ -56,11 +57,44 @@ namespace llaminar2
         /// store was unbound or already bound to the same id; false on mismatch.
         bool bindModelIdIfUnset(ModelContextId model_id);
 
+        /**
+         * @brief Publish the model context's sole physical-memory authority.
+         *
+         * Graph builders and prepared expert services already share this
+         * model-owned store.  Carrying the admitted authority through that
+         * existing lifetime avoids introducing a process-global registry or a
+         * second graph-local accountant.  The store does not perform memory
+         * arithmetic; it preserves object identity across setup workers.
+         *
+         * @param authority Rank-bound authority selected before materialization.
+         * @throws std::invalid_argument for a null authority.
+         * @throws std::logic_error when a different authority is already bound.
+         */
+        void installPhysicalMemoryAuthority(
+            std::shared_ptr<PhysicalMemoryAuthority> authority);
+
+        /**
+         * @brief Return the model context's admitted allocation authority.
+         * @return Shared authority, or null before memory admission.
+         */
+        [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority>
+        physicalMemoryAuthority() const;
+
         // =========================================================================
         // GEMM Preparation & Resolution
         // =========================================================================
 
+        /**
+         * @brief Prepare a CPU GEMM binding under its admitted weight owner.
+         * @param binding Immutable materialized weight binding.
+         * @param memory_owner Exact persistent-weight BOM owner.
+         */
+        /** @brief Prepare an ordinary primary-model CPU GEMM binding. */
         PreparedWeightRef prepareGemm(const WeightBinding &binding);
+
+        PreparedWeightRef prepareGemm(
+            const WeightBinding &binding,
+            PhysicalMemoryOwner memory_owner);
         PreparedWeightRef registerPreparedForTest(
             const WeightBinding &binding,
             PreparedWeightKind kind,
@@ -70,8 +104,57 @@ namespace llaminar2
             PreparedWeightKind kind,
             DeviceId device,
             std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle);
+        /**
+         * @brief Attach an existing prepared GEMM to a materialized binding.
+         *
+         * An exact `(binding_id, device)` hit also restores the store-owned
+         * source tensor into `binding`.  Repeated graph materialization can
+         * otherwise create an equivalent derived tensor (for example a GDN
+         * FP32 projection override) while retaining the earlier packed handle.
+         * Keeping the first model-lifetime tensor authoritative makes the
+         * stage contract and the prepared kernel name the same live value.
+         *
+         * @param binding Mutable graph binding to adopt or canonicalize.
+         * @param device Exact execution device for the prepared state.
+         * @return True when compatible prepared state was found and attached.
+         * @throws std::runtime_error when an exact stable identity names an
+         *         incompatible tensor, slice, canonical name, or prepared kind.
+         */
         bool adoptPreparedGemmForBinding(
-            const WeightBinding &binding,
+            WeightBinding &binding,
+            DeviceId device);
+
+        /**
+         * @brief Attach an existing prepared embedding to a rematerialized binding.
+         *
+         * Binding ids are local to one frozen-weight materialization. A later
+         * graph may assign the same immutable embedding a different id, including
+         * an id already used by a GEMM entry from an earlier graph. This typed
+         * adoption path resolves only embedding state and installs an alias for
+         * the new binding without rebuilding or copying device weights.
+         *
+         * @param binding Mutable embedding binding to adopt or canonicalize.
+         * @param device Exact execution device for the prepared state.
+         * @return True when compatible prepared embedding state was adopted.
+         * @throws std::runtime_error for an incompatible exact embedding-id hit.
+         */
+        bool adoptPreparedEmbeddingForBinding(
+            WeightBinding &binding,
+            DeviceId device);
+
+        /**
+         * @brief Adopt the representation declared by `binding.prepared`.
+         *
+         * This is the materialization boundary for callers that handle mixed
+         * graph roles. It dispatches embedding and GEMM bindings to their
+         * disjoint typed registries, preventing equal numeric binding ids from
+         * being interpreted as the wrong prepared representation.
+         *
+         * @return True when compatible prepared state was attached; false for
+         *         an unprepared binding, an expert-slab binding, or a miss.
+         */
+        bool adoptPreparedForBinding(
+            WeightBinding &binding,
             DeviceId device);
 
         /// Resolve GEMM kernel from a prepared ref. O(1) lookup by binding_id.
@@ -83,6 +166,18 @@ namespace llaminar2
         std::optional<PreparedWeightRef> preparedRefForBinding(
             uint64_t binding_id,
             DeviceId device) const;
+
+        /**
+         * @brief Resolve one exact prepared representation kind by binding id.
+         *
+         * GEMM and embedding entries deliberately occupy distinct typed
+         * registries. Callers that know the graph role must use this overload so
+         * a rematerialized id collision cannot select the wrong representation.
+         */
+        std::optional<PreparedWeightRef> preparedRefForBinding(
+            uint64_t binding_id,
+            DeviceId device,
+            PreparedWeightKind expected_kind) const;
 
         // =========================================================================
         // Fused Gate/Up Kernel Resolution
@@ -103,6 +198,21 @@ namespace llaminar2
             int d_model,
             size_t vocab_offset = 0,
             size_t total_vocab = 0);
+
+        /**
+         * @brief Prepare an embedding against an explicit persistent owner.
+         * @param binding Immutable embedding binding.
+         * @param d_model Logical embedding width.
+         * @param vocab_offset First row in the global vocabulary.
+         * @param total_vocab Global vocabulary size.
+         * @param memory_owner Exact admitted persistent-weight owner.
+         */
+        PreparedWeightRef prepareEmbedding(
+            const WeightBinding &binding,
+            int d_model,
+            size_t vocab_offset,
+            size_t total_vocab,
+            PhysicalMemoryOwner memory_owner);
 
         /// Register an already-prepared embedding handle from the pipeline.
         PreparedWeightRef registerPreparedEmbeddingFromPipeline(
@@ -131,6 +241,33 @@ namespace llaminar2
         bool contains(const PreparedWeightRef &ref) const;
         std::optional<WeightBinding> binding(const PreparedWeightRef &ref) const;
         size_t size() const;
+
+        /**
+         * @brief Count prepared model records owned by one exact device.
+         *
+         * The count includes GEMM handles, prepared embeddings, and registered
+         * expert slabs. It is an existence/observability query, not a byte
+         * estimate and not by itself a completeness certificate; callers that
+         * make admission decisions must also require the WeightManager lifecycle
+         * gates and a matching production-plan reuse contract.
+         *
+         * @param device Backend type and ordinal whose records are counted.
+         * @return Number of prepared records registered for that device.
+         */
+        [[nodiscard]] size_t sizeForDevice(DeviceId device) const;
+
+        /**
+         * @brief Sum unique live GPU embedding allocations for one device.
+         * @param device Exact backend and ordinal to inspect.
+         * @return Checked bytes owned by distinct PreparedEmbeddingWeights.
+         *
+         * Embedding aliases may publish several binding ids over one allocation.
+         * This query deduplicates by the allocation owner, not by logical entry,
+         * and is used only at a quiescent reusable-model seal.
+         */
+        [[nodiscard]] size_t preparedEmbeddingAllocationBytesForDevice(
+            DeviceId device) const;
+
         /**
          * @brief Reset input-dependent state on all prepared kernels.
          *
@@ -157,14 +294,23 @@ namespace llaminar2
         // MoE Expert Slab API
         // =========================================================================
 
-        /// Register a new expert slab (one weight group × one layer × one device).
+        /// Register an expert slab (one global expert-id table × weight group × layer × device).
         ExpertSlabRef registerExpertSlab(const ExpertSlabDescriptor &desc);
 
-        /// Find an existing expert slab with the same layer/role/device/dimensions.
+        /// Find an existing expert slab with the same global table identity.
+        /// local_expert_start/count are residency metadata and do not split slabs.
         std::optional<ExpertSlabRef> findExpertSlab(const ExpertSlabDescriptor &desc) const;
 
         /// Get the GEMM engine for a specific expert within a slab.
         ITensorGemm *expertGemmKernel(const ExpertSlabRef &slab, int expert_id) const;
+
+        /// Get the owned GEMM lifetime for a specific expert within a slab.
+        std::shared_ptr<ITensorGemm> expertGemmKernelLifetime(const ExpertSlabRef &slab, int expert_id) const;
+
+        /// Get a pending GPU-direct readiness event for an arrived expert, if any.
+        std::optional<GpuDirectTransferCompletion> expertGpuDirectCompletion(
+            const ExpertSlabRef &slab,
+            int expert_id) const;
 
         /// Register newly-arrived expert engines (from initial load or rebalance transfer).
         std::vector<int> registerArrivedExperts(
@@ -189,6 +335,52 @@ namespace llaminar2
         size_t totalPopulatedExperts() const;
 
     private:
+        /**
+         * @brief Device-scoped identity for a frozen model-weight binding.
+         *
+         * LocalTP participants materialize symmetric plans, so binding ids are
+         * intentionally reused across devices. PreparedWeightRef already carries
+         * the device; the registry key must preserve the same identity instead
+         * of allowing the last participant to overwrite earlier entries.
+         */
+        struct PreparedBindingKey
+        {
+            uint64_t binding_id = 0;
+            DeviceId device = DeviceId::invalid();
+
+            bool operator==(const PreparedBindingKey &other) const
+            {
+                return binding_id == other.binding_id &&
+                       device == other.device;
+            }
+        };
+
+        struct PreparedBindingKeyHash
+        {
+            size_t operator()(const PreparedBindingKey &key) const noexcept
+            {
+                size_t hash = std::hash<uint64_t>{}(key.binding_id);
+                hash ^= std::hash<DeviceId>{}(key.device) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                return hash;
+            }
+        };
+
+        static PreparedBindingKey keyFor(
+            uint64_t binding_id,
+            DeviceId device)
+        {
+            return PreparedBindingKey{
+                .binding_id = binding_id,
+                .device = device,
+            };
+        }
+
+        static PreparedBindingKey keyFor(const PreparedWeightRef &ref)
+        {
+            return keyFor(ref.binding_id, ref.device);
+        }
+
         struct Entry
         {
             WeightBinding binding;
@@ -208,16 +400,29 @@ namespace llaminar2
         {
             uint64_t gate_binding_id = 0;
             uint64_t up_binding_id = 0;
+            DeviceId gate_device = DeviceId::invalid();
+            DeviceId up_device = DeviceId::invalid();
+
             bool operator==(const FusedCacheKey &o) const
             {
-                return gate_binding_id == o.gate_binding_id && up_binding_id == o.up_binding_id;
+                return gate_binding_id == o.gate_binding_id &&
+                       up_binding_id == o.up_binding_id &&
+                       gate_device == o.gate_device &&
+                       up_device == o.up_device;
             }
         };
         struct FusedCacheHash
         {
             size_t operator()(const FusedCacheKey &k) const
             {
-                return std::hash<uint64_t>{}(k.gate_binding_id) ^ (std::hash<uint64_t>{}(k.up_binding_id) << 32);
+                size_t hash = std::hash<uint64_t>{}(k.gate_binding_id);
+                hash ^= std::hash<uint64_t>{}(k.up_binding_id) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                hash ^= std::hash<DeviceId>{}(k.gate_device) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                hash ^= std::hash<DeviceId>{}(k.up_device) +
+                        0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+                return hash;
             }
         };
 
@@ -226,7 +431,9 @@ namespace llaminar2
 
         ModelContextId model_id_;
         mutable std::mutex mutex_;
-        std::unordered_map<uint64_t, Entry> entries_;
+        /** Sole admitted authority carried to graph-owned allocation sites. */
+        std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
+        std::unordered_map<PreparedBindingKey, Entry, PreparedBindingKeyHash> entries_;
         mutable std::unordered_map<FusedCacheKey, std::unique_ptr<ITensorFusedGateUpGemm>, FusedCacheHash> fused_cache_;
 
         // =========================================================================
@@ -246,7 +453,8 @@ namespace llaminar2
             }
         };
 
-        std::unordered_map<uint64_t, EmbeddingEntry> embedding_entries_;
+        std::unordered_map<PreparedBindingKey, EmbeddingEntry, PreparedBindingKeyHash>
+            embedding_entries_;
 
         // =========================================================================
         // Sliced GEMM Cache (Phase 8: owned by this store)
@@ -255,12 +463,14 @@ namespace llaminar2
         struct SlicedKey
         {
             uint64_t binding_id = 0;
+            DeviceId device = DeviceId::invalid();
             const TensorBase *tensor = nullptr;
             size_t row_start = 0;
             size_t row_end = 0;
             bool operator==(const SlicedKey &o) const
             {
                 return binding_id == o.binding_id &&
+                       device == o.device &&
                        tensor == o.tensor &&
                        row_start == o.row_start &&
                        row_end == o.row_end;
@@ -271,6 +481,7 @@ namespace llaminar2
             size_t operator()(const SlicedKey &k) const
             {
                 auto h = std::hash<uint64_t>{}(k.binding_id);
+                h ^= std::hash<DeviceId>{}(k.device) << 4;
                 h ^= std::hash<const void *>{}(k.tensor) << 8;
                 h ^= std::hash<size_t>{}(k.row_start) << 16;
                 h ^= std::hash<size_t>{}(k.row_end) << 32;
@@ -291,6 +502,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> view_lifetime;
             WeightDerivationKind derivation = WeightDerivationKind::ExpertSlice;
             std::optional<DeviceId> source_device;
+            std::optional<GpuDirectTransferCompletion> gpu_direct_completion;
             bool available = false;
         };
 

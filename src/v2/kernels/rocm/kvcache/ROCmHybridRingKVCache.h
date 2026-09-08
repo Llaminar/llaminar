@@ -13,13 +13,15 @@
 #pragma once
 
 #include "ROCmRingKVCache.h"
+#include "../../HybridGDNDeviceStateArena.h"
 #include "../../HybridKVCacheConfig.h"
 #include "../../IHybridKVCache.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 
 #include <cstdint>
-#include <cstring>
+#include <memory>
+#include <utility>
 
 namespace llaminar2
 {
@@ -53,12 +55,13 @@ namespace llaminar2
         ROCmHybridRingKVCache(
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
-            int n_kv_heads, int head_dim, int device_id = 0)
+            int n_kv_heads, int head_dim, int device_id,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, head_dim, device_id),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         /**
@@ -67,12 +70,13 @@ namespace llaminar2
         ROCmHybridRingKVCache(
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
-            int n_kv_heads, int head_dim, IWorkerGPUContext *ctx)
+            int n_kv_heads, int head_dim, IWorkerGPUContext *ctx,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, head_dim, ctx),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         /**
@@ -82,13 +86,14 @@ namespace llaminar2
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
             int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-            int head_dim, int device_id = 0)
+            int head_dim, int device_id,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, local_n_kv_heads, kv_head_start,
                    head_dim, device_id),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         /**
@@ -98,13 +103,14 @@ namespace llaminar2
             const HybridKVCacheConfig &hybrid_config,
             int n_layers, int batch_size, int max_seq_len,
             int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-            int head_dim, IWorkerGPUContext *ctx)
+            int head_dim, IWorkerGPUContext *ctx,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
             : Base(hybrid_config.countKVLayers(), batch_size, max_seq_len,
                    n_kv_heads, local_n_kv_heads, kv_head_start,
                    head_dim, ctx),
               total_layers_(n_layers)
         {
-            initHybrid(hybrid_config);
+            initHybrid(hybrid_config, std::move(memory_authority));
         }
 
         // =====================================================================
@@ -176,6 +182,25 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override
         {
+            ITensor *k = nullptr;
+            ITensor *v = nullptr;
+            const bool ok = const_cast<ROCmHybridRingKVCache<Precision> *>(this)->get_kv(
+                layer, seq_idx, &k, &v, out_kv_len);
+            if (ok)
+            {
+                if (out_k)
+                    *out_k = k;
+                if (out_v)
+                    *out_v = v;
+            }
+            return ok;
+        }
+
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  ITensor **out_k, ITensor **out_v,
+                                  int *out_kv_len = nullptr) override
+        {
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
@@ -187,7 +212,26 @@ namespace llaminar2
                     *out_kv_len = 0;
                 return false;
             }
-            return Base::get_kv(kv_idx, seq_idx, out_k, out_v, out_kv_len);
+            return Base::get_kv_snapshot_view(kv_idx, seq_idx, token_count, out_k, out_v, out_kv_len);
+        }
+
+        bool get_kv_snapshot_view(int layer, int seq_idx,
+                                  int token_count,
+                                  const ITensor **out_k, const ITensor **out_v,
+                                  int *out_kv_len = nullptr) const override
+        {
+            ITensor *k = nullptr;
+            ITensor *v = nullptr;
+            const bool ok = const_cast<ROCmHybridRingKVCache<Precision> *>(this)->get_kv_snapshot_view(
+                layer, seq_idx, token_count, &k, &v, out_kv_len);
+            if (ok)
+            {
+                if (out_k)
+                    *out_k = k;
+                if (out_v)
+                    *out_v = v;
+            }
+            return ok;
         }
 
         ITensor *get_k(int layer, int seq_idx = 0) override
@@ -200,10 +244,7 @@ namespace llaminar2
 
         const ITensor *get_k(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
-            if (kv_idx < 0)
-                return nullptr;
-            return Base::get_k(kv_idx, seq_idx);
+            return const_cast<ROCmHybridRingKVCache<Precision> *>(this)->get_k(layer, seq_idx);
         }
 
         ITensor *get_v(int layer, int seq_idx = 0) override
@@ -216,10 +257,7 @@ namespace llaminar2
 
         const ITensor *get_v(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
-            if (kv_idx < 0)
-                return nullptr;
-            return Base::get_v(kv_idx, seq_idx);
+            return const_cast<ROCmHybridRingKVCache<Precision> *>(this)->get_v(layer, seq_idx);
         }
 
         // ROCm-specific append (device pointer version)
@@ -231,6 +269,18 @@ namespace llaminar2
             if (kv_idx < 0)
                 return true; // GDN layer — no-op
             return Base::append(kv_idx, seq_idx, d_k, d_v, num_tokens, stream);
+        }
+
+        bool appendConvertedWithStream(int layer, int seq_idx,
+                                       const void *d_k_src, const void *d_v_src,
+                                       TensorType src_type,
+                                       int num_tokens, hipStream_t stream) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return true; // GDN layer — no KV payload to publish.
+            return Base::appendConvertedWithStream(
+                kv_idx, seq_idx, d_k_src, d_v_src, src_type, num_tokens, stream);
         }
 
         /**
@@ -312,44 +362,209 @@ namespace llaminar2
                                            kv_lens, max_kv_len, stream);
         }
 
-        void clear() override
+        /**
+         * @brief Remap a model-layer direct ring read to its compressed FA slot.
+         *
+         * The physical ROCm ring and its canonical device head/count arrays
+         * share the full-attention layer map. Resolve that map here before a
+         * graph captures their stable addresses; passing the global hybrid
+         * layer to the compact parent would either fail or select the wrong
+         * full-attention payload.
+         *
+         * @return true when @p layer names a full-attention layer with a
+         *         complete native floating ring contract.
+         */
+        bool get_kv_device_ring_view(
+            int layer,
+            int seq_idx,
+            ITensor **out_k,
+            ITensor **out_v,
+            const int **device_head,
+            const int **device_count,
+            int *physical_capacity,
+            void *gpu_stream) override
         {
-            Base::clear();
+            const int kv_idx =
+                layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+            {
+                if (out_k)
+                    *out_k = nullptr;
+                if (out_v)
+                    *out_v = nullptr;
+                if (device_head)
+                    *device_head = nullptr;
+                if (device_count)
+                    *device_count = nullptr;
+                if (physical_capacity)
+                    *physical_capacity = 0;
+                return false;
+            }
+            return Base::get_kv_device_ring_view(
+                kv_idx,
+                seq_idx,
+                out_k,
+                out_v,
+                device_head,
+                device_count,
+                physical_capacity,
+                gpu_stream);
+        }
+
+        /**
+         * @brief Remap a model-layer batched read to its compressed FA slot.
+         *
+         * Hybrid Qwen graphs address full-attention stages by global model
+         * layer, while the base ring cache allocates entries only for FA
+         * layers.  Both the payload pointer table and its device head/count
+         * metadata use that compressed index, so the remap must happen once
+         * here before the native grouped gather is enqueued.
+         */
+        bool get_kv_batched_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            ITensor **out_k,
+            ITensor **out_v,
+            void *gpu_stream) override
+        {
+            const int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+            {
+                if (out_k)
+                    *out_k = nullptr;
+                if (out_v)
+                    *out_v = nullptr;
+                return false;
+            }
+            return Base::get_kv_batched_device_view(
+                kv_idx,
+                first_seq_idx,
+                request_count,
+                out_k,
+                out_v,
+                gpu_stream);
+        }
+
+        /**
+         * @brief Remap a converted resident read to the compressed FA slot.
+         *
+         * Production RoPE-on-read addresses this cache with the graph's global
+         * model-layer id. The parent ROCm ring stores only full-attention
+         * layers, so every converted payload read must use the same compressed
+         * slot as append, native gather, and canonical device head/count state.
+         * An un-remapped id may still be in the parent's numeric range and then
+         * silently returns another full-attention layer instead of failing.
+         *
+         * @param layer Global or pipeline-local model layer accepted by this
+         *        hybrid cache.
+         * @param first_seq_idx First independent request bank to materialize.
+         * @param request_count Number of contiguous request banks.
+         * @param target Converted activation precision requested by attention.
+         * @param out_k Receives the fixed-stride resident K view.
+         * @param out_v Receives the fixed-stride resident V view.
+         * @param read Device stream, RoPE geometry, and logical head metadata.
+         * @return true when the global layer is full-attention and the parent
+         *         cache enqueued the converted grouped read.
+         */
+        bool get_kv_batched_converted_device_view(
+            int layer,
+            int first_seq_idx,
+            int request_count,
+            ActivationPrecision target,
+            ITensor **out_k,
+            ITensor **out_v,
+            const typename IKVCache::KVReadParams &read) override
+        {
+            const int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+            {
+                if (out_k)
+                    *out_k = nullptr;
+                if (out_v)
+                    *out_v = nullptr;
+                return false;
+            }
+            return Base::get_kv_batched_converted_device_view(
+                kv_idx,
+                first_seq_idx,
+                request_count,
+                target,
+                out_k,
+                out_v,
+                read);
+        }
+
+        bool resetRequestState(
+            const typename IKVCache::StateResetContext &context) override
+        {
+            if (!Base::resetRequestState(context))
+                return false;
             for (auto &state : gdn_states_)
             {
-                state.reset();
-                state.resetGPUKernelState();
+                if (!state.resetGPUKernelState(context.execution_stream))
+                {
+                    LOG_ERROR("[ROCmHybridRingKVCache] Failed to enqueue cache-owned GDN request reset"
+                              << " reason=" << context.reason);
+                    return false;
+                }
             }
+            return true;
         }
 
-        void clear_sequence(int layer, int seq_idx) override
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const typename IKVCache::StateResetContext &context) override
         {
+            IKVCache::requireGPUExecutionStream(
+                context.execution_stream,
+                "ROCmHybridRingKVCache::resetLayerSequenceState");
+            if (!context.permitsLayerSequenceReset() ||
+                !context.hasReason() ||
+                seq_idx < 0 || seq_idx >= this->batch_size_)
+                return false;
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
-                return;
-            // Qualify fully to avoid name hiding from 'using IKVCache::clear_sequence' in Base
-            ROCmRingKVCacheBase::clear_sequence(kv_idx, seq_idx);
+            {
+                const int gdn_idx =
+                    layer_map_.toGDNIndex(normalizeLayerIndex(layer));
+                return gdn_idx >= 0 &&
+                       gdn_idx < static_cast<int>(gdn_states_.size());
+            }
+            return ROCmRingKVCacheBase::resetLayerSequenceState(
+                kv_idx,
+                seq_idx,
+                context);
         }
 
-        void clear_layer(int layer) override
+        bool resetLayerState(
+            int layer,
+            const typename IKVCache::StateResetContext &context) override
         {
+            IKVCache::requireGPUExecutionStream(
+                context.execution_stream,
+                "ROCmHybridRingKVCache::resetLayerState");
+            if (!context.permitsLayerReset() || !context.hasReason())
+            {
+                return false;
+            }
             int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx >= 0)
             {
-                for (int seq = 0; seq < this->batch_size_; ++seq)
-                {
-                    ROCmRingKVCacheBase::clear_sequence(kv_idx, seq);
-                }
+                return ROCmRingKVCacheBase::resetLayerState(kv_idx, context);
             }
-            else
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
+            if (gdn_idx < 0 || gdn_idx >= static_cast<int>(gdn_states_.size()))
+                return false;
+            if (!gdn_states_[gdn_idx].resetGPUKernelState(
+                    context.execution_stream))
             {
-                int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
-                if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
-                {
-                    gdn_states_[gdn_idx].reset();
-                    gdn_states_[gdn_idx].resetGPUKernelState();
-                }
+                LOG_ERROR("[ROCmHybridRingKVCache] Failed to enqueue layer GDN reset"
+                          << " layer=" << layer);
+                return false;
             }
+            return true;
         }
 
         typename IKVCache::KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override
@@ -417,29 +632,23 @@ namespace llaminar2
             return Base::get_kv_converted(kv_idx, seq_idx, target, out_k, out_v, out_kv_len, rope);
         }
 
-        // Graph capture support with remapping
-        void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override
+        /** @brief Remap one graph append-count binding to the compressed FA slot. */
+        bool bindGraphAppendCountSource(
+            int layer,
+            int seq_idx,
+            const int32_t *append_tokens_device,
+            int captured_max_tokens,
+            void *gpu_stream) override
         {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
-            if (kv_idx < 0)
-                return;
-            Base::setDynamicHead(kv_idx, seq_idx, gpu_stream);
-        }
-
-        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override
-        {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            const int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return false;
-            return Base::setDynamicAppendState(kv_idx, seq_idx, append_tokens, gpu_stream);
-        }
-
-        void advanceHead(int layer, int seq_idx, int num_tokens) override
-        {
-            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
-            if (kv_idx < 0)
-                return;
-            Base::advanceHead(kv_idx, seq_idx, num_tokens);
+            return Base::bindGraphAppendCountSource(
+                kv_idx,
+                seq_idx,
+                append_tokens_device,
+                captured_max_tokens,
+                gpu_stream);
         }
 
         // =====================================================================
@@ -475,14 +684,14 @@ namespace llaminar2
 
         float *getRecurrenceState(int layer) override
         {
-            auto *state = getGDNState(layer);
-            return state ? state->recurrence_state.data() : nullptr;
+            (void)layer;
+            return nullptr;
         }
 
         float *getConvState(int layer) override
         {
-            auto *state = getGDNState(layer);
-            return state ? state->conv_state.data() : nullptr;
+            (void)layer;
+            return nullptr;
         }
 
         ITensorShortConvolution *getConvKernel(int layer) override
@@ -499,10 +708,12 @@ namespace llaminar2
 
         void resetGDNStates() override
         {
+            void *const state_stream = gdnStateStream();
             for (auto &state : gdn_states_)
             {
-                state.reset();
-                state.resetGPUKernelState();
+                if (!state.resetGPUKernelState(state_stream))
+                    throw std::runtime_error(
+                        "[ROCmHybridRingKVCache] Failed to reset GDN state");
             }
         }
 
@@ -511,10 +722,7 @@ namespace llaminar2
 
         size_t gdnMemoryBytes() const override
         {
-            size_t total = 0;
-            for (const auto &state : gdn_states_)
-                total += state.memoryBytes();
-            return total;
+            return gdn_state_arena_.bytes();
         }
 
         HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
@@ -530,32 +738,29 @@ namespace llaminar2
             if (desc.seq_idx < 0)
                 return false;
 
-            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
-            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
-            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
-            const bool host_staged_device_state = needs_device && !dst_device && dst_host;
-            if ((needs_host && !dst_host) ||
-                (needs_device && !dst_device && !host_staged_device_state))
-            {
+            const HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!desc.include_device_state || metadata.device_bytes == 0)
+                return true;
+            if (!dst_host && !dst_device)
                 return false;
-            }
 
             void *effective_stream = desc.stream;
             if (!effective_stream && this->device_id() >= 0)
-                effective_stream = GPUDeviceContextPool::instance()
-                                       .getAMDContext(this->device_id())
-                                       .defaultStream();
+            {
+                LOG_ERROR("[ROCmHybridRingKVCache] exportHybridPrefixState requires an explicit GPU stream");
+                return false;
+            }
 
-            auto *host_cursor = (needs_host || host_staged_device_state)
-                                    ? reinterpret_cast<uint8_t *>(dst_host)
-                                    : nullptr;
-            auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
+            auto *host_cursor = dst_device
+                                    ? nullptr
+                                    : reinterpret_cast<uint8_t *>(dst_host);
+            auto *device_cursor = reinterpret_cast<uint8_t *>(dst_device);
             const bool ok = exportHybridStatePayload(
                 host_cursor,
                 device_cursor,
                 effective_stream,
-                desc.include_host_state,
-                desc.include_device_state);
+                false,
+                true);
             if (ok && effective_stream && desc.synchronize)
                 GPUDeviceContextPool::instance()
                     .getAMDContext(this->device_id())
@@ -571,32 +776,29 @@ namespace llaminar2
             if (desc.seq_idx < 0)
                 return false;
 
-            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
-            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
-            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
-            const bool host_staged_device_state = needs_device && !src_device && src_host;
-            if ((needs_host && !src_host) ||
-                (needs_device && !src_device && !host_staged_device_state))
-            {
+            const HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if (!desc.include_device_state || metadata.device_bytes == 0)
+                return true;
+            if (!src_host && !src_device)
                 return false;
-            }
 
             void *effective_stream = desc.stream;
             if (!effective_stream && this->device_id() >= 0)
-                effective_stream = GPUDeviceContextPool::instance()
-                                       .getAMDContext(this->device_id())
-                                       .defaultStream();
+            {
+                LOG_ERROR("[ROCmHybridRingKVCache] importHybridPrefixState requires an explicit GPU stream");
+                return false;
+            }
 
-            const auto *host_cursor = (needs_host || host_staged_device_state)
-                                          ? reinterpret_cast<const uint8_t *>(src_host)
-                                          : nullptr;
-            const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
+            const auto *host_cursor = src_device
+                                          ? nullptr
+                                          : reinterpret_cast<const uint8_t *>(src_host);
+            const auto *device_cursor = reinterpret_cast<const uint8_t *>(src_device);
             const bool ok = importHybridStatePayload(
                 host_cursor,
                 device_cursor,
                 effective_stream,
-                desc.include_host_state,
-                desc.include_device_state);
+                false,
+                true);
             if (ok && effective_stream && desc.synchronize)
                 GPUDeviceContextPool::instance()
                     .getAMDContext(this->device_id())
@@ -610,7 +812,21 @@ namespace llaminar2
         int total_layers_;
         int first_layer_index_ = 0;
         HybridLayerMap layer_map_;
+        HybridGDNStateGeometry gdn_state_geometry_;
+        HybridGDNDeviceStateArena gdn_state_arena_;
         std::vector<HybridGDNLayerState> gdn_states_;
+
+        /**
+         * @brief Resolve the cache's explicit state-management stream.
+         */
+        void *gdnStateStream() const
+        {
+            if (this->deviceContext())
+                return this->deviceContext()->defaultStream();
+            return GPUDeviceContextPool::instance()
+                .getAMDContext(this->device_id())
+                .defaultStream();
+        }
 
         int normalizeLayerIndex(int layer) const
         {
@@ -632,18 +848,10 @@ namespace llaminar2
             HybridPrefixStateMetadata metadata;
             metadata.total_layers = total_layers_;
             metadata.gdn_layers = layer_map_.gdnLayerCount();
-            metadata.host_bytes = gdnMemoryBytes();
-
-            for (int layer = 0; layer < total_layers_; ++layer)
-            {
-                const auto *state = getGDNState(layer);
-                if (!state)
-                    continue;
-                if (state->conv_kernel)
-                    metadata.device_bytes += state->conv_kernel->stateBytes();
-                if (state->rec_kernel)
-                    metadata.device_bytes += state->rec_kernel->stateBytes();
-            }
+            metadata.host_bytes = 0;
+            metadata.device_bytes =
+                gdn_state_geometry_.deviceSerializedPayloadBytes(
+                    metadata.gdn_layers);
             metadata.has_device_kernel_state = metadata.device_bytes > 0;
             return metadata;
         }
@@ -652,69 +860,93 @@ namespace llaminar2
             uint8_t *&host_cursor,
             uint8_t *&device_cursor,
             void *stream,
-            bool include_host_state = true,
+            bool include_host_state = false,
             bool include_device_state = true) const
         {
+            if (include_host_state)
+                return false;
+            if (!include_device_state)
+                return true;
+
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                const auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
+                const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
-                if (include_host_state && recurrence_bytes > 0)
+                if (state.conv_kernel)
                 {
-                    std::memcpy(host_cursor, state->recurrence_state.data(), recurrence_bytes);
-                    host_cursor += recurrence_bytes;
+                    if (!exportDeviceBank(
+                            *state.conv_kernel,
+                            state.local_conv_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
+                    if (state.full_conv_state_size != state.local_conv_state_size &&
+                        !exportDeviceBank(
+                            *state.conv_kernel,
+                            state.full_conv_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
                 }
-                if (include_host_state && conv_bytes > 0)
+                if (state.rec_kernel)
                 {
-                    std::memcpy(host_cursor, state->conv_state.data(), conv_bytes);
-                    host_cursor += conv_bytes;
-                }
-
-                if (include_device_state && state->conv_kernel)
-                {
-                    const size_t bytes = state->conv_kernel->stateBytes();
-                    if (bytes > 0)
-                    {
-                        if (device_cursor)
-                        {
-                            if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state->conv_kernel->exportState(host_cursor, nullptr, stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
-                }
-                if (include_device_state && state->rec_kernel)
-                {
-                    const size_t bytes = state->rec_kernel->stateBytes();
-                    if (bytes > 0)
-                    {
-                        if (device_cursor)
-                        {
-                            if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state->rec_kernel->exportState(host_cursor, nullptr, stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
+                    if (!exportDeviceBank(
+                            *state.rec_kernel,
+                            state.local_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
+                    if (state.full_recurrence_state_size !=
+                            state.local_recurrence_state_size &&
+                        !exportDeviceBank(
+                            *state.rec_kernel,
+                            state.full_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
                 }
             }
+            return true;
+        }
+
+        /**
+         * @brief Export one kernel-owned state bank to device or archive memory.
+         *
+         * A non-null device cursor keeps live checkpoints device resident. A
+         * host cursor is accepted only as an explicit prefix-archive transport;
+         * it is never retained or adopted as live GPU state.
+         */
+        template <typename Kernel>
+        static bool exportDeviceBank(
+            Kernel &kernel,
+            int state_size,
+            uint8_t *&host_cursor,
+            uint8_t *&device_cursor,
+            void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            const size_t bytes = static_cast<size_t>(state_size) * sizeof(float);
+            if (device_cursor)
+            {
+                if (!kernel.exportStateForSize(
+                        state_size, nullptr, device_cursor, stream))
+                    return false;
+                device_cursor += bytes;
+                return true;
+            }
+            if (!host_cursor ||
+                !kernel.exportStateForSize(
+                    state_size, host_cursor, nullptr, stream))
+                return false;
+            host_cursor += bytes;
             return true;
         }
 
@@ -722,73 +954,98 @@ namespace llaminar2
             const uint8_t *&host_cursor,
             const uint8_t *&device_cursor,
             void *stream,
-            bool include_host_state = true,
+            bool include_host_state = false,
             bool include_device_state = true)
         {
+            if (include_host_state)
+                return false;
+            if (!include_device_state)
+                return true;
+
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
+                auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
-                if (include_host_state && recurrence_bytes > 0)
+                if (state.conv_kernel)
                 {
-                    std::memcpy(state->recurrence_state.data(), host_cursor, recurrence_bytes);
-                    host_cursor += recurrence_bytes;
+                    if (!importDeviceBank(
+                            *state.conv_kernel,
+                            state.local_conv_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
+                    if (state.full_conv_state_size != state.local_conv_state_size &&
+                        !importDeviceBank(
+                            *state.conv_kernel,
+                            state.full_conv_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
                 }
-                if (include_host_state && conv_bytes > 0)
+                if (state.rec_kernel)
                 {
-                    std::memcpy(state->conv_state.data(), host_cursor, conv_bytes);
-                    host_cursor += conv_bytes;
-                }
-
-                if (include_device_state && state->conv_kernel)
-                {
-                    const size_t bytes = state->conv_kernel->stateBytes();
-                    if (bytes > 0)
-                    {
-                        if (device_cursor)
-                        {
-                            if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state->conv_kernel->importState(host_cursor, nullptr, stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
-                }
-                if (include_device_state && state->rec_kernel)
-                {
-                    const size_t bytes = state->rec_kernel->stateBytes();
-                    if (bytes > 0)
-                    {
-                        if (device_cursor)
-                        {
-                            if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
-                                return false;
-                            device_cursor += bytes;
-                        }
-                        else
-                        {
-                            if (!host_cursor ||
-                                !state->rec_kernel->importState(host_cursor, nullptr, stream))
-                                return false;
-                            host_cursor += bytes;
-                        }
-                    }
+                    if (!importDeviceBank(
+                            *state.rec_kernel,
+                            state.local_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
+                    if (state.full_recurrence_state_size !=
+                            state.local_recurrence_state_size &&
+                        !importDeviceBank(
+                            *state.rec_kernel,
+                            state.full_recurrence_state_size,
+                            host_cursor,
+                            device_cursor,
+                            stream))
+                        return false;
                 }
             }
             return true;
         }
 
-        void initHybrid(const HybridKVCacheConfig &config)
+        /// @brief Import one serialized bank without ever retaining its host address.
+        template <typename Kernel>
+        static bool importDeviceBank(
+            Kernel &kernel,
+            int state_size,
+            const uint8_t *&host_cursor,
+            const uint8_t *&device_cursor,
+            void *stream)
+        {
+            if (state_size <= 0)
+                return true;
+            const size_t bytes = static_cast<size_t>(state_size) * sizeof(float);
+            if (device_cursor)
+            {
+                if (!kernel.importStateForSize(
+                        state_size, nullptr, device_cursor, stream))
+                    return false;
+                device_cursor += bytes;
+                return true;
+            }
+            if (!host_cursor ||
+                !kernel.importStateForSize(
+                    state_size, host_cursor, nullptr, stream))
+                return false;
+            host_cursor += bytes;
+            return true;
+        }
+
+        /**
+         * @brief Materialize GDN banks from canonical geometry and authority.
+         * @param config Immutable hybrid model/participant geometry.
+         * @param memory_authority Sole ledger for the GPU allocation.
+         */
+        void initHybrid(
+            const HybridKVCacheConfig &config,
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority)
         {
             first_layer_index_ = config.first_layer_index;
             layer_map_.build(config.layer_types);
@@ -797,50 +1054,32 @@ namespace llaminar2
             if (n_gdn <= 0)
                 return;
 
-            // Compute GDN dimensions (same logic as Qwen35Graph::ensureGDNStates)
-            const int n_k_heads_full = config.gdn_group_count > 0
-                                           ? config.gdn_group_count
-                                           : config.n_heads;
-            const int n_v_heads_full = config.gdn_time_step_rank > 0
-                                           ? config.gdn_time_step_rank
-                                           : n_k_heads_full;
-
-            int n_k_heads = n_k_heads_full;
-            int n_v_heads = n_v_heads_full;
-            const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
-
-            if (config.local_n_heads > 0 && config.n_heads > 0 &&
-                config.local_n_heads < config.n_heads)
-            {
-                n_v_heads = n_v_heads_full * config.local_n_heads / config.n_heads;
-                if (n_v_heads <= 0)
-                    n_v_heads = 1;
-                if (!gdn_modular_repeat)
-                {
-                    n_k_heads = n_k_heads_full * config.local_n_heads / config.n_heads;
-                    if (n_k_heads <= 0)
-                        n_k_heads = 1;
-                }
-            }
-
-            const int d_v = config.gdn_state_size;
-            const int d_k = d_v;
-            const int key_dim = n_k_heads * d_k;
-            const int value_dim = config.gdn_inner_size > 0
-                                      ? (config.gdn_inner_size * n_v_heads / n_v_heads_full)
-                                      : n_v_heads * d_v;
-            const int qkv_dim = 2 * key_dim + value_dim;
+            gdn_state_geometry_ = config.gdnStateGeometry();
+            const HybridGDNStateGeometry &geometry =
+                gdn_state_geometry_;
 
             gdn_states_.resize(n_gdn);
             for (auto &state : gdn_states_)
             {
-                state.n_v_heads = n_v_heads;
-                state.n_k_heads = n_k_heads;
-                state.d_k = d_k;
-                state.d_v = d_v;
+                state.n_v_heads = geometry.local_value_heads;
+                state.n_k_heads = geometry.local_key_heads;
+                state.d_k = geometry.d_k;
+                state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
-                state.initialize(qkv_dim);
+                state.full_recurrence_state_size =
+                    geometry.full_recurrence_state_floats;
+                state.full_conv_state_size =
+                    geometry.full_conv_state_floats;
+                state.initializeShape(geometry.local_qkv_dim);
             }
+
+            gdn_state_arena_.initialize(
+                DeviceId::rocm(this->device_id()),
+                this->batch_size_,
+                geometry,
+                gdn_states_,
+                gdnStateStream(),
+                std::move(memory_authority));
 
             LOG_DEBUG("[ROCmHybridRingKVCache] Created: " << total_layers_ << " total layers, "
                                                           << layer_map_.kvLayerCount() << " KV (FA), "

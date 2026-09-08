@@ -1,3 +1,13 @@
+/**
+ * @file MTPWeightManifest.h
+ * @brief Declares the typed inventory and ownership views of MTP weights.
+ *
+ * The discovered manifest is the single source of truth for both graph
+ * bindings and auxiliary participant-local replicas.  In particular, it
+ * distinguishes the predictor's dense/shared tensors from routed-expert
+ * parents whose physical ownership may belong to ExpertOverlay.
+ */
+
 #pragma once
 
 #include <string>
@@ -6,6 +16,19 @@
 namespace llaminar2
 {
     class IModelLoader;
+
+    /**
+     * @enum MTPRoutedExpertWeightAuthority
+     * @brief Physical owner of routed-expert parents in an MTP sidecar.
+     */
+    enum class MTPRoutedExpertWeightAuthority
+    {
+        /** The participant-local sidecar replica owns complete expert parents. */
+        SidecarParticipant,
+
+        /** ExpertOverlay owns per-expert prepared residency and publication. */
+        ExpertOverlay,
+    };
 
     struct MTPDepthWeightNames
     {
@@ -53,6 +76,21 @@ namespace llaminar2
         std::string diagnostic;
 
         std::vector<std::string> requiredNames() const;
+
+        /**
+         * @brief Return the exact weights for one complete local predictor.
+         *
+         * Attention, predictor FC/norm, router, and shared-expert tensors are
+         * always included. Routed-expert parents are included only when the
+         * sidecar participant is their declared physical authority; an
+         * ExpertOverlay topology obtains those parents from its prepared
+         * residency registry instead of creating a second frozen owner.
+         *
+         * @param routed_authority Typed physical owner of routed experts.
+         * @return Sorted, duplicate-free canonical GGUF tensor names.
+         */
+        [[nodiscard]] std::vector<std::string> participantReplicaNames(
+            MTPRoutedExpertWeightAuthority routed_authority) const;
     };
 
     MTPWeightManifest discoverMTPWeightManifest(

@@ -24,6 +24,8 @@
 #include "memory/StageBufferContract.h"
 #include "mocks/MockComputeStage.h"
 #include "mocks/MockCollectiveContext.h"
+#include "mocks/MockWorkerGPUContext.h"
+#include "transfer/TransferEngine.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
@@ -37,17 +39,47 @@ namespace
         explicit CountingFP32Tensor(const std::vector<size_t> &shape)
             : FP32Tensor(shape, DeviceId::cpu()) {}
 
+        ~CountingFP32Tensor() override
+        {
+            /*
+             * The fake device pointer is an opaque unit-test token, never a
+             * backend allocation. Retire it before TensorBase destruction so
+             * the test cannot accidentally call a physical CUDA free.
+             */
+            gpu_data_ptr_ = nullptr;
+            gpu_device_.reset();
+        }
+
         bool ensureOnDevice(DeviceId target_device, void *stream = nullptr) override
         {
             (void)stream;
             ++ensure_on_device_calls;
             last_ensure_device = target_device;
-            transitionTo(TensorCoherenceState::SYNCED);
+            gpu_data_ptr_ = &fake_device_storage_;
+            gpu_device_ = target_device;
+            TransferEngine::publishSynchronized(this);
+            return true;
+        }
+
+        bool allocateOnDevice(
+            DeviceId target_device,
+            void *stream = nullptr) override
+        {
+            (void)stream;
+            ++allocate_on_device_calls;
+            last_allocate_device = target_device;
+            gpu_data_ptr_ = &fake_device_storage_;
+            gpu_device_ = target_device;
             return true;
         }
 
         int ensure_on_device_calls = 0;
+        int allocate_on_device_calls = 0;
         DeviceId last_ensure_device;
+        DeviceId last_allocate_device;
+
+    private:
+        int fake_device_storage_ = 0;
     };
 }
 
@@ -68,6 +100,9 @@ TEST(Test__StageRunPolicy, FullPolicy_AllFeaturesEnabled)
     EXPECT_TRUE(p.snapshot_callback);
     EXPECT_TRUE(p.timeline);            // On by default in full (prefill profiling)
     EXPECT_FALSE(p.pointer_validation); // Off by default in full
+    EXPECT_EQ(
+        p.snapshot_recording_authority,
+        StageRunPolicy::SnapshotRecordingAuthority::StageExecutor);
 }
 
 TEST(Test__StageRunPolicy, FastDecodePolicy_MinimalOverhead)
@@ -84,10 +119,30 @@ TEST(Test__StageRunPolicy, FastDecodePolicy_MinimalOverhead)
     EXPECT_FALSE(p.stage_dump);
     EXPECT_FALSE(p.snapshot_callback);
     EXPECT_FALSE(p.pointer_validation);
+    EXPECT_EQ(
+        p.snapshot_recording_authority,
+        StageRunPolicy::SnapshotRecordingAuthority::StageExecutor);
 
     // collective_intercept and timeline should be ON for fast decode
     EXPECT_TRUE(p.collective_intercept);
     EXPECT_TRUE(p.timeline);
+}
+
+TEST(Test__StageRunPolicy, CapturePhasePolicy_NoHostDiagnostics)
+{
+    auto p = StageRunPolicy::capturePhase();
+
+    EXPECT_TRUE(p.coherence);
+    EXPECT_TRUE(p.weight_coherence);
+    EXPECT_TRUE(p.mark_dirty);
+    EXPECT_TRUE(p.collective_intercept);
+    EXPECT_TRUE(p.preserve_gpu_streams);
+
+    EXPECT_FALSE(p.validation);
+    EXPECT_FALSE(p.stage_dump);
+    EXPECT_FALSE(p.snapshot_callback);
+    EXPECT_FALSE(p.pointer_validation);
+    EXPECT_FALSE(p.timeline);
 }
 
 TEST(Test__StageRunPolicy, DebugPolicy_EverythingOn)
@@ -116,6 +171,13 @@ protected:
     {
         GraphExecutorConfig config;
         config.enable_profiling = true;
+        config.worker_gpu_context_resolver =
+            [](DeviceId device) -> IWorkerGPUContext *
+        {
+            return device.is_gpu()
+                       ? &llaminar2::testing::sharedMockWorkerGPUContext()
+                       : nullptr;
+        };
         executor_ = std::make_unique<DeviceGraphExecutor>(config);
         cpu_ctx_ = std::make_unique<CPUDeviceContext>(DeviceId::cpu());
     }
@@ -240,6 +302,60 @@ TEST_F(Test__UnifiedExecution, FastDecodeCollectiveCoheresGpuInputAfterCpuContra
     EXPECT_EQ(tensor->last_ensure_device, DeviceId::cuda(0));
 }
 
+TEST_F(Test__UnifiedExecution, FastDecodePreparesColdGpuOutputExactlyOnce)
+{
+    auto tensor =
+        std::make_unique<CountingFP32Tensor>(std::vector<size_t>{4, 8});
+
+    BufferArena arena;
+    ASSERT_TRUE(arena.registerExternalBuffer(
+        BufferId::PREFIX_TERMINAL_HIDDEN,
+        tensor.get()));
+    executor_->setArena(&arena);
+
+    ComputeGraph graph;
+    auto gpu_writer = std::make_unique<MockComputeStage>(
+        ComputeStageType::ROW_SELECT,
+        "cold_gpu_output_writer",
+        DeviceId::cuda(0));
+    gpu_writer->setBufferContract(
+        StageBufferContract::build().addOutput(
+            BufferId::PREFIX_TERMINAL_HIDDEN,
+            "FP32"));
+    graph.addNode(
+        "cold_gpu_output_writer",
+        std::move(gpu_writer),
+        DeviceId::cuda(0));
+
+    /*
+     * Keep the fake GPU writer non-terminal. Terminal GPU outputs publish a
+     * physical backend event, which correctly requires a real stream and is an
+     * integration-test concern; this unit test exercises allocation policy only.
+     */
+    auto cpu_terminal = std::make_unique<MockComputeStage>(
+        ComputeStageType::GEMM,
+        "cpu_terminal",
+        DeviceId::cpu());
+    graph.addNode(
+        "cpu_terminal",
+        std::move(cpu_terminal),
+        DeviceId::cpu());
+    graph.addDependency("cpu_terminal", "cold_gpu_output_writer");
+    graph.buildFastSchedule();
+
+    ASSERT_EQ(tensor->gpu_data_ptr(), nullptr);
+    ASSERT_TRUE(executor_->executeFastDecode(graph, cpu_ctx_.get()));
+    EXPECT_EQ(tensor->allocate_on_device_calls, 1);
+    EXPECT_EQ(tensor->last_allocate_device, DeviceId::cuda(0));
+    EXPECT_NE(tensor->gpu_data_ptr(), nullptr);
+
+    // Once the graph-family address is stable, fast replay must remain free of
+    // redundant output preparation and its associated hot-path bookkeeping.
+    graph.reset();
+    ASSERT_TRUE(executor_->executeFastDecode(graph, cpu_ctx_.get()));
+    EXPECT_EQ(tensor->allocate_on_device_calls, 1);
+}
+
 TEST_F(Test__UnifiedExecution, StageFailure_StopsExecution)
 {
     std::vector<std::string> exec_log;
@@ -356,7 +472,7 @@ TEST_F(Test__UnifiedExecution, FullPolicy_InvokesSnapshotCallback)
     EXPECT_EQ(callback_stages[2], "stage_2");
 }
 
-TEST_F(Test__UnifiedExecution, FastDecodePolicy_SkipsSnapshotCallback)
+TEST_F(Test__UnifiedExecution, FastDecodeWithSnapshotDiagnosticsInvokesCallbackAtEachStage)
 {
     int callback_count = 0;
 
@@ -372,8 +488,13 @@ TEST_F(Test__UnifiedExecution, FastDecodePolicy_SkipsSnapshotCallback)
     graph.buildFastSchedule();
     executor_->executeFastDecode(graph, cpu_ctx_.get());
 
-    // Fast decode policy has snapshot_callback=false, so callback should NOT fire
-    EXPECT_EQ(callback_count, 0);
+    /*
+     * StageRunPolicy::fastDecode() remains callback-free by default, but the
+     * eager executor promotes callbacks when a diagnostic sink is explicitly
+     * armed. Publishing at each producer boundary is required because arena
+     * aliasing can overwrite an early stage before a post-graph drain.
+     */
+    EXPECT_EQ(callback_count, 3);
 }
 
 // =============================================================================

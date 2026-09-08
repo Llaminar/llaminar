@@ -13,7 +13,7 @@
  *   - ActivationRotation: FWHT (64, 128), sign_flips, scale_block
  *   - TurboQuant: quantize/dequantize TQ8/TQ4
  *   - TQFusedAttentionPrimitives: tq8_dot_rotated_q, tq4_accum_weighted
- *   - Q16_1 attention VNNI dot products: packed-pair 2/4-row, single-from-pair, 4-row separate
+ *   - Q16_1 attention VNNI dot products over native separate cache rows
  *
  * All tests run on AVX512 hardware, calling both paths explicitly and comparing.
  */
@@ -334,13 +334,13 @@ TEST(AVX2TQFusedParity, TQ8DotRotatedQ)
     struct MockTQ8
     {
         float norm;
-        float residual_norm;
+        float reconstruction_norm;
         uint8_t indices[D];
     };
 
     MockTQ8 block;
     block.norm = 1.5f;
-    block.residual_norm = -1.0f;
+    block.reconstruction_norm = 1.45f;
     std::mt19937 rng(42);
     for (int i = 0; i < D; ++i)
         block.indices[i] = rng() % 256;
@@ -355,6 +355,8 @@ TEST(AVX2TQFusedParity, TQ8DotRotatedQ)
     float ref = 0.0f;
     for (int i = 0; i < D; ++i)
         ref += Q_rot[i] * TQ8_CENTROIDS[block.indices[i]];
+    // Key dot products intentionally use the source norm. The fitted radius is
+    // reserved for reconstructing values, where vector MSE is the objective.
     ref *= block.norm;
 
     EXPECT_NEAR(result, ref, std::abs(ref) * 0.001f);
@@ -366,7 +368,7 @@ TEST(AVX2TQFusedParity, TQ4AccumWeighted)
     // Create a mock TQ4 block
     TQ4Block<D> block;
     block.norm = 2.0f;
-    block.residual_norm = -1.0f;
+    block.reconstruction_norm = 1.9f;
     std::mt19937 rng(42);
     // Pack random 4-bit indices
     for (int i = 0; i < D; i += 8)
@@ -393,7 +395,7 @@ TEST(AVX2TQFusedParity, TQ4AccumWeighted)
 
     // Scalar reference
     std::vector<float> accum_ref(D, 0.0f);
-    float combined = weight * block.norm;
+    float combined = weight * block.reconstruction_norm;
     for (int i = 0; i < D; i += 8)
     {
         uint8_t idx8[8], hb[8];
@@ -695,124 +697,8 @@ TEST(AVX2AttentionGateParity, Sigmoid_Accuracy)
 using FlashKernel = CPUFlashAttentionKernelT<ActivationPrecision::FP32>;
 
 class AVX2Q16DotParityTest : public ::testing::Test
-{
-protected:
-    // Helper to fill packed-pair buffer from two separate rows
-    // Layout: [row0_32, row1_32, row0_32, row1_32, ...]
-    static void pack_pair(const int16_t *row0, const int16_t *row1,
-                          int16_t *pair_buf, int n)
-    {
-        for (int i = 0; i < n; i += 32)
-        {
-            const int chunk = std::min(32, n - i);
-            std::memcpy(pair_buf, row0 + i, chunk * sizeof(int16_t));
-            std::memcpy(pair_buf + 32, row1 + i, chunk * sizeof(int16_t));
-            pair_buf += 64;
-        }
-    }
-};
+{};
 
-TEST_F(AVX2Q16DotParityTest, Dot2RowPackedPair)
-{
-    for (int n : {32, 64, 96, 128, 160})
-    {
-        alignas(64) int16_t q[256], k0[256], k1[256];
-        alignas(64) int16_t pair_buf[512];
-
-        std::mt19937 rng(42 + n);
-        std::uniform_int_distribution<int16_t> dist(-2047, 2047);
-        for (int i = 0; i < n; ++i)
-        {
-            q[i] = dist(rng);
-            k0[i] = dist(rng);
-            k1[i] = dist(rng);
-        }
-        pack_pair(k0, k1, pair_buf, n);
-
-        int32_t s0, s1, a2_0, a2_1;
-        FlashKernel::dot_2row_packedpair_scalar(q, pair_buf, n, s0, s1);
-        FlashKernel::dot_2row_packedpair_avx2(q, pair_buf, n, a2_0, a2_1);
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-        int32_t a5_0, a5_1;
-        FlashKernel::dot_2row_packedpair_avx512(q, pair_buf, n, a5_0, a5_1);
-
-        EXPECT_EQ(a5_0, s0) << "AVX512 vs scalar row0, n=" << n;
-        EXPECT_EQ(a5_1, s1) << "AVX512 vs scalar row1, n=" << n;
-#endif
-        EXPECT_EQ(a2_0, s0) << "AVX2 vs scalar row0, n=" << n;
-        EXPECT_EQ(a2_1, s1) << "AVX2 vs scalar row1, n=" << n;
-    }
-}
-
-TEST_F(AVX2Q16DotParityTest, Dot4RowPackedPair)
-{
-    for (int n : {32, 64, 128})
-    {
-        alignas(64) int16_t q[256], k0[256], k1[256], k2[256], k3[256];
-        alignas(64) int16_t pair0[512], pair1[512];
-
-        std::mt19937 rng(99 + n);
-        std::uniform_int_distribution<int16_t> dist(-2047, 2047);
-        for (int i = 0; i < n; ++i)
-        {
-            q[i] = dist(rng);
-            k0[i] = dist(rng);
-            k1[i] = dist(rng);
-            k2[i] = dist(rng);
-            k3[i] = dist(rng);
-        }
-        pack_pair(k0, k1, pair0, n);
-        pack_pair(k2, k3, pair1, n);
-
-        int32_t s0, s1, s2, s3, a2_0, a2_1, a2_2, a2_3;
-        FlashKernel::dot_4row_packedpair_scalar(q, pair0, pair1, n, s0, s1, s2, s3);
-        FlashKernel::dot_4row_packedpair_avx2(q, pair0, pair1, n, a2_0, a2_1, a2_2, a2_3);
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-        int32_t a5_0, a5_1, a5_2, a5_3;
-        FlashKernel::dot_4row_packedpair_avx512(q, pair0, pair1, n, a5_0, a5_1, a5_2, a5_3);
-
-        EXPECT_EQ(a5_0, s0) << "n=" << n;
-        EXPECT_EQ(a5_1, s1) << "n=" << n;
-        EXPECT_EQ(a5_2, s2) << "n=" << n;
-        EXPECT_EQ(a5_3, s3) << "n=" << n;
-#endif
-        EXPECT_EQ(a2_0, s0) << "n=" << n;
-        EXPECT_EQ(a2_1, s1) << "n=" << n;
-        EXPECT_EQ(a2_2, s2) << "n=" << n;
-        EXPECT_EQ(a2_3, s3) << "n=" << n;
-    }
-}
-
-TEST_F(AVX2Q16DotParityTest, DotSingleFromPackedPair)
-{
-    for (int n : {32, 64, 128})
-    {
-        alignas(64) int16_t q[256], k0[256], k1[256];
-        alignas(64) int16_t pair_buf[512];
-
-        std::mt19937 rng(77 + n);
-        std::uniform_int_distribution<int16_t> dist(-2047, 2047);
-        for (int i = 0; i < n; ++i)
-        {
-            q[i] = dist(rng);
-            k0[i] = dist(rng);
-            k1[i] = dist(rng);
-        }
-        pack_pair(k0, k1, pair_buf, n);
-
-        for (int row_sel : {0, 1})
-        {
-            int32_t s = FlashKernel::dot_single_from_packedpair_scalar(q, pair_buf, n, row_sel);
-            int32_t a2 = FlashKernel::dot_single_from_packedpair_avx2(q, pair_buf, n, row_sel);
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
-            int32_t a5 = FlashKernel::dot_single_from_packedpair_avx512(q, pair_buf, n, row_sel);
-
-            EXPECT_EQ(a5, s) << "AVX512 vs scalar, n=" << n << " row=" << row_sel;
-#endif
-            EXPECT_EQ(a2, s) << "AVX2 vs scalar, n=" << n << " row=" << row_sel;
-        }
-    }
-}
 
 TEST_F(AVX2Q16DotParityTest, Dot4RowSeparate)
 {

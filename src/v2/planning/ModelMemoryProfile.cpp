@@ -4,6 +4,7 @@
 #include <numeric>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 
 /**
  * @file ModelMemoryProfile.cpp
@@ -20,6 +21,11 @@ namespace llaminar2
 
     namespace
     {
+
+        /** @brief Stable marker preceding every serialized memory profile. */
+        constexpr uint32_t kProfileWireMagic = 0x4C4D5032U; // "LMP2"
+        /** @brief Current profile layout, including exact MoE geometry. */
+        constexpr uint32_t kProfileWireVersion = 2U;
 
         std::string ggufTypeToString(GGUFTensorType type)
         {
@@ -100,6 +106,66 @@ namespace llaminar2
             return result;
         }
 
+        /** @brief Whether a tensor is one packed parent containing every routed expert. */
+        bool isRoutedExpertParent(std::string_view name)
+        {
+            return name.ends_with(".ffn_gate_exps.weight") ||
+                   name.ends_with(".ffn_up_exps.weight") ||
+                   name.ends_with(".ffn_down_exps.weight");
+        }
+
+        /**
+         * @brief Recover the K dimension of one logical matrix from GGUF axes.
+         *
+         * ModelLoader normalizes ordinary 2-D tensors to `[N, K]`. Routed
+         * expert parents retain GGUF's three-dimensional `[K, N, experts]`
+         * representation because loading slices the outer expert axis before
+         * preparing an individual matrix. Treating the final axis as K turns
+         * the expert count into a matrix dimension and grossly overprices
+         * split-K workspace.
+         *
+         * @param tensor Parsed tensor directory entry.
+         * @param expert_count Model-wide routed expert cardinality.
+         * @return Inner dimension of one logical matrix, or zero for a scalar.
+         * @throws std::invalid_argument when a routed parent has an invalid
+         *         rank, expert axis, or zero matrix geometry.
+         */
+        size_t logicalMatrixK(
+            const GGUFTensorInfo &tensor,
+            int expert_count)
+        {
+            if (tensor.dimensions.empty())
+                return 0u;
+            if (!isRoutedExpertParent(tensor.name))
+                return static_cast<size_t>(tensor.dimensions.back());
+
+            if (tensor.dimensions.size() != 3u || expert_count <= 0 ||
+                tensor.dimensions[0] == 0u || tensor.dimensions[1] == 0u ||
+                tensor.dimensions[2] != static_cast<uint64_t>(expert_count))
+            {
+                throw std::invalid_argument(
+                    "Routed expert tensor has invalid [K, N, experts] geometry: " +
+                    tensor.name);
+            }
+            return static_cast<size_t>(tensor.dimensions[0]);
+        }
+
+        int firstPositiveMetadataInt(
+            const GGUFModel &model,
+            const std::vector<std::string> &keys)
+        {
+            for (const auto &key : keys)
+            {
+                const auto it = model.metadata.find(key);
+                if (it == model.metadata.end())
+                    continue;
+                const uint64_t value = it->second.asUInt64();
+                if (value > 0)
+                    return static_cast<int>(value);
+            }
+            return 0;
+        }
+
     } // anonymous namespace
 
     ModelMemoryProfile ModelMemoryProfile::fromGGUF(const GGUFModel &model)
@@ -113,6 +179,45 @@ namespace llaminar2
         profile.n_kv_heads = static_cast<int>(model.head_count_kv);
         profile.vocab_size = static_cast<int>(model.vocab_size);
         profile.max_seq_len = static_cast<int>(model.context_length);
+        profile.expert_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_count"});
+        profile.expert_used_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_used_count"});
+        profile.expert_feed_forward_length = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_feed_forward_length"});
+        profile.expert_shared_feed_forward_length = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_shared_feed_forward_length"});
+        profile.mtp_layer_count = firstPositiveMetadataInt(
+            model,
+            {
+                model.architecture + ".nextn_predict_layers",
+                model.architecture + ".mtp_num_hidden_layers",
+                model.architecture + ".mtp.num_hidden_layers",
+                "mtp.num_hidden_layers",
+                "mtp_num_hidden_layers",
+            });
+        profile.full_attention_interval = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".full_attention_interval"});
+        profile.gdn_conv_kernel_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.conv_kernel"});
+        profile.gdn_state_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.state_size"});
+        profile.gdn_inner_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.inner_size"});
+        profile.gdn_group_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.group_count"});
+        profile.gdn_time_step_rank = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.time_step_rank"});
 
         // head_dim from key_length or computed
         if (model.key_length > 0)
@@ -163,7 +268,7 @@ namespace llaminar2
             info.native_bytes = static_cast<size_t>(t.size_bytes);
             info.quant_type = ggufTypeToString(t.type);
             info.elements = computeElements(t.dimensions);
-            info.K = t.dimensions.empty() ? 0 : static_cast<size_t>(t.dimensions.back());
+            info.K = logicalMatrixK(t, profile.expert_count);
             info.layer_index = parseLayerIndex(t.name);
 
             profile.total_native_bytes += info.native_bytes;
@@ -292,6 +397,10 @@ namespace llaminar2
         std::vector<uint8_t> buf;
         buf.reserve(4096);
 
+        // Prefix scalars with a versioned identity so stale layouts fail hard.
+        writeVal<uint32_t>(buf, kProfileWireMagic);
+        writeVal<uint32_t>(buf, kProfileWireVersion);
+
         // Scalar fields
         writeStr(buf, architecture);
         writeVal<int32_t>(buf, n_layers);
@@ -302,6 +411,17 @@ namespace llaminar2
         writeVal<int32_t>(buf, head_dim);
         writeVal<int32_t>(buf, vocab_size);
         writeVal<int32_t>(buf, max_seq_len);
+        writeVal<int32_t>(buf, expert_count);
+        writeVal<int32_t>(buf, expert_used_count);
+        writeVal<int32_t>(buf, expert_feed_forward_length);
+        writeVal<int32_t>(buf, expert_shared_feed_forward_length);
+        writeVal<int32_t>(buf, mtp_layer_count);
+        writeVal<int32_t>(buf, full_attention_interval);
+        writeVal<int32_t>(buf, gdn_conv_kernel_size);
+        writeVal<int32_t>(buf, gdn_state_size);
+        writeVal<int32_t>(buf, gdn_inner_size);
+        writeVal<int32_t>(buf, gdn_group_count);
+        writeVal<int32_t>(buf, gdn_time_step_rank);
         writeVal<uint64_t>(buf, total_native_bytes);
 
         // Tensor inventory
@@ -325,6 +445,20 @@ namespace llaminar2
         const uint8_t *ptr = data;
         const uint8_t *end = data + size;
 
+        const uint32_t magic = readVal<uint32_t>(ptr, end);
+        if (magic != kProfileWireMagic)
+        {
+            throw std::runtime_error(
+                "ModelMemoryProfile deserialization: invalid wire-format magic");
+        }
+        const uint32_t version = readVal<uint32_t>(ptr, end);
+        if (version != kProfileWireVersion)
+        {
+            throw std::runtime_error(
+                "ModelMemoryProfile deserialization: unsupported wire-format version " +
+                std::to_string(version));
+        }
+
         p.architecture = readStr(ptr, end);
         p.n_layers = readVal<int32_t>(ptr, end);
         p.d_model = readVal<int32_t>(ptr, end);
@@ -334,6 +468,17 @@ namespace llaminar2
         p.head_dim = readVal<int32_t>(ptr, end);
         p.vocab_size = readVal<int32_t>(ptr, end);
         p.max_seq_len = readVal<int32_t>(ptr, end);
+        p.expert_count = readVal<int32_t>(ptr, end);
+        p.expert_used_count = readVal<int32_t>(ptr, end);
+        p.expert_feed_forward_length = readVal<int32_t>(ptr, end);
+        p.expert_shared_feed_forward_length = readVal<int32_t>(ptr, end);
+        p.mtp_layer_count = readVal<int32_t>(ptr, end);
+        p.full_attention_interval = readVal<int32_t>(ptr, end);
+        p.gdn_conv_kernel_size = readVal<int32_t>(ptr, end);
+        p.gdn_state_size = readVal<int32_t>(ptr, end);
+        p.gdn_inner_size = readVal<int32_t>(ptr, end);
+        p.gdn_group_count = readVal<int32_t>(ptr, end);
+        p.gdn_time_step_rank = readVal<int32_t>(ptr, end);
         p.total_native_bytes = readVal<uint64_t>(ptr, end);
 
         uint32_t n_tensors = readVal<uint32_t>(ptr, end);

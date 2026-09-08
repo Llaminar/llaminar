@@ -26,6 +26,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -54,6 +55,8 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
+#include "utils/PrefillGraphBucketDefaults.h"
+#include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "fort.hpp"
 
@@ -93,22 +96,6 @@ extern "C"
         uint8_t codebook_id,
         int device_id, void *stream);
 
-    bool rocmGemv_native_vnni_small_m_batched_fp32(
-        const int8_t *d_A_int8,
-        const uint8_t *const *d_payloads,
-        const uint16_t *const *d_block_scales,
-        const uint16_t *const *d_block_mins,
-        const uint32_t *const *d_block_emins,
-        const float *const *d_biases,
-        float *const *d_outputs,
-        const float *d_scale_A_blockwise,
-        float *const *d_partials,
-        const int *Ns,
-        int num_projections,
-        int M, int K,
-        uint8_t codebook_id,
-        int device_id,
-        void *stream);
 
     bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
         const int8_t *d_A_int8,
@@ -262,8 +249,17 @@ namespace
     /// Sequence lengths to benchmark (typical prefill sizes)
     static const std::vector<int> M_VALUES = {32, 64, 128, 256};
 
-    /// MTP verifier batch sizes exercised by the Phase 13.5 small-M route.
-    static const std::vector<int> MTP_SMALL_M_VALUES = {2, 3, 4};
+    /**
+     * @brief Canonical runtime-M verifier rows exercised by this ROCm suite.
+     *
+     * Keep this inventory sourced from the production graph defaults. A local
+     * `{2, 3, 4}` list previously let deeper speculative groups escape the
+     * all-format ROCm performance and correctness surface even though the
+     * learned dispatch trainer already certified every row through sixteen.
+     */
+    static const std::vector<int> MTP_SMALL_M_VALUES(
+        kDefaultNativeVNNISmallMRows.begin(),
+        kDefaultNativeVNNISmallMRows.end());
 
     // Qwen2.5-0.5B:  hidden=896,  intermediate=4864
     // Qwen2.5-3B:    hidden=2048, intermediate=11008
@@ -287,7 +283,8 @@ namespace
     };
 
     static const std::vector<GEMMShape> MTP_SMALL_M_SHAPES = {
-        {"Qwen36_MTP_HiddenProjection", 5120, 5120},
+        {"Qwen36Dense_MTP_HiddenProjection", 5120, 10240},
+        {"Qwen36MoE_MTP_HiddenProjection", 2048, 4096},
         {"Qwen36_FFN_DownProjection", 5120, 17408},
         {"Qwen36_GDN_InnerProjection", 10240, 5120},
         {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
@@ -488,7 +485,7 @@ namespace
         {
             for (int n = 0; n < N; ++n)
                 for (int b = 0; b < blocks_per_row; ++b)
-                    unpackable->packVnniBlock(ctx, n, b);
+                    unpackable->packVnniBlock(ctx, n, n, b);
         }
         catch (const std::exception &)
         {
@@ -685,6 +682,42 @@ namespace
         return values;
     }
 
+    /**
+     * @brief Parse a comma-separated environment variable into integer values.
+     *
+     * Performance tuning frequently needs to isolate one format and one row
+     * count so a profiler trace contains exactly the launch under study.  Keep
+     * that selection inside the stable focused harness instead of creating
+     * one-off binaries whose allocation or launch behavior can drift from the
+     * production wrapper.
+     *
+     * @param name Environment-variable name.
+     * @return Parsed values. Invalid tokens are ignored; an unset variable
+     *         returns an empty set, which callers interpret as "run all".
+     */
+    static std::set<int> getEnvCsvIntSet(const char *name)
+    {
+        std::set<int> values;
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return values;
+
+        std::stringstream stream(raw);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            token = trim(token);
+            if (token.empty())
+                continue;
+
+            char *end = nullptr;
+            const long value = std::strtol(token.c_str(), &end, 10);
+            if (end != token.c_str() && *end == '\0' && value > 0)
+                values.insert(static_cast<int>(value));
+        }
+        return values;
+    }
+
     static bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
     {
         return filters.empty() || filters.count(toLower(name)) != 0;
@@ -801,11 +834,12 @@ namespace
                                                   int M, int N, int K, int device_id)
         {
             (void)hipSetDevice(device_id);
+            auto stream = static_cast<hipStream_t>(kernel.requireGPUStream());
 
             // Warmup
             for (int i = 0; i < WARMUP_RUNS; ++i)
                 kernel.multiply_tensor(input, output, M, N, K);
-            (void)hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream);
 
             // Timed runs
             hipEvent_t start = nullptr, stop = nullptr;
@@ -817,10 +851,9 @@ namespace
 
             for (int i = 0; i < BENCH_RUNS; ++i)
             {
-                (void)hipDeviceSynchronize();
-                (void)hipEventRecord(start);
+                (void)hipEventRecord(start, stream);
                 kernel.multiply_tensor(input, output, M, N, K);
-                (void)hipEventRecord(stop);
+                (void)hipEventRecord(stop, stream);
                 (void)hipEventSynchronize(stop);
 
                 float ms = 0.0f;
@@ -851,6 +884,8 @@ namespace
                 return 0.0;
 
             ROCmQuantisedGemmKernel kernel(&packed, device_id);
+            ScopedGPUStream stream(DeviceId::rocm(device_id));
+            kernel.setGPUStream(stream.get());
             auto reqs = kernel.getWorkspaceRequirements(M, N, K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
@@ -910,6 +945,8 @@ namespace
 
             // 2. Create kernel + workspace
             ROCmQuantisedGemmKernel kernel(&packed, device_id);
+            ScopedGPUStream stream(DeviceId::rocm(device_id));
+            kernel.setGPUStream(stream.get());
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
@@ -938,7 +975,9 @@ namespace
             {
                 kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(
+                    output,
+                    kernel.requireGPUStream());
 
                 if (gpu_weights && gpu_weights->d_weights)
                 {
@@ -1158,6 +1197,8 @@ namespace
                 return result;
 
             ROCmQuantisedGemmKernel kernel(&packed, device_id);
+            ScopedGPUStream stream(DeviceId::rocm(device_id));
+            kernel.setGPUStream(stream.get());
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
@@ -2066,6 +2107,29 @@ namespace
             GTEST_SKIP() << "No ROCm device available";
 
         const GEMMShape shape{"3B_FFN_Up", 11008, 2048};
+        const std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_ROCM_NVNNI_FOCUSED_FORMATS");
+        const std::set<int> m_filters =
+            getEnvCsvIntSet("LLAMINAR_ROCM_NVNNI_FOCUSED_M");
+
+        std::vector<int> selected_format_indices;
+        for (int fi = 0; fi < static_cast<int>(GEMM_FORMATS.size()); ++fi)
+        {
+            if (shouldRunName(format_filters, GEMM_FORMATS[fi].name))
+                selected_format_indices.push_back(fi);
+        }
+
+        std::vector<int> selected_m_indices;
+        for (int mi = 0; mi < static_cast<int>(M_VALUES.size()); ++mi)
+        {
+            if (m_filters.empty() || m_filters.count(M_VALUES[mi]) != 0)
+                selected_m_indices.push_back(mi);
+        }
+
+        ASSERT_FALSE(selected_format_indices.empty())
+            << "LLAMINAR_ROCM_NVNNI_FOCUSED_FORMATS selected no format";
+        ASSERT_FALSE(selected_m_indices.empty())
+            << "LLAMINAR_ROCM_NVNNI_FOCUSED_M selected no row count";
 
         fprintf(stderr, "\n[NativeVNNI GEMM] Focused: %s (N=%d K=%d) using %d GPU(s)\n",
                 shape.name.c_str(), shape.N, shape.K, NUM_GPUS);
@@ -2075,7 +2139,7 @@ namespace
         std::vector<double> int8_refs(M_VALUES.size(), 0.0);
         {
             std::vector<std::thread> threads;
-            for (int mi = 0; mi < (int)M_VALUES.size(); ++mi)
+            for (const int mi : selected_m_indices)
             {
                 int g = mi % NUM_GPUS;
                 threads.emplace_back([&, mi, g]()
@@ -2098,8 +2162,8 @@ namespace
             double cost;
         };
         std::vector<WorkItem> items;
-        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
-            for (int mi = 0; mi < (int)M_VALUES.size(); ++mi)
+        for (const int fi : selected_format_indices)
+            for (const int mi : selected_m_indices)
                 items.push_back({fi, mi, (double)shape.N * shape.K * M_VALUES[mi]});
 
         std::sort(items.begin(), items.end(),
@@ -2112,8 +2176,8 @@ namespace
 
         // Results indexed by (format_idx * num_m + m_idx)
         const size_t num_m = M_VALUES.size();
-        const size_t total = GEMM_FORMATS.size() * num_m;
-        std::vector<GEMMBenchResult> results(total);
+        const size_t total = items.size();
+        std::vector<GEMMBenchResult> results(GEMM_FORMATS.size() * num_m);
         std::atomic<int> done_count{0};
 
         {
@@ -2190,9 +2254,9 @@ namespace
         for (int c = 1; c <= 9; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
-        for (int fi = 0; fi < (int)GEMM_FORMATS.size(); ++fi)
+        for (const int fi : selected_format_indices)
         {
-            for (int mi = 0; mi < (int)num_m; ++mi)
+            for (const int mi : selected_m_indices)
             {
                 size_t idx = fi * num_m + mi;
                 const auto &r = results[idx];

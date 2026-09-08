@@ -200,8 +200,21 @@ namespace
                 return;
             }
 
-            // Use first 2 devices (matching typical TP=2 setup)
+            // Keep the historical two-device default, while allowing a focused
+            // topology measurement to include every participant in a larger
+            // homogeneous domain without baking that host's shape into the test.
             num_devices_ = 2;
+            if (const char *requested =
+                    std::getenv("LLAMINAR_RCCL_PERF_DEVICE_COUNT"))
+            {
+                char *end = nullptr;
+                const long parsed = std::strtol(requested, &end, 10);
+                ASSERT_TRUE(end && end != requested && *end == '\0')
+                    << "LLAMINAR_RCCL_PERF_DEVICE_COUNT must be an integer";
+                ASSERT_GT(parsed, 1);
+                ASSERT_LE(parsed, device_count);
+                num_devices_ = static_cast<int>(parsed);
+            }
 
             // Print current NCCL environment for reference
             printCurrentNCCLEnv();
@@ -477,6 +490,126 @@ namespace
                 samples.push_back(static_cast<double>(ms) * 1000.0); // convert to µs
             }
 
+            return computeStats(samples, bytes, label);
+        }
+
+        /**
+         * @brief Measure a rooted domain reduction, optionally followed by one
+         * pinned-host publication on the root's exact stream.
+         *
+         * This models the alternative ExpertOverlay return topology: participant
+         * outputs are combined inside a homogeneous domain and only the root
+         * crosses the heterogeneous boundary. Synchronization brackets samples
+         * in this isolated harness; it is not part of the proposed captured
+         * production transaction.
+         */
+        LatencyResult benchReduceRootHostTimed(
+            size_t num_floats,
+            bool publish_to_host,
+            const std::string &label)
+        {
+            constexpr int ROOT = 0;
+            constexpr int CANDIDATE_WARMUP_ITERS = 40;
+            constexpr int CANDIDATE_BENCH_ITERS = 200;
+            const size_t bytes = num_floats * sizeof(float);
+            float *root_result = nullptr;
+            float *host_result = nullptr;
+
+            HIP_CHECK(hipSetDevice(devices_[ROOT].ordinal));
+            HIP_CHECK(hipMalloc(&root_result, bytes));
+            if (publish_to_host)
+                HIP_CHECK(hipHostMalloc(&host_result, bytes, hipHostMallocDefault));
+
+            // A zero payload has a deterministic exact oracle without changing
+            // RCCL's byte traffic or transport selection.
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                HIP_CHECK(hipMemsetAsync(
+                    devices_[i].d_buffer, 0, bytes, devices_[i].stream));
+                HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+            }
+
+            const auto submit = [&]
+            {
+                RCCL_CHECK(rccl::ncclGroupStart());
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    void *receive = i == ROOT
+                                        ? static_cast<void *>(root_result)
+                                        : static_cast<void *>(devices_[i].d_buffer);
+                    RCCL_CHECK(rccl::ncclReduce(
+                        devices_[i].d_buffer, receive, num_floats,
+                        rccl::ncclFloat, rccl::ncclSum, ROOT,
+                        comms_[i], devices_[i].stream));
+                }
+                RCCL_CHECK(rccl::ncclGroupEnd());
+                if (publish_to_host)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[ROOT].ordinal));
+                    HIP_CHECK(hipMemcpyAsync(
+                        host_result, root_result, bytes, hipMemcpyDeviceToHost,
+                        devices_[ROOT].stream));
+                }
+            };
+            const auto synchronize = [&]
+            {
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                    HIP_CHECK(hipStreamSynchronize(devices_[i].stream));
+                }
+            };
+
+            for (int iteration = 0;
+                 iteration < CANDIDATE_WARMUP_ITERS; ++iteration)
+            {
+                submit();
+                synchronize();
+            }
+
+            std::vector<double> samples;
+            samples.reserve(CANDIDATE_BENCH_ITERS);
+            for (int iteration = 0;
+                 iteration < CANDIDATE_BENCH_ITERS; ++iteration)
+            {
+                synchronize();
+                const auto begin = std::chrono::high_resolution_clock::now();
+                submit();
+                synchronize();
+                const auto end = std::chrono::high_resolution_clock::now();
+                samples.push_back(
+                    std::chrono::duration<double, std::micro>(end - begin)
+                        .count());
+            }
+
+            if (!publish_to_host)
+            {
+                HIP_CHECK(hipSetDevice(devices_[ROOT].ordinal));
+                HIP_CHECK(hipHostMalloc(
+                    &host_result, bytes, hipHostMallocDefault));
+                HIP_CHECK(hipMemcpy(
+                    host_result, root_result, bytes, hipMemcpyDeviceToHost));
+            }
+            EXPECT_NE(host_result, nullptr);
+            if (host_result)
+            {
+                const auto mismatch = std::find_if(
+                    host_result,
+                    host_result + num_floats,
+                    [](float value)
+                    {
+                        return value != 0.0f;
+                    });
+                EXPECT_EQ(mismatch, host_result + num_floats)
+                    << "Rooted RCCL output first differs at element "
+                    << static_cast<std::size_t>(mismatch - host_result);
+            }
+
+            HIP_CHECK(hipSetDevice(devices_[ROOT].ordinal));
+            HIP_CHECK(hipFree(root_result));
+            HIP_CHECK(hipHostFree(host_result));
             return computeStats(samples, bytes, label);
         }
 
@@ -1568,6 +1701,28 @@ namespace
             std::cout << "\n"
                       << table.to_string() << "\n";
         }
+    }
+
+    /**
+     * @brief Compare domain-rooted return alternatives at the actual Qwen 3.5
+     * 122B prefill geometry.
+     */
+    TEST_F(Perf__RCCLAllreduceLatency, Qwen35_122B_RootedReturn_600x3072)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        constexpr size_t PREFILL_FLOATS = 600u * 3072u;
+        auto reduce_only = benchReduceRootHostTimed(
+            PREFILL_FLOATS, false, "RCCL reduce to domain root");
+        auto reduce_and_publish = benchReduceRootHostTimed(
+            PREFILL_FLOATS, true, "RCCL reduce plus pinned-host publication");
+
+        std::cout << "\nQwen3.5-122B rooted return candidate ("
+                  << num_devices_ << " ROCm devices, 600x3072 FP32)\n"
+                  << "  reduce median: " << reduce_only.median_us << " us\n"
+                  << "  reduce + D2H median: "
+                  << reduce_and_publish.median_us << " us\n";
     }
 
     // ============================================================================

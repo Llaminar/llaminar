@@ -22,6 +22,7 @@
 #include "backends/BackendManager.h"
 #include "backends/cuda/CUDABackend.h"
 #include "backends/rocm/ROCmBackend.h"
+#include "../utils/ScopedGPUStream.h"
 
 using namespace llaminar2;
 
@@ -53,6 +54,7 @@ protected:
         std::vector<float> host_c(TEST_SIZE, 0.0f);
 
         size_t bytes = TEST_SIZE * sizeof(float);
+        test::ScopedGPUStream stream(DeviceId::cuda(0));
 
         // Allocate GPU memory
         void *d_a = cuda_backend_->allocate(bytes, 0);
@@ -66,12 +68,14 @@ protected:
         }
 
         // Upload data
-        if (!cuda_backend_->hostToDevice(d_a, host_a.data(), bytes, 0))
+        if (!cuda_backend_->hostToDevice(
+                d_a, host_a.data(), bytes, 0, stream.get()))
         {
             std::cerr << "CUDA H2D failed (a) in phase: " << phase << std::endl;
             return false;
         }
-        if (!cuda_backend_->hostToDevice(d_b, host_b.data(), bytes, 0))
+        if (!cuda_backend_->hostToDevice(
+                d_b, host_b.data(), bytes, 0, stream.get()))
         {
             std::cerr << "CUDA H2D failed (b) in phase: " << phase << std::endl;
             return false;
@@ -79,20 +83,21 @@ protected:
 
         // For now, just do a memset to verify basic CUDA operations work
         // (We don't have a simple vector add kernel exposed in the backend API)
-        if (!cuda_backend_->memset(d_c, 0, bytes, 0))
+        if (!cuda_backend_->memset(d_c, 0, bytes, 0, stream.get()))
         {
             std::cerr << "CUDA memset failed in phase: " << phase << std::endl;
             return false;
         }
 
-        if (!cuda_backend_->synchronize(0))
+        if (!cuda_backend_->synchronizeStream(stream.get(), 0))
         {
             std::cerr << "CUDA sync failed in phase: " << phase << std::endl;
             return false;
         }
 
         // Download and verify
-        if (!cuda_backend_->deviceToHost(host_c.data(), d_c, bytes, 0))
+        if (!cuda_backend_->deviceToHost(
+                host_c.data(), d_c, bytes, 0, stream.get()))
         {
             std::cerr << "CUDA D2H failed in phase: " << phase << std::endl;
             return false;
@@ -132,6 +137,7 @@ protected:
         std::vector<float> host_result(TEST_SIZE, 0.0f);
 
         size_t bytes = TEST_SIZE * sizeof(float);
+        test::ScopedGPUStream stream(DeviceId::rocm(0));
 
         // Allocate GPU memory
         void *d_data = rocm_backend_->allocate(bytes, 0);
@@ -142,21 +148,23 @@ protected:
         }
 
         // Upload data
-        if (!rocm_backend_->hostToDevice(d_data, host_data.data(), bytes, 0))
+        if (!rocm_backend_->hostToDevice(
+                d_data, host_data.data(), bytes, 0, stream.get()))
         {
             std::cerr << "ROCm H2D failed in phase: " << phase << std::endl;
             return false;
         }
 
         // Sync
-        if (!rocm_backend_->synchronize(0))
+        if (!rocm_backend_->synchronizeStream(stream.get(), 0))
         {
             std::cerr << "ROCm sync failed in phase: " << phase << std::endl;
             return false;
         }
 
         // Download
-        if (!rocm_backend_->deviceToHost(host_result.data(), d_data, bytes, 0))
+        if (!rocm_backend_->deviceToHost(
+                host_result.data(), d_data, bytes, 0, stream.get()))
         {
             std::cerr << "ROCm D2H failed in phase: " << phase << std::endl;
             return false;
@@ -278,6 +286,7 @@ TEST_F(Test__CUDAHIPKernelCoexistence, CUDAEventsAfterROCm)
     {
         GTEST_SKIP() << "ROCm not available";
     }
+    test::ScopedGPUStream stream(DeviceId::cuda(0));
 
     std::cout << "=== Testing CUDA events before ROCm ===" << std::endl;
 
@@ -286,7 +295,8 @@ TEST_F(Test__CUDAHIPKernelCoexistence, CUDAEventsAfterROCm)
     ASSERT_NE(event, nullptr) << "Failed to create CUDA event";
 
     // Record the event
-    ASSERT_TRUE(cuda_backend_->recordEvent(event, 0)) << "Failed to record CUDA event (before ROCm)";
+    ASSERT_TRUE(cuda_backend_->recordEvent(event, 0, stream.get()))
+        << "Failed to record CUDA event (before ROCm)";
 
     // Wait for the event (should work)
     ASSERT_TRUE(cuda_backend_->waitForEvent(event, 0)) << "Failed to wait for CUDA event (before ROCm)";
@@ -299,7 +309,7 @@ TEST_F(Test__CUDAHIPKernelCoexistence, CUDAEventsAfterROCm)
     std::cout << "=== Testing CUDA events after ROCm ===" << std::endl;
 
     // Record the event again (after ROCm operations)
-    bool record_ok = cuda_backend_->recordEvent(event, 0);
+    bool record_ok = cuda_backend_->recordEvent(event, 0, stream.get());
     std::cout << "Record event after ROCm: " << (record_ok ? "OK" : "FAILED") << std::endl;
     EXPECT_TRUE(record_ok) << "Failed to record CUDA event (after ROCm)";
 
@@ -329,6 +339,7 @@ TEST_F(Test__CUDAHIPKernelCoexistence, NewCUDAEventsAfterROCm)
     {
         GTEST_SKIP() << "ROCm not available";
     }
+    test::ScopedGPUStream stream(DeviceId::cuda(0));
 
     std::cout << "=== Running ROCm operations first ===" << std::endl;
     ASSERT_TRUE(runROCmOperation("ROCm_first"));
@@ -340,7 +351,8 @@ TEST_F(Test__CUDAHIPKernelCoexistence, NewCUDAEventsAfterROCm)
     ASSERT_NE(event, nullptr) << "Failed to create CUDA event after ROCm";
 
     // Record the event
-    ASSERT_TRUE(cuda_backend_->recordEvent(event, 0)) << "Failed to record new CUDA event after ROCm";
+    ASSERT_TRUE(cuda_backend_->recordEvent(event, 0, stream.get()))
+        << "Failed to record new CUDA event after ROCm";
 
     // Wait for the event
     ASSERT_TRUE(cuda_backend_->waitForEvent(event, 0)) << "Failed to wait for new CUDA event after ROCm";

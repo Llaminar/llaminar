@@ -747,7 +747,7 @@ TEST_F(Test__GlobalPPRankPlanBuilder, Phase0_ThreeStageRank0OwnershipRequiresTwo
  * Rank 1 should execute the node-local CPU shard and both local GPU TP stages,
  * with local handoff actions between 0 -> 1 and 1 -> 2. Rank 0 should execute
  * only stage 0; it does not need to send to rank 1 because rank 1 already
- * participates in the source node-local TP stage.
+ * participates in the source NodeTP stage.
  */
 TEST_F(Test__GlobalPPRankPlanBuilder, Phase0_MirroredSocketLocalityRequiresRank1LocalHandoffs)
 {
@@ -773,7 +773,7 @@ TEST_F(Test__GlobalPPRankPlanBuilder, Phase0_MirroredSocketLocalityRequiresRank1
 
     EXPECT_EQ(executeStageIds(plan0), std::vector<int>({0}));
     EXPECT_EQ(countTransferActions(plan0, 0, 1), 0u)
-        << "Rank 0 should not send because rank 1 already has stage 0 output from its node-local TP shard";
+        << "Rank 0 should not send because rank 1 already has stage 0 output from its NodeTP shard";
 }
 
 /**

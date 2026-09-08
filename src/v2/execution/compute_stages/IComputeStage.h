@@ -21,13 +21,15 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <functional>
 #include "../local_execution/device/DeviceContext.h"
 #include "../debug/BufferRole.h"
 #include "../config/RuntimeConfig.h"
-#include "../local_execution/coherence/StageCoherence.h"
+#include "../local_execution/coherence/CoherencePolicy.h"
 #include "ComputeStageUtils.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../tensors/TensorKernels.h"
@@ -224,6 +226,33 @@ namespace llaminar2
 
         StageDumpInfo &addWeight(const char *name, const ITensor *tensor);
 
+        /**
+         * @brief Describe immutable raw parameter storage without calling it an activation.
+         *
+         * Legacy stage APIs may still expose a read-only parameter as an unowned
+         * host pointer. Keeping that storage in the weight collection prevents
+         * per-execution activation validation while preserving diagnostic shape
+         * and type metadata.
+         *
+         * @param name Stable diagnostic name.
+         * @param data Immutable raw parameter bytes.
+         * @param bytes Exact byte count available at @p data.
+         * @param rows Logical row count.
+         * @param cols Logical column count.
+         * @param dtype Native element type label.
+         */
+        StageDumpInfo &addRawWeight(
+            const char *name,
+            const void *data,
+            size_t bytes,
+            size_t rows,
+            size_t cols,
+            const char *dtype)
+        {
+            weights.push_back({name, nullptr, data, bytes, rows, cols, dtype});
+            return *this;
+        }
+
         StageDumpInfo &addScalar(const char *name, double value, const char *dtype = "float")
         {
             scalars.push_back({name, value, dtype});
@@ -248,8 +277,12 @@ namespace llaminar2
          * Call this BEFORE reading output.data for verification/dumping.
          * This is a deferred sync - outputs are NOT synced in addOutput().
          * This allows GPU kernels to run async without blocking.
+         *
+         * GPU-backed outputs that need a device-to-host publication require the
+         * producer stream. Passing null for those outputs is a programming error:
+         * the graph executor must thread the stage stream through explicitly.
          */
-        void ensureOutputsOnHost() const;
+        void ensureOutputsOnHost(void *stream = nullptr) const;
     };
 
     /**
@@ -261,6 +294,7 @@ namespace llaminar2
         GEMM,
         GEMM_BIAS,
         GEMM_FUSED_QKV,
+        GEMM_FUSED_KV,
         GEMM_FUSED_GATE_UP,
 
         // Normalization
@@ -288,14 +322,32 @@ namespace llaminar2
         MOE_EXPERT_FFN,
         MOE_SHARED_EXPERT_FFN,      ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
         MOE_SHARED_EXPERT_GATE,     ///< Shared expert sigmoid gate
-        MOE_EXPERT_DISPATCH,        ///< Host-side dispatch descriptor builder for expert-parallel tiers
-        MOE_EXPERT_PARALLEL_REDUCE, ///< Host-side dense partial reduction for expert-parallel tiers
+        MOE_CANONICAL_ROUTE_REDUCE, ///< Router-ordered LocalTP contribution reduction
+        MOE_SHARED_RANK_BANK_PUBLISH, ///< Publish one shared partial into its canonical participant bank
+        MOE_CANONICAL_PUBLICATION_FINALIZE, ///< Root-only fixed-order routed/shared finalizer
+        MOE_OVERLAY_TICKET_PUBLISH,  ///< Captured fixed-capacity heterogeneous dispatch ticket
+        MOE_OVERLAY_TICKET_CONSUME,  ///< Captured fixed-capacity heterogeneous return ingress
+        MOE_OVERLAY_ACTIVATION_DISPATCH_PACK, ///< Device pack into a mapped node-local activation lane
+        MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME, ///< Device consume from a mapped node-local activation lane
+        MOE_OVERLAY_ACTIVATION_RETURN_PACK, ///< Device pack of follower output into a mapped lane
+        MOE_OVERLAY_ACTIVATION_RETURN_CONSUME, ///< Device deterministic fold of one mapped return lane
+        MOE_EXPERT_DISPATCH,        ///< Routed-row dispatch descriptor builder
         MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
+        MOE_RANK_BATCH_DISPATCH,   ///< One sparse dispatch envelope for all participants on a remote rank
         MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute
+        MOE_LOCAL_EXPERT_INPUT_PUBLISH, ///< Captured pinned-host packet publication into participant tensors
+        MOE_LOCAL_EXPERT_OUTPUT_PUBLISH, ///< Captured participant output publication into pinned host storage
+        MOE_LOCAL_EXPERT_COMPLETION, ///< Explicit completion of one submitted remote GPU expert packet
         MOE_SPARSE_RETURN_REDUCE,   ///< Graph-native sparse MoE return reduce
+        MOE_RANK_BATCH_RETURN_REDUCE, ///< One sparse return envelope for all participants on a remote rank
+        MOE_DEVICE_REBALANCE,       ///< Graph-captured device-side MoE rebalance publish/apply
+        MOE_GPU_CURRENT_BATCH_LLEP, ///< Explicit GPU LLEP plan/sideband/apply transaction phase
+        MOE_DEVICE_DECODE_COMMIT_BOUNDARY, ///< Captured HIP serial-decode cadence publish/ack
+        MOE_CPU_CURRENT_BATCH_LLEP, ///< CPU transient LLEP plan/transfer/restore transaction
 
         // Collective
         ALLREDUCE,
+        ROOTED_COLLECTIVE, ///< LocalTP reduce-to-root or root broadcast
         ALLGATHER,
         ALLGATHER_V, ///< Variable-count allgather for heterogeneous TP
 
@@ -319,6 +371,7 @@ namespace llaminar2
         // KV Cache operations
         KV_CACHE_APPEND,
         KV_CACHE_GATHER,
+        TP_KV_CACHE_STATE_ALLGATHER, ///< Gather TP-local prefill K/V rows into full replicated decode KV rows
         ATTENTION_COMPUTE,
 
         // Quantization
@@ -337,18 +390,215 @@ namespace llaminar2
         GDN_PROJECTION,        ///< 4 separate GEMMs: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b
         SHORT_CONV1D,          ///< Causal depthwise conv1d (kernel=4) + SiLU
         GDN_RECURRENCE,        ///< Delta rule recurrence (chunk prefill, single-step decode)
+        GDN_LIVE_STATE_ALLGATHER, ///< Gather TP-local GDN state into mirrored decode state
+
+        /** Captured device publication of the current long-prefill request bucket. */
+        PREFILL_CHUNK_MATERIALIZATION,
 
         // Qwen 3.5 FA-specific
         Q_GATE_SPLIT, ///< Split interleaved Q+gate GEMM output into separate buffers
 
         // MTP sidecar
         MTP_CONCAT, ///< Concatenate normalized draft embedding and terminal hidden rows
+
+        /**
+         * Captured proposal transaction: optional serial-equivalent branch
+         * penalties followed by deterministic device-slot argmax publication.
+         */
+        MTP_DRAFT_TOKEN_PUBLICATION,
+        MOE_OVERLAY_EPOCH_BOUNDARY,
+        MOE_OVERLAY_DEVICE_CONTROLLER,
+
+        /**
+         * Captured verifier prelude: resident token composition, device geometry,
+         * base-count snapshot, and opaque pre-verifier KV checkpoint capture.
+         */
+        MTP_VERIFIER_PREPARATION,
+
+        /**
+         * Captured target-verifier transaction: optional device-history
+         * penalties followed by compact top-k/top-p row construction.
+         */
+        MTP_STOCHASTIC_TARGET_DISTRIBUTION,
+
+        /**
+         * Terminal grouped-verifier transaction: device argmax/distribution
+         * reduction plus optional mirrored LocalTP outcome publication.
+         */
+        MTP_VERIFIER_OUTCOME,
+
+        /**
+         * Captured seeded stochastic transaction: sample compact target rows
+         * and reduce them against the materialized verifier input sequence.
+         */
+        MTP_STOCHASTIC_SERIAL_OUTCOME,
+
+        /**
+         * Captured accepted-state transaction: response/controller commit,
+         * main and shifted KV publication, MoE history, penalty history, and
+         * recurrent verifier-row restoration.
+         */
+        MTP_SPEC_STATE_PUBLICATION,
     };
+
+    /**
+     * @brief Identify stage types whose execution includes a domain collective.
+     *
+     * Capture policy, graph partitioning, fast scheduling, and profiling must
+     * agree on this classification. Keeping the mapping beside the enum avoids
+     * duplicated local lists that can silently omit a specialized collective
+     * such as TP KV-state or GDN-state all-gather.
+     *
+     * @param type Stage operation type.
+     * @return true when the stage necessarily participates in a collective.
+     */
+    [[nodiscard]] constexpr bool isCollectiveComputeStageType(
+        ComputeStageType type) noexcept
+    {
+        switch (type)
+        {
+        case ComputeStageType::ALLREDUCE:
+        case ComputeStageType::ROOTED_COLLECTIVE:
+        case ComputeStageType::ALLGATHER:
+        case ComputeStageType::ALLGATHER_V:
+        case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:
+        case ComputeStageType::GDN_LIVE_STATE_ALLGATHER:
+        case ComputeStageType::FUSED_ADD_ALLREDUCE:
+            return true;
+        default:
+            return false;
+        }
+    }
 
     /**
      * @brief Convert stage type to string for logging
      */
     const char *computeStageTypeName(ComputeStageType type);
+
+    class IComputeStage;
+
+    /**
+     * @brief Immutable GPU execution authority for one bound compute stage.
+     *
+     * A GPU write is correctly published only when its completion event is
+     * recorded on the exact stream that enqueued the write. Passing a raw
+     * `DeviceId` and `void *` independently to launch and publication APIs made
+     * it possible for those values to drift apart while remaining non-null.
+     *
+     * This token binds the stage's authoritative device and executor-selected
+     * stream into one value. Its constructor is private, so production code
+     * cannot manufacture a token from ambient tensor state or a backend default
+     * stream. Stages use the same value to bind kernels, obtain the native
+     * launch stream, prepare tensor inputs and outputs, and publish resulting
+     * tensor writes.
+     */
+    class StageGPUExecution final
+    {
+    public:
+        /**
+         * @brief Return the GPU selected by the graph executor for this stage.
+         */
+        [[nodiscard]] DeviceId device() const noexcept { return device_; }
+
+        /**
+         * @brief Return the exact non-null native stream for backend launches.
+         *
+         * The returned opaque pointer is a `cudaStream_t` or `hipStream_t`
+         * according to device(). It is never a default-stream sentinel.
+         */
+        [[nodiscard]] void *nativeStream() const noexcept { return stream_; }
+
+        /**
+         * @brief Bind a tensor kernel to this execution's producer stream.
+         *
+         * Returning the kernel preserves the established fluent stage setup
+         * pattern while ensuring binding and later publication are sourced from
+         * the same immutable token.
+         */
+        template <typename KernelT>
+        KernelT *bind(KernelT *kernel) const
+        {
+            if (kernel)
+                kernel->setGPUStream(stream_);
+            return kernel;
+        }
+
+        /**
+         * @brief Join an input tensor to this execution's consumer stream.
+         *
+         * This placement-capable operation is reserved for the explicit
+         * heterogeneous host-packet transport stage. Ordinary GPU graph stages
+         * declare arena inputs and use requirePreparedInput(), which cannot
+         * allocate or upload. No free device or stream arguments are exposed.
+         */
+        void prepareInput(ITensor *tensor) const;
+
+        /**
+         * @brief Prepare output storage for this execution's producer stream.
+         *
+         * This operation carries the same immutable device/stream identity as
+         * bind() and publish(), preventing output preparation from drifting to
+         * a backend default or an unrelated ambient stream.
+         */
+        void prepareOutput(ITensor *tensor) const;
+
+        /**
+         * @brief Require an executor-prepared input without moving or allocating it.
+         *
+         * Graph stages call this after DeviceGraphExecutor has applied their
+         * StageBufferContract. Unlike prepareInput(), this method cannot upload
+         * host bytes, allocate device storage, or change tensor coherence. It
+         * joins an existing producer event to nativeStream() and fails
+         * immediately when the declared input is not valid on the exact device
+         * bound into this execution token.
+         *
+         * @param tensor Declared stage input that the executor prepared.
+         * @throws std::invalid_argument when @p tensor is null.
+         * @throws std::runtime_error when the tensor is not valid on device().
+         */
+        void requirePreparedInput(ITensor *tensor) const;
+
+        /**
+         * @brief Require pre-existing output storage on the executor-bound GPU.
+         *
+         * Output bytes need not be valid before a producer overwrites them, but
+         * the storage must already exist on the exact stage device. This method
+         * never calls an allocator or imports host contents.
+         *
+         * @param tensor Declared stage output whose storage was prepared.
+         * @throws std::invalid_argument when @p tensor is null.
+         * @throws std::runtime_error when exact-device storage is absent.
+         */
+        void requirePreparedOutput(ITensor *tensor) const;
+
+        /**
+         * @brief Publish a tensor written by work enqueued through this token.
+         *
+         * During eager execution, TransferEngine records the completion event
+         * on nativeStream() and makes the producer device authoritative. During
+         * graph capture, recording is not execution: publication validates and
+         * records the internal producer edge in the capture dependency ledger,
+         * while the graph-launch boundary publishes live tensor authority after
+         * replay. Callers must therefore treat successful return as the complete
+         * publication contract and must never inspect or mutate raw tensor
+         * coherence afterward.
+         *
+         * No device or stream argument is accepted here, so a stage cannot
+         * publish the write against a different execution context by accident.
+         *
+         * @throws std::invalid_argument for a null tensor.
+         * @throws std::runtime_error if completion-event publication fails.
+         */
+        void publish(ITensor *tensor) const;
+
+    private:
+        friend class IComputeStage;
+
+        StageGPUExecution(DeviceId device, void *stream);
+
+        DeviceId device_;
+        void *stream_;
+    };
 
     /**
      * @brief Base class for all compute stages
@@ -356,6 +606,152 @@ namespace llaminar2
      * Derived classes implement device-specific kernels while maintaining
      * a common interface for orchestration.
      */
+    /**
+     * @brief Declares when a stage needs work outside its captured graph body.
+     *
+     * Graph launch preparation is deliberately a typed lifecycle contract. A
+     * capture-only stage may initialize persistent streams, import an existing
+     * producer event, or bind a stable device pointer before native capture.
+     * Once captured, that work is represented by the graph and does not have to
+     * be repeated by its launcher. A capture-and-replay stage, by contrast,
+     * publishes mutable metadata from outside the graph before every replay and
+     * therefore cannot be cloned into a fully device-controlled parent loop.
+     */
+    enum class GraphLaunchPreparationPolicy : uint8_t
+    {
+        None,
+        CaptureOnly,
+        CaptureAndReplay,
+    };
+
+    /**
+     * @brief Identifies the lifecycle boundary requesting graph preparation.
+     */
+    enum class GraphLaunchPreparationPhase : uint8_t
+    {
+        Capture,
+        Replay,
+    };
+
+    /**
+     * @brief Typed lifecycle transition around one native graph recording.
+     *
+     * Launch preparation establishes immutable resources before capture, but
+     * a background authority may also need to know when an admitted stream is
+     * temporarily unavailable for external event publication.  Entering is
+     * delivered immediately before the backend `beginCapture()` call. Exactly
+     * one Completed or Aborted transition follows every successful Entering,
+     * including when backend capture itself refuses to start.
+     */
+    enum class GraphCaptureActivityTransition : uint8_t
+    {
+        Entering = 0, ///< The exact stage stream is about to enter native capture.
+        Completed,   ///< Native capture closed and the recorded unit is retained.
+        Aborted,     ///< Capture did not produce a usable retained unit.
+    };
+
+    /**
+     * @brief Declare how one intentional manual graph boundary is scheduled.
+     *
+     * Most manual stages sit between separately submitted native executables;
+     * their host completion is therefore the launch permission for the next
+     * executable. A retained heterogeneous ticket transaction is different:
+     * one complete GPU parent is submitted first and its captured consumers
+     * wait on mapped, release/acquire ticket state while the rank worker
+     * services CPU stages. Only stages whose complete protocol has that exact
+     * property may select @ref ConcurrentTicketService.
+     */
+    enum class ManualGraphBoundaryScheduling : uint8_t
+    {
+        BetweenExecutableLaunches = 0, ///< Host completion precedes the next native launch.
+        ConcurrentTicketService, ///< Pre-armed host work overlaps one retained parent submission.
+    };
+
+    /**
+     * @brief Failure-drain role within a concurrent manual ticket service.
+     *
+     * A retained parent may already be waiting on a mapped return ticket when
+     * CPU execution fails. Exactly the stages that own such a return
+     * publication advertise @ref DeviceIngressPublisher. The executor asks
+     * every advertised publisher to release its consumer with an authenticated
+     * abort record before fencing the failed parent. Other service stages do
+     * not own a device-visible terminal and therefore advertise @ref None.
+     */
+    enum class ConcurrentManualFailureRole : uint8_t
+    {
+        None = 0,
+        DeviceIngressPublisher,
+    };
+
+    /**
+     * @brief Lifetime over which one successful prepared-weight proof remains valid.
+     *
+     * PerExecution is the conservative default for stages whose engine bindings
+     * can change without another typed authority validating the replacement.
+     * StageLifetime may be selected only when construction/publication owns an
+     * immutable prepared representation and every mutable runtime bank performs
+     * its own generation/epoch proof before use.
+     */
+    enum class PreparedWeightValidationLifetime : uint8_t
+    {
+        PerExecution = 0, ///< Revalidate prepared bindings before every stage invocation.
+        StageLifetime,   ///< One successful setup proof covers this stage object's lifetime.
+    };
+
+    /**
+     * @brief Return whether @p policy requires work at @p phase.
+     */
+    [[nodiscard]] constexpr bool requiresGraphLaunchPreparation(
+        GraphLaunchPreparationPolicy policy,
+        GraphLaunchPreparationPhase phase) noexcept
+    {
+        return policy == GraphLaunchPreparationPolicy::CaptureAndReplay ||
+               (policy == GraphLaunchPreparationPolicy::CaptureOnly &&
+                phase == GraphLaunchPreparationPhase::Capture);
+    }
+
+    /**
+     * @brief Outcome of planning one CPU verifier-state snapshot commit.
+     *
+     * CPU MTP publication validates every recurrent-state copy before any live
+     * state changes.  The publisher can then execute all independent layer
+     * copies in one OpenMP team instead of serializing one `memcpy` per stage.
+     * A typed status keeps an unsupported stage distinct from a valid no-op
+     * request whose accepted row is negative.
+     */
+    enum class CPUVerifierStateRestorePlanStatus : uint8_t
+    {
+        Unsupported,
+        NoOp,
+        Ready,
+        Invalid,
+    };
+
+    /**
+     * @brief Immutable byte-copy plan for one CPU-owned verifier-state stage.
+     *
+     * `source` points at the selected post-verifier snapshot and `destination`
+     * points at that stage's live CPU state. Both allocations remain owned by
+     * the stage/workspace that produced the plan and must stay valid until the
+     * enclosing publication transaction finishes. Publication copies these
+     * bytes verbatim; it never replays recurrence math.
+     */
+    struct CPUVerifierStateRestorePlan
+    {
+        CPUVerifierStateRestorePlanStatus status =
+            CPUVerifierStateRestorePlanStatus::Unsupported;
+        void *destination = nullptr;
+        const void *source = nullptr;
+        size_t bytes = 0;
+
+        /** @brief Return true when this plan describes a concrete byte copy. */
+        [[nodiscard]] bool ready() const noexcept
+        {
+            return status == CPUVerifierStateRestorePlanStatus::Ready &&
+                   destination != nullptr && source != nullptr && bytes > 0;
+        }
+    };
+
     class IComputeStage
     {
     public:
@@ -373,12 +769,87 @@ namespace llaminar2
          * host-side sequence state after graph replay use this metadata to keep
          * KV heads, recurrent state, and future row-selection logic aligned to
          * the real token count rather than the padded execution length.
+         *
+         * `token_offset` is the absolute logical request offset for the first
+         * real row in this replay.  It must stay synchronized with position-id
+         * generation and restored-prefix suffix prefill so stateful stages do
+         * not accidentally append or interpret rows at prompt offset zero.
          */
         struct PrefillReplayParams
         {
             int real_seq_len = 0;   ///< Real, non-padding token count in this replay.
             int bucket_seq_len = 0; ///< Fixed graph execution length for this replay.
-            int token_offset = 0;   ///< Offset of this chunk within the original prompt.
+            int token_offset = 0;   ///< Absolute offset of the first real replay token.
+        };
+
+        /**
+         * @brief Root-authoritative identity for one graph-native MoE collective transaction.
+         *
+         * Graph capture can materialize the continuation and expert-only
+         * participant graphs at different times.  A stage-local execution
+         * counter therefore cannot name a distributed transaction: capture,
+         * recapture, and graph-cache eviction would make independently built
+         * stages disagree even though they are servicing the same request
+         * chunk.  The runner stamps this immutable pair before graph
+         * execution, and every sparse dispatch/return stage uses it to derive
+         * its wire key.
+         *
+         * The values are host-side control metadata for explicit manual
+         * sparse-collective boundaries. They do not create a host mirror of a
+         * device tensor and they do not change captured GPU topology.
+         */
+        struct MoEOverlayCollectiveRuntimeParams
+        {
+            /** Mathematical phase carried across an explicit sparse boundary. */
+            enum class ExecutionSemantics : uint8_t
+            {
+                Unspecified,
+                Decode,
+                Prefill,
+                MTPDraft,
+                GroupedVerifier,
+            };
+
+            uint64_t generation_id = 0; ///< Monotonic request-generation authority; zero is invalid.
+            uint64_t step_id = 0;       ///< Absolute logical operation offset within that generation.
+            /** Typed phase; a one-row prefill remains Prefill. */
+            ExecutionSemantics execution_semantics =
+                ExecutionSemantics::Unspecified;
+            /**
+             * MTP graph namespace depth selected by the controller.
+             *
+             * Main decode/prefill use -1. A NextN sidecar uses its declared
+             * sidecar graph depth (currently zero), while a grouped verifier
+             * uses the admitted speculative draft depth. This value is never
+             * inferred from a physical graph bucket.
+             */
+            int mtp_depth = -1;
+
+            /**
+             * Exact immutable residency epoch selected for this graph sequence.
+             *
+             * A heterogeneous MTP sequence may span several retained graphs
+             * while background maintenance publishes a successor placement.
+             * Every manual sparse boundary must therefore consume this exact
+             * epoch rather than independently sampling the newest host
+             * publication. Zero means the caller has no sequence-level
+             * placement authority and preserves process-local admission.
+             */
+            uint64_t placement_epoch = 0;
+
+            /** @brief Return true when the runner supplied a usable protocol identity. */
+            [[nodiscard]] bool valid() const noexcept { return generation_id != 0; }
+            /** @return Whether the mathematical phase was supplied explicitly. */
+            [[nodiscard]] bool hasExecutionSemantics() const noexcept
+            {
+                return execution_semantics !=
+                       ExecutionSemantics::Unspecified;
+            }
+            /** @return Whether the caller pinned one exact residency epoch. */
+            [[nodiscard]] bool hasPinnedPlacementEpoch() const noexcept
+            {
+                return placement_epoch != 0;
+            }
         };
 
         /**
@@ -434,6 +905,19 @@ namespace llaminar2
         virtual ComputeStageType type() const = 0;
 
         /**
+         * @brief Report whether executing this stage participates in a collective.
+         *
+         * Stages with unconditional collective semantics inherit the canonical
+         * enum mapping. A future stage whose collective behavior depends on its
+         * parameters can override this method, keeping capture policy tied to
+         * the actual stage instance rather than another orchestration-side list.
+         */
+        virtual bool isCollectiveStage() const
+        {
+            return isCollectiveComputeStageType(type());
+        }
+
+        /**
          * @brief Human-readable name (for profiling/logging)
          */
         virtual std::string name() const
@@ -470,6 +954,7 @@ namespace llaminar2
          */
         const StageDumpInfo &getDumpInfo() const
         {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
             if (!dump_info_cached_)
             {
                 cached_dump_info_ = buildDumpInfoImpl();
@@ -479,11 +964,47 @@ namespace llaminar2
         }
 
         /**
+         * @brief Return a stable copy of cached dump info.
+         *
+         * Use this in executor/debug paths that pass StageDumpInfo across
+         * callbacks, stream waits, async dump queues, or other code that should
+         * not observe a concurrent cache refresh.
+         */
+        StageDumpInfo getDumpInfoSnapshot() const
+        {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
+            if (!dump_info_cached_)
+            {
+                cached_dump_info_ = buildDumpInfoImpl();
+                dump_info_cached_ = true;
+            }
+            return cached_dump_info_;
+        }
+
+        /**
+         * @brief Rebuild dump info under the cache lock and return a stable copy.
+         *
+         * Post-execute debug consumers use this when stages may have populated
+         * outputs or diagnostic tensors during execute().
+         */
+        StageDumpInfo refreshDumpInfoSnapshot() const
+        {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
+            cached_dump_info_ = buildDumpInfoImpl();
+            dump_info_cached_ = true;
+            return cached_dump_info_;
+        }
+
+        /**
          * @brief Invalidate cached dump info (for dynamic reconfiguration)
          *
          * Call this if stage parameters change after construction (rare).
          */
-        void invalidateDumpInfoCache() const { dump_info_cached_ = false; }
+        void invalidateDumpInfoCache() const
+        {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
+            dump_info_cached_ = false;
+        }
 
         /**
          * @brief Get buffer requirements for this stage
@@ -504,7 +1025,8 @@ namespace llaminar2
          * uses this contract (instead of StageDumpInfo) to drive coherence:
          *
          *   1. For each input binding: arena.prepareForRead(id, device)
-         *   2. For each weight tensor: tensor->ensureOnDevice(device)
+         *   2. For each weight tensor: TransferEngine prepares the exact
+         *      device allocation on the stage's explicit stream
          *   3. For each output binding: arena.prepareForWrite(id, device)
          *   4. stage->execute(ctx)
          *   5. For each output/inout: arena.markWritten(id, device, stream)
@@ -517,7 +1039,7 @@ namespace llaminar2
          *   - Weights use direct ITensor* (external, read-only)
          *   - KV caches are out of scope (managed by IKVCache)
          *   - Effective dimensions (M in GEMM) are stage-internal
-         *   - updateDynamicParams/onGraphReplayed remain orthogonal
+         *   - updateDynamicParams remains orthogonal
          *
          * @return StageBufferContract (empty if not migrated)
          */
@@ -584,6 +1106,21 @@ namespace llaminar2
         virtual bool isGraphCapturable() const { return true; }
 
         /**
+         * @brief Whether this immutable graph role performs no execution work.
+         *
+         * Returning true permits a graph-capture wave contract to mark this
+         * node as a passive participant. The stage must then be a complete
+         * no-op for its graph-bound role: execute() may not enqueue device
+         * work, mutate host state, publish coherence, or allocate storage.
+         * Generic orchestration uses this opt-in to omit the node from the
+         * local executable while still joining a sibling's begin/end capture
+         * rendezvous. Shape-dependent or runtime-dependent no-op decisions
+         * must return false because capture topology cannot depend on live
+         * tensor values.
+         */
+        virtual bool isPassiveGraphCaptureNoOp() const { return false; }
+
+        /**
          * @brief Variant signature for graph-captured launch topology.
          *
          * Most stages have a single stable graph-capture topology and return 0.
@@ -599,16 +1136,40 @@ namespace llaminar2
         virtual uint64_t graphCaptureVariantSignature() const { return 0; }
 
         /**
-         * @brief Whether warmup can make a cold stage graph-capturable.
+         * @brief Declare how long validatePreparedWeights() remains authoritative.
          *
-         * Stages return true here when their backend and shape support graph
-         * capture in principle, but their cold isGraphCapturable() answer may
-         * remain false until the first warmup execution creates runtime tables,
-         * descriptor banks, kernels, or scratch. The segmented planner may place
-         * these stages in capturable segments before warmup; the capture phase
-         * then hard-fails if isGraphCapturable() is still false.
+         * The default deliberately repeats validation. A stage opting into
+         * StageLifetime must document the immutable owner that prevents its
+         * prepared bindings from changing behind a retained execution plan.
          */
-        virtual bool supportsWarmupDependentGraphCapture() const { return false; }
+        virtual PreparedWeightValidationLifetime
+        preparedWeightValidationLifetime() const noexcept
+        {
+            return PreparedWeightValidationLifetime::PerExecution;
+        }
+
+        /**
+         * @brief Whether explicit launch preparation can make this stage capture-ready.
+         *
+         * A stage returns true when its immutable graph topology is supported but
+         * isGraphCapturable() remains false until prepareGraphLaunch() binds
+         * persistent kernels, descriptor tables, scratch pointers, or events.
+         * Preparation must never execute model arithmetic. The planner may admit
+         * such a stage provisionally, then requires preparation to make the
+         * stricter isGraphCapturable() predicate true before beginCapture().
+         */
+        virtual bool supportsGraphCaptureAfterLaunchPreparation() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Human-readable readiness details when launch preparation fails.
+         *
+         * Returned text is diagnostic only. It must not allocate device memory or
+         * mutate stage state because callers invoke it on fatal capture failures.
+         */
+        virtual std::string graphCaptureReadinessDebugString() const { return {}; }
 
         /**
          * @brief Whether a capturable stage must start a fresh graph segment.
@@ -652,6 +1213,49 @@ namespace llaminar2
         virtual bool manualGraphBoundaryComplete() const { return true; }
 
         /**
+         * @brief Return the exact scheduling contract for this manual stage.
+         *
+         * The conservative default keeps the stage between native launches.
+         * Selecting concurrent service requires immutable mapped ticket
+         * addresses, a captured device-side wait, and no arena-owned payload
+         * dependency that would otherwise rely on host sequencing.
+         */
+        virtual ManualGraphBoundaryScheduling
+        manualGraphBoundaryScheduling() const noexcept
+        {
+            return ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
+        }
+
+        /**
+         * @brief Identify whether this stage can release a waiting parent on failure.
+         *
+         * This is meaningful only for @ref ConcurrentTicketService stages.
+         * The executor rejects a concurrent manual unit with no device-ingress
+         * publisher, preventing a CPU error from stranding a retained GPU graph.
+         */
+        virtual ConcurrentManualFailureRole
+        concurrentManualFailureRole() const noexcept
+        {
+            return ConcurrentManualFailureRole::None;
+        }
+
+        /**
+         * @brief Publish an authenticated abort for this stage's device ingress.
+         *
+         * The default rejects the operation. A stage advertising
+         * @ref ConcurrentManualFailureRole::DeviceIngressPublisher must
+         * override it and make the call idempotent for a payload already
+         * published successfully in the current transaction.
+         *
+         * @return True when the captured consumer is guaranteed to make
+         *         progress; false when the parent cannot be drained safely.
+         */
+        virtual bool publishConcurrentManualFailure() noexcept
+        {
+            return false;
+        }
+
+        /**
          * @brief True when the stage captured mutable verifier-row state.
          *
          * MTP verifier forwards may compute multiple candidate rows in one
@@ -685,6 +1289,51 @@ namespace llaminar2
             (void)row;
             (void)stream;
             return false;
+        }
+
+        /**
+         * @brief Restore one host-selected verifier row per CPU request.
+         *
+         * `host_row_indices[request]` contains a flat verifier snapshot row;
+         * negative values leave that request's live state unchanged.  Native
+         * CPU grouped stages must restore the complete vector in one call so
+         * scalar publication cannot overwrite one shared layer state or clear
+         * capture bindings between requests.
+         */
+        virtual bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream = nullptr)
+        {
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Plan a byte-exact single-request CPU state publication.
+         *
+         * The method validates @p row and exposes the already-computed snapshot
+         * span without mutating live state. The MTP publisher first gathers and
+         * validates plans from every captured stage, then copies all `Ready`
+         * spans in one persistent OpenMP region. This two-phase contract makes
+         * malformed publication atomic and removes serial per-layer memory
+         * bandwidth from the decode hot path.
+         *
+         * A negative row is a valid `NoOp`: that request accepted no verifier
+         * row and retains its pre-transaction live state. GPU stages and CPU
+         * stages without native snapshot spans return `Unsupported`; a required
+         * captured CPU stage returning that status is a fatal publication
+         * contract violation, not permission to call a slower path.
+         *
+         * @param row Flat verifier snapshot row selected for the request.
+         * @return Typed immutable restore plan whose storage remains stage-owned.
+         */
+        virtual CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row)
+        {
+            (void)row;
+            return {};
         }
 
         /**
@@ -736,6 +1385,60 @@ namespace llaminar2
             (void)stream;
             return false;
         }
+
+        /**
+         * @brief Publish request-local terminal states from device real lengths.
+         *
+         * Padded request-batched prefill owns one captured state row per flat
+         * `(request,row)` coordinate. Implementations derive each terminal row
+         * as `request * request_row_width + real_length - 1` on @p stream and
+         * restore all request-owned live states without exposing row indices to
+         * the host. The default is a hard failure.
+         */
+        virtual bool restoreVerifierStateCaptureRequestTerminalRows(
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream)
+        {
+            (void)device_request_seq_lens;
+            (void)request_count;
+            (void)request_row_width;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Report that grouped request execution already committed live state.
+         *
+         * Long request-batched prefill may reserve only a small MTP verifier
+         * snapshot window. When that window cannot cover the complete flattened
+         * request matrix, conforming grouped kernels execute directly against
+         * request-owned live state banks and need no post-graph restore. Stages
+         * must return true only for that exact backend policy and geometry.
+         */
+        virtual bool requestBatchedTerminalStateCommittedDuringExecution(
+            int request_count,
+            int request_row_width) const
+        {
+            (void)request_count;
+            (void)request_row_width;
+            return false;
+        }
+
+        /**
+         * @brief Detach verifier-row scratch from a shared kernel after publication.
+         *
+         * Some GPU recurrent kernels are shared between the all-position verifier
+         * graph and the ordinary one-token decode graph.  The verifier graph binds
+         * speculative capture/work buffers so it can snapshot every candidate row
+         * without mutating live state.  After accepted-state publication restores
+         * the chosen row into live device state, the next ordinary decode must no
+         * longer see those speculative buffers as active.  Stages that multiplex a
+         * shared backend kernel override this hook to leave the live state resident
+         * while clearing only the verifier-capture binding.
+         */
+        virtual void clearVerifierStateCaptureBindingAfterPublication() {}
 
         /**
          * @brief Whether this stage allows all-zero output tensors
@@ -801,17 +1504,132 @@ namespace llaminar2
          *
          * @param stream Opaque GPU stream pointer (hipStream_t / cudaStream_t as void*)
          */
-        void setGPUStream(void *stream) { gpu_stream_ = stream; }
+        void setGPUStream(void *stream)
+        {
+            if (device_id_.is_gpu() && !stream)
+            {
+                throw std::invalid_argument(
+                    "IComputeStage::setGPUStream refuses a null stream for GPU stage on " +
+                    device_id_.toString());
+            }
+            gpu_stream_ = stream;
+        }
 
         /**
-         * @brief Get the GPU stream for kernel dispatch
+         * @brief Report whether the executor has bound an explicit GPU stream.
          *
-         * Returns the stream assigned by the executor, or nullptr if none was set.
-         * GPU kernel wrapper functions should pass this to their launch calls.
+         * This is the only non-throwing stream-state query. Schedulers, graph
+         * binders, and hardware-free tests may use it before execution to decide
+         * whether a stage still needs a binding. Compute code must use
+         * gpuStream() or requireGPUStream() so a missing GPU stream cannot flow
+         * into a kernel launch, transfer, or completion publication as nullptr.
          *
-         * @return Opaque GPU stream pointer (nullptr = use default stream)
+         * @return true when an explicit stream is currently bound.
          */
-        void *gpuStream() const { return gpu_stream_; }
+        bool hasGPUStream() const noexcept { return gpu_stream_ != nullptr; }
+
+        /**
+         * @brief Test whether two GPU stages share one exact execution stream.
+         *
+         * Paired producer/completion nodes use this typed relation instead of
+         * retrieving two opaque pointers and accidentally treating null as a
+         * valid shared stream. CPU stages and either unbound GPU stage always
+         * return false.
+         */
+        bool sharesExactGPUStreamWith(
+            const IComputeStage &other) const noexcept
+        {
+            return device_id_.is_gpu() && other.device_id_.is_gpu() &&
+                   gpu_stream_ && other.gpu_stream_ &&
+                   gpu_stream_ == other.gpu_stream_;
+        }
+
+        /**
+         * @brief Get the stream used by this stage's current execution.
+         *
+         * CPU stages have no GPU stream and return nullptr. GPU stages must have
+         * been bound by the executor; retrieving an unbound GPU stream is a
+         * fatal programming error. This contract deliberately makes the CUDA or
+         * HIP default stream unavailable as an implicit fallback.
+         *
+         * @return Exact GPU stream, or nullptr only for a CPU stage.
+         * @throws std::logic_error when a GPU stage has not been bound.
+         */
+        void *gpuStream() const
+        {
+            if (device_id_.is_gpu() && !gpu_stream_)
+            {
+                throw std::logic_error(
+                    "IComputeStage::gpuStream found no explicit stream for GPU stage on " +
+                    device_id_.toString());
+            }
+            return gpu_stream_;
+        }
+
+        /**
+         * @brief Return the exact stream bound to this GPU stage.
+         *
+         * GPU execution and publication code may use this accessor when it also
+         * wants to reject accidental use from a CPU stage. Both this method and
+         * gpuStream() reject an unbound GPU stage; requireGPUStream() additionally
+         * rejects CPU callers.
+         *
+         * @return Exact non-null stream assigned by the graph executor.
+         * @throws std::logic_error when called for a CPU stage or before the
+         *         executor has bound the GPU stage to its execution stream.
+         */
+        void *requireGPUStream() const
+        {
+            if (!device_id_.is_gpu())
+            {
+                throw std::logic_error(
+                    "IComputeStage::requireGPUStream called for non-GPU stage on " +
+                    device_id_.toString());
+            }
+            if (!gpu_stream_)
+            {
+                throw std::logic_error(
+                    "IComputeStage::requireGPUStream found no explicit stream for GPU stage on " +
+                    device_id_.toString());
+            }
+            return gpu_stream_;
+        }
+
+        /**
+         * @brief Return the immutable execution authority for this GPU stage.
+         *
+         * New stage code should retain this value for the duration of an
+         * execution method and use it for both kernel binding/launch and output
+         * publication. Unlike separate calls to device() and gpuStream(), the
+         * token cannot be assembled from unrelated values.
+         *
+         * @throws std::logic_error for CPU stages or an unbound GPU stage.
+         */
+        [[nodiscard]] StageGPUExecution gpuExecution() const
+        {
+            return StageGPUExecution(device_id_, requireGPUStream());
+        }
+
+        /**
+         * @brief Publish a stage output when this stage executes on a GPU.
+         *
+         * CPU kernels write host-authoritative tensor storage directly and
+         * therefore require no device publication. GPU kernels, by contrast,
+         * must publish through the executor-bound stream so downstream
+         * consumers inherit the exact producer event. Keeping that distinction
+         * in this shared helper prevents individual dual-backend stages from
+         * accidentally constructing a GPU execution token on their CPU path.
+         *
+         * This is intentionally not a permissive GPU fallback: a GPU stage
+         * without an executor-bound stream still fails through gpuExecution().
+         *
+         * @param tensor Tensor written by the stage kernel.
+         */
+        void publishStageOutput(ITensor *tensor) const
+        {
+            if (device_id_.is_gpu())
+                gpuExecution().publish(tensor);
+        }
 
         /**
          * @brief Update dynamic parameters for graph reuse
@@ -903,15 +1721,12 @@ namespace llaminar2
         /**
          * @brief Reset request-scoped state while preserving captured replay metadata.
          *
-         * A normal session reset may intentionally mark warmup-dependent
-         * backend metadata cold so the next execution warms and captures again.
-         * This hook is used only when the caller is keeping an already
-         * instantiated GPU graph executable alive across a request boundary.
-         * Derived stages must clear stream ownership and transient request
-         * mirrors, but must not invalidate descriptor tables, pointer slots, or
-         * other device metadata that the preserved graph launch reads by
-         * address. The default remains conservative for stages without a
-         * narrower contract.
+         * This hook is used only when the caller keeps an already instantiated
+         * GPU graph executable alive across a request boundary. Derived stages
+         * must clear request-local host bookkeeping without invalidating stream
+         * ownership, descriptor tables, pointer slots, or other persistent
+         * device metadata read by the preserved graph. A request reset must not
+         * force eager initialization or recapture.
          */
         virtual void resetSessionStatePreservingCapturedReplay()
         {
@@ -935,13 +1750,32 @@ namespace llaminar2
         }
 
         /**
+         * @brief Invalidate handles into backend-owned kernel-dynamic state.
+         *
+         * Kernel-dynamic state is separate from request-scoped model state and
+         * separate from immutable model weights. It includes backend-owned
+         * pointer tables, descriptor table IDs, dynamic argument buffers, and
+         * other launch metadata that kernels populate lazily for eager or graph
+         * replay execution. When the orchestrator calls
+         * KernelFactory::resetAllDynamicState(), cached ComputeGraphs may keep
+         * their stage objects, but any stage-local handles into the reset kernel
+         * metadata must be treated as stale.
+         *
+         * Implementations must not clear KV/GDN/MTP model state, graph topology,
+         * tensor bindings, workspace ownership, or prepared model weights here.
+         * They should only mark kernel-dynamic handles cold so the next eager
+         * warmup can rebuild them, and they should fail hard if asked to rebuild
+         * while GPU graph capture is already active.
+         */
+        virtual void invalidateKernelDynamicState() {}
+
+        /**
          * @brief Update prefill replay bookkeeping before a captured graph launch.
          *
          * The executor calls this on cached prefill graph hits before normal
-         * dynamic params are refreshed and before capture/replay callbacks can
-         * run. Decode graph replay continues to use updateDynamicParams() only.
-         * Stages should ignore this unless their dynamic device metadata or
-         * host-side replay callback must distinguish real tokens from padded
+         * dynamic params are refreshed. Decode graph replay continues to use
+         * updateDynamicParams() only. Stages should ignore this unless their
+         * dynamic device metadata must distinguish real tokens from padded
          * bucket rows.
          *
          * @param params Real-token and bucket metadata for the upcoming prefill replay.
@@ -960,6 +1794,31 @@ namespace llaminar2
         virtual bool hasPrefillReplayParams() const { return false; }
 
         /**
+         * @brief Stamp the next graph-native MoE sparse-collective transaction.
+         *
+         * The forward engine invokes this before either a cold graph execution
+         * or a cached graph replay. Implementations must retain only this
+         * scalar protocol identity; they must not allocate, synchronize, or
+         * upload request state from this hook.
+         *
+         * @param params Root-authoritative generation and logical step.
+         */
+        virtual void updateMoEOverlayCollectiveRuntimeParams(
+            const MoEOverlayCollectiveRuntimeParams &params)
+        {
+            (void)params;
+        }
+
+        /**
+         * @brief Return true when this stage requires explicit MoE protocol identity.
+         *
+         * The forward graph cache uses this opt-in query to update only sparse
+         * collective stages rather than scanning unrelated model operations on
+         * every execution.
+         */
+        virtual bool hasMoEOverlayCollectiveRuntimeParams() const { return false; }
+
+        /**
          * @brief Whether this stage can safely execute padded prefill buckets.
          *
          * Stateful prefill stages such as GDN recurrence and short convolution
@@ -971,32 +1830,42 @@ namespace llaminar2
         virtual bool supportsPaddedPrefillRealLengthContract() const { return false; }
 
         /**
-         * @brief Whether cold padded-prefill graph preflight may allow this stage.
+         * @brief Whether cold prefill graph preflight may allow this stage.
          *
-         * Padded bucket preflight can run before the first normal warmup pass,
-         * while some stages intentionally allocate kernels, descriptor tables,
-         * or scratch buffers during that warmup. Such stages should return true
-         * here when their backend and shape support fixed-bucket prefill capture
-         * in principle, and keep isGraphCapturable() as the stricter
-         * capture-time readiness check.
+         * Cold preflight runs before the first normal warmup pass, while some
+         * stages intentionally allocate backend state, descriptor tables, or
+         * scratch buffers during that warmup. Such stages should return true
+         * here when their backend and shape support prefill capture in
+         * principle, and keep isGraphCapturable() as the stricter capture-time
+         * readiness check.
          *
          * The default preserves legacy behavior for existing stages: if a stage
-         * has no separate cold-support contract, padded preflight still requires
-         * normal graph-capture readiness.
+         * has no separate cold-support contract, preflight still requires normal
+         * graph-capture readiness.
          */
-        virtual bool supportsPaddedPrefillGraphCapturePreflight() const { return isGraphCapturable(); }
+        virtual bool supportsLazyPrefillGraphCapturePreflight() const { return isGraphCapturable(); }
 
         /**
-         * @brief Prepare mutable device metadata before a captured graph launch.
+         * @brief Whether cold padded-prefill graph preflight may allow this stage.
          *
-         * Device graphs may read tiny metadata buffers whose contents change
-         * between launches while the graph topology stays fixed, such as
-         * row-select indices for bucketed prefill or compact verifier rows.
-         * The executor calls this after it has rebound workspace ownership and
-         * assigned an explicit stream, but before starting capture or replaying
-         * an already captured segment. Implementations may enqueue small
-         * workspace uploads on @p stream, but must not allocate ad-hoc device
-         * memory or synchronize the device.
+         * Padded buckets also require supportsPaddedPrefillRealLengthContract()
+         * to ensure recurrent state commits only the real prompt prefix. Stages
+         * may override this when the padded fixed-bucket contract differs from
+         * exact-shape prefill support.
+         */
+        virtual bool supportsPaddedPrefillGraphCapturePreflight() const
+        {
+            return supportsLazyPrefillGraphCapturePreflight();
+        }
+
+        /**
+         * @brief Prepare stage state outside a captured graph launch.
+         *
+         * The executor calls this only at the lifecycle boundaries selected by
+         * graphLaunchPreparationPolicy(), after rebinding workspace ownership
+         * and assigning an explicit stream. Implementations may publish into
+         * persistent workspace or establish event ordering on @p stream, but
+         * must not allocate ad-hoc device memory or synchronize the device.
          *
          * @param ctx Device context for the launch.
          * @param stream Explicit backend stream used for the upcoming launch.
@@ -1011,35 +1880,43 @@ namespace llaminar2
         }
 
         /**
-         * @brief Whether this stage needs prepareGraphLaunch() callbacks.
+         * @brief Declare exactly when prepareGraphLaunch() is required.
          *
-         * Used by graph replay/capture code to avoid calling the hook on every
-         * stage in hot paths.
+         * The default is fully self-contained. Stages that return
+         * CaptureAndReplay are ineligible for device-controlled parent graph
+         * composition until their mutable launch state becomes device-owned.
          */
-        virtual bool needsGraphLaunchPreparation() const { return false; }
+        virtual GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const
+        {
+            return GraphLaunchPreparationPolicy::None;
+        }
 
         /**
-         * @brief Called after a captured GPU graph segment is replayed.
+         * @brief Publish a typed native-capture activity transition.
          *
-         * This method is invoked by DeviceGraphExecutor after launching a graph segment
-         * containing this stage (Phase 3 replay). It allows stages to perform
-         * host-side bookkeeping that would normally happen inside execute().
+         * Most stages own no resource that can be touched by a background
+         * thread, so the default is a no-op. A stage that lends its exact
+         * capture stream to another authority must override this method and
+         * make the Entering-to-terminal transition exception safe. The method
+         * must not allocate device memory, synchronize a stream/device, or
+         * submit model arithmetic.
          *
-         * Primary use case: KVCacheAppendStage advances the ring buffer head
-         * position and count after the replayed graph performs the actual GPU append.
-         * This MUST happen AFTER the graph replay (not before in updateDynamicParams)
-         * to preserve the invariant that get_cached_tokens() returns the PREVIOUS
-         * step's count during updateDynamicParams.
+         * @param ctx Device context that owns the capture.
+         * @param stream Exact non-null native capture stream.
+         * @param transition Lifecycle edge being published.
+         * @return true when the transition was accepted by every stage-owned
+         *         authority.
          */
-        virtual void onGraphReplayed() {}
-
-        /**
-         * @brief Returns true if this stage overrides onGraphReplayed().
-         *
-         * Used by DeviceGraphExecutor to precompute a list of stages needing
-         * post-replay callbacks, avoiding per-step hash map lookups.
-         */
-        virtual bool needsOnGraphReplayed() const { return false; }
+        virtual bool transitionGraphCaptureActivity(
+            IDeviceContext *ctx,
+            void *stream,
+            GraphCaptureActivityTransition transition)
+        {
+            (void)ctx;
+            (void)stream;
+            (void)transition;
+            return true;
+        }
 
     protected:
         /**
@@ -1056,7 +1933,7 @@ namespace llaminar2
         /**
          * @brief Build partial StageDumpInfo from this stage's bufferContract().
          *
-         * Populates the weight entries from the contract's weight_tensors list.
+         * Populates weight entries from both raw and prepared contract lists.
          * Stages that implement bufferContract() can call this in their
          * buildDumpInfoImpl() and then append inputs/outputs with dynamic dims:
          *
@@ -1078,6 +1955,11 @@ namespace llaminar2
                 const ITensor *w = contract.weight_tensors[i];
                 if (w)
                     info.addWeight("weight", w);
+            }
+            for (const auto &prepared : contract.prepared_weights)
+            {
+                if (prepared.source_tensor)
+                    info.addWeight("prepared_weight", prepared.source_tensor);
             }
             return info;
         }
@@ -1192,12 +2074,15 @@ namespace llaminar2
         }
 
         /**
-         * @brief Bind this stage's GPU stream to a kernel when available
+         * @brief Apply this stage's device-specific stream lifecycle to a kernel
          *
-         * Many stages repeat `kernel->setGPUStream(gpuStream())`. This helper
-         * centralizes that pattern while keeping behavior unchanged.
+         * GPU stages must bind the exact non-null producer stream assigned by
+         * the graph executor. CPU stages explicitly clear any stale GPU
+         * binding that may remain on a reused prepared kernel. Keeping both
+         * transitions behind this boundary prevents callers from representing
+         * GPU execution with a nullable raw stream.
          *
-         * @tparam KernelT Kernel type exposing setGPUStream(void*)
+         * @tparam KernelT Kernel type exposing the explicit GPU stream lifecycle
          * @param kernel Kernel pointer (may be nullptr)
          * @return The same kernel pointer for fluent usage
          */
@@ -1206,7 +2091,10 @@ namespace llaminar2
         {
             if (kernel)
             {
-                kernel->setGPUStream(gpuStream());
+                if (device_id_.is_gpu())
+                    gpuExecution().bind(kernel);
+                else
+                    kernel->clearGPUStreamBinding();
             }
             return kernel;
         }
@@ -1332,11 +2220,12 @@ namespace llaminar2
 
     private:
         DeviceId device_id_;         ///< Authoritative device (set via constructor, no default)
-        void *gpu_stream_ = nullptr; ///< GPU stream for kernel dispatch (nullptr = default stream)
+        void *gpu_stream_ = nullptr; ///< Explicit GPU stream; null means unbound, never a default stream.
 
         // Cached dump info (built once, reused for all subsequent calls)
         mutable StageDumpInfo cached_dump_info_;
         mutable bool dump_info_cached_ = false;
+        mutable std::mutex dump_info_mutex_;
 
         static bool shapesMatch(const std::vector<size_t> &actual,
                                 const std::vector<size_t> &expected,

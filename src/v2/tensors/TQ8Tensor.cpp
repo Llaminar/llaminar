@@ -27,9 +27,9 @@ namespace llaminar2
         {
             throw std::invalid_argument("TQ8Tensor: shape must have at least 2 dimensions [rows, kv_dim]");
         }
-        if (head_dim <= 0 || head_dim % 2 != 0)
+        if (head_dim != 64 && head_dim != 128 && head_dim != 256)
         {
-            throw std::invalid_argument("TQ8Tensor: head_dim must be positive and even");
+            throw std::invalid_argument("TQ8Tensor: head_dim must be 64, 128, or 256");
         }
 
         const size_t kv_dim = shape[shape.size() - 1];
@@ -38,9 +38,12 @@ namespace llaminar2
             throw std::invalid_argument("TQ8Tensor: kv_dim must be divisible by head_dim");
         }
 
-        block_bytes_ = (head_dim == 128)
-                           ? sizeof(TQ8Block_128)
-                           : sizeof(TQ8Block_64);
+        if (head_dim == 256)
+            block_bytes_ = sizeof(TQ8Block_256);
+        else if (head_dim == 128)
+            block_bytes_ = sizeof(TQ8Block_128);
+        else
+            block_bytes_ = sizeof(TQ8Block_64);
         blocks_per_row_ = kv_dim / static_cast<size_t>(head_dim);
 
         // Calculate total rows
@@ -142,14 +145,20 @@ namespace llaminar2
         const size_t bpr = blocks_per_row_;
         const size_t bb = block_bytes_;
         const uint8_t *row_src = raw_blocks_.data() + row_idx * bpr * bb;
-        alignas(64) float scratch[128];
+        alignas(64) float scratch[256];
 
         for (size_t h = 0; h < bpr; ++h)
         {
             float *head_dst = buffer + h * static_cast<size_t>(head_dim_);
             const uint8_t *block_src = row_src + h * bb;
 
-            if (head_dim_ == 128)
+            if (head_dim_ == 256)
+            {
+                const auto &head_ctx = turboquant_ctx_->for_layer(static_cast<int>(h));
+                const auto *block = reinterpret_cast<const TQ8Block_256 *>(block_src);
+                turboquant_dequantize_tq8<256>(*block, head_ctx, head_dst, scratch);
+            }
+            else if (head_dim_ == 128)
             {
                 const auto &head_ctx = turboquant_ctx_->for_layer(static_cast<int>(h));
                 const TQ8Block_128 *block = reinterpret_cast<const TQ8Block_128 *>(block_src);
@@ -209,15 +218,21 @@ namespace llaminar2
         {
             const float *row_src = src + r * kv_dim;
             uint8_t *row_dst = tensor->raw_blocks_.data() + r * bpr * bb;
-            alignas(64) float scratch0[128];
-            alignas(64) float scratch1[128];
+            alignas(64) float scratch0[256];
+            alignas(64) float scratch1[256];
 
             for (size_t h = 0; h < bpr; ++h)
             {
                 const float *head_src = row_src + h * static_cast<size_t>(head_dim);
                 uint8_t *block_dst = row_dst + h * bb;
 
-                if (head_dim == 128)
+                if (head_dim == 256)
+                {
+                    auto *block = reinterpret_cast<TQ8Block_256 *>(block_dst);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_quantize_tq8<256>(head_src, head_ctx, *block, scratch0, scratch1);
+                }
+                else if (head_dim == 128)
                 {
                     TQ8Block_128 *block = reinterpret_cast<TQ8Block_128 *>(block_dst);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
@@ -249,15 +264,21 @@ namespace llaminar2
         {
             const float *row_src = src_data + r * kv_dim;
             uint8_t *row_dst = raw_blocks_.data() + r * bpr * bb;
-            alignas(64) float scratch0[128];
-            alignas(64) float scratch1[128];
+            alignas(64) float scratch0[256];
+            alignas(64) float scratch1[256];
 
             for (size_t h = 0; h < bpr; ++h)
             {
                 const float *head_src = row_src + h * static_cast<size_t>(head_dim_);
                 uint8_t *block_dst = row_dst + h * bb;
 
-                if (head_dim_ == 128)
+                if (head_dim_ == 256)
+                {
+                    auto *block = reinterpret_cast<TQ8Block_256 *>(block_dst);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_quantize_tq8<256>(head_src, head_ctx, *block, scratch0, scratch1);
+                }
+                else if (head_dim_ == 128)
                 {
                     TQ8Block_128 *block = reinterpret_cast<TQ8Block_128 *>(block_dst);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
@@ -289,14 +310,20 @@ namespace llaminar2
         {
             float *row_dst = dst + r * kv_dim;
             const uint8_t *row_src = raw_blocks_.data() + r * bpr * bb;
-            alignas(64) float scratch[128];
+            alignas(64) float scratch[256];
 
             for (size_t h = 0; h < bpr; ++h)
             {
                 float *head_dst = row_dst + h * static_cast<size_t>(head_dim_);
                 const uint8_t *block_src = row_src + h * bb;
 
-                if (head_dim_ == 128)
+                if (head_dim_ == 256)
+                {
+                    const auto *block = reinterpret_cast<const TQ8Block_256 *>(block_src);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_dequantize_tq8<256>(*block, head_ctx, head_dst, scratch);
+                }
+                else if (head_dim_ == 128)
                 {
                     const TQ8Block_128 *block = reinterpret_cast<const TQ8Block_128 *>(block_src);
                     const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));

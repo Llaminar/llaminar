@@ -248,7 +248,13 @@ namespace llaminar2
 
             log_table(table.to_string());
 
-            // Degraded link warnings
+            /*
+             * Enumeration runs before model traffic. PCIe switches may use
+             * autonomous link-width and speed reduction while idle, so this
+             * snapshot is diagnostic rather than an actionable runtime
+             * failure. The table and structured inventory retain the exact
+             * negotiated values for explicit loaded-link diagnostics.
+             */
             for (const auto &gpu : gpus)
             {
                 if (gpu.pcie_degraded)
@@ -268,16 +274,16 @@ namespace llaminar2
                     const char *type_prefix = (gpu.type == DeviceType::CUDA) ? "cuda" : "rocm";
                     if (!gpu.pcie_bottleneck_bdf.empty())
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << gpu.local_device_id
-                                        << " link degraded: " << format_pcie_link(gpu)
-                                        << " — capable of " << cap_buf
-                                        << " (bottleneck at upstream bridge " << gpu.pcie_bottleneck_bdf << ")");
+                        LOG_DEBUG("  " << type_prefix << ":" << gpu.local_device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(gpu)
+                                       << "; capable of " << cap_buf
+                                       << " (narrowest upstream bridge " << gpu.pcie_bottleneck_bdf << ")");
                     }
                     else
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << gpu.local_device_id
-                                        << " link degraded: " << format_pcie_link(gpu)
-                                        << " — capable of " << cap_buf);
+                        LOG_DEBUG("  " << type_prefix << ":" << gpu.local_device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(gpu)
+                                       << "; capable of " << cap_buf);
                     }
                 }
             }

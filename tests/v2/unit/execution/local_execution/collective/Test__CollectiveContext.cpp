@@ -18,8 +18,10 @@
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "collective/test/CollectiveTestMocks.h"
 #include "config/TPDomain.h"
+#include "tensors/GpuTensorView.h"
 #include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
+#include <cstdint>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -38,7 +40,7 @@ protected:
         mock_router_raw_ = mock_router_.get();
 
         // Create mock backend
-        mock_backend_ = std::make_unique<MockCollectiveBackend>(CollectiveBackendType::MPI);
+        mock_backend_ = std::make_unique<MockCollectiveBackend>(CollectiveBackendType::HOST);
         mock_backend_raw_ = mock_backend_.get();
 
         // Configure router to return mock backend
@@ -157,7 +159,7 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceDelegatesToRouter)
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Execute allreduce
-    bool result = ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0));
+    bool result = ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu());
 
     // Verify router was called
     EXPECT_GE(mock_router_raw_->getBackendCallCount(), 1);
@@ -173,7 +175,7 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceDelegatesToBackend)
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Execute allreduce
-    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0));
+    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu());
 
     // Verify backend's allreduce was called
     EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 1);
@@ -189,7 +191,7 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceUsesBufferNumelWhenCountIsZe
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Execute allreduce with count=0 (should use buffer->numel())
-    ctx->executeAllreduce(buffer.get(), 0, DeviceId::cuda(0));
+    ctx->executeAllreduce(buffer.get(), 0, DeviceId::cpu());
 
     // Verify count was derived from buffer
     EXPECT_EQ(mock_backend_raw_->lastAllreduceCount(), 16);
@@ -284,7 +286,7 @@ TEST_F(Test__CollectiveContext, BuildDeviceGroupSetsCorrectScope_Local)
 
     // Execute operation to trigger group building
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
-    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0));
+    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu());
 
     // Verify group was built with LOCAL scope
     const auto &group = mock_router_raw_->lastGroup();
@@ -323,7 +325,7 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceFailsWithoutRouter)
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Should fail gracefully - backend required for multi-device
-    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0)));
+    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu()));
 }
 
 TEST_F(Test__CollectiveContext, ExecuteAllgatherFailsWithoutRouter)
@@ -362,7 +364,7 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceFailsWhenBackendReturnsNull)
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Should fail gracefully when backend is null
-    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0)));
+    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu()));
 }
 
 TEST_F(Test__CollectiveContext, MultiDeviceAllreduceFailsWhenBackendFails)
@@ -376,7 +378,161 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceFailsWhenBackendFails)
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Should propagate backend failure
-    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0)));
+    EXPECT_FALSE(ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu()));
+}
+
+TEST_F(
+    Test__CollectiveContext,
+    SuccessfulGPUAllreduceWithoutExactProducerStreamFailsHard)
+{
+    auto ctx = createContextWithMockRouter(
+        nullptr,
+        {DeviceId::cuda(0), DeviceId::cuda(1)});
+    GpuTensorView buffer(
+        reinterpret_cast<void *>(std::uintptr_t{0x1000}),
+        4,
+        4,
+        TensorType::FP32,
+        DeviceId::cuda(0));
+
+    EXPECT_THROW(
+        ctx->executeAllreduce(
+            &buffer, 16, DeviceId::cuda(0)),
+        std::runtime_error);
+    EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 1);
+}
+
+TEST_F(
+    Test__CollectiveContext,
+    SuccessfulGPUAllgatherWithoutExactProducerStreamFailsHard)
+{
+    auto ctx = createContextWithMockRouter(
+        nullptr,
+        {DeviceId::cuda(0), DeviceId::cuda(1)});
+    GpuTensorView local_input(
+        reinterpret_cast<void *>(std::uintptr_t{0x1000}),
+        2,
+        8,
+        TensorType::FP32,
+        DeviceId::cuda(0));
+    GpuTensorView full_output(
+        reinterpret_cast<void *>(std::uintptr_t{0x2000}),
+        2,
+        16,
+        TensorType::FP32,
+        DeviceId::cuda(0));
+
+    EXPECT_THROW(
+        ctx->executeAllgather(
+            &local_input,
+            &full_output,
+            2,
+            DeviceId::cuda(0)),
+        std::runtime_error);
+    EXPECT_EQ(mock_backend_raw_->allgatherCallCount(), 1);
+}
+
+TEST_F(
+    Test__CollectiveContext,
+    SuccessfulGPUAllgathervWithoutExactProducerStreamFailsHard)
+{
+    auto ctx = createContextWithMockRouter(
+        nullptr,
+        {DeviceId::cuda(0), DeviceId::cuda(1)});
+    GpuTensorView local_input(
+        reinterpret_cast<void *>(std::uintptr_t{0x1000}),
+        2,
+        8,
+        TensorType::FP32,
+        DeviceId::cuda(0));
+    GpuTensorView full_output(
+        reinterpret_cast<void *>(std::uintptr_t{0x2000}),
+        2,
+        16,
+        TensorType::FP32,
+        DeviceId::cuda(0));
+
+    EXPECT_THROW(
+        ctx->executeAllgatherv(
+            &local_input,
+            &full_output,
+            {8, 8},
+            {0, 8},
+            2,
+            DeviceId::cuda(0)),
+        std::runtime_error);
+    EXPECT_EQ(mock_backend_raw_->allgathervCallCount(), 1);
+}
+
+TEST_F(
+    Test__CollectiveContext,
+    SuccessfulGPUBroadcastWithoutExactProducerStreamFailsHard)
+{
+    auto ctx = createContextWithMockRouter(
+        nullptr,
+        {DeviceId::cuda(0), DeviceId::cuda(1)});
+    GpuTensorView buffer(
+        reinterpret_cast<void *>(std::uintptr_t{0x1000}),
+        4,
+        4,
+        TensorType::FP32,
+        DeviceId::cuda(0));
+
+    EXPECT_THROW(
+        ctx->executeBroadcast(
+            &buffer,
+            16,
+            0,
+            DeviceId::cuda(0)),
+        std::runtime_error);
+    EXPECT_EQ(mock_backend_raw_->broadcastCallCount(), 1);
+}
+
+TEST_F(
+    Test__CollectiveContext,
+    RejectsDeclaredGPUStorageBeforeCallingBackend)
+{
+    auto ctx = createContextWithMockRouter(
+        nullptr,
+        {DeviceId::cuda(0), DeviceId::cuda(1)});
+    auto host_buffer =
+        std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
+
+    EXPECT_THROW(
+        ctx->executeAllreduce(
+            host_buffer.get(), 16, DeviceId::cuda(0)),
+        std::invalid_argument);
+    EXPECT_EQ(mock_backend_raw_->allreduceCallCount(), 0);
+}
+
+TEST_F(
+    Test__CollectiveContext,
+    RejectsMismatchedGPUOutputBeforeCallingBackend)
+{
+    GpuTensorView local_input(
+        reinterpret_cast<void *>(std::uintptr_t{0x1000}),
+        2,
+        8,
+        TensorType::FP32,
+        DeviceId::cuda(0));
+    GpuTensorView wrong_device_output(
+        reinterpret_cast<void *>(std::uintptr_t{0x2000}),
+        2,
+        16,
+        TensorType::FP32,
+        DeviceId::cuda(1));
+    auto ctx = createContextWithMockRouter(
+        nullptr,
+        {DeviceId::cuda(0), DeviceId::cuda(1)});
+
+    EXPECT_THROW(
+        ctx->executeAllgather(
+            &local_input,
+            &wrong_device_output,
+            2,
+            DeviceId::cuda(0)),
+        std::invalid_argument);
+    EXPECT_EQ(mock_backend_raw_->allgatherCallCount(), 0);
 }
 
 // =============================================================================
@@ -461,10 +617,10 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceUsesCorrectOp)
     auto buffer = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 4});
 
     // Test with different operations
-    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_SUM);
+    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM);
     EXPECT_EQ(mock_backend_raw_->lastAllreduceOp(), CollectiveOp::ALLREDUCE_SUM);
 
-    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_MAX);
+    ctx->executeAllreduce(buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_MAX);
     EXPECT_EQ(mock_backend_raw_->lastAllreduceOp(), CollectiveOp::ALLREDUCE_MAX);
 }
 
@@ -495,7 +651,7 @@ TEST_F(Test__CollectiveContext, MultiDeviceAllreduceInDomainWithNullFallsBack)
 
     // Execute with nullptr domain - should fall back to regular allreduce
     bool result = ctx->executeAllreduceInDomain(
-        buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_SUM, nullptr);
+        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, nullptr);
 
     EXPECT_TRUE(result);
     // Regular allreduce should have been called via the router
@@ -523,7 +679,7 @@ TEST_F(Test__CollectiveContext, ExecuteAllreduceInDomainUsesCorrectBackend)
 
     // Execute with domain
     bool result = ctx->executeAllreduceInDomain(
-        buffer.get(), 16, DeviceId::cuda(0), CollectiveOp::ALLREDUCE_SUM, &gpu_domain);
+        buffer.get(), 16, DeviceId::cpu(), CollectiveOp::ALLREDUCE_SUM, &gpu_domain);
 
     EXPECT_TRUE(result);
     // Domain-aware backend selection should have been used

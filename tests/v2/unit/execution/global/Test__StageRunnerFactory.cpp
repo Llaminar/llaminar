@@ -491,8 +491,8 @@ namespace llaminar2::test
         // --- Stage 0: global TP shard (rank 1 perspective) ---
         // Simulated as a 1-rank domain using MPI_COMM_SELF
         auto [spec0, action0] = makeGlobalTPStage(0, 0, 0, false, /*tp_rank=*/0, 1);
-        action0.domain_name = "node_local_tp";
-        spec0.domain_name = "node_local_tp";
+        action0.domain_name = "node_tp";
+        spec0.domain_name = "node_tp";
 
         auto global_ctx = GlobalTPContext::createForTest(
             MPI_COMM_SELF, /*domain_id=*/0, /*world_ranks=*/{1}); // world rank 1
@@ -506,7 +506,7 @@ namespace llaminar2::test
 
         EXPECT_NE(entry0.runner, nullptr);
         EXPECT_EQ(entry0.stage_id, 0);
-        EXPECT_EQ(entry0.domain_name, "node_local_tp");
+        EXPECT_EQ(entry0.domain_name, "node_tp");
         EXPECT_NE(entry0.global_tp_ctx, nullptr);
         EXPECT_EQ(entry0.local_tp_ctx, nullptr);
         EXPECT_EQ(entry0.global_tp_ctx->degree(), 1);

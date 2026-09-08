@@ -1,6 +1,6 @@
 /**
- * @file Tensors.h
- * @brief Minimal tensor interface with device affinity
+ * @file TensorClasses.h
+ * @brief Tensor interfaces, storage ownership, and coherence contracts.
  *
  * ============================================================================
  * INTERFACE HIERARCHY AND USAGE
@@ -429,7 +429,8 @@ namespace llaminar2
          * symmetry, etc.) that describe how this format is packed for VNNI
          * kernels. Formats returning non-null are routed to NativeVNNI GEMV/GEMM.
          *
-         * @return Pointer to static metadata, or nullptr for non-VNNI formats (Q8_0, Q8_1)
+         * @return Pointer to static metadata, or nullptr when the tensor cannot be
+         *         represented by the native-VNNI packing contract.
          */
         virtual const NativeVnniFormatInfo *vnniFormatInfo() const { return nullptr; }
 
@@ -441,13 +442,25 @@ namespace llaminar2
          * output arrays in the VnniPackContext.  Super-block formats decompose
          * on the fly using (b / 8, b % 8) addressing.
          *
-         * Default is a no-op for non-VNNI formats (Q8_0, Q8_1).
+         * Default is a no-op for formats that use the generic pre-decoded INT8
+         * packing path rather than preserving a compressed native payload.
          *
-         * @param ctx  Packing context with output buffers and layout parameters
-         * @param n    Row index (output feature)
-         * @param b    Block index within the row (0 to blocks_per_row-1)
+         * The source and destination row coordinates are deliberately separate.
+         * A tensor-parallel slice reads a row in the original tensor while writing
+         * that row at a slice-local position in the packed representation. Keeping
+         * those coordinates distinct prevents nonzero row slices from silently
+         * repacking row zero.
+         *
+         * @param ctx Packing context with output buffers and layout parameters.
+         * @param source_n Row in this source tensor from which payload is read.
+         * @param destination_n Row in the packed destination to which payload is written.
+         * @param b Block index within the row (0 to blocks_per_row-1).
          */
-        virtual void packVnniBlock(const VnniPackContext &ctx, int n, int b) const {}
+        virtual void packVnniBlock(
+            const VnniPackContext &ctx,
+            int source_n,
+            int destination_n,
+            int b) const {}
 
         /**
          * @brief Unpack one quantized block to plain int8 values (native range, NO requantization)
@@ -649,6 +662,8 @@ namespace llaminar2
      * This allows concrete tensors to inherit type-safe typed_data() from TypedTensorBase
      * while still getting the full TensorBase infrastructure.
      */
+    class PreparedWeightStore;
+    class MappedHostTransferRegion;
     class TensorSlice;       // Forward declaration for friend
     struct MemoryDescriptor; // Forward declaration for friend
 
@@ -656,7 +671,29 @@ namespace llaminar2
     {
         friend class TensorSlice;                                         // Allow TensorSlice to access protected byte_size()/raw_host_data_ptr()
         friend class TransferEngine;                                      // Allow TransferEngine to access coherence state and pointers
+        friend class PreparedWeightStore;                                 // Allow the model-owned store to publish prepared representations
         friend MemoryDescriptor makeMemoryDescriptor(const TensorBase *); // Allow descriptor factory
+
+    private:
+        /**
+         * @brief Publish that a model-owned prepared representation exists.
+         *
+         * Only PreparedWeightStore may call this lifecycle hook. Keeping the
+         * mutation private prevents graph stages and transfer callers from
+         * suppressing raw-weight coherence without first registering the real,
+         * device-owned prepared representation.
+         *
+         * Tensor wrappers override this method and delegate to their storage
+         * owner so wrapper-local shadow state cannot disagree with the bytes
+         * consumed by a prepared kernel.
+         */
+        virtual void publishPreparedDeviceState()
+        {
+            has_prepared_device_state_ = true;
+        }
+
+        // PreparedWeightStore owns the corresponding allocation and lifecycle.
+        mutable bool has_prepared_device_state_ = false;
 
     public:
         virtual ~TensorBase(); // Implemented in TensorBase.cpp
@@ -672,17 +709,6 @@ namespace llaminar2
 
         // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
-
-        // Runtime hint: set when this tensor's device representation is managed
-        // by the prepared weight pipeline (PreparedWeightStore).
-        // Used by StageCoherence, TransferEngine, DeviceGraphExecutor, and
-        // WeightManager to skip raw uploads and determine host-release safety.
-        //
-        // Phase 8: This flag is a cheap O(1) alternative to mutex-guarded
-        // registry lookups on every stage boundary. It has NO lifecycle
-        // implications — TensorBase destructor does NOT use it.
-        // Cleanup is the exclusive responsibility of PreparedWeightStore.
-        mutable bool has_prepared_device_state_ = false;
 
         // Synchronizes cache_ initialization and reset
         mutable std::mutex packed_cache_mutex_;
@@ -743,7 +769,8 @@ namespace llaminar2
          */
         const void *active_data_ptr() const override
         {
-            return gpu_data_ptr_ ? gpu_data_ptr_ : raw_host_data_ptr();
+            const void *device_data = gpu_data_ptr();
+            return device_data ? device_data : raw_host_data_ptr();
         }
 
         /**
@@ -753,7 +780,8 @@ namespace llaminar2
          */
         void *active_mutable_data_ptr() override
         {
-            return gpu_data_ptr_ ? gpu_data_ptr_ : raw_host_data_ptr();
+            void *device_data = gpu_data_ptr();
+            return device_data ? device_data : raw_host_data_ptr();
         }
 
         // ===== Device Affinity API =====
@@ -809,9 +837,29 @@ namespace llaminar2
          * For dual-residency (data on both CPU and GPU), returns GPU device.
          *
          * @return std::optional<DeviceId> - nullopt for host/CPU only, DeviceId for GPU
-         * @note This is non-virtual - uses TensorBase's gpu_device_ tracking
+         * Tensor wrappers must override this query together with transfer and
+         * pointer delegation. Otherwise a wrapper can expose its inner device
+         * pointer while reporting no owning device.
          */
-        std::optional<DeviceId> current_device() const { return gpu_device_; }
+        std::optional<DeviceId> current_device() const override { return gpu_device_; }
+
+        /**
+         * @brief Return the concrete tensor that owns transfer storage and coherence.
+         *
+         * Most tensors own their host buffer, device buffer, completion event,
+         * and coherence state directly, so the default owner is `this`.
+         * Structural wrappers such as TensorSlice must override this method and
+         * return the recursively resolved owner of their inner tensor.
+         *
+         * TransferEngine canonicalizes every public operation through this
+         * method before it reads or mutates storage state.  This prevents a
+         * wrapper's unused TensorBase fields from diverging from the backing
+         * tensor that its virtual pointer and coherence queries expose.
+         *
+         * @return Non-null tensor that owns the physical transfer state.
+         */
+        virtual TensorBase *transferStorageOwner() { return this; }
+        virtual const TensorBase *transferStorageOwner() const { return this; }
 
         // ===== Multi-Device Coherence API =====
 
@@ -819,7 +867,10 @@ namespace llaminar2
          * @brief Get the device that currently has authoritative data
          * @return DeviceId if a GPU is authoritative, nullopt if host is authoritative
          */
-        std::optional<DeviceId> getAuthoritativeDevice() const { return authoritative_device_; }
+        virtual std::optional<DeviceId> getAuthoritativeDevice() const
+        {
+            return authoritative_device_;
+        }
 
         /**
          * @brief Check if host memory is authoritative (has current data)
@@ -829,7 +880,10 @@ namespace llaminar2
          * - After ensureOnHost() synced from GPU
          * - Tensor has never been uploaded to GPU
          */
-        bool isHostAuthoritative() const { return !authoritative_device_.has_value(); }
+        bool isHostAuthoritative() const
+        {
+            return !getAuthoritativeDevice().has_value();
+        }
 
         /**
          * @brief Check if a specific device is authoritative
@@ -838,46 +892,10 @@ namespace llaminar2
          */
         bool isDeviceAuthoritative(DeviceId device) const
         {
-            return authoritative_device_.has_value() && *authoritative_device_ == device;
+            const auto authoritative_device = getAuthoritativeDevice();
+            return authoritative_device.has_value() &&
+                   *authoritative_device == device;
         }
-
-        /**
-         * @brief Transfer tensor data directly to another GPU device
-         *
-         * Uses ICollectiveBackend::copy() for direct P2P/BAR transfer.
-         * Does NOT go through host staging - this is a direct GPU-to-GPU copy.
-         *
-         * @param dst_device Target GPU device
-         * @return true on success, false if no backend supports this transfer
-         *
-         * @pre Tensor must have authoritative data on a GPU (call transitionTo(DEVICE_AUTHORITATIVE) first)
-         * @post getAuthoritativeDevice() == dst_device
-         * @post Source device buffer becomes stale
-         * @post Host buffer becomes stale (if it exists)
-         *
-         * @note Fails fast if no backend supports the transfer path.
-         *       Does NOT silently fall back to host staging.
-         *
-         * @example
-         *   tensor->ensureOnDevice(cuda0);
-         *   tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);  // GPU computed new values
-         *   tensor->transferTo(rocm0);    // Direct transfer, no host staging
-         */
-        bool transferTo(DeviceId dst_device, size_t bytes_override = 0);
-
-        /**
-         * @brief Copy tensor data to another GPU, keeping both devices valid
-         *
-         * Unlike transferTo(), this keeps the source device buffer valid.
-         * Useful for read-only sharing or when source needs to continue computing.
-         *
-         * @param dst_device Target GPU device
-         * @return true on success
-         *
-         * @post Both src and dst devices have valid data
-         * @post authoritative_device_ unchanged (source still authoritative)
-         */
-        bool copyTo(DeviceId dst_device);
 
         /**
          * @brief Check if tensor currently has valid data on the specified device
@@ -948,29 +966,18 @@ namespace llaminar2
          */
         virtual void invalidateGpuData();
 
+    private:
         /**
          * @brief Mark host storage as containing the newest tensor contents.
          *
-         * Use this after callers write host memory directly through
-         * raw_mutable_data() or an external receive path. Unlike mutable_data(),
-         * this does not try to download the previous device contents first.
+         * TransferEngine invokes this hook after a caller writes host memory
+         * directly through raw_mutable_data() or an external receive path.
+         * Unlike mutable_data(), this does not try to download previous device
+         * contents first.
          */
-        void mark_host_dirty() override
-        {
-            std::lock_guard<std::mutex> lock(coherence_mutex_);
-            if (is_mapped_)
-            {
-                setCoherenceState_(TensorCoherenceState::MAPPED);
-                mapped_needs_sync_ = false;
-            }
-            else
-            {
-                setCoherenceState_(gpu_data_ptr_ ? TensorCoherenceState::HOST_AUTHORITATIVE
-                                                 : TensorCoherenceState::HOST_ONLY);
-            }
-            authoritative_device_.reset();
-        }
+        virtual void publishHostWriteState();
 
+    public:
         /**
          * @brief Ensure tensor data is available on host (CPU)
          *
@@ -1001,28 +1008,15 @@ namespace llaminar2
         virtual void *gpu_data_ptr();
         virtual const void *gpu_data_ptr() const;
 
-        /**
-         * @brief Clear the device completion event without destroying it through the backend
-         *
-         * This is used during cross-device transfers (e.g., CUDA -> ROCm) where the
-         * event was created by a different backend. We can't destroy a CUDA event
-         * through the ROCm backend, so we just clear the pointer. The event will
-         * leak, but this only happens during PP transfers which are rare.
-         *
-         * @note Use this when transferring tensors between different GPU types
-         *       to avoid passing CUDA events to ROCm's hipEventRecord.
-         */
-        void clearCompletionEvent()
-        {
-            device_completion_event_ = nullptr;
-            event_device_.reset();
-        }
-
         /// @deprecated Use hostValid() or coherenceState() instead. Will be removed.
         bool isOnCPU() const { return ::llaminar2::isHostValid(coherence_state_); }
 
         /// @deprecated Use deviceValid() or coherenceState() instead. Will be removed.
-        bool isDeviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_) && gpu_data_ptr_ != nullptr; }
+        bool isDeviceValid() const
+        {
+            return ::llaminar2::isDeviceValid(coherenceState()) &&
+                   gpu_data_ptr() != nullptr;
+        }
 
         // ================================================================
         // New state-based coherence query API
@@ -1032,100 +1026,209 @@ namespace llaminar2
          * @brief Get the explicit coherence state of this tensor
          * @return Current TensorCoherenceState enum value
          */
-        TensorCoherenceState coherenceState() const { return coherence_state_; }
+        virtual TensorCoherenceState coherenceState() const
+        {
+            return coherence_state_;
+        }
 
         /**
          * @brief Get the memory residency type of this tensor
          * @return Current MemoryResidency enum value
          */
-        MemoryResidency memoryResidency() const { return memory_residency_; }
+        virtual MemoryResidency memoryResidency() const
+        {
+            return memory_residency_;
+        }
 
         /// True if host buffer contains valid data (safe for CPU read).
-        bool hostValid() const { return ::llaminar2::isHostValid(coherence_state_); }
+        bool hostValid() const
+        {
+            return ::llaminar2::isHostValid(coherenceState());
+        }
 
         /// True if device buffer is allocated AND contains valid data (safe for GPU kernel).
-        bool deviceValid() const { return ::llaminar2::isDeviceValid(coherence_state_) && gpu_data_ptr_ != nullptr; }
+        bool deviceValid() const
+        {
+            return ::llaminar2::isDeviceValid(coherenceState()) &&
+                   gpu_data_ptr() != nullptr;
+        }
 
         /// True if both host and device are in sync (no transfer needed).
-        bool isSynced() const { return coherence_state_ == TensorCoherenceState::SYNCED || coherence_state_ == TensorCoherenceState::MAPPED; }
+        bool isSynced() const
+        {
+            const auto state = coherenceState();
+            return state == TensorCoherenceState::SYNCED ||
+                   state == TensorCoherenceState::MAPPED;
+        }
 
         /// True if host was modified more recently and device needs upload.
-        bool needsUpload() const { return ::llaminar2::needsHostToDeviceUpload(coherence_state_); }
+        bool needsUpload() const
+        {
+            return ::llaminar2::needsHostToDeviceUpload(coherenceState());
+        }
 
         /// True if device was modified more recently and host needs download.
-        bool needsDownload() const { return ::llaminar2::needsDeviceToHostSync(coherence_state_); }
+        bool needsDownload() const
+        {
+            return ::llaminar2::needsDeviceToHostSync(coherenceState());
+        }
 
+    private:
         // ================================================================
-        // Public coherence transition API
+        // TransferEngine-owned coherence transition primitives
         // ================================================================
 
         /**
-         * @brief Explicitly transition this tensor's coherence state.
+         * @brief Wait for any host-source use, then destroy the completion event.
          *
-         * This is the preferred public API for coherence mutations that don't
-         * involve data movement (those go through TransferEngine or ensureOnDevice).
-         * Use this when you know the correct target state after an external operation
-         * (e.g., after a collective backend writes to the GPU buffer).
+         * Caller must hold coherence_mutex_. Event handles are backend-specific;
+         * missing ownership metadata is therefore a fatal lifecycle defect, not
+         * permission to leak or destroy through the tensor's current backend.
+         * Graph-owned publication must use
+         * @ref discardDeviceValueCompletionProtection_ instead: it may not block
+         * inference merely to retire an older H2D source lifetime.
+         */
+        void retireCompletionEvent_();
+
+        /**
+         * @brief Remove only the event's device-value producer meaning.
+         *
+         * A graph-owned write supersedes the prior device value, but an
+         * asynchronous H2D may still be reading the tensor's host allocation.
+         * This transition preserves that independent source-lifetime proof and
+         * never waits on the host.
+         */
+        void discardDeviceValueCompletionProtection_();
+
+        /**
+         * @brief Publish a graph-owned GPU write without a per-tensor event.
+         *
+         * TransferEngine is the sole public authority for invoking this hook.
+         * The owning graph boundary publishes externally visible completion
+         * after launch, either as a per-output tensor event or as explicit
+         * stream provenance for the next device-only consumer.
          *
          * Thread-safe: acquires coherence_mutex_.
          *
-         * @param new_state The target coherence state
-         * @param authoritative_dev Optional device that now has authoritative data.
-         *                          Required when transitioning to DEVICE_AUTHORITATIVE.
-         *                          Ignored for HOST_ONLY, HOST_AUTHORITATIVE, SYNCED.
-         *
-         * Valid transitions (enforced in debug builds):
-         *   Any → HOST_ONLY       (host has data, no device buffer)
-         *   Any → HOST_AUTHORITATIVE (host modified, device stale)
-         *   Any → DEVICE_AUTHORITATIVE (GPU modified, host stale)
-         *   Any → SYNCED           (both host and device valid)
-         *   Any → MAPPED           (shared memory, always in sync)
+         * @param device GPU that owns the written storage.
          */
-        void transitionTo(TensorCoherenceState new_state,
-                          std::optional<DeviceId> authoritative_dev = std::nullopt) override
+        virtual void publishGraphOwnedDeviceWriteState(DeviceId device)
         {
             std::lock_guard<std::mutex> lock(coherence_mutex_);
-            setCoherenceState_(new_state);
-            if (new_state == TensorCoherenceState::DEVICE_AUTHORITATIVE)
+            if (!device.is_gpu())
             {
-                authoritative_device_ = authoritative_dev.value_or(gpu_device_.value_or(DeviceId::cpu()));
+                throw std::invalid_argument(
+                    "Graph-owned device publication requires a GPU device");
             }
-            else if (new_state == TensorCoherenceState::HOST_ONLY ||
-                     new_state == TensorCoherenceState::HOST_AUTHORITATIVE)
+            if (!gpu_device_.has_value() || *gpu_device_ != device)
             {
-                authoritative_device_.reset();
+                throw std::runtime_error(
+                    "Graph-owned device publication does not match tensor storage");
             }
+
+            /* The graph supersedes only the previous device-value producer.
+             * An H2D source-lifetime proof remains live until host reuse or
+             * teardown observes its exact event. */
+            discardDeviceValueCompletionProtection_();
+            setCoherenceState_(
+                is_mapped_
+                    ? TensorCoherenceState::MAPPED
+                    : TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            authoritative_device_ = device;
+            mapped_needs_sync_ = is_mapped_;
         }
 
         /**
-         * @brief Transition coherence state AND record a GPU completion event.
+         * @brief Publish a completed copy that made host and device identical.
          *
-         * This combines transitionTo() state management with GPU event recording.
-         * Use this after GPU kernel writes when you need fine-grained sync
-         * (so ensureOnHost/ensureOnDevice can wait on the specific kernel rather
-         * than doing a full device synchronize).
+         * This hook deliberately has no state parameter, preventing callers
+         * from repurposing it for an eventless GPU write.
+         */
+        virtual void publishSynchronizedState()
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            retireCompletionEvent_();
+            setCoherenceState_(TensorCoherenceState::SYNCED);
+            authoritative_device_.reset();
+            mapped_needs_sync_ = false;
+        }
+
+        /**
+         * @brief Publish device authority after a blocking GPU write completed.
+         *
+         * TransferEngine is the sole public authority for invoking this hook.
+         * Unlike graph-owned publication, this state has no deferred producer:
+         * the backend operation completed before publication began. Any older
+         * event therefore describes obsolete work and is retired.
+         *
+         * @param device GPU whose storage contains the completed write.
+         *
+         * @throws std::invalid_argument if @p device is not a GPU.
+         * @throws std::runtime_error if the tensor's storage is absent or owned
+         *         by a different device.
+         */
+        virtual void publishCompletedDeviceWriteState(DeviceId device)
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            if (!device.is_gpu())
+            {
+                throw std::invalid_argument(
+                    "Completed device publication requires a GPU device");
+            }
+            if (!gpu_device_.has_value() || *gpu_device_ != device)
+            {
+                throw std::runtime_error(
+                    "Completed device publication does not match tensor storage");
+            }
+
+            retireCompletionEvent_();
+            setCoherenceState_(
+                is_mapped_
+                    ? TensorCoherenceState::MAPPED
+                    : TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            authoritative_device_ = device;
+            mapped_needs_sync_ = false;
+        }
+
+        /**
+         * @brief Publish a GPU write and record its completion event.
+         *
+         * During graph capture the graph controller owns the externally visible
+         * event; this hook validates and publishes device state while deferring
+         * the replay completion event to the controller.
          *
          * Thread-safe: acquires coherence_mutex_.
          *
-         * @param new_state The target coherence state (typically DEVICE_AUTHORITATIVE or MAPPED)
-         * @param authoritative_dev Device that now has authoritative data
-         * @param stream GPU stream to record the event on (nullptr = default stream)
+         * @param device Device that now has authoritative data.
+         * @param stream Exact non-null GPU producer stream on which to record.
+         *
+         * @throws std::invalid_argument if @p stream is null.
+         * @throws std::runtime_error if a required GPU event cannot be created,
+         *         recorded, or associated with the tensor's owning backend.
+         *         Coherence is not published when event publication fails.
          */
-        void transitionToWithEvent(TensorCoherenceState new_state,
-                                   std::optional<DeviceId> authoritative_dev = std::nullopt,
-                                   void *stream = nullptr);
+        virtual void publishDeviceWriteStateWithEvent(
+            DeviceId device,
+            void *stream);
+
+    public:
 
         /**
          * @brief Check if this tensor's GEMM weights are managed by the GPU pipeline
          *
          * When true, the tensor's GEMM representation lives in pooled VRAM owned
          * by the prepared weight pipeline (PreparedWeightStore).
-         * The raw host data may already be released.  Callers should skip
-         * ensureOnDevice() for such tensors — the kernel has its own device copy.
+         * The raw host data may already be released. This state proves that a
+         * prepared kernel representation exists for lifecycle/reclamation
+         * purposes; it is not raw TensorBase device residency and TransferEngine
+         * never treats it as a successful upload.
          *
          * @return true if this tensor has prepared device state
          */
-        bool hasPreparedDeviceState() const { return has_prepared_device_state_; }
+        virtual bool hasPreparedDeviceState() const
+        {
+            return has_prepared_device_state_;
+        }
 
         /**
          * @brief Check if tensor uses zero-copy mapped memory
@@ -1140,6 +1243,22 @@ namespace llaminar2
         bool isMapped() const { return is_mapped_; }
 
         /**
+         * @brief Return the TransferEngine region backing mapped tensor storage.
+         *
+         * A non-null result is the lifetime and endpoint-identity authority for
+         * @ref mapped_host_ptr_ and @ref mapped_device_ptr_. Ordinary tensors
+         * return null. Exposing the immutable owner lets a graph ticket reuse
+         * the exact tensor allocation without registering the pages again.
+         *
+         * @return Shared mapped-region owner, or null for ordinary storage.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion>
+        mappedHostTransferRegion() const noexcept
+        {
+            return mapped_transfer_region_;
+        }
+
+        /**
          * @brief Check if tensor is host-resident (never uploaded to device)
          * @return true if tensor is marked HOST_RESIDENT
          *
@@ -1148,7 +1267,10 @@ namespace llaminar2
          * Use this for weights that are consumed on CPU and repacked into a
          * device workspace by the kernel (e.g., embedding tables → EmbedQ8).
          */
-        bool isHostResident() const { return memory_residency_ == MemoryResidency::HOST_RESIDENT; }
+        bool isHostResident() const
+        {
+            return memoryResidency() == MemoryResidency::HOST_RESIDENT;
+        }
 
         /**
          * @brief Mark this tensor as host-resident (device uploads become no-ops)
@@ -1169,7 +1291,10 @@ namespace llaminar2
         /**
          * @brief Check if tensor is GPU-only (host freed after upload)
          */
-        bool isGpuOnly() const { return memory_residency_ == MemoryResidency::GPU_ONLY; }
+        bool isGpuOnly() const
+        {
+            return memoryResidency() == MemoryResidency::GPU_ONLY;
+        }
 
         /**
          * @brief Mark this tensor as GPU-only
@@ -1187,16 +1312,17 @@ namespace llaminar2
         }
 
         /**
-         * @brief Notify a mapped tensor that the GPU stream has been externally
-         *        synchronized, so no per-access event wait is needed.
+         * @brief Notify a mapped tensor that its exact publication event has
+         *        completed, so no second host wait is needed.
          *
-         * Call this after performing a stream-level synchronization (e.g.,
-         * hipStreamSynchronize) to avoid redundant hipEventSynchronize calls
-         * when the host subsequently reads the mapped pointer via data().
+         * Call this only after the completion event associated with the mapped
+         * tensor's producer stream has been waited successfully. A broad stream
+         * or device synchronization is not a substitute for publication
+         * ownership and must not be introduced merely to call this method.
          *
-         * This is the preferred pattern for forward pass boundaries: the
-         * orchestrator syncs the stream once, then marks logits as synced,
-         * so the sampler receives logits without any coherence overhead.
+         * Forward boundaries either keep the tensor device-owned by publishing
+         * its producer stream to the next GPU consumer, or materialize it through
+         * the tensor's exact completion event before marking it synchronized.
          *
          * @note Only meaningful for mapped tensors (is_mapped_ == true).
          *       No-op for non-mapped tensors.
@@ -1889,9 +2015,64 @@ namespace llaminar2
          */
         IBackend *resolveBackend(DeviceId device) const;
 
+        /**
+         * @brief Independent lifetimes represented by one exact event.
+         *
+         * One H2D completion is both the producer of device bytes and the
+         * lifetime fence for its host source. A later device write may
+         * supersede only the first meaning. These four states make that partial
+         * transition explicit instead of losing one lifetime through a
+         * single-purpose enum or parallel booleans.
+         */
+        enum class CompletionEventProtection : uint8_t
+        {
+            None,
+            DeviceValue,
+            HostSource,
+            DeviceValueAndHostSource,
+        };
+
+        /** @return Whether the event orders consumers of current device bytes. */
+        bool completionEventProtectsDeviceValue_() const noexcept
+        {
+            return completion_event_protection_ ==
+                       CompletionEventProtection::DeviceValue ||
+                   completion_event_protection_ ==
+                       CompletionEventProtection::DeviceValueAndHostSource;
+        }
+
+        /** @return Whether the event protects an asynchronous H2D host source. */
+        bool completionEventProtectsHostSource_() const noexcept
+        {
+            return completion_event_protection_ ==
+                       CompletionEventProtection::HostSource ||
+                   completion_event_protection_ ==
+                       CompletionEventProtection::DeviceValueAndHostSource;
+        }
+
         std::optional<DeviceId> gpu_device_;      // Which GPU device (nullopt = not on GPU)
-        void *device_completion_event_ = nullptr; // Event marking last kernel write (for fine-grained sync)
-        std::optional<DeviceId> event_device_;    // Device where device_completion_event_ was created
+        void *device_completion_event_ = nullptr; // Exact event for completion_event_protection_.
+        std::optional<DeviceId> event_device_;    // Device where device_completion_event_ was created.
+        CompletionEventProtection completion_event_protection_ =
+            CompletionEventProtection::None;
+
+        /**
+         * @brief Exact producer-event generation already joined to one consumer stream.
+         *
+         * CUDA and HIP forbid a graph capture from importing an event that was
+         * recorded by uncaptured work on another stream.  The graph executor
+         * therefore joins every arena input before `beginCapture()`.  These two
+         * non-owning identities let `TransferEngine::requireDeviceInput()` prove
+         * that the current completion event was joined to the exact capture
+         * stream and omit a second, illegal wait while capture is active.
+         *
+         * A normal device publication invalidates both fields before recording
+         * the next event generation.  A publication made while capture is active
+         * deliberately preserves them: graph stream order, rather than the old
+         * external event handle, orders producers and consumers inside the graph.
+         */
+        void *last_joined_completion_event_ = nullptr;
+        void *last_joined_consumer_stream_ = nullptr;
 
         // ===== Multi-Device Coherence Tracking =====
         // Tracks which device has authoritative (current) data.
@@ -1929,7 +2110,8 @@ namespace llaminar2
         /**
          * @brief Get existing GPU buffer pointer for a device, or allocate new one
          *
-         * Used by transferTo() and copyTo() to ensure destination buffer exists.
+         * Used by TransferEngine to ensure destination storage exists before a
+         * device transfer or replicated copy.
          *
          * @param device Target GPU device
          * @return GPU pointer or nullptr if allocation failed
@@ -1937,7 +2119,7 @@ namespace llaminar2
         void *getOrAllocateDeviceBuffer(DeviceId device);
 
         // ===== Zero-Copy Mapped Memory =====
-        // When a tensor uses mapped memory (hipHostMallocMapped/cudaHostAllocMapped):
+        // When a tensor uses TransferEngine-owned mapped memory:
         // - Host and device share the SAME physical memory via mapped pinned memory
         // - GPU can read/write directly without memcpy
         // - ensureOnDevice()/ensureOnHost() become no-ops
@@ -1951,16 +2133,21 @@ namespace llaminar2
         bool is_mapped_ = false;            // True if using mapped memory
         void *mapped_device_ptr_ = nullptr; // Device-visible pointer for mapped host memory
         void *mapped_host_ptr_ = nullptr;   // Host-visible pointer for mapped memory
+        /**
+         * Exact mapped allocation and endpoint lifetime. TransferEngine owns
+         * native allocation/free; the tensor owns only this shared handle.
+         */
+        std::shared_ptr<MappedHostTransferRegion> mapped_transfer_region_;
 
         // For mapped memory: tracks whether GPU has written since last sync.
-        // Set to true by transitionTo(MAPPED/DEVICE_AUTHORITATIVE), cleared by ensureOnHost() after sync.
+        // Set by device-write publication and cleared by ensureOnHost() after sync.
         // This avoids redundant hipDeviceSynchronize() calls.
         bool mapped_needs_sync_ = false;
 
         /**
          * @brief Initialize mapped memory for this tensor (protected helper)
          *
-         * Allocates GPU-visible host memory via backend->allocateMapped().
+         * Allocates GPU-visible host memory through TransferEngine.
          * Sets up is_mapped_, mapped_host_ptr_, mapped_device_ptr_, and gpu_data_ptr_.
          *
          * @param bytes Size in bytes to allocate
@@ -1972,7 +2159,7 @@ namespace llaminar2
         bool initMappedMemory(size_t bytes, DeviceId target_device);
 
         /**
-         * @brief Free mapped memory if allocated (called by destructor)
+         * @brief Release mapped-region ownership if present (called by destructor)
          */
         void freeMappedMemory();
 
@@ -1995,6 +2182,22 @@ namespace llaminar2
          * @note Safe to call multiple times - will return true if already pinned
          */
         bool ensureHostPinned();
+
+        /**
+         * @brief Close host-transfer ownership before derived storage is freed.
+         *
+         * C++ destroys a concrete tensor's vector members before entering the
+         * TensorBase destructor.  Every concrete destructor therefore calls
+         * this method first, while its registered host allocation is still
+         * alive.  The transition waits only the exact outstanding H2D event and
+         * then unregisters the pages; repeated calls from TensorBase teardown
+         * are idempotent.
+         *
+         * Failure is fatal because freeing an in-flight or still-registered
+         * allocation leaves the CUDA/HIP runtime pointing at recycled heap
+         * pages and corrupts unrelated transfers.
+         */
+        void retireHostTransferLifetimeBeforeStorageDestruction() noexcept;
 
         /**
          * @brief Unregister host buffer from pinned memory
@@ -2148,6 +2351,17 @@ namespace llaminar2
         explicit FP32Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
         /**
+         * @brief Adopt fully initialized aligned FP32 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param host_data Exact element storage; ownership is transferred.
+         * @param device Logical home device for subsequent preparation.
+         * @throws std::invalid_argument When storage size does not match @p shape.
+         */
+        FP32Tensor(const std::vector<size_t> &shape,
+                   AlignedVector<float> host_data,
+                   DeviceId device = DeviceId::cpu());
+
+        /**
          * @brief Create a zero-copy mapped FP32Tensor for GPU execution
          *
          * Allocates tensor data in mapped host memory that is directly accessible
@@ -2161,14 +2375,32 @@ namespace llaminar2
          *
          * @param shape Tensor dimensions
          * @param target_device GPU device for mapped memory (must be CUDA or ROCm)
-         * @return unique_ptr<FP32Tensor> with mapped memory, or nullptr on failure
+         * @return unique_ptr<FP32Tensor> with mapped memory, or nullptr on failure.
          *
-         * @note Falls back to regular allocation if mapped memory unavailable
-         * @note Currently supported: ROCm (hipHostMallocMapped)
+         * @note This factory never substitutes ordinary host/device storage.
+         *       Callers requesting mapped placement must fail if it is unavailable.
+         * @note Allocation is delegated to TransferEngine, which selects the
+         *       exact CUDA or ROCm native mapped allocation for the endpoint.
          */
         static std::unique_ptr<FP32Tensor> createMapped(
             const std::vector<size_t> &shape,
             DeviceId target_device);
+
+        /**
+         * @brief Create CPU-owned FP32 storage mapped into one exact GPU.
+         *
+         * CPU kernels remain the value authority and access the host alias;
+         * captured GPU consumers use the immutable device alias published by
+         * TransferEngine. This is distinct from @ref createMapped, whose
+         * logical home is the GPU itself.
+         *
+         * @param shape Tensor dimensions.
+         * @param mapped_device Exact CUDA/ROCm alias endpoint.
+         * @return Host-owned mapped tensor, or null when allocation fails.
+         */
+        static std::unique_ptr<FP32Tensor> createHostOwnedMapped(
+            const std::vector<size_t> &shape,
+            DeviceId mapped_device);
 
         ~FP32Tensor() override;
 
@@ -2327,6 +2559,35 @@ namespace llaminar2
         size_t byte_size() const override { return element_count() * sizeof(float); }
 
     private:
+        /** Tag selecting shape-only construction before mapped allocation. */
+        struct MappedStorageConstructionTag final
+        {
+        };
+
+        /**
+         * @brief Construct tensor metadata without allocating ordinary pages.
+         *
+         * Only @ref createMapped uses this path, immediately followed by a
+         * mandatory TransferEngine mapped allocation. Keeping ordinary host
+         * storage absent avoids transient first-touch and duplicate capacity.
+         */
+        FP32Tensor(
+            const std::vector<size_t> &shape,
+            DeviceId device,
+            MappedStorageConstructionTag);
+
+        /**
+         * @brief Materialize mapped storage with independent logical ownership.
+         * @param shape Tensor dimensions.
+         * @param home_device CPU or exact GPU that owns tensor execution state.
+         * @param mapped_device Exact GPU receiving the mapped alias.
+         * @return Complete mapped tensor, or null when allocation fails.
+         */
+        static std::unique_ptr<FP32Tensor> createMappedWithHome(
+            const std::vector<size_t> &shape,
+            DeviceId home_device,
+            DeviceId mapped_device);
+
         // Private constructor for creating views
         FP32Tensor(const std::vector<size_t> &shape,
                    DeviceId device,
@@ -2390,6 +2651,13 @@ namespace llaminar2
 
         explicit FP16Tensor(const std::vector<size_t> &shape);
         FP16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &fp16_data);
+        /**
+         * @brief Adopt fully initialized aligned FP16 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param fp16_data Exact FP16 element storage; ownership is transferred.
+         * @throws std::invalid_argument When storage size does not match @p shape.
+         */
+        FP16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> fp16_data);
         ~FP16Tensor() override;
 
         // TensorBase interface
@@ -2415,9 +2683,25 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // Memory management - FP16 doesn't have separate raw data to release
-        void release_raw_data() override { /* no-op: FP16 has no separate raw block data */ }
-        bool is_raw_data_released() const override { return false; /* FP16 always has its data */ }
+        /**
+         * @brief Release owned FP16 host storage after device preparation.
+         *
+         * Floating-point model weights use their native element vector as raw
+         * storage. Treating this as a no-op retained the entire host copy and
+         * made the common weight-release contract format-dependent.
+         */
+        void release_raw_data() override
+        {
+            if (!is_view_)
+            {
+                decltype(host_fp16_data_) empty;
+                std::swap(host_fp16_data_, empty);
+            }
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         void release_host_weight_data() override
         {
@@ -2572,6 +2856,7 @@ namespace llaminar2
 
         void *device_data_;                          // Device-side storage
         mutable AlignedVector<float> dequant_cache_; // For data() calls (64-byte aligned)
+        bool raw_data_released_ = false;              ///< Host weight bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();
@@ -2618,6 +2903,13 @@ namespace llaminar2
 
         explicit BF16Tensor(const std::vector<size_t> &shape);
         BF16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &bf16_data);
+        /**
+         * @brief Adopt fully initialized aligned BF16 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param bf16_data Exact BF16 element storage; ownership is transferred.
+         * @throws std::invalid_argument When storage size does not match @p shape.
+         */
+        BF16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> bf16_data);
         ~BF16Tensor() override;
 
         // TensorBase interface
@@ -2639,9 +2931,19 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // Memory management - BF16 doesn't have separate raw data to release
-        void release_raw_data() override { /* no-op: BF16 has no separate raw block data */ }
-        bool is_raw_data_released() const override { return false; /* BF16 always has its data */ }
+        /** @brief Release owned BF16 host storage after device preparation. */
+        void release_raw_data() override
+        {
+            if (!is_view_)
+            {
+                decltype(host_bf16_data_) empty;
+                std::swap(host_bf16_data_, empty);
+            }
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         void release_host_weight_data() override
         {
@@ -2782,6 +3084,7 @@ namespace llaminar2
 
         void *device_data_;                          // Device-side storage
         mutable AlignedVector<float> dequant_cache_; // For data() calls (64-byte aligned)
+        bool raw_data_released_ = false;              ///< Host weight bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();
@@ -2834,7 +3137,7 @@ namespace llaminar2
                    float scale);
         INT8Tensor(const std::vector<size_t> &shape,
                    const std::vector<float> &fp32_data);
-        ~INT8Tensor() override = default;
+        ~INT8Tensor() override;
 
         // TensorBase interface
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -2855,6 +3158,36 @@ namespace llaminar2
 
         // TensorBase pure virtual - required implementation
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        /** @brief Release the native INT8 host-weight vector after preparation. */
+        void release_raw_data() override
+        {
+            decltype(host_int8_data_) empty;
+            std::swap(host_int8_data_, empty);
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
+
+        /**
+         * @brief Retire registration and all host-only INT8 weight metadata.
+         *
+         * Prepared GEMM state owns the execution copy before this method is
+         * called; per-column/row scales and diagnostic FP32 materialization are
+         * therefore no longer live inputs.
+         */
+        void release_host_weight_data() override
+        {
+            unpinHostMemory();
+            release_raw_data();
+            decltype(col_scales_) empty_col_scales;
+            std::swap(col_scales_, empty_col_scales);
+            decltype(row_scales_cache_) empty_row_scales;
+            std::swap(row_scales_cache_, empty_row_scales);
+            decltype(dequant_cache_) empty_dequant;
+            std::swap(dequant_cache_, empty_dequant);
+        }
 
         bool from_int32_with_scales(
             const int32_t *accum,
@@ -2931,6 +3264,7 @@ namespace llaminar2
         mutable std::vector<float> row_scales_cache_; ///< Cached per-row scales (computed on-demand)
         void *device_data_ = nullptr;
         mutable AlignedVector<float> dequant_cache_; // 64-byte aligned dequant buffer
+        bool raw_data_released_ = false;             ///< Host weight bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();
@@ -2981,7 +3315,7 @@ namespace llaminar2
         INT32Tensor(const std::vector<size_t> &shape,
                     const std::vector<float> &fp32_data,
                     float scale);
-        ~INT32Tensor() override = default;
+        ~INT32Tensor() override;
 
         // TensorBase interface
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -3001,6 +3335,28 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        /** @brief Release the native INT32 host vector after device preparation. */
+        void release_raw_data() override
+        {
+            decltype(host_int32_data_) empty;
+            std::swap(host_int32_data_, empty);
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
+
+        /** @brief Retire registration and all host-only INT32 materialization. */
+        void release_host_weight_data() override
+        {
+            unpinHostMemory();
+            release_raw_data();
+            decltype(row_scales_) empty_row_scales;
+            std::swap(row_scales_, empty_row_scales);
+            decltype(dequant_cache_) empty_dequant;
+            std::swap(dequant_cache_, empty_dequant);
+        }
 
         bool from_int32_with_scales(
             const int32_t *accum,
@@ -3070,6 +3426,7 @@ namespace llaminar2
         std::vector<float> row_scales_;          ///< Per-row scales (optional)
         void *device_data_ = nullptr;
         mutable AlignedVector<float> dequant_cache_; ///< Cached FP32 dequantization (64-byte aligned)
+        bool raw_data_released_ = false;             ///< Host bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();
@@ -3113,6 +3470,13 @@ namespace llaminar2
         const IQ4_NLBlock *blocks() const { return typed_data(); }
 
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ4_NL blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ4_NLTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_NLTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -3170,10 +3534,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{4, 16, false, false, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::IQ4_NL;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -3319,7 +3682,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -3366,6 +3729,13 @@ namespace llaminar2
         const Q8_0Block *blocks() const { return typed_data(); }
 
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q8_0 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q8_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -3445,10 +3815,9 @@ namespace llaminar2
         // NativeVNNI support: codebook 19, 32-byte payload (raw int8 blocks)
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{19, 32, false, false, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::Q8_0;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         /// Efficient override: reads Q8_0 blocks directly via typed_data()
         /// without virtual dispatch per block.
@@ -3565,7 +3934,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -3754,9 +4123,9 @@ namespace llaminar2
         // NativeVNNI support: codebook 20, 32-byte payload (raw int8 blocks)
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{20, 32, false, false, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::Q8_1;
         }
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         /// Efficient override: reads Q8_1 blocks directly via typed_data()
         /// without virtual dispatch per block.
@@ -4050,7 +4419,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -4516,7 +4885,7 @@ namespace llaminar2
         std::vector<size_t> shape_;
 
         bool is_view_;
-        std::vector<uint8_t> raw_data_;
+        AlignedVector<uint8_t> raw_data_;
         const uint8_t *raw_data_ptr_;
         size_t view_byte_offset_;
         std::shared_ptr<TensorBase> parent_;
@@ -4618,6 +4987,13 @@ namespace llaminar2
         const Q4_0Block *blocks() const { return typed_data(); }
 
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q4_0 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q4_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -4694,10 +5070,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{0, 16, false, false, false, 8.0f};
-            return &info;
+            return &native_vnni_formats::Q4_0;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -4796,7 +5171,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -4839,6 +5214,13 @@ namespace llaminar2
         const Q4_1Block *blocks() const { return typed_data(); }
 
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q4_1 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q4_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -4919,10 +5301,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{5, 16, true, false, false, 15.0f};
-            return &info;
+            return &native_vnni_formats::Q4_1;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -5015,7 +5396,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5059,6 +5440,13 @@ namespace llaminar2
         const Q5_0Block *blocks() const { return typed_data(); }
 
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q5_0 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q5_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5126,10 +5514,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{6, 20, false, false, false, 16.0f};
-            return &info;
+            return &native_vnni_formats::Q5_0;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -5225,7 +5612,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5269,6 +5656,13 @@ namespace llaminar2
         const Q5_1Block *blocks() const { return typed_data(); }
 
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q5_1 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q5_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5336,10 +5730,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{7, 20, true, false, false, 31.0f};
-            return &info;
+            return &native_vnni_formats::Q5_1;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         void unpack_superblock_to_int8(
             size_t row_idx,
@@ -5435,7 +5828,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5475,6 +5868,13 @@ namespace llaminar2
         const Q6_KBlock *blocks() const { return typed_data(); }
 
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q6_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q6_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q6_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5529,10 +5929,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{8, 24, true, true, false, 32.0f};
-            return &info;
+            return &native_vnni_formats::Q6_K;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
@@ -5606,7 +6005,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5644,6 +6043,13 @@ namespace llaminar2
         const Q2_KBlock *blocks() const { return typed_data(); }
 
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q2_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q2_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q2_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5698,10 +6104,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{10, 8, true, true, true, 3.0f};
-            return &info;
+            return &native_vnni_formats::Q2_K;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
@@ -5774,7 +6179,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5814,6 +6219,13 @@ namespace llaminar2
         const Q5_KBlock *blocks() const { return typed_data(); }
 
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q5_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q5_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5829,10 +6241,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{7, 20, true, true, false, 31.0f};
-            return &info;
+            return &native_vnni_formats::Q5_K;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         DeviceId home_device() const override { return device_; }
@@ -5951,7 +6362,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> parent);
 
         std::vector<size_t> shape_;
-        std::vector<uint8_t> raw_data_; // Owned only by parent tensor
+        AlignedVector<uint8_t> raw_data_; // Owned only by parent tensor
         DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
@@ -5987,6 +6398,13 @@ namespace llaminar2
         const Q3_KBlock *blocks() const { return typed_data(); }
 
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q3_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q3_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q3_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6041,10 +6459,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{9, 12, true, true, false, 4.0f};
-            return &info;
+            return &native_vnni_formats::Q3_K;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Format conversion (TensorBase interface)
@@ -6118,7 +6535,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -6156,6 +6573,13 @@ namespace llaminar2
         const Q4_KBlock *blocks() const { return typed_data(); }
 
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q4_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q4_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6222,10 +6646,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{5, 16, true, true, false, 15.0f};
-            return &info;
+            return &native_vnni_formats::Q4_K;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // Q8_0 quantization (for quantized GEMM)
@@ -6293,7 +6716,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> parent);
 
         std::vector<size_t> shape_;
-        std::vector<uint8_t> raw_data_; // Owned only by parent tensor
+        AlignedVector<uint8_t> raw_data_; // Owned only by parent tensor
         DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
@@ -6329,6 +6752,13 @@ namespace llaminar2
         const Q8_KBlock *blocks() const { return typed_data(); }
 
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q8_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q8_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6409,6 +6839,23 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+
+        /**
+         * @brief Describe Q8_K as a lossless pre-decoded INT8 VNNI source.
+         *
+         * Q8_K already stores signed INT8 values.  Its 16-element block sums are
+         * an auxiliary dot-product acceleration and do not participate in the
+         * represented weight values, so CPU and GPU preparation can copy the
+         * values into the common 32-byte INT8 payload and publish a unit FP16
+         * scale for every 32-element execution block.  Codebook 21 identifies
+         * the source layout during preparation; GPU execution canonicalizes the
+         * prepared payload to the tuned raw-INT8 codebook 19.
+         */
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            return &native_vnni_formats::Q8_K;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
 
         /// Efficient override: reads Q8_K superblocks directly via typed_data().
         /// Q8_K has no per-block scale so values are already int8; only needs
@@ -6495,7 +6942,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> parent);
 
         std::vector<size_t> shape_;
-        std::vector<uint8_t> raw_data_; // Owned only by parent tensor
+        AlignedVector<uint8_t> raw_data_; // Owned only by parent tensor
         DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
@@ -6531,6 +6978,13 @@ namespace llaminar2
         const IQ4_XSBlock *blocks() const { return typed_data(); }
 
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ4_XS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ4_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6663,10 +7117,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{4, 16, false, true, false, 127.0f};
-            return &info;
+            return &native_vnni_formats::IQ4_XS;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // SIMD decode methods (public for testing)
@@ -6699,7 +7152,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -6731,6 +7184,13 @@ namespace llaminar2
         const IQ2_XXSBlock *blocks() const { return typed_data(); }
 
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ2_XXS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ2_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                       size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6847,10 +7307,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{15, 8, false, true, false, 43.0f};
-            return &info;
+            return &native_vnni_formats::IQ2_XXS;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -6887,7 +7346,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -6919,6 +7378,13 @@ namespace llaminar2
         const IQ2_XSBlock *blocks() const { return typed_data(); }
 
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ2_XS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ2_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7035,10 +7501,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{14, 9, true, true, false, 43.0f};
-            return &info;
+            return &native_vnni_formats::IQ2_XS;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -7075,7 +7540,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7107,6 +7572,13 @@ namespace llaminar2
         const IQ3_XXSBlock *blocks() const { return typed_data(); }
 
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ3_XXS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ3_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                       size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7231,10 +7703,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{12, 12, false, true, false, 62.0f};
-            return &info;
+            return &native_vnni_formats::IQ3_XXS;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         // SIMD decode methods (public for testing)
@@ -7267,7 +7738,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7299,6 +7770,13 @@ namespace llaminar2
         const IQ2_SBlock *blocks() const { return typed_data(); }
 
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ2_S blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ2_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7415,10 +7893,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{13, 9, true, true, false, 43.0f};
-            return &info;
+            return &native_vnni_formats::IQ2_S;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -7455,7 +7932,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7487,6 +7964,13 @@ namespace llaminar2
         const IQ3_SBlock *blocks() const { return typed_data(); }
 
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ3_S blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ3_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7607,10 +8091,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{11, 13, false, true, false, 15.0f};
-            return &info;
+            return &native_vnni_formats::IQ3_S;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -7647,7 +8130,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7679,6 +8162,13 @@ namespace llaminar2
         const IQ1_SBlock *blocks() const { return typed_data(); }
 
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ1_S blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ1_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7795,10 +8285,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{16, 6, true, true, false, 1.125f};
-            return &info;
+            return &native_vnni_formats::IQ1_S;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -7835,7 +8324,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7867,6 +8356,13 @@ namespace llaminar2
         const IQ1_MBlock *blocks() const { return typed_data(); }
 
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ1_M blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ1_MTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7983,10 +8479,9 @@ namespace llaminar2
         size_t superblock_size() const override { return 256; }
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{17, 6, true, true, false, 1.125f};
-            return &info;
+            return &native_vnni_formats::IQ1_M;
         }
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx, int8_t *output, float *scales = nullptr, float *mins = nullptr) const override;
 
         size_t decoder_rows() const override { return shape_[0]; }
@@ -8023,7 +8518,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)

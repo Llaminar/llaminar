@@ -22,8 +22,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -48,6 +46,7 @@ extern "C"
     void cudaNativeVNNIGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt,
         int target_waves, int mkg, int max_kb,
+        int exact_kb,
         int force_two_phase);
     void cudaNativeVNNIGemvSweep_clearConfig();
 }
@@ -137,6 +136,10 @@ namespace
          { return createFastSweepTensor<IQ1_MTensor, IQ1_MBlock>(n, k); }},
         {"Q8_0", [](size_t n, size_t k)
          { return createFastSweepTensor<Q8_0Tensor, Q8_0Block>(n, k); }},
+        {"Q8_1", [](size_t n, size_t k)
+         { return createFastSweepTensor<Q8_1Tensor, Q8_1Block>(n, k); }},
+        {"Q8_K", [](size_t n, size_t k)
+         { return createFastSweepTensor<Q8_KTensor, Q8_KBlock>(n, k); }},
     };
 
     const NativeVnniFormatInfo &requireNativeVnniInfo(const TensorBase *weights, const std::string &format_name)
@@ -274,7 +277,7 @@ namespace
         std::vector<int> target_waves = {4, 8, 16};
         std::vector<int> mkg_values = {2, 4, 8};
         std::vector<int> max_kb_values = {0, 2, 4, 8};
-        std::vector<int> force_two_phase_values = {0, 1, 2};
+        std::vector<int> force_two_phase_values = {1};
         int max_cases = std::numeric_limits<int>::max();
         bool smoke = false;
         std::string csv_path = "/tmp/llaminar_cuda_tc_gemv_sweep.csv";
@@ -431,7 +434,7 @@ namespace
             cfg.target_waves = {8};
             cfg.mkg_values = {4};
             cfg.max_kb_values = {0, 4};
-            cfg.force_two_phase_values = {0, 1, 2};
+            cfg.force_two_phase_values = {1};
             cfg.max_cases = 3;
         }
 
@@ -485,7 +488,12 @@ namespace
 
         const auto force_phase = getEnvCsvInts("LLAMINAR_CUDA_TC_SWEEP_FORCE_PHASES");
         if (!force_phase.empty())
+        {
+            if (force_phase != std::vector<int>{1})
+                throw std::invalid_argument(
+                    "CUDA NativeVNNI KPAR supports only ordered publication (phase 1)");
             cfg.force_two_phase_values = force_phase;
+        }
 
         const std::string csv_path = getEnvString("LLAMINAR_CUDA_TC_SWEEP_CSV");
         if (!csv_path.empty())
@@ -583,73 +591,6 @@ namespace
         return std::max(kMinimumBudget, requirements.total_bytes_with_alignment());
     }
 
-    std::string shellQuote(const std::string &value)
-    {
-        std::string quoted = "'";
-        for (const char ch : value)
-        {
-            if (ch == '\'')
-                quoted += "'\\''";
-            else
-                quoted += ch;
-        }
-        quoted += "'";
-        return quoted;
-    }
-
-    std::string existingPathOrDefault(std::initializer_list<std::string> candidates)
-    {
-        for (const auto &candidate : candidates)
-        {
-            if (!candidate.empty() && std::filesystem::exists(candidate))
-                return candidate;
-        }
-        for (const auto &candidate : candidates)
-        {
-            if (!candidate.empty())
-                return candidate;
-        }
-        return {};
-    }
-
-    std::string loadHeuristicInputCsvPath()
-    {
-        const std::string heuristic_csv = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_INPUT_CSV");
-        const std::string sweep_csv = getEnvString("LLAMINAR_CUDA_TC_SWEEP_CSV");
-        return existingPathOrDefault({
-            heuristic_csv,
-            sweep_csv,
-            "/tmp/llaminar_cuda_tc_gemv_sweep_expanded_20260312.csv",
-            "/tmp/llaminar_cuda_tc_gemv_sweep.csv",
-        });
-    }
-
-    std::string loadHeuristicOutputPath()
-    {
-        const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_OUTPUT");
-        return path.empty() ? "/tmp/llaminar_cuda_tc_gemv_dispatch_heuristic_generated.inc" : path;
-    }
-
-    std::string loadHeuristicSummaryPath()
-    {
-        const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_SUMMARY");
-        return path.empty() ? "/tmp/llaminar_cuda_tc_gemv_dispatch_heuristic_summary.txt" : path;
-    }
-
-    std::string loadHeuristicScriptPath()
-    {
-        const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_SCRIPT");
-        return path.empty()
-                   ? "/workspaces/llaminar/tests/v2/performance/kernels/cuda/gemm/infer_gemv_dispatch_heuristic.py"
-                   : path;
-    }
-
-    bool fileHasContent(const std::string &path)
-    {
-        std::ifstream input(path);
-        return input.good() && input.peek() != std::ifstream::traits_type::eof();
-    }
-
     struct RunResult
     {
         double min_us = 0.0;
@@ -687,6 +628,7 @@ namespace
                 candidate.target_waves,
                 candidate.mkg,
                 candidate.max_kb,
+                0,
                 candidate.force_two_phase);
 
             if (!kernel)
@@ -709,7 +651,7 @@ namespace
             {
                 if (ws_consumer)
                     ws_consumer->unbindWorkspace();
-                kernel->setGPUStream(nullptr);
+                kernel->clearGPUStreamBinding();
                 cudaStreamDestroy(stream);
                 cudaNativeVNNIGemvSweep_clearConfig();
             };
@@ -946,62 +888,6 @@ namespace
                      executed_rows, executed_cases, cfg.csv_path.c_str());
     }
 
-    TEST(CUDABlockwiseTensorCoreGemmSweepOffline, GenerateDispatchHeuristicFromExistingCsv)
-    {
-        const std::string input_csv = loadHeuristicInputCsvPath();
-        if (input_csv.empty() || !std::filesystem::exists(input_csv))
-        {
-            GTEST_SKIP() << "No existing sweep CSV found. Set LLAMINAR_CUDA_TC_HEURISTIC_INPUT_CSV.";
-        }
-
-        const std::string script_path = loadHeuristicScriptPath();
-        ASSERT_TRUE(std::filesystem::exists(script_path)) << "Heuristic generator script missing: " << script_path;
-
-        const std::string output_path = loadHeuristicOutputPath();
-        const std::string summary_path = loadHeuristicSummaryPath();
-
-        std::filesystem::create_directories(std::filesystem::path(output_path).parent_path());
-        std::filesystem::create_directories(std::filesystem::path(summary_path).parent_path());
-
-        std::string command =
-            "python3 " + shellQuote(script_path) +
-            " --input " + shellQuote(input_csv) +
-            " --output " + shellQuote(output_path) +
-            " --summary " + shellQuote(summary_path);
-
-        if (script_path.find("analyze_cuda_tc_gemv_dispatch.py") != std::string::npos)
-        {
-            command +=
-                " --min-overall-family-pct 99.0"
-                " --min-overall-exact-pct 99.0"
-                " --min-fallback-family-pct 97.0"
-                " --min-fallback-exact-pct 30.0";
-        }
-        command += " 2>&1";
-
-        FILE *pipe = popen(command.c_str(), "r");
-        ASSERT_NE(pipe, nullptr) << "Failed to spawn heuristic generator";
-
-        char buffer[256];
-        std::string output;
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
-            output += buffer;
-
-        const int status = pclose(pipe);
-        ASSERT_TRUE(WIFEXITED(status)) << "Heuristic generator terminated abnormally:\n"
-                                       << output;
-        ASSERT_EQ(WEXITSTATUS(status), 0) << "Heuristic generator failed:\n"
-                                          << output;
-
-        ASSERT_TRUE(std::filesystem::exists(output_path)) << "Heuristic output was not created: " << output_path;
-        ASSERT_TRUE(std::filesystem::exists(summary_path)) << "Heuristic summary was not created: " << summary_path;
-        ASSERT_TRUE(fileHasContent(output_path)) << "Heuristic output is empty: " << output_path;
-        ASSERT_TRUE(fileHasContent(summary_path)) << "Heuristic summary is empty: " << summary_path;
-
-        std::fprintf(stderr,
-                     "[CUDABlockwiseTC][HEURISTIC] input=%s output=%s summary=%s\n%s",
-                     input_csv.c_str(), output_path.c_str(), summary_path.c_str(), output.c_str());
-    }
 }
 
 #endif

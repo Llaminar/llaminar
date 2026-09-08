@@ -488,7 +488,7 @@ TEST(Test__RankExecutionPlan_Integration, FullyConfiguredPlan)
     plan.next_rank = std::nullopt;
 
     // TP config
-    plan.tp_scope = TPScope::LOCAL;
+    plan.tp_scope = TPScope::RANK_LOCAL;
     plan.local_tp_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)};
     plan.local_tp_weights = {0.6f, 0.4f};
     plan.local_tp_backend = CollectiveBackendType::HETEROGENEOUS;

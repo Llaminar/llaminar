@@ -1,4 +1,19 @@
+/**
+ * @file Qwen36DenseParityTestBase.h
+ * @brief Real-weight Qwen3.6 dense parity, prefix-cache, and MTP test support.
+ *
+ * The helpers in this file keep the live production runner as the system under
+ * test while authenticating every reusable CPU/FP32 Hugging Face reference
+ * pack against the declared GGUF descriptor, prompt, and tokenization.
+ * Checkpoint campaigns
+ * retain captured graph, device-state, depth-policy, and CSV evidence instead
+ * of reducing correctness to final-token agreement.
+ */
+
 #pragma once
+
+#include "../ParityTestBase.h"
+#include "Qwen36MTPCheckpointSurface.h"
 
 #include <cnpy.h>
 #include <gtest/gtest.h>
@@ -12,18 +27,24 @@
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/mtp/MTPDecodeCatchup.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
+#include "execution/mtp/MTPStateTransaction.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "execution/runner/ModelContextRetirement.h"
 #include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
 #include "utils/DebugEnv.h"
+#include "utils/MTPParitySnapshotContext.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/Sampler.h"
+#include "utils/Sha256.h"
 #include "utils/Tokenizer.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -32,22 +53,16 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
-
-#ifdef HAVE_CUDA
-extern "C"
-{
-    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
-    bool cudaNativeVNNIPrefill_getDeterministicMode();
-}
-#endif
 
 namespace llaminar2::test::parity::qwen36
 {
@@ -56,7 +71,7 @@ namespace llaminar2::test::parity::qwen36
         SingleDevice,
         LocalTP,
         LocalPP,
-        NodeLocalTP,
+        NodeTP,
     };
 
     enum class PrefixRestoreParityMode
@@ -176,8 +191,42 @@ namespace llaminar2::test::parity::qwen36
         return false;
     }
 
-    inline bool denseHasMTPPerfCounter(
+    /**
+     * @brief Return whether dense MTP should use device-resident publication.
+     *
+     * Single-device GPU runners own every speculative slot locally.  GPU
+     * LocalTP runners now reduce verifier outcomes at RankOrchestrator scope
+     * and then fan the same compact accepted-state transaction to every child.
+     * CPU runners and distributed runners without that mailbox remain on
+     * explicit decode-equivalent replay until they have their own resident
+     * publication proof.
+     *
+     * @param test_case Dense parity fixture under test.
+     * @return true when the fixture should exercise device-resident MTP state
+     *         publication.
+     */
+    inline bool denseCaseExpectsGroupedDevicePublication(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        if (test_case.devices.empty())
+            return false;
+
+        const bool all_gpu =
+            std::all_of(
+                test_case.devices.begin(),
+                test_case.devices.end(),
+                [](const GlobalDeviceAddress &device)
+                {
+                    return device.isGPU();
+                });
+        return all_gpu &&
+               (test_case.topology == DensePrefixParityTopology::SingleDevice ||
+                test_case.topology == DensePrefixParityTopology::LocalTP);
+    }
+
+    inline bool denseHasPerfCounter(
         const std::vector<PerfStatRecord> &records,
+        const char *domain,
         const char *name)
     {
         return std::any_of(
@@ -186,13 +235,15 @@ namespace llaminar2::test::parity::qwen36
             [&](const PerfStatRecord &record)
             {
                 return record.kind == PerfStatRecord::Kind::Counter &&
-                       record.domain == "mtp" &&
-                       record.name == name;
+                       record.domain == domain &&
+                       record.name == name &&
+                       record.value > 0.0;
             });
     }
 
-    inline bool denseHasMTPPerfRecordTag(
+    inline bool denseHasPerfRecordTag(
         const std::vector<PerfStatRecord> &records,
+        const char *domain,
         const char *name,
         const char *tag_key,
         const char *tag_value)
@@ -202,11 +253,354 @@ namespace llaminar2::test::parity::qwen36
             records.end(),
             [&](const PerfStatRecord &record)
             {
-                if (record.domain != "mtp" || record.name != name)
+                if (record.domain != domain || record.name != name)
                     return false;
                 const auto it = record.tags.find(tag_key);
                 return it != record.tags.end() && it->second == tag_value;
             });
+    }
+
+    /**
+     * @brief Return whether a positive counter carries an exact metadata tag.
+     *
+     * Graph-capture assertions must distinguish evidence emitted by the main
+     * decode graph from evidence emitted by the MTP sidecar graph. Merely
+     * finding a tagged zero-valued planning record would not prove execution,
+     * so this helper requires both the matching tag and positive counter value.
+     */
+    inline bool denseHasPositivePerfCounterTag(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name,
+        const char *tag_key,
+        const char *tag_value)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != domain ||
+                    record.name != name ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() && it->second == tag_value;
+            });
+    }
+
+    /**
+     * @brief Return whether a positive counter tag starts with a stable prefix.
+     *
+     * MTP sidecar graph contexts include resident-input policy suffixes in
+     * their cache identity. Tests care that the sidecar graph family replayed,
+     * while preserving those suffixes as useful diagnostics.
+     */
+    inline bool denseHasPositivePerfCounterTagPrefix(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name,
+        const char *tag_key,
+        const char *tag_prefix)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != domain ||
+                    record.name != name ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find(tag_key);
+                return it != record.tags.end() &&
+                       it->second.rfind(tag_prefix, 0) == 0;
+            });
+    }
+
+    inline bool denseHasMTPPerfCounter(
+        const std::vector<PerfStatRecord> &records,
+        const char *name)
+    {
+        return denseHasPerfCounter(records, "mtp", name);
+    }
+
+    inline bool denseHasMTPPerfRecordTag(
+        const std::vector<PerfStatRecord> &records,
+        const char *name,
+        const char *tag_key,
+        const char *tag_value)
+    {
+        return denseHasPerfRecordTag(
+            records,
+            "mtp",
+            name,
+            tag_key,
+            tag_value);
+    }
+
+    /**
+     * @brief Format every tagged instance of one PerfStats counter.
+     *
+     * Stochastic MTP regressions need to compare the exact transaction chosen
+     * during first capture with the transaction chosen during graph reuse.
+     * PerfStats is deliberately reset between those requests, so formatting
+     * the saved snapshots is more reliable than querying the live collector in
+     * a later assertion message.
+     */
+    inline std::string densePerfCounterTagSummary(
+        const std::vector<PerfStatRecord> &records,
+        const char *domain,
+        const char *name)
+    {
+        std::ostringstream out;
+        bool found = false;
+        for (const PerfStatRecord &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != domain ||
+                record.name != name)
+            {
+                continue;
+            }
+
+            if (found)
+                out << '\n';
+            found = true;
+            out << domain << '.' << name << '{';
+            bool first_tag = true;
+            for (const auto &[key, value] : record.tags)
+            {
+                if (!first_tag)
+                    out << ',';
+                first_tag = false;
+                out << key << '=' << value;
+            }
+            out << '}';
+        }
+        return found ? out.str() : std::string("<no matching records>");
+    }
+
+    /**
+     * @brief Return whether every participant uses one homogeneous GPU backend.
+     *
+     * CUDA-only and ROCm-only graphs can capture their backend-native
+     * collectives. A mixed CUDA/ROCm topology is intentionally excluded because
+     * its cross-backend handoff may require explicit execution segments.
+     */
+    inline bool denseCaseUsesHomogeneousGPU(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        return classifyProductionParityExecutionTopology(test_case.devices) ==
+               ProductionParityExecutionTopology::HomogeneousGPU;
+    }
+
+    /**
+     * @brief Assert that a dense greedy MTP request used the expected verifier lane.
+     *
+     * Token equality proves the visible response, but not the performance path.
+     * This guard makes the parity matrix fail if a GPU LocalTP, single-device,
+     * CPU, or NodeTP request silently drifts away from the grouped
+     * decode-equivalent verifier rows after those rows have already been proven
+     * correct.
+     *
+     * @param test_case Dense parity fixture under test.
+     * @param records Perfstats snapshot captured immediately after the request.
+     * @param context Human-readable request label for assertion failures.
+     */
+    inline void expectDenseGreedyMTPPublicationPath(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        const bool used_retired_serial_replay =
+            denseHasMTPPerfCounter(
+                records,
+                "decode_equivalent_sequential_verifier_runs");
+        const bool used_grouped_host_publication =
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_publication_uses") &&
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_host_state_publications");
+        const bool used_grouped_device_publication =
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_outcome_device_resident_publication_uses") &&
+            (denseHasMTPPerfCounter(records, "spec_state_publications") ||
+             denseHasMTPPerfCounter(records, "spec_state_batch_publications") ||
+             denseHasMTPPerfCounter(
+                 records,
+                 "rank_grouped_decode_equivalent_spec_state_batch_publications"));
+        const bool used_direct_all_position_publication =
+            denseHasMTPPerfCounter(
+                records,
+                "all_position_state_publication_verifier_runs");
+        const bool used_grouped_verifier =
+            denseHasMTPPerfCounter(
+                records,
+                "grouped_decode_equivalent_greedy_verifier_runs");
+        const bool used_rank_grouped_multi_stream_publication =
+            denseHasPerfCounter(
+                records,
+                "tp_collective_runtime",
+                "sideband_only_multi_stream_groups");
+
+        if (denseCaseExpectsGroupedDevicePublication(test_case))
+        {
+            EXPECT_TRUE(used_grouped_device_publication)
+                << context << " should publish grouped verifier rows through "
+                   "the device-resident mailbox.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(used_grouped_verifier)
+                << context << " should run the grouped greedy verifier rows.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_retired_serial_replay)
+                << context << " must not use row-serial verifier replay when "
+                   "device-resident publication is available.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_direct_all_position_publication)
+                << context << " must not promote dense direct all-position "
+                   "publication without a continuation proof.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            if (test_case.topology == DensePrefixParityTopology::LocalTP)
+            {
+                EXPECT_TRUE(used_rank_grouped_multi_stream_publication)
+                    << context << " must publish the compact mirrored outcome "
+                       "through one rank-level NCCL/RCCL multi-stream group.\n"
+                    << PerfStatsCollector::summaryString(
+                           {"mtp", "tp_collective_runtime"});
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "host_rendezvous",
+                    "false"))
+                    << context << " must not rendezvous host workers for compact "
+                       "outcome publication.";
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "device_completion_wait",
+                    "false"))
+                    << context << " must leave collective completion ordered by "
+                       "the participant device streams.";
+            }
+            return;
+        }
+
+        EXPECT_TRUE(used_grouped_verifier)
+            << context << " should run grouped decode-equivalent verifier rows.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_TRUE(used_grouped_device_publication || used_grouped_host_publication)
+            << context << " should publish grouped verifier state through an "
+               "explicit grouped publication path.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(used_retired_serial_replay)
+            << context << " must not use the retired row-serial verifier replay.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
+        EXPECT_FALSE(used_direct_all_position_publication)
+            << context << " must not use unproven dense direct all-position "
+                   "publication.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+    }
+
+    /**
+     * @brief Prove homogeneous GPU MTP executed whole captured graphs.
+     *
+     * CUDA-only and ROCm-only serving cells have graph-capturable collectives,
+     * so both the ordinary decode graph and the MTP sidecar graph must replay as
+     * one native graph each. Segmented plans, segmented capture executables, and
+     * segmented replay are all architectural failures for these topologies.
+     *
+     * Heterogeneous device mixes are intentionally outside this assertion:
+     * crossing backend boundaries can require explicit collective segments.
+     *
+     * @param test_case Dense parity fixture under test.
+     * @param records Request-local PerfStats evidence.
+     * @param context Human-readable request label for assertion failures.
+     */
+    inline void expectDenseHomogeneousGPUFullGraphReplay(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        if (!denseCaseUsesHomogeneousGPU(test_case))
+        {
+            return;
+        }
+
+        const bool planned_capturable_full_graph =
+            denseHasPositivePerfCounterTag(
+                records,
+                "forward_graph",
+                "full_graph_plan_graphs",
+                "type",
+                "capturable");
+        const bool captured_full_graph = denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "full_graph_capture_executable_nodes");
+        const bool replayed_full_graph = denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "full_graph_replay_calls");
+        EXPECT_TRUE(
+            planned_capturable_full_graph ||
+            captured_full_graph ||
+            replayed_full_graph)
+            << context << " provided no proof of a whole-graph capture plan, "
+                          "executable, or replay. A reused graph does not rerun "
+                          "planning merely to recreate PerfStats evidence.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        EXPECT_TRUE(captured_full_graph || replayed_full_graph)
+            << context << " neither instantiated nor replayed a whole native graph.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        const bool captured_full_sidecar =
+            denseHasPositivePerfCounterTagPrefix(
+                records,
+                "forward_graph",
+                "full_graph_capture_executable_nodes",
+                "context",
+                "mtp_decode_sidecar");
+        const bool replayed_full_sidecar =
+            denseHasPositivePerfCounterTagPrefix(
+                records,
+                "forward_graph",
+                "full_graph_replay_calls",
+                "context",
+                "mtp_decode_sidecar");
+        EXPECT_TRUE(captured_full_sidecar || replayed_full_sidecar)
+            << context << " neither captured nor replayed the MTP sidecar as "
+                          "one native graph.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+
+        EXPECT_FALSE(denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_plan_segments"))
+            << context << " produced a segmented graph plan on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        EXPECT_FALSE(denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_graph_capture_executable_nodes"))
+            << context << " instantiated a segmented graph on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
+        EXPECT_FALSE(denseHasPerfCounter(
+            records,
+            "forward_graph",
+            "segmented_replay_segments"))
+            << context << " executed segmented replay on homogeneous GPUs.\n"
+            << PerfStatsCollector::summaryString({"forward_graph"});
     }
 
     inline void expectPhase138TransactionUsed(
@@ -247,15 +641,8 @@ namespace llaminar2::test::parity::qwen36
                 old_deterministic_env_ = old_value;
             }
 
-#ifdef HAVE_CUDA
-            old_cuda_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
-#endif
-
             setenv("LLAMINAR_DETERMINISTIC", "0", 1);
             mutableDebugEnv().reload();
-#ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(false);
-#endif
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
@@ -266,9 +653,6 @@ namespace llaminar2::test::parity::qwen36
                 return;
             }
 
-#ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(old_cuda_prefill_deterministic_);
-#endif
             if (had_old_deterministic_env_)
             {
                 setenv("LLAMINAR_DETERMINISTIC", old_deterministic_env_.c_str(), 1);
@@ -288,9 +672,6 @@ namespace llaminar2::test::parity::qwen36
         bool enabled_ = false;
         bool had_old_deterministic_env_ = false;
         std::string old_deterministic_env_;
-#ifdef HAVE_CUDA
-        bool old_cuda_prefill_deterministic_ = false;
-#endif
     };
 
     inline bool isDenseGpuParityCase(
@@ -336,6 +717,23 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Resolve the first configured model path through campaign tmpfs.
+     * @param names Ordered environment-variable overrides for the model.
+     * @param fallback Test-owned default GGUF path.
+     * @return The staged path in an aggregate campaign, otherwise the selected
+     *         source path.
+     * @throws std::runtime_error when aggregate staging did not declare or
+     *         publish the model selected by the concrete test.
+     */
+    inline std::string firstModelEnvOrDefault(
+        const std::vector<std::string> &names,
+        const std::string &fallback)
+    {
+        return productionParityResolvedModelPath(
+            firstEnvOrDefault(names, fallback));
+    }
+
+    /**
      * @brief Return true when a parity case will stage weights for a GPU backend.
      *
      * The distinction matters before any runner is built: GPU model loads should
@@ -365,7 +763,10 @@ namespace llaminar2::test::parity::qwen36
         model_config.strategy = strategy;
         model_config.weight_precision = weight_precision;
         model_config.use_mmap = true;
-        model_config.target_is_gpu = isQwen36GpuParityDevice(device);
+        model_config.payload_access_pattern =
+            isQwen36GpuParityDevice(device)
+                ? ModelPayloadAccessPattern::DeviceStaging
+                : ModelPayloadAccessPattern::DenseCpuResident;
         return ModelContext::create(model_path, model_config);
     }
 
@@ -591,6 +992,194 @@ namespace llaminar2::test::parity::qwen36
                << ", rel_l2<=" << max_rel_l2
                << ", symmetric_kl<=" << max_symmetric_kl
                << ", max_abs_diff<=" << max_abs_diff << ")";
+    }
+
+    inline ::testing::AssertionResult denseVerifierLogitsByteIdentical(
+        const float *actual_logits,
+        const float *serial_logits,
+        int vocab_size,
+        const std::string &label)
+    {
+        const size_t count = static_cast<size_t>(vocab_size);
+        if (std::memcmp(actual_logits, serial_logits, count * sizeof(float)) == 0)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        size_t first_mismatch = 0;
+        while (first_mismatch < count &&
+               std::memcmp(actual_logits + first_mismatch,
+                           serial_logits + first_mismatch,
+                           sizeof(float)) == 0)
+        {
+            ++first_mismatch;
+        }
+
+        uint32_t actual_bits = 0;
+        uint32_t serial_bits = 0;
+        if (first_mismatch < count)
+        {
+            std::memcpy(&actual_bits,
+                        actual_logits + first_mismatch,
+                        sizeof(actual_bits));
+            std::memcpy(&serial_bits,
+                        serial_logits + first_mismatch,
+                        sizeof(serial_bits));
+        }
+
+        const DenseVerifierLogitMetrics metrics =
+            computeDenseVerifierLogitMetrics(
+                actual_logits,
+                serial_logits,
+                vocab_size);
+        return ::testing::AssertionFailure()
+               << label
+               << " must be byte-identical to serial decode"
+               << " first_mismatch=" << first_mismatch
+               << " actual=" << (first_mismatch < count ? actual_logits[first_mismatch] : 0.0f)
+               << " serial=" << (first_mismatch < count ? serial_logits[first_mismatch] : 0.0f)
+               << " actual_bits=0x" << std::hex << actual_bits
+               << " serial_bits=0x" << serial_bits << std::dec
+               << " cosine=" << metrics.cosine
+               << " rel_l2=" << metrics.rel_l2
+               << " symmetric_kl=" << metrics.symmetric_kl
+               << " max_abs_diff=" << metrics.max_abs_diff
+               << " max_abs_index=" << metrics.max_abs_index;
+    }
+
+    /**
+     * @brief Prove grouped verifier recurrent state is byte-identical to serial decode.
+     *
+     * Logit equality is necessary but not sufficient for MTP publication:
+     * accepted verifier rows also publish GDN recurrence and short-conv state
+     * that the next ordinary decode step consumes.  CPU stores that state in
+     * host vectors, while CUDA/ROCm own the production state in backend kernel
+     * buffers.  This helper therefore treats GPU device hashes as mandatory
+     * whenever either side exposes them, and only falls back to host-vector
+     * hashes for pure CPU probes.
+     */
+    inline ::testing::AssertionResult verifierGDNStateByteIdentical(
+        const PrefixRuntimeStateSnapshot &grouped,
+        const PrefixRuntimeStateSnapshot &serial,
+        const std::string &label)
+    {
+        if (grouped.gdn_layers.size() != serial.gdn_layers.size())
+        {
+            return ::testing::AssertionFailure()
+                   << label << " GDN layer count mismatch: grouped="
+                   << grouped.gdn_layers.size()
+                   << " serial=" << serial.gdn_layers.size();
+        }
+
+        auto boolString = [](bool value) -> const char *
+        {
+            return value ? "true" : "false";
+        };
+
+        for (size_t i = 0; i < grouped.gdn_layers.size(); ++i)
+        {
+            const PrefixGDNLayerProbe &g = grouped.gdn_layers[i];
+            const PrefixGDNLayerProbe &s = serial.gdn_layers[i];
+            const bool compare_device =
+                g.device_state_hash_available ||
+                s.device_state_hash_available;
+            const bool compare_local_device =
+                g.local_device_state_hash_available ||
+                s.local_device_state_hash_available;
+
+            if (g.global_layer != s.global_layer)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " GDN layer index mismatch at ordinal " << i
+                       << ": grouped=L" << g.global_layer
+                       << " serial=L" << s.global_layer;
+            }
+
+            if (compare_device)
+            {
+                if (!g.device_state_hash_available ||
+                    !s.device_state_hash_available ||
+                    g.recurrence_device_bytes != s.recurrence_device_bytes ||
+                    g.conv_device_bytes != s.conv_device_bytes ||
+                    g.recurrence_device_hash != s.recurrence_device_hash ||
+                    g.conv_device_hash != s.conv_device_hash)
+                {
+                    return ::testing::AssertionFailure()
+                           << label << " device GDN state mismatch at L"
+                           << g.global_layer
+                           << ": grouped_available="
+                           << boolString(g.device_state_hash_available)
+                           << " serial_available="
+                           << boolString(s.device_state_hash_available)
+                           << " grouped_rec_bytes="
+                           << g.recurrence_device_bytes
+                           << " serial_rec_bytes="
+                           << s.recurrence_device_bytes
+                           << " grouped_conv_bytes=" << g.conv_device_bytes
+                           << " serial_conv_bytes=" << s.conv_device_bytes
+                           << " grouped_rec_hash="
+                           << g.recurrence_device_hash
+                           << " serial_rec_hash="
+                           << s.recurrence_device_hash
+                           << " grouped_conv_hash=" << g.conv_device_hash
+                           << " serial_conv_hash=" << s.conv_device_hash;
+                }
+            }
+            else if (g.recurrence_values != s.recurrence_values ||
+                     g.conv_values != s.conv_values ||
+                     g.recurrence_hash != s.recurrence_hash ||
+                     g.conv_hash != s.conv_hash)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " host GDN state mismatch at L"
+                       << g.global_layer
+                       << ": grouped_rec_values=" << g.recurrence_values
+                       << " serial_rec_values=" << s.recurrence_values
+                       << " grouped_conv_values=" << g.conv_values
+                       << " serial_conv_values=" << s.conv_values
+                       << " grouped_rec_hash=" << g.recurrence_hash
+                       << " serial_rec_hash=" << s.recurrence_hash
+                       << " grouped_conv_hash=" << g.conv_hash
+                       << " serial_conv_hash=" << s.conv_hash;
+            }
+
+            if (compare_local_device &&
+                (!g.local_device_state_hash_available ||
+                 !s.local_device_state_hash_available ||
+                 g.recurrence_local_device_bytes !=
+                     s.recurrence_local_device_bytes ||
+                 g.conv_local_device_bytes != s.conv_local_device_bytes ||
+                 g.recurrence_local_device_hash !=
+                     s.recurrence_local_device_hash ||
+                 g.conv_local_device_hash != s.conv_local_device_hash))
+            {
+                return ::testing::AssertionFailure()
+                       << label << " local-device GDN state mismatch at L"
+                       << g.global_layer
+                       << ": grouped_available="
+                       << boolString(g.local_device_state_hash_available)
+                       << " serial_available="
+                       << boolString(s.local_device_state_hash_available)
+                       << " grouped_rec_bytes="
+                       << g.recurrence_local_device_bytes
+                       << " serial_rec_bytes="
+                       << s.recurrence_local_device_bytes
+                       << " grouped_conv_bytes="
+                       << g.conv_local_device_bytes
+                       << " serial_conv_bytes="
+                       << s.conv_local_device_bytes
+                       << " grouped_rec_hash="
+                       << g.recurrence_local_device_hash
+                       << " serial_rec_hash="
+                       << s.recurrence_local_device_hash
+                       << " grouped_conv_hash="
+                       << g.conv_local_device_hash
+                       << " serial_conv_hash="
+                       << s.conv_local_device_hash;
+            }
+        }
+
+        return ::testing::AssertionSuccess();
     }
 
     inline ::testing::AssertionResult tokenSequencesMatch(
@@ -1028,6 +1617,817 @@ namespace llaminar2::test::parity::qwen36
                << ", rel_l2<=" << rel_l2_threshold << ")";
     }
 
+    /**
+     * @brief Semantic kind of one production checkpoint artifact row.
+     */
+    enum class Qwen36CheckpointKind
+    {
+        Numeric,
+        RoutingIndices,
+        RoutingWeights,
+    };
+
+    /**
+     * @brief Collect rigorous checkpoint comparisons and emit standard parity CSVs.
+     *
+     * Prefix/MTP tests use production generation APIs rather than the classic
+     * fixture's raw forward loop.  This recorder keeps that execution path but
+     * feeds its checkpoints through the same metric and CSV authorities as the
+     * established PyTorch parity suite.  A cell cannot finalize without both
+     * prefill and decode stage evidence.
+     */
+    class Qwen36CheckpointArtifactRecorder final
+    {
+    public:
+        Qwen36CheckpointArtifactRecorder(
+            std::string backend,
+            float prefill_cosine_threshold,
+            float decode_cosine_threshold,
+            float logit_kl_threshold,
+            int routing_top_k = 8,
+            int num_experts = 256)
+            : backend_(std::move(backend)),
+              prefill_cosine_threshold_(prefill_cosine_threshold),
+              decode_cosine_threshold_(decode_cosine_threshold),
+              logit_kl_threshold_(logit_kl_threshold),
+              routing_top_k_(routing_top_k),
+              num_experts_(num_experts)
+        {
+            if (routing_top_k_ <= 0 || num_experts_ < routing_top_k_)
+                throw std::invalid_argument("invalid Qwen3.6 routing geometry");
+        }
+
+        /** @brief Record one prefill checkpoint against its PyTorch tensor. */
+        void recordPrefill(
+            int layer,
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &expected,
+            Qwen36CheckpointKind kind = Qwen36CheckpointKind::Numeric)
+        {
+            auto comparison = compare(
+                stage,
+                actual,
+                expected,
+                kind,
+                routingContext("prefill", -1, layer, stage),
+                prefill_cosine_threshold_);
+            if (!comparison)
+                return;
+
+            if (stage == "EMBEDDING")
+            {
+                prefill_.embedding_cosine = comparison->cosine_similarity;
+                prefill_.embedding_passed = comparison->passed;
+                saw_prefill_embedding_ = true;
+                return;
+            }
+            if (stage == "LM_HEAD")
+            {
+                populatePrefillLogits(*comparison, actual, expected);
+                saw_prefill_logits_ = true;
+                return;
+            }
+            addStage(
+                prefill_.layer_stats,
+                layer,
+                std::move(*comparison),
+                prefill_cosine_threshold_);
+            ++prefill_checkpoint_count_;
+        }
+
+        /** @brief Record the expected and emitted token for a decode row. */
+        void recordDecodeToken(int step, int actual_token, int expected_token)
+        {
+            DecodeStepStats &stats = decodeStep(step);
+            stats.llaminar_token = actual_token;
+            stats.pytorch_token = expected_token;
+            stats.token_match = actual_token == expected_token;
+        }
+
+        /** @brief Record one decode or MTP-sidecar checkpoint. */
+        void recordDecode(
+            int step,
+            int layer,
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &expected,
+            Qwen36CheckpointKind kind = Qwen36CheckpointKind::Numeric)
+        {
+            auto comparison = compare(
+                stage,
+                actual,
+                expected,
+                kind,
+                routingContext("decode", step, layer, stage),
+                decode_cosine_threshold_);
+            if (!comparison)
+                return;
+
+            DecodeStepStats &stats = decodeStep(step);
+            if (stage == "LM_HEAD")
+            {
+                populateDecodeLogits(stats, *comparison, actual, expected);
+                ++decode_checkpoint_count_;
+                return;
+            }
+            if (stage.ends_with("_LM_HEAD"))
+                populateDecodeLogits(stats, *comparison, actual, expected);
+            addStage(
+                stats.layer_stats,
+                layer,
+                std::move(*comparison),
+                decode_cosine_threshold_);
+            ++decode_checkpoint_count_;
+            observed_decode_stages_.insert(stage);
+        }
+
+        /**
+         * @brief Require at least one recorded decode stage with this suffix.
+         */
+        void requireDecodeStageSuffix(std::string suffix)
+        {
+            required_decode_stage_suffixes_.insert(std::move(suffix));
+        }
+
+        /**
+         * @brief Assert the numerical contract and write all standard CSVs.
+         */
+        void finalize()
+        {
+            finalizePrefillSummary();
+            finalizeDecodeSummary();
+
+            EXPECT_TRUE(saw_prefill_embedding_)
+                << "Production checkpoint parity recorded no prefill EMBEDDING";
+            EXPECT_TRUE(saw_prefill_logits_)
+                << "Production checkpoint parity recorded no prefill LM_HEAD";
+            EXPECT_GT(prefill_checkpoint_count_, 0u)
+                << "Production checkpoint parity recorded no prefill layer stages";
+            EXPECT_GT(decode_checkpoint_count_, 0u)
+                << "Production checkpoint parity recorded no decode stages";
+
+            for (const std::string &suffix : required_decode_stage_suffixes_)
+            {
+                const bool observed = std::any_of(
+                    observed_decode_stages_.begin(),
+                    observed_decode_stages_.end(),
+                    [&suffix](const std::string &stage)
+                    {
+                        return stage.size() >= suffix.size() &&
+                               stage.compare(
+                                   stage.size() - suffix.size(),
+                                   suffix.size(),
+                                   suffix) == 0;
+                    });
+                EXPECT_TRUE(observed)
+                    << "Production checkpoint parity missing required stage suffix "
+                    << suffix;
+            }
+
+            EXPECT_GE(prefill_.early_layers_passed, min_early_layers_passed_)
+                << "At least " << min_early_layers_passed_ << " of embedding plus the first "
+                << early_layers_count_ << " layers must pass prefill parity";
+            EXPECT_TRUE(prefill_.lm_head_passed)
+                << "Prefill LM_HEAD failed KL/top-k parity";
+            EXPECT_TRUE(decode_.overall_passed)
+                << "Decode checkpoint/logit campaign failed established parity gates";
+
+            const auto results_dir = ParityCSVArtifactWriter::resultsDir();
+            EXPECT_TRUE(ParityCSVArtifactWriter::writePrefill(
+                results_dir, backend_, prefill_))
+                << "Failed to write standard prefill CSV artifacts";
+            EXPECT_TRUE(ParityCSVArtifactWriter::writeDecode(
+                results_dir, backend_, decode_))
+                << "Failed to write standard decode CSV artifacts";
+        }
+
+    private:
+        std::optional<StageComparisonResult> compare(
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &reference,
+            Qwen36CheckpointKind kind,
+            const std::string &routing_context,
+            float cosine_threshold)
+        {
+            if (actual.empty() || reference.empty())
+            {
+                ADD_FAILURE() << stage << " has an empty production/reference payload";
+                return std::nullopt;
+            }
+
+            const float *expected = reference.data();
+            size_t expected_size = reference.size();
+            if (reference.size() > actual.size() &&
+                reference.size() % actual.size() == 0)
+            {
+                expected = reference.data() + (reference.size() - actual.size());
+                expected_size = actual.size();
+            }
+            if (actual.size() != expected_size)
+            {
+                ADD_FAILURE()
+                    << stage << " checkpoint size mismatch: production="
+                    << actual.size() << " reference=" << reference.size();
+                return std::nullopt;
+            }
+
+            if (kind == Qwen36CheckpointKind::RoutingIndices)
+            {
+                std::vector<float> aligned_expected(
+                    expected,
+                    expected + expected_size);
+                routing_indices_[routing_context] = {
+                    actual,
+                    aligned_expected};
+                return compareRoutingIndices(
+                    stage,
+                    actual,
+                    aligned_expected,
+                    cosine_threshold);
+            }
+            if (kind == Qwen36CheckpointKind::RoutingWeights)
+            {
+                const auto indices = routing_indices_.find(routing_context);
+                if (indices == routing_indices_.end())
+                {
+                    ADD_FAILURE()
+                        << stage << " has no paired routing-index checkpoint in "
+                        << routing_context;
+                    return std::nullopt;
+                }
+                return compareRoutingWeights(
+                    stage,
+                    actual,
+                    std::vector<float>(expected, expected + expected_size),
+                    indices->second.first,
+                    indices->second.second,
+                    cosine_threshold);
+            }
+
+            StageComparisonResult result = compareParityTensorData(
+                actual.data(),
+                expected,
+                actual.size(),
+                stage,
+                cosine_threshold);
+            return result;
+        }
+
+        static std::string routingContext(
+            std::string_view phase,
+            int step,
+            int layer,
+            const std::string &stage)
+        {
+            const size_t suffix = stage.find("MOE_ROUTING_");
+            const std::string family =
+                suffix == std::string::npos ? stage : stage.substr(0, suffix);
+            return std::string(phase) + '/' + std::to_string(step) + '/' +
+                   std::to_string(layer) + '/' + family;
+        }
+
+        StageComparisonResult compareRoutingIndices(
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &expected,
+            float cosine_threshold) const
+        {
+            StageComparisonResult result;
+            result.stage_name = stage;
+            result.total_elements = actual.size();
+            result.is_routing_stage = true;
+            if (actual.size() != expected.size() ||
+                actual.size() % static_cast<size_t>(routing_top_k_) != 0)
+            {
+                return result;
+            }
+
+            const size_t rows =
+                actual.size() / static_cast<size_t>(routing_top_k_);
+            double overlap_sum = 0.0;
+            size_t top1_matches = 0;
+            for (size_t row = 0; row < rows; ++row)
+            {
+                std::set<int> actual_experts;
+                std::set<int> expected_experts;
+                for (int route = 0; route < routing_top_k_; ++route)
+                {
+                    const size_t index =
+                        row * static_cast<size_t>(routing_top_k_) +
+                        static_cast<size_t>(route);
+                    actual_experts.insert(static_cast<int>(actual[index]));
+                    expected_experts.insert(static_cast<int>(expected[index]));
+                }
+                size_t intersection = 0;
+                for (const int expert : actual_experts)
+                    intersection += expected_experts.contains(expert) ? 1u : 0u;
+                overlap_sum += static_cast<double>(intersection) /
+                               static_cast<double>(routing_top_k_);
+                top1_matches +=
+                    static_cast<int>(actual[row * routing_top_k_]) ==
+                            static_cast<int>(expected[row * routing_top_k_])
+                        ? 1u
+                        : 0u;
+            }
+            result.routing_overlap = static_cast<float>(
+                overlap_sum / static_cast<double>(rows));
+            result.routing_top1_match = static_cast<float>(
+                static_cast<double>(top1_matches) / static_cast<double>(rows));
+            result.cosine_similarity = result.routing_overlap;
+            result.max_abs_diff = 1.0f - result.routing_overlap;
+            result.passed = result.routing_overlap >= cosine_threshold;
+            return result;
+        }
+
+        StageComparisonResult compareRoutingWeights(
+            const std::string &stage,
+            const std::vector<float> &actual_weights,
+            const std::vector<float> &expected_weights,
+            const std::vector<float> &actual_indices,
+            const std::vector<float> &expected_indices,
+            float cosine_threshold) const
+        {
+            StageComparisonResult result;
+            result.stage_name = stage;
+            result.total_elements = actual_weights.size();
+            result.is_routing_stage = true;
+            if (actual_weights.size() != expected_weights.size() ||
+                actual_weights.size() != actual_indices.size() ||
+                actual_indices.size() != expected_indices.size() ||
+                actual_weights.size() % static_cast<size_t>(routing_top_k_) != 0)
+            {
+                return result;
+            }
+
+            const size_t rows =
+                actual_weights.size() / static_cast<size_t>(routing_top_k_);
+            double cosine_sum = 0.0;
+            double l1_sum = 0.0;
+            float max_difference = 0.0f;
+            std::vector<float> actual_sparse(
+                static_cast<size_t>(num_experts_));
+            std::vector<float> expected_sparse(
+                static_cast<size_t>(num_experts_));
+            for (size_t row = 0; row < rows; ++row)
+            {
+                std::fill(actual_sparse.begin(), actual_sparse.end(), 0.0f);
+                std::fill(expected_sparse.begin(), expected_sparse.end(), 0.0f);
+                for (int route = 0; route < routing_top_k_; ++route)
+                {
+                    const size_t index =
+                        row * static_cast<size_t>(routing_top_k_) +
+                        static_cast<size_t>(route);
+                    const int actual_expert =
+                        static_cast<int>(actual_indices[index]);
+                    const int expected_expert =
+                        static_cast<int>(expected_indices[index]);
+                    if (actual_expert >= 0 && actual_expert < num_experts_)
+                        actual_sparse[static_cast<size_t>(actual_expert)] =
+                            actual_weights[index];
+                    if (expected_expert >= 0 && expected_expert < num_experts_)
+                        expected_sparse[static_cast<size_t>(expected_expert)] =
+                            expected_weights[index];
+                }
+
+                double dot = 0.0;
+                double actual_norm = 0.0;
+                double expected_norm = 0.0;
+                double row_l1 = 0.0;
+                for (int expert = 0; expert < num_experts_; ++expert)
+                {
+                    const double actual =
+                        actual_sparse[static_cast<size_t>(expert)];
+                    const double expected =
+                        expected_sparse[static_cast<size_t>(expert)];
+                    const double difference = std::abs(actual - expected);
+                    dot += actual * expected;
+                    actual_norm += actual * actual;
+                    expected_norm += expected * expected;
+                    row_l1 += difference;
+                    max_difference = std::max(
+                        max_difference,
+                        static_cast<float>(difference));
+                }
+                const double denominator =
+                    std::sqrt(actual_norm * expected_norm);
+                cosine_sum += denominator > 1.0e-30 ? dot / denominator : 0.0;
+                l1_sum += row_l1;
+            }
+            result.routing_overlap = static_cast<float>(
+                cosine_sum / static_cast<double>(rows));
+            result.routing_weight_l1 = static_cast<float>(
+                l1_sum / static_cast<double>(rows));
+            result.cosine_similarity = result.routing_overlap;
+            result.max_abs_diff = max_difference;
+            result.passed = result.routing_overlap >= cosine_threshold;
+            return result;
+        }
+
+        static void addStage(
+            std::vector<LayerStats> &layers,
+            int layer_index,
+            StageComparisonResult result,
+            float cosine_threshold)
+        {
+            auto layer_it = std::find_if(
+                layers.begin(),
+                layers.end(),
+                [layer_index](const LayerStats &layer)
+                {
+                    return layer.layer_idx == layer_index;
+                });
+            if (layer_it == layers.end())
+            {
+                layers.push_back(LayerStats{.layer_idx = layer_index});
+                layer_it = std::prev(layers.end());
+            }
+            layer_it->stage_results.push_back(std::move(result));
+            recomputeLayer(*layer_it, cosine_threshold);
+            std::sort(
+                layers.begin(),
+                layers.end(),
+                [](const LayerStats &left, const LayerStats &right)
+                {
+                    return left.layer_idx < right.layer_idx;
+                });
+        }
+
+        static void recomputeLayer(
+            LayerStats &layer,
+            float cosine_threshold)
+        {
+            layer.avg_cosine_sim = 0.0f;
+            layer.min_cosine_sim = 1.0f;
+            layer.max_cosine_drop = 0.0f;
+            layer.stages_compared = 0;
+            layer.passed = false;
+            layer.worst_stage.clear();
+            layer.max_drop_stage.clear();
+            layer.max_kurtosis = 0.0f;
+            layer.max_kurtosis_stage.clear();
+
+            float previous_cosine = 0.0f;
+            bool have_previous = false;
+            for (auto &stage : layer.stage_results)
+            {
+                if (stage.llaminar_stats.kurtosis > layer.max_kurtosis)
+                {
+                    layer.max_kurtosis = stage.llaminar_stats.kurtosis;
+                    layer.max_kurtosis_stage = stage.stage_name;
+                }
+                if (stage.is_routing_stage)
+                    continue;
+
+                ++layer.stages_compared;
+                layer.avg_cosine_sim += stage.cosine_similarity;
+                if (stage.cosine_similarity < layer.min_cosine_sim)
+                {
+                    layer.min_cosine_sim = stage.cosine_similarity;
+                    layer.worst_stage = stage.stage_name;
+                }
+                if (have_previous)
+                {
+                    stage.cosine_drop = previous_cosine - stage.cosine_similarity;
+                    if (stage.cosine_drop > layer.max_cosine_drop)
+                    {
+                        layer.max_cosine_drop = stage.cosine_drop;
+                        layer.max_drop_stage = stage.stage_name;
+                    }
+                }
+                previous_cosine = stage.cosine_similarity;
+                have_previous = true;
+            }
+            if (layer.stages_compared > 0)
+            {
+                layer.avg_cosine_sim /=
+                    static_cast<float>(layer.stages_compared);
+                layer.passed =
+                    layer.avg_cosine_sim >= cosine_threshold;
+            }
+        }
+
+        DecodeStepStats &decodeStep(int step)
+        {
+            auto it = std::find_if(
+                decode_.step_stats.begin(),
+                decode_.step_stats.end(),
+                [step](const DecodeStepStats &stats)
+                {
+                    return stats.step_idx == step;
+                });
+            if (it == decode_.step_stats.end())
+            {
+                decode_.step_stats.push_back(DecodeStepStats{.step_idx = step});
+                std::sort(
+                    decode_.step_stats.begin(),
+                    decode_.step_stats.end(),
+                    [](const DecodeStepStats &left, const DecodeStepStats &right)
+                    {
+                        return left.step_idx < right.step_idx;
+                    });
+                it = std::find_if(
+                    decode_.step_stats.begin(),
+                    decode_.step_stats.end(),
+                    [step](const DecodeStepStats &stats)
+                    {
+                        return stats.step_idx == step;
+                    });
+            }
+            return *it;
+        }
+
+        void populatePrefillLogits(
+            const StageComparisonResult &comparison,
+            const std::vector<float> &actual,
+            const std::vector<float> &reference)
+        {
+            const size_t size = std::min(actual.size(), reference.size());
+            const float *expected = reference.data() + (reference.size() - size);
+            const float *observed = actual.data() + (actual.size() - size);
+            prefill_.lm_head_cosine = comparison.cosine_similarity;
+            prefill_.lm_head_kl = computeKLDivergence(
+                observed, expected, size, size);
+            prefill_.lm_head_top1 = computeTopKOverlap(
+                observed, expected, size, size, 1);
+            prefill_.lm_head_top5 = computeTopKOverlap(
+                observed, expected, size, size, 5);
+            prefill_.lm_head_pytorch_top1_in_top3 =
+                pytorchTop1InLlaminarTopK(
+                    observed, expected, size, size, 3) >= 1.0f - 1.0e-6f;
+            prefill_.lm_head_passed =
+                prefill_.lm_head_kl < logit_kl_threshold_ &&
+                prefill_.lm_head_top1 * 100.0f >= min_top1_accuracy_ &&
+                prefill_.lm_head_top5 * 100.0f >= min_top5_accuracy_ &&
+                prefill_.lm_head_pytorch_top1_in_top3;
+        }
+
+        void populateDecodeLogits(
+            DecodeStepStats &stats,
+            const StageComparisonResult &comparison,
+            const std::vector<float> &actual,
+            const std::vector<float> &reference)
+        {
+            stats.has_logit_data = true;
+            const size_t size = std::min(actual.size(), reference.size());
+            const float *expected = reference.data() + (reference.size() - size);
+            const float *observed = actual.data() + (actual.size() - size);
+            stats.cosine_similarity = comparison.cosine_similarity;
+            stats.kl_divergence = computeKLDivergence(
+                observed, expected, size, size);
+            stats.top1_overlap = computeTopKOverlap(
+                observed, expected, size, size, 1);
+            stats.top5_overlap = computeTopKOverlap(
+                observed, expected, size, size, 5);
+            stats.top3_match = pytorchTop1InLlaminarTopK(
+                                   observed, expected, size, size, 3) >=
+                               1.0f - 1.0e-6f;
+            stats.top5_match = pytorchTop1InLlaminarTopK(
+                                   observed, expected, size, size, 5) >=
+                               1.0f - 1.0e-6f;
+            stats.passed =
+                comparison.cosine_similarity >= decode_cosine_threshold_ ||
+                stats.kl_divergence < logit_kl_threshold_;
+        }
+
+        void finalizePrefillSummary()
+        {
+            prefill_.early_layers_passed = prefill_.embedding_passed ? 1 : 0;
+            prefill_.total_layers_passed = prefill_.embedding_passed ? 1 : 0;
+            for (const auto &layer : prefill_.layer_stats)
+            {
+                if (layer.passed)
+                {
+                    ++prefill_.total_layers_passed;
+                    if (layer.layer_idx >= 0 &&
+                        layer.layer_idx < early_layers_count_)
+                        ++prefill_.early_layers_passed;
+                }
+            }
+            prefill_.overall_passed =
+                prefill_.early_layers_passed >= min_early_layers_passed_ &&
+                prefill_.lm_head_passed;
+        }
+
+        void finalizeDecodeSummary()
+        {
+            decode_.steps_total = static_cast<int>(decode_.step_stats.size());
+            for (auto &step : decode_.step_stats)
+            {
+                if (step.passed)
+                    ++decode_.steps_passed;
+                if (step.token_match)
+                    ++decode_.top1_matches;
+                if (step.top3_match)
+                    ++decode_.top3_matches;
+                if (step.top5_match)
+                    ++decode_.top5_matches;
+                decode_.avg_cosine += step.cosine_similarity;
+                decode_.avg_kl += step.kl_divergence;
+            }
+            if (decode_.steps_total > 0)
+            {
+                const float denominator =
+                    static_cast<float>(decode_.steps_total);
+                decode_.avg_cosine /= denominator;
+                decode_.avg_kl /= denominator;
+                decode_.top1_accuracy =
+                    100.0f * static_cast<float>(decode_.top1_matches) /
+                    denominator;
+                decode_.top3_accuracy =
+                    100.0f * static_cast<float>(decode_.top3_matches) /
+                    denominator;
+                decode_.top5_accuracy =
+                    100.0f * static_cast<float>(decode_.top5_matches) /
+                    denominator;
+            }
+            const int minimum_steps = static_cast<int>(
+                static_cast<float>(decode_.steps_total) *
+                minimum_decode_pass_rate_);
+            decode_.overall_passed =
+                decode_.steps_total > 0 &&
+                decode_.steps_passed >= minimum_steps &&
+                decode_.top5_accuracy >= min_top5_accuracy_ &&
+                decode_.avg_cosine >= decode_cosine_threshold_ &&
+                decode_.top3_matches == decode_.steps_total;
+        }
+
+        std::string backend_;
+        float prefill_cosine_threshold_ = 0.96f;
+        float decode_cosine_threshold_ = 0.98f;
+        float logit_kl_threshold_ = 0.03f;
+        int early_layers_count_ = 6;
+        int min_early_layers_passed_ = 5;
+        float min_top1_accuracy_ = 80.0f;
+        float min_top5_accuracy_ = 60.0f;
+        float minimum_decode_pass_rate_ = 0.8f;
+        int routing_top_k_ = 8;
+        int num_experts_ = 256;
+        ParityTestSummary prefill_;
+        DecodeParitySummary decode_;
+        bool saw_prefill_embedding_ = false;
+        bool saw_prefill_logits_ = false;
+        size_t prefill_checkpoint_count_ = 0;
+        size_t decode_checkpoint_count_ = 0;
+        std::map<
+            std::string,
+            std::pair<std::vector<float>, std::vector<float>>>
+            routing_indices_;
+        std::set<std::string> observed_decode_stages_;
+        std::set<std::string> required_decode_stage_suffixes_;
+    };
+
+    /** @brief Split a canonical snapshot key into its layer and stage fields. */
+    inline std::pair<int, std::string> qwen36CheckpointLayerAndStage(
+        const std::string &key)
+    {
+        if (key.rfind("layer", 0) != 0)
+            return {-1, key};
+        size_t digit_end = 5;
+        while (digit_end < key.size() &&
+               std::isdigit(static_cast<unsigned char>(key[digit_end])))
+        {
+            ++digit_end;
+        }
+        if (digit_end == 5 || digit_end >= key.size() || key[digit_end] != '_')
+            return {-1, key};
+        return {
+            std::stoi(key.substr(5, digit_end - 5)),
+            key.substr(digit_end + 1)};
+    }
+
+    /** @brief Select the semantically correct comparison for a stage. */
+    inline Qwen36CheckpointKind qwen36CheckpointKind(const std::string &stage)
+    {
+        if (stage.ends_with("MOE_ROUTING_INDICES"))
+            return Qwen36CheckpointKind::RoutingIndices;
+        if (stage.ends_with("MOE_ROUTING_WEIGHTS"))
+            return Qwen36CheckpointKind::RoutingWeights;
+        return Qwen36CheckpointKind::Numeric;
+    }
+
+    /**
+     * @brief Select the real prompt rows from a fixed-capacity captured tensor.
+     *
+     * GPU prefill graphs execute a bucket-sized physical matrix while PyTorch
+     * snapshots contain only logical prompt rows.  The graph contract places
+     * the logical prefix at the leading rows and masks the remaining capacity.
+     * Project that explicit row interval before numerical comparison; treating
+     * a shape mismatch as an absent checkpoint would silently erase nearly all
+     * prefill coverage under graph capture.
+     */
+    inline std::optional<std::vector<float>> qwen36ProjectCapturedPrefillRows(
+        const std::string &key,
+        const float *actual,
+        size_t actual_size,
+        const std::vector<float> &expected,
+        size_t logical_rows)
+    {
+        if (!actual || actual_size == 0 || expected.empty() || logical_rows == 0)
+            return std::nullopt;
+        if (actual_size == expected.size())
+            return std::vector<float>(actual, actual + actual_size);
+
+        if (expected.size() % logical_rows == 0)
+        {
+            const size_t columns = expected.size() / logical_rows;
+            if (key == "LM_HEAD" && actual_size == columns)
+            {
+                return std::vector<float>(actual, actual + actual_size);
+            }
+            if (columns > 0 && actual_size % columns == 0)
+            {
+                const size_t physical_rows = actual_size / columns;
+                if (physical_rows >= logical_rows)
+                {
+                    return std::vector<float>(
+                        actual,
+                        actual + logical_rows * columns);
+                }
+            }
+        }
+
+        /*
+         * Terminal-only stages such as LM_HEAD may publish one selected row
+         * even when their producer owns the full physical bucket.  Select the
+         * last logical row, never the padded physical tail.
+         */
+        if (actual_size > expected.size() &&
+            actual_size % expected.size() == 0)
+        {
+            const size_t physical_rows = actual_size / expected.size();
+            if (physical_rows >= logical_rows)
+            {
+                const size_t row = logical_rows - 1;
+                const float *begin = actual + row * expected.size();
+                return std::vector<float>(begin, begin + expected.size());
+            }
+        }
+
+        ADD_FAILURE()
+            << key << " cannot project captured prefill shape: production="
+            << actual_size << " reference=" << expected.size()
+            << " logical_rows=" << logical_rows;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Compare every available production prefill checkpoint to PyTorch.
+     */
+    inline void recordQwen36PrefillArtifacts(
+        Qwen36CheckpointArtifactRecorder &recorder,
+        IOrchestrationRunner &runner,
+        const std::filesystem::path &reference_dir,
+        size_t logical_rows,
+        const ParityGDNHeadConfig &gdn_config = {})
+    {
+        size_t comparable = 0;
+        auto keys = runner.getSnapshotKeys();
+        std::sort(keys.begin(), keys.end());
+        for (const std::string &key : keys)
+        {
+            const std::vector<float> expected =
+                loadDensePyTorchSnapshot(reference_dir, key);
+            if (expected.empty())
+                continue;
+            size_t actual_size = 0;
+            const float *actual_data = runner.getSnapshot(key, actual_size);
+            if (!actual_data || actual_size == 0)
+            {
+                ADD_FAILURE() << "Production prefill advertised an empty checkpoint "
+                              << key;
+                continue;
+            }
+            auto projected = qwen36ProjectCapturedPrefillRows(
+                key,
+                actual_data,
+                actual_size,
+                expected,
+                logical_rows);
+            if (!projected)
+                continue;
+            const auto [layer, stage] = qwen36CheckpointLayerAndStage(key);
+            auto permuted = applyParityGDNHeadPermutation(
+                projected->data(),
+                projected->size(),
+                stage,
+                gdn_config);
+            const std::vector<float> &production =
+                permuted.empty() ? *projected : permuted;
+            recorder.recordPrefill(
+                layer,
+                stage,
+                production,
+                expected,
+                qwen36CheckpointKind(stage));
+            ++comparable;
+        }
+        EXPECT_GT(comparable, 0u)
+            << "No production prefill checkpoints matched references in "
+            << reference_dir;
+    }
+
     inline std::vector<std::string> denseOrderedDecodeSnapshotKeys(
         const DenseDecodeSnapshotComparisonPolicy &policy)
     {
@@ -1194,31 +2594,46 @@ namespace llaminar2::test::parity::qwen36
         return snapshots;
     }
 
-    inline ::testing::AssertionResult denseVerifierRowSnapshotsNear(
+    /**
+     * @brief Copy orchestration-level snapshots without inventing tensor shape.
+     *
+     * The orchestration API intentionally exposes only authenticated element
+     * cardinality because TP/PP reconstruction may have joined participant
+     * shapes. Dense MTP checkpoint comparisons need the exact flat payload,
+     * not a guessed row/column decomposition, so the diagnostic records one
+     * logical row and the complete cardinality here.
+     */
+    inline std::map<std::string, DenseStageSnapshot> captureDenseStageSnapshots(
+        IOrchestrationRunner &runner)
+    {
+        std::map<std::string, DenseStageSnapshot> snapshots;
+        auto keys = runner.getSnapshotKeys();
+        std::sort(keys.begin(), keys.end());
+        for (const std::string &key : keys)
+        {
+            size_t size = 0;
+            const float *data = runner.getSnapshot(key, size);
+            if (!data || size == 0)
+                continue;
+            snapshots.emplace(
+                key,
+                DenseStageSnapshot{
+                    .key = key,
+                    .data = std::vector<float>(data, data + size),
+                    .rows = 1,
+                    .cols = size,
+                });
+        }
+        return snapshots;
+    }
+
+    inline ::testing::AssertionResult denseVerifierRowSnapshotsByteIdentical(
         const std::map<std::string, DenseStageSnapshot> &verifier_snapshots,
         const std::map<std::string, DenseStageSnapshot> &single_row_snapshots,
         const std::string &label,
         int verifier_rows,
-        int verifier_row_index,
-        float abs_tolerance = 1.0e-6f,
-        float rel_tolerance = 1.0e-6f)
+        int verifier_row_index)
     {
-        if (const char *override_tolerance =
-                std::getenv("LLAMINAR_DENSE_VERIFIER_SNAPSHOT_TOLERANCE"))
-        {
-            char *parse_end = nullptr;
-            const float parsed = std::strtof(override_tolerance, &parse_end);
-            if (parse_end != override_tolerance && std::isfinite(parsed) && parsed >= 0.0f)
-            {
-                /*
-                 * Diagnostic only: the normal acceptance thresholds above stay
-                 * strict and stable, while this env var lets us hunt for the
-                 * earliest sub-micro drift without changing test semantics.
-                 */
-                abs_tolerance = parsed;
-                rel_tolerance = parsed;
-            }
-        }
         if (verifier_rows <= 0 ||
             verifier_row_index < 0 ||
             verifier_row_index >= verifier_rows)
@@ -1236,6 +2651,8 @@ namespace llaminar2::test::parity::qwen36
             size_t mismatches = 0;
             float first_actual = 0.0f;
             float first_expected = 0.0f;
+            uint32_t first_actual_bits = 0;
+            uint32_t first_expected_bits = 0;
             float first_abs = 0.0f;
             float first_rel = 0.0f;
             float max_abs = 0.0f;
@@ -1267,19 +2684,22 @@ namespace llaminar2::test::parity::qwen36
             {
                 const float a = verifier.data[verifier_row_offset + col];
                 const float e = single.data[col];
+                uint32_t actual_bits = 0;
+                uint32_t expected_bits = 0;
+                std::memcpy(&actual_bits, &a, sizeof(actual_bits));
+                std::memcpy(&expected_bits, &e, sizeof(expected_bits));
                 const float abs_diff = std::fabs(a - e);
                 const float scale = std::max(std::fabs(a), std::fabs(e));
                 const float rel_diff = scale > 0.0f ? abs_diff / scale : 0.0f;
-                const bool within_tolerance =
-                    std::isfinite(a) && std::isfinite(e) &&
-                    abs_diff <= abs_tolerance + rel_tolerance * scale;
-                if (!within_tolerance)
+                if (actual_bits != expected_bits)
                 {
                     if (mismatch.mismatches == 0)
                     {
                         mismatch.col = col;
                         mismatch.first_actual = a;
                         mismatch.first_expected = e;
+                        mismatch.first_actual_bits = actual_bits;
+                        mismatch.first_expected_bits = expected_bits;
                         mismatch.first_abs = abs_diff;
                         mismatch.first_rel = rel_diff;
                     }
@@ -1375,7 +2795,7 @@ namespace llaminar2::test::parity::qwen36
                   });
 
         std::ostringstream oss;
-        oss << label << " stage snapshot row mismatch across "
+        oss << label << " stage snapshot row byte mismatch across "
             << mismatches.size() << " / " << comparable
             << " comparable stages";
         const size_t limit = std::min<size_t>(mismatches.size(), 24);
@@ -1387,6 +2807,8 @@ namespace llaminar2::test::parity::qwen36
                 << " first_col=" << m.col
                 << " actual=" << m.first_actual
                 << " expected=" << m.first_expected
+                << " actual_bits=0x" << std::hex << m.first_actual_bits
+                << " expected_bits=0x" << m.first_expected_bits << std::dec
                 << " abs=" << m.first_abs
                 << " rel=" << m.first_rel
                 << " max_abs=" << m.max_abs
@@ -1479,6 +2901,84 @@ namespace llaminar2::test::parity::qwen36
         return std::nullopt;
     }
 
+    /**
+     * @brief Read an exact multiline value from the line-oriented snapshot metadata format.
+     *
+     * The Python snapshot generators write prompts as human-readable text:
+     * the first physical line begins with `prompt:`, while every remaining
+     * prompt line is written verbatim until the following `token_ids:` field.
+     * `readStringFromMetadata()` is intentionally a scalar-field reader and
+     * therefore cannot authenticate such a prompt; using it here truncated the
+     * expected value at the first newline and made every valid long-context
+     * corpus appear stale.
+     *
+     * This parser preserves every embedded newline and every continuation-line
+     * byte. It removes only a terminal carriage return so metadata written with
+     * CRLF line endings compares identically on Linux. The field must be
+     * terminated by the named next key. A missing terminator is treated as a
+     * malformed corpus rather than accepting a partially written metadata file.
+     *
+     * @param metadata_path Metadata file produced by a parity snapshot generator.
+     * @param key Name of the multiline field, without the trailing colon.
+     * @param terminator_key Name of the scalar field immediately following it.
+     * @return The exact logical field value, or `std::nullopt` when the file or
+     *         requested field is incomplete.
+     */
+    inline std::optional<std::string> readMultilineStringFromMetadata(
+        const std::filesystem::path &metadata_path,
+        const std::string &key,
+        const std::string &terminator_key)
+    {
+        std::ifstream file(metadata_path);
+        if (!file.is_open())
+        {
+            return std::nullopt;
+        }
+
+        const std::string prefix = key + ":";
+        const std::string terminator_prefix = terminator_key + ":";
+        std::string line;
+        while (std::getline(file, line))
+        {
+            if (line.rfind(prefix, 0) != 0)
+            {
+                continue;
+            }
+
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.pop_back();
+            }
+
+            std::string value = line.substr(prefix.size());
+            const size_t first_content = value.find_first_not_of(" \t");
+            value = first_content == std::string::npos
+                        ? std::string{}
+                        : value.substr(first_content);
+
+            while (std::getline(file, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                {
+                    line.pop_back();
+                }
+                if (line.rfind(terminator_prefix, 0) == 0)
+                {
+                    return value;
+                }
+
+                // A physical continuation line represents an embedded newline,
+                // including when the first prompt line itself was empty.
+                value.push_back('\n');
+                value += line;
+            }
+
+            return std::nullopt;
+        }
+
+        return std::nullopt;
+    }
+
     inline bool metadataLooksUsable(
         const std::filesystem::path &metadata_path,
         const std::string &expected_prompt,
@@ -1486,7 +2986,10 @@ namespace llaminar2::test::parity::qwen36
     {
         constexpr int kRequiredQwen36DenseSnapshotVersion = 4;
         const auto version = readStringFromMetadata(metadata_path, "snapshot_version");
-        const auto prompt = readStringFromMetadata(metadata_path, "prompt");
+        const auto prompt = readMultilineStringFromMetadata(
+            metadata_path,
+            "prompt",
+            "token_ids");
         const auto token_ids = readTokenListFromMetadata(metadata_path, "token_ids");
         const auto decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
         int parsed_version = 0;
@@ -1506,6 +3009,81 @@ namespace llaminar2::test::parity::qwen36
                *prompt == expected_prompt &&
                !token_ids.empty() &&
                decode_tokens.size() >= static_cast<size_t>(required_decode_steps);
+    }
+
+    /**
+     * @brief Authenticate one CPU/FP32 PyTorch pack against live model inputs.
+     *
+     * Typed campaign registration binds the model and pack. The inexpensive
+     * filename/size descriptor catches accidental fixture selection, while
+     * prompt/token digests and full numerical checkpoints prove the actual
+     * inference inputs without rescanning the GGUF payload.
+     */
+    inline bool qwen36ReferenceIdentityMatches(
+        const std::filesystem::path &metadata_path,
+        const std::string &model_path,
+        const std::string &prompt,
+        std::string *reason = nullptr)
+    {
+        const auto fail = [reason](std::string message)
+        {
+            if (reason)
+                *reason = std::move(message);
+            return false;
+        };
+        const auto expect = [&](const char *key, const char *value)
+        {
+            const auto observed = readStringFromMetadata(metadata_path, key);
+            return observed.has_value() && *observed == value;
+        };
+        if (!expect("reference_identity_version", "1") ||
+            !expect("reference_engine", "pytorch") ||
+            !expect("reference_device", "cpu") ||
+            !expect("reference_dtype", "float32"))
+        {
+            return fail("missing or incompatible CPU/FP32 PyTorch identity");
+        }
+
+        std::string digest_error;
+        if (const auto model_error = productionParityModelDescriptorError(
+                model_path,
+                readStringFromMetadata(metadata_path, "model_filename"),
+                readStringFromMetadata(metadata_path, "model_size_bytes")))
+            return fail(*model_error);
+
+        const auto prompt_digest = sha256BytesHex(prompt, &digest_error);
+        const auto observed_prompt_digest =
+            readStringFromMetadata(metadata_path, "prompt_sha256");
+        if (!prompt_digest || !observed_prompt_digest ||
+            *observed_prompt_digest != *prompt_digest)
+        {
+            return fail("prompt_sha256 does not match the configured prompt");
+        }
+
+        const auto token_ids =
+            readTokenListFromMetadata(metadata_path, "token_ids");
+        if (token_ids.empty())
+            return fail("token_ids is missing or malformed");
+        std::ostringstream canonical_tokens;
+        for (size_t index = 0; index < token_ids.size(); ++index)
+        {
+            if (index != 0)
+                canonical_tokens << ',';
+            canonical_tokens << token_ids[index];
+        }
+        const auto token_digest =
+            sha256BytesHex(canonical_tokens.str(), &digest_error);
+        const auto observed_token_digest =
+            readStringFromMetadata(metadata_path, "token_ids_sha256");
+        if (!token_digest || !observed_token_digest ||
+            *observed_token_digest != *token_digest)
+        {
+            return fail("token_ids_sha256 does not authenticate token_ids");
+        }
+
+        if (reason)
+            reason->clear();
+        return true;
     }
 
     inline bool regenerateQwen36Metadata(
@@ -1557,7 +3135,8 @@ namespace llaminar2::test::parity::qwen36
 
     inline bool qwen36DecodeSnapshotsLookUsable(
         const std::filesystem::path &snapshot_dir,
-        int required_decode_steps)
+        int required_decode_steps,
+        bool require_mtp_sidecar_snapshots = false)
     {
         if (required_decode_steps <= 0)
         {
@@ -1585,7 +3164,73 @@ namespace llaminar2::test::parity::qwen36
                 }
             }
         }
-        return true;
+
+        if (!require_mtp_sidecar_snapshots)
+            return true;
+
+        /*
+         * Schema 5 binds recursive depth N to the preceding predictor's
+         * shared-head-normalized hidden result.  Older experimental packs
+         * chained the pre-normalized decoder residual and cannot certify the
+         * production MTP graph even when their filenames happen to match.
+         */
+        constexpr int kMTPSidecarSnapshotSchema = 5;
+        std::ifstream schema_file(
+            snapshot_dir / "mtp_sidecar_snapshot_schema.txt");
+        int observed_schema = 0;
+        if (!(schema_file >> observed_schema) ||
+            observed_schema != kMTPSidecarSnapshotSchema)
+        {
+            return false;
+        }
+
+        const std::vector<std::string_view> sidecar_stage_suffixes = {
+            "TERMINAL_HIDDEN_ROW_SELECT",
+            "EMBEDDING",
+            "NORM_HIDDEN",
+            "NORM_EMBEDDING",
+            "CONCAT",
+            "FC",
+            "ATTENTION_NORM",
+            "Q_PROJECTION",
+            "FA_GATE",
+            "K_PROJECTION",
+            "V_PROJECTION",
+            "Q_NORM",
+            "K_NORM",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_CONTEXT_GATED",
+            "ATTENTION_OUTPUT",
+            "FFN_NORM",
+            "FFN_GATE",
+            "FFN_UP",
+            "FFN_SWIGLU",
+            "FFN_DOWN",
+            "FFN_RESIDUAL",
+            "FINAL_NORM",
+            "LM_HEAD",
+        };
+        if (!std::filesystem::is_regular_file(
+                snapshot_dir /
+                "decode_step0_MTP_TERMINAL_HIDDEN_ROW_SELECT.npy"))
+        {
+            return false;
+        }
+        for (int depth = 0; depth <= 2; ++depth)
+        {
+            for (const std::string_view suffix : sidecar_stage_suffixes)
+            {
+                const auto path = snapshot_dir /
+                    ("decode_step0_MTP" + std::to_string(depth) + "_" +
+                     std::string(suffix) + ".npy");
+                if (!std::filesystem::is_regular_file(path))
+                    return false;
+            }
+        }
+        return std::filesystem::is_regular_file(
+            snapshot_dir /
+            ("decode_step" + std::to_string(required_decode_steps - 1) +
+             "_MTP2_LM_HEAD.npy"));
     }
 
     inline bool regenerateQwen36DecodeSnapshots(
@@ -1593,6 +3238,7 @@ namespace llaminar2::test::parity::qwen36
         const std::filesystem::path &metadata_path,
         const std::string &prompt,
         int decode_steps,
+        bool require_mtp_sidecar_snapshots,
         std::string *output)
     {
         std::filesystem::create_directories(metadata_path.parent_path());
@@ -1608,6 +3254,8 @@ namespace llaminar2::test::parity::qwen36
         script += " --decode-steps " + std::to_string(decode_steps);
         script += " --output " + shellQuote(metadata_path.parent_path().string());
         script += " --decode-snapshots-only";
+        if (require_mtp_sidecar_snapshots)
+            script += " --mtp-sidecar-snapshots";
 
         const std::string command = "bash -c " + shellQuote(script) + " 2>&1";
         FILE *pipe = popen(command.c_str(), "r");
@@ -1638,11 +3286,24 @@ namespace llaminar2::test::parity::qwen36
     inline void ensurePyTorchDecodeSnapshots(
         const DensePrefixRestoreParityCase &test_case,
         const std::string &model_path,
-        const std::filesystem::path &metadata_path)
+        const std::filesystem::path &metadata_path,
+        bool require_mtp_sidecar_snapshots = false)
     {
         const auto snapshot_dir = metadata_path.parent_path();
-        if (qwen36DecodeSnapshotsLookUsable(snapshot_dir, test_case.decode_steps) &&
-            metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        std::string identity_error;
+        if (qwen36DecodeSnapshotsLookUsable(
+                snapshot_dir,
+                test_case.decode_steps,
+                require_mtp_sidecar_snapshots) &&
+            metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
         {
             return;
         }
@@ -1653,16 +3314,30 @@ namespace llaminar2::test::parity::qwen36
             metadata_path,
             test_case.prompt,
             test_case.decode_steps,
+            require_mtp_sidecar_snapshots,
             &output))
             << test_case.name << " failed to regenerate PyTorch decode snapshots at "
             << snapshot_dir << "\n"
             << output;
 
-        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        ASSERT_TRUE(
+            metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
             << test_case.name << " regenerated metadata is incomplete at "
             << metadata_path << "\n"
+            << identity_error << "\n"
             << output;
-        ASSERT_TRUE(qwen36DecodeSnapshotsLookUsable(snapshot_dir, test_case.decode_steps))
+        ASSERT_TRUE(qwen36DecodeSnapshotsLookUsable(
+            snapshot_dir,
+            test_case.decode_steps,
+            require_mtp_sidecar_snapshots))
             << test_case.name << " regenerated decode snapshots are incomplete at "
             << snapshot_dir << "\n"
             << output;
@@ -1673,7 +3348,16 @@ namespace llaminar2::test::parity::qwen36
         const std::string &model_path,
         const std::filesystem::path &metadata_path)
     {
-        if (metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        std::string identity_error;
+        if (metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
         {
             return;
         }
@@ -1689,9 +3373,19 @@ namespace llaminar2::test::parity::qwen36
             << metadata_path << "\n"
             << output;
 
-        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        ASSERT_TRUE(
+            metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
             << test_case.name << " regenerated metadata is incomplete at "
             << metadata_path << "\n"
+            << identity_error << "\n"
             << output;
     }
 
@@ -1699,7 +3393,7 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case)
     {
         const int world_size = mpiWorldSize();
-        if (test_case.topology == DensePrefixParityTopology::NodeLocalTP)
+        if (test_case.topology == DensePrefixParityTopology::NodeTP)
         {
             if (world_size != test_case.mpi_ranks)
             {
@@ -1767,6 +3461,57 @@ namespace llaminar2::test::parity::qwen36
         return stages;
     }
 
+    /**
+     * @brief Select the collective backend for a homogeneous dense LocalTP case.
+     *
+     * The dense LocalTP parity helper used to assume ROCm because the original
+     * generic suite only targeted ROCm devices.  Explicit CUDA and ROCm suites
+     * make that assumption dangerous: the test name can say CUDA while the
+     * config still asks LocalTPContext to create RCCL.  Keep backend selection
+     * beside the topology translation so every explicit backend suite builds a
+     * self-consistent TP domain.
+     *
+     * @param devices Devices participating in the LocalTP domain.
+     * @return NCCL for homogeneous CUDA, RCCL for homogeneous ROCm, AUTO
+     *         otherwise so production validation can reject unsupported mixes.
+     */
+    inline CollectiveBackendType denseLocalTPBackendForDevices(
+        const std::vector<GlobalDeviceAddress> &devices)
+    {
+        if (devices.empty())
+        {
+            return CollectiveBackendType::AUTO;
+        }
+
+        const bool all_cuda =
+            std::all_of(
+                devices.begin(),
+                devices.end(),
+                [](const GlobalDeviceAddress &device)
+                {
+                    return device.isCUDA();
+                });
+        if (all_cuda)
+        {
+            return CollectiveBackendType::NCCL;
+        }
+
+        const bool all_rocm =
+            std::all_of(
+                devices.begin(),
+                devices.end(),
+                [](const GlobalDeviceAddress &device)
+                {
+                    return device.isROCm();
+                });
+        if (all_rocm)
+        {
+            return CollectiveBackendType::RCCL;
+        }
+
+        return CollectiveBackendType::AUTO;
+    }
+
     inline OrchestrationConfig makeDensePrefixRestoreConfig(
         const DensePrefixRestoreParityCase &test_case,
         const std::string &model_path,
@@ -1805,10 +3550,10 @@ namespace llaminar2::test::parity::qwen36
 
         case DensePrefixParityTopology::LocalTP:
             config.tp_degree = static_cast<int>(test_case.devices.size());
-            config.tp_scope = TPScope::LOCAL;
+            config.tp_scope = TPScope::RANK_LOCAL;
             config.tp_devices = test_case.devices;
             config.pp_degree = 1;
-            config.default_backend = CollectiveBackendType::RCCL;
+            config.default_backend = denseLocalTPBackendForDevices(test_case.devices);
             break;
 
         case DensePrefixParityTopology::LocalPP:
@@ -1822,14 +3567,14 @@ namespace llaminar2::test::parity::qwen36
                 DomainDefinition domain;
                 domain.name = "stage" + std::to_string(i);
                 domain.devices = {test_case.devices[i]};
-                domain.scope = TPScope::LOCAL;
+                domain.scope = TPScope::RANK_LOCAL;
                 domain.owner_rank = 0;
                 domain.backend = CollectiveBackendType::AUTO;
                 config.domain_definitions.push_back(std::move(domain));
             }
             break;
 
-        case DensePrefixParityTopology::NodeLocalTP:
+        case DensePrefixParityTopology::NodeTP:
             config.tp_degree = test_case.mpi_ranks;
             config.tp_scope = TPScope::NODE_LOCAL;
             config.pp_degree = 1;
@@ -1897,7 +3642,7 @@ namespace llaminar2::test::parity::qwen36
             };
             test_case.required_rocm_devices = 2;
             break;
-        case DensePrefixParityTopology::NodeLocalTP:
+        case DensePrefixParityTopology::NodeTP:
             test_case.devices = {
                 GlobalDeviceAddress::cpu(0),
                 GlobalDeviceAddress::cpu(1),
@@ -2040,7 +3785,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        *model_path = firstEnvOrDefault(
+        *model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(*model_path))
@@ -2077,9 +3822,21 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> expected_tokens;
         loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
 
+        constexpr int kPartialPrefixBlockSize = 4;
+        constexpr int kTerminalPartialPrefixTokens = 3;
         const int block_size = mode == PrefixRestoreParityMode::FullHit
                                    ? static_cast<int>(prompt_tokens.size())
-                                   : 4;
+                                   : kPartialPrefixBlockSize;
+        std::unique_ptr<ScopedEnvironmentValues> partial_prefix_graph_env;
+        if (mode == PrefixRestoreParityMode::PartialHit)
+        {
+            partial_prefix_graph_env =
+                std::make_unique<ScopedEnvironmentValues>(
+                    std::initializer_list<std::pair<const char *, const char *>>{
+                        {"LLAMINAR_GPU_GRAPHS", "1"},
+                        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+                    });
+        }
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -2092,8 +3849,14 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> first_prompt = prompt_tokens;
         if (mode == PrefixRestoreParityMode::PartialHit)
         {
-            ASSERT_GT(prompt_tokens.size(), 4u);
-            first_prompt.assign(prompt_tokens.begin(), prompt_tokens.begin() + 4);
+            ASSERT_GT(
+                prompt_tokens.size(),
+                static_cast<size_t>(kTerminalPartialPrefixTokens));
+            first_prompt.assign(
+                prompt_tokens.begin(),
+                prompt_tokens.begin() + kTerminalPartialPrefixTokens);
+            ASSERT_NE(first_prompt.size() % static_cast<size_t>(block_size), 0u)
+                << "partial-prefix seed must terminate inside a cache block";
         }
 
         auto first = cached->generate(first_prompt, test_case.decode_steps, greedy);
@@ -2129,7 +3892,9 @@ namespace llaminar2::test::parity::qwen36
         {
             EXPECT_FALSE(after_second.prefix_request.hit);
             EXPECT_TRUE(after_second.prefix_request.partial_hit);
-            EXPECT_EQ(after_second.prefix_request.matched_tokens, 4);
+            EXPECT_EQ(
+                after_second.prefix_request.matched_tokens,
+                kTerminalPartialPrefixTokens);
             EXPECT_FALSE(after_second.prefix_request.terminal_logits_restored);
         }
     }
@@ -2181,25 +3946,773 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(split_tokens_out, expected_tokens);
     }
 
-    inline void runDenseMTPParity(
+    /**
+     * @brief Bounded immutable model authority shared by one dense MTP campaign.
+     *
+     * Depth changes controller and graph geometry but not the GGUF tensors or
+     * their backend-specific prepared representation.  Each depth cell still
+     * owns a fresh runner, arena, streams, graphs, controller, and request
+     * state; this sole process-local slot retains only the model context and
+     * the production plan that certified its prepared weights.
+     */
+    struct DenseMTPModelContextCampaignCache
+    {
+        std::mutex mutex;
+        std::string key;
+        std::optional<ModelContextReuseContract> contract;
+    };
+
+    /** @brief Return the one bounded prepared-weight cache for this process. */
+    inline DenseMTPModelContextCampaignCache &
+    denseMTPModelContextCampaignCache()
+    {
+        static DenseMTPModelContextCampaignCache cache;
+        return cache;
+    }
+
+    /**
+     * @brief Return whether the aggregate may amortize immutable dense weights.
+     *
+     * Focused GTest invocations retain fresh-load isolation.  The aggregate
+     * driver groups only equivalent single-device depth cells and opts into
+     * reuse explicitly through its process-campaign environment contract.
+     */
+    inline bool mayReuseDenseMTPModelContext(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        return test_case.topology == DensePrefixParityTopology::SingleDevice &&
+               DebugEnv::isTruthyEnv(
+                   "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN");
+    }
+
+    /** @brief Build the physical identity of reusable prepared dense weights. */
+    inline std::string denseMTPModelContextCampaignKey(
         const DensePrefixRestoreParityCase &test_case,
+        const std::string &model_path)
+    {
+        std::ostringstream key;
+        key << "model=" << model_path
+            << "|topology=" << static_cast<int>(test_case.topology)
+            << "|devices=";
+        for (const auto &device : test_case.devices)
+            key << device.toString() << ',';
+        return key.str();
+    }
+
+    /**
+     * @brief Find a plan-certified context retained by an earlier depth cell.
+     *
+     * A miss never constructs a guessed context.  The first production runner
+     * is the sole authority for main-layer versus trailing-nextn ownership and
+     * for the exact prepared-weight plan.
+     */
+    inline std::optional<ModelContextReuseContract>
+    findDenseMTPModelContext(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        bool *cache_hit)
+    {
+        if (cache_hit)
+            *cache_hit = false;
+        if (!mayReuseDenseMTPModelContext(test_case))
+            return std::nullopt;
+
+        const std::string key =
+            denseMTPModelContextCampaignKey(test_case, model_path);
+        auto &cache = denseMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.contract && cache.key == key)
+        {
+            if (cache_hit)
+                *cache_hit = true;
+            return cache.contract;
+        }
+        if (cache.contract)
+        {
+            llaminar::v2::kernels::KernelFactory::clearCache();
+            cache.contract.reset();
+            cache.key.clear();
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Publish the first initialized runner's reusable model authority.
+     */
+    inline bool publishDenseMTPModelContext(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        const ModelContextReuseContract &contract,
+        std::string *error)
+    {
+        if (!mayReuseDenseMTPModelContext(test_case) || !contract.context)
+        {
+            if (error)
+                *error = "cannot publish an ineligible dense MTP model context";
+            return false;
+        }
+        if (contract.context->path() != model_path)
+        {
+            if (error)
+                *error = "production runner returned a different model authority";
+            return false;
+        }
+
+        const std::string key =
+            denseMTPModelContextCampaignKey(test_case, model_path);
+        auto &cache = denseMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.contract)
+        {
+            if (cache.key == key &&
+                cache.contract->context == contract.context)
+            {
+                return true;
+            }
+            if (error)
+                *error = "dense MTP campaign attempted to replace a live model authority";
+            return false;
+        }
+        cache.key = key;
+        cache.contract = contract;
+        return true;
+    }
+
+    /**
+     * @brief Retire the dense campaign's exclusive final prepared-model owner.
+     *
+     * Production campaign binaries terminate with `_exit` after explicitly
+     * shutting down MPI and backend singletons, so process-static destructors
+     * are intentionally bypassed.  This function creates the missing typed
+     * final-owner edge before that shutdown: prepared weights and sealed
+     * workspace backing are released, and every GPU runtime generation is
+     * reset and certified through the same core API used by JIT eviction.
+     *
+     * @param error Receives the exact ownership or backend failure.
+     * @return True when the slot was empty or retired completely.
+     */
+    inline bool releaseDenseMTPModelContextCampaignCache(
+        std::string *error)
+    {
+        if (error)
+            error->clear();
+        auto &cache = denseMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (!cache.contract)
+        {
+            cache.key.clear();
+            return true;
+        }
+
+        try
+        {
+            llaminar::v2::kernels::KernelFactory::clearCache();
+            (void)retireExclusiveModelContextReuseContract(
+                *cache.contract);
+            cache.contract.reset();
+            cache.key.clear();
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+            {
+                *error =
+                    "dense MTP campaign final model retirement failed: " +
+                    std::string(exception.what());
+            }
+            return false;
+        }
+    }
+
+    /**
+     * @brief Return the complete dense predictor checkpoint surface.
+     *
+     * ``FFN_SWIGLU`` is intentionally absent: production fuses that activation
+     * into the down-projection kernel and exposes its gate/up inputs plus final
+     * projection output.  Requiring a test-only materialization would alter the
+     * optimized graph being certified.
+     */
+    inline const std::vector<std::string_view> &
+    qwen36DenseMTPSidecarStageSuffixes()
+    {
+        static const std::vector<std::string_view> suffixes(
+            kQwen36DenseMTPModelStageSuffixes.begin(),
+            kQwen36DenseMTPModelStageSuffixes.end());
+        return suffixes;
+    }
+
+    /**
+     * @brief Run one real-weight production MTP checkpoint/CSV campaign cell.
+     *
+     * The runner executes its ordinary captured sidecar, verifier, sampling,
+     * and device-state publication path.  The harness maps only the graph
+     * context selected by the live depth controller to recursive MTP0..MTP2
+     * CPU/FP32 Hugging Face checkpoints generated from the same GGUF nextn
+     * weights.  Token parity, stage metrics, depth telemetry, full-capture
+     * evidence, and all seven canonical CSVs are fail-closed requirements.
+     */
+    inline void runDenseMTPCheckpointProductionParity(
+        DensePrefixRestoreParityCase test_case,
+        int decode_token_budget,
+        int mtp_draft_tokens,
+        MTPDepthPolicyConfig depth_policy = {})
+    {
+        const auto campaign_started_at = std::chrono::steady_clock::now();
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+        ASSERT_GT(decode_token_budget, 0);
+        ASSERT_GE(mtp_draft_tokens, 1);
+        ASSERT_LE(mtp_draft_tokens, 3);
+
+        test_case.decode_steps = std::max(
+            test_case.decode_steps,
+            std::max(decode_token_budget, 8));
+        test_case.max_seq_len = std::max(test_case.max_seq_len, 128);
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_phase138_continuation_snapshots/metadata.txt";
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+            GTEST_SKIP() << *skip_reason;
+        const std::string model_path = firstModelEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::is_regular_file(model_path))
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+
+        const std::filesystem::path metadata_path = firstEnvOrDefault(
+            test_case.metadata_envs,
+            test_case.default_metadata_path);
+        ensurePyTorchDecodeSnapshots(
+            test_case,
+            model_path,
+            metadata_path,
+            /*require_mtp_sidecar_snapshots=*/true);
+        const std::filesystem::path sidecar_reference_dir =
+            metadata_path.parent_path();
+        const std::vector<int32_t> prompt_tokens =
+            readTokenListFromMetadata(metadata_path, "token_ids");
+        const std::vector<int32_t> expected_tokens =
+            readTokenListFromMetadata(metadata_path, "decode_tokens");
+        ASSERT_FALSE(prompt_tokens.empty());
+        ASSERT_GE(
+            expected_tokens.size(),
+            static_cast<size_t>(decode_token_budget));
+
+        const std::filesystem::path full_reference_dir =
+            "pytorch_qwen36_dense_singledevice_snapshots";
+        const std::filesystem::path full_reference_metadata =
+            full_reference_dir / "metadata.txt";
+        ASSERT_TRUE(std::filesystem::is_regular_file(full_reference_metadata))
+            << "Dense full-checkpoint reference is missing: "
+            << full_reference_metadata;
+        std::string full_identity_error;
+        ASSERT_TRUE(qwen36ReferenceIdentityMatches(
+            full_reference_metadata,
+            model_path,
+            test_case.prompt,
+            &full_identity_error))
+            << "Dense full-checkpoint reference is unauthenticated: "
+            << full_identity_error;
+        const std::vector<int32_t> artifact_prefill_tokens =
+            readTokenListFromMetadata(full_reference_metadata, "token_ids");
+        ASSERT_FALSE(artifact_prefill_tokens.empty());
+
+        const ModelContextConfig metadata_context_config{
+            .strategy = WeightDistributionStrategy::REPLICATED,
+            .use_mmap = true,
+            .payload_access_pattern =
+                ModelPayloadAccessPattern::DeviceStaging,
+        };
+        auto metadata_context =
+            ModelContext::create(model_path, metadata_context_config);
+        ASSERT_NE(metadata_context, nullptr)
+            << "Could not inspect dense GDN checkpoint geometry";
+        const ParityGDNHeadConfig gdn_config =
+            parityGDNHeadConfigFromModel(metadata_context.get());
+        /*
+         * Dense Qwen3.6 uses the reference head order directly.  The same
+         * typed configuration is still passed to the common recorder so a
+         * future dense checkpoint with unequal heads cannot accidentally
+         * inherit guessed geometry from the test name.
+         */
+        EXPECT_FALSE(gdn_config.is_moe);
+        metadata_context.reset();
+
+        const bool dynamic_depth =
+            depth_policy.mode == MTPDepthPolicyMode::Dynamic;
+        const std::string artifact_backend =
+            test_case.name +
+            (dynamic_depth
+                 ? "_MTP_DYNAMIC"
+                 : "_MTP_DEPTH" + std::to_string(mtp_draft_tokens));
+        Qwen36CheckpointArtifactRecorder artifact_recorder(
+            artifact_backend,
+            /*prefill_cosine_threshold=*/0.96f,
+            /*decode_cosine_threshold=*/0.98f,
+            /*logit_kl_threshold=*/0.08f);
+
+        PerfStatsCollector::reset();
+        auto factory = createOrchestrationRunnerFactory();
+        const OrchestrationConfig config = makeDensePrefixRestoreConfig(
+            test_case,
+            model_path,
+            /*enable_prefix_cache=*/false,
+            /*block_size=*/2,
+            /*enable_mtp=*/true,
+            mtp_draft_tokens,
+            depth_policy);
+
+        const bool reuse_enabled =
+            mayReuseDenseMTPModelContext(test_case);
+        bool model_context_reused = false;
+        std::string model_context_error;
+        auto reuse_contract = findDenseMTPModelContext(
+            test_case,
+            model_path,
+            &model_context_reused);
+        auto mtp = reuse_contract
+                       ? factory->createFromOrchestrationConfig(
+                             config,
+                             *reuse_contract)
+                       : factory->createFromOrchestrationConfig(config);
+        ASSERT_NE(mtp, nullptr);
+        ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        if (reuse_enabled && !model_context_reused)
+        {
+            reuse_contract = mtp->modelContextReuseContract();
+            ASSERT_TRUE(reuse_contract.has_value())
+                << "Dense production runner exposed no prepared-weight reuse contract";
+            ASSERT_TRUE(publishDenseMTPModelContext(
+                test_case,
+                model_path,
+                *reuse_contract,
+                &model_context_error))
+                << model_context_error;
+        }
+        if (reuse_enabled)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                model_context_reused
+                    ? "dense_parity_campaign_model_context_cache_hits"
+                    : "dense_parity_campaign_model_context_cache_misses",
+                1.0,
+                "setup",
+                mtp->primaryDeviceId().toString(),
+                {{"depth", std::to_string(mtp_draft_tokens)},
+                 {"policy", dynamic_depth ? "dynamic" : "fixed"}});
+        }
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        mtp->setSamplingParams(greedy);
+        mtp->setSkipLogitsGatherPrefill(false);
+        mtp->setSkipLogitsGatherDecode(false);
+        mtp->enableSnapshotCapture();
+
+        ASSERT_TRUE(mtp->prefill(artifact_prefill_tokens)) << mtp->lastError();
+        recordQwen36PrefillArtifacts(
+            artifact_recorder,
+            *mtp,
+            full_reference_dir,
+            artifact_prefill_tokens.size(),
+            gdn_config);
+        mtp->clearSnapshots();
+        mtp->clearCache();
+
+        ASSERT_TRUE(mtp->prefill(prompt_tokens)) << mtp->lastError();
+        const bool host_owned_sidecar = mtp->primaryDeviceId().is_cpu();
+        std::vector<int32_t> emitted_tokens;
+        int speculative_transaction_count = 0;
+        int observation_index = 0;
+
+        struct ActiveCheckpointContext
+        {
+            std::string production_prefix;
+            int reference_depth = 0;
+        };
+
+        while (static_cast<int>(emitted_tokens.size()) < decode_token_budget)
+        {
+            const int remaining =
+                decode_token_budget - static_cast<int>(emitted_tokens.size());
+            const auto before = mtp->prefixStateProbe();
+            const int reference_step =
+                mtpParityReferenceStepForConditionPosition(
+                    before.mtp_next_condition_position,
+                    static_cast<int>(prompt_tokens.size()));
+            ASSERT_GE(reference_step, 0)
+                << "Production MTP transaction began before the authenticated "
+                   "prefill boundary: next_condition_position="
+                << before.mtp_next_condition_position
+                << " prompt_tokens=" << prompt_tokens.size();
+            int selected_depth = before.mtp_current_depth;
+            if (selected_depth <= 0)
+                selected_depth = mtp_draft_tokens;
+            selected_depth = std::clamp(
+                selected_depth,
+                1,
+                mtp_draft_tokens);
+
+            mtp->clearSnapshots();
+            mtp->setDecodeStepTokenBudget(
+                std::min(remaining, mtp_draft_tokens + 1));
+            GenerationResult step = mtp->decodeStep();
+            mtp->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(step.error.empty()) << step.error;
+            ASSERT_FALSE(step.tokens.empty());
+            emitted_tokens.insert(
+                emitted_tokens.end(),
+                step.tokens.begin(),
+                step.tokens.end());
+            ASSERT_LE(
+                emitted_tokens.size(),
+                static_cast<size_t>(decode_token_budget));
+
+            const auto after = mtp->prefixStateProbe();
+            const MTPParityTransactionCounters before_counters{
+                .draft_steps = before.mtp_draft_steps,
+                .verifier_runs = before.mtp_verifier_runs,
+            };
+            const MTPParityTransactionCounters after_counters{
+                .draft_steps = after.mtp_draft_steps,
+                .verifier_runs = after.mtp_verifier_runs,
+            };
+            const auto activity = classifyMTPParityTransactionActivity(
+                before_counters,
+                after_counters);
+            ASSERT_NE(activity, MTPParityTransactionActivity::Inconsistent)
+                << "Dense MTP draft/verifier counters disagree around decodeStep";
+
+            std::vector<ActiveCheckpointContext> active_contexts;
+            if (activity == MTPParityTransactionActivity::Speculative)
+            {
+                const uint64_t transaction_delta =
+                    mtpParityExecutedTransactionCount(
+                        before_counters,
+                        after_counters);
+                const uint64_t draft_delta =
+                    mtpParityAttemptedDraftTokenCount(
+                        before_counters,
+                        after_counters);
+                ASSERT_GE(transaction_delta, 1u);
+                ASSERT_GE(draft_delta, transaction_delta);
+                ASSERT_LE(
+                    draft_delta,
+                    transaction_delta *
+                        static_cast<uint64_t>(mtp_draft_tokens));
+
+                const int last_depth =
+                    after.mtp_last_transaction_draft_depth;
+                ASSERT_GE(last_depth, 1);
+                ASSERT_LE(last_depth, mtp_draft_tokens);
+                int captured_depth = selected_depth;
+                if (host_owned_sidecar)
+                {
+                    ASSERT_EQ(transaction_delta, 1u)
+                        << "CPU snapshot observation must own one transaction";
+                    captured_depth = last_depth;
+                }
+                else if (!dynamic_depth)
+                {
+                    ASSERT_EQ(last_depth, selected_depth)
+                        << "Fixed-depth device controller changed depth in-call";
+                }
+                speculative_transaction_count +=
+                    static_cast<int>(transaction_delta);
+
+                active_contexts.push_back({
+                    .production_prefix = std::string(
+                        host_owned_sidecar
+                            ? mtpParityCheckpointContextPrefix(
+                                  MTPParityCheckpointContext::
+                                      HostConditionTokenLivePosition)
+                            : reference_step == 0
+                                  ? mtpParityCheckpointContextPrefix(
+                                        MTPParityCheckpointContext::
+                                            DeviceTargetTokenLivePosition)
+                                  : mtpParityCheckpointContextPrefix(
+                                        MTPParityCheckpointContext::
+                                            DeviceResidentLogicalState)),
+                    .reference_depth = 0,
+                });
+                if (captured_depth > 1)
+                {
+                    active_contexts.push_back({
+                        .production_prefix = std::string(
+                            host_owned_sidecar
+                                ? mtpParityCheckpointContextPrefix(
+                                      MTPParityCheckpointContext::
+                                          HostChainedDraftLivePosition)
+                                : mtpParityCheckpointContextPrefix(
+                                      MTPParityCheckpointContext::
+                                          DeviceChainedTokenLivePosition)),
+                        .reference_depth = captured_depth - 1,
+                    });
+                }
+            }
+
+            const auto snapshots = captureDenseStageSnapshots(*mtp);
+            for (const auto &context : active_contexts)
+            {
+                SCOPED_TRACE(
+                    "dense MTP observation=" +
+                    std::to_string(observation_index) +
+                    " context=" + context.production_prefix +
+                    " reference_depth=" +
+                    std::to_string(context.reference_depth));
+                for (const std::string_view suffix :
+                     qwen36DenseMTPSidecarStageSuffixes())
+                {
+                    const std::string production_key =
+                        context.production_prefix + "MTP0_" +
+                        std::string(suffix);
+                    const auto production = snapshots.find(production_key);
+                    ASSERT_NE(production, snapshots.end())
+                        << "Selected production sidecar omitted "
+                        << production_key;
+
+                    const std::string reference_stage =
+                        "MTP" + std::to_string(context.reference_depth) +
+                        "_" + std::string(suffix);
+                    const std::string reference_key =
+                        "decode_step" + std::to_string(reference_step) +
+                        "_" + reference_stage;
+                    const std::vector<float> reference =
+                        loadDensePyTorchSnapshot(
+                            sidecar_reference_dir,
+                            reference_key);
+                    ASSERT_FALSE(reference.empty())
+                        << "Authenticated dense MTP pack omitted "
+                        << reference_key;
+                    ASSERT_EQ(production->second.data.size(), reference.size())
+                        << production_key << " shape differs from "
+                        << reference_key;
+
+                    const StageComparisonResult stage_result =
+                        compareParityTensorData(
+                            production->second.data.data(),
+                            reference.data(),
+                            reference.size(),
+                            reference_stage,
+                            /*cosine_threshold=*/0.98f);
+                    EXPECT_TRUE(stage_result.passed)
+                        << production_key << " failed dense MTP checkpoint "
+                        << "parity against " << reference_key
+                        << " cosine=" << stage_result.cosine_similarity
+                        << " max_abs=" << stage_result.max_abs_diff;
+
+                    artifact_recorder.requireDecodeStageSuffix(reference_stage);
+                    artifact_recorder.recordDecode(
+                        reference_step,
+                        /*layer=*/-1,
+                        reference_stage,
+                        production->second.data,
+                        reference);
+                    if (suffix == "LM_HEAD")
+                    {
+                        artifact_recorder.recordDecodeToken(
+                            reference_step,
+                            denseArgmaxToken(
+                                production->second.data.data(),
+                                static_cast<int>(
+                                    production->second.data.size())),
+                            denseArgmaxToken(
+                                reference.data(),
+                                static_cast<int>(reference.size())));
+                    }
+                }
+            }
+            ++observation_index;
+        }
+
+        const auto mtp_state = mtp->prefixStateProbe();
+        const bool graph_execution = mtp->executorStats() != nullptr;
+        const std::string production_device =
+            mtp->primaryDeviceId().toString();
+        const auto production_records = PerfStatsCollector::snapshot(
+            {"forward_graph", "mtp", "weight_loading"});
+        mtp->disableSnapshotCapture();
+        mtp->shutdown();
+
+        ASSERT_EQ(
+            emitted_tokens,
+            std::vector<int32_t>(
+                expected_tokens.begin(),
+                expected_tokens.begin() + decode_token_budget));
+        EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
+        EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
+        EXPECT_GE(speculative_transaction_count, 1);
+        if (dynamic_depth)
+        {
+            EXPECT_TRUE(mtp_state.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "dynamic");
+            EXPECT_GE(mtp_state.mtp_depth_policy_windows, 1u);
+            EXPECT_GE(mtp_state.mtp_depth_policy_updates, 1u);
+            EXPECT_GE(mtp_state.mtp_depth_policy_demotions, 1u);
+            EXPECT_EQ(mtp_state.mtp_min_depth, depth_policy.min_depth);
+            EXPECT_EQ(mtp_state.mtp_max_depth, depth_policy.max_depth);
+            EXPECT_GE(mtp_state.mtp_current_depth, depth_policy.min_depth);
+            EXPECT_LE(mtp_state.mtp_current_depth, depth_policy.max_depth);
+        }
+        else
+        {
+            EXPECT_FALSE(mtp_state.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "fixed");
+            EXPECT_EQ(mtp_state.mtp_current_depth, mtp_draft_tokens);
+            EXPECT_EQ(mtp_state.mtp_max_depth, mtp_draft_tokens);
+            EXPECT_EQ(mtp_state.mtp_depth_policy_updates, 0u);
+        }
+
+        if (reuse_enabled)
+        {
+            const auto counter_sum = [&](std::string_view name)
+            {
+                double total = 0.0;
+                for (const auto &record : production_records)
+                {
+                    if (record.kind == PerfStatRecord::Kind::Counter &&
+                        record.domain == "mtp" && record.name == name)
+                        total += record.value;
+                }
+                return total;
+            };
+            EXPECT_EQ(
+                counter_sum(
+                    "dense_parity_campaign_model_context_cache_hits"),
+                model_context_reused ? 1.0 : 0.0);
+            EXPECT_EQ(
+                counter_sum(
+                    "dense_parity_campaign_model_context_cache_misses"),
+                model_context_reused ? 0.0 : 1.0);
+        }
+
+        artifact_recorder.finalize();
+
+        const ProductionParityExecutionTopology execution_topology =
+            classifyProductionParityExecutionTopology(test_case.devices);
+        const ProductionParityEvidence production_evidence =
+            collectProductionParityEvidence(
+                production_records,
+                graph_execution,
+                execution_topology,
+                resolveProductionParityGraphContract(
+                    execution_topology,
+                    /*is_campaign_authority=*/true,
+                    execution_topology !=
+                        ProductionParityExecutionTopology::CPUOnly),
+                model_context_reused,
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - campaign_started_at)
+                    .count());
+        const ProductionParityGraphCertification graph_certification =
+            certifyProductionParityGraphExecution(production_evidence);
+        EXPECT_TRUE(
+            graph_certification ==
+            ProductionParityGraphCertification::Certified)
+            << "Dense MTP graph certification failed: topology='"
+            << productionParityExecutionTopologyName(execution_topology)
+            << "' result='"
+            << productionParityGraphCertificationName(graph_certification)
+            << "'.\n"
+            << PerfStatsCollector::summaryString({"forward_graph", "mtp"});
+        if (production_evidence.usesHomogeneousGPU())
+        {
+            EXPECT_TRUE(production_evidence.device_generation_controller)
+                << "Dense MTP parity published no device-generation controller evidence";
+            EXPECT_TRUE(production_evidence.generation_loop_certified)
+                << "Dense MTP parity used outer-loop policy '"
+                << productionDeviceGenerationPolicyName(
+                       production_evidence.generation_execution_policy)
+                << "' without satisfying its backend-specific authority and dispatch proof: "
+                << production_evidence.generation_certification_detail;
+            EXPECT_TRUE(
+                productionParityHasRequiredGenerationGraph(
+                    production_evidence))
+                << "Dense MTP parity did not certify the captured graph body required by its generation policy";
+            expectDenseHomogeneousGPUFullGraphReplay(
+                test_case,
+                production_records,
+                "real-weight dense MTP checkpoint campaign");
+            EXPECT_TRUE(
+                production_evidence.decode_graph_capture ||
+                production_evidence.decode_graph_replay)
+                << "Dense MTP campaign produced no native capture/replay evidence";
+        }
+        EXPECT_TRUE(ParityCSVArtifactWriter::writeProductionPath(
+            ParityCSVArtifactWriter::resultsDir(),
+            artifact_backend,
+            production_device,
+            production_evidence))
+            << "Failed to write dense MTP production_path.csv";
+        PerfStatsCollector::reset();
+    }
+
+    inline void runDenseMTPParity(
+        DensePrefixRestoreParityCase test_case,
         bool enable_prefix_cache,
         int mtp_draft_tokens = 1,
-        MTPDepthPolicyConfig depth_policy = {})
+        MTPDepthPolicyConfig depth_policy = {},
+        int terminal_partial_prefix_tokens = 0)
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
+        if (denseCaseUsesHomogeneousGPU(test_case))
+        {
+            // Short requests can finish before a repeated verifier geometry
+            // crosses graph warmup. Use the established continuation fixture so
+            // every homogeneous-GPU MTP cell proves an executable full graph,
+            // rather than stopping at the weaker "capturable plan" assertion.
+            test_case.decode_steps = std::max(test_case.decode_steps, 8);
+            test_case.max_seq_len = std::max(test_case.max_seq_len, 128);
+            test_case.default_metadata_path =
+                "pytorch_qwen36_dense_phase138_continuation_snapshots/metadata.txt";
+        }
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
         ASSERT_GE(mtp_draft_tokens, 1);
         ASSERT_LE(mtp_draft_tokens, 3);
+        ASSERT_GE(terminal_partial_prefix_tokens, 0);
+        ASSERT_TRUE(
+            terminal_partial_prefix_tokens == 0 || enable_prefix_cache)
+            << "terminal-partial MTP restore requires prefix cache";
 
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
         loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
 
-        const int block_size = enable_prefix_cache
-                                   ? static_cast<int>(prompt_tokens.size())
-                                   : 2;
+        const bool terminal_partial_restore =
+            terminal_partial_prefix_tokens > 0;
+        if (terminal_partial_restore)
+        {
+            ASSERT_LT(
+                terminal_partial_prefix_tokens,
+                static_cast<int>(prompt_tokens.size()));
+        }
+        const int block_size = terminal_partial_restore
+                                   ? terminal_partial_prefix_tokens + 1
+                                   : (enable_prefix_cache
+                                          ? static_cast<int>(prompt_tokens.size())
+                                          : 2);
+        std::unique_ptr<ScopedEnvironmentValues> partial_prefix_graph_env;
+        if (terminal_partial_restore)
+        {
+            partial_prefix_graph_env =
+                std::make_unique<ScopedEnvironmentValues>(
+                    std::initializer_list<std::pair<const char *, const char *>>{
+                        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+                    });
+        }
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -2216,11 +4729,31 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
 
-        auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const std::vector<int32_t> first_prompt = terminal_partial_restore
+                                                      ? std::vector<int32_t>(
+                                                            prompt_tokens.begin(),
+                                                            prompt_tokens.begin() +
+                                                                terminal_partial_prefix_tokens)
+                                                      : prompt_tokens;
+        if (terminal_partial_restore)
+        {
+            ASSERT_NE(first_prompt.size() % static_cast<size_t>(block_size), 0u)
+                << "MTP prefix seed must terminate inside its cache block";
+        }
+
+        PerfStatsCollector::reset();
+        auto first = mtp->generate(first_prompt, test_case.decode_steps, greedy);
         const auto after_first = mtp->prefixStateProbe();
+        const auto first_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
         ASSERT_TRUE(first.error.empty()) << first.error;
-        ASSERT_EQ(first.tokens.size(), expected_tokens.size());
-        EXPECT_EQ(first.tokens, expected_tokens);
+        ASSERT_FALSE(first.tokens.empty());
+        if (!terminal_partial_restore)
+        {
+            ASSERT_EQ(first.tokens.size(), expected_tokens.size());
+            EXPECT_EQ(first.tokens, expected_tokens);
+        }
         EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
         const uint64_t expected_first_step_drafts = static_cast<uint64_t>(
             std::min(mtp_draft_tokens, std::max(0, test_case.decode_steps - 1)));
@@ -2234,10 +4767,19 @@ namespace llaminar2::test::parity::qwen36
             test_case,
             after_first,
             test_case.name + " first request");
+        expectDenseGreedyMTPPublicationPath(
+            test_case,
+            first_records,
+            test_case.name + " first request");
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            first_records,
+            test_case.name + " first request");
 
         if (!enable_prefix_cache)
         {
             mtp->shutdown();
+            PerfStatsCollector::reset();
             return;
         }
 
@@ -2245,8 +4787,12 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GE(after_first.prefix_cache_inserts, 1u);
         EXPECT_GT(after_first.prefix_cache_mtp_state_bytes, 0u);
 
+        PerfStatsCollector::reset();
         auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         const auto after_second = mtp->prefixStateProbe();
+        const auto second_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "prefix_cache", "tp_collective_runtime", "forward_graph"});
         mtp->shutdown();
 
         ASSERT_TRUE(second.error.empty()) << second.error;
@@ -2254,11 +4800,29 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(second.tokens, expected_tokens);
         EXPECT_TRUE(after_second.prefix_cache_ready);
         EXPECT_GE(after_second.prefix_cache_hits, 1u);
-        EXPECT_TRUE(after_second.prefix_request.hit);
-        EXPECT_EQ(after_second.prefix_request.matched_tokens,
-                  static_cast<int>(prompt_tokens.size()));
-        EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
-        EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
+        if (terminal_partial_restore)
+        {
+            EXPECT_FALSE(after_second.prefix_request.hit);
+            EXPECT_TRUE(after_second.prefix_request.partial_hit);
+            EXPECT_EQ(
+                after_second.prefix_request.matched_tokens,
+                terminal_partial_prefix_tokens);
+            EXPECT_FALSE(after_second.prefix_request.terminal_logits_restored);
+            EXPECT_FALSE(after_second.prefix_request.terminal_hidden_restored);
+            EXPECT_TRUE(denseHasPerfCounter(
+                second_records,
+                "prefix_cache",
+                "terminal_partial_block_prefix_hits"));
+        }
+        else
+        {
+            EXPECT_TRUE(after_second.prefix_request.hit);
+            EXPECT_FALSE(after_second.prefix_request.partial_hit);
+            EXPECT_EQ(after_second.prefix_request.matched_tokens,
+                      static_cast<int>(prompt_tokens.size()));
+            EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
+            EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
+        }
         EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
         // MTP counters are request-local: prove the restored-prefix request
@@ -2273,6 +4837,34 @@ namespace llaminar2::test::parity::qwen36
             test_case,
             after_second,
             test_case.name + " restored request");
+        expectDenseGreedyMTPPublicationPath(
+            test_case,
+            second_records,
+            test_case.name + " restored request");
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            second_records,
+            test_case.name + " restored request");
+        PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Prove an in-block terminal prefix restores shifted MTP KV exactly.
+     *
+     * The seed request ends at token three of a four-token cache block. The
+     * second request extends that same block, forcing production lookup to use
+     * the shorter terminal key, import recurrent and shifted-MTP state, and
+     * prefill only the suffix before grouped verification resumes.
+     */
+    inline void runDenseMTPPartialTerminalPrefixRestoreParity(
+        DensePrefixRestoreParityCase test_case)
+    {
+        runDenseMTPParity(
+            std::move(test_case),
+            /*enable_prefix_cache=*/true,
+            /*mtp_draft_tokens=*/3,
+            /*depth_policy=*/{},
+            /*terminal_partial_prefix_tokens=*/3);
     }
 
     /**
@@ -2352,7 +4944,11 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
         EXPECT_GE(mtp_state.mtp_verifier_token_count, 2u);
 
-        const bool used_decode_equivalent_greedy_verifier =
+        const bool used_grouped_decode_equivalent_greedy_verifier =
+            denseHasMTPPerfCounter(
+                mtp_records,
+                "grouped_decode_equivalent_greedy_verifier_runs");
+        const bool used_retired_serial_replay =
             denseHasMTPPerfCounter(
                 mtp_records,
                 "decode_equivalent_sequential_verifier_runs");
@@ -2366,7 +4962,7 @@ namespace llaminar2::test::parity::qwen36
                 mtp_records,
                 "verifier_policy_selections",
                 "reason",
-                "greedy_penalties_use_shared_decode_equivalent_verifier");
+                "greedy_penalties_use_grouped_decode_equivalent_outcome");
 
         if (denseCaseExpectsAllPositionSpecPublication(test_case))
         {
@@ -2374,15 +4970,19 @@ namespace llaminar2::test::parity::qwen36
                 << "Dense penalty-greedy MTP advertised all-position "
                    "publication support but did not use it.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_greedy_verifier)
+            EXPECT_FALSE(used_grouped_decode_equivalent_greedy_verifier)
                 << "Dense penalty-greedy MTP should not use the shared "
                    "verifier once direct publication is proven.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_retired_serial_replay)
+                << "Dense penalty-greedy MTP must not use retired row-serial "
+                   "verifier replay.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
         else
         {
-            EXPECT_TRUE(used_decode_equivalent_greedy_verifier)
-                << "Dense penalty-greedy MTP must use the shared "
+            EXPECT_TRUE(used_grouped_decode_equivalent_greedy_verifier)
+                << "Dense penalty-greedy MTP must use the grouped "
                    "decode-equivalent verifier while direct publication is "
                    "not advertised.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
@@ -2393,6 +4993,10 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_FALSE(used_all_position_publication)
                 << "Dense penalty-greedy MTP must not publish from an "
                    "unproven all-position verifier.\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_retired_serial_replay)
+                << "Dense penalty-greedy MTP must not use retired row-serial "
+                   "verifier replay.\n"
                 << PerfStatsCollector::summaryString({"mtp"});
         }
     }
@@ -2439,7 +5043,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
 
@@ -2453,10 +5056,15 @@ namespace llaminar2::test::parity::qwen36
         runner->setSkipLogitsGatherPrefill(true);
         runner->setSkipLogitsGatherDecode(true);
 
+        constexpr int kCatchupTargetSampleSlot = 0;
         ASSERT_TRUE(runner->forward(
             prompt_tokens.data(),
             static_cast<int>(prompt_tokens.size())));
-        ASSERT_EQ(runner->sampleGreedyOnDevice(), expected_tokens[0]);
+        int32_t prefill_sample = -1;
+        ASSERT_TRUE(runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+            kCatchupTargetSampleSlot,
+            &prefill_sample));
+        ASSERT_EQ(prefill_sample, expected_tokens[0]);
 
         const int base_position = runner->get_position();
         const PrefixStateSnapshot base_checkpoint = runner->captureLivePrefixState();
@@ -2468,10 +5076,16 @@ namespace llaminar2::test::parity::qwen36
         request.allow_speculative_discard = true;
         request.verifier_path = "phase138_first_transaction_regression";
         request.verifier_base_checkpoint = &base_checkpoint;
+        request.device_target_sample_slot = kCatchupTargetSampleSlot;
 
         auto sample_after_forward = [&](int32_t) -> int32_t
         {
-            return runner->sampleGreedyOnDevice();
+            int32_t sampled = -1;
+            return runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                       kCatchupTargetSampleSlot,
+                       &sampled)
+                       ? sampled
+                       : -1;
         };
 
         MTPDecodeCatchupGreedyResult shared =
@@ -2661,7 +5275,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = false;
 
         auto runner = createInferenceRunner(
@@ -2735,6 +5348,19 @@ namespace llaminar2::test::parity::qwen36
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
+        // A single longer request is required here. It exercises repeated
+        // dynamic-depth verifier shapes after graph warmup without resetting
+        // runner state between requests and accidentally testing lifecycle
+        // behavior instead of the production dynamic-depth path.
+        test_case.decode_steps = std::max(test_case.decode_steps, 8);
+        test_case.max_seq_len = std::max(test_case.max_seq_len, 128);
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_phase138_continuation_snapshots/metadata.txt";
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
         const int adaptive_max_depth = enable_prefix_cache ? 1 : 2;
         MTPDepthPolicyConfig depth_policy;
         depth_policy.mode = MTPDepthPolicyMode::Dynamic;
@@ -2769,8 +5395,13 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
 
+        PerfStatsCollector::reset();
         auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
         const auto after_first = mtp->prefixStateProbe();
+        const auto first_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
+        mtp->shutdown();
         ASSERT_TRUE(first.error.empty()) << first.error;
         ASSERT_EQ(first.tokens.size(), expected_tokens.size());
         EXPECT_EQ(first.tokens, expected_tokens);
@@ -2782,24 +5413,15 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(after_first.mtp_max_depth, adaptive_max_depth);
         EXPECT_GE(after_first.mtp_current_depth, 1);
         EXPECT_LE(after_first.mtp_current_depth, adaptive_max_depth);
-
-        if (!enable_prefix_cache)
-        {
-            mtp->shutdown();
-            return;
-        }
-
-        auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
-        const auto after_second = mtp->prefixStateProbe();
-        mtp->shutdown();
-
-        ASSERT_TRUE(second.error.empty()) << second.error;
-        ASSERT_EQ(second.tokens.size(), expected_tokens.size());
-        EXPECT_EQ(second.tokens, expected_tokens);
-        EXPECT_TRUE(after_second.prefix_request.hit);
-        EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
-        EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
-        EXPECT_GE(after_second.mtp_depth_policy_windows, 1u);
+        expectDenseGreedyMTPPublicationPath(
+            test_case,
+            first_records,
+            test_case.name + " dynamic-depth first request");
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            first_records,
+            test_case.name + " dynamic-depth long request");
+        PerfStatsCollector::reset();
     }
 
     inline void runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(
@@ -2829,7 +5451,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        const std::string model_path = firstEnvOrDefault(
+        const std::string model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(model_path))
@@ -3120,7 +5742,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        model_path = firstEnvOrDefault(
+        model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(model_path))
@@ -3623,7 +6245,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = 3;
 
@@ -3667,14 +6288,12 @@ namespace llaminar2::test::parity::qwen36
         const int32_t restored_next = runner->sampleGreedyOnDevice();
 
         const ::testing::AssertionResult stage_match =
-            denseVerifierRowSnapshotsNear(
+            denseVerifierRowSnapshotsByteIdentical(
                 restored_snapshots,
                 sequential_snapshots,
                 "Restored one-row decode",
                 1,
-                0,
-                1.0e-5f,
-                1.0e-5f);
+                0);
         EXPECT_TRUE(stage_match)
             << stage_match.message();
         EXPECT_EQ(restored_next, sequential_next)
@@ -3786,7 +6405,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = false;
 
         auto runner = createInferenceRunner(
@@ -3896,7 +6514,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        const std::string model_path = firstEnvOrDefault(
+        const std::string model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(model_path))
@@ -3930,7 +6548,6 @@ namespace llaminar2::test::parity::qwen36
             config.force_graph = true;
             config.activation_precision = ActivationPrecision::FP32;
             config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-            config.use_mapped_memory = false;
             config.mtp.enabled = enable_mtp;
             config.mtp.draft_tokens = 1;
             return config;
@@ -4071,7 +6688,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = verifier_row_count;
 
@@ -4079,17 +6695,29 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_NE(runner, nullptr);
         ASSERT_GT(runner->vocab_size(), 0);
 
+        constexpr int kSetupTargetSampleSlot = 0;
+        constexpr int kCatchupTargetSampleSlot = 1;
+        auto sample_current_to_slot =
+            [&](const char *label, int target_sample_slot) -> int32_t
+        {
+            int32_t sampled = -1;
+            const bool sampled_ok =
+                device.is_gpu()
+                    ? runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                          target_sample_slot,
+                          &sampled)
+                    : ((sampled = runner->sampleGreedyOnDevice()) >= 0);
+            if (!sampled_ok || sampled < 0)
+            {
+                ADD_FAILURE()
+                    << "device-owned greedy sampling failed after " << label;
+                return -1;
+            }
+            return sampled;
+        };
         auto sample_current = [&](const char *label) -> int32_t
         {
-            int32_t sampled = runner->sampleGreedyOnDevice();
-            if (sampled >= 0)
-            {
-                return sampled;
-            }
-            const float *logits = runner->logits();
-            ADD_FAILURE() << "sampleGreedyOnDevice failed after " << label
-                          << "; falling back to host-visible logits";
-            return denseArgmaxToken(logits, runner->vocab_size());
+            return sample_current_to_slot(label, kSetupTargetSampleSlot);
         };
 
         runner->setSuppressTimeline(true);
@@ -4102,35 +6730,46 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(sample_current("prefill"), expected_tokens[0]);
 
         int32_t token_after_setup = -1;
+        /*
+         * Match the production shifted-MTP ordering exactly. The sampled token
+         * remains in the persistent target slot while the sidecar consumes it;
+         * only after that event-published append do we advance the main graph.
+         * Delaying both sidecar appends until after serial setup would lose the
+         * token-to-terminal-hidden relationship and would require a host replay.
+         */
         for (int i = 0; i < 2; ++i)
         {
             const int32_t token = expected_tokens[static_cast<size_t>(i)];
+            const int setup_sidecar_position = runner->get_position();
+            const bool shifted_row_committed =
+                device.is_gpu()
+                    ? runner->commitMTPShiftedRowFromDeviceTargetSample(
+                          kSetupTargetSampleSlot,
+                          /*already_appended_tokens=*/0,
+                          /*allow_speculative_discard=*/true)
+                    : runner->commitMTPShiftedRowFromCurrentTerminalHidden(
+                          token,
+                          /*already_appended_tokens=*/0,
+                          /*allow_speculative_discard=*/true,
+                          setup_sidecar_position);
+            ASSERT_TRUE(shifted_row_committed)
+                << "failed to publish shifted MTP setup row " << i
+                << " from the production condition-token owner";
             ASSERT_TRUE(runner->forward(&token, 1))
                 << "serial setup forward failed at token index " << i;
             token_after_setup = sample_current("serial setup");
         }
         ASSERT_GE(token_after_setup, 0)
             << "serial setup must produce the first verifier input token";
-
-        /*
-         * The shared stepwise verifier publishes shifted-MTP rows before each
-         * accepted main-model forward.  These two setup rows were ordinary
-         * serial decode steps, so prime the shifted cache to the same logical
-         * base position before the M=1..4 proof begins.
-         */
-        const int setup_sidecar_position = runner->get_position();
-        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-            expected_tokens[0],
-            /*already_appended_tokens=*/0,
-            /*allow_speculative_discard=*/true,
-            setup_sidecar_position - 2))
-            << "failed to prime shifted MTP cache for first dense setup token";
-        ASSERT_TRUE(runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-            expected_tokens[1],
-            /*already_appended_tokens=*/0,
-            /*allow_speculative_discard=*/true,
-            setup_sidecar_position - 1))
-            << "failed to prime shifted MTP cache for second dense setup token";
+        if (device.is_gpu())
+        {
+            ASSERT_TRUE(runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                kCatchupTargetSampleSlot,
+                /*out_token=*/nullptr))
+                << "the verifier-base condition token must be checkpointed in "
+                   "a device-owned consumer slot before diagnostic serial rows "
+                   "overwrite the ordinary sampling slot";
+        }
 
         const PrefixStateSnapshot verifier_base = runner->captureLivePrefixState();
         ASSERT_TRUE(verifier_base.valid);
@@ -4154,6 +6793,15 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_TRUE(runner->restoreLivePrefixState(verifier_base))
             << "decode-equivalent row proof must restore the verifier base "
                "before running the shared production catch-up helper";
+        if (device.is_gpu())
+        {
+            ASSERT_TRUE(runner
+                            ->deviceStochasticTargetSampleProducerSlot(
+                                kCatchupTargetSampleSlot)
+                            .valid())
+                << "prefix restore must preserve the explicitly verifier-owned "
+                   "condition-token event edge";
+        }
 
         const int vocab = runner->vocab_size();
         const int base_sidecar_position = runner->get_position();
@@ -4169,11 +6817,17 @@ namespace llaminar2::test::parity::qwen36
         request.verifier_path = "phase97_dense_decode_equivalent_row_proof";
         request.implementation_name = "shared_stepwise";
         request.verifier_base_checkpoint = &verifier_base;
+        if (device.is_gpu())
+        {
+            request.device_target_sample_slot = kCatchupTargetSampleSlot;
+        }
 
         auto sample_after_forward = [&](int32_t) -> int32_t
         {
             const int32_t sampled =
-                sample_current("dense decode-equivalent catch-up row");
+                sample_current_to_slot(
+                    "dense decode-equivalent catch-up row",
+                    kCatchupTargetSampleSlot);
             const float *logits = runner->logits();
             if (!logits)
             {
@@ -4358,7 +7012,6 @@ namespace llaminar2::test::parity::qwen36
         config.force_graph = true;
         config.activation_precision = ActivationPrecision::FP32;
         config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
-        config.use_mapped_memory = false;
         config.mtp.enabled = true;
         config.mtp.draft_tokens = verifier_row_count;
 
@@ -4373,17 +7026,23 @@ namespace llaminar2::test::parity::qwen36
             runner->enableSnapshotCapture();
         }
 
+        constexpr int kSetupTargetSampleSlot = 0;
         auto sample_current = [&](const char *label) -> int32_t
         {
-            int32_t sampled = runner->sampleGreedyOnDevice();
-            if (sampled >= 0)
+            int32_t sampled = -1;
+            const bool sampled_ok =
+                device.is_gpu()
+                    ? runner->sampleGreedyFromMainLogitsToDeviceTargetSlot(
+                          kSetupTargetSampleSlot,
+                          &sampled)
+                    : ((sampled = runner->sampleGreedyOnDevice()) >= 0);
+            if (!sampled_ok || sampled < 0)
             {
-                return sampled;
+                ADD_FAILURE()
+                    << "device-owned greedy sampling failed after " << label;
+                return -1;
             }
-            const float *logits = runner->logits();
-            ADD_FAILURE() << "sampleGreedyOnDevice failed after " << label
-                          << "; falling back to host-visible logits";
-            return denseArgmaxToken(logits, runner->vocab_size());
+            return sampled;
         };
 
         ASSERT_TRUE(runner->forward(
@@ -4443,9 +7102,29 @@ namespace llaminar2::test::parity::qwen36
             true,
             row_plan.compact_logit_row_count));
         ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
-        ASSERT_TRUE(runner->forward(
-            verifier_tokens.data(),
-            static_cast<int>(verifier_tokens.size())))
+        bool grouped_forward_ok = false;
+        if (device.is_gpu())
+        {
+            const void *verifier_tokens_device =
+                runner->prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+                    verifier_tokens.data(),
+                    static_cast<int>(verifier_tokens.size()),
+                    static_cast<int>(verifier_tokens.size() - 1));
+            ASSERT_NE(verifier_tokens_device, nullptr)
+                << "dense GPU grouped verifier must bind its arena-owned token row";
+            grouped_forward_ok =
+                runner->forwardGroupedMTPVerifierWithDeviceTokenIds(
+                verifier_tokens.data(),
+                verifier_tokens_device,
+                static_cast<int>(verifier_tokens.size()));
+        }
+        else
+        {
+            grouped_forward_ok = runner->forward(
+                verifier_tokens.data(),
+                static_cast<int>(verifier_tokens.size()));
+        }
+        ASSERT_TRUE(grouped_forward_ok)
             << "dense grouped all-position verifier forward failed";
 
         std::map<std::string, DenseStageSnapshot> grouped_snapshots;
@@ -4467,7 +7146,6 @@ namespace llaminar2::test::parity::qwen36
             grouped_logits,
             grouped_logits + static_cast<size_t>(grouped_rows.size()) *
                                  static_cast<size_t>(vocab));
-
         EXPECT_EQ(grouped_rows.back(), expected_ready_token)
             << "final grouped verifier row must expose the same ready token as "
                "serial verifier replay";
@@ -4530,7 +7208,7 @@ namespace llaminar2::test::parity::qwen36
                 ::testing::AssertionSuccess();
             if (verifier_snapshot_diagnostic)
             {
-                snapshot_result = denseVerifierRowSnapshotsNear(
+                snapshot_result = denseVerifierRowSnapshotsByteIdentical(
                     grouped_snapshots,
                     serial_snapshots_by_row[row],
                     "dense grouped verifier diagnostic row " +
@@ -4538,7 +7216,7 @@ namespace llaminar2::test::parity::qwen36
                     static_cast<int>(verifier_tokens.size()),
                     static_cast<int>(row));
             }
-            EXPECT_TRUE(denseVerifierLogitsNumericallyEquivalent(
+            EXPECT_TRUE(denseVerifierLogitsByteIdentical(
                 grouped_row_logits,
                 serial_logits_by_row[row].data(),
                 vocab,
@@ -4567,20 +7245,43 @@ namespace llaminar2::test::parity::qwen36
         }
     }
 
+    /**
+     * @brief Construct the dynamic-depth policy used by stochastic MTP parity.
+     *
+     * The stochastic parity matrix intentionally uses an eager one-sample
+     * controller window so the test proves the dynamic controller is active in
+     * short integration runs instead of silently behaving like fixed-depth MTP.
+     */
+    inline MTPDepthPolicyConfig qwen36DenseStochasticDynamicDepthPolicy(
+        int max_depth = 3)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = std::max(1, max_depth);
+        depth_policy.initial_depth = depth_policy.max_depth;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        return depth_policy;
+    }
+
     inline void runDenseStochasticMTPVerifierParity(
-        const DensePrefixRestoreParityCase &test_case)
+        const DensePrefixRestoreParityCase &test_case,
+        int draft_depth = 1,
+        MTPDepthPolicyConfig depth_policy = {})
     {
         ScopedDenseParityProductionMode production_mode(
             shouldForceDenseParityProductionMode(test_case));
         ASSERT_TRUE(test_case.topology == DensePrefixParityTopology::SingleDevice ||
-                    test_case.topology == DensePrefixParityTopology::LocalPP)
-            << "Stochastic MTP verifier parity currently requires a full-logit "
-               "SingleDevice or LocalPP final-stage owner";
+                    test_case.topology == DensePrefixParityTopology::LocalPP ||
+                    test_case.topology == DensePrefixParityTopology::LocalTP)
+            << "Stochastic MTP verifier parity requires either a full-logit "
+               "owner or a rank-owned LocalTP compact reducer";
 
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
             {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
 
@@ -4589,8 +7290,20 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> expected_tokens;
         loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
 
+        const int requested_draft_depth = std::max(1, draft_depth);
+        const bool dynamic_depth =
+            depth_policy.mode == MTPDepthPolicyMode::Dynamic;
         constexpr int block_size = 2;
-        constexpr int stochastic_decode_steps = 3;
+        /*
+         * One decode-step output slot belongs to the already-sampled first
+         * token.  The remaining budget must still fit every requested draft
+         * token, otherwise a nominal depth-3 cell is silently clamped to depth
+         * 2 and dynamic policy observations are intentionally discarded as
+         * budget-limited.  Keep three outputs for the shallow cells and add the
+         * fourth output required to exercise a complete depth-3 verifier.
+         */
+        const int stochastic_decode_steps =
+            std::max(3, requested_draft_depth + 1);
         auto factory = createOrchestrationRunnerFactory();
 
         SamplingParams stochastic;
@@ -4600,8 +7313,50 @@ namespace llaminar2::test::parity::qwen36
         stochastic.presence_penalty = 0.25f;
         stochastic.seed = 123;
 
+        /*
+         * Same-seed graph-lifecycle parity is necessary but not sufficient:
+         * two MTP executions can agree on the same stale recurrent/KV state.
+         * Establish the production serial stochastic result first so every
+         * cold, warmup, capture, and replay result has an unambiguous oracle.
+         * This mirrors the MoE stochastic suite and keeps the dense GDN path
+         * honest when graph reuse changes execution ordering.
+         */
+        auto baseline_config =
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                /*enable_prefix_cache=*/false,
+                block_size,
+                /*enable_mtp=*/false);
+        auto baseline =
+            factory->createFromOrchestrationConfig(baseline_config);
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result =
+            baseline->generate(
+                prompt_tokens,
+                stochastic_decode_steps,
+                stochastic);
+        const auto baseline_snapshot = baseline->prefixStateProbe();
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty())
+            << baseline_result.error;
+        ASSERT_EQ(
+            baseline_result.tokens.size(),
+            static_cast<size_t>(stochastic_decode_steps));
+        EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+        EXPECT_EQ(baseline_snapshot.mtp_stochastic_accept_tests, 0u);
+
         auto mtp_config =
-            makeDensePrefixRestoreConfig(test_case, model_path, false, block_size, true, 1);
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                false,
+                block_size,
+                true,
+                requested_draft_depth,
+                depth_policy);
         mtp_config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
 
         auto mtp = factory->createFromOrchestrationConfig(mtp_config);
@@ -4613,21 +7368,95 @@ namespace llaminar2::test::parity::qwen36
         auto mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
         ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+        const PrefixRuntimeStateSnapshot initial_mtp_snapshot =
+            mtp->prefixStateProbe();
+        EXPECT_EQ(mtp_result.tokens, baseline_result.tokens)
+            << "Dense stochastic MTP must match serial stochastic decode for "
+               "the same seed on the first request";
+        MTPRuntimeSnapshotComparisonOptions state_comparison;
+        state_comparison.compare_shifted_mtp_kv = false;
+        const MTPStateValidationResult initial_state_match =
+            compareMTPRuntimeStateSnapshots(
+                baseline_snapshot,
+                initial_mtp_snapshot,
+                state_comparison);
+        EXPECT_TRUE(initial_state_match)
+            << "Dense stochastic MTP must leave main KV payload, GDN "
+               "recurrence, short-conv, terminal state, and logical metadata "
+               "serial-row-equivalent after its first graph lifecycle: "
+            << initial_state_match.reason;
+        const auto initial_phase138_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            initial_phase138_records,
+            test_case.name + " stochastic MTP during first capture");
 
         mtp->clearCache();
         PerfStatsCollector::reset();
         auto reused_mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         const auto after_reused_mtp = mtp->prefixStateProbe();
-        const auto phase138_records = PerfStatsCollector::snapshot({"mtp"});
+        const auto phase138_records =
+            PerfStatsCollector::snapshot(
+                {"mtp", "tp_collective_runtime", "forward_graph"});
         mtp->shutdown();
 
         ASSERT_TRUE(reused_mtp_result.error.empty()) << reused_mtp_result.error;
         ASSERT_EQ(reused_mtp_result.tokens.size(), mtp_result.tokens.size());
+        EXPECT_EQ(reused_mtp_result.tokens, baseline_result.tokens)
+            << "Dense stochastic MTP after clearCache() must match serial "
+               "stochastic decode for the same seed";
+        const MTPStateValidationResult reused_state_match =
+            compareMTPRuntimeStateSnapshots(
+                baseline_snapshot,
+                after_reused_mtp,
+                state_comparison);
+        EXPECT_TRUE(reused_state_match)
+            << "Dense stochastic MTP graph replay must preserve serial-row "
+               "equivalence for main KV payload, GDN recurrence, short-conv, "
+               "terminal state, and logical metadata: "
+            << reused_state_match.reason;
         EXPECT_EQ(reused_mtp_result.tokens, mtp_result.tokens)
-            << "Stochastic MTP with the same seed must be reproducible after clearCache()";
+            << "Stochastic MTP with the same seed must be reproducible after "
+               "clearCache().\nfirst-capture acceptance trace:\n"
+            << densePerfCounterTagSummary(
+                   initial_phase138_records,
+                   "mtp",
+                   "acceptance_trace")
+            << "\nreused-graph acceptance trace:\n"
+            << densePerfCounterTagSummary(
+                   phase138_records,
+                   "mtp",
+                   "acceptance_trace")
+            << "\nfirst-request graph phases:\n"
+            << densePerfCounterTagSummary(
+                   initial_phase138_records,
+                   "forward_graph",
+                   "decode_graph_phase")
+            << "\nreused-request graph phases:\n"
+            << densePerfCounterTagSummary(
+                   phase138_records,
+                   "forward_graph",
+                   "decode_graph_phase");
         EXPECT_FALSE(after_reused_mtp.mtp_bypassed) << after_reused_mtp.mtp_bypass_reason;
         EXPECT_EQ(after_reused_mtp.mtp_request.verify_mode, "speculative-sampling");
         EXPECT_TRUE(after_reused_mtp.mtp_request.stochastic_verify);
+        if (dynamic_depth)
+        {
+            EXPECT_TRUE(after_reused_mtp.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(after_reused_mtp.mtp_request.depth_policy_mode, "dynamic");
+            EXPECT_GE(after_reused_mtp.mtp_depth_policy_windows, 1u);
+            EXPECT_GE(after_reused_mtp.mtp_min_depth, depth_policy.min_depth);
+            EXPECT_EQ(after_reused_mtp.mtp_max_depth, depth_policy.max_depth);
+            EXPECT_GE(after_reused_mtp.mtp_current_depth, depth_policy.min_depth);
+            EXPECT_LE(after_reused_mtp.mtp_current_depth, depth_policy.max_depth);
+        }
+        else
+        {
+            EXPECT_FALSE(after_reused_mtp.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(after_reused_mtp.mtp_max_depth, requested_draft_depth);
+        }
         expectPhase138TransactionUsed(
             test_case,
             after_reused_mtp,
@@ -4635,7 +7464,12 @@ namespace llaminar2::test::parity::qwen36
             /*allow_transaction_rollbacks=*/true);
         EXPECT_GE(after_reused_mtp.mtp_draft_steps, 1u);
         EXPECT_GE(after_reused_mtp.mtp_verifier_runs, 1u);
-        EXPECT_GE(after_reused_mtp.mtp_verifier_token_count, 2u);
+        EXPECT_GE(
+            after_reused_mtp.mtp_verifier_token_count,
+            static_cast<uint64_t>(requested_draft_depth + 1))
+            << "The stochastic depth cell must execute one complete verifier "
+               "at its requested depth instead of passing through a "
+               "budget-clamped shallower draft.";
         EXPECT_GE(after_reused_mtp.mtp_stochastic_accept_tests, 1u);
         EXPECT_EQ(after_reused_mtp.mtp_stochastic_accept_tests,
                   after_reused_mtp.mtp_stochastic_accepts +
@@ -4663,32 +7497,86 @@ namespace llaminar2::test::parity::qwen36
                         1e-12);
         }
 
-        const bool used_decode_equivalent_stochastic_verifier =
+        const bool used_grouped_stochastic_verifier =
             denseHasMTPPerfCounter(
                 phase138_records,
-                "decode_equivalent_stochastic_verifier_runs");
+                "grouped_decode_equivalent_stochastic_verifier_runs");
         const bool used_all_position_publication =
             denseHasMTPPerfCounter(
                 phase138_records,
                 "all_position_state_publication_verifier_runs") &&
             denseHasMTPPerfCounter(phase138_records, "spec_state_publications");
+        const bool used_grouped_device_publication =
+            denseHasMTPPerfCounter(
+                phase138_records,
+                "grouped_decode_equivalent_stochastic_verifier_runs") &&
+            denseHasMTPPerfCounter(
+                phase138_records,
+                "grouped_outcome_device_resident_publication_uses") &&
+            denseHasMTPPerfCounter(
+                phase138_records,
+                "grouped_outcome_device_resident_state_publications");
         if (denseCaseExpectsAllPositionSpecPublication(test_case))
         {
             EXPECT_TRUE(used_all_position_publication)
                 << "GPU Qwen3.6 stochastic MTP must exercise vLLM-style "
                    "all-position state publication\n"
                 << PerfStatsCollector::summaryString({"mtp"});
-            EXPECT_FALSE(used_decode_equivalent_stochastic_verifier)
-                << "GPU Qwen3.6 stochastic MTP must not fall back to the "
-                   "decode-equivalent stochastic verifier once publication is "
-                   "available\n"
+            EXPECT_FALSE(used_grouped_stochastic_verifier)
+                << "GPU Qwen3.6 stochastic MTP must not also run grouped "
+                   "decode-equivalent stochastic verification once direct "
+                   "all-position publication is available\n"
                 << PerfStatsCollector::summaryString({"mtp"});
+        }
+        else if (denseCaseExpectsGroupedDevicePublication(test_case))
+        {
+            EXPECT_TRUE(used_grouped_device_publication)
+                << "GPU LocalTP Qwen3.6 stochastic MTP must exercise the "
+                   "rank-owned grouped verifier outcome and device-resident "
+                   "publication path\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_FALSE(used_all_position_publication)
+                << "GPU LocalTP Qwen3.6 stochastic MTP must not promote to a "
+                   "single-owner all-position publication path\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            const bool used_rank_grouped_multi_stream_publication =
+                denseHasPerfCounter(
+                    phase138_records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups");
+            if (test_case.topology == DensePrefixParityTopology::LocalTP)
+            {
+                EXPECT_TRUE(used_rank_grouped_multi_stream_publication)
+                    << "GPU LocalTP stochastic MTP must publish each compact "
+                       "mirrored outcome through the rank-level NCCL/RCCL "
+                       "multi-stream primitive\n"
+                    << PerfStatsCollector::summaryString(
+                           {"mtp", "tp_collective_runtime"});
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    phase138_records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "host_rendezvous",
+                    "false"));
+                EXPECT_TRUE(denseHasPerfRecordTag(
+                    phase138_records,
+                    "tp_collective_runtime",
+                    "sideband_only_multi_stream_groups",
+                    "device_completion_wait",
+                    "false"));
+            }
+            else
+            {
+                EXPECT_FALSE(used_rank_grouped_multi_stream_publication)
+                    << "SingleDevice stochastic MTP must publish locally and "
+                       "must not enter a rank-level collective.";
+            }
         }
         else
         {
-            EXPECT_TRUE(used_decode_equivalent_stochastic_verifier)
-                << "CPU Qwen3.6 stochastic MTP must use the shared "
-                   "decode-equivalent verifier while direct all-position "
+            EXPECT_TRUE(used_grouped_stochastic_verifier)
+                << "CPU Qwen3.6 stochastic MTP must use grouped "
+                   "decode-equivalent verification while direct all-position "
                    "publication is not advertised\n"
                 << PerfStatsCollector::summaryString({"mtp"});
             EXPECT_FALSE(used_all_position_publication)
@@ -4705,6 +7593,11 @@ namespace llaminar2::test::parity::qwen36
             << "Stateful Qwen3.6 stochastic MTP must not use the retired "
                "accepted-count publication candidate\n"
             << PerfStatsCollector::summaryString({"mtp"});
+        expectDenseHomogeneousGPUFullGraphReplay(
+            test_case,
+            phase138_records,
+            test_case.name + " stochastic MTP after clearCache");
+        PerfStatsCollector::reset();
     }
 
 } // namespace llaminar2::test::parity::qwen36

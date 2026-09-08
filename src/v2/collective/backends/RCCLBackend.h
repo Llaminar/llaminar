@@ -23,6 +23,7 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
+#include "../CollectiveRuntimeLifecycle.h"
 #include "../../utils/MPIContext.h"
 
 // Note: No longer include rccl.h directly - use dynamic loading via wrappers
@@ -93,6 +94,18 @@ namespace llaminar2
         void shutdown() override;
         void abort() override;
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
+        [[nodiscard]] CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const override
+        {
+#ifdef HAVE_RCCL
+            return device.is_rocm()
+                       ? CollectiveSubmissionReceipt::onDeviceStream(stream_)
+                       : CollectiveSubmissionReceipt{};
+#else
+            (void)device;
+            return {};
+#endif
+        }
 
         // =====================================================================
         // Collective Operations
@@ -242,6 +255,28 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op) override;
 
+        bool allreduceMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams) override;
+        bool supportsAllreduceMultiOnStreams() const override;
+
+        bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams) override;
+        bool supportsAllreduceWithSidebandsMultiOnStreams() const override;
+
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams) override;
+        bool supportsCollectiveSidebandsMultiOnStreams() const override;
+
         bool allreduceSingleDeviceAsync(
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,
@@ -251,8 +286,60 @@ namespace llaminar2
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,
             int device_idx, void *stream) override;
+        bool supportsAllreduceSingleDeviceOnStream() const override;
+
+        bool reduceSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root,
+            int device_idx,
+            void *stream) override;
+        bool supportsReduceSingleDeviceOnStream() const override;
+
+        bool allgatherSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_idx,
+            void *stream) override;
+        bool supportsAllgatherSingleDeviceOnStream() const override;
+
+        bool broadcastSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            int device_idx,
+            void *stream) override;
+        bool supportsBroadcastSingleDeviceOnStream() const override;
+
+        bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream) override;
+        bool supportsGroupedP2PSingleDeviceOnStream() const override;
+
+        bool broadcastMultiOnStreams(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            const std::vector<void *> &streams) override;
+        bool supportsBroadcastMultiOnStreams() const override;
 
         bool allgatherMulti(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype) override;
+
+        bool allgatherMultiWithComputeDeps(
             const std::vector<const void *> &send_bufs,
             const std::vector<void *> &recv_bufs,
             size_t send_count,
@@ -337,22 +424,62 @@ namespace llaminar2
         // access faults after multiple init/destroy cycles).
         std::shared_ptr<RCCLCoordinator> coordinator_;
 
+        /** True while this backend is registered as a live coordinator owner. */
+        bool coordinator_owner_registered_ = false;
+
         // Helper to convert our types to integer values for wrapper functions
         static int toRcclDataTypeInt(CollectiveDataType dtype);
         static int toRcclRedOpInt(CollectiveOp op);
 
         // Static coordinator pool: avoids repeated ncclCommDestroy/ncclCommInit
         // cycles that trigger ROCm CLR state accumulation bugs.
-        // Key: sorted device ordinals string (e.g., "0,1")
+        // Key: rank-ordered device ordinals string (e.g., "0,1"). Device
+        // order is part of communicator identity and must never be sorted away.
+        struct PooledCoordinatorEntry
+        {
+            std::vector<int> device_ordinals; ///< Immutable clique identity.
+            std::shared_ptr<RCCLCoordinator> coordinator; ///< Inactive owner.
+        };
+
+        /** Live backends sharing one immutable device-clique identity. */
+        struct ActiveCoordinatorEntry
+        {
+            std::vector<int> device_ordinals; ///< Immutable clique identity.
+            std::size_t owners = 0u; ///< Live RCCLBackend instances.
+        };
+
         static std::mutex coordinator_pool_mutex_;
-        static std::unordered_map<std::string, std::shared_ptr<RCCLCoordinator>> coordinator_pool_;
+        static std::vector<PooledCoordinatorEntry> coordinator_pool_;
+        static std::unordered_map<std::string, ActiveCoordinatorEntry>
+            active_coordinator_owners_;
         static std::string makePoolKey(const std::vector<int> &device_ordinals);
+
+        /** @brief Publish this backend as a live owner under the pool mutex. */
+        void registerActiveCoordinatorOwnerLocked();
+
+        /** @brief Remove this backend's live-owner publication under the mutex. */
+        void unregisterActiveCoordinatorOwnerLocked() noexcept;
 #endif
 
     public:
-        /// Drain the static coordinator pool, destroying all pooled coordinators.
-        /// Call this at process shutdown (e.g., from GlobalBackendRouter::shutdown())
-        /// to ensure RCCL resources are properly released.
+        /**
+         * @brief Retire pooled RCCL owners that intersect one HIP runtime.
+         *
+         * Active owners are never interrupted: they produce an explicit
+         * `ActiveOwner` receipt, causing the native-reset transaction to fail.
+         * Inactive coordinators are detached under the pool mutex and joined
+         * outside it while all participating HIP generations are still live.
+         */
+        [[nodiscard]] static CollectiveRuntimeRetirementReceipt
+        retireRuntimeGenerationResources(DeviceId device);
+
+        /**
+         * @brief Drain every inactive coordinator at process shutdown.
+         *
+         * Call only after every backend instance has retired. A surviving live
+         * owner is a fatal lifecycle defect rather than a resource to tear out
+         * from underneath its caller.
+         */
         static void drainCoordinatorPool();
     };
 

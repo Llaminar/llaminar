@@ -8,12 +8,17 @@
 
 #pragma once
 
+#include "../../../backends/DeviceId.h"
 #include "../../../backends/IWorkerGPUContext.h"
+#include "../../../execution/config/RuntimeConfig.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../utils/ROCmKernelProfiler.h"
 #include <cstdint>
+#include <string>
 #include <stdexcept>
 
 // Forward declarations for HIP kernels (implemented in ROCmResidualAddKernels.hip)
@@ -28,6 +33,53 @@ namespace llaminar2
 {
     namespace rocm
     {
+
+        namespace residual_add_detail
+        {
+            /**
+             * @brief Recover active verifier rows from a flat element span.
+             *
+             * The tensor's logical width remains stable for graph-reserved
+             * buffers, while num_elements describes the active M-row prefix.
+             */
+            inline int activeRows(
+                const TensorBase *input,
+                size_t num_elements)
+            {
+                if (!input || input->cols() == 0 || num_elements % input->cols() != 0)
+                    return 0;
+                return static_cast<int>(num_elements / input->cols());
+            }
+
+            /**
+             * @brief Record one successful device-owned ROCm grouped launch.
+             *
+             * One flat HIP grid processes every active value in all M rows.
+             * Serial M=1 witnesses are deliberately omitted from telemetry.
+             */
+            inline void recordROCmGroupedCall(
+                const TensorBase *input,
+                size_t num_elements,
+                int device)
+            {
+                const int rows = activeRows(input, num_elements);
+                if (rows < 2)
+                    return;
+
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "rocm_residual_add_grouped_verifier_rows_calls",
+                    1.0,
+                    "verifier",
+                    DeviceId::rocm(device).to_string(),
+                    {{"tensor_format", tensorTypeName(input->native_type())},
+                     {"verifier_rows", std::to_string(rows)},
+                     {"cols", std::to_string(input->cols())},
+                     {"active_elements", std::to_string(num_elements)},
+                     {"capture_mode", isGraphCaptureActive() ? "graph_capture" : "direct"},
+                     {"invocation_policy", "single_flat_launch"}});
+            }
+        } // namespace residual_add_detail
 
         // ============================================================================
         // Primary Template (static_assert for unsupported precisions)
@@ -73,7 +125,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             bool supports_device(int device_idx) const override
             {
@@ -81,7 +133,8 @@ namespace llaminar2
             }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             bool apply(
                 const float *input, const float *residual, float *output,
@@ -92,7 +145,7 @@ namespace llaminar2
                 ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RESIDUAL_ADD, static_cast<hipStream_t>(gpu_stream_));
                 (void)mpi_ctx;
                 int dev = (device_idx >= 0) ? device_idx : device_idx_;
-                LOG_DEBUG("[ROCmResidualAddKernelT::FP32] Executing on device " << dev);
+                LOG_TRACE("[ROCmResidualAddKernelT::FP32] Executing on device " << dev);
                 return rocmOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
             }
 
@@ -106,18 +159,29 @@ namespace llaminar2
             {
                 if (!input || !residual || !output)
                     return false;
-                if (input->native_type() != TensorType::FP32)
+                if (!gpu_stream_)
+                {
+                    LOG_ERROR("[ROCmResidualAddKernelT::FP32] apply_tensor requires an explicit non-null HIP stream");
+                    return false;
+                }
+                if (input->native_type() != TensorType::FP32 ||
+                    residual->native_type() != TensorType::FP32 ||
+                    output->native_type() != TensorType::FP32)
                     return false;
 
-                // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
-                // (consistent with BF16/FP16 specializations and CUDA implementation)
-                return apply(
-                    static_cast<const float *>(input->active_data_ptr()),
-                    static_cast<const float *>(residual->active_data_ptr()),
-                    static_cast<float *>(output->active_mutable_data_ptr()),
+                // Device graph execution owns residency. GPU residual stages
+                // must never adopt host-visible active pointers.
+                const bool ok = apply(
+                    static_cast<const float *>(input->gpu_data_ptr()),
+                    static_cast<const float *>(residual->gpu_data_ptr()),
+                    static_cast<float *>(output->gpu_data_ptr()),
                     num_elements,
                     mpi_ctx,
                     device_idx);
+                const int dev = (device_idx >= 0) ? device_idx : device_idx_;
+                if (ok)
+                    residual_add_detail::recordROCmGroupedCall(input, num_elements, dev);
+                return ok;
             }
 
         private:
@@ -156,12 +220,16 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             bool supports_device(int device_idx) const override
             {
                 return device_idx >= 0;
             }
+
+            // GPU stream for graph capture and device-owned execution support.
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             bool apply(
                 const float *input, const float *residual, float *output,
@@ -201,17 +269,27 @@ namespace llaminar2
             {
                 if (!input || !residual || !output)
                     return false;
-                if (input->native_type() != TensorType::BF16)
+                if (!gpu_stream_)
+                {
+                    LOG_ERROR("[ROCmResidualAddKernelT::BF16] apply_tensor requires an explicit non-null HIP stream");
+                    return false;
+                }
+                if (input->native_type() != TensorType::BF16 ||
+                    residual->native_type() != TensorType::BF16 ||
+                    output->native_type() != TensorType::BF16)
                     return false;
 
-                // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
-                return apply_bf16(
-                    static_cast<const uint16_t *>(input->active_data_ptr()),
-                    static_cast<const uint16_t *>(residual->active_data_ptr()),
-                    static_cast<uint16_t *>(output->active_mutable_data_ptr()),
+                const bool ok = apply_bf16(
+                    static_cast<const uint16_t *>(input->gpu_data_ptr()),
+                    static_cast<const uint16_t *>(residual->gpu_data_ptr()),
+                    static_cast<uint16_t *>(output->gpu_data_ptr()),
                     num_elements,
                     mpi_ctx,
                     device_idx);
+                const int dev = (device_idx >= 0) ? device_idx : device_idx_;
+                if (ok)
+                    residual_add_detail::recordROCmGroupedCall(input, num_elements, dev);
+                return ok;
             }
 
         private:
@@ -250,7 +328,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             bool supports_device(int device_idx) const override
             {
@@ -258,7 +336,8 @@ namespace llaminar2
             }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             bool apply(
                 const float *input, const float *residual, float *output,
@@ -298,17 +377,27 @@ namespace llaminar2
             {
                 if (!input || !residual || !output)
                     return false;
-                if (input->native_type() != TensorType::FP16)
+                if (!gpu_stream_)
+                {
+                    LOG_ERROR("[ROCmResidualAddKernelT::FP16] apply_tensor requires an explicit non-null HIP stream");
+                    return false;
+                }
+                if (input->native_type() != TensorType::FP16 ||
+                    residual->native_type() != TensorType::FP16 ||
+                    output->native_type() != TensorType::FP16)
                     return false;
 
-                // Use active_data_ptr() which returns GPU pointer when tensor is on GPU
-                return apply_fp16(
-                    static_cast<const uint16_t *>(input->active_data_ptr()),
-                    static_cast<const uint16_t *>(residual->active_data_ptr()),
-                    static_cast<uint16_t *>(output->active_mutable_data_ptr()),
+                const bool ok = apply_fp16(
+                    static_cast<const uint16_t *>(input->gpu_data_ptr()),
+                    static_cast<const uint16_t *>(residual->gpu_data_ptr()),
+                    static_cast<uint16_t *>(output->gpu_data_ptr()),
                     num_elements,
                     mpi_ctx,
                     device_idx);
+                const int dev = (device_idx >= 0) ? device_idx : device_idx_;
+                if (ok)
+                    residual_add_detail::recordROCmGroupedCall(input, num_elements, dev);
+                return ok;
             }
 
         private:

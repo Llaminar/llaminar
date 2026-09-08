@@ -17,6 +17,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "backends/BackendManager.h"
 #include "backends/DeviceRegistry.h"
 #include "backends/IBackend.h"
 
@@ -207,6 +208,11 @@ TEST(Test__DeviceRegistry, BackendForCpu)
 {
     auto &registry = DeviceRegistry::instance();
     registry.discover();
+
+    // Discovery describes hardware; rank placement explicitly installs the
+    // one immutable CPU execution backend. Mirror that production lifecycle
+    // instead of expecting inventory discovery to create execution state.
+    initCPUBackend(-1);
 
     GlobalDeviceAddress cpu0 = GlobalDeviceAddress::cpu(0);
     IBackend *backend = registry.backendFor(cpu0);

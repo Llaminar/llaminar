@@ -22,6 +22,7 @@
 #include "v2/backends/BackendManager.h"
 #include "v2/backends/IBackend.h"
 #include "v2/config/OrchestrationConfig.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 #include <cstring>
 #include <numeric>
@@ -97,11 +98,15 @@ namespace llaminar2::test
         {
             if (type == DeviceType::CUDA && cuda_backend_)
             {
-                return cuda_backend_->hostToDevice(buf, data, bytes, device_idx);
+                ScopedGPUStream stream(DeviceId::cuda(device_idx));
+                return cuda_backend_->hostToDevice(
+                    buf, data, bytes, device_idx, stream.get());
             }
             else if (type == DeviceType::ROCm && rocm_backend_)
             {
-                return rocm_backend_->hostToDevice(buf, data, bytes, device_idx);
+                ScopedGPUStream stream(DeviceId::rocm(device_idx));
+                return rocm_backend_->hostToDevice(
+                    buf, data, bytes, device_idx, stream.get());
             }
             return false;
         }
@@ -110,11 +115,15 @@ namespace llaminar2::test
         {
             if (type == DeviceType::CUDA && cuda_backend_)
             {
-                return cuda_backend_->deviceToHost(out, buf, bytes, device_idx);
+                ScopedGPUStream stream(DeviceId::cuda(device_idx));
+                return cuda_backend_->deviceToHost(
+                    out, buf, bytes, device_idx, stream.get());
             }
             else if (type == DeviceType::ROCm && rocm_backend_)
             {
-                return rocm_backend_->deviceToHost(out, buf, bytes, device_idx);
+                ScopedGPUStream stream(DeviceId::rocm(device_idx));
+                return rocm_backend_->deviceToHost(
+                    out, buf, bytes, device_idx, stream.get());
             }
             return false;
         }

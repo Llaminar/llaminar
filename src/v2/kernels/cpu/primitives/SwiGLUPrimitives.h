@@ -29,6 +29,37 @@ namespace llaminar2::primitives
     /// implementations as compute_swiglu.
     void compute_swiglu_serial(const float *gate, const float *up, float *output, int size);
 
+    /**
+     * @brief Compute GPU-aligned expert SwiGLU with the CPU/CUDA/ROCm byte contract.
+     *
+     * This workshare-aware entry point is used for grouped CPU expert rows. It
+     * preserves the exact polynomial and rounding sequence used by device
+     * experts rather than selecting the ordinary CPU fast-exp approximation.
+     *
+     * @param gate Gate projection values.
+     * @param up Up projection values.
+     * @param output Placement-invariant FP32 results.
+     * @param size Positive element count.
+     */
+    void compute_swiglu_gpu_aligned_expert(
+        const float *gate,
+        const float *up,
+        float *output,
+        int size);
+
+    /**
+     * @brief Serial variant of compute_swiglu_gpu_aligned_expert().
+     * @param gate Gate projection values.
+     * @param up Up projection values.
+     * @param output Placement-invariant FP32 results.
+     * @param size Positive element count.
+     */
+    void compute_swiglu_gpu_aligned_expert_serial(
+        const float *gate,
+        const float *up,
+        float *output,
+        int size);
+
     void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size);
     void compute_swiglu_fp16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size);
     void compute_swiglu_q8_1(const void *gate, const void *up, void *output, int size);

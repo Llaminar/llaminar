@@ -1,0 +1,3315 @@
+/**
+ * @file NativeVNNIExpertTransferParityTest.h
+ * @brief Shared CUDA/ROCm regression for transfer-backed grouped MoE parity.
+ *
+ * Current-batch LLEP changes both the physical expert descriptor and the
+ * participant assigned to each grouped route. A grouped-kernel-only sweep can
+ * therefore remain green while compact payload movement, transfer-slot format
+ * retargeting, runtime-bank publication, or assignment-span consumption changes
+ * the bytes produced by the real destination transaction. This helper drives
+ * that complete production ABI with real GPU-prepared NativeVNNI weights.
+ *
+     * For every canonical quantized model format, every supported MTP depth, and
+     * one prefill size beyond the small-group routing capacity, the test compares
+     * two executions of the same routed transaction:
+ *
+ * 1. StaticOwner executes four source experts on participant zero.
+ * 2. CurrentBatchLLEP keeps two experts resident on participant one, transfers
+ *    two more into distinct stable slots through the production compact-payload
+ *    ABI, consumes four assignment spans, and executes the same top-k=4 route
+ *    transaction entirely on participant one.
+ *
+ * Equality is byte equality. The helper contains no row-replay arithmetic and
+ * does not replace either backend's production grouped implementation.
+ */
+
+#pragma once
+
+#include <gtest/gtest.h>
+
+#include "backends/BackendManager.h"
+#include "backends/IBackend.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/DeviceMoERebalanceABI.h"
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
+#include "execution/moe/DeviceMoETransferSlotDirectory.h"
+#include "execution/moe/ExpertTierWeightStream.h"
+#include "execution/moe/ExpertTierWeightTransferLane.h"
+#include "execution/moe/LeastLoadedExpertAssignment.h"
+#include "execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.h"
+#include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
+#include "interfaces/IWorkspaceConsumer.h"
+#include "kernels/IMoEKernel.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+
+#include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/TestTensorFactory.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace llaminar2::test
+{
+    namespace native_vnni_transfer_parity_detail
+    {
+        /**
+         * @brief RAII owner for setup-only device allocations used by the test.
+         *
+         * Production owns these buffers through graph arenas. A focused kernel
+         * integration test has no graph builder, so this owner models the same
+         * stable-address lifetime while guaranteeing cleanup after assertions or
+         * exceptions. Allocation occurs only during test setup, never inside a
+         * captured or measured inference path.
+         */
+        class DeviceAllocation final
+        {
+        public:
+            DeviceAllocation(IBackend *backend, int ordinal, size_t bytes)
+                : backend_(backend), ordinal_(ordinal), bytes_(bytes)
+            {
+                if (!backend_ || bytes_ == 0u)
+                    throw std::invalid_argument(
+                        "NativeVNNI transfer parity allocation requires a backend and bytes");
+                pointer_ = backend_->allocate(bytes_, ordinal_);
+                if (!pointer_)
+                    throw std::runtime_error(
+                        "NativeVNNI transfer parity device allocation failed");
+            }
+
+            ~DeviceAllocation()
+            {
+                if (pointer_)
+                    backend_->free(pointer_, ordinal_);
+            }
+
+            DeviceAllocation(const DeviceAllocation &) = delete;
+            DeviceAllocation &operator=(const DeviceAllocation &) = delete;
+            DeviceAllocation(DeviceAllocation &&) = delete;
+            DeviceAllocation &operator=(DeviceAllocation &&) = delete;
+
+            /** @brief Return the untyped stable device address. */
+            [[nodiscard]] void *get() const noexcept { return pointer_; }
+
+            /** @brief Return the stable address interpreted as @p T. */
+            template <typename T>
+            [[nodiscard]] T *as() const noexcept
+            {
+                return static_cast<T *>(pointer_);
+            }
+
+            /** @brief Return the allocation capacity in bytes. */
+            [[nodiscard]] size_t bytes() const noexcept { return bytes_; }
+
+        private:
+            IBackend *backend_ = nullptr;
+            int ordinal_ = -1;
+            size_t bytes_ = 0u;
+            void *pointer_ = nullptr;
+        };
+
+        /**
+         * @brief Describe gate/up/down transfer capacity for one device codebook.
+         */
+        inline std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>
+        projectionSpecsForFormat(
+            const QuantizedVerifierFormatCase &format,
+            int d_model,
+            int intermediate)
+        {
+            uint8_t payload_bytes = 0u;
+            uint8_t is_asymmetric = 0u;
+            uint8_t has_emins = 0u;
+            if (!deviceMoENativeVnniFormatForCodebook(
+                    format.device_execution_codebook_id,
+                    payload_bytes,
+                    is_asymmetric,
+                    has_emins))
+            {
+                throw std::runtime_error(
+                    std::string("No transfer ABI for canonical format ") +
+                    format.label);
+            }
+
+            const auto make = [&](const char *label, int n, int k)
+            {
+                return DeviceMoETransferSlotDirectory::ProjectionSpec{
+                    .label = label,
+                    .N = n,
+                    .K = k,
+                    .payload_bytes_per_block = payload_bytes,
+                    .is_asymmetric = is_asymmetric != 0u,
+                    .has_emins = has_emins != 0u,
+                    .codebook_id = format.device_execution_codebook_id,
+                    .format = ExpertWeightFormat::nativeVnni(
+                        NativeVnniSourceIdentity{
+                            .codebook_id = format.source_codebook_id,
+                            .is_superblock = format.source_is_superblock,
+                            .present = true,
+                        }),
+                };
+            };
+            return {
+                make("gate", intermediate, d_model),
+                make("up", intermediate, d_model),
+                make("down", d_model, intermediate),
+            };
+        }
+
+        /**
+         * @brief Build one participant-local runtime table for an expert domain.
+         *
+         * Participant zero is the immutable owner of every expert. Participant
+         * one may begin with a subset already resident; the transfer/apply
+         * transaction must replace each missing descriptor with a pointer into a
+         * distinct destination-owned transfer slot before grouped execution.
+         */
+        inline std::unique_ptr<DeviceMoERuntimeTable> makeRuntimeTable(
+            DeviceId device,
+            void *stream,
+            const std::vector<DeviceMoEExpertDescriptor> &descriptors,
+            uint32_t participant_id,
+            const std::vector<uint8_t> &local_compute_mask,
+            const std::vector<uint32_t> &resident_participant_mask,
+            int num_layers,
+            int top_k,
+            int token_capacity,
+            std::shared_ptr<DeviceMoEOverlayEpochArena> overlay_epoch_arena = {})
+        {
+            if (descriptors.empty() ||
+                descriptors.size() != local_compute_mask.size() ||
+                descriptors.size() != resident_participant_mask.size() ||
+                num_layers <= 0 ||
+                top_k <= 0)
+            {
+                throw std::invalid_argument(
+                    "NativeVNNI transfer parity runtime domain is inconsistent");
+            }
+
+            DeviceMoERuntimeTable::Config config{
+                .device_id = device,
+                .num_layers = num_layers,
+                .num_experts = static_cast<int>(descriptors.size()),
+                .top_k = top_k,
+                .mirror_to_device = true,
+                .prefill_token_capacity = token_capacity,
+                .overlay_epoch_arena = std::move(overlay_epoch_arena),
+            };
+            auto table = std::make_unique<DeviceMoERuntimeTable>(config);
+
+            MoEPlacementUpdate update;
+            update.epoch = 1u;
+            update.expert_count = static_cast<uint32_t>(descriptors.size());
+            update.participant_id = participant_id;
+            update.participant_count = 2u;
+            update.experts = descriptors;
+            update.local_compute_mask = local_compute_mask;
+            update.replica_role.resize(
+                descriptors.size(),
+                static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+            update.resident_participant_mask = resident_participant_mask;
+
+            for (size_t expert = 0; expert < descriptors.size(); ++expert)
+            {
+                auto &published = update.experts[expert];
+                const bool local_compute = local_compute_mask[expert] != 0u;
+                published.local_slot =
+                    local_compute ? static_cast<int32_t>(expert) : -1;
+                published.flags = toMoEExpertFlags(
+                    DeviceMoEExpertFlags::Valid |
+                    DeviceMoEExpertFlags::Resident);
+                if (local_compute)
+                {
+                    published.flags |=
+                        toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute);
+                    update.replica_role[expert] = static_cast<uint8_t>(
+                        published.owner_participant ==
+                                static_cast<int32_t>(participant_id)
+                            ? DeviceMoEReplicaRole::Primary
+                            : DeviceMoEReplicaRole::Replica);
+                }
+                if ((resident_participant_mask[expert] &
+                     (resident_participant_mask[expert] - 1u)) != 0u)
+                {
+                    published.flags |=
+                        toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+                }
+            }
+
+            for (int layer = 0; layer < num_layers; ++layer)
+            {
+                if (!table->prepareInactiveBank(layer, update) ||
+                    !table->flipActiveBank(layer, update.epoch, stream))
+                {
+                    throw std::runtime_error(
+                        "Failed to publish NativeVNNI transfer parity runtime table");
+                }
+            }
+            return table;
+        }
+
+        /**
+         * @brief Prepare one real source matrix through the production GPU loader.
+         */
+        inline DeviceNativeVNNIMatrixDesc prepareMatrixDescriptor(
+            const QuantizedVerifierFormatCase &format,
+            DeviceId device,
+            void *stream,
+            int rows,
+            int columns,
+            uint32_t seed,
+            const std::string &name,
+            ModelContextId model_id,
+            std::vector<std::unique_ptr<TensorBase>> &weights,
+            std::vector<GpuPreparedGemm> &prepared)
+        {
+            auto weight = format.create(
+                {static_cast<size_t>(rows), static_cast<size_t>(columns)},
+                seed);
+            TensorBase *weight_ptr = weight.get();
+            weights.push_back(std::move(weight));
+            prepared.push_back(makeGpuPreparedGemm(
+                weight_ptr,
+                device,
+                name,
+                model_id));
+
+            ITensorGemm *gemm = prepared.back().kernel;
+            if (!gemm)
+                throw std::runtime_error("Prepared NativeVNNI GEMM is null");
+            if (auto *tensor_kernel = dynamic_cast<ITensorKernel *>(gemm))
+                tensor_kernel->setGPUStream(stream);
+
+            DeviceNativeVNNIMatrixDesc descriptor{};
+            if (!gemm->exportNativeVNNIMatrixDesc(descriptor) ||
+                descriptor.codebook_id != format.device_execution_codebook_id ||
+                descriptor.n != rows || descriptor.k != columns)
+            {
+                throw std::runtime_error(
+                    std::string("Prepared descriptor mismatch for ") +
+                    format.label + " " + name);
+            }
+            return descriptor;
+        }
+
+        /**
+         * @brief Create one deterministic, non-degenerate hidden-state matrix.
+         */
+        inline std::unique_ptr<TensorBase> makeHidden(
+            int rows,
+            int d_model,
+            size_t format_index)
+        {
+            auto hidden = TestTensorFactory::createFP32(
+                {static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+            float *values = hidden->mutable_data();
+            for (size_t i = 0; i < hidden->numel(); ++i)
+            {
+                values[i] =
+                    0.017f * std::sin(
+                                 0.0041f * static_cast<float>(i + 11u + format_index)) -
+                    0.009f * std::cos(
+                                 0.0067f * static_cast<float>(i + 23u)) +
+                    0.0007f * static_cast<float>(
+                                  static_cast<int>(i % 31u) - 15);
+            }
+            return hidden;
+        }
+
+        /**
+         * @brief Execute one already-published grouped runtime plan and observe it.
+         *
+         * The grouped expert producer writes canonical route contributions. The
+         * fixed-order reducer owns the visible output. Keeping those two steps
+         * separate mirrors the production LocalTP publication contract exactly.
+         */
+        inline std::vector<float> executePublishedPlan(
+            IBackend *backend,
+            IMoEKernel &kernel,
+            DeviceMoERuntimeTable &runtime,
+            DeviceId device,
+            void *stream,
+            ITensor *hidden,
+            int gateup_table,
+            int down_table,
+            int rows,
+            int d_model,
+            int intermediate,
+            int num_experts,
+            int top_k,
+            int layer_idx,
+            std::vector<float> *canonical_output = nullptr)
+        {
+            auto output = TestTensorFactory::createFP32(
+                {static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+            auto canonical = TestTensorFactory::createFP32(
+                {static_cast<size_t>(rows),
+                 static_cast<size_t>(top_k),
+                 static_cast<size_t>(d_model)});
+            if (!canonical->ensureOnDevice(device, stream))
+                throw std::runtime_error("Failed to allocate canonical MoE output");
+
+            if (!kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
+                    runtime.deviceLayerState(layer_idx),
+                    runtime.hostLayerState(layer_idx),
+                    hidden,
+                    output.get(),
+                    gateup_table,
+                    down_table,
+                    rows,
+                    d_model,
+                    intermediate,
+                    num_experts,
+                    top_k,
+                    canonical.get()))
+            {
+                throw std::runtime_error("Grouped runtime expert execution failed");
+            }
+            if (output->gpu_data_ptr() != nullptr)
+            {
+                throw std::runtime_error(
+                    "Grouped producer wrote reducer-owned output storage");
+            }
+            if (!output->ensureOnDevice(device, stream) ||
+                !kernel.reduceCanonicalRouteContributions(
+                    canonical.get(), output.get(), rows, top_k, d_model))
+            {
+                throw std::runtime_error("Canonical MoE reduction failed");
+            }
+            if (!output->ensureOnHost(stream) ||
+                (canonical_output && !canonical->ensureOnHost(stream)) ||
+                !backend->synchronizeStream(stream, device.ordinal))
+            {
+                throw std::runtime_error("Failed to observe grouped MoE output");
+            }
+            if (canonical_output)
+            {
+                canonical_output->assign(
+                    canonical->data(),
+                    canonical->data() + canonical->numel());
+            }
+            return std::vector<float>(
+                output->data(), output->data() + output->numel());
+        }
+
+        /**
+         * @brief Publish the two device-owned current-batch plan counts.
+         *
+         * The runtime table allocates and owns the span/transfer arrays. Tests
+         * may replace their contents between launches, but must update only the
+         * two count words rather than uploading the stale host placement bank
+         * over a transfer-applied device bank.
+         */
+        inline bool publishCurrentBatchPlanCounts(
+            IBackend *backend,
+            DeviceId device,
+            void *stream,
+            DeviceMoELayerRuntime *runtime,
+            uint64_t span_count,
+            uint64_t transfer_count)
+        {
+            if (!backend || !stream || !runtime)
+                return false;
+            const std::array<uint64_t, 2> counts = {
+                span_count,
+                transfer_count,
+            };
+            auto *count_words =
+                reinterpret_cast<uint8_t *>(runtime) +
+                offsetof(DeviceMoELayerRuntime, reserved_u64) +
+                2u * sizeof(uint64_t);
+            return backend->hostToDeviceOnStream(
+                count_words,
+                counts.data(),
+                sizeof(counts),
+                device.ordinal,
+                stream);
+        }
+
+        /**
+         * @brief Report the first unequal IEEE-754 word in two grouped outputs.
+         */
+        inline void expectByteEqual(
+            const std::string &label,
+            const std::vector<float> &actual,
+            const std::vector<float> &expected,
+            int d_model)
+        {
+            ASSERT_EQ(actual.size(), expected.size()) << label;
+            if (std::memcmp(
+                    actual.data(),
+                    expected.data(),
+                    actual.size() * sizeof(float)) == 0)
+            {
+                return;
+            }
+
+            size_t mismatch = 0u;
+            while (mismatch < actual.size())
+            {
+                uint32_t actual_bits = 0u;
+                uint32_t expected_bits = 0u;
+                std::memcpy(&actual_bits, &actual[mismatch], sizeof(actual_bits));
+                std::memcpy(&expected_bits, &expected[mismatch], sizeof(expected_bits));
+                if (actual_bits != expected_bits)
+                {
+                    ADD_FAILURE()
+                        << label
+                        << " first_mismatch=" << mismatch
+                        << " row=" << mismatch / static_cast<size_t>(d_model)
+                        << " column=" << mismatch % static_cast<size_t>(d_model)
+                        << " actual=" << actual[mismatch]
+                        << " expected=" << expected[mismatch]
+                        << " actual_bits=0x" << std::hex << actual_bits
+                        << " expected_bits=0x" << expected_bits << std::dec;
+                    return;
+                }
+                ++mismatch;
+            }
+        }
+
+        /**
+         * @brief Own one CPU-promoted projection on a GPU endpoint.
+         *
+         * Optional metadata allocations follow the exact destination layout.
+         * The owners keep every descriptor address stable until grouped
+         * inference has consumed the promoted expert.
+         */
+        struct PromotedCPUProjection final
+        {
+            std::unique_ptr<DeviceAllocation> payload;
+            std::unique_ptr<DeviceAllocation> scales;
+            std::unique_ptr<DeviceAllocation> mins;
+            std::unique_ptr<DeviceAllocation> emins;
+            DeviceNativeVNNIMatrixDesc descriptor{};
+            ExpertTierWeightTransferLaneStats stats{};
+        };
+
+        /**
+         * @brief Stream final CPU execution bytes into their exact GPU form.
+         * @param backend Exact destination backend.
+         * @param device CUDA or ROCm endpoint that owns the inactive allocation.
+         * @param cpu_weights Real CPU prepared bytes retaining source provenance.
+         * @param projection Stable gate/up/down role used in the transfer manifest.
+         * @param identity Unique diagnostic identity for the transaction.
+         * @return Stable promoted descriptor and all of its allocation owners.
+         */
+        PromotedCPUProjection promoteCPUProjection(
+            IBackend *backend,
+            DeviceId device,
+            const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+            ExpertTierWeightProjection projection,
+            uint64_t identity);
+    } // namespace native_vnni_transfer_parity_detail
+
+    /**
+     * @brief Prove one logical quantized expert is byte-stable across CPU/GPU.
+     *
+     * The transfer-only regressions above prove that every codebook survives
+     * repacking, but movement correctness also requires the destination to
+     * execute the same arithmetic program. For every canonical quantized
+     * source format this test prepares the same gate/up/down tensors twice:
+     * once as GPU-aligned CPU NativeVNNI engines and once through the production
+     * CUDA/ROCm loader. The GPU endpoint runs its real grouped sparse-MoE plan;
+     * the CPU endpoint runs the complete grouped FFN transaction. Hidden Q8,
+     * gate/up, SwiGLU Q8, down, and canonical route publication are therefore
+     * all inside the comparison rather than mocked by a format conversion.
+     *
+     * @param backend_label Stable diagnostic backend label.
+     * @param device CUDA or ROCm endpoint paired with the CPU tier.
+     * @param stream Explicit non-default GPU stream.
+     */
+    inline void runCPUToGPUAllFormatExpertArithmeticParity(
+        const char *backend_label,
+        DeviceId device,
+        void *stream)
+    {
+        using namespace native_vnni_transfer_parity_detail;
+        using CpuKernel =
+            cpu::native_vnni::CPUNativeVNNIGemmKernel;
+        using CpuDescriptor =
+            CpuKernel::BatchedPrequantizedProjectionDesc;
+
+        if (!backend_label || !device.is_gpu() || !stream)
+        {
+            throw std::invalid_argument(
+                "Cross-tier expert arithmetic parity requires a GPU and stream");
+        }
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+            throw std::runtime_error("Cross-tier parity backend is unavailable");
+
+        // Qwen3.5-122B production expert geometry. Both K widths exercise the
+        // complete GPU-aligned expert tree, while M=65 crosses from the
+        // verifier family into the scalable prefill family.
+        constexpr int kDModel = 3072;
+        constexpr int kIntermediate = 1024;
+        constexpr int kNumExperts = 1;
+        constexpr int kTopK = 1;
+        constexpr int kMaximumRows = 65;
+        constexpr std::array<int, 5> kRows = {1, 2, 3, 15, 65};
+
+        auto gpu_kernel =
+            llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+        ASSERT_NE(gpu_kernel, nullptr);
+        gpu_kernel->setGPUStream(stream);
+        auto requirements = device.is_cuda()
+                                ? MoEWorkspaceBuffers::cudaMoE(
+                                      kMaximumRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK)
+                                : MoEWorkspaceBuffers::rocmMoE(
+                                      kMaximumRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK);
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() +
+                4u * 1024u * 1024u);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        auto *workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(gpu_kernel.get());
+        ASSERT_NE(workspace_consumer, nullptr);
+        workspace_consumer->bindWorkspace(&workspace);
+
+        const auto &formats = quantizedMoEVerifierFormats();
+        for (std::size_t format_index = 0;
+             format_index < formats.size();
+             ++format_index)
+        {
+            const auto &format = formats[format_index];
+            SCOPED_TRACE(
+                std::string(backend_label) + " cross-tier format=" +
+                format.label);
+
+            std::vector<std::unique_ptr<TensorBase>> weights;
+            std::vector<GpuPreparedGemm> prepared;
+            weights.reserve(3u);
+            prepared.reserve(3u);
+            const std::uint64_t model_base =
+                3900000u + static_cast<std::uint64_t>(format_index) * 16u +
+                (device.is_cuda() ? 0u : 100000u);
+            const std::string prefix =
+                std::string("test.") + backend_label +
+                ".cross_tier_arithmetic." + format.label;
+            const DeviceNativeVNNIMatrixDesc gate_descriptor =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kIntermediate,
+                    kDModel,
+                    930001u + static_cast<std::uint32_t>(format_index),
+                    prefix + ".gate",
+                    ModelContextId{model_base + 1u},
+                    weights,
+                    prepared);
+            const DeviceNativeVNNIMatrixDesc up_descriptor =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kIntermediate,
+                    kDModel,
+                    940001u + static_cast<std::uint32_t>(format_index),
+                    prefix + ".up",
+                    ModelContextId{model_base + 2u},
+                    weights,
+                    prepared);
+            const DeviceNativeVNNIMatrixDesc down_descriptor =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kDModel,
+                    kIntermediate,
+                    950001u + static_cast<std::uint32_t>(format_index),
+                    prefix + ".down",
+                    ModelContextId{model_base + 3u},
+                    weights,
+                    prepared);
+
+            std::array<std::unique_ptr<CpuKernel>, 3> cpu_kernels;
+            for (std::size_t projection = 0;
+                 projection < cpu_kernels.size();
+                 ++projection)
+            {
+                cpu_kernels[projection] = std::make_unique<CpuKernel>(
+                    weights[projection].get(),
+                    0,
+                    -1,
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                ASSERT_TRUE(cpu_kernels[projection]->isValid());
+            }
+
+            auto promoted_gate = promoteCPUProjection(
+                backend,
+                device,
+                cpu_kernels[0]->packedWeights(),
+                ExpertTierWeightProjection::Gate,
+                model_base + 11u);
+            auto promoted_up = promoteCPUProjection(
+                backend,
+                device,
+                cpu_kernels[1]->packedWeights(),
+                ExpertTierWeightProjection::Up,
+                model_base + 12u);
+            auto promoted_down = promoteCPUProjection(
+                backend,
+                device,
+                cpu_kernels[2]->packedWeights(),
+                ExpertTierWeightProjection::Down,
+                model_base + 13u);
+
+            DeviceMoEExpertDescriptor expert{};
+            expert.logical_expert_id = 0;
+            expert.owner_participant = 0;
+            expert.local_slot = 0;
+            expert.flags = toMoEExpertFlags(
+                DeviceMoEExpertFlags::Valid |
+                DeviceMoEExpertFlags::Resident |
+                DeviceMoEExpertFlags::LocalCompute);
+            expert.gate = promoted_gate.descriptor;
+            expert.up = promoted_up.descriptor;
+            expert.down = promoted_down.descriptor;
+            std::vector<DeviceMoEExpertDescriptor> experts = {expert};
+
+            const int gate_up_table =
+                gpu_kernel->uploadGroupedExpertGateUpDescriptorTables(
+                    &promoted_gate.descriptor,
+                    &promoted_up.descriptor,
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            const int down_table =
+                gpu_kernel->uploadGroupedExpertDownDescriptorTable(
+                    &promoted_down.descriptor,
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            ASSERT_GE(gate_up_table, 0);
+            ASSERT_GE(down_table, 0);
+
+            auto runtime = makeRuntimeTable(
+                device,
+                stream,
+                experts,
+                /*participant_id=*/0u,
+                std::vector<std::uint8_t>(kNumExperts, 1u),
+                std::vector<std::uint32_t>(kNumExperts, 0b01u),
+                /*num_layers=*/1,
+                kTopK,
+                kMaximumRows);
+
+            for (const int rows : kRows)
+            {
+                SCOPED_TRACE("rows=" + std::to_string(rows));
+                auto hidden = makeHidden(rows, kDModel, format_index);
+                const int hidden_blocks_per_row =
+                    kDModel / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+                const int activation_blocks_per_row =
+                    kIntermediate /
+                    static_cast<int>(Q8_1Block::BLOCK_SIZE);
+                std::vector<Q8_1Block> hidden_q8(
+                    static_cast<std::size_t>(rows) *
+                    hidden_blocks_per_row);
+                std::vector<float> cpu_gate(
+                    static_cast<std::size_t>(rows) * kIntermediate);
+                std::vector<float> cpu_up(cpu_gate.size());
+                std::vector<Q8_1Block> cpu_activation_q8(
+                    static_cast<std::size_t>(rows) *
+                    activation_blocks_per_row);
+                std::vector<float> cpu_output(
+                    static_cast<std::size_t>(rows) * kDModel);
+                std::vector<float> cpu_serial_gate(cpu_gate.size());
+                std::vector<float> cpu_serial_up(cpu_up.size());
+                std::vector<float> cpu_serial_activation(cpu_up.size());
+                std::vector<Q8_1Block> cpu_serial_activation_q8(
+                    cpu_activation_q8.size());
+                std::vector<float> cpu_serial_output(cpu_output.size());
+
+                cpu::native_vnni::quantize_activations_to_q8_1(
+                    hidden->data(),
+                    hidden_q8.data(),
+                    rows,
+                    kDModel,
+                    hidden_blocks_per_row,
+                    CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                const std::array<CpuDescriptor, 2> gate_up{{
+                    {
+                        .kernel = cpu_kernels[0].get(),
+                        .input_q8 = hidden_q8.data(),
+                        .output = cpu_gate.data(),
+                        .rows = rows,
+                        .n = kIntermediate,
+                        .ldc = kIntermediate,
+                    },
+                    {
+                        .kernel = cpu_kernels[1].get(),
+                        .input_q8 = hidden_q8.data(),
+                        .output = cpu_up.data(),
+                        .rows = rows,
+                        .n = kIntermediate,
+                        .ldc = kIntermediate,
+                    },
+                }};
+                const std::array<CpuDescriptor, 1> down{{{
+                    .kernel = cpu_kernels[2].get(),
+                    .input_q8 = cpu_activation_q8.data(),
+                    .output = cpu_output.data(),
+                    .rows = rows,
+                    .n = kDModel,
+                    .ldc = kDModel,
+                }}};
+                ASSERT_TRUE(
+                    CpuKernel::
+                        execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                            gate_up.data(),
+                            static_cast<int>(gate_up.size()),
+                            kDModel,
+                            cpu_gate.data(),
+                            cpu_up.data(),
+                            cpu_activation_q8.data(),
+                            rows,
+                            kIntermediate,
+                            activation_blocks_per_row,
+                            down.data(),
+                            static_cast<int>(down.size())));
+
+                /*
+                 * Keep an independent M=1 oracle beside the layer-global CPU
+                 * transaction. This is diagnostic and test-only: it localizes
+                 * a broken grouped schedule before a downstream GPU mismatch
+                 * obscures which arithmetic boundary changed. Production never
+                 * replays expert rows.
+                 */
+                for (int row = 0; row < rows; ++row)
+                {
+                    const auto hidden_offset =
+                        static_cast<std::size_t>(row) * hidden_blocks_per_row;
+                    const auto intermediate_offset =
+                        static_cast<std::size_t>(row) * kIntermediate;
+                    const auto activation_offset =
+                        static_cast<std::size_t>(row) *
+                        activation_blocks_per_row;
+                    const auto output_offset =
+                        static_cast<std::size_t>(row) * kDModel;
+                    cpu::native_vnni::gemv_native_vnni_preq(
+                        cpu_kernels[0]->packedWeights(),
+                        hidden_q8.data() + hidden_offset,
+                        cpu_serial_gate.data() + intermediate_offset);
+                    cpu::native_vnni::gemv_native_vnni_preq(
+                        cpu_kernels[1]->packedWeights(),
+                        hidden_q8.data() + hidden_offset,
+                        cpu_serial_up.data() + intermediate_offset);
+                    primitives::compute_swiglu_gpu_aligned_expert_serial(
+                        cpu_serial_gate.data() + intermediate_offset,
+                        cpu_serial_up.data() + intermediate_offset,
+                        cpu_serial_activation.data() + intermediate_offset,
+                        kIntermediate);
+                    cpu::native_vnni::quantize_activations_to_q8_1(
+                        cpu_serial_activation.data() + intermediate_offset,
+                        cpu_serial_activation_q8.data() + activation_offset,
+                        /*M=*/1,
+                        kIntermediate,
+                        activation_blocks_per_row,
+                        CPUProjectionNumericalPolicy::GPUAlignedExpert);
+                    cpu::native_vnni::gemv_native_vnni_preq(
+                        cpu_kernels[2]->packedWeights(),
+                        cpu_serial_activation_q8.data() + activation_offset,
+                        cpu_serial_output.data() + output_offset);
+                }
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU grouped vs independent M1 gate M=" +
+                        std::to_string(rows),
+                    cpu_gate,
+                    cpu_serial_gate,
+                    kIntermediate);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU grouped vs independent M1 up M=" +
+                        std::to_string(rows),
+                    cpu_up,
+                    cpu_serial_up,
+                    kIntermediate);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU grouped vs independent M1 full expert M=" +
+                        std::to_string(rows),
+                    cpu_output,
+                    cpu_serial_output,
+                    kDModel);
+
+                if (rows == 1)
+                {
+                    /*
+                     * The tables now contain the CPU-promoted descriptors, so
+                     * these are genuine before/after-movement checkpoints.
+                     * They localize projection drift before SwiGLU and the
+                     * second activation quantization can obscure its origin.
+                     */
+                    auto gpu_gate = TestTensorFactory::createFP32(
+                        {1u, static_cast<std::size_t>(kIntermediate)});
+                    auto gpu_up = TestTensorFactory::createFP32(
+                        {1u, static_cast<std::size_t>(kIntermediate)});
+                    ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+                    ASSERT_TRUE(gpu_gate->ensureOnDevice(device, stream));
+                    ASSERT_TRUE(gpu_up->ensureOnDevice(device, stream));
+                    ITensor *gate_outputs[1] = {gpu_gate.get()};
+                    ITensor *up_outputs[1] = {gpu_up.get()};
+                    const int expert_id = 0;
+                    ASSERT_TRUE(gpu_kernel->groupedExpertGateUpDecodeFromTable(
+                        hidden.get(),
+                        &expert_id,
+                        gate_up_table,
+                        /*num_active=*/1,
+                        gate_outputs,
+                        up_outputs,
+                        kDModel,
+                        kIntermediate));
+                    ASSERT_TRUE(gpu_gate->ensureOnHost(stream));
+                    ASSERT_TRUE(gpu_up->ensureOnHost(stream));
+                    ASSERT_TRUE(backend->synchronizeStream(
+                        stream, device.ordinal));
+                    expectByteEqual(
+                        std::string(backend_label) + " " + format.label +
+                            " CPU vs promoted-GPU gate checkpoint",
+                        std::vector<float>(
+                            gpu_gate->data(),
+                            gpu_gate->data() + gpu_gate->numel()),
+                        cpu_serial_gate,
+                        kIntermediate);
+                    expectByteEqual(
+                        std::string(backend_label) + " " + format.label +
+                            " CPU vs promoted-GPU up checkpoint",
+                        std::vector<float>(
+                            gpu_up->data(),
+                            gpu_up->data() + gpu_up->numel()),
+                        cpu_serial_up,
+                        kIntermediate);
+                }
+
+                auto routing_indices = TestTensorFactory::createFP32(
+                    {static_cast<std::size_t>(rows), kTopK});
+                auto routing_weights = TestTensorFactory::createFP32(
+                    {static_cast<std::size_t>(rows), kTopK});
+                std::fill_n(
+                    routing_indices->mutable_data(), rows * kTopK, 0.0f);
+                std::vector<float> cpu_preweighted_output(
+                    cpu_serial_output.size());
+                for (int row = 0; row < rows; ++row)
+                {
+                    /*
+                     * A unit route weight cannot distinguish raw expert rows
+                     * from the preweighted publication contract used by the
+                     * heterogeneous return lane. Vary non-dyadic weights by
+                     * row so this proof covers the exact placement-sensitive
+                     * multiply that follows a CPU/GPU ownership change.
+                     */
+                    const float route_weight =
+                        0.137f + 0.019f * static_cast<float>(row % 11);
+                    routing_weights->mutable_data()[row] = route_weight;
+                    const size_t row_offset =
+                        static_cast<size_t>(row) * kDModel;
+                    for (int column = 0; column < kDModel; ++column)
+                    {
+                        cpu_preweighted_output[row_offset + column] =
+                            device_fp32_contract::multiply(
+                                route_weight,
+                                cpu_serial_output[row_offset + column]);
+                    }
+                }
+                ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+                ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+                ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+                ASSERT_TRUE(gpu_kernel->publishCompleteGroupedPrefillPlanFromRouter(
+                    runtime->deviceLayerState(0),
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    rows,
+                    rows,
+                    kNumExperts,
+                    kTopK,
+                    gate_up_table,
+                    down_table,
+                    /*filter_to_local_runtime_experts=*/true));
+                std::vector<float> gpu_canonical;
+                const auto gpu_output = executePublishedPlan(
+                    backend,
+                    *gpu_kernel,
+                    *runtime,
+                    device,
+                    stream,
+                    hidden.get(),
+                    gate_up_table,
+                    down_table,
+                    rows,
+                    kDModel,
+                    kIntermediate,
+                    kNumExperts,
+                    kTopK,
+                    /*layer_idx=*/0,
+                    &gpu_canonical);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU vs promoted-GPU canonical expert rows M=" +
+                        std::to_string(rows),
+                    gpu_canonical,
+                    cpu_preweighted_output,
+                    kDModel);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " CPU vs promoted-GPU reduced expert output M=" +
+                        std::to_string(rows),
+                    gpu_output,
+                    cpu_preweighted_output,
+                    kDModel);
+            }
+        }
+
+        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+        workspace_consumer->unbindWorkspace();
+    }
+
+    /**
+     * @brief Prove StaticOwner and transferred CurrentBatchLLEP grouped equality.
+     *
+     * @param backend_label Stable diagnostic label ("CUDA" or "ROCm").
+     * @param device Physical GPU used to execute both simulated participants.
+     * @param stream Explicit non-null backend stream owning every test operation.
+     *
+     * @throws std::runtime_error for setup or launch failures. GoogleTest catches
+     *         the exception at the backend test boundary and reports the active
+     *         format/M trace.
+     */
+    inline void runNativeVNNIExpertTransferGroupedParity(
+        const char *backend_label,
+        DeviceId device,
+        void *stream)
+    {
+        using namespace native_vnni_transfer_parity_detail;
+
+        if (!backend_label || !stream || !device.is_gpu())
+            throw std::invalid_argument(
+                "NativeVNNI transfer parity requires a GPU and explicit stream");
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+            throw std::runtime_error("NativeVNNI transfer parity backend is unavailable");
+
+        constexpr int kDModel = 2048;
+        constexpr int kIntermediate = 512;
+        constexpr int kMaxRows = 2560;
+        constexpr int kNumExperts = 256;
+        constexpr int kTopK = 8;
+        constexpr uint32_t kPlanCapacity = 32u;
+        /*
+         * Collective payload lanes and physical transfer-directory slots are
+         * different address spaces.  Keep the wire transaction compact while
+         * forcing both arrivals beyond its width: production long-context LLEP
+         * first diverged when layer 1 leased directory slots 32 through 35
+         * after layer 0 had retained the lower slots.
+         */
+        constexpr uint32_t kPhysicalTransferSlotBase = kPlanCapacity;
+        constexpr uint32_t kTransferSlotCount =
+            kPhysicalTransferSlotBase + kPlanCapacity;
+        constexpr uint32_t kCommandBufferCount = 1u;
+        constexpr uint32_t kParticipantCount = 2u;
+        constexpr uint32_t kDestinationParticipant = 1u;
+        constexpr int kRuntimeLayerCount = 2;
+        constexpr int kTargetLayer = 1;
+        std::array<uint32_t, kPlanCapacity> transferred_experts{};
+        for (uint32_t index = 0u; index < kPlanCapacity; ++index)
+            transferred_experts[index] = index * 2u + 1u;
+        /*
+         * Cover the complete MTP regime plus both scalable-grouping boundaries
+         * and the production long-context capture bucket that exposed the E2E
+         * failure. The largest case is intentionally retained for every format:
+         * small-M exactness cannot certify 32-bit count/offset arithmetic.
+         */
+        constexpr std::array<int, 8> kRows = {
+            2, 4, 8, 15, 16, 65, 257, 2560};
+
+        const auto &formats = quantizedMoEVerifierFormats();
+        std::vector<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
+            format_specs;
+        format_specs.reserve(formats.size());
+        for (const auto &format : formats)
+        {
+            format_specs.push_back(
+                projectionSpecsForFormat(format, kDModel, kIntermediate));
+        }
+
+        auto transfer_directory = DeviceMoETransferSlotDirectory::createForTest(
+            backend,
+            device,
+            device.ordinal,
+            kDestinationParticipant,
+            /*slot_count=*/kTransferSlotCount,
+            DeviceMoETransferSlotDirectory::profileForLayerFormats(format_specs));
+        ASSERT_NE(transfer_directory, nullptr);
+        ASSERT_EQ(transfer_directory->slotCount(), kTransferSlotCount);
+
+        auto kernel_owner =
+            llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+        ASSERT_NE(kernel_owner, nullptr);
+        kernel_owner->setGPUStream(stream);
+
+        auto requirements = device.is_cuda()
+                                ? MoEWorkspaceBuffers::cudaMoE(
+                                      kMaxRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK)
+                                : MoEWorkspaceBuffers::rocmMoE(
+                                      kMaxRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK);
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() + 4u * 1024u * 1024u);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        auto *workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kernel_owner.get());
+        ASSERT_NE(workspace_consumer, nullptr);
+        workspace_consumer->bindWorkspace(&workspace);
+
+        IMoEKernel &kernel = *kernel_owner;
+        const MoEKernelLaunchContext launch{
+            .stream = stream,
+            .workspace = &workspace,
+        };
+
+        const uint64_t payload_slot_bytes =
+            (sizeof(DeviceMoEExpertDirectoryEntry) +
+             transfer_directory->wirePayloadBytes() + 255u) /
+            256u * 256u;
+        const size_t local_payload_bytes =
+            kPlanCapacity * static_cast<size_t>(payload_slot_bytes);
+        const size_t gathered_payload_bytes =
+            kParticipantCount * local_payload_bytes;
+        const size_t source_directory_entries =
+            kParticipantCount * kCommandBufferCount * kPlanCapacity;
+
+        DeviceAllocation d_plan(
+            backend,
+            device.ordinal,
+            kPlanCapacity * sizeof(DeviceMoERebalancePlanEntry));
+        DeviceAllocation d_plan_count(
+            backend,
+            device.ordinal,
+            sizeof(uint32_t));
+        DeviceAllocation d_command_header(
+            backend,
+            device.ordinal,
+            sizeof(DeviceMoERebalanceCommandBufferHeader));
+        DeviceAllocation d_source_descriptors(
+            backend,
+            device.ordinal,
+            source_directory_entries * sizeof(DeviceMoEExpertDirectoryEntry));
+        DeviceAllocation d_local_payload(
+            backend,
+            device.ordinal,
+            local_payload_bytes);
+        DeviceAllocation d_gathered_payload(
+            backend,
+            device.ordinal,
+            gathered_payload_bytes);
+        DeviceAllocation d_copy_status(
+            backend,
+            device.ordinal,
+            sizeof(DeviceMoERebalanceApplyStatus));
+        DeviceAllocation d_apply_status(
+            backend,
+            device.ordinal,
+            sizeof(DeviceMoERebalanceApplyStatus));
+        DeviceAllocation d_source_apply_status(
+            backend,
+            device.ordinal,
+            sizeof(DeviceMoERebalanceApplyStatus));
+        DeviceAllocation d_transfer_status(
+            backend,
+            device.ordinal,
+            sizeof(DeviceMoERebalanceStatus));
+
+        for (size_t format_index = 0;
+             format_index < formats.size();
+             ++format_index)
+        {
+            const auto &format = formats[format_index];
+            SCOPED_TRACE(
+                std::string(backend_label) + " format=" + format.label);
+
+            std::vector<std::unique_ptr<TensorBase>> weights;
+            std::vector<GpuPreparedGemm> prepared;
+            weights.reserve(3u);
+            prepared.reserve(3u);
+
+            const uint64_t model_base =
+                1900000u + static_cast<uint64_t>(format_index) * 64u +
+                (device.is_cuda() ? 0u : 100000u);
+            const std::string name_prefix =
+                std::string("test.") + backend_label +
+                ".native_vnni_transfer_parity." + format.label;
+
+            std::vector<DeviceMoEExpertDescriptor> source_descriptors(kNumExperts);
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> gate_descs{};
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> up_descs{};
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> down_descs{};
+
+            /*
+             * Cardinality, not unique payload bytes, is the subject of this
+             * regression.  Prepare one real production-ABI matrix triplet per
+             * format and alias it across 256 logical experts.  The grouped
+             * kernels still execute every routed row and every expert group,
+             * while setup remains light enough to sweep all codebooks and M.
+             */
+            const DeviceNativeVNNIMatrixDesc shared_gate =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kIntermediate,
+                    kDModel,
+                    810001u,
+                    name_prefix + ".shared.gate",
+                    ModelContextId{model_base + 1u},
+                    weights,
+                    prepared);
+            const DeviceNativeVNNIMatrixDesc shared_up =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kIntermediate,
+                    kDModel,
+                    810002u,
+                    name_prefix + ".shared.up",
+                    ModelContextId{model_base + 2u},
+                    weights,
+                    prepared);
+            const DeviceNativeVNNIMatrixDesc shared_down =
+                prepareMatrixDescriptor(
+                    format,
+                    device,
+                    stream,
+                    kDModel,
+                    kIntermediate,
+                    810003u,
+                    name_prefix + ".shared.down",
+                    ModelContextId{model_base + 3u},
+                    weights,
+                    prepared);
+            for (int expert = 0; expert < kNumExperts; ++expert)
+            {
+                auto &descriptor = source_descriptors[expert];
+                descriptor.logical_expert_id = expert;
+                descriptor.owner_participant = 0;
+                descriptor.local_slot = expert;
+                descriptor.flags = toMoEExpertFlags(
+                    DeviceMoEExpertFlags::Valid |
+                    DeviceMoEExpertFlags::Resident |
+                    DeviceMoEExpertFlags::LocalCompute);
+
+                descriptor.gate = shared_gate;
+                descriptor.up = shared_up;
+                descriptor.down = shared_down;
+                gate_descs[expert] = descriptor.gate;
+                up_descs[expert] = descriptor.up;
+                down_descs[expert] = descriptor.down;
+            }
+
+            const int source_gateup_table =
+                kernel.uploadGroupedExpertGateUpDescriptorTables(
+                    gate_descs.data(),
+                    up_descs.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            const int source_down_table =
+                kernel.uploadGroupedExpertDownDescriptorTable(
+                    down_descs.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            const int destination_gateup_table =
+                kernel.uploadGroupedExpertGateUpDescriptorTables(
+                    gate_descs.data(),
+                    up_descs.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            const int destination_down_table =
+                kernel.uploadGroupedExpertDownDescriptorTable(
+                    down_descs.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate);
+            ASSERT_GE(source_gateup_table, 0);
+            ASSERT_GE(source_down_table, 0);
+            ASSERT_GE(destination_gateup_table, 0);
+            ASSERT_GE(destination_down_table, 0);
+
+            auto source_runtime = makeRuntimeTable(
+                device,
+                stream,
+                source_descriptors,
+                /*participant_id=*/0u,
+                std::vector<uint8_t>(kNumExperts, 1u),
+                std::vector<uint32_t>(kNumExperts, 0b01u),
+                kRuntimeLayerCount,
+                kTopK,
+                kMaxRows);
+            std::vector<uint8_t> destination_compute_mask(kNumExperts, 1u);
+            std::vector<uint32_t> destination_resident_mask(kNumExperts, 0b11u);
+            for (const uint32_t expert : transferred_experts)
+            {
+                destination_compute_mask[expert] = 0u;
+                destination_resident_mask[expert] = 0b01u;
+            }
+            auto destination_runtime = makeRuntimeTable(
+                device,
+                stream,
+                source_descriptors,
+                kDestinationParticipant,
+                destination_compute_mask,
+                destination_resident_mask,
+                kRuntimeLayerCount,
+                kTopK,
+                kMaxRows);
+
+            /*
+             * The host runtime object owns only immutable scratch addresses in
+             * this setup. Publish the two current-batch counts once before GPU
+             * work begins; all route values, placement mutation, and grouped
+             * execution remain device-owned after this boundary.
+             */
+            auto &source_host = source_runtime->hostLayerState(kTargetLayer);
+            auto &destination_host =
+                destination_runtime->hostLayerState(kTargetLayer);
+            destination_host.reserved_u64[2] = kNumExperts;
+            destination_host.reserved_u64[3] = kPlanCapacity;
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                destination_runtime->deviceLayerState(kTargetLayer),
+                &destination_host,
+                sizeof(destination_host),
+                device.ordinal,
+                stream));
+
+            DeviceMoERebalanceConfig base_config;
+            base_config.num_layers = kRuntimeLayerCount;
+            base_config.num_experts = kNumExperts;
+            base_config.top_k = kTopK;
+            base_config.participant_count = kParticipantCount;
+            base_config.window_size_tokens = 1u;
+            base_config.max_hot_replicas_per_participant = kPlanCapacity;
+            base_config.active_transfer_slot_capacity = kTransferSlotCount;
+            base_config.transfer_slot_directory_capacity = kTransferSlotCount;
+            base_config.llep_enable_balanced_skip = 0u;
+
+            std::array<DeviceMoERebalancePlanEntry, kPlanCapacity> plans{};
+            for (uint32_t plan_index = 0u;
+                 plan_index < kPlanCapacity;
+                 ++plan_index)
+            {
+                auto &plan = plans[plan_index];
+                plan.op = static_cast<uint32_t>(
+                    DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+                plan.layer = kTargetLayer;
+                plan.expert = transferred_experts[plan_index];
+                plan.source_participant = 0u;
+                plan.destination_participant = kDestinationParticipant;
+                plan.source_resident_mask = 0b01u;
+                plan.flags = moe_rebalance_abi::kPlanFlagCurrentBatchLLEP;
+                plan.destination_slot =
+                    kPhysicalTransferSlotBase + plan_index;
+                plan.payload_slot = plan_index;
+            }
+            auto retained_layer_plans = plans;
+            for (uint32_t plan_index = 0u;
+                 plan_index < kPlanCapacity;
+                 ++plan_index)
+            {
+                retained_layer_plans[plan_index].layer = 0u;
+                retained_layer_plans[plan_index].destination_slot = plan_index;
+            }
+
+            DeviceMoERebalanceCommandBufferHeader source_header;
+            source_header.epoch = static_cast<uint32_t>(format_index + 3u);
+            source_header.phase = static_cast<uint32_t>(
+                DeviceMoERebalancePipelinePhase::PlanAssignments);
+            source_header.command_count = kPlanCapacity;
+            source_header.command_capacity = kPlanCapacity;
+            source_header.participant_id = 0u;
+            source_header.participant_count = kParticipantCount;
+            auto destination_header = source_header;
+            destination_header.participant_id = kDestinationParticipant;
+            auto retained_source_header = source_header;
+            retained_source_header.epoch =
+                static_cast<uint32_t>(format_index + 2u);
+            auto retained_destination_header = retained_source_header;
+            retained_destination_header.participant_id =
+                kDestinationParticipant;
+
+            const uint32_t plan_count = kPlanCapacity;
+            auto source_config = base_config;
+            source_config.participant_id = 0u;
+            auto destination_config = base_config;
+            destination_config.participant_id = kDestinationParticipant;
+            const auto apply_config = prefillLLEPTransferConfig(
+                destination_config,
+                PrefillLLEPTransferPurpose::CurrentBatchMovement);
+
+            ASSERT_TRUE(backend->memset(
+                d_source_descriptors.get(),
+                0,
+                d_source_descriptors.bytes(),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->memset(
+                d_local_payload.get(),
+                0,
+                d_local_payload.bytes(),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->memset(
+                d_gathered_payload.get(),
+                0,
+                d_gathered_payload.bytes(),
+                device.ordinal,
+                stream));
+            transfer_directory->resetRequestPublications(stream);
+
+            /*
+             * First retain one complete layer-0 wave in physical slots 0..31.
+             * Layer 1 below must materialize into slots 32..63 without changing
+             * any descriptor still published by this earlier layer.
+             */
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_plan.get(),
+                retained_layer_plans.data(),
+                sizeof(retained_layer_plans),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_plan_count.get(),
+                &plan_count,
+                sizeof(plan_count),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_command_header.get(),
+                &retained_source_header,
+                sizeof(retained_source_header),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(kernel.packDeviceRebalanceSourceDescriptors(
+                launch,
+                source_runtime->deviceLayerState(0),
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                kPlanCapacity,
+                d_source_descriptors.as<DeviceMoEExpertDirectoryEntry>(),
+                source_config,
+                /*controller_state=*/nullptr,
+                kCommandBufferCount));
+            ASSERT_TRUE(kernel.packDeviceRebalanceCompactPayloads(
+                launch,
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                kPlanCapacity,
+                d_source_descriptors.as<DeviceMoEExpertDirectoryEntry>(),
+                d_local_payload.as<uint8_t>(),
+                /*local_payload_slot_count=*/kPlanCapacity,
+                payload_slot_bytes,
+                source_config,
+                d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
+                /*controller_state=*/nullptr,
+                kCommandBufferCount));
+            ASSERT_TRUE(backend->deviceCopyAsync(
+                d_gathered_payload.get(),
+                d_local_payload.get(),
+                local_payload_bytes,
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_command_header.get(),
+                &retained_destination_header,
+                sizeof(retained_destination_header),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(kernel.unpackDeviceRebalanceCollectivePayloads(
+                launch,
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_plan_count.as<uint32_t>(),
+                kPlanCapacity,
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                d_gathered_payload.as<uint8_t>(),
+                /*local_payload_slot_count=*/kPlanCapacity,
+                payload_slot_bytes,
+                transfer_directory->deviceEntries(),
+                transfer_directory->slotCount(),
+                destination_config,
+                d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
+                /*controller_state=*/nullptr,
+                kCommandBufferCount));
+            ASSERT_TRUE(kernel.applyDeviceRebalanceArrivals(
+                launch,
+                destination_runtime->deviceLayerState(0),
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_plan_count.as<uint32_t>(),
+                kPlanCapacity,
+                transfer_directory->deviceEntries(),
+                transfer_directory->slotCount(),
+                apply_config,
+                d_apply_status.as<DeviceMoERebalanceApplyStatus>(),
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                /*target_layer=*/0));
+
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_plan.get(),
+                plans.data(),
+                sizeof(plans),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_plan_count.get(),
+                &plan_count,
+                sizeof(plan_count),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_command_header.get(),
+                &source_header,
+                sizeof(source_header),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(kernel.packDeviceRebalanceSourceDescriptors(
+                launch,
+                source_runtime->deviceLayerState(0),
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                kPlanCapacity,
+                d_source_descriptors.as<DeviceMoEExpertDirectoryEntry>(),
+                source_config,
+                /*controller_state=*/nullptr,
+                kCommandBufferCount));
+            ASSERT_TRUE(kernel.packDeviceRebalanceCompactPayloads(
+                launch,
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                kPlanCapacity,
+                d_source_descriptors.as<DeviceMoEExpertDirectoryEntry>(),
+                d_local_payload.as<uint8_t>(),
+                /*local_payload_slot_count=*/kPlanCapacity,
+                payload_slot_bytes,
+                source_config,
+                d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
+                /*controller_state=*/nullptr,
+                kCommandBufferCount));
+
+            /*
+             * A real two-rank graph uses one NCCL/RCCL allgather here. This
+             * focused one-device regression preserves its byte layout and
+             * ordering while replacing only the transport primitive with D2D.
+             * Source participant zero occupies gathered lane zero.
+             */
+            ASSERT_TRUE(backend->deviceCopyAsync(
+                d_gathered_payload.get(),
+                d_local_payload.get(),
+                local_payload_bytes,
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_command_header.get(),
+                &destination_header,
+                sizeof(destination_header),
+                device.ordinal,
+                stream));
+
+            ASSERT_TRUE(kernel.unpackDeviceRebalanceCollectivePayloads(
+                launch,
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_plan_count.as<uint32_t>(),
+                kPlanCapacity,
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                d_gathered_payload.as<uint8_t>(),
+                /*local_payload_slot_count=*/kPlanCapacity,
+                payload_slot_bytes,
+                transfer_directory->deviceEntries(),
+                transfer_directory->slotCount(),
+                destination_config,
+                d_copy_status.as<DeviceMoERebalanceApplyStatus>(),
+                /*controller_state=*/nullptr,
+                kCommandBufferCount));
+
+            ASSERT_TRUE(kernel.applyDeviceRebalanceArrivals(
+                launch,
+                destination_runtime->deviceLayerState(0),
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_plan_count.as<uint32_t>(),
+                kPlanCapacity,
+                transfer_directory->deviceEntries(),
+                transfer_directory->slotCount(),
+                apply_config,
+                d_apply_status.as<DeviceMoERebalanceApplyStatus>(),
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                /*target_layer=*/kTargetLayer));
+
+            /*
+             * The source participates in the same domain-wide transaction even
+             * though neither payload arrival targets participant zero. Publish
+             * its independent completion record now; the split-row regression
+             * below must consume the exact per-participant status object that a
+             * real NCCL/RCCL graph would produce.
+             */
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_command_header.get(),
+                &source_header,
+                sizeof(source_header),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(kernel.applyDeviceRebalanceArrivals(
+                launch,
+                source_runtime->deviceLayerState(0),
+                d_plan.as<DeviceMoERebalancePlanEntry>(),
+                d_plan_count.as<uint32_t>(),
+                kPlanCapacity,
+                transfer_directory->deviceEntries(),
+                transfer_directory->slotCount(),
+                prefillLLEPTransferConfig(
+                    source_config,
+                    PrefillLLEPTransferPurpose::CurrentBatchMovement),
+                d_source_apply_status.as<DeviceMoERebalanceApplyStatus>(),
+                d_command_header.as<DeviceMoERebalanceCommandBufferHeader>(),
+                /*target_layer=*/kTargetLayer));
+
+            DeviceMoERebalanceStatus transfer_status;
+            transfer_status.planned_arrivals = kPlanCapacity;
+            transfer_status.llep_assignment_span_count = kNumExperts;
+            transfer_status.llep_weight_transfer_count = kPlanCapacity;
+            ASSERT_TRUE(backend->hostToDeviceOnStream(
+                d_transfer_status.get(),
+                &transfer_status,
+                sizeof(transfer_status),
+                device.ordinal,
+                stream));
+
+            DeviceMoERebalanceApplyStatus observed_apply{};
+            DeviceMoELayerRuntime observed_retained_runtime{};
+            DeviceMoELayerRuntime observed_runtime{};
+            ASSERT_TRUE(backend->deviceToHostOnStream(
+                &observed_apply,
+                d_apply_status.get(),
+                sizeof(observed_apply),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->deviceToHostOnStream(
+                &observed_retained_runtime,
+                destination_runtime->deviceLayerState(0),
+                sizeof(observed_retained_runtime),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->deviceToHostOnStream(
+                &observed_runtime,
+                destination_runtime->deviceLayerState(kTargetLayer),
+                sizeof(observed_runtime),
+                device.ordinal,
+                stream));
+            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+
+            ASSERT_EQ(observed_apply.status_code, 0u);
+            ASSERT_EQ(observed_apply.invalid_plan_entries, 0u);
+            ASSERT_EQ(observed_apply.missing_source_descriptors, 0u);
+            ASSERT_EQ(observed_apply.missing_destination_slots, 0u);
+            ASSERT_EQ(observed_apply.descriptor_mismatches, 0u);
+            ASSERT_EQ(observed_apply.copy_incomplete, 0u);
+            ASSERT_EQ(observed_apply.required_local_arrivals, kPlanCapacity);
+            ASSERT_EQ(observed_apply.ready_local_arrivals, kPlanCapacity);
+            ASSERT_EQ(observed_apply.applied_arrivals, kPlanCapacity);
+
+            ASSERT_LE(observed_runtime.active_bank, 1u);
+            const auto &destination_bank =
+                observed_runtime.banks[observed_runtime.active_bank];
+            for (int expert = 0; expert < kNumExperts; ++expert)
+            {
+                ASSERT_EQ(destination_bank.local_compute_mask[expert], 1u)
+                    << "expert=" << expert;
+                ASSERT_EQ(destination_bank.resident_participant_mask[expert], 0b11u)
+                    << "expert=" << expert;
+                ASSERT_EQ(
+                    destination_bank.experts[expert].gate.codebook_id,
+                    format.device_execution_codebook_id)
+                    << "expert=" << expert;
+            }
+            const auto &slot_entries =
+                transfer_directory->hostEntriesForTest();
+            ASSERT_LE(observed_retained_runtime.active_bank, 1u);
+            const auto &retained_bank = observed_retained_runtime.banks[
+                observed_retained_runtime.active_bank];
+            for (uint32_t plan_index = 0u;
+                 plan_index < kPlanCapacity;
+                 ++plan_index)
+            {
+                const uint32_t expert = transferred_experts[plan_index];
+                const auto &retained_descriptor =
+                    retained_bank.experts[expert];
+                const auto &retained_slot_descriptor =
+                    slot_entries[plan_index].descriptor;
+                const uint32_t physical_slot =
+                    kPhysicalTransferSlotBase + plan_index;
+                const auto &destination_descriptor =
+                    destination_bank.experts[expert];
+                const auto &slot_descriptor =
+                    slot_entries[physical_slot].descriptor;
+                ASSERT_EQ(
+                    retained_descriptor.local_slot,
+                    static_cast<int32_t>(plan_index));
+                ASSERT_EQ(
+                    retained_descriptor.gate.payload,
+                    retained_slot_descriptor.gate.payload);
+                ASSERT_EQ(
+                    retained_descriptor.up.payload,
+                    retained_slot_descriptor.up.payload);
+                ASSERT_EQ(
+                    retained_descriptor.down.payload,
+                    retained_slot_descriptor.down.payload);
+                ASSERT_EQ(
+                    destination_descriptor.local_slot,
+                    static_cast<int32_t>(physical_slot));
+                ASSERT_EQ(
+                    destination_descriptor.gate.payload,
+                    slot_descriptor.gate.payload);
+                ASSERT_EQ(
+                    destination_descriptor.up.payload,
+                    slot_descriptor.up.payload);
+                ASSERT_EQ(
+                    destination_descriptor.down.payload,
+                    slot_descriptor.down.payload);
+            }
+            ASSERT_EQ(observed_runtime.current_batch_llep_movement_observed, 1u);
+
+            for (const int rows : kRows)
+            {
+                SCOPED_TRACE("M=" + std::to_string(rows));
+                auto hidden = makeHidden(rows, kDModel, format_index);
+                ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+
+                auto routing_indices = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(rows), static_cast<size_t>(kTopK)});
+                auto routing_weights = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(rows), static_cast<size_t>(kTopK)});
+                constexpr std::array<float, kTopK> kRouteWeights = {
+                    0.25f, 0.20f, 0.16f, 0.13f,
+                    0.10f, 0.07f, 0.05f, 0.04f};
+                for (int row = 0; row < rows; ++row)
+                {
+                    for (int route = 0; route < kTopK; ++route)
+                    {
+                        const size_t slot =
+                            static_cast<size_t>(row) * kTopK + route;
+                        routing_indices->mutable_data()[slot] =
+                            static_cast<float>((row + route) % kNumExperts);
+                        routing_weights->mutable_data()[slot] =
+                            kRouteWeights[route];
+                    }
+                }
+                ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+                ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+                ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                    source_runtime->deviceLayerState(kTargetLayer),
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    rows,
+                    rows,
+                    kNumExperts,
+                    kTopK,
+                    source_gateup_table,
+                    source_down_table,
+                    /*filter_to_local_runtime_experts=*/true));
+                std::vector<float> static_owner_canonical;
+                const auto static_owner_output = executePublishedPlan(
+                    backend,
+                    kernel,
+                    *source_runtime,
+                    device,
+                    stream,
+                    hidden.get(),
+                    source_gateup_table,
+                    source_down_table,
+                    rows,
+                    kDModel,
+                    kIntermediate,
+                    kNumExperts,
+                    kTopK,
+                    kTargetLayer,
+                    &static_owner_canonical);
+
+                ASSERT_TRUE(kernel.groupPrefillRoutes(
+                    destination_runtime->deviceLayerState(kTargetLayer),
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    rows,
+                    rows,
+                    kNumExperts,
+                    kTopK,
+                    /*filter_to_local_runtime_experts=*/false));
+
+                std::array<least_loaded_ep::LeastLoadedExpertAssignmentSpan,
+                           kNumExperts>
+                    spans{};
+                std::array<int32_t, kNumExperts * 2> span_bounds{};
+                for (int expert = 0; expert < kNumExperts; ++expert)
+                {
+                    spans[expert] = {
+                        .expert = static_cast<uint32_t>(expert),
+                        .owner_participant = 0u,
+                        .destination_participant = kDestinationParticipant,
+                        .route_row_begin = 0u,
+                        .route_row_end = static_cast<uint64_t>(rows),
+                        .needs_foreign_weight = static_cast<uint8_t>(
+                            (expert & 1) != 0 ? 1u : 0u),
+                    };
+                    span_bounds[2 * expert] = expert;
+                    span_bounds[2 * expert + 1] = expert + 1;
+                }
+                ASSERT_TRUE(backend->hostToDeviceOnStream(
+                    destination_host.reserved_ptrs[1],
+                    spans.data(),
+                    sizeof(spans),
+                    device.ordinal,
+                    stream));
+                ASSERT_TRUE(backend->hostToDeviceOnStream(
+                    destination_host.reserved_ptrs[0],
+                    span_bounds.data(),
+                    sizeof(span_bounds),
+                    device.ordinal,
+                    stream));
+                ASSERT_TRUE(
+                    kernel.assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+                        launch,
+                        destination_runtime->deviceLayerState(kTargetLayer),
+                        rows,
+                        rows,
+                        kNumExperts,
+                        kTopK,
+                        d_transfer_status.as<DeviceMoERebalanceStatus>(),
+                        d_apply_status.as<DeviceMoERebalanceApplyStatus>()));
+
+                std::vector<int32_t> assigned_participants(
+                    static_cast<size_t>(rows) * kTopK,
+                    -1);
+                ASSERT_TRUE(backend->deviceToHostOnStream(
+                    assigned_participants.data(),
+                    destination_host.route_participant_ids,
+                    assigned_participants.size() * sizeof(int32_t),
+                    device.ordinal,
+                    stream));
+                ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                ASSERT_TRUE(std::all_of(
+                    assigned_participants.begin(),
+                    assigned_participants.end(),
+                    [=](int32_t participant)
+                    {
+                        return participant ==
+                               static_cast<int32_t>(kDestinationParticipant);
+                    })) << "CurrentBatchLLEP did not assign every routed slot to the ready destination";
+
+                ASSERT_TRUE(
+                    kernel.publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+                        destination_runtime->deviceLayerState(kTargetLayer),
+                        rows,
+                        rows,
+                        kNumExperts,
+                        kTopK,
+                        destination_gateup_table,
+                        destination_down_table));
+                std::vector<float> llep_canonical;
+                const auto llep_output = executePublishedPlan(
+                    backend,
+                    kernel,
+                    *destination_runtime,
+                    device,
+                    stream,
+                    hidden.get(),
+                    destination_gateup_table,
+                    destination_down_table,
+                    rows,
+                    kDModel,
+                    kIntermediate,
+                    kNumExperts,
+                    kTopK,
+                    kTargetLayer,
+                    &llep_canonical);
+
+                double norm_squared = 0.0;
+                for (const float value : static_owner_output)
+                {
+                    ASSERT_TRUE(std::isfinite(value));
+                    norm_squared += static_cast<double>(value) * value;
+                }
+                ASSERT_GT(norm_squared, 1.0e-14)
+                    << format.label << " produced a degenerate all-zero witness";
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " transferred CurrentBatchLLEP vs StaticOwner M=" +
+                        std::to_string(rows),
+                    llep_output,
+                    static_owner_output,
+                    kDModel);
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " transferred CurrentBatchLLEP canonical routes vs StaticOwner M=" +
+                        std::to_string(rows),
+                    llep_canonical,
+                    static_owner_canonical,
+                    kDModel);
+
+                /*
+                 * Exercise the defining LLEP shape that the complete-expert
+                 * comparison above cannot cover: every logical expert is split
+                 * into two contiguous grouped-row spans and both participants
+                 * execute one half. Production publishes those partials into
+                 * the same canonical [row, route, column] coordinates before a
+                 * rooted collective. Comparing the selected route slot before
+                 * reduction isolates assignment/regrouping from collective
+                 * arithmetic and proves that no row is duplicated, omitted, or
+                 * associated with the wrong route weight.
+                 */
+                constexpr size_t kSplitSpanCount =
+                    static_cast<size_t>(kNumExperts) * 2u;
+                std::array<least_loaded_ep::LeastLoadedExpertAssignmentSpan,
+                           kSplitSpanCount>
+                    split_spans{};
+                std::array<int32_t, kNumExperts * 2> split_span_bounds{};
+                std::array<uint32_t, kNumExperts> grouped_route_counts{};
+                for (int row = 0; row < rows; ++row)
+                {
+                    for (int route = 0; route < kTopK; ++route)
+                    {
+                        const int expert = (row + route) % kNumExperts;
+                        ++grouped_route_counts[expert];
+                    }
+                }
+                for (int expert = 0; expert < kNumExperts; ++expert)
+                {
+                    const size_t first = static_cast<size_t>(expert) * 2u;
+                    const uint32_t route_count =
+                        grouped_route_counts[expert];
+                    const uint32_t split_row = (route_count + 1u) / 2u;
+                    split_spans[first] = {
+                        .expert = static_cast<uint32_t>(expert),
+                        .owner_participant = 0u,
+                        .destination_participant = 0u,
+                        .route_row_begin = 0u,
+                        .route_row_end = split_row,
+                        .needs_foreign_weight = 0u,
+                    };
+                    split_spans[first + 1u] = {
+                        .expert = static_cast<uint32_t>(expert),
+                        .owner_participant = 0u,
+                        .destination_participant = kDestinationParticipant,
+                        .route_row_begin = split_row,
+                        .route_row_end = route_count,
+                        .needs_foreign_weight = static_cast<uint8_t>(
+                            (expert & 1) != 0 ? 1u : 0u),
+                    };
+                    split_span_bounds[2 * expert] =
+                        static_cast<int32_t>(first);
+                    split_span_bounds[2 * expert + 1] =
+                        static_cast<int32_t>(first + 2u);
+                }
+
+                for (auto *runtime : {source_runtime.get(),
+                                      destination_runtime.get()})
+                {
+                    ASSERT_TRUE(kernel.groupPrefillRoutes(
+                        runtime->deviceLayerState(kTargetLayer),
+                        routing_indices.get(),
+                        routing_weights.get(),
+                        rows,
+                        rows,
+                        kNumExperts,
+                        kTopK,
+                        /*filter_to_local_runtime_experts=*/false));
+                    ASSERT_TRUE(publishCurrentBatchPlanCounts(
+                        backend,
+                        device,
+                        stream,
+                        runtime->deviceLayerState(kTargetLayer),
+                        kSplitSpanCount,
+                        kPlanCapacity));
+                    auto &host_runtime = runtime->hostLayerState(kTargetLayer);
+                    ASSERT_TRUE(backend->hostToDeviceOnStream(
+                        host_runtime.reserved_ptrs[1],
+                        split_spans.data(),
+                        sizeof(split_spans),
+                        device.ordinal,
+                        stream));
+                    ASSERT_TRUE(backend->hostToDeviceOnStream(
+                        host_runtime.reserved_ptrs[0],
+                        split_span_bounds.data(),
+                        sizeof(split_span_bounds),
+                        device.ordinal,
+                        stream));
+                }
+
+                transfer_status.llep_assignment_span_count =
+                    static_cast<uint32_t>(kSplitSpanCount);
+                ASSERT_TRUE(backend->hostToDeviceOnStream(
+                    d_transfer_status.get(),
+                    &transfer_status,
+                    sizeof(transfer_status),
+                    device.ordinal,
+                    stream));
+                ASSERT_TRUE(
+                    kernel.assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+                        launch,
+                        source_runtime->deviceLayerState(kTargetLayer),
+                        rows,
+                        rows,
+                        kNumExperts,
+                        kTopK,
+                        d_transfer_status.as<DeviceMoERebalanceStatus>(),
+                        d_source_apply_status.as<DeviceMoERebalanceApplyStatus>()));
+                ASSERT_TRUE(
+                    kernel.assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+                        launch,
+                        destination_runtime->deviceLayerState(kTargetLayer),
+                        rows,
+                        rows,
+                        kNumExperts,
+                        kTopK,
+                        d_transfer_status.as<DeviceMoERebalanceStatus>(),
+                        d_apply_status.as<DeviceMoERebalanceApplyStatus>()));
+
+                std::vector<int32_t> source_assignments(
+                    static_cast<size_t>(rows) * kTopK,
+                    -1);
+                std::vector<int32_t> destination_assignments(
+                    source_assignments.size(),
+                    -1);
+                ASSERT_TRUE(backend->deviceToHostOnStream(
+                    source_assignments.data(),
+                    source_host.route_participant_ids,
+                    source_assignments.size() * sizeof(int32_t),
+                    device.ordinal,
+                    stream));
+                ASSERT_TRUE(backend->deviceToHostOnStream(
+                    destination_assignments.data(),
+                    destination_host.route_participant_ids,
+                    destination_assignments.size() * sizeof(int32_t),
+                    device.ordinal,
+                    stream));
+                ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                ASSERT_EQ(source_assignments, destination_assignments)
+                    << "LLEP participants consumed different assignment spans";
+                ASSERT_TRUE(std::all_of(
+                    source_assignments.begin(),
+                    source_assignments.end(),
+                    [](int32_t participant)
+                    {
+                        return participant == 0 || participant == 1;
+                    }));
+                ASSERT_NE(
+                    std::find(source_assignments.begin(),
+                              source_assignments.end(),
+                              0),
+                    source_assignments.end());
+                ASSERT_NE(
+                    std::find(source_assignments.begin(),
+                              source_assignments.end(),
+                              1),
+                    source_assignments.end());
+
+                ASSERT_TRUE(
+                    kernel.publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+                        source_runtime->deviceLayerState(kTargetLayer),
+                        rows,
+                        rows,
+                        kNumExperts,
+                        kTopK,
+                        source_gateup_table,
+                        source_down_table));
+
+                /*
+                 * A production participant owns a distinct kernel instance and
+                 * grouping workspace. This focused fixture intentionally reuses
+                 * one physical GPU and one kernel instance for both simulated
+                 * participants, so each participant's publication and execution
+                 * must remain one indivisible test transaction. Publishing the
+                 * destination first would overwrite the source participant's
+                 * inverse map in the shared fixture workspace and manufacture a
+                 * cross-participant race that cannot exist between real ranks.
+                 */
+                std::vector<float> source_split_canonical;
+                const auto source_split_output = executePublishedPlan(
+                    backend,
+                    kernel,
+                    *source_runtime,
+                    device,
+                    stream,
+                    hidden.get(),
+                    source_gateup_table,
+                    source_down_table,
+                    rows,
+                    kDModel,
+                    kIntermediate,
+                    kNumExperts,
+                    kTopK,
+                    kTargetLayer,
+                    &source_split_canonical);
+
+                ASSERT_TRUE(
+                    kernel.publishCompleteGroupedPrefillPlanFromRuntimeAssignments(
+                        destination_runtime->deviceLayerState(kTargetLayer),
+                        rows,
+                        rows,
+                        kNumExperts,
+                        kTopK,
+                        destination_gateup_table,
+                        destination_down_table));
+
+                std::vector<float> destination_split_canonical;
+                const auto destination_split_output = executePublishedPlan(
+                    backend,
+                    kernel,
+                    *destination_runtime,
+                    device,
+                    stream,
+                    hidden.get(),
+                    destination_gateup_table,
+                    destination_down_table,
+                    rows,
+                    kDModel,
+                    kIntermediate,
+                    kNumExperts,
+                    kTopK,
+                    kTargetLayer,
+                    &destination_split_canonical);
+                (void)source_split_output;
+                (void)destination_split_output;
+
+                ASSERT_EQ(source_split_canonical.size(),
+                          static_owner_canonical.size());
+                ASSERT_EQ(destination_split_canonical.size(),
+                          static_owner_canonical.size());
+                std::vector<float> reconstructed_canonical(
+                    static_owner_canonical.size(),
+                    0.0f);
+                for (size_t route_slot = 0;
+                     route_slot < source_assignments.size();
+                     ++route_slot)
+                {
+                    const bool source_selected =
+                        source_assignments[route_slot] == 0;
+                    const auto &selected =
+                        source_selected
+                            ? source_split_canonical
+                            : destination_split_canonical;
+                    const auto &inactive =
+                        source_selected
+                            ? destination_split_canonical
+                            : source_split_canonical;
+                    const size_t begin =
+                        route_slot * static_cast<size_t>(kDModel);
+                    const size_t end = begin + static_cast<size_t>(kDModel);
+                    std::copy(
+                        selected.begin() + static_cast<std::ptrdiff_t>(begin),
+                        selected.begin() + static_cast<std::ptrdiff_t>(end),
+                        reconstructed_canonical.begin() +
+                            static_cast<std::ptrdiff_t>(begin));
+                    for (size_t element = begin; element < end; ++element)
+                    {
+                        uint32_t inactive_bits = 0u;
+                        std::memcpy(
+                            &inactive_bits,
+                            &inactive[element],
+                            sizeof(inactive_bits));
+                        ASSERT_EQ(inactive_bits & 0x7fffffffu, 0u)
+                            << "inactive participant wrote canonical route slot="
+                            << route_slot << " element=" << element;
+                    }
+                }
+                expectByteEqual(
+                    std::string(backend_label) + " " + format.label +
+                        " participant-split CurrentBatchLLEP canonical routes vs StaticOwner M=" +
+                        std::to_string(rows),
+                    reconstructed_canonical,
+                    static_owner_canonical,
+                    kDModel);
+            }
+        }
+
+        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+        workspace_consumer->unbindWorkspace();
+    }
+
+    namespace native_vnni_transfer_parity_detail
+    {
+        /**
+         * @brief Stream one CPU-native matrix into executable GPU form.
+         *
+         * @param backend Exact destination backend.
+         * @param device CUDA or ROCm endpoint that owns the inactive allocation.
+         * @param cpu_weights Real CPU prepared bytes retaining source provenance.
+         * @param projection Stable gate/up/down role used in the transfer manifest.
+         * @param identity Unique diagnostic identity for the transaction.
+         * @return Stable destination descriptor and its device allocation owners.
+         * @throws std::runtime_error when materialization, streaming, or format
+         *         publication fails.
+         */
+        inline PromotedCPUProjection promoteCPUProjection(
+            IBackend *backend,
+            DeviceId device,
+            const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+            ExpertTierWeightProjection projection,
+            uint64_t identity)
+        {
+            if (!backend || !device.is_gpu())
+            {
+                throw std::invalid_argument(
+                    "Grouped promotion parity requires a GPU destination");
+            }
+
+            const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
+                cpu_weights,
+                identity,
+                /*layer_id=*/0,
+                /*expert_id=*/0,
+                projection,
+                /*maximum_units_per_chunk=*/1);
+            const auto layout = manifest.deviceLayout();
+            if (!layout.valid())
+            {
+                throw std::runtime_error(
+                    "CPU promotion did not produce a valid device layout");
+            }
+
+            const size_t blocks =
+                static_cast<size_t>(layout.N) *
+                static_cast<size_t>(layout.blocks_per_row);
+            PromotedCPUProjection result;
+            result.payload = std::make_unique<DeviceAllocation>(
+                backend,
+                device.ordinal,
+                blocks * layout.gpu_payload_bytes_per_block);
+            result.scales = std::make_unique<DeviceAllocation>(
+                backend,
+                device.ordinal,
+                blocks * sizeof(uint16_t));
+            if (layout.gpu_is_asymmetric != 0u)
+            {
+                result.mins = std::make_unique<DeviceAllocation>(
+                    backend,
+                    device.ordinal,
+                    blocks * sizeof(uint16_t));
+            }
+            if (layout.gpu_has_emins != 0u)
+            {
+                result.emins = std::make_unique<DeviceAllocation>(
+                    backend,
+                    device.ordinal,
+                    blocks * sizeof(uint32_t));
+            }
+
+            ExpertTierGpuMutableProjectionView destination{
+                .payload = result.payload->as<uint8_t>(),
+                .scales = result.scales->as<uint16_t>(),
+                .mins = result.mins
+                            ? result.mins->as<uint16_t>()
+                            : nullptr,
+                .emins = result.emins
+                             ? result.emins->as<uint32_t>()
+                             : nullptr,
+                .payload_bytes = result.payload->bytes(),
+                .scales_bytes = result.scales->bytes(),
+                .mins_bytes = result.mins ? result.mins->bytes() : 0u,
+                .emins_bytes = result.emins ? result.emins->bytes() : 0u,
+            };
+            if (!destination.validFor(layout))
+            {
+                throw std::runtime_error(
+                    "CPU promotion allocation does not satisfy its layout");
+            }
+
+            std::string error;
+            ExpertTierWeightTransferLane lane({
+                .device = device,
+                .staging = TransferEngine::instance()
+                               .allocatePersistentTransferStagingSlices(
+                                   layout.chunkBytes(1),
+                                   1u,
+                                   device)
+                               .front(),
+                .execution = TransferEngine::instance()
+                                 .allocatePersistentTransferExecutionLanes(
+                                     1u,
+                                     device,
+                                     "grouped_cpu_promotion_" +
+                                         std::to_string(identity))
+                                 .front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
+                .lane_name = "grouped_cpu_promotion_" +
+                             std::to_string(identity),
+                .perf_device = device.to_string(),
+                .collect_timing_measurements = true,
+            });
+            if (!lane.materialize(&error) ||
+                !lane.startCpuToGpu(
+                    layout,
+                    cpu_weights.native_interleaved,
+                    destination,
+                    &error))
+            {
+                throw std::runtime_error(
+                    "Failed to start grouped CPU promotion: " + error);
+            }
+
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            auto progress = lane.progress();
+            while (progress == ExpertTierWeightTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                progress = lane.poll(&error);
+                std::this_thread::yield();
+            }
+            if (progress != ExpertTierWeightTransferProgress::Ready)
+            {
+                throw std::runtime_error(
+                    "Grouped CPU promotion did not complete: " + error);
+            }
+            result.stats = lane.stats();
+            if (result.stats.transfers_completed != 1u ||
+                result.stats.timing_measurement_failures != 0u ||
+                !result.stats.last_measurement.valid() ||
+                result.stats.last_measurement.device_nanoseconds == 0u ||
+                result.stats.blocking_synchronizations != 0u ||
+                result.stats.inference_stream_waits != 0u)
+            {
+                throw std::runtime_error(
+                    "Grouped CPU promotion violated the async lane contract");
+            }
+
+            result.descriptor = DeviceNativeVNNIMatrixDesc{
+                .payload = result.payload->as<uint8_t>(),
+                .scales = result.scales->get(),
+                .mins = result.mins ? result.mins->get() : nullptr,
+                .emins = result.emins ? result.emins->get() : nullptr,
+                .n = layout.N,
+                .k = layout.K,
+                .blocks_per_row =
+                    static_cast<uint32_t>(layout.blocks_per_row),
+                .codebook_id = layout.gpu_codebook_id,
+                .allocation_payload_bytes_per_block =
+                    layout.gpu_payload_bytes_per_block,
+                .allocation_has_mins =
+                    static_cast<uint8_t>(layout.gpu_is_asymmetric),
+                .allocation_has_emins =
+                    static_cast<uint8_t>(layout.gpu_has_emins),
+                .source_codebook_id = layout.gpu_source_codebook_id,
+                .source_is_superblock = layout.gpu_source_is_superblock,
+                .source_identity_present = 1u,
+            };
+            return result;
+        }
+
+        /**
+         * @brief Minimal non-owning boundary required by host publication setup.
+         *
+         * The focused publisher regression has no concurrent inference graph
+         * while maintenance prepares the candidate. The publisher nevertheless
+         * requires the same typed model binding as production; this object makes
+         * that absence explicit without introducing a stream synchronization or
+         * pretending to own device execution state.
+         */
+        class QuiescentOverlayInferenceBoundary final
+            : public IMoEOverlayDeviceInferenceBoundary,
+              public IMoEOverlayDeviceInitialRuntimePublisher
+        {
+        public:
+            /** The focused fixture has already published its sole runtime layer. */
+            bool publishMoEOverlayDeviceInitialRuntime(
+                void *controller_stream) override
+            {
+                if (!controller_stream)
+                    return false;
+                initial_runtime_published_.store(
+                    true, std::memory_order_release);
+                return true;
+            }
+
+            /** @return Whether setup invoked the typed initial publication edge. */
+            [[nodiscard]] bool initialRuntimePublished() const noexcept
+            {
+                return initial_runtime_published_.load(
+                    std::memory_order_acquire);
+            }
+
+            MoEOverlayInferenceBoundaryStatus
+            enqueueMoEOverlayDeviceInferenceBoundary(
+                void *maintenance_stream,
+                MoEOverlayInferenceBoundaryRequest) override
+            {
+                return maintenance_stream
+                           ? MoEOverlayInferenceBoundaryStatus::Submitted
+                           : MoEOverlayInferenceBoundaryStatus::Failed;
+            }
+
+            bool installMoEOverlayTransferProgressEpoch(
+                std::shared_ptr<MappedTransferProgressEpoch> epoch) override
+            {
+                return epoch != nullptr;
+            }
+
+        private:
+            std::atomic<bool> initial_runtime_published_{false};
+        };
+
+        /** @brief Build one two-tier, one-participant-per-domain placement. */
+        inline MoERoutedExpertPlacementPlan hostPublicationPlan(
+            DeviceId device,
+            bool candidate)
+        {
+            RoutedExpertDomain priority_zero_domain;
+            priority_zero_domain.name = "priority_0_domain";
+            priority_zero_domain.scope = ExecutionDomainScope::SINGLE;
+            priority_zero_domain.backend = CollectiveBackendType::HOST;
+            priority_zero_domain.participants = {
+                device.is_cuda()
+                    ? GlobalDeviceAddress::cuda(device.cuda_ordinal(), 0)
+                    : GlobalDeviceAddress::rocm(device.rocm_ordinal(), 0)};
+            priority_zero_domain.world_ranks = {0};
+            priority_zero_domain.owner_rank = 0;
+            priority_zero_domain.routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+
+            RoutedExpertDomain priority_one_domain;
+            priority_one_domain.name = "priority_1_domain";
+            priority_one_domain.scope = ExecutionDomainScope::SINGLE;
+            priority_one_domain.backend = CollectiveBackendType::HOST;
+            priority_one_domain.participants = {GlobalDeviceAddress::cpu(0)};
+            priority_one_domain.world_ranks = {0};
+            priority_one_domain.owner_rank = 0;
+            priority_one_domain.routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+
+            RoutedExpertTier priority_zero;
+            priority_zero.name = "priority_0";
+            priority_zero.domain = priority_zero_domain.name;
+            priority_zero.priority = 0;
+            priority_zero.max_experts_per_layer = 1;
+
+            RoutedExpertTier priority_one;
+            priority_one.name = "priority_1";
+            priority_one.domain = priority_one_domain.name;
+            priority_one.priority = 1;
+            priority_one.max_experts_per_layer = 1;
+            priority_one.fallback = true;
+
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan.continuation_domain = priority_zero_domain.name;
+            plan.shared_expert_domain = priority_zero_domain.name;
+            plan.residency_policy =
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.owner_order = RoutedExpertOwnerOrder::Ordinal;
+            plan.domains = {
+                std::move(priority_zero_domain),
+                std::move(priority_one_domain)};
+            plan.routed_tiers = {
+                std::move(priority_zero),
+                std::move(priority_one)};
+            plan.placements = {{
+                .layer = 0,
+                .routed_expert_tier = candidate
+                                          ? std::vector<int>{1, 0}
+                                          : std::vector<int>{0, 1},
+            }};
+            return plan;
+        }
+
+        /** @brief Materialize one immutable snapshot from its exact plan. */
+        inline std::shared_ptr<const MoEOverlayResidencySnapshot>
+        hostPublicationSnapshot(
+            std::uint64_t epoch,
+            MoERoutedExpertPlacementPlan plan)
+        {
+            auto retained_plan =
+                std::make_shared<MoERoutedExpertPlacementPlan>(
+                    std::move(plan));
+            MoEExpertOwnerMap owner_map = MoEExpertOwnerMap::build(
+                *retained_plan);
+            auto snapshot = std::make_shared<MoEOverlayResidencySnapshot>();
+            snapshot->epoch = epoch;
+            snapshot->placement_plan = std::move(retained_plan);
+            snapshot->owner_map = owner_map;
+            snapshot->layered_ownership = owner_map.layeredOwnership(1, 2);
+            if (!snapshot->valid())
+                throw std::runtime_error(
+                    "Host publication test produced an invalid snapshot");
+            return snapshot;
+        }
+
+        /** @brief Create a prepared engine alias over promoted GPU storage. */
+        inline std::shared_ptr<ITensorGemm> promotedEngine(
+            DeviceId device,
+            const DeviceNativeVNNIMatrixDesc &descriptor,
+            const std::shared_ptr<void> &lifetime)
+        {
+            const NativeVnniSourceIdentity source_identity{
+                .codebook_id = descriptor.source_codebook_id,
+                .is_superblock = descriptor.source_is_superblock != 0u,
+                .present = descriptor.source_identity_present != 0u,
+            };
+            const NativeVnniReusableDeviceAllocationFormat allocation{
+                .payload_bytes_per_block =
+                    descriptor.allocation_payload_bytes_per_block,
+                .has_mins = descriptor.allocation_has_mins != 0u,
+                .has_emins = descriptor.allocation_has_emins != 0u,
+            };
+#ifdef HAVE_CUDA
+            if (device.is_cuda())
+            {
+                // The direct GEMM constructors predate the immutable device
+                // descriptor ABI and still spell their borrowed weight views
+                // as mutable pointers. They never write through these aliases;
+                // retain constness everywhere except this legacy constructor
+                // boundary so the publisher regression consumes the exact ABI
+                // used by grouped execution.
+                return std::make_shared<cuda::CUDAQuantisedGemmKernel>(
+                    descriptor.n,
+                    descriptor.k,
+                    device.cuda_ordinal(),
+                    const_cast<std::uint8_t *>(descriptor.payload),
+                    const_cast<std::uint16_t *>(
+                        static_cast<const std::uint16_t *>(descriptor.scales)),
+                    const_cast<std::uint16_t *>(
+                        static_cast<const std::uint16_t *>(descriptor.mins)),
+                    const_cast<std::uint32_t *>(
+                        static_cast<const std::uint32_t *>(descriptor.emins)),
+                    descriptor.codebook_id,
+                    descriptor.blocks_per_row,
+                    lifetime,
+                    source_identity,
+                    allocation);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm())
+            {
+                return std::make_shared<rocm::ROCmQuantisedGemmKernel>(
+                    descriptor.n,
+                    descriptor.k,
+                    device.rocm_ordinal(),
+                    const_cast<std::uint8_t *>(descriptor.payload),
+                    const_cast<void *>(descriptor.scales),
+                    const_cast<void *>(descriptor.mins),
+                    const_cast<void *>(descriptor.emins),
+                    descriptor.codebook_id,
+                    descriptor.blocks_per_row,
+                    lifetime,
+                    source_identity,
+                    allocation);
+            }
+#endif
+            throw std::runtime_error(
+                "Host publication test backend was not built");
+        }
+
+        /** @brief Poll one typed inactive-bank phase to its terminal. */
+        template <typename Poll>
+        inline MoEOverlayResidencyWaveProgress awaitPublicationPhase(
+            Poll &&poll,
+            std::string *error)
+        {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            auto progress = MoEOverlayResidencyWaveProgress::Pending;
+            while (progress == MoEOverlayResidencyWaveProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                progress = poll(error);
+                if (progress == MoEOverlayResidencyWaveProgress::Pending)
+                    std::this_thread::yield();
+            }
+            return progress;
+        }
+    } // namespace native_vnni_transfer_parity_detail
+
+    /**
+     * @brief Prove promoted codebook-23 weights through grouped MoE execution.
+     *
+         * Three real Q5_K projections are prepared twice: the ordinary compact GPU
+     * load path publishes codebook 7, while the CPU-cold promotion path streams
+     * the same mathematical weights into codebook 23. Both descriptor triplets
+     * then execute the production grouped route plan at verifier and long-prefill
+     * sizes. Final outputs and canonical route contributions must be byte equal.
+     *
+     * @param backend_label Stable diagnostic label (CUDA or ROCm).
+     * @param device Physical backend endpoint.
+     * @param stream Explicit non-null production stream.
+     */
+    inline void runExpandedAsymmetricGroupedMoEParity(
+        const char *backend_label,
+        DeviceId device,
+        void *stream)
+    {
+        using namespace native_vnni_transfer_parity_detail;
+        if (!backend_label || !device.is_gpu() || !stream)
+            throw std::invalid_argument(
+                "Grouped asymmetric parity requires a GPU and explicit stream");
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+            throw std::runtime_error(
+                "Grouped asymmetric parity backend is unavailable");
+
+        constexpr int kDModel = 2048;
+        constexpr int kIntermediate = 512;
+        constexpr int kNumExperts = 2;
+        constexpr int kTopK = 2;
+        constexpr int kMaxRows = 65;
+        constexpr int kLayer = 0;
+        const auto &format = quantizedVerifierFormat("Q5_K");
+
+        std::vector<std::unique_ptr<TensorBase>> weights;
+        std::vector<GpuPreparedGemm> prepared;
+        weights.reserve(3u);
+        prepared.reserve(3u);
+        const uint64_t model_base =
+            device.is_cuda() ? 2910000u : 2920000u;
+        const std::string prefix =
+            std::string("test.") + backend_label +
+            ".expanded_asymmetric_grouped";
+        const DeviceNativeVNNIMatrixDesc compact_gate =
+            prepareMatrixDescriptor(
+                format,
+                device,
+                stream,
+                kIntermediate,
+                kDModel,
+                99181u,
+                prefix + ".gate",
+                ModelContextId{model_base + 1u},
+                weights,
+                prepared);
+        const DeviceNativeVNNIMatrixDesc compact_up =
+            prepareMatrixDescriptor(
+                format,
+                device,
+                stream,
+                kIntermediate,
+                kDModel,
+                99182u,
+                prefix + ".up",
+                ModelContextId{model_base + 2u},
+                weights,
+                prepared);
+        const DeviceNativeVNNIMatrixDesc compact_down =
+            prepareMatrixDescriptor(
+                format,
+                device,
+                stream,
+                kDModel,
+                kIntermediate,
+                99183u,
+                prefix + ".down",
+                ModelContextId{model_base + 3u},
+                weights,
+                prepared);
+        ASSERT_EQ(compact_gate.codebook_id, 7u);
+        ASSERT_EQ(compact_up.codebook_id, 7u);
+        ASSERT_EQ(compact_down.codebook_id, 7u);
+
+        std::array<cpu::native_vnni::CPUNativeVNNIPackedWeights, 3>
+            cpu_weights;
+        for (size_t index = 0; index < cpu_weights.size(); ++index)
+        {
+            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+                weights[index].get(), cpu_weights[index]));
+            ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights[index].is_asymmetric);
+        }
+        auto promoted_gate = promoteCPUProjection(
+            backend,
+            device,
+            cpu_weights[0],
+            ExpertTierWeightProjection::Gate,
+            model_base + 11u);
+        auto promoted_up = promoteCPUProjection(
+            backend,
+            device,
+            cpu_weights[1],
+            ExpertTierWeightProjection::Up,
+            model_base + 12u);
+        auto promoted_down = promoteCPUProjection(
+            backend,
+            device,
+            cpu_weights[2],
+            ExpertTierWeightProjection::Down,
+            model_base + 13u);
+
+        const auto make_experts = [&](
+            const DeviceNativeVNNIMatrixDesc &gate,
+            const DeviceNativeVNNIMatrixDesc &up,
+            const DeviceNativeVNNIMatrixDesc &down)
+        {
+            std::vector<DeviceMoEExpertDescriptor> descriptors(kNumExperts);
+            for (int expert = 0; expert < kNumExperts; ++expert)
+            {
+                auto &descriptor = descriptors[expert];
+                descriptor.logical_expert_id = expert;
+                descriptor.owner_participant = 0;
+                descriptor.local_slot = expert;
+                descriptor.flags = toMoEExpertFlags(
+                    DeviceMoEExpertFlags::Valid |
+                    DeviceMoEExpertFlags::Resident |
+                    DeviceMoEExpertFlags::LocalCompute);
+                descriptor.gate = gate;
+                descriptor.up = up;
+                descriptor.down = down;
+            }
+            return descriptors;
+        };
+        const auto compact_experts =
+            make_experts(compact_gate, compact_up, compact_down);
+        const auto promoted_experts = make_experts(
+            promoted_gate.descriptor,
+            promoted_up.descriptor,
+            promoted_down.descriptor);
+
+        auto kernel_owner =
+            llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+        ASSERT_NE(kernel_owner, nullptr);
+        kernel_owner->setGPUStream(stream);
+        auto requirements = device.is_cuda()
+                                ? MoEWorkspaceBuffers::cudaMoE(
+                                      kMaxRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK)
+                                : MoEWorkspaceBuffers::rocmMoE(
+                                      kMaxRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK);
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() + 4u * 1024u * 1024u);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        auto *workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kernel_owner.get());
+        ASSERT_NE(workspace_consumer, nullptr);
+        workspace_consumer->bindWorkspace(&workspace);
+        IMoEKernel &kernel = *kernel_owner;
+
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> compact_gates{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> compact_ups{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> compact_downs{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> promoted_gates{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> promoted_ups{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> promoted_downs{};
+        for (int expert = 0; expert < kNumExperts; ++expert)
+        {
+            compact_gates[expert] = compact_gate;
+            compact_ups[expert] = compact_up;
+            compact_downs[expert] = compact_down;
+            promoted_gates[expert] = promoted_gate.descriptor;
+            promoted_ups[expert] = promoted_up.descriptor;
+            promoted_downs[expert] = promoted_down.descriptor;
+        }
+        const int compact_gateup_table =
+            kernel.uploadGroupedExpertGateUpDescriptorTables(
+                compact_gates.data(),
+                compact_ups.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        const int compact_down_table =
+            kernel.uploadGroupedExpertDownDescriptorTable(
+                compact_downs.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        const int promoted_gateup_table =
+            kernel.uploadGroupedExpertGateUpDescriptorTables(
+                promoted_gates.data(),
+                promoted_ups.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        const int promoted_down_table =
+            kernel.uploadGroupedExpertDownDescriptorTable(
+                promoted_downs.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        ASSERT_GE(compact_gateup_table, 0);
+        ASSERT_GE(compact_down_table, 0);
+        ASSERT_GE(promoted_gateup_table, 0);
+        ASSERT_GE(promoted_down_table, 0);
+
+        auto compact_runtime = makeRuntimeTable(
+            device,
+            stream,
+            compact_experts,
+            /*participant_id=*/0u,
+            std::vector<uint8_t>(kNumExperts, 1u),
+            std::vector<uint32_t>(kNumExperts, 0b01u),
+            /*num_layers=*/1,
+            kTopK,
+            kMaxRows);
+        auto promoted_runtime = makeRuntimeTable(
+            device,
+            stream,
+            promoted_experts,
+            /*participant_id=*/0u,
+            std::vector<uint8_t>(kNumExperts, 1u),
+            std::vector<uint32_t>(kNumExperts, 0b01u),
+            /*num_layers=*/1,
+            kTopK,
+            kMaxRows);
+
+        for (const int rows : {2, 4, 16, kMaxRows})
+        {
+            SCOPED_TRACE(
+                std::string(backend_label) + " grouped promoted M=" +
+                std::to_string(rows));
+            auto hidden = makeHidden(rows, kDModel, 77u);
+            auto routing_indices = TestTensorFactory::createFP32(
+                {static_cast<size_t>(rows), kTopK});
+            auto routing_weights = TestTensorFactory::createFP32(
+                {static_cast<size_t>(rows), kTopK});
+            for (int row = 0; row < rows; ++row)
+            {
+                routing_indices->mutable_data()[row * kTopK] =
+                    static_cast<float>(row & 1);
+                routing_indices->mutable_data()[row * kTopK + 1] =
+                    static_cast<float>((row + 1) & 1);
+                routing_weights->mutable_data()[row * kTopK] = 0.625f;
+                routing_weights->mutable_data()[row * kTopK + 1] = 0.375f;
+            }
+            ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                compact_runtime->deviceLayerState(kLayer),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                compact_gateup_table,
+                compact_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+            std::vector<float> compact_canonical;
+            const auto compact_output = executePublishedPlan(
+                backend,
+                kernel,
+                *compact_runtime,
+                device,
+                stream,
+                hidden.get(),
+                compact_gateup_table,
+                compact_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                kLayer,
+                &compact_canonical);
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                promoted_runtime->deviceLayerState(kLayer),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                promoted_gateup_table,
+                promoted_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+            std::vector<float> promoted_canonical;
+            const auto promoted_output = executePublishedPlan(
+                backend,
+                kernel,
+                *promoted_runtime,
+                device,
+                stream,
+                hidden.get(),
+                promoted_gateup_table,
+                promoted_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                kLayer,
+                &promoted_canonical);
+
+            double norm_squared = 0.0;
+            for (const float value : compact_output)
+            {
+                ASSERT_TRUE(std::isfinite(value));
+                norm_squared += static_cast<double>(value) * value;
+            }
+            ASSERT_GT(norm_squared, 1.0e-14);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " grouped promoted output M=" + std::to_string(rows),
+                promoted_output,
+                compact_output,
+                kDModel);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " grouped promoted canonical M=" + std::to_string(rows),
+                promoted_canonical,
+                compact_canonical,
+                kDModel);
+        }
+
+        /*
+         * Close the last production-only gap: a heterogeneous host authority
+         * does not call flipActiveBank() or upload a table assembled by this
+         * test. It installs a complete immutable participant bank, exports the
+         * retained engines into the canonical runtime table, DMA-publishes only
+         * the inactive placement bank plus its selector, advances the device RCU
+         * epoch, and lets inference acquire that epoch ticket. The descriptor
+         * tables start with expert one empty, exactly as a graph captured before
+         * promotion would. Runtime publication must therefore be the sole reason
+         * the promoted expert becomes executable.
+         */
+        {
+            constexpr int rows = 16;
+            auto previous_snapshot = hostPublicationSnapshot(
+                1u, hostPublicationPlan(device, /*candidate=*/false));
+            auto candidate_snapshot = hostPublicationSnapshot(
+                2u, hostPublicationPlan(device, /*candidate=*/true));
+            const auto *gpu_participant =
+                previous_snapshot->owner_map.participantForId(0);
+            ASSERT_NE(gpu_participant, nullptr);
+            ASSERT_EQ(gpu_participant->device, device);
+
+            auto registry = std::make_shared<
+                MoEOverlayParticipantResidencyRegistry>(
+                MoEOverlayParticipantResidencyRegistry::Config{
+                    .owner_map = previous_snapshot->owner_map,
+                    .local_participant_ids = {0},
+                    .num_layers = 1,
+                    .num_experts = kNumExperts,
+                    .initial_epoch = 1u,
+                    .retained_epoch_capacity = 2u,
+                });
+            const auto borrowed = [](ITensorGemm *engine)
+            {
+                return std::shared_ptr<ITensorGemm>(
+                    engine, [](ITensorGemm *) {});
+            };
+            MoEOverlayPreparedExpertTriplet compact_triplet{
+                .gate = borrowed(prepared[0].kernel),
+                .up = borrowed(prepared[1].kernel),
+                .down = borrowed(prepared[2].kernel),
+            };
+            std::vector<MoEOverlayPreparedExpertTriplet> initial_triplets(
+                kNumExperts);
+            initial_triplets[0] = compact_triplet;
+            std::string publication_error;
+            ASSERT_TRUE(registry->registerInitialLayer(
+                /*participant_id=*/0,
+                /*layer_idx=*/0,
+                std::vector<bool>{true, false},
+                initial_triplets,
+                &publication_error))
+                << publication_error;
+            ASSERT_TRUE(registry->allInitialBanksReady());
+
+            auto promoted_lifetime = std::make_shared<int>(7319);
+            MoEOverlayPreparedExpertTriplet promoted_triplet{
+                .gate = promotedEngine(
+                    device, promoted_gate.descriptor, promoted_lifetime),
+                .up = promotedEngine(
+                    device, promoted_up.descriptor, promoted_lifetime),
+                .down = promotedEngine(
+                    device, promoted_down.descriptor, promoted_lifetime),
+            };
+            auto endpoint = registry->endpoint(0);
+            ASSERT_NE(endpoint, nullptr);
+            auto candidate_bank = endpoint->cloneCandidate(1u, 2u);
+            candidate_bank.layers[0].clearExpert(0);
+            candidate_bank.layers[0].setResidentExpert(
+                1, promoted_triplet);
+            auto prepared_candidate = endpoint->prepareReadyBank(
+                std::move(candidate_bank), &publication_error);
+            ASSERT_TRUE(prepared_candidate.has_value()) << publication_error;
+            ASSERT_EQ(
+                endpoint->installReadyBank(
+                    std::move(*prepared_candidate), &publication_error),
+                MoEOverlayParticipantBankInstallStatus::Installed)
+                << publication_error;
+
+            auto epoch_arena = std::make_shared<DeviceMoEOverlayEpochArena>(
+                DeviceMoEOverlayEpochArena::Config{
+                    .device_id = device,
+                    .initial_epoch = 1u,
+                    // A freshly initialized runtime table prepares bank one.
+                    .initial_bank = 1u,
+                    .request_slot_capacity = 1u,
+                });
+            auto initial_runtime_descriptors = compact_experts;
+            initial_runtime_descriptors[0].owner_participant = 0;
+            initial_runtime_descriptors[1].owner_participant = 1;
+            auto published_runtime = makeRuntimeTable(
+                device,
+                stream,
+                initial_runtime_descriptors,
+                /*participant_id=*/0u,
+                std::vector<std::uint8_t>{1u, 0u},
+                std::vector<std::uint32_t>{0b01u, 0b10u},
+                /*num_layers=*/1,
+                kTopK,
+                kMaxRows,
+                epoch_arena);
+            ASSERT_EQ(
+                published_runtime->hostLayerState(0).active_bank,
+                1u);
+
+            QuiescentOverlayInferenceBoundary inference_boundary;
+            MoEOverlayDeviceControllerRuntimeBinding runtime_binding{
+                .device = device,
+                .runtime_layers_device =
+                    published_runtime->deviceLayerState(0),
+                .runtime_table_host = published_runtime.get(),
+                .overlay_participant_id = 0,
+                .domain_participant_id = 0u,
+                .domain_participant_count = 1u,
+                .layer_count = 1u,
+                .expert_count = kNumExperts,
+                .top_k = kTopK,
+                .epoch_control = epoch_arena->control(),
+                .maintenance_epoch = epoch_arena->maintenanceEpoch(),
+                .maintenance_status = epoch_arena->maintenanceStatus(),
+                .inference_boundary = &inference_boundary,
+                .initial_runtime_publisher = &inference_boundary,
+            };
+            ASSERT_TRUE(runtime_binding.hostPublicationValid());
+            auto publisher = std::make_shared<
+                MoEOverlayHostAuthorityDeviceBankPublisher>(
+                MoEOverlayHostAuthorityDeviceBankPublisher::Config{
+                    .runtime_bindings = {runtime_binding},
+                    .registry = registry,
+                    .perf_device = device.to_string(),
+                });
+            ASSERT_TRUE(inference_boundary.initialRuntimePublished());
+            auto transaction = publisher->createTransaction(
+                previous_snapshot,
+                candidate_snapshot,
+                &publication_error);
+            ASSERT_NE(transaction, nullptr) << publication_error;
+            ASSERT_TRUE(transaction->beginPrepare(&publication_error))
+                << publication_error;
+            ASSERT_EQ(
+                awaitPublicationPhase(
+                    [&](std::string *error)
+                    { return transaction->pollPrepare(error); },
+                    &publication_error),
+                MoEOverlayResidencyWaveProgress::Ready)
+                << publication_error;
+
+            /*
+             * Preparation may install the immutable candidate bank, but it
+             * must not change the live runtime selector.  Inference holding an
+             * epoch-one ticket can overlap this observation and must continue
+             * to see bank one until the explicit publication transition.
+             */
+            DeviceMoELayerRuntime prepared_runtime{};
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                &prepared_runtime,
+                published_runtime->deviceLayerState(0),
+                sizeof(prepared_runtime),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            EXPECT_EQ(prepared_runtime.active_bank, 1u);
+            EXPECT_EQ(prepared_runtime.active_epoch, 1u);
+            EXPECT_EQ(prepared_runtime.banks[0].epoch, 2u);
+            EXPECT_TRUE(prepared_runtime.banks[0].experts[1].weightsReady());
+
+            ASSERT_TRUE(transaction->beginPublication(&publication_error))
+                << publication_error;
+            ASSERT_EQ(
+                awaitPublicationPhase(
+                    [&](std::string *error)
+                    { return transaction->pollPublication(error); },
+                    &publication_error),
+                MoEOverlayResidencyWaveProgress::Ready)
+                << publication_error;
+
+            const MoEKernelLaunchContext launch{.stream = stream};
+            ASSERT_TRUE(kernel.acquireMoEOverlayEpoch(
+                launch,
+                epoch_arena->control(),
+                epoch_arena->requestTicket(0u),
+                epoch_arena->requestStatus(0u)));
+            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+
+            /*
+             * Observe the publication certificate before routing. These are
+             * diagnostic-only D2H copies in an integration test; production
+             * inference consumes the same records in place on device. Keeping
+             * the assertions here makes the regression identify whether a
+             * future break is in epoch admission or descriptor execution.
+             */
+            DeviceMoELayerRuntime observed_runtime{};
+            DeviceMoEOverlayEpochTicket observed_ticket{};
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                &observed_runtime,
+                published_runtime->deviceLayerState(0),
+                sizeof(observed_runtime),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                &observed_ticket,
+                epoch_arena->requestTicket(0u),
+                sizeof(observed_ticket),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            EXPECT_EQ(observed_runtime.active_bank, 0u);
+            EXPECT_EQ(observed_runtime.active_epoch, 2u);
+            EXPECT_EQ(observed_runtime.banks[0].epoch, 2u);
+            EXPECT_EQ(observed_runtime.banks[0].expert_count,
+                      static_cast<std::uint32_t>(kNumExperts));
+            EXPECT_EQ(observed_runtime.banks[0].local_compute_mask[1], 1u);
+            EXPECT_EQ(observed_runtime.banks[0].resident_participant_mask[1],
+                      0b01u);
+            EXPECT_TRUE(observed_runtime.banks[0].experts[1].weightsReady());
+            EXPECT_EQ(observed_runtime.banks[0].experts[1].gate.payload,
+                      promoted_gate.descriptor.payload);
+            EXPECT_EQ(observed_ticket.epoch, 2u);
+            EXPECT_EQ(observed_ticket.selector & 1u, 0u);
+            EXPECT_GT(observed_ticket.selector >> 1u, 0u);
+
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts>
+                sparse_bootstrap_gates{compact_gate, {}};
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts>
+                sparse_bootstrap_ups{compact_up, {}};
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts>
+                sparse_bootstrap_downs{compact_down, {}};
+            const int published_gateup_table =
+                kernel.uploadGroupedExpertGateUpDescriptorTables(
+                    sparse_bootstrap_gates.data(),
+                    sparse_bootstrap_ups.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate,
+                    MoEDecodeDescriptorSource::RuntimePlacementTable);
+            const int published_down_table =
+                kernel.uploadGroupedExpertDownDescriptorTable(
+                    sparse_bootstrap_downs.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate,
+                    MoEDecodeDescriptorSource::RuntimePlacementTable);
+            ASSERT_GE(published_gateup_table, 0);
+            ASSERT_GE(published_down_table, 0);
+
+            auto reference_descriptors = compact_experts;
+            reference_descriptors[0].owner_participant = -1;
+            reference_descriptors[1].owner_participant = 0;
+            auto reference_runtime = makeRuntimeTable(
+                device,
+                stream,
+                reference_descriptors,
+                /*participant_id=*/0u,
+                std::vector<std::uint8_t>{0u, 1u},
+                std::vector<std::uint32_t>{0u, 0b01u},
+                /*num_layers=*/1,
+                kTopK,
+                kMaxRows);
+
+            auto hidden = makeHidden(rows, kDModel, 93u);
+            auto routing_indices = TestTensorFactory::createFP32(
+                {static_cast<std::size_t>(rows), kTopK});
+            auto routing_weights = TestTensorFactory::createFP32(
+                {static_cast<std::size_t>(rows), kTopK});
+            for (int row = 0; row < rows; ++row)
+            {
+                routing_indices->mutable_data()[row * kTopK] = 1.0f;
+                routing_indices->mutable_data()[row * kTopK + 1] = 0.0f;
+                routing_weights->mutable_data()[row * kTopK] = 0.625f;
+                routing_weights->mutable_data()[row * kTopK + 1] = 0.375f;
+            }
+            ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                reference_runtime->deviceLayerState(0),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                compact_gateup_table,
+                compact_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+            std::vector<float> reference_canonical;
+            const auto reference_output = executePublishedPlan(
+                backend,
+                kernel,
+                *reference_runtime,
+                device,
+                stream,
+                hidden.get(),
+                compact_gateup_table,
+                compact_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                /*layer_idx=*/0,
+                &reference_canonical);
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                published_runtime->deviceLayerState(0),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                published_gateup_table,
+                published_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+
+            std::array<std::int32_t, kNumExperts> observed_counts{};
+            std::array<std::int32_t, rows * kTopK> observed_route_experts{};
+            std::array<std::int32_t, rows * kTopK>
+                observed_route_participants{};
+            std::array<float, rows * kTopK> observed_route_weights{};
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_counts.data(),
+                observed_runtime.expert_counts,
+                sizeof(observed_counts),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_route_experts.data(),
+                observed_runtime.route_expert_ids,
+                sizeof(observed_route_experts),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_route_participants.data(),
+                observed_runtime.route_participant_ids,
+                sizeof(observed_route_participants),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_route_weights.data(),
+                observed_runtime.route_weights,
+                sizeof(observed_route_weights),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            EXPECT_EQ(observed_counts[0], 0);
+            EXPECT_EQ(observed_counts[1], rows);
+            for (int row = 0; row < rows; ++row)
+            {
+                const auto local_slot =
+                    static_cast<std::size_t>(row * kTopK);
+                const auto remote_slot = local_slot + 1u;
+                EXPECT_EQ(observed_route_experts[local_slot], 1);
+                EXPECT_EQ(observed_route_participants[local_slot], 0);
+                EXPECT_FLOAT_EQ(observed_route_weights[local_slot], 0.625f);
+                EXPECT_EQ(observed_route_experts[remote_slot], 0);
+                EXPECT_EQ(observed_route_participants[remote_slot], -1);
+                EXPECT_FLOAT_EQ(observed_route_weights[remote_slot], 0.0f);
+            }
+            std::vector<float> published_canonical;
+            const auto published_output = executePublishedPlan(
+                backend,
+                kernel,
+                *published_runtime,
+                device,
+                stream,
+                hidden.get(),
+                published_gateup_table,
+                published_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                /*layer_idx=*/0,
+                &published_canonical);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " host-published promoted output",
+                published_output,
+                reference_output,
+                kDModel);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " host-published promoted canonical",
+                published_canonical,
+                reference_canonical,
+                kDModel);
+
+            ASSERT_TRUE(kernel.releaseMoEOverlayEpoch(
+                launch,
+                epoch_arena->control(),
+                epoch_arena->requestTicket(0u),
+                epoch_arena->requestStatus(0u)));
+            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            ASSERT_EQ(
+                awaitPublicationPhase(
+                    [&](std::string *error)
+                    { return transaction->pollRetirementFence(error); },
+                    &publication_error),
+                MoEOverlayResidencyWaveProgress::Ready)
+                << publication_error;
+            transaction->retirePrevious();
+            transaction.reset();
+        }
+
+        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+        workspace_consumer->unbindWorkspace();
+    }
+} // namespace llaminar2::test

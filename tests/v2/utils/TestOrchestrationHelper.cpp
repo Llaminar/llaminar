@@ -38,6 +38,26 @@ namespace llaminar2::test
         return factory->createFromOrchestrationConfig(config);
     }
 
+    std::unique_ptr<IOrchestrationRunner> TestOrchestrationHelper::create(
+        const OrchestrationConfig &config,
+        std::shared_ptr<ModelContext> model_ctx)
+    {
+        auto factory = createOrchestrationRunnerFactory();
+        return factory->createFromOrchestrationConfig(
+            config,
+            std::move(model_ctx));
+    }
+
+    std::unique_ptr<IOrchestrationRunner> TestOrchestrationHelper::create(
+        const OrchestrationConfig &config,
+        ModelContextReuseContract reuse_contract)
+    {
+        auto factory = createOrchestrationRunnerFactory();
+        return factory->createFromOrchestrationConfig(
+            config,
+            std::move(reuse_contract));
+    }
+
     // =========================================================================
     // Pipeline Parallel (PP) Configuration
     // =========================================================================

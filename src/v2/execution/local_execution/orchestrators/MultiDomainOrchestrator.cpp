@@ -126,6 +126,46 @@ namespace llaminar2
         return inner_runner_->forward(tokens, seq_len);
     }
 
+    bool MultiDomainOrchestrator::forwardPrefill(
+        const int *tokens,
+        int seq_len)
+    {
+        if (!initialized_ || !inner_runner_)
+        {
+            LOG_ERROR("MultiDomainOrchestrator not initialized");
+            return false;
+        }
+        return inner_runner_->forwardPrefill(tokens, seq_len);
+    }
+
+    bool MultiDomainOrchestrator::forwardRestoredPrefixMTPDecodeBridge(
+        const RestoredPrefixMTPDecodeBridgeRequest &request)
+    {
+        if (!initialized_ || !inner_runner_)
+        {
+            LOG_ERROR("MultiDomainOrchestrator not initialized");
+            return false;
+        }
+        return inner_runner_->forwardRestoredPrefixMTPDecodeBridge(request);
+    }
+
+    /**
+     * @brief Preserve the root-authoritative sparse protocol identity through this wrapper.
+     */
+    bool MultiDomainOrchestrator::setMoEOverlayCollectiveRequestGeneration(
+        uint64_t generation_id)
+    {
+        if (!initialized_ || !inner_runner_)
+        {
+            LOG_ERROR(
+                "MultiDomainOrchestrator cannot publish a graph-native MoE "
+                "collective generation before initialization");
+            return false;
+        }
+        return inner_runner_->setMoEOverlayCollectiveRequestGeneration(
+            generation_id);
+    }
+
     const float *MultiDomainOrchestrator::logits() const
     {
         if (!initialized_ || !inner_runner_)
@@ -150,13 +190,23 @@ namespace llaminar2
     {
         if (initialized_ && inner_runner_)
         {
-            inner_runner_->clear_cache();
+            inner_runner_->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("multi-domain-orchestrator"));
         }
+    }
+
+    bool MultiDomainOrchestrator::purgePrefixCache()
+    {
+        return !inner_runner_ || inner_runner_->purgePrefixCache();
     }
 
     int MultiDomainOrchestrator::get_position() const
     {
-        if (!initialized_ || !inner_runner_)
+        if (!initialized_)
+        {
+            return 0;
+        }
+        if (!inner_runner_)
         {
             return 0;
         }
@@ -171,7 +221,11 @@ namespace llaminar2
 
     const char *MultiDomainOrchestrator::architecture() const
     {
-        if (!initialized_ || !inner_runner_)
+        if (!initialized_)
+        {
+            return "unknown";
+        }
+        if (!inner_runner_)
         {
             return "unknown";
         }

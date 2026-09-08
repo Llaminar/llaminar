@@ -1,10 +1,18 @@
 /**
  * @file Qwen35Graph.cpp
- * @brief Qwen 3.5 compute graph builder implementation
+ * @brief Declarative Qwen 3.5-family forward and recursive MTP graph wiring.
+ *
+ * This builder binds model-owned buffers and weights into participant-local
+ * compute graphs.  It declares dependencies, sharding-aware collectives, MTP
+ * input ownership, and transaction terminal nodes; orchestration remains in
+ * the runner/executor layers.  Diagnostic metadata identifies existing graph
+ * values only and must not introduce alternate arithmetic or lifecycle paths.
  */
 
 #include "Qwen35Graph.h"
+#include "../../config/GDNHeadAssignment.h"
 #include "Qwen35Schema.h"
+#include "../../collective/ILocalTPContext.h"
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
 #include "../../kernels/HybridKVCacheConfig.h"
@@ -15,8 +23,11 @@
 #include "../../utils/Logger.h"
 
 #include <algorithm>
+#include <iterator>
+#include <limits>
 #include <set>
 #include <stdexcept>
+#include <vector>
 
 namespace llaminar2
 {
@@ -107,46 +118,6 @@ namespace llaminar2
         }
     }
 
-    int Qwen35Graph::resolveGDNGlobalVHeadOffset(
-        const WeightBinding *value_projection_binding,
-        int d_v,
-        int n_v_heads,
-        int n_v_heads_full,
-        const GraphConfig &config,
-        const IMPIContext *mpi_ctx)
-    {
-        if (n_v_heads >= n_v_heads_full || d_v <= 0)
-            return 0;
-
-        if (value_projection_binding)
-        {
-            const auto &slice = value_projection_binding->slice;
-            if (slice.row_count > 0 && slice.row_start % static_cast<size_t>(d_v) == 0)
-            {
-                return static_cast<int>(slice.row_start / static_cast<size_t>(d_v));
-            }
-        }
-
-        if (config.tp_config)
-        {
-            const auto *assignment = config.getAssignment();
-            const int total_heads = config.n_heads;
-            if (assignment && total_heads > 0)
-            {
-                return static_cast<int>(
-                    static_cast<int64_t>(n_v_heads_full) * assignment->head_start / total_heads);
-            }
-        }
-
-        if (mpi_ctx && mpi_ctx->world_size() > 1)
-            return mpi_ctx->rank() * n_v_heads;
-
-        if (config.tp_ctx && config.tp_ctx->degree() > 1)
-            return config.tp_ctx->myIndex() * n_v_heads;
-
-        return 0;
-    }
-
     // =========================================================================
     // Constructors
     // =========================================================================
@@ -158,6 +129,34 @@ namespace llaminar2
         : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
         populateHybridAllreducePrecision(config_);
+    }
+
+    Qwen35Graph::ScopedMTPGraphContext::ScopedMTPGraphContext(
+        Qwen35Graph &graph,
+        int depth_idx) noexcept
+        : graph_(graph),
+          previous_active_(graph.mtp_graph_context_active_),
+          previous_depth_idx_(graph.mtp_graph_depth_idx_)
+    {
+        graph_.mtp_graph_context_active_ = true;
+        graph_.mtp_graph_depth_idx_ = depth_idx;
+    }
+
+    Qwen35Graph::ScopedMTPGraphContext::~ScopedMTPGraphContext()
+    {
+        graph_.mtp_graph_context_active_ = previous_active_;
+        graph_.mtp_graph_depth_idx_ = previous_depth_idx_;
+    }
+
+    std::string Qwen35Graph::ffnGraphStagePrefix(int layer_idx) const
+    {
+        if (mtpGraphContextActive())
+        {
+            return "MTP" +
+                   std::to_string(std::max(0, mtpGraphDepthIndex())) +
+                   "_";
+        }
+        return QwenGraphBase::ffnGraphStagePrefix(layer_idx);
     }
 
     Qwen35Graph::Qwen35Graph(
@@ -214,6 +213,59 @@ namespace llaminar2
         // them, and the auto-discovery pipeline handles propagation.
     }
 
+    bool Qwen35Graph::gdnLiveStateAllGatherAvailable(int total_tokens, DeviceId device) const
+    {
+        (void)total_tokens;
+        if (!device.is_gpu() ||
+            !config_.dense_tp_enabled ||
+            !config_.dense_tp_decode_replicated ||
+            !config_.qkv_column_parallel ||
+            !hasDecodeReplicatedDenseWeightSource() ||
+            !config_.tp_ctx ||
+            !config_.tp_ctx->isLocal())
+        {
+            return false;
+        }
+
+        const auto *local_tp = static_cast<const ILocalTPContext *>(config_.tp_ctx);
+        if (local_tp->degree() <= 1)
+            return false;
+        const auto backend = local_tp->backend();
+        if (backend != CollectiveBackendType::NCCL &&
+            backend != CollectiveBackendType::RCCL)
+        {
+            return false;
+        }
+        const int degree = local_tp->degree();
+        const int n_k_heads_full = config_.gdn.group_count > 0
+                                       ? config_.gdn.group_count
+                                       : config_.n_heads;
+        const int n_v_heads_full = config_.gdn.time_step_rank > 0
+                                       ? config_.gdn.time_step_rank
+                                       : n_k_heads_full;
+        if (n_v_heads_full <= 0 ||
+            n_k_heads_full <= 0 ||
+            config_.gdn.state_size <= 0 ||
+            config_.gdn.conv_kernel_size <= 1)
+        {
+            return false;
+        }
+
+        const GDNLinkedLiveStateGeometry geometry{
+            .global_key_heads = n_k_heads_full,
+            .global_value_heads = n_v_heads_full,
+            .key_width = config_.gdn.state_size,
+            .value_width = config_.gdn.state_size,
+            .conv_history_length = config_.gdn.conv_kernel_size - 1,
+        };
+        return geometry.resolve(
+                   GDNLinkedLiveStateKind::ConvHistory,
+                   degree).has_value() &&
+               geometry.resolve(
+                   GDNLinkedLiveStateKind::Recurrence,
+                   degree).has_value();
+    }
+
     // =========================================================================
     // Resolver Config — extends Qwen2 with GDN-specific formulas + mappings
     // =========================================================================
@@ -234,22 +286,20 @@ namespace llaminar2
                                        : n_k_heads_full;
         int n_k_heads_local = n_k_heads_full;
         int n_v_heads_local = n_v_heads_full;
-        const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
-        if (config_.qkv_column_parallel && config_.local_n_heads > 0 && config_.n_heads > 0)
+        const int resolver_local_n_heads = config.local_n_heads > 0
+                                               ? config.local_n_heads
+                                               : config_.local_n_heads;
+        if (config_.qkv_column_parallel && resolver_local_n_heads > 0 && config_.n_heads > 0)
         {
-            // V-heads are always sharded
-            n_v_heads_local = n_v_heads_full * config_.local_n_heads / config_.n_heads;
-            if (n_v_heads_local <= 0)
-                n_v_heads_local = 1;
-
-            // K-heads: replicated for GDN modular repeat, sharded otherwise
-            if (!gdn_modular_repeat)
-            {
-                n_k_heads_local = n_k_heads_full * config_.local_n_heads / config_.n_heads;
-                if (n_k_heads_local <= 0)
-                    n_k_heads_local = 1;
-            }
-            // else: n_k_heads_local stays at full count (replicated)
+            const GDNHeadAssignment assignment =
+                GDNHeadAssignment::fromPartition(
+                    n_k_heads_full,
+                    n_v_heads_full,
+                    config_.head_start,
+                    resolver_local_n_heads,
+                    config_.n_heads);
+            n_k_heads_local = assignment.localKeyHeads();
+            n_v_heads_local = assignment.localValueHeads();
         }
         const int d_k = config_.gdn.state_size;
         const int key_dim = n_k_heads_local * d_k;
@@ -265,11 +315,20 @@ namespace llaminar2
 
         // FA-specific: Q projection outputs query + sigmoid gate (2× normal Q dim)
         // Use local head count for TP
-        const int local_n_heads_fa = (config_.qkv_column_parallel && config_.local_n_heads > 0)
-                                         ? config_.local_n_heads
+        const int local_n_heads_fa = (config_.qkv_column_parallel && resolver_local_n_heads > 0)
+                                         ? resolver_local_n_heads
                                          : config_.n_heads;
         config.custom_formulas["fa_q_full_dim"] =
             static_cast<size_t>(local_n_heads_fa * config_.head_dim * 2);
+
+        /*
+         * MTP can retain a complete participant-local predictor while the main
+         * forward graph stays tensor parallel. QwenGraphBase publishes that
+         * typed sidecar width independently of local_qkv_dim; derive the two
+         * Qwen3.5-only FA capacities from the same authority.
+         */
+        const size_t mtp_q_dim = config.custom_formulas.at("mtp_q_dim");
+        config.custom_formulas["mtp_fa_q_full_dim"] = 2 * mtp_q_dim;
 
         // attn_output must be wide enough for BOTH FA (local_qkv_dim) and GDN (gdn_inner_size).
         // GDN layers write n_v_heads * d_v elements per row; FA layers write local_n_heads * head_dim.
@@ -278,9 +337,14 @@ namespace llaminar2
         const size_t local_qkv_dim = static_cast<size_t>(config.local_n_heads * config.head_dim);
         config.custom_formulas["attn_output_dim"] =
             std::max(local_qkv_dim, static_cast<size_t>(gdn_inner));
+        config.custom_formulas["mtp_attn_output_dim"] =
+            std::max(
+                mtp_q_dim,
+                config.custom_formulas["attn_output_dim"]);
 
         // Add GDN buffer name → BufferId mappings
         config.buffer_name_to_id["gdn_qkv"] = BufferId::GDN_QKV;
+        config.buffer_name_to_id["gdn_recurrence_in"] = BufferId::GDN_RECURRENCE_IN;
         config.buffer_name_to_id["gdn_z"] = BufferId::GDN_Z;
         config.buffer_name_to_id["gdn_alpha"] = BufferId::GDN_ALPHA;
         config.buffer_name_to_id["gdn_beta"] = BufferId::GDN_BETA;
@@ -313,7 +377,59 @@ namespace llaminar2
         const MTPForwardInput &input,
         MTPForwardOutput &output)
     {
-        return buildMTPGraph(depth_idx, toLegacyMTPDepthWeights(bindings), input, output);
+        const MTPDepthWeightBindings *effective_bindings = &bindings;
+        if (config_.mtpUsesReplicatedDenseSidecarBinding())
+        {
+            /*
+             * Both retained live sidecars and the graph-integrated shifted
+             * prefill transaction enter through this typed overload.  Their
+             * caller may be building the primary TP graph and therefore pass
+             * that graph's compact MTP binding.  A replicated predictor must
+             * never reinterpret that shard as a full K/V or dense matrix: it
+             * selects the auxiliary full binding here, before any legacy
+             * tensor view or prepared-reference lookup is formed.
+             *
+             * Selecting by declared depth rather than vector position keeps
+             * dynamic-depth reuse explicit and rejects an incomplete frozen
+             * auxiliary weight set at graph construction.
+             */
+            const auto &replicated_depths =
+                decode_replicated_dense_weight_bindings_.mtp.depths;
+            const auto match = std::find_if(
+                replicated_depths.begin(),
+                replicated_depths.end(),
+                [depth_idx](const MTPDepthWeightBindings &candidate)
+                {
+                    return candidate.depth_index == depth_idx;
+                });
+            if (match == replicated_depths.end())
+            {
+                throw std::runtime_error(
+                    "[Qwen35Graph] Replicated MTP sidecar depth " +
+                    std::to_string(depth_idx) +
+                    " has no auxiliary full-width weight binding");
+            }
+            if (std::find_if(
+                    std::next(match),
+                    replicated_depths.end(),
+                    [depth_idx](const MTPDepthWeightBindings &candidate)
+                    {
+                        return candidate.depth_index == depth_idx;
+                    }) != replicated_depths.end())
+            {
+                throw std::runtime_error(
+                    "[Qwen35Graph] Replicated MTP sidecar depth " +
+                    std::to_string(depth_idx) +
+                    " has duplicate auxiliary weight bindings");
+            }
+            effective_bindings = &*match;
+        }
+
+        return buildMTPGraph(
+            depth_idx,
+            toLegacyMTPDepthWeights(*effective_bindings),
+            input,
+            output);
     }
 
     ComputeGraph Qwen35Graph::buildMTPGraph(
@@ -322,9 +438,9 @@ namespace llaminar2
         const MTPForwardInput &input,
         MTPForwardOutput &output)
     {
+        ScopedMTPGraphContext mtp_graph_context(*this, depth_idx);
         ComputeGraph graph;
         const std::string prefix = "mtp" + std::to_string(depth_idx) + "_";
-        const int total_tokens = input.batch_size * input.seq_len;
         const DeviceId device = input.device.is_valid() ? input.device : config_.default_device;
 
         auto missing = [&](const char *name, const void *ptr)
@@ -337,24 +453,76 @@ namespace llaminar2
 
         if (input.batch_size <= 0 ||
             input.seq_len <= 0 ||
-            total_tokens > 4 ||
-            (!input.kv_cache_only && input.seq_len != 1) ||
-            (input.kv_cache_only && input.batch_size != 1 && input.seq_len != 1))
+            input.batch_size > std::numeric_limits<int>::max() / input.seq_len ||
+            (!input.kv_cache_only && input.seq_len != 1))
         {
-            LOG_ERROR("[Qwen35Graph::buildMTPGraph] MTP sidecar graphs require total_tokens<=4, "
-                      "normal execution with seq_len=1, and multi-token catchup only for a single request");
+            LOG_ERROR("[Qwen35Graph::buildMTPGraph] MTP sidecar graphs require a positive, representable shape, "
+                      "and normal execution with seq_len=1; KV-only prefill accepts request-batched padded geometry");
             return graph;
         }
+        const int total_tokens = input.batch_size * input.seq_len;
+
+        /*
+         * MTP sidecars verify decode rows. When LocalTP uses either replicated
+         * decode weights or the narrower replicated-predictor policy, every
+         * reused attention/FFN sub-builder must resolve prepared refs from that
+         * same view; otherwise a stage can pair a replicated tensor pointer
+         * with a TP-local prepared GEMM engine. The selected MTPDepthWeights
+         * already come from selectMTPDecodeWeightSet(); this scope keeps the
+         * binding/ref lookups and collective topology aligned with those tensors.
+         */
+        DecodeReplicatedDenseScope decode_dense_scope(
+            *this,
+            total_tokens,
+            config_.mtpUsesReplicatedDenseSidecarBinding());
 
         const bool kv_cache_only = input.kv_cache_only;
+        MTPKVCacheOnlyScope kv_cache_only_scope(*this, kv_cache_only);
+        const bool phase_split_mtp_kv_handoff =
+            kv_cache_only && needsPhaseSplitPrefillKVCacheHandoff(total_tokens, input.kv_cache, device);
         const bool mtp_moe =
             weights.fa_block.moe_gate ||
             weights.fa_block.moe_gate_exps ||
             weights.fa_block.moe_up_exps ||
             weights.fa_block.moe_down_exps;
+        const bool registry_owned_mtp_experts =
+            config_.moe.routed_expert_plan &&
+            config_.moe.routed_expert_plan->usesExpertOverlayAuthority();
+        const bool mirror_mtp_lm_head =
+            !kv_cache_only &&
+            mirroredMTPHeadConfigured();
+        MirroredMTPHeadScope mirrored_head_scope(*this, mirror_mtp_lm_head);
+        const FinalProjectionPolicy mtp_final_projection =
+            kv_cache_only
+                ? FinalProjectionPolicy{}
+                : resolveFinalProjectionPolicy({
+                      .norm_source = FinalNormSource::MTPSidecarNorm,
+                      .mtp_norm = weights.final_norm,
+                      .full_vocab_output = output.logits,
+                      .column_parallel_output = output.logits,
+                      .total_tokens = total_tokens,
+                      .force_full_vocabulary_head = mirror_mtp_lm_head,
+                      .compute_all_positions = true,
+                  });
+        const bool spans_multiple_global_ranks =
+            (config_.tp_ctx != nullptr &&
+             !config_.tp_ctx->isLocal() &&
+             config_.tp_ctx->degree() > 1) ||
+            (config_.tp_ctx == nullptr &&
+             mpi_ctx_ != nullptr &&
+             mpi_ctx_->world_size() > 1);
+        const bool gather_global_tp_mtp_logits =
+            resolveMTPTerminalLogitsCollective({
+                .layout = config_.mtpTerminalLogitsLayout(),
+                .sidecar_produces_logits = !kv_cache_only,
+                .spans_multiple_global_ranks =
+                    spans_multiple_global_ranks,
+            }) ==
+            MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
 
         if (missing("embedding table", modelEmbeddingTable()) ||
-            (!kv_cache_only && missing("lm head", modelLMHead())) ||
+            (!kv_cache_only &&
+             missing("lm head", mtp_final_projection.lm_head_weight)) ||
             (!input.draft_token_ids && !input.draft_token_ids_device &&
              missing("draft_token_ids", input.draft_token_ids)) ||
             missing("terminal_hidden", input.terminal_hidden) ||
@@ -362,7 +530,7 @@ namespace llaminar2
             missing("mtp.fc", weights.fc) ||
             missing("mtp.pre_fc_norm_hidden", weights.pre_fc_norm_hidden) ||
             missing("mtp.pre_fc_norm_embedding", weights.pre_fc_norm_embedding) ||
-            (!kv_cache_only && missing("mtp.final_norm", weights.final_norm)) ||
+            (!kv_cache_only && missing("mtp.final_norm", mtp_final_projection.norm_gamma)) ||
             missing("output.embedding", output.embedding) ||
             missing("output.norm_hidden", output.norm_hidden) ||
             missing("output.norm_embedding", output.norm_embedding) ||
@@ -370,11 +538,15 @@ namespace llaminar2
             missing("output.projected", output.projected) ||
             (!kv_cache_only && missing("output.hidden", output.hidden)) ||
             (!kv_cache_only && missing("output.logits", output.logits)) ||
-            missing("output.q", output.q) ||
+            (gather_global_tp_mtp_logits &&
+             missing("output.gathered_logits", output.gathered_logits)) ||
+            (!kv_cache_only && missing("output.q", output.q)) ||
             missing("output.k", output.k) ||
             missing("output.v", output.v) ||
-            missing("output.q_raw", output.q_raw) ||
-            missing("output.q_gate", output.q_gate) ||
+            (phase_split_mtp_kv_handoff && missing("output.k_full_prefill", output.k_full_prefill)) ||
+            (phase_split_mtp_kv_handoff && missing("output.v_full_prefill", output.v_full_prefill)) ||
+            (!kv_cache_only && missing("output.q_raw", output.q_raw)) ||
+            (!kv_cache_only && missing("output.q_gate", output.q_gate)) ||
             (!kv_cache_only && missing("output.attn_output", output.attn_output)) ||
             (!kv_cache_only && missing("output.attn_proj", output.attn_proj)) ||
             (!kv_cache_only && missing("output.gate", output.gate)) ||
@@ -386,18 +558,35 @@ namespace llaminar2
         if (mtp_moe && !kv_cache_only)
         {
             if (missing("mtp.moe_gate", weights.fa_block.moe_gate) ||
-                missing("mtp.moe_gate_exps", weights.fa_block.moe_gate_exps) ||
-                missing("mtp.moe_up_exps", weights.fa_block.moe_up_exps) ||
-                missing("mtp.moe_down_exps", weights.fa_block.moe_down_exps) ||
+                (!registry_owned_mtp_experts &&
+                 missing("mtp.moe_gate_exps", weights.fa_block.moe_gate_exps)) ||
+                (!registry_owned_mtp_experts &&
+                 missing("mtp.moe_up_exps", weights.fa_block.moe_up_exps)) ||
+                (!registry_owned_mtp_experts &&
+                 missing("mtp.moe_down_exps", weights.fa_block.moe_down_exps)) ||
                 missing("output.moe_expert_indices", output.moe_expert_indices) ||
                 missing("output.moe_expert_weights", output.moe_expert_weights) ||
                 missing("output.moe_combined_output", output.moe_combined_output) ||
+                missing("output.moe_canonical_route_contributions",
+                        output.moe_canonical_route_contributions) ||
                 missing("output.moe_shared_expert_output", output.moe_shared_expert_output) ||
                 missing("output.moe_gate_scratch", output.moe_gate_scratch) ||
                 missing("output.moe_up_scratch", output.moe_up_scratch))
             {
                 return graph;
             }
+
+            /*
+             * ExpertOverlay deliberately removes raw 3-D routed parents from
+             * a reusable graph binding. The model-owned ExpertGemmRegistry is
+             * the sole prepared-weight authority after terminal sealing, and
+             * Qwen35MoEGraph validates the exact layer placement while lowering
+             * its registry-only local-expert stages. Requiring source pointers
+             * here would force a second GGUF materialization merely to provide
+             * non-owning graph markers, defeating both lifecycle ownership and
+             * process-campaign reuse. The router and shared-expert tensors stay
+             * ordinary immutable graph bindings and remain mandatory above.
+             */
         }
 
         graph.addNode(prefix + "embedding",
@@ -411,16 +600,14 @@ namespace llaminar2
                           .num_tokens = total_tokens,
                           .d_model = config_.d_model,
                           .vocab_size = config_.vocab_size,
-                          .vocab_offset = embeddingVocabOffsetForDevice(config_, device),
+                          .vocab_offset = embeddingVocabOffsetForCurrentGraph(device),
                           .local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0,
                           .output_buffer_id = BufferId::MTP_EMBEDDING,
                           .prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
-        const bool embedding_is_sharded =
-            modelEmbeddingTable() &&
-            static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
+        const bool embedding_is_sharded = usesVocabParallelEmbeddingForCurrentGraph();
         std::string embedding_terminal = prefix + "embedding";
         if (embedding_is_sharded && needsTPAllreduce())
         {
@@ -451,6 +638,9 @@ namespace llaminar2
                           .seq_len = total_tokens,
                           .input_buffer_id = input.terminal_hidden_buffer_id,
                           .output_buffer_id = BufferId::MTP_NORM_HIDDEN,
+                          .diagnostic_input_publication =
+                              RMSNormStage::DiagnosticInputPublication::
+                                  MTPTerminalHidden,
                       }),
                       device);
 
@@ -500,6 +690,9 @@ namespace llaminar2
                           .gemm_context = GemmContext::NONE,
                           .a_buffer_id = BufferId::MTP_CONCAT,
                           .c_buffer_id = BufferId::MTP_PROJECTED,
+                          .force_decode_equivalent_verifier_prefill =
+                              total_tokens > 1 &&
+                              config_.usesMTPGroupedDecodeEquivalentRows(),
                           .prepared_ref = preparedRefForGraphWeight(weights.fc_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),
@@ -509,35 +702,44 @@ namespace llaminar2
         ActivationBuffers mtp_buffers;
         mtp_buffers.current_hidden = output.projected;
         mtp_buffers.normalized = output.norm_hidden;
-        mtp_buffers.Q = output.q;
         mtp_buffers.K = output.k;
         mtp_buffers.V = output.v;
+        mtp_buffers.K_full_prefill = output.k_full_prefill;
+        mtp_buffers.V_full_prefill = output.v_full_prefill;
         mtp_buffers.attn_output = output.attn_output;
         mtp_buffers.attn_proj = output.attn_proj;
         mtp_buffers.gate = output.gate;
         mtp_buffers.up = output.up;
         mtp_buffers.ffn_output = output.ffn_output;
-        mtp_buffers.extensions[BufferId::MTP_FA_Q_RAW] = output.q_raw;
-        mtp_buffers.extensions[BufferId::MTP_FA_GATE] = output.q_gate;
         mtp_buffers.binding_ids = {
             {BufferId::HIDDEN_STATE, BufferId::MTP_PROJECTED},
             {BufferId::NORMALIZED, BufferId::MTP_NORM_HIDDEN},
-            {BufferId::Q_PROJ, BufferId::MTP_Q_PROJ},
             {BufferId::K_PROJ, BufferId::MTP_K_PROJ},
             {BufferId::V_PROJ, BufferId::MTP_V_PROJ},
-            {BufferId::FA_Q_RAW, BufferId::MTP_FA_Q_RAW},
-            {BufferId::FA_GATE, BufferId::MTP_FA_GATE},
+            {BufferId::K_FULL_PREFILL, BufferId::MTP_K_FULL_PREFILL},
+            {BufferId::V_FULL_PREFILL, BufferId::MTP_V_FULL_PREFILL},
             {BufferId::ATTN_OUTPUT, BufferId::MTP_ATTN_OUTPUT},
             {BufferId::ATTN_PROJ, BufferId::MTP_ATTN_PROJ},
             {BufferId::GATE_PROJ, BufferId::MTP_GATE_PROJ},
             {BufferId::UP_PROJ, BufferId::MTP_UP_PROJ},
             {BufferId::FFN_OUTPUT, BufferId::MTP_FFN_OUTPUT},
         };
+        if (!kv_cache_only)
+        {
+            mtp_buffers.Q = output.q;
+            mtp_buffers.extensions[BufferId::MTP_FA_Q_RAW] = output.q_raw;
+            mtp_buffers.extensions[BufferId::MTP_FA_GATE] = output.q_gate;
+            mtp_buffers.binding_ids.emplace(BufferId::Q_PROJ, BufferId::MTP_Q_PROJ);
+            mtp_buffers.binding_ids.emplace(BufferId::FA_Q_RAW, BufferId::MTP_FA_Q_RAW);
+            mtp_buffers.binding_ids.emplace(BufferId::FA_GATE, BufferId::MTP_FA_GATE);
+        }
         if (mtp_moe && !kv_cache_only)
         {
             mtp_buffers.extensions[BufferId::MOE_EXPERT_INDICES] = output.moe_expert_indices;
             mtp_buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = output.moe_expert_weights;
             mtp_buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = output.moe_combined_output;
+            mtp_buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
+                output.moe_canonical_route_contributions;
             mtp_buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = output.moe_shared_expert_output;
             mtp_buffers.extensions[BufferId::MOE_GATE_SCRATCH] = output.moe_gate_scratch;
             mtp_buffers.extensions[BufferId::MOE_UP_SCRATCH] = output.moe_up_scratch;
@@ -547,7 +749,7 @@ namespace llaminar2
         {
             const std::string sidecar_stage_prefix =
                 "MTP" + std::to_string(depth_idx) + "_";
-            ComputeGraph kv_append = buildFAKVCacheAppendGraph(
+            ComputeGraph kv_append = buildMTPFAKVCacheAppendGraph(
                 weights.fa_block,
                 mtp_buffers,
                 /*layer_idx=*/0,
@@ -556,15 +758,17 @@ namespace llaminar2
                 input.kv_cache,
                 input.position_ids,
                 input.position_ids_device,
+                input.sequence_lengths_device,
                 device,
                 sidecar_stage_prefix,
-                /*layer_idx_is_cache_local=*/true);
+                /*layer_idx_is_cache_local=*/true,
+                input.first_sequence_index);
             if (kv_append.size() == 0)
                 return ComputeGraph{};
 
             const std::string kv_terminal = kv_append.terminalNode();
             graph.merge(std::move(kv_append), prefix + "fc");
-            graph.setTerminalNode(kv_terminal);
+            sealInferenceTransactionGraph(graph, kv_terminal);
             return graph;
         }
 
@@ -575,12 +779,13 @@ namespace llaminar2
             mtp_buffers,
             /*layer_idx=*/0,
             input.seq_len,
-                input.batch_size,
-                input.kv_cache,
-                input.position_ids,
-                input.position_ids_device,
-                device,
-                input.sequence_lengths,
+            input.batch_size,
+            input.kv_cache,
+            input.position_ids,
+            input.position_ids_device,
+            device,
+            input.sequence_lengths,
+            /*sequence_lengths_device=*/nullptr,
             sidecar_stage_prefix,
             /*layer_idx_is_cache_local=*/true);
         if (attention.size() == 0)
@@ -602,7 +807,11 @@ namespace llaminar2
             ffn_layer_idx,
             input.seq_len,
             input.batch_size,
-            device);
+            device,
+            input.device_state_publication_stream,
+            /*sequence_lengths_device=*/nullptr,
+            static_cast<const int32_t *>(
+                input.position_ids_device));
         if (ffn.size() == 0)
             return ComputeGraph{};
 
@@ -614,7 +823,7 @@ namespace llaminar2
                           .device_id = device,
                           .input = output.projected,
                           .output = output.hidden,
-                          .gamma = weights.final_norm,
+                          .gamma = mtp_final_projection.norm_gamma,
                           .eps = config_.rms_norm_eps,
                           .subtract_one = config_.rms_norm_subtract_one,
                           .seq_len = total_tokens,
@@ -624,30 +833,73 @@ namespace llaminar2
                       device);
         graph.addDependency(prefix + "final_norm", ffn_terminal);
 
-        const int mtp_lm_head_vocab_size =
-            (config_.lm_head_column_parallel && config_.vocab_local > 0)
-                ? config_.vocab_local
-                : config_.vocab_size;
+        const bool force_decode_equivalent_lm_head_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            total_tokens > 1 &&
+            config_.usesMTPGroupedDecodeEquivalentRows();
 
         graph.addNode(prefix + "lm_head",
                       ComputeStageFactory::createLMHead({
                           .device_id = device,
                           .hidden_states = output.hidden,
-                          .lm_head_weight = modelLMHead(),
+                          .lm_head_weight = mtp_final_projection.lm_head_weight,
                           .logits = output.logits,
                           .seq_len = total_tokens,
                           .d_model = config_.d_model,
-                          .vocab_size = mtp_lm_head_vocab_size,
+                          .vocab_size = mtp_final_projection.lm_head_vocab_size,
+                          .serial_equivalent_partition_width =
+                              mtp_final_projection.serial_equivalent_partition_width,
                           .use_prefill_replay_row_offset = false,
                           .compute_all_positions = true,
+                          /*
+                           * MTP verifier logits are compared row-by-row against
+                           * ordinary serial decode.  The generic all-position
+                           * GEMM path is allowed to choose a reduction order
+                           * that is mathematically close but not identical to
+                           * the rowwise decode GEMV path, which is exactly the
+                           * kind of drift ROCm LocalTP surfaced at the LM head.
+                           * Keep the graph on the economical grouped small-M
+                           * verifier implementation that the backend kernel
+                           * suites prove serial-row-equivalent.
+                           */
+                          .force_decode_equivalent_verifier_prefill =
+                              force_decode_equivalent_lm_head_verifier_prefill,
                           .input_buffer_id = BufferId::MTP_HIDDEN,
                           .output_buffer_id = BufferId::MTP_LOGITS,
-                          .prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device),
+                          .prepared_ref = preparedRefForGraphWeight(
+                              mtp_final_projection.lm_head_binding,
+                              device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
         graph.addDependency(prefix + "lm_head", prefix + "final_norm");
-        graph.setTerminalNode(prefix + "lm_head");
+
+        std::string terminal_node = prefix + "lm_head";
+        if (gather_global_tp_mtp_logits)
+        {
+            /*
+             * This branch is reachable only for the explicit
+             * vocabulary-sharded terminal-head policy. Mirrored ownership is
+             * scope-independent and writes a full distribution on every rank,
+             * so it must never pay this per-draft collective.
+             */
+            AllGatherStage::Params gather_params;
+            gather_params.local_input = output.logits;
+            gather_params.full_output = output.gathered_logits;
+            gather_params.mpi_ctx = mpi_ctx_.get();
+            gather_params.actual_seq_len = total_tokens;
+            gather_params.domain = nullptr;
+            gather_params.input_buffer_id = BufferId::MTP_LOGITS;
+            gather_params.output_buffer_id = BufferId::MTP_LOGITS_GATHERED;
+
+            terminal_node = prefix + "lm_head_allgather";
+            graph.addNode(
+                terminal_node,
+                ComputeStageFactory::createAllGather(gather_params),
+                device);
+            graph.addDependency(terminal_node, prefix + "lm_head");
+        }
+        sealInferenceTransactionGraph(graph, terminal_node);
 
         return graph;
     }
@@ -666,26 +918,72 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
-        const void *position_ids_device)
+        const void *position_ids_device,
+        const int32_t *sequence_lengths_device)
     {
+        DecodeReplicatedDenseScope decode_dense_scope(*this, seq_len * batch_size);
         if (isGDNLayer(layer_idx))
         {
             (void)position_ids_device;
             return buildGDNAttentionGraph(layer, buffers, layer_idx,
-                                          seq_len, batch_size, kv_cache, device);
+                                          seq_len, batch_size, kv_cache, device,
+                                          sequence_lengths,
+                                          sequence_lengths_device);
         }
         else
         {
             // Full attention layers — custom Qwen3.5 FA path with Q gate split
             return buildFAAttentionGraph(
                 layer, buffers, layer_idx, seq_len, batch_size,
-                kv_cache, position_ids, position_ids_device, device, sequence_lengths);
+                kv_cache, position_ids, position_ids_device, device,
+                sequence_lengths, sequence_lengths_device);
         }
     }
 
     // =========================================================================
     // GDN Attention Sub-Graph
     // =========================================================================
+
+    std::string Qwen35Graph::maybeAddGDNDiagnosticCheckpoint(
+        ComputeGraph &graph,
+        const std::string &boundary,
+        const ITensor *source,
+        BufferId source_buffer_id,
+        const std::string &dependency,
+        int layer_idx,
+        int total_tokens,
+        int feature_dim,
+        DeviceId device,
+        const int32_t *sequence_lengths_device)
+    {
+        (void)graph;
+        (void)boundary;
+        (void)source;
+        (void)source_buffer_id;
+        (void)layer_idx;
+        (void)total_tokens;
+        (void)feature_dim;
+        (void)device;
+        (void)sequence_lengths_device;
+        return dependency;
+    }
+
+    std::string Qwen35Graph::gdnWorkspaceRoleNamespace() const
+    {
+        /*
+         * `compute_all_position_logits` is deliberately absent: it is an output
+         * policy shared by ordinary MTP prompt prefill and grouped verification,
+         * not an execution owner. DeviceGraphOrchestrator scopes the two typed
+         * role flags below around exactly one graph build, so mutable workspace
+         * identity follows semantic ownership rather than tensor shape or
+         * requested outputs.
+         */
+        if (config_.grouped_mtp_verifier)
+            return "grouped_mtp_verifier";
+        if (config_.live_mtp_request_batch_condition)
+            return "live_mtp_request_batch";
+        return {};
+    }
 
     ComputeGraph Qwen35Graph::buildGDNAttentionGraph(
         const LayerWeights &layer,
@@ -694,16 +992,68 @@ namespace llaminar2
         int seq_len,
         int batch_size,
         IKVCache *kv_cache,
-        DeviceId device)
+        DeviceId device,
+        const std::vector<int> *sequence_lengths,
+        const int32_t *sequence_lengths_device)
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
-        const std::string workspace_namespace =
-            prefix.empty() || prefix.back() != '_'
-                ? prefix
-                : prefix.substr(0, prefix.size() - 1);
+        const std::string workspace_namespace = gdnWorkspaceRoleNamespace();
         int total_tokens = batch_size * seq_len;
-        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        const bool live_state_allgather_available =
+            gdnLiveStateAllGatherAvailable(total_tokens, device);
+        /*
+         * All-position logits are also used by compact request-batch prefill.
+         * Rollback slots belong only to a true grouped verifier transaction;
+         * allocating them for main prefill both misstates ownership and retains
+         * one large append-only bank per GDN layer in captured GPU workspaces.
+         */
+        const bool verifier_state_capture_supported =
+            config_.grouped_mtp_verifier &&
+            retainsMTPGraphCapacity(config_.mtp) &&
+            (device.is_cpu() || device.is_cuda() || device.is_rocm());
+        /*
+         * LocalTP dense decode normally runs from replicated GDN weights and a
+         * full mirrored GDN live-state bank after the prefill handoff.  The MTP
+         * all-position verifier has the same numerical contract as ordinary
+         * serial decode: every verifier row must see the same GDN math, the same
+         * output-projection reduction order, and the same post-row state shape.
+         *
+         * Earlier builds forced verifier rows back through the TP-local GDN path
+         * so an explicit local-to-full handoff stage could publish accepted
+         * state.  That made publication possible, but it also made the verifier
+         * compare a row-parallel `ssm_out` partial-sum/allreduce against serial
+         * decode's replicated full projection.  Those two paths are not
+         * bitwise-equivalent because they reduce the dot product in different
+         * FP32 orders.  Once the mirrored live-state handoff is available, keep
+         * verifier rows on the mirrored dense GDN path instead: the short-conv
+         * and recurrence stages capture full post-row state directly, so
+         * accepted-state publication can restore the same full bank that serial
+         * decode would have produced without a tiny verifier allreduce.
+         */
+        const bool keep_gdn_state_tp_local =
+            useDecodeReplicatedDenseWeights() &&
+            config_.dense_tp_decode_replicated &&
+            config_.qkv_column_parallel &&
+            weight_bindings_.get_layer_weights != nullptr &&
+            !live_state_allgather_available;
+
+        LayerWeightBindings layer_bindings = keep_gdn_state_tp_local
+                                                 ? weight_bindings_.get_layer_weights(layer_idx)
+                                                 : layerWeightBindingsForGraph(layer_idx);
+        LayerWeights tp_local_layer;
+        const LayerWeights *gdn_layer = &layer;
+        const bool saved_replicated_attention_state_graph_active =
+            replicated_attention_state_graph_active_;
+        if (keep_gdn_state_tp_local)
+        {
+            tp_local_layer = toLegacyLayerWeights(layer_bindings);
+            gdn_layer = &tp_local_layer;
+            replicated_attention_state_graph_active_ = false;
+            LOG_DEBUG("[Qwen35Graph] Keeping GDN layer " << layer_idx
+                                                        << " TP-local during replicated dense decode "
+                                                           "until GDN live-state allgather is available");
+        }
 
         // Get GDN state from hybrid KV cache
         auto *hybrid_cache = dynamic_cast<IHybridKVCache *>(kv_cache);
@@ -728,12 +1078,12 @@ namespace llaminar2
         // When column-parallel TP is active, weights are already sharded by WeightManager
         // so shape[0] reflects the local output dimension for this rank.
         int qkv_dim, value_dim, n_k_heads, n_v_heads;
-        if (layer.attn_qkv)
+        if (gdn_layer->attn_qkv)
         {
             // Derive from actual weight shape (works for both sharded and full)
-            qkv_dim = static_cast<int>(layer.attn_qkv->shape()[0]);
-            value_dim = layer.attn_gate
-                            ? static_cast<int>(layer.attn_gate->shape()[0])
+            qkv_dim = static_cast<int>(gdn_layer->attn_qkv->shape()[0]);
+            value_dim = gdn_layer->attn_gate
+                            ? static_cast<int>(gdn_layer->attn_gate->shape()[0])
                             : (config_.gdn.inner_size > 0
                                    ? config_.gdn.inner_size
                                    : n_v_heads_full * d_v);
@@ -754,32 +1104,85 @@ namespace llaminar2
             qkv_dim = 2 * key_dim + value_dim;
         }
 
-        LOG_DEBUG("[Qwen35Graph] Building GDN attention for layer " << layer_idx
+        LOG_TRACE("[Qwen35Graph] Building GDN attention for layer " << layer_idx
                                                                     << ": total_tokens=" << total_tokens
                                                                     << " n_k_heads=" << n_k_heads << " (full=" << n_k_heads_full << ")"
                                                                     << " n_v_heads=" << n_v_heads << " (full=" << n_v_heads_full << ")"
                                                                     << " d_k=" << d_k << " d_v=" << d_v
                                                                     << " qkv_dim=" << qkv_dim << " value_dim=" << value_dim);
-        const bool verifier_state_capture_supported =
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled &&
-            (device.is_cpu() || device.is_cuda() || device.is_rocm());
-        const int per_request_verifier_state_capture_rows =
-            verifier_state_capture_supported ? resolveMTPMaxTargetQueryRows(config_.mtp) : 0;
+        /*
+         * resolveMTPMaxTargetQueryRows() already returns the flattened capacity
+         * across `max_request_batch`. Multiplying by this graph's live batch size
+         * again makes request-batched captures reserve batch^2 rollback rows.
+         * Besides wasting VRAM, an earlier scalar graph leaves the smaller
+         * capture-address bank alive, so append-only workspace growth retains
+         * both allocations and can exhaust an otherwise healthy GPU.
+         */
         const int verifier_state_capture_rows =
-            per_request_verifier_state_capture_rows * std::max(1, batch_size);
+            verifier_state_capture_supported
+                ? resolveMTPMaxTargetQueryRows(config_.mtp)
+                : 0;
         const bool force_decode_equivalent_gdn_verifier_prefill =
-            verifier_state_capture_supported &&
+            config_.usesMTPGroupedDecodeEquivalentRows() &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
-            total_tokens > 1 &&
-            total_tokens <= 4;
+            total_tokens > 1;
+        const int full_key_dim = n_k_heads_full * d_k;
+        const int full_value_dim = config_.gdn.inner_size > 0
+                                       ? config_.gdn.inner_size
+                                       : n_v_heads_full * d_v;
+        const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
+        const int conv_history_len = std::max(0, config_.gdn.conv_kernel_size - 1);
+        const int local_conv_state_floats = qkv_dim * conv_history_len;
+        const int full_conv_state_floats = full_qkv_dim * conv_history_len;
+        const int local_recurrence_state_floats = n_v_heads * d_k * d_v;
+        const int full_recurrence_state_floats = n_v_heads_full * d_k * d_v;
+        const GDNLinkedLiveStateGeometry linked_state_geometry{
+            .global_key_heads = n_k_heads_full,
+            .global_value_heads = n_v_heads_full,
+            .key_width = d_k,
+            .value_width = d_v,
+            .conv_history_length = conv_history_len,
+        };
+        const int live_state_degree =
+            config_.tp_ctx && config_.tp_ctx->isLocal()
+                ? static_cast<ILocalTPContext *>(config_.tp_ctx)->degree()
+                : 0;
+        const auto linked_conv_shape = linked_state_geometry.resolve(
+            GDNLinkedLiveStateKind::ConvHistory,
+            live_state_degree);
+        const auto linked_recurrence_shape = linked_state_geometry.resolve(
+            GDNLinkedLiveStateKind::Recurrence,
+            live_state_degree);
+        const bool gdn_state_is_linked_local =
+            linked_conv_shape && linked_recurrence_shape &&
+            local_conv_state_floats == linked_conv_shape->local_state_floats &&
+            local_recurrence_state_floats ==
+                linked_recurrence_shape->local_state_floats;
+        const bool gdn_state_already_full =
+            local_conv_state_floats == full_conv_state_floats &&
+            local_recurrence_state_floats == full_recurrence_state_floats;
+        const bool gdn_live_state_handoff_candidate =
+            total_tokens > 1 && live_state_allgather_available &&
+            (gdn_state_is_linked_local || gdn_state_already_full);
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
         // =====================================================================
         // GDN layers don't check HybridQ16 (always use fused when not first layer)
-        addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
+        addPreAttentionNorm(graph, prefix, buffers, gdn_layer->attn_norm,
                             total_tokens, layer_idx, device, /*check_hybrid_q16=*/false);
+        const std::string gdn_attention_norm_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_attention_norm",
+                buffers.normalized,
+                BufferId::NORMALIZED,
+                prefix + "attn_norm",
+                layer_idx,
+                total_tokens,
+                d_model,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
         // Stage 2: GDN 4-way Projection
@@ -791,27 +1194,29 @@ namespace llaminar2
         proj_params.m = total_tokens;
         proj_params.k = d_model;
 
-        proj_params.w_qkv = layer.attn_qkv;
+        proj_params.w_qkv = gdn_layer->attn_qkv;
         proj_params.prepared_ref_qkv = preparedRefForGraphWeight(layer_bindings.attn_qkv, device);
         proj_params.output_qkv = buffers.get(BufferId::GDN_QKV);
         proj_params.n_qkv = qkv_dim;
 
-        proj_params.w_z = layer.attn_gate; // Z projection = attn_gate.weight (in_proj_z in HF)
+        proj_params.w_z = gdn_layer->attn_gate; // Z projection = attn_gate.weight (in_proj_z in HF)
         proj_params.prepared_ref_z = preparedRefForGraphWeight(layer_bindings.attn_gate, device);
         proj_params.output_z = buffers.get(BufferId::GDN_Z);
         proj_params.n_z = value_dim; // Z gate operates on value_dim (n_v_heads * d_v)
 
-        proj_params.w_a = layer.ssm_alpha;
+        proj_params.w_a = gdn_layer->ssm_alpha;
         proj_params.prepared_ref_a = preparedRefForGraphWeight(layer_bindings.ssm_alpha, device);
         proj_params.output_a = buffers.get(BufferId::GDN_ALPHA);
         proj_params.n_a = n_v_heads; // Alpha is per-value-head
 
-        proj_params.w_b = layer.ssm_beta;
+        proj_params.w_b = gdn_layer->ssm_beta;
         proj_params.prepared_ref_b = preparedRefForGraphWeight(layer_bindings.ssm_beta, device);
         proj_params.output_b = buffers.get(BufferId::GDN_BETA);
         proj_params.n_b = n_v_heads; // Beta is per-value-head
         proj_params.force_decode_equivalent_verifier_prefill =
             force_decode_equivalent_gdn_verifier_prefill;
+        proj_params.verifier_row_range = projectionVerifierRows(
+            device, seq_len, batch_size, sequence_lengths_device);
 
         proj_params.input_buffer_id = BufferId::NORMALIZED;
         proj_params.output_qkv_buffer_id = BufferId::GDN_QKV;
@@ -822,7 +1227,67 @@ namespace llaminar2
         graph.addNode(prefix + "gdn_proj",
                       ComputeStageFactory::createGDNProjection(proj_params),
                       device);
-        graph.addDependency(prefix + "gdn_proj", prefix + "attn_norm");
+        graph.addDependency(prefix + "gdn_proj", gdn_attention_norm_ready);
+        std::string gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_projection",
+                buffers.get(BufferId::GDN_QKV),
+                BufferId::GDN_QKV,
+                prefix + "gdn_proj",
+                layer_idx,
+                total_tokens,
+                qkv_dim,
+                device,
+                sequence_lengths_device);
+        /*
+         * The recurrence consumes alpha and beta in addition to the merged QKV
+         * projection, while gated normalization consumes Z later in the same
+         * subgraph. Retain all four projection products when diagnostics are
+         * enabled so a recurrence mismatch cannot be misattributed to its
+         * kernel merely because the QKV branch happened to remain identical.
+         *
+         * Each checkpoint is chained through `gdn_projection_ready`. Besides
+         * making the diagnostic order obvious, this prevents a later layer from
+         * reusing these arena buffers before every terminal row has been copied
+         * into its graph-owned device checkpoint.
+         */
+        gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_z",
+                buffers.get(BufferId::GDN_Z),
+                BufferId::GDN_Z,
+                gdn_projection_ready,
+                layer_idx,
+                total_tokens,
+                value_dim,
+                device,
+                sequence_lengths_device);
+        gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_alpha",
+                buffers.get(BufferId::GDN_ALPHA),
+                BufferId::GDN_ALPHA,
+                gdn_projection_ready,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
+        gdn_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_beta",
+                buffers.get(BufferId::GDN_BETA),
+                BufferId::GDN_BETA,
+                gdn_projection_ready,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
         // Stage 3: Short Conv1d + SiLU on QKV
@@ -830,13 +1295,19 @@ namespace llaminar2
         ShortConv1dStage::Params conv_params;
         conv_params.device_id = device;
         conv_params.input = buffers.get(BufferId::GDN_QKV);
-        conv_params.output = buffers.get(BufferId::GDN_QKV); // In-place (conv modifies QKV)
-        conv_params.weight = layer.ssm_conv1d;
+        conv_params.output = buffers.get(BufferId::GDN_RECURRENCE_IN);
+        conv_params.weight = gdn_layer->ssm_conv1d;
         conv_params.bias = nullptr; // Conv bias from ssm_dt.bias if available
-        conv_params.conv_state = gdn_state->conv_state.data();
+        // CPU kernels own live state in the cache vector. GPU kernels own stable
+        // device banks and must never adopt a host pointer as live state.
+        conv_params.conv_state = device.is_cpu()
+                                     ? gdn_state->conv_state.data()
+                                     : nullptr;
         conv_params.seq_len = total_tokens;
         conv_params.request_count = batch_size;
         conv_params.request_seq_len = seq_len;
+        conv_params.request_seq_lens_host = sequence_lengths;
+        conv_params.request_seq_lens_device = sequence_lengths_device;
         conv_params.channels = qkv_dim;
         conv_params.kernel_size = config_.gdn.conv_kernel_size;
         conv_params.layer_idx = layer_idx;
@@ -848,17 +1319,29 @@ namespace llaminar2
         conv_params.kernel = gdn_state->conv_kernel.get();
 
         conv_params.input_buffer_id = BufferId::GDN_QKV;
-        conv_params.output_buffer_id = BufferId::GDN_QKV;
+        conv_params.output_buffer_id = BufferId::GDN_RECURRENCE_IN;
 
         graph.addNode(prefix + "short_conv",
                       ComputeStageFactory::createShortConv1d(conv_params),
                       device);
-        graph.addDependency(prefix + "short_conv", prefix + "gdn_proj");
+        graph.addDependency(prefix + "short_conv", gdn_projection_ready);
+        const std::string short_conv_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "short_conv",
+                buffers.get(BufferId::GDN_RECURRENCE_IN),
+                BufferId::GDN_RECURRENCE_IN,
+                prefix + "short_conv",
+                layer_idx,
+                total_tokens,
+                qkv_dim,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
         // Stage 4: GDN Recurrence (delta rule linear attention)
         // =====================================================================
-        // Q, K, V are interleaved in gdn_qkv after conv:
+        // Q, K, V are interleaved in gdn_recurrence_in after conv:
         // [seq_len, 2*n_k_heads*d_k + n_v_heads*d_v]
         // The recurrence stage splits Q, K, V internally and repeat_interleaves
         // Q/K from n_k_heads to n_v_heads when they differ.
@@ -866,18 +1349,22 @@ namespace llaminar2
         rec_params.device_id = device;
         rec_params.layer_idx = layer_idx;
         rec_params.workspace_namespace = workspace_namespace;
-        rec_params.Q = buffers.get(BufferId::GDN_QKV); // Will be split by kernel
-        rec_params.K = buffers.get(BufferId::GDN_QKV); // Same tensor, offset by kernel
-        rec_params.V = buffers.get(BufferId::GDN_QKV); // Same tensor, offset by kernel
+        rec_params.Q = buffers.get(BufferId::GDN_RECURRENCE_IN); // Split by kernel.
+        rec_params.K = buffers.get(BufferId::GDN_RECURRENCE_IN); // Same tensor, kernel offset.
+        rec_params.V = buffers.get(BufferId::GDN_RECURRENCE_IN); // Same tensor, kernel offset.
         rec_params.alpha = buffers.get(BufferId::GDN_ALPHA);
         rec_params.beta = buffers.get(BufferId::GDN_BETA);
-        rec_params.A_log = layer.ssm_a; // Learnable log-space gate
-        rec_params.dt_bias = layer.ssm_dt_bias;
+        rec_params.A_log = gdn_layer->ssm_a; // Learnable log-space gate
+        rec_params.dt_bias = gdn_layer->ssm_dt_bias;
         rec_params.output = buffers.attn_output;
-        rec_params.recurrence_state = gdn_state->recurrence_state.data();
+        rec_params.recurrence_state = device.is_cpu()
+                                          ? gdn_state->recurrence_state.data()
+                                          : nullptr;
         rec_params.seq_len = total_tokens;
         rec_params.request_count = batch_size;
         rec_params.request_seq_len = seq_len;
+        rec_params.request_seq_lens_host = sequence_lengths;
+        rec_params.request_seq_lens_device = sequence_lengths_device;
         rec_params.n_heads = n_v_heads;   // Recurrence runs with value head count
         rec_params.n_k_heads = n_k_heads; // Key head count for QKV split
         rec_params.d_k = d_k;
@@ -887,34 +1374,14 @@ namespace llaminar2
         rec_params.verifier_state_capture_rows = verifier_state_capture_rows;
         rec_params.speculative_state_slot_rows = verifier_state_capture_rows;
 
-        // Under TP, V-heads are always sharded (each rank owns a contiguous
-        // slice of global V-heads). The global_v_head_offset tells the
-        // recurrence stage which global V-heads this rank owns, so the
-        // deinterleave helper can select the correct K-heads:
-        //   k_idx = (v_local + offset) % n_k_heads_local
-        //
-        // This is required in ALL TP modes where V is sharded:
-        //   - Selection   (n_k > n_v_local):  K sharded alongside V
-        //   - Identity    (n_k == n_v_local, K replicated at full count)
-        //   - Expansion   (n_k < n_v_local):  K replicated, modular GQA repeat
-        //                                     (e.g. 27B TP=2: n_k=16, n_v_local=24)
-        //
-        // V is sharded whenever n_v_heads < n_v_heads_full. Previously the
-        // expansion case was missed, leaving rank>0 with offset=0 and reading
-        // the wrong K-heads for its V-head slice.
-        if (n_v_heads < n_v_heads_full)
-        {
-            rec_params.global_v_head_offset = resolveGDNGlobalVHeadOffset(
-                layer_bindings.attn_gate,
-                d_v,
-                n_v_heads,
-                n_v_heads_full,
-                config_,
-                mpi_ctx_.get());
-        }
+        /* Every backend packs V repeats beside the local Q/K interval in
+         * dependency-closed order. The recurrence's local modular relation is
+         * therefore exact with offset zero; a global offset would select a
+         * different local key and corrupt every non-zero participant. */
+        rec_params.global_v_head_offset = 0;
 
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-        rec_params.qkv_buffer_id = BufferId::GDN_QKV;
+        rec_params.qkv_buffer_id = BufferId::GDN_RECURRENCE_IN;
         rec_params.alpha_buffer_id = BufferId::GDN_ALPHA;
         rec_params.beta_buffer_id = BufferId::GDN_BETA;
 
@@ -924,7 +1391,102 @@ namespace llaminar2
         graph.addNode(prefix + "gdn_recurrence",
                       ComputeStageFactory::createGDNRecurrence(rec_params),
                       device);
-        graph.addDependency(prefix + "gdn_recurrence", prefix + "short_conv");
+        graph.addDependency(prefix + "gdn_recurrence", short_conv_ready);
+
+        std::string gdn_state_ready_node = prefix + "gdn_recurrence";
+        if (gdn_live_state_handoff_candidate)
+        {
+            GDNLiveStateAllGatherStage::Params state_gather_params;
+            state_gather_params.device_id = device;
+            state_gather_params.tp_ctx = static_cast<ILocalTPContext *>(config_.tp_ctx);
+            state_gather_params.conv_kernel = gdn_state->conv_kernel.get();
+            state_gather_params.recurrence_kernel = gdn_state->rec_kernel.get();
+            state_gather_params.layer_idx = layer_idx;
+            state_gather_params.tp_device_idx = config_.tp_device_idx;
+            state_gather_params.geometry = linked_state_geometry;
+            state_gather_params.stage_name = prefix + "gdn_live_state_allgather";
+
+            if (!gdn_state_already_full)
+            {
+                graph.addNode(prefix + "gdn_live_state_allgather",
+                              ComputeStageFactory::createGDNLiveStateAllGather(state_gather_params),
+                              device);
+                graph.addDependency(prefix + "gdn_live_state_allgather", prefix + "gdn_recurrence");
+                gdn_state_ready_node = prefix + "gdn_live_state_allgather";
+            }
+            else
+            {
+                /*
+                 * Dynamic ExpertOverlay can install replicated dense/GDN weights
+                 * before the long-context prefill begins.  In that case the
+                 * recurrence and short-conv kernels already own full mirrored
+                 * state, so an allgather would be both unnecessary and
+                 * dimensionally invalid (`full == local`, not `local * degree`).
+                 */
+                LOG_TRACE("[Qwen35Graph] Skipping GDN live-state allgather for layer "
+                          << layer_idx
+                          << " because prefill state is already full-sized");
+            }
+        }
+
+        /*
+         * GPU prefill recurrence preprocesses Q/K and alpha/beta in place.
+         * Capturing only their raw projection values before recurrence cannot
+         * distinguish an upstream input mismatch from repeated or stale
+         * preprocessing during graph capture.  Diagnostic graphs therefore
+         * retain the terminal row of the exact transformed inputs after the
+         * recurrence has consumed them.  Chaining through the live-state
+         * handoff also prevents arena reuse before these tiny device copies.
+         */
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_preprocessed_qkv",
+                buffers.get(BufferId::GDN_RECURRENCE_IN),
+                BufferId::GDN_RECURRENCE_IN,
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                qkv_dim,
+                device,
+                sequence_lengths_device);
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_preprocessed_alpha",
+                buffers.get(BufferId::GDN_ALPHA),
+                BufferId::GDN_ALPHA,
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_preprocessed_beta",
+                buffers.get(BufferId::GDN_BETA),
+                BufferId::GDN_BETA,
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                n_v_heads,
+                device,
+                sequence_lengths_device);
+
+        gdn_state_ready_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_recurrence",
+                buffers.attn_output,
+                BufferId::ATTN_OUTPUT,
+                gdn_state_ready_node,
+                layer_idx,
+                total_tokens,
+                value_dim,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
         // Stage 5: Gated RMSNorm — RMSNorm(output) * SiLU(Z)
@@ -934,10 +1496,11 @@ namespace llaminar2
         gnorm_params.input = buffers.attn_output;
         gnorm_params.gate = buffers.get(BufferId::GDN_Z);
         gnorm_params.output = buffers.attn_output; // In-place
-        gnorm_params.gamma = layer.ssm_norm;
+        gnorm_params.gamma = gdn_layer->ssm_norm;
         gnorm_params.eps = config_.rms_norm_eps;
         gnorm_params.subtract_one = config_.rms_norm_subtract_one;
         gnorm_params.seq_len = total_tokens;
+        gnorm_params.feature_dim = value_dim;
         gnorm_params.norm_dim = d_v;   // Per-head normalization over d_v (128)
                                        // PyTorch reshapes to [B*T, n_heads, d_v] before norm
         gnorm_params.gate_silu = true; // GDN uses SiLU(Z) as gate
@@ -948,16 +1511,60 @@ namespace llaminar2
         graph.addNode(prefix + "gated_norm",
                       ComputeStageFactory::createGatedRMSNorm(gnorm_params),
                       device);
-        graph.addDependency(prefix + "gated_norm", prefix + "gdn_recurrence");
+        graph.addDependency(prefix + "gated_norm", gdn_state_ready_node);
+        const std::string gated_norm_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_gated_norm",
+                buffers.attn_output,
+                BufferId::ATTN_OUTPUT,
+                prefix + "gated_norm",
+                layer_idx,
+                total_tokens,
+                value_dim,
+                device,
+                sequence_lengths_device);
 
         // =====================================================================
-        // Stage 6: Output Projection (Wo GEMM) + optional TP AllReduce
+        // Stage 6: Local output projection, observation, then TP reconstruction
         // =====================================================================
-        std::string terminal_node = addWoProjectionAndAllreduce(
-            graph, prefix, buffers, layer.ssm_out, layer_bindings.ssm_out,
+        const std::string local_projection_node = addWoProjection(
+            graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
+            total_tokens, device,
+            gated_norm_ready,
+            "gdn_out_proj",
+            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
+        const std::string local_projection_ready =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_local_output_projection",
+                buffers.attn_proj,
+                BufferId::ATTN_PROJ,
+                local_projection_node,
+                layer_idx,
+                total_tokens,
+                config_.d_model,
+                device,
+                sequence_lengths_device);
+        std::string terminal_node = addWoAllreduce(
+            graph, prefix, buffers, gdn_layer->ssm_out,
             total_tokens, layer_idx, device,
-            prefix + "gated_norm",
-            "gdn_out_proj", "gdn_wo_allreduce");
+            local_projection_ready,
+            "gdn_wo_allreduce");
+        terminal_node =
+            maybeAddGDNDiagnosticCheckpoint(
+                graph,
+                "gdn_output_projection",
+                buffers.attn_proj,
+                BufferId::ATTN_PROJ,
+                terminal_node,
+                layer_idx,
+                total_tokens,
+                config_.d_model,
+                device,
+                sequence_lengths_device);
+        replicated_attention_state_graph_active_ =
+            saved_replicated_attention_state_graph_active;
 
         // NOTE: GDN layers do NOT apply a sigmoid output gate after out_proj.
         // The Z projection is consumed entirely by GatedRMSNorm (SiLU gating).
@@ -970,7 +1577,7 @@ namespace llaminar2
 
         graph.setTerminalNode(terminal_node);
 
-        LOG_DEBUG("[Qwen35Graph] GDN attention graph for layer " << layer_idx
+        LOG_TRACE("[Qwen35Graph] GDN attention graph for layer " << layer_idx
                                                                  << " has " << graph.size() << " nodes");
 
         return graph;
@@ -988,7 +1595,7 @@ namespace llaminar2
     //   5. Wo GEMM on gated attention output
     // =========================================================================
 
-    ComputeGraph Qwen35Graph::buildFAKVCacheAppendGraph(
+    ComputeGraph Qwen35Graph::buildMTPFAKVCacheAppendGraph(
         const LayerWeights &layer,
         ActivationBuffers &buffers,
         int layer_idx,
@@ -997,14 +1604,16 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         const void *position_ids_device,
+        const int32_t *sequence_lengths_device,
         DeviceId device,
         const std::string &stage_prefix_override,
-        bool layer_idx_is_cache_local)
+        bool layer_idx_is_cache_local,
+        int first_seq_idx)
     {
         ComputeGraph graph;
         if (!kv_cache)
         {
-            LOG_ERROR("[Qwen35Graph::buildFAKVCacheAppendGraph] KV-only graph requires a KV cache");
+            LOG_ERROR("[Qwen35Graph::buildMTPFAKVCacheAppendGraph] KV-only graph requires a KV cache");
             return graph;
         }
 
@@ -1013,42 +1622,34 @@ namespace llaminar2
                                  : stage_prefix_override;
         const int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
-        const WeightBinding *wq_binding = layer.wq_binding ? layer.wq_binding : layer_bindings.wq;
         const WeightBinding *wk_binding = layer.wk_binding ? layer.wk_binding : layer_bindings.wk;
         const WeightBinding *wv_binding = layer.wv_binding ? layer.wv_binding : layer_bindings.wv;
 
         addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
                             total_tokens, layer_idx, device);
 
-        TensorBase *fa_q_raw = buffers.get(buffers.idFor(BufferId::FA_Q_RAW));
-        TensorBase *fa_gate = buffers.get(buffers.idFor(BufferId::FA_GATE));
-        if (!fa_q_raw || !fa_gate || !layer.wq || !layer.wk || !layer.wv)
+        if (!buffers.normalized || !buffers.K || !buffers.V ||
+            !layer.wk || !layer.wv)
         {
-            LOG_ERROR("[Qwen35Graph::buildFAKVCacheAppendGraph] Missing FA projection inputs");
+            LOG_ERROR("[Qwen35Graph::buildMTPFAKVCacheAppendGraph] Missing K/V projection state");
             return ComputeGraph{};
         }
 
         const int k = config_.d_model;
-        const int q_n = static_cast<int>(layer.wq->shape()[0]);
         const int k_n = static_cast<int>(layer.wk->shape()[0]);
         const int v_n = static_cast<int>(layer.wv->shape()[0]);
-        const bool force_decode_equivalent_qkv_verifier_prefill =
+        const bool force_decode_equivalent_kv_prefill =
             (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
             total_tokens > 1 &&
-            total_tokens <= 4 &&
-            config_.compute_all_position_logits &&
-            config_.mtp.enabled;
+            config_.usesMTPGroupedDecodeEquivalentRows();
 
-        graph.addNode(prefix + "qkv_proj",
-                      ComputeStageFactory::createFusedQKVGEMM({
+        const std::string kv_projection = prefix + "kv_proj";
+        graph.addNode(kv_projection,
+                      ComputeStageFactory::createFusedKVGEMM({
                           .device_id = device,
                           .input = buffers.normalized,
                           .m = total_tokens,
                           .k = k,
-                          .wq = layer.wq,
-                          .output_q = fa_q_raw,
-                          .n_q = q_n,
-                          .bias_q = layer.q_bias,
                           .wk = layer.wk,
                           .output_k = buffers.K,
                           .n_k = k_n,
@@ -1058,56 +1659,32 @@ namespace llaminar2
                           .n_v = v_n,
                           .bias_v = layer.v_bias,
                           .input_buffer_id = buffers.idFor(BufferId::NORMALIZED),
-                          .output_q_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
                           .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                           .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
-                          .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
-                          .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
+                          .force_decode_equivalent_verifier_prefill =
+                              force_decode_equivalent_kv_prefill,
                           .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                           .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
-        graph.addDependency(prefix + "qkv_proj", prefix + "attn_norm");
+        graph.addDependency(kv_projection, prefix + "attn_norm");
 
-        auto [local_n_heads, local_n_kv_heads] = resolveLocalHeadCounts();
-        graph.addNode(prefix + "q_gate_split",
-                      ComputeStageFactory::createQGateSplit({
-                          .device_id = device,
-                          .input = fa_q_raw,
-                          .output_q = buffers.Q,
-                          .output_gate = fa_gate,
-                          .seq_len = total_tokens,
-                          .n_heads = local_n_heads,
-                          .head_dim = config_.head_dim,
-                          .input_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
-                          .output_q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
-                          .output_gate_buffer_id = buffers.idFor(BufferId::FA_GATE),
-                      }),
-                      device);
-        graph.addDependency(prefix + "q_gate_split", prefix + "qkv_proj");
-
-        const bool has_qk_norms = addQKNorms(
-            graph, prefix, buffers, layer,
-            local_n_heads, local_n_kv_heads, total_tokens, device,
-            prefix + "q_gate_split",
-            prefix + "qkv_proj");
-
-        std::string rope_node = addRoPE(
-            graph, prefix, buffers,
-            local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
-
-        if (has_qk_norms)
-        {
-            graph.addDependency(rope_node, prefix + "q_norm");
-            graph.addDependency(rope_node, prefix + "k_norm");
-        }
-        else
-        {
-            graph.addDependency(rope_node, prefix + "q_gate_split");
-            graph.addDependency(rope_node, prefix + "qkv_proj");
-        }
+        const int local_n_kv_heads = resolveLocalHeadCounts().second;
+        const attention::AttentionExecutionPolicy attention_policy =
+            resolveAttentionExecutionPolicy(device, kv_cache != nullptr);
+        const std::string key_terminal = addKeyCachePublicationTransforms(
+            graph,
+            prefix,
+            buffers,
+            layer,
+            local_n_kv_heads,
+            total_tokens,
+            position_ids,
+            position_ids_device,
+            device,
+            attention_policy,
+            kv_projection);
 
         const std::string kv_append = addKVCacheAppend(
             graph,
@@ -1117,9 +1694,13 @@ namespace llaminar2
             seq_len,
             batch_size,
             kv_cache,
+            sequence_lengths_device,
             device,
-            rope_node,
-            layer_idx_is_cache_local);
+            attention_policy,
+            key_terminal,
+            {key_terminal},
+            layer_idx_is_cache_local,
+            first_seq_idx);
         graph.setTerminalNode(kv_append);
         return graph;
     }
@@ -1135,6 +1716,7 @@ namespace llaminar2
         const void *position_ids_device,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
+        const int32_t *sequence_lengths_device,
         const std::string &stage_prefix_override,
         bool layer_idx_is_cache_local)
     {
@@ -1149,7 +1731,7 @@ namespace llaminar2
         const WeightBinding *wv_binding = layer.wv_binding ? layer.wv_binding : layer_bindings.wv;
         const WeightBinding *wo_binding = layer.wo_binding ? layer.wo_binding : layer_bindings.wo;
 
-        LOG_DEBUG("[Qwen35Graph::buildFAAttentionGraph] layer=" << layer_idx
+        LOG_TRACE("[Qwen35Graph::buildFAAttentionGraph] layer=" << layer_idx
                                                                 << " seq_len=" << seq_len << " batch_size=" << batch_size
                                                                 << " total_tokens=" << total_tokens);
 
@@ -1185,11 +1767,9 @@ namespace llaminar2
             const bool force_decode_equivalent_qkv_verifier_prefill =
                 (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
-                total_tokens <= 4 &&
-                config_.compute_all_position_logits &&
-                config_.mtp.enabled;
+                config_.usesMTPGroupedDecodeEquivalentRows();
 
-            LOG_DEBUG("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
+            LOG_TRACE("[Qwen35Graph FA] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                                 << " k_n=" << k_n << " v_n=" << v_n);
 
             // Q GEMM writes to fa_q_raw (oversized: n_heads * head_dim * 2)
@@ -1216,6 +1796,8 @@ namespace llaminar2
                               .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                               .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
                               .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
+                              .verifier_row_range = projectionVerifierRows(
+                                  device, seq_len, batch_size, sequence_lengths_device),
                               .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
                               .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                               .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
@@ -1257,6 +1839,20 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             prefix + "q_gate_split",
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
+        const attention::AttentionExecutionPolicy attention_policy =
+            resolveAttentionExecutionPolicy(device, kv_cache != nullptr);
+        std::vector<std::string> cache_source_dependencies;
+        if (has_qk_norms)
+        {
+            cache_source_dependencies.push_back(prefix + "q_norm");
+            cache_source_dependencies.push_back(prefix + "k_norm");
+        }
+        else
+        {
+            cache_source_dependencies.push_back(prefix + "q_gate_split");
+            if (has_qkv_proj)
+                cache_source_dependencies.push_back(prefix + "qkv_proj");
+        }
 
         // =================================================================
         // Stage 3: RoPE on Q and K
@@ -1264,7 +1860,7 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
+            position_ids, position_ids_device, device, attention_policy);
 
         if (has_qk_norms)
         {
@@ -1284,7 +1880,10 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node,
+            kv_cache, position_ids, position_ids_device,
+            sequence_lengths_device,
+            device, has_qkv_proj, attention_policy, rope_node,
+            cache_source_dependencies,
             layer_idx_is_cache_local);
 
         // =================================================================
@@ -1308,16 +1907,20 @@ namespace llaminar2
         }
 
         // =================================================================
-        // Stage 5: Wo projection + optional TP allreduce
+        // Stage 5: publish the local Wo partial, then reconstruct TP output.
         // =================================================================
-        std::string terminal = addWoProjectionAndAllreduce(
+        const std::string wo_projection = addWoProjection(
             graph, prefix, buffers, layer.wo, wo_binding,
-            total_tokens, layer_idx, device,
-            prefix + "attn_output_gate");
+            total_tokens, device,
+            prefix + "attn_output_gate", "wo_proj",
+            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
+        std::string terminal = addWoAllreduce(
+            graph, prefix, buffers, layer.wo,
+            total_tokens, layer_idx, device, wo_projection);
 
         graph.setTerminalNode(terminal);
 
-        LOG_DEBUG("[Qwen35Graph] FA attention graph for layer " << layer_idx
+        LOG_TRACE("[Qwen35Graph] FA attention graph for layer " << layer_idx
                                                                 << " has " << graph.size() << " nodes");
 
         return graph;

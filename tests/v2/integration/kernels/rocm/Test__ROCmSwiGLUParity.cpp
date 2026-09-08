@@ -21,6 +21,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 // Include project headers
 #include "tensors/Tensors.h"
@@ -218,6 +219,42 @@ namespace
             dst[i] = floatToFP16(src[i]);
         }
     }
+
+#ifdef HAVE_ROCM
+    /**
+     * @brief Own a non-default HIP stream for tensor-aware legacy parity cells.
+     *
+     * Raw-pointer tests above intentionally remain low-level kernel checks. The
+     * production tensor API must instead obey the same explicit-stream contract
+     * as DeviceGraphExecutor, so its stream lifetime is managed independently.
+     */
+    class ScopedROCmStream
+    {
+    public:
+        explicit ScopedROCmStream(int device = 0)
+        {
+            if (hipSetDevice(device) != hipSuccess)
+                return;
+            if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) != hipSuccess)
+                stream_ = nullptr;
+        }
+
+        ~ScopedROCmStream()
+        {
+            if (stream_)
+                (void)hipStreamDestroy(stream_);
+        }
+
+        ScopedROCmStream(const ScopedROCmStream &) = delete;
+        ScopedROCmStream &operator=(const ScopedROCmStream &) = delete;
+
+        /** @return Owned HIP stream, or null after setup failure. */
+        hipStream_t get() const { return stream_; }
+
+    private:
+        hipStream_t stream_ = nullptr;
+    };
+#endif
 
 } // namespace
 
@@ -620,17 +657,20 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP32_ApplyTensor)
                      rows, cols, false, nullptr, -1);
 
     DeviceId rocm_device = DeviceId::rocm(0);
-    ASSERT_TRUE(gate->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(up->ensureOnDevice(rocm_device));
-    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+    ScopedROCmStream stream;
+    ASSERT_NE(stream.get(), nullptr);
+    ASSERT_TRUE(gate->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(up->ensureOnDevice(rocm_device, stream.get()));
+    ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream.get()));
 
     llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream.get());
     ASSERT_TRUE(rocm_kernel.apply_tensor(
         gate.get(), up.get(), rocm_output.get(),
         rows, cols, false, nullptr, 0));
 
-    (void)hipDeviceSynchronize();
-    rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    ASSERT_EQ(hipStreamSynchronize(stream.get()), hipSuccess);
+    TransferEngine::publishCurrentDeviceWrite(rocm_output, stream.get());
     const float *result = rocm_output->data();
 
     ASSERT_FALSE(hasNaNOrInf(result, total));

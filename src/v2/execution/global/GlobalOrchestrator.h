@@ -134,6 +134,40 @@ namespace llaminar2
         const IInferenceRunner *lastLocalRunner() const;
 
         void clearCacheAll();
+        /** @return True after every local stage retires reusable prefix state. */
+        bool purgePrefixCacheAll();
+        /**
+         * @brief Admit one immutable stop-token policy into every local runner.
+         *
+         * Global orchestration is a transparent ownership boundary: request
+         * controls belong to the leaf runners that own captured execution, not
+         * to this registry.  A null child or a rejected policy is therefore a
+         * fatal topology error.  The method stops immediately rather than
+         * leaving later participants configured under a partially accepted
+         * request.
+         *
+         * @param stop_tokens Complete model-specific stop-token set.
+         * @return True after every registered runner accepts the policy.
+         * @throws std::logic_error if the registry has no usable runner.
+         * @throws std::runtime_error if any runner rejects the policy.
+         */
+        bool configureMTPRequestStopTokensAll(
+            const std::vector<int32_t> &stop_tokens);
+        /**
+         * @brief Admit one immutable penalty policy into every local runner.
+         *
+         * The policy is staged at request admission and later published by each
+         * leaf on its exact producer stream.  Global orchestration must never
+         * retain a wrapper-only copy because captured verifier consumers cannot
+         * observe such host state.
+         *
+         * @param policy Request-constant presence and frequency penalties.
+         * @return True after every registered runner accepts the policy.
+         * @throws std::logic_error if the registry has no usable runner.
+         * @throws std::runtime_error if any runner rejects the policy.
+         */
+        bool configureMTPRequestPenaltyPolicyAll(
+            const MTPRequestPenaltyPolicy &policy);
         void setSkipLogitsGatherDecodeAll(bool skip);
         void setSkipLogitsGatherPrefillAll(bool skip);
         void setSuppressTimelineAll(bool suppress);
@@ -146,20 +180,122 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens);
+        /**
+         * @brief Commit accepted grouped verifier rows through every local stage.
+         *
+         * Grouped MTP verification may publish only a suffix of the verifier
+         * forward rows into shifted MTP state.  The extra row-count, base
+         * offset, and discard arguments preserve the exact single-rank
+         * publication contract when GlobalTP wraps the real rank runner.
+         */
+        bool commitMTPShiftedRowsFromPartialForwardAll(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1);
         bool commitMTPShiftedRowFromCurrentTerminalHiddenAll(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1);
+        bool commitMTPShiftedRowFromCheckpointTerminalHiddenAll(
+            const PrefixStateSnapshot &checkpoint,
             int32_t token,
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1);
         bool ensureMTPCheckpointTerminalHiddenAll();
         bool setComputeAllPositionLogitsAll(bool enabled);
+        /**
+         * @brief Toggle compact row-indexed all-position verifier logits.
+         *
+         * GlobalTP is a transparent IInferenceRunner wrapper.  The grouped
+         * verifier planner installs compact verifier rows on the wrapper, so
+         * this helper fans the shape toggle out to the actual rank-local
+         * runner that owns graph execution and LM-head row packing.
+         */
+        bool setComputeRowIndexedAllPositionLogitsAll(bool enabled, int row_count);
+        /**
+         * @brief Install grouped verifier input metadata on every local runner.
+         *
+         * Row-indexed verifier forwards need the compact row plan and token
+         * ordering to live beside the runner that executes the graph.  Without
+         * this fan-out, GlobalTP would enable row-indexed logits but leave the
+         * child runner without row metadata.
+         */
+        bool setMTPSpecVerifierInputPlanAll(const MTPSpecDecodeVerifierInputPlan &plan);
+        /**
+         * @brief Clear stale grouped verifier row metadata from local runners.
+         */
+        void clearMTPSpecVerifierInputPlanAll();
+        /**
+         * @brief Publish the accepted grouped verifier prefix through all local runners.
+         *
+         * The same MTPSpecStepPlanBatch must reach every GlobalTP participant
+         * so positions, KV, shifted MTP KV, and recurrent payloads advance in
+         * lockstep after the rank-wide verifier decision.
+         */
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatchAll(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr);
         uint64_t moePlacementEpochAll() const;
+        uint64_t moeRuntimeMovementEpochAll() const;
+        /**
+         * @brief Coordinate one prefix lookup across every local PP stage.
+         *
+         * Each stage owns a distinct payload/fingerprint but all stages must
+         * restore the same logical token boundary. The registry retains each
+         * child result so later population and terminal-state restoration use
+         * the exact handles returned by that child.
+         *
+         * @param tokens Complete request prefix token sequence.
+         * @return Common locally restorable prefix and typed terminal requirements.
+         */
+        PrefixLookupResult lookupPrefixAll(const std::vector<int32_t> &tokens);
+        /**
+         * @brief Restore the coordinated prefix into every local PP stage.
+         * @param hit Aggregate result returned by @ref lookupPrefixAll.
+         * @param seq_idx Sequence slot receiving the restored state.
+         * @return True after every child imports its own clamped payload.
+         */
+        bool populatePrefixAll(const PrefixLookupResult &hit, int seq_idx = 0);
+        /**
+         * @brief Archive one completed prefix in every local PP stage cache.
+         * @param tokens Complete prompt token sequence.
+         * @param prompt_token_count Number of live prompt tokens.
+         * @return True after every child publishes its stage-owned payload.
+         */
+        bool harvestPrefixAll(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count);
+        /**
+         * @brief Restore stage-specific terminal state for a full prefix hit.
+         * @param hit Aggregate coordinated hit naming the common token boundary.
+         * @return True when every child satisfies its typed terminal contract.
+         */
+        bool restorePrefixTerminalStateAll(const PrefixLookupResult &hit);
+        /**
+         * @brief Return the local PP participant runtime-state observation.
+         *
+         * A single local stage is returned verbatim. Multiple local stages are
+         * folded in stable pipeline order so cache inventories and terminal
+         * evidence remain complete without inventing a second state authority.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbeAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
-        PrefixStateSnapshot captureLivePrefixCheckpointAll(int seq_idx = 0) const;
+        PrefixStateSnapshot captureLivePrefixCheckpointAll(
+            const PrefixCheckpointCaptureRequest &request) const;
         bool restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx = 0);
         bool truncateLivePrefixStateAll(int cached_tokens, int seq_idx = 0);
         std::string mtpDecodeUnsupportedReasonAll() const;
         void enableSnapshotCaptureAll(const std::string &output_dir);
+        /** @brief Install one immutable capture filter on every local stage. */
+        void setSnapshotCaptureFilterAll(
+            const std::vector<std::string> &keys);
         void disableSnapshotCaptureAll();
         void clearSnapshotsAll();
         const float *getSnapshot(const std::string &key, size_t &out_size) const;
@@ -169,6 +305,9 @@ namespace llaminar2
     private:
         std::vector<StageRunnerEntry> entries_;
         std::unique_ptr<IInferenceRunner> compatibility_runner_;
+        /** Child-owned lookup handles retained until this prefix transaction ends. */
+        std::vector<PrefixLookupResult> last_prefix_hits_;
+        std::optional<PrefixLookupResult> compatibility_prefix_hit_;
     };
 
     /**
@@ -266,9 +405,24 @@ namespace llaminar2
         // =================================================================
 
         bool forward(const int *tokens, int seq_len) override;
+        /**
+         * @brief Execute a CPU grouped-MTP verifier transaction through GlobalPP/TP.
+         *
+         * The wrapper must preserve `GroupedMTPVerifier` as a semantic graph
+         * role at every local stage. Routing this call through ordinary
+         * `forward()` would build a main-inference graph and omit the recurrent
+         * verifier checkpoints consumed by accepted-state publication.
+         *
+         * @param token_batches Logical verifier rows for every request.
+         * @return True after every local execute/transfer step succeeds.
+         */
+        bool forwardGroupedMTPVerifierWithHostTokenIds(
+            const std::vector<std::vector<int>> &token_batches) override;
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
         int get_position() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
@@ -276,7 +430,7 @@ namespace llaminar2
         /**
          * @brief True when every local participant can execute chained MTP drafts.
          *
-         * NodeLocalTP/GlobalTP uses one rank-wide draft token broadcast.  Chained
+         * NodeTP/GlobalTP uses one rank-wide draft token broadcast.  Chained
          * depth-2/3 drafts are safe only when each rank-local participant can
          * consume the previous sidecar hidden state at the same logical shifted
          * MTP position.
@@ -287,28 +441,102 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens) override;
+        /**
+         * @brief Forward grouped verifier shifted-row publication to local stages.
+         *
+         * IInferenceRunner's default implementation intentionally has a narrow
+         * legacy shape.  GlobalTP must override it so grouped publication keeps
+         * the verifier row count, base offset, and speculative-discard
+         * semantics supplied by OrchestrationRunner.
+         */
+        bool commitMTPShiftedRowsFromPartialForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1) override;
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromCheckpointTerminalHidden(
+            const PrefixStateSnapshot &checkpoint,
             int32_t token,
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
         bool ensureMTPCheckpointTerminalHidden() override;
         const float *mtpLogits() const override;
+        /**
+         * @brief Forward request stop-token admission to every graph owner.
+         */
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override;
+        /**
+         * @brief Forward request penalty admission to every graph owner.
+         */
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override;
         bool setComputeAllPositionLogits(bool enabled) override;
+        /**
+         * @brief Forward compact verifier LM-head row packing to local runners.
+         */
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override;
+        /**
+         * @brief Forward grouped verifier input metadata to local runners.
+         */
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override;
+        /**
+         * @brief Clear grouped verifier input metadata from local runners.
+         */
+        void clearMTPSpecVerifierInputPlan() override;
         const float *getAllPositionLogits() const override;
         bool hasMTPLogitsLocal() const override;
         LogitsLocalInfo getMTPLogitsLocalInfo() const override;
+        LogitsLocalInfo consumeMTPLogitsLocalInfoForSampling() override;
+        LogitsLocalInfo consumeMTPLogitsLocalInfoForHostGather() override;
         bool hasAllPositionLogitsLocal() const override;
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override;
+        LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling() override;
+        LogitsLocalInfo consumeAllPositionLogitsLocalInfoForHostGather() override;
+        /**
+         * @brief Publish accepted grouped verifier rows through GlobalTP children.
+         */
+        bool publishGroupedDecodeEquivalentMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
         std::string mtpDecodeUnsupportedReason() const override;
         bool supportsMTPTokenCoordination() const override;
         uint64_t moePlacementEpoch() const override;
+        uint64_t moeRuntimeMovementEpoch() const override;
+        /** @brief Coordinate prefix lookup across the local stages on this rank. */
+        PrefixLookupResult lookupPrefix(
+            const std::vector<int32_t> &tokens) override;
+        /** @brief Populate every local stage from its retained lookup handles. */
+        bool populatePrefix(
+            const PrefixLookupResult &hit,
+            int seq_idx = 0) override;
+        /** @brief Harvest one prefix payload from every local stage. */
+        bool harvestPrefix(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count) override;
+        /** @brief Restore typed terminal state on every local stage. */
+        bool restorePrefixTerminalState(
+            const PrefixLookupResult &hit) override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
-        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
+        /** @brief Observe the complete rank-local pipeline prefix state. */
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
 
         // =================================================================
         // IInferenceRunner — GPU-side Sampling
@@ -364,6 +592,9 @@ namespace llaminar2
         // =================================================================
 
         void enableSnapshotCapture(const std::string &output_dir) override;
+        /** @brief Forward the graph-identity snapshot filter to local stages. */
+        void setSnapshotCaptureFilter(
+            const std::vector<std::string> &keys) override;
         void disableSnapshotCapture() override;
         void clearSnapshots() override;
         const float *getSnapshot(const std::string &key, size_t &out_size) const override;
@@ -377,6 +608,8 @@ namespace llaminar2
         DeviceId primaryDeviceId() const override;
         bool hasLogitsLocal() const override;
         LogitsLocalInfo getLogitsLocalInfo() const override;
+        LogitsLocalInfo consumeLogitsLocalInfoForSampling() override;
+        LogitsLocalInfo consumeLogitsLocalInfoForHostGather() override;
 
         // =================================================================
         // Query API
@@ -435,6 +668,17 @@ namespace llaminar2
          */
         bool executeStage(const RankStageAction &action,
                           const int *tokens, int seq_len);
+
+        /**
+         * @brief Execute one local stage with the typed grouped-verifier role.
+         *
+         * Pipeline stages without an embedding still receive the logical row
+         * geometry; their graph omits token embedding and consumes the hidden
+         * activation installed by the preceding transfer.
+         */
+        bool executeGroupedMTPVerifierStage(
+            const RankStageAction &action,
+            const std::vector<std::vector<int>> &token_batches);
 
         /**
          * @brief Execute a single TRANSFER step (MPI Send or Recv)

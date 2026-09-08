@@ -24,8 +24,10 @@
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "memory/BufferArena.h"
 #include "execution/factory/FactoryPPStageConfig.h"
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
+#include "../../../../mocks/MockWorkerGPUContext.h"
 
 using namespace llaminar2;
 
@@ -58,7 +60,9 @@ namespace
         int last_workspace_seq_len = -1;
         uint64_t workspace_generation = 0;
         int sync_logits_calls = 0;
-        int logits_tensor_calls = 0;
+        TensorBase *last_published_logits = nullptr;
+        TensorBase *last_published_hidden = nullptr;
+        int committed_forward_output_calls = 0;
         int build_decode_policy_calls = 0;
         int resolve_pp_copy_calls = 0;
         int get_pipeline_contexts_calls = 0;
@@ -70,6 +74,8 @@ namespace
         int graph_node_count = 3; // Stages in built graph (0 = empty)
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
+        TensorBase *graph_output_logits = nullptr;
+        TensorBase *graph_output_hidden = nullptr;
 
         // ----- Captured Input -----
         int last_build_seq_len = -1;
@@ -90,6 +96,8 @@ namespace
 
             ComputeGraph graph;
             ForwardOutput output{};
+            output.logits = graph_output_logits;
+            output.hidden = graph_output_hidden;
 
             // Build a graph with actual mock stages so it's non-empty
             for (int i = 0; i < graph_node_count; ++i)
@@ -110,6 +118,15 @@ namespace
             call_sequence.push_back("getDeviceContext");
             return ctx_;
         }
+
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId device) override
+        {
+            if (!ctx_ || device != ctx_->deviceId())
+                return nullptr;
+            return &llaminar2::testing::sharedMockWorkerGPUContext();
+        }
+
+        bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
 
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
         {
@@ -135,23 +152,28 @@ namespace
             return workspace_generation;
         }
 
-        void syncLogitsAtBoundary(IDeviceContext *ctx) override
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &output,
+            IDeviceContext *ctx) override
         {
+            last_published_logits = output.logits;
+            last_published_hidden = output.hidden;
+            (void)ctx;
             sync_logits_calls++;
             call_sequence.push_back("syncLogits");
+            return true;
         }
 
-        TensorBase *logitsTensor() override
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &) override
         {
-            logits_tensor_calls++;
-            call_sequence.push_back("logitsTensor");
-            return nullptr;
+            ++committed_forward_output_calls;
+            call_sequence.push_back("commitForwardOutput");
         }
 
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool has_collective_nodes,
-            IDeviceContext *ctx,
-            int segment_consecutive_failures) const override
+            IDeviceContext *ctx) const override
         {
             const_cast<TrackingHost *>(this)->build_decode_policy_calls++;
             const_cast<TrackingHost *>(this)->call_sequence.push_back("buildDecodeCapturePolicy");
@@ -204,6 +226,13 @@ namespace
             input.token_ids = tokens.data();
             input.position_ids = positions.data();
             input.position_offset = position_offset;
+            input.execution_phase = resolveForwardExecutionPhase({
+                .role = ForwardExecutionRole::MainInference,
+                .seq_len = seq_len,
+                .batch_size = batch_size,
+                .decode_max_seq_len = 4,
+                .logical_position = position_offset,
+            });
         }
     };
 
@@ -216,8 +245,14 @@ namespace
 class Test__ForwardExecutionEngineAdvanced : public ::testing::Test
 {
 protected:
+    BufferArena arena_;
     DeviceGraphExecutor executor_;
     llaminar2::testing::MockDeviceContext mock_ctx_{DeviceId::cpu()};
+
+    void SetUp() override
+    {
+        executor_.setArena(&arena_);
+    }
 
     ForwardExecutionEngine makeEngine(bool cache_enabled = true,
                                       bool has_pp = false,
@@ -359,6 +394,42 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillThenDecode_TwoSeparateBuilds
     EXPECT_EQ(host.build_calls, 2) << "Different seq_len should trigger a new build";
 }
 
+/**
+ * @brief Prove typed phase, rather than row count, selects graph topology.
+ *
+ * A one-token prompt has the same tensor geometry as serial decode. The
+ * request orchestrator has already resolved that ambiguity before invoking
+ * ForwardExecutionEngine, so the engine must retain a prefill graph for the
+ * former and a decode graph for the latter.
+ */
+TEST_F(
+    Test__ForwardExecutionEngineAdvanced,
+    OneTokenExplicitPrefillDoesNotEnterDecodeTopology)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    ForwardOutput output{};
+
+    TestInput prefill(1);
+    prefill.input.execution_phase = ForwardExecutionPhase::Prefill;
+    ASSERT_TRUE(engine.execute(prefill.input, output, host));
+    const auto prefill_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(prefill_view.has_value());
+    EXPECT_FALSE(prefill_view->is_decode);
+    EXPECT_FALSE(prefill_view->signature.decode);
+
+    TestInput decode(1);
+    decode.input.execution_phase = ForwardExecutionPhase::Decode;
+    ASSERT_TRUE(engine.execute(decode.input, output, host));
+    const auto decode_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(decode_view.has_value());
+    EXPECT_TRUE(decode_view->is_decode);
+    EXPECT_TRUE(decode_view->signature.decode);
+    EXPECT_EQ(host.build_calls, 2)
+        << "Prefill and decode need distinct graph identities even at M=1.";
+}
+
 TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCall)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
@@ -372,13 +443,18 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCal
     engine.execute(decode1.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
     EXPECT_FALSE(engine.cacheEmpty());
+    const int workspace_calls_after_first_decode =
+        host.ensure_workspace_calls;
+    EXPECT_GE(workspace_calls_after_first_decode, 1);
 
     // Second decode (same shape): should be cache hit → no build
     TestInput decode2(1, 1, DeviceId::cuda(0));
     engine.execute(decode2.input, output, host);
     // On cache HIT, buildForwardGraph is NOT called
     EXPECT_EQ(host.build_calls, 1) << "Second decode with same shape should hit cache";
-    EXPECT_EQ(host.ensure_workspace_calls, 2)
+    EXPECT_EQ(
+        host.ensure_workspace_calls,
+        workspace_calls_after_first_decode + 1)
         << "Cache hits must rebind workspace in case another cached bucket replaced it";
 }
 
@@ -501,7 +577,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ThreeTokenAllPositionVerifierUsesDe
         << "M=3 verifier continuations should be eligible for decode graph capture";
 }
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNotUseDecodeCache)
+TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryUsesPrefillTopology)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -515,7 +591,11 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNot
 
     TestInput prompt2(2);
     engine.execute(prompt2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2)
+    EXPECT_EQ(host.build_calls, 1)
+        << "Exact CPU prefill topology should remain reusable across requests";
+    const auto view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(view.has_value());
+    EXPECT_FALSE(view->is_decode)
         << "A two-token prompt at position zero is prefill, not verifier decode";
 }
 
@@ -692,6 +772,33 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPStageConfig_BuildReceivesInput)
     EXPECT_EQ(host.last_build_seq_len, 1);
 }
 
+/**
+ * @brief A non-head PP graph publishes its declared hidden output, not logits.
+ */
+TEST_F(Test__ForwardExecutionEngineAdvanced,
+       PPNonTerminalStagePublishesHiddenForwardResult)
+{
+    FactoryPPStageConfig pp{
+        .first_layer = 0,
+        .last_layer = 12,
+        .has_embedding = true,
+        .has_lm_head = false};
+    auto engine = makeEngine(/*cache_enabled=*/false, /*has_pp=*/false, pp);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 1;
+    FP32Tensor hidden(std::vector<size_t>{1, 8}, DeviceId::cpu());
+    host.graph_output_hidden = &hidden;
+
+    TestInput prefill(2);
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(prefill.input, output, host));
+
+    EXPECT_EQ(host.sync_logits_calls, 1);
+    EXPECT_EQ(host.last_published_logits, nullptr);
+    EXPECT_EQ(host.last_published_hidden, &hidden);
+    EXPECT_EQ(output.hidden, &hidden);
+}
+
 // =========================================================================
 // PP Copy Info Resolution
 // =========================================================================
@@ -707,8 +814,13 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPCopyInfo_ResolvedOnCacheMiss)
 
     TrackingHost host(&mock_ctx_);
     host.graph_node_count = 3;
+    FP32Tensor external_hidden(std::vector<size_t>{1024}, DeviceId::cpu());
+    FP32Tensor working_buffer(std::vector<size_t>{1024}, DeviceId::cpu());
+    host.mock_pp_copy.external_hidden = &external_hidden;
+    host.mock_pp_copy.working_buffer = &working_buffer;
     host.mock_pp_copy.needs_copy = true;
     host.mock_pp_copy.copy_bytes = 4096;
+    host.mock_pp_copy.device = DeviceId::cpu();
 
     TestInput ti(1);
     ForwardOutput output{};
@@ -803,10 +915,10 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, DiscardAllCachedGraphs_ForcesRebuil
 }
 
 // =========================================================================
-// Prefill is not cached; decode is cached
+// Exact CPU prefill and decode use distinct reusable topology entries
 // =========================================================================
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillRebuilds_DecodeCaches)
+TEST_F(Test__ForwardExecutionEngineAdvanced, CPUExactPrefillAndDecodeCacheSeparately)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -819,22 +931,20 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillRebuilds_DecodeCaches)
     engine.execute(prefill.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
 
-    // Same prefill shape should rebuild. Caching prefill graphs retains large
-    // per-prompt activation state and causes server memory growth across
-    // different chat requests.
+    // Exact CPU prefill reuses topology while refreshing request data.
     TestInput prefill2(100);
     engine.execute(prefill2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2) << "Prefill graphs should not be cached";
+    EXPECT_EQ(host.build_calls, 1);
 
     // Decode with 1 token
     TestInput decode(1);
     engine.execute(decode.input, output, host);
-    EXPECT_EQ(host.build_calls, 3);
+    EXPECT_EQ(host.build_calls, 2);
 
     // Decode again — should hit cache
     TestInput decode2(1);
     engine.execute(decode2.input, output, host);
-    EXPECT_EQ(host.build_calls, 3) << "Same decode shape should hit cache";
+    EXPECT_EQ(host.build_calls, 2) << "Same decode shape should hit cache";
 }
 
 // =========================================================================

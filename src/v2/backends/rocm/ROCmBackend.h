@@ -11,9 +11,9 @@
 #pragma once
 
 #include "../IBackend.h"
-#include <future>
 #include <memory>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace llaminar2
@@ -44,24 +44,36 @@ namespace llaminar2
         ~ROCmBackend() override;
 
         // Memory transfer operations (see IBackend documentation)
-        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
-        bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
-        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
+        bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
+        bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
         bool synchronize(int device_id) override;
         bool streamSynchronize(int device_id) override;
         bool setDevice(int device_id) override;
 
         // Host memory pinning for async DMA
-        bool pinHostMemory(void *ptr, size_t bytes) override;
-        bool unpinHostMemory(void *ptr) override;
+        bool pinHostMemory(void *ptr, size_t bytes, int device_id) override;
+        bool unpinHostMemory(void *ptr, int device_id) override;
+        bool registerExternalMappedHostMemory(
+            void *ptr,
+            size_t bytes,
+            int registration_device_id,
+            MappedHostRegistrationScope scope) override;
+        bool externalMappedHostDevicePointer(
+            void *host_ptr,
+            int device_id,
+            void **device_ptr) override;
+        bool unregisterExternalMappedHostMemory(
+            void *ptr,
+            int registration_device_id) override;
 
         // GPU-side argmax for greedy sampling
         bool argmaxF32(const void *data_device, int n, int device_id,
-                       float *out_value, int *out_index, void *stream = nullptr,
+                       float *out_value, int *out_index, void *stream,
                        void *partial_vals = nullptr, void *partial_idxs = nullptr,
                        int partial_capacity = 0) override;
         bool argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
-                                  float *out_values, int *out_indices, void *stream = nullptr,
+                                  float *out_values, int *out_indices, void *stream,
                                   void *partial_vals = nullptr, void *partial_idxs = nullptr,
                                   int partial_capacity = 0) override;
         bool enqueueArgmaxF32BatchedRowsDevice(
@@ -76,20 +88,107 @@ namespace llaminar2
             void *partial_idxs = nullptr,
             int partial_capacity = 0,
             int output_stride = 1) override;
+        bool enqueueArgmaxF32BatchedRowsAndPublishMTPChainDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *chain_condition_tokens_device,
+            void *chain_position_ids_device,
+            int chain_position_increment,
+            void *partial_vals,
+            void *partial_idxs,
+            int partial_capacity,
+            int output_stride = 1) override;
+        bool enqueueRetainMTPFirstTransactionDraftBoundaryDevice(
+            const void *data_words_device,
+            int word_count,
+            int boundary,
+            int draft_slot,
+            const void *condition_token_device,
+            const void *position_id_device,
+            const void *generation_control_device,
+            int generation_control_stride,
+            void *diagnostic_record_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueConfigureMTPGreedyPenaltyPolicyDevice(
+            void *controls_device,
+            float presence_penalty,
+            float frequency_penalty,
+            bool first_token_already_in_history,
+            int device_id,
+            void *stream) override;
+        bool enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            const void *verifier_input_tokens_device,
+            const void *generated_token_counts_device,
+            const void *penalty_policy_device,
+            const void *active_rows_device,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *partial_vals,
+            void *partial_idxs,
+            int partial_capacity,
+            int output_stride = 1) override;
+        bool enqueueApplyMTPPenaltiesToF32RowsDevice(
+            void *data_device,
+            int rows,
+            int cols,
+            int row_stride,
+            const void *verifier_input_tokens_device,
+            const void *generated_token_counts_device,
+            const void *penalty_policy_device,
+            int device_id,
+            void *stream,
+            const void *active_rows_device = nullptr) override;
+        bool enqueueApplyMTPBranchPenaltiesToF32RowDevice(
+            void *data_device,
+            int cols,
+            const void *first_condition_token_device,
+            const void *prior_draft_tokens_device,
+            int prior_draft_count,
+            const void *generated_token_counts_device,
+            const void *penalty_policy_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueCommitMTPGreedyPenaltyHistoryDevice(
+            const void *output_tokens_device,
+            const void *output_meta_device,
+            void *penalty_policy_device,
+            const void *accepted_state_counts_device,
+            const void *stopped_flags_device,
+            int output_token_capacity,
+            int vocab_size,
+            void *generated_token_counts_device,
+            int device_id,
+            void *stream) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
-                     float *out_values, int *out_indices, void *stream = nullptr) override;
+                     float *out_values, int *out_indices, void *stream) override;
         bool sampleTopKTopPF32(const void *data_device, int n,
                                int top_k, float top_p, float temperature,
                                uint64_t rng_seed, uint64_t rng_offset,
                                int device_id, int *out_token,
-                               void *stream = nullptr) override;
+                               void *stream) override;
         bool enqueueSampleTopKTopPF32Device(const void *data_device, int n,
                                             int top_k, float top_p, float temperature,
                                             uint64_t rng_seed, uint64_t rng_offset,
                                             int device_id, void *stream,
                                             void *out_token_device) override;
+        bool enqueuePublishInt32ControlScalarDevice(
+            int32_t value,
+            void *out_value_device,
+            int device_id,
+            void *stream) override;
         bool enqueueBuildTopKTopPDistributionF32Device(const void *data_device, int n,
                                                        int top_k, float top_p, float temperature,
                                                        int device_id, void *stream,
@@ -113,7 +212,8 @@ namespace llaminar2
             void *out_probs_device,
             void *scratch_values_device = nullptr,
             void *scratch_indices_device = nullptr,
-            int scratch_capacity = 0) override;
+            int scratch_capacity = 0,
+            const void *active_rows_device = nullptr) override;
         bool enqueueBuildTopKTopPProcessedLogitsF32Device(
             const void *data_device,
             int row_count,
@@ -137,7 +237,10 @@ namespace llaminar2
             int device_id,
             void *stream,
             void *out_token_device,
-            void *out_probability_device = nullptr) override;
+            void *out_probability_device = nullptr,
+            uint64_t threshold_seed = 0,
+            const void *threshold_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSampleProcessedLogitsF32Device(
             const void *logits_device,
             int vocab_size,
@@ -162,7 +265,10 @@ namespace llaminar2
             int device_id,
             void *stream,
             void *out_token_device,
-            void *out_probability_device = nullptr) override;
+            void *out_probability_device = nullptr,
+            uint64_t threshold_seed = 0,
+            const void *threshold_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSoftmaxAndSampleTemperatureLogitsF32Device(
             const void *logits_device,
             int vocab_size,
@@ -274,7 +380,9 @@ namespace llaminar2
             const void *draft_token_probabilities_device = nullptr,
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
-            int inverse_sample_vocab_size = 0) override;
+            int inverse_sample_vocab_size = 0,
+            const void *threshold_base_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
             const void *target_logits_device,
             const void *draft_logits_device,
@@ -309,7 +417,9 @@ namespace llaminar2
             void *out_accepted_device,
             void *out_accept_probability_device = nullptr,
             void *out_accept_threshold_device = nullptr,
-            bool no_draft_probabilities = false) override;
+            bool no_draft_probabilities = false,
+            const void *threshold_base_position_device = nullptr,
+            int threshold_position_offset = 0) override;
         bool enqueueSpeculativeVerifyProcessedTargetDraftLogitsF32DeviceThresholdsBatchDeviceTokens(
             const void *target_logits_device,
             const void *draft_logits_device,
@@ -357,8 +467,11 @@ namespace llaminar2
             bool has_bonus_token,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
-            void *out_meta_device) override;
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            int leading_committed_output_count = 0) override;
         bool enqueueSummarizeSpeculativeVerifyBatchDeviceFirstToken(
             const void *verify_tokens_device,
             const void *verify_accepted_device,
@@ -370,8 +483,45 @@ namespace llaminar2
             bool has_bonus_token,
             int device_id,
             void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            int leading_committed_output_count = 0) override;
+        bool enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            const void *greedy_draft_tokens_device,
+            int row_count,
+            const void *first_token_device,
+            const void *stop_tokens_device,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
             void *out_meta_device) override;
+        bool enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            int target_row_stride,
+            int top_k,
+            int row_count,
+            uint64_t threshold_seed,
+            const void *threshold_position_device,
+            int threshold_position_offset,
+            const void *verifier_input_tokens_device,
+            const void *stop_tokens_device,
+            const void *generation_control_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *sampled_target_tokens_device,
+            void *out_tokens_device,
+            void *out_meta_device,
+            void *first_transaction_diagnostic_device = nullptr) override;
         bool enqueueSummarizeGreedySpeculativeVerifyBatch(
             const void *verify_tokens_device,
             const void *draft_tokens_device,
@@ -381,8 +531,144 @@ namespace llaminar2
             int stop_token_count,
             int device_id,
             void *stream,
+            int out_token_capacity,
             void *out_tokens_device,
-            void *out_meta_device) override;
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            int leading_committed_output_count = 0) override;
+        bool enqueueSummarizeGreedySpeculativeVerifyBatchDeviceControls(
+            const void *verify_tokens_device,
+            const void *draft_tokens_device,
+            int compare_row_count,
+            const void *active_verifier_row_count_device,
+            const void *stop_tokens_device,
+            int device_id,
+            void *stream,
+            int out_token_capacity,
+            void *out_tokens_device,
+            void *out_meta_device,
+            const void *max_state_commit_rows_device = nullptr,
+            const void *next_leading_committed_output_count_device = nullptr) override;
+        bool enqueueAdvanceSpeculativeCommitBoundary(
+            void *meta_device,
+            int request_count,
+            int meta_stride,
+            void *decode_rounds_committed_device,
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream) override;
+        bool enqueuePublishSerialDecodeCommitBoundary(
+            void *decode_rounds_committed_device,
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueAcknowledgeDecodeCommitBoundary(
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueInitializeDeviceMoERebalanceDispatchTicket(
+            uint64_t session_epoch,
+            uint64_t workspace_generation,
+            uint32_t participant_id,
+            uint32_t participant_count,
+            void *ticket_device,
+            int device_id,
+            void *stream) override;
+        bool enqueuePublishDeviceMoERebalanceDispatchTicket(
+            const void *controller_magic_device,
+            const void *controller_version_device,
+            const void *controller_error_device,
+            const void *decode_rounds_committed_device,
+            const void *decode_rounds_until_maintenance_device,
+            const void *maintenance_due_device,
+            const void *decode_boundary_advanced_device,
+            void *ticket_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueInitializeDeviceGeneration(
+            int request_count,
+            int max_new_tokens,
+            const sampling_math::DeviceGenerationPolicy &depth_policy,
+            sampling_math::DeviceGenerationLeadingRowDisposition
+                initial_leading_row_disposition,
+            int response_token_stride,
+            void *response_tokens_device,
+            int control_stride,
+            void *control_device,
+            int device_id,
+            void *stream) override;
+        /** @copydoc IBackend::enqueuePublishOrdinaryGenerationSample */
+        bool enqueuePublishOrdinaryGenerationSample(
+            const sampling_math::OrdinaryGenerationPublication &publication,
+            int device_id, void *stream) override;
+        bool enqueueInitializeDeviceGenerationDispatchTicket(
+            uint64_t session_epoch,
+            uint64_t workspace_generation,
+            void *control_device,
+            int control_stride,
+            int request_count,
+            void *dispatch_tickets_device,
+            int device_id,
+            void *stream) override;
+        bool enqueuePublishDeviceGenerationDispatchTickets(
+            void *control_device,
+            int control_stride,
+            int request_count,
+            const void *maintenance_due_device,
+            void *dispatch_tickets_device,
+            int device_id,
+            void *stream) override;
+        bool enqueuePublishMoECurrentBatchLLEPEvidenceToGenerationControl(
+            const void *runtime_layers_device,
+            int layer_count,
+            void *generation_control_device,
+            int generation_control_stride,
+            int request_count,
+            int device_id,
+            void *stream) override;
+        bool enqueuePrepareDeviceGenerationTransactionBudget(
+            void *control_device,
+            int control_stride,
+            int request_count,
+            int verifier_row_capacity,
+            const void *maintenance_rows_remaining_device,
+            const void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+            const void *output_tokens_device,
+            int output_token_stride,
+            void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            void *response_tokens_device,
+            int response_token_stride,
+            void *control_device,
+            int control_stride,
+            int device_id,
+            void *stream,
+            void *out_restore_rows_device,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device,
+            void *out_next_condition_tokens_device = nullptr,
+            void *out_all_drafts_accepted_flags_device = nullptr,
+            void *out_stopped_flags_device = nullptr,
+            void *out_next_sidecar_condition_tokens_device = nullptr,
+            void *out_next_sidecar_position_ids_device = nullptr,
+            void *out_next_verifier_condition_tokens_device = nullptr,
+            const void *verifier_input_tokens_device = nullptr,
+            int verifier_input_token_stride = 0,
+            void *out_committed_verifier_identity_device = nullptr) override;
         bool enqueueDeriveSpeculativePublicationMetadata(
             const void *meta_device,
             int meta_stride,
@@ -400,27 +686,99 @@ namespace llaminar2
             const void *output_tokens_device = nullptr,
             int output_token_stride = 0,
             void *out_all_drafts_accepted_flags_device = nullptr,
-            void *out_stopped_flags_device = nullptr) override;
-        bool enqueueDeriveShiftedSpeculativePublicationMetadata(
-            const void *meta_device,
-            int meta_stride,
+            void *out_stopped_flags_device = nullptr,
+            void *out_next_verifier_condition_tokens_device = nullptr) override;
+        bool enqueueDeriveShiftedSpeculativePublicationMetadataFromPrimary(
             const void *base_cached_tokens_device,
+            const void *main_target_cached_tokens_device,
+            const void *main_publication_ok_device,
             int request_count,
-            int padded_state_rows_per_request,
-            int max_state_commit_rows,
             int mtp_depth,
             int device_id,
             void *stream,
             void *out_target_cached_tokens_device,
             void *out_accepted_state_counts_device,
             void *out_ok_device) override;
+        bool enqueuePrepareSpeculativeShiftedKVTokens(
+            const void *meta_device,
+            int meta_stride,
+            const void *output_tokens_device,
+            int output_token_stride,
+            int request_index,
+            int first_output_token_index,
+            int row_count,
+            int32_t filler_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            const void *base_positions_device,
+            int position_offset,
+            void *out_position_ids_device) override;
+        bool enqueuePrepareMTPBatchedSidecarInputs(
+            const void *condition_tokens_device,
+            int condition_token_stride,
+            const void *base_positions_device,
+            int position_offset,
+            int request_count,
+            int device_id,
+            void *stream,
+            void *out_condition_tokens_device,
+            void *out_position_ids_device) override;
+        bool enqueuePrepareMTPVerifierPositionIds(
+            const void *base_positions_device,
+            int request_count,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_position_ids_device) override;
+        bool enqueuePrepareMTPVerifierGeometry(
+            const void *base_positions_device,
+            const void *valid_graph_rows_device,
+            int valid_graph_row_count,
+            void *generation_control_device,
+            int generation_control_stride,
+            int request_count,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_position_ids_device,
+            void *out_request_lengths_device) override;
+        bool enqueuePrepareMTPVerifierControlledRow(
+            const void *first_token_device,
+            const void *draft_tokens_device,
+            const void *base_position_device,
+            void *generation_control_row_device,
+            int generation_control_stride,
+            int padded_seq_len,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_position_ids_device,
+            void *out_request_length_device,
+            void *out_base_position_snapshot_device) override;
+        bool enqueueInitializeMTPDeviceLogicalState(
+            const void *sampled_tokens_device,
+            const void *target_positions_device,
+            int request_count,
+            int device_id,
+            void *stream,
+            void *out_base_cached_tokens_device,
+            void *out_target_positions_device,
+            void *out_accepted_state_counts_device,
+            void *out_next_condition_tokens_device,
+            void *out_all_drafts_accepted_flags_device,
+            void *out_stopped_flags_device,
+            void *out_publication_ok_flags_device) override;
 
         // GPU-side sparse logit penalty application
+        bool prepareLogitPenaltyWorkspace(
+            int vocab_size,
+            int device_id) override;
         bool applyLogitPenaltiesF32(void *logits_device,
                                     const int *token_ids_host,
                                     const float *penalties_host,
                                     int num_penalties, int vocab_size,
-                                    int device_id, void *stream = nullptr) override;
+                                    int device_id, void *stream) override;
         bool enqueueLogitPenaltiesF32Device(void *logits_device,
                                             const void *token_ids_device,
                                             const void *penalties_device,
@@ -431,8 +789,10 @@ namespace llaminar2
         void *createEvent(int device_id) override;
         void *createTimingEvent(int device_id) override;
         void destroyEvent(void *event, int device_id) override;
-        bool recordEvent(void *event, int device_id, void *stream = nullptr) override;
+        bool recordEvent(void *event, int device_id, void *stream) override;
         bool waitForEvent(void *event, int device_id) override;
+        /** @copydoc IBackend::queryEvent */
+        bool queryEvent(void *event, int device_id, bool *ready) override;
         bool eventElapsedTimeMs(
             void *start_event,
             void *stop_event,
@@ -442,19 +802,33 @@ namespace llaminar2
         // Memory allocation operations
         void *allocate(size_t bytes, int device_id) override;
         void free(void *ptr, int device_id) override;
-        bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool memset(void *ptr, int value, size_t bytes, int device_id, void *stream) override;
+        bool enqueuePreparePrefillChunkView(
+            const void *request_token_ids_device,
+            const void *request_position_ids_device,
+            const void *request_total_rows_device,
+            const void *cached_tokens_device,
+            int request_row_capacity,
+            int bucket_seq_len,
+            int pad_token_id,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            void *out_position_ids_device,
+            void *out_real_rows_device,
+            void *out_row_stride_device) override;
         /**
          * @brief Enqueue an in-device copy on an explicit ROCm stream.
          *
          * This is the non-synchronizing copy path used by graph-friendly hot
          * loops such as MTP sidecar token chaining. Callers must pass an
-         * explicit stream or have a device context whose default stream can be
-         * resolved; the implementation deliberately refuses HIP's null stream.
+         * explicit stream; the implementation deliberately refuses HIP's null
+         * stream.
          */
         bool deviceCopyAsync(void *dst, const void *src, size_t bytes,
-                             int device_id, void *stream = nullptr) override;
+                             int device_id, void *stream) override;
         bool vectorAddInplace(void *output, const void *input, size_t count,
-                      int element_size, int device_id, void *stream = nullptr) override;
+                      int element_size, int device_id, void *stream) override;
 
         // Zero-copy mapped memory operations
         void *allocateMapped(size_t bytes, int device_id, void **device_ptr) override;
@@ -466,6 +840,25 @@ namespace llaminar2
         std::string deviceName(int device_id) const override;
         size_t deviceMemoryTotal(int device_id) const override;
         size_t deviceMemoryFree(int device_id) const override;
+        [[nodiscard]] DeviceAllocationAccounting
+        deviceAllocationAccounting(int device_id) const override;
+
+        /**
+         * @brief Trim unused HIP graph/default-pool reservations without reset.
+         * @param device_id HIP device ordinal whose retired caches are trimmed.
+         * @return Driver and allocator accounting before and after the trim.
+         */
+        DeviceMemoryCacheReclamationResult
+        trimUnusedDeviceMemoryCaches(int device_id) override;
+
+        /** @copydoc IBackend::retireExclusiveDeviceRuntimeGeneration */
+        DeviceRuntimeGenerationRetirementResult
+        retireExclusiveDeviceRuntimeGeneration(
+            const DeviceRuntimeGenerationRetirementRequest &request) override;
+
+        /** @copydoc IBackend::deviceRuntimeGeneration */
+        [[nodiscard]] std::uint64_t
+        deviceRuntimeGeneration(int device_id) const override;
 
         // Capability queries
         bool supportsBF16(int device_id) const override;
@@ -491,24 +884,88 @@ namespace llaminar2
         bool synchronizeStream(void *stream, int device_id) override;
         bool streamWaitEvent(void *stream, void *event, int device_id) override;
 
+        /** @copydoc IBackend::supportsStreamTimelineSignal32 */
+        bool supportsStreamTimelineSignal32(int device_id) const override;
+
+        /** @copydoc IBackend::allocateStreamTimelineSignal32 */
+        void *allocateStreamTimelineSignal32(int device_id) override;
+
+        /** @copydoc IBackend::freeStreamTimelineSignal32 */
+        void freeStreamTimelineSignal32(void *signal, int device_id) override;
+
+        /** @copydoc IBackend::streamWaitTimelineSignal32 */
+        bool streamWaitTimelineSignal32(
+            void *stream,
+            void *signal,
+            uint32_t value,
+            int device_id) override;
+
+        /** @copydoc IBackend::streamPublishTimelineSignal32 */
+        bool streamPublishTimelineSignal32(
+            void *stream,
+            void *signal,
+            uint32_t value,
+            int device_id) override;
+
+        /** @copydoc IBackend::supportsStreamTimelineSignal64 */
+        bool supportsStreamTimelineSignal64(int device_id) const override;
+        /** @copydoc IBackend::allocateStreamTimelineSignal64 */
+        void *allocateStreamTimelineSignal64(int device_id) override;
+        /** @copydoc IBackend::freeStreamTimelineSignal64 */
+        void freeStreamTimelineSignal64(void *signal, int device_id) override;
+        /** @copydoc IBackend::streamWaitTimelineSignal64 */
+        bool streamWaitTimelineSignal64(
+            void *stream,
+            void *signal,
+            uint64_t value,
+            int device_id) override;
+        /** @copydoc IBackend::streamPublishTimelineSignal64 */
+        bool streamPublishTimelineSignal64(
+            void *stream,
+            void *signal,
+            uint64_t value,
+            int device_id) override;
+
         // Async H2D without sync (for pipelined loading)
         bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
                                   int device_id, void *stream) override;
         bool deviceToHostOnStream(void *dst, const void *src, size_t bytes,
                                   int device_id, void *stream) override;
+        /** @copydoc IBackend::prepareMappedHostCopyKernels */
+        bool prepareMappedHostCopyKernels(int device_id) override;
+
+        /** @copydoc IBackend::enqueueBackgroundMappedCopyOnStream */
+        bool enqueueBackgroundMappedCopyOnStream(
+            void *device_region, void *mapped_host, void *mapped_alias,
+            size_t bytes, MappedTransferDirection direction,
+            int device_id, void *stream) override;
+
+        /** @copydoc IBackend::copyDeviceVisibleRegionByKernelOnStream */
+        bool copyDeviceVisibleRegionByKernelOnStream(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream) override;
+        /** @copydoc IBackend::enqueueMappedTransferProgressClaims */
+        bool enqueueMappedTransferProgressClaims(
+            const MappedTransferProgressCommand *commands,
+            MappedTransferProgressClaim *claims,
+            size_t slot_capacity,
+            int device_id,
+            void *stream) override;
+        /** @copydoc IBackend::enqueueMappedTransferProgressCopies */
+        bool enqueueMappedTransferProgressCopies(
+            const MappedTransferProgressClaim *claims,
+            MappedTransferProgressCompletion *completions,
+            size_t slot_capacity,
+            size_t maximum_bytes,
+            int device_id,
+            void *stream) override;
 
         // Pinned host memory
         void *allocatePinned(size_t bytes, int device_id) override;
         void freePinned(void *ptr, int device_id) override;
-
-        // ==== Async operations (submitted via AMDDeviceContext worker) ====
-
-        std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) override;
-        std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) override;
-        std::future<bool> synchronizeAsync(int device_id) override;
-        std::future<void *> allocateAsync(size_t bytes, int device_id) override;
-        std::future<void> freeAsync(void *ptr, int device_id) override;
-        std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) override;
 
         // ==== Extended operations (not in IBackend) ====
 
@@ -532,7 +989,7 @@ namespace llaminar2
          * @param device_id Device to use for the copy
          * @return true on success
          */
-        bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream) override;
 
         /**
          * @brief Register IO memory with HIP using hipHostRegisterIoMemory flag
@@ -677,14 +1134,32 @@ namespace llaminar2
         };
         std::vector<SampleTokenDeviceBuffers> sample_token_buffers_;
 
-        // Per-device penalty upload buffers (lazily allocated)
+        /**
+         * @brief Persistent per-device sparse-penalty publication storage.
+         *
+         * Capacity is fixed to the vocabulary on first use. An event orders
+         * cross-stream reuse without a host or device synchronization.
+         */
         struct PenaltyDeviceBuffers
         {
-            void *token_ids_ptr = nullptr;   // int[] on device
-            void *penalties_ptr = nullptr;    // float[] on device
+            void *token_ids_ptr = nullptr;  ///< int[allocated_count] on device.
+            void *penalties_ptr = nullptr;  ///< float[allocated_count] on device.
             int allocated_count = 0;
+            void *ready_event = nullptr;    ///< Event recorded after the penalty kernel.
+            void *producer_stream = nullptr; ///< Stream owning the newest publication.
+            bool publication_valid = false;
         };
         std::vector<PenaltyDeviceBuffers> penalty_buffers_;
+
+        /** Serializes publication of HIP runtime-generation identities. */
+        mutable std::mutex runtime_generation_mutex_;
+
+        /**
+         * Monotonic runtime generation per ROCm ordinal. Generation one is the
+         * initial primary-context lifetime; a successful hipDeviceReset
+         * publishes the next value.
+         */
+        std::vector<std::uint64_t> runtime_generations_;
     };
 
 } // namespace llaminar2

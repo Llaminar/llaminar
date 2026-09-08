@@ -156,7 +156,7 @@ namespace llaminar2
     // AllReduce
     // =========================================================================
 
-    TEST_F(CollectiveContextCUDATest, AllReduce)
+    TEST_F(CollectiveContextCUDATest, RejectsHostAllReduceRoutedAsCUDA)
     {
         auto inventory = buildSingleCUDAInventory();
         auto ctx = CollectiveContextFactory::createIntraNode(inventory, nullptr);
@@ -165,70 +165,44 @@ namespace llaminar2
         constexpr size_t TENSOR_SIZE = 64;
         auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
 
-        float *data = tensor->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            data[i] = static_cast<float>(i + 1);
-        }
-
         DeviceId cuda_device = DeviceId::cuda(0);
-        bool result = ctx->executeAllreduce(tensor.get(), TENSOR_SIZE, cuda_device);
-        EXPECT_TRUE(result) << "AllReduce on CUDA device routing failed";
-
-        const float *result_data = tensor->data();
-        ASSERT_NE(result_data, nullptr);
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            EXPECT_FALSE(std::isnan(result_data[i])) << "NaN at index " << i;
-            EXPECT_FALSE(std::isinf(result_data[i])) << "Inf at index " << i;
-        }
+        EXPECT_THROW(
+            ctx->executeAllreduce(
+                tensor.get(), TENSOR_SIZE, cuda_device),
+            std::invalid_argument);
     }
 
     // =========================================================================
     // AllGather
     // =========================================================================
 
-    TEST_F(CollectiveContextCUDATest, AllGather)
+    TEST_F(CollectiveContextCUDATest, RejectsHostAllGatherRoutedAsCUDA)
     {
         auto inventory = buildCUDAInventory();
         auto ctx = CollectiveContextFactory::createIntraNode(inventory, nullptr);
         ASSERT_NE(ctx, nullptr);
 
         constexpr size_t TENSOR_SIZE = 8;
-        const size_t num_devices = ctx->localDevices().size();
-
         auto local_input = std::make_unique<FP32Tensor>(
             std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
         auto full_output = std::make_unique<FP32Tensor>(
-            std::vector<size_t>{TENSOR_SIZE * num_devices}, DeviceId::cpu());
-
-        float *input_data = local_input->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            input_data[i] = static_cast<float>(i + 1);
-        }
-
-        float *output_data = full_output->mutable_data();
-        std::fill(output_data, output_data + TENSOR_SIZE * num_devices, 0.0f);
+            std::vector<size_t>{TENSOR_SIZE * 2}, DeviceId::cpu());
 
         DeviceId cuda_device = DeviceId::cuda(0);
-        bool result = ctx->executeAllgather(
-            local_input.get(), full_output.get(), TENSOR_SIZE, cuda_device);
-        EXPECT_TRUE(result) << "AllGather on CUDA device routing failed";
-
-        const float *result_data = full_output->data();
-        for (size_t i = 0; i < TENSOR_SIZE * num_devices; ++i)
-        {
-            EXPECT_FALSE(std::isnan(result_data[i])) << "NaN at index " << i;
-            EXPECT_FALSE(std::isinf(result_data[i])) << "Inf at index " << i;
-        }
+        EXPECT_THROW(
+            ctx->executeAllgather(
+                local_input.get(),
+                full_output.get(),
+                TENSOR_SIZE,
+                cuda_device),
+            std::invalid_argument);
     }
 
     // =========================================================================
     // Broadcast
     // =========================================================================
 
-    TEST_F(CollectiveContextCUDATest, Broadcast)
+    TEST_F(CollectiveContextCUDATest, RejectsHostBroadcastRoutedAsCUDA)
     {
         auto inventory = buildCUDAInventory();
         auto ctx = CollectiveContextFactory::createIntraNode(inventory, nullptr);
@@ -237,23 +211,11 @@ namespace llaminar2
         constexpr size_t TENSOR_SIZE = 64;
         auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
 
-        float *data = tensor->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            data[i] = static_cast<float>(i + 1);
-        }
-
         DeviceId cuda_device = DeviceId::cuda(0);
-        bool result = ctx->executeBroadcast(tensor.get(), TENSOR_SIZE, 0, cuda_device);
-        EXPECT_TRUE(result) << "Broadcast on CUDA device routing failed";
-
-        const float *result_data = tensor->data();
-        ASSERT_NE(result_data, nullptr);
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            EXPECT_FLOAT_EQ(result_data[i], static_cast<float>(i + 1))
-                << "Data mismatch at index " << i;
-        }
+        EXPECT_THROW(
+            ctx->executeBroadcast(
+                tensor.get(), TENSOR_SIZE, 0, cuda_device),
+            std::invalid_argument);
     }
 
 } // namespace llaminar2

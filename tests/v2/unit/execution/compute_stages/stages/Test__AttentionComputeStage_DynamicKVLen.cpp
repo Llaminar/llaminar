@@ -11,16 +11,19 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "kernels/attention/AttentionDeviceParams.h"
 #include "tensors/Tensors.h"
 #include "kernels/cpu/CPUKVCache.h"
 #include "backends/DeviceId.h"
@@ -83,6 +86,45 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prompt query rows must not multiply request-major attention scratch.
+         *
+         * This is the allocator-scale regression for a 4096-row prefill that
+         * previously requested two 256 GiB FP32 K/V conversion buffers. The
+         * compact split-decode bank remains fixed at the complete depth-15 MTP
+         * verifier capacity, while K/V conversion scales only with independent
+         * requests.
+         */
+        TEST(
+            Test__AttentionWorkspaceCardinality,
+            WorkspaceCardinalitySeparatesPromptRowsFromRequests)
+        {
+            constexpr auto decode =
+                attention::planAttentionWorkspaceCardinality(
+                    /*graph_query_rows=*/1,
+                    /*stage_request_count=*/1);
+            constexpr auto maximum_prefill =
+                attention::planAttentionWorkspaceCardinality(
+                    /*graph_query_rows=*/4096,
+                    /*stage_request_count=*/1);
+            constexpr auto batched =
+                attention::planAttentionWorkspaceCardinality(
+                    /*graph_query_rows=*/4096,
+                    /*stage_request_count=*/4);
+
+            EXPECT_EQ(
+                decode.compact_query_rows,
+                attention::kMaxGroupedVerifierAttentionRows);
+            EXPECT_EQ(
+                maximum_prefill.compact_query_rows,
+                decode.compact_query_rows);
+            EXPECT_EQ(maximum_prefill.request_count, 1);
+            EXPECT_EQ(batched.request_count, 4);
+            EXPECT_EQ(
+                batched.compact_query_rows,
+                attention::kMaxGroupedVerifierAttentionRows);
+        }
+
+        /**
          * @brief Mock KV cache for testing dynamic kv_len queries
          *
          * This mock allows us to control what get_cached_tokens() returns
@@ -123,6 +165,17 @@ namespace llaminar2
                 if (layer < 0 || layer >= num_layers_)
                     return 0;
                 return cached_tokens_[layer];
+            }
+
+            KVCacheSequenceState sequenceState(int layer, int seq_idx) const override
+            {
+                if (seq_idx != 0 || layer < 0 || layer >= num_layers_)
+                    return {};
+                return {
+                    .cached_tokens = cached_tokens_[layer],
+                    .implementation_head = 0,
+                    .wrapped = false,
+                };
             }
 
             // Unified KV access (new interface)
@@ -176,9 +229,15 @@ namespace llaminar2
                                   int *out_kv_len = nullptr,
                                   const KVReadParams *rope = nullptr) override
             {
+                (void)layer;
+                (void)seq_idx;
                 (void)target;
+                (void)out_k;
+                (void)out_v;
+                (void)out_kv_len;
                 (void)rope;
-                return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+                throw std::logic_error(
+                    "CPU attention must consume the cache's native logical view");
             }
 
             // Legacy individual accessors (deprecated)
@@ -238,26 +297,42 @@ namespace llaminar2
                 return true;
             }
 
-            void clear() override
+            bool resetRequestState(const StateResetContext &) override
             {
                 for (auto &count : cached_tokens_)
                 {
                     count = 0;
                 }
+                return true;
             }
 
-            void clear_sequence(int layer, int seq_idx) override
+            bool resetSequenceState(int seq_idx, const StateResetContext &) override
+            {
+                (void)seq_idx;
+                return true;
+            }
+            bool resetLayerSequenceState(
+                int layer,
+                int seq_idx,
+                const StateResetContext &) override
             {
                 (void)layer;
                 (void)seq_idx;
+                return true;
             }
-            void clear_layer(int layer) override { (void)layer; }
+            bool resetLayerState(int layer, const StateResetContext &) override
+            {
+                (void)layer;
+                return true;
+            }
             void evict_oldest(int tokens_to_evict) override { (void)tokens_to_evict; }
             void evict_oldest_from_sequence(int seq_idx, int tokens_to_evict) override
             {
                 (void)seq_idx;
                 (void)tokens_to_evict;
             }
+            int get_total_evicted() const override { return 0; }
+            void reset_eviction_counter() override {}
 
             DeviceId get_layer_device(int layer) const override
             {
@@ -265,8 +340,6 @@ namespace llaminar2
                 return DeviceId::cpu();
             }
 
-            int get_total_evicted() const override { return 0; }
-            void reset_eviction_counter() override {}
 
             int gather_kv_batched(int layer, int num_sequences, TensorBase *out_k,
                                   TensorBase *out_v, std::vector<int> &out_kv_lens) override
@@ -380,7 +453,7 @@ namespace llaminar2
             EXPECT_FALSE(stage.requiresGraphCaptureSegmentBoundaryAfter());
         }
 
-        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionVariantChangesAtSplitBucket)
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, GPUDecodeAttentionLaunchSignatureIsStableAcrossSequenceParallelRegimes)
         {
             AttentionComputeStage::Params params;
             params.Q = Q_.get();
@@ -389,30 +462,53 @@ namespace llaminar2
             params.output = output_.get();
             params.batch_size = 1;
             params.seq_len = 1;
-            params.kv_len = 64;
+            params.kv_len = 32;
             params.n_heads = kNumHeads;
             params.n_kv_heads = kNumKVHeads;
             params.head_dim = kHeadDim;
             params.auto_detect_mode = true;
             params.kv_cache = kv_cache_.get();
             params.layer_idx = 0;
-            params.device_id = DeviceId::rocm(0);
 
-            AttentionComputeStage stage(params);
+            constexpr std::array<int, 13> kPositions{
+                30, 31, 32,
+                62, 63, 64,
+                126, 127, 128,
+                254, 255, 256,
+                512};
+            for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            {
+                params.device_id = device;
+                AttentionComputeStage stage(params);
+                const uint64_t stable_signature =
+                    stage.graphCaptureVariantSignature();
+                EXPECT_EQ(stable_signature, 0u)
+                    << "GPU attention must not request host-selected recapture "
+                       "variants; physical launch geometry is immutable and "
+                       "device parameters select all logical work regimes"
+                    << " device=" << device.toString();
 
-            kv_cache_->setCachedTokens(0, 62); // post-append kv_len=63
-            const uint64_t bucket_a = stage.graphCaptureVariantSignature();
-            ASSERT_NE(bucket_a, 0u);
-
-            kv_cache_->setCachedTokens(0, 63); // post-append kv_len=64
-            const uint64_t bucket_a_edge = stage.graphCaptureVariantSignature();
-            EXPECT_EQ(bucket_a_edge, bucket_a);
-
-            kv_cache_->setCachedTokens(0, 64); // post-append kv_len=65
-            const uint64_t bucket_b = stage.graphCaptureVariantSignature();
-            EXPECT_NE(bucket_b, 0u);
-            EXPECT_NE(bucket_b, bucket_a)
-                << "ROCm split-K decode must recapture when crossing the 64-token launch bucket";
+                for (int query_rows = 1;
+                     query_rows <= attention::kMaxGroupedVerifierAttentionRows;
+                     ++query_rows)
+                {
+                    for (const int position : kPositions)
+                    {
+                        stage.updateDynamicParams(
+                            /*pos_offset=*/position,
+                            /*seq_len=*/query_rows);
+                        EXPECT_EQ(
+                            stage.graphCaptureVariantSignature(),
+                            stable_signature)
+                            << "GPU attention must select grouped/serial and "
+                               "short/long sequence-parallel work inside one "
+                               "captured launch envelope"
+                            << " device=" << device.toString()
+                            << " query_rows=" << query_rows
+                            << " position=" << position;
+                    }
+                }
+            }
         }
 
         TEST_F(Test__AttentionComputeStage_DynamicKVLen, CPUAndROCmPrefillGraphCaptureContractsRemainUnchanged)
@@ -1006,7 +1102,7 @@ namespace llaminar2
             EXPECT_GT(sum, 0.0f) << "Output should have contributions from all attended positions";
         }
 
-        TEST(Test__AttentionComputeStage_ROCmCaptureContract, CapturedAttentionUsesPreuploadedDeviceParams)
+        TEST(Test__AttentionComputeStage_ROCmCaptureContract, CapturedAttentionUsesPreparedDeviceParams)
         {
             const fs::path root = findRepoRoot();
             const std::string source =
@@ -1014,7 +1110,7 @@ namespace llaminar2
             ASSERT_FALSE(source.empty());
 
             const size_t params_start =
-                source.find("// Wire device_params for graph-capture replay.");
+                source.find("// Wire the device-owned parameter block for graph-capture replay.");
             ASSERT_NE(params_start, std::string::npos);
             const size_t params_end =
                 source.find("void *d_buf = workspace_->getBuffer", params_start);
@@ -1031,7 +1127,7 @@ namespace llaminar2
             const std::string active_capture_section =
                 params_section.substr(active_capture, non_capture_else - active_capture);
             EXPECT_EQ(active_capture_section.find("setDynamicAttnParams("), std::string::npos)
-                << "Captured ROCm attention execution must not mutate or upload dynamic params";
+                << "Captured ROCm attention execution must consume the already ordered device params";
             EXPECT_NE(active_capture_section.find("Attention device params were not ready before HIP graph capture"),
                       std::string::npos);
             EXPECT_NE(active_capture_section.find("dynamic_attn_query_rows_ != query_rows_for_params"),
@@ -1043,44 +1139,120 @@ namespace llaminar2
                 << "Non-captured ROCm attention still prepares params lazily for eager execution";
         }
 
+        TEST(Test__AttentionComputeStage_GPUCaptureContract, AttentionParamsHaveNoHostMirror)
+        {
+            const fs::path root = findRepoRoot();
+            const std::vector<fs::path> implementation_paths = {
+                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp",
+                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.h",
+                root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp",
+                root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.h"};
+
+            for (const fs::path &path : implementation_paths)
+            {
+                const std::string source = readFile(path);
+                ASSERT_FALSE(source.empty()) << path;
+                EXPECT_EQ(source.find("h_attn_params_"), std::string::npos) << path;
+                EXPECT_EQ(source.find("dynamic_attn_host_valid_"), std::string::npos) << path;
+                EXPECT_EQ(source.find("hipHostMalloc"), std::string::npos) << path;
+                EXPECT_EQ(source.find("hipMemcpyHostToDevice"), std::string::npos) << path;
+                EXPECT_EQ(source.find("cudaMemcpyHostToDevice"), std::string::npos) << path;
+            }
+
+            const std::string cuda_kernels = readFile(
+                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+            const std::string rocm_kernels = readFile(
+                root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip");
+            ASSERT_FALSE(cuda_kernels.empty());
+            ASSERT_FALSE(rocm_kernels.empty());
+            EXPECT_NE(cuda_kernels.find("cuda_write_attention_params_from_geometry_kernel"),
+                      std::string::npos);
+            EXPECT_NE(rocm_kernels.find("hip_write_attention_params_from_geometry_kernel"),
+                      std::string::npos);
+        }
+
         TEST(Test__AttentionComputeStage_ROCmCaptureContract, MultiRowContinuationParamsMatchCudaContract)
         {
             const fs::path root = findRepoRoot();
-            const std::string source =
+            const std::string policy =
+                readFile(root / "src/v2/kernels/attention/AttentionDeviceParams.h");
+            const std::string rocm_source =
                 readFile(root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp");
-            ASSERT_FALSE(source.empty());
+            const std::string cuda_source =
+                readFile(root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp");
+            ASSERT_FALSE(policy.empty());
+            ASSERT_FALSE(rocm_source.empty());
+            ASSERT_FALSE(cuda_source.empty());
 
-            EXPECT_NE(source.find("constexpr int MAX_SMALL_DECODE_ROWS = 4"),
+            EXPECT_NE(policy.find("inline constexpr int kMaxGroupedVerifierAttentionRows = 16"),
                       std::string::npos)
-                << "ROCm fixed-depth-3 MTP verification needs draft_count + 1 == 4 continuation rows on the decode path.";
+                << "Depth-15 MTP verification needs draft_count + 1 == 16 continuation rows.";
+            EXPECT_NE(rocm_source.find("attention::kMaxGroupedVerifierAttentionRows"),
+                      std::string::npos)
+                << "ROCm must consume the shared grouped-attention row policy.";
+            EXPECT_NE(cuda_source.find("attention::kMaxGroupedVerifierAttentionRows"),
+                      std::string::npos)
+                << "CUDA must consume the shared grouped-attention row policy.";
+
+            const std::string rocm_kernels = readFile(
+                root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip");
+            const std::string cuda_kernels = readFile(
+                root / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+            ASSERT_FALSE(rocm_kernels.empty());
+            ASSERT_FALSE(cuda_kernels.empty());
+            EXPECT_NE(
+                rocm_kernels.find(
+                    "llaminar2::attention::kMaxGroupedVerifierAttentionRows"),
+                std::string::npos)
+                << "ROCm grouped launchers must accept the complete M=2..16 policy.";
+            EXPECT_NE(
+                cuda_kernels.find(
+                    "llaminar2::attention::kMaxGroupedVerifierAttentionRows"),
+                std::string::npos)
+                << "CUDA grouped launchers must accept the complete M=2..16 policy.";
+            EXPECT_EQ(rocm_kernels.find("row_count > 4"), std::string::npos)
+                << "A stale ROCm M=4 launcher cap would contradict the shared policy.";
+            EXPECT_EQ(cuda_kernels.find("verifier_rows > 4"), std::string::npos)
+                << "A stale CUDA M=4 launcher cap would contradict the shared policy.";
 
             const std::string stage_source =
                 readFile(root / "src/v2/execution/compute_stages/stages/AttentionComputeStage.cpp");
             ASSERT_FALSE(stage_source.empty());
-            EXPECT_NE(stage_source.find("logical_seq_len <= kMTPVerifierSmallDecodeMaxRows"),
+            EXPECT_NE(stage_source.find("logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows"),
                       std::string::npos)
-                << "ROCm graph-capture preparation must pre-upload four-row verifier attention params.";
-            EXPECT_NE(stage_source.find("native-KV M=2..4 verifier path"),
+                << "ROCm graph-capture preparation must materialize sixteen device-owned verifier parameter rows.";
+            EXPECT_EQ(stage_source.find("AttentionComputeStage::graphCaptureVariantSignature"),
                       std::string::npos)
-                << "ROCm graph replay signatures must document and cover the four-row verifier path.";
-            EXPECT_NE(stage_source.find("params_.seq_len > kMTPVerifierSmallDecodeMaxRows"),
-                      std::string::npos)
-                << "ROCm graph replay signatures must be keyed for every MTP verifier row up to M=4.";
+                << "Attention must not key graph capture by verifier M or live "
+                   "KV length; the captured physical envelope owns every M=1..16 "
+                   "and short/long sequence-parallel regime.";
 
-            const std::string body = sliceFunction(
-                source,
-                "void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(",
-                "bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(");
+            const std::string rocm_body = sliceFunction(
+                rocm_kernels,
+                "__global__ void hip_write_attention_params_from_geometry_kernel(",
+                "__global__ void hip_derive_attention_params_from_request_counts_kernel(");
+            const std::string cuda_body = sliceFunction(
+                cuda_kernels,
+                "__global__ void cuda_write_attention_params_from_geometry_kernel(",
+                "__global__ void cuda_derive_attention_params_from_request_counts_kernel(");
+            ASSERT_FALSE(rocm_body.empty());
+            ASSERT_FALSE(cuda_body.empty());
 
-            EXPECT_NE(body.find("h_attn_params_[row].position_offset = position_offset + row"),
+            EXPECT_NE(rocm_body.find("out[row].position_offset = position_offset + row"),
                       std::string::npos)
-                << "ROCm M=2..4 verifier rows must use absolute continuation positions.";
-            EXPECT_NE(body.find("h_attn_params_[row].mask_stride = kv_len"),
+                << "ROCm M=2..16 verifier rows must use absolute continuation positions.";
+            EXPECT_NE(rocm_body.find("out[row].mask_stride = kv_len"),
                       std::string::npos)
-                << "ROCm M=2..4 verifier rows must keep the full verifier KV stride.";
-            EXPECT_EQ(body.find("h_attn_params_[row].position_offset = std::max(0, row_kv_len - 1)"),
+                << "ROCm M=2..16 verifier rows must keep the full verifier KV stride.";
+            EXPECT_EQ(rocm_body.find("position_offset = row_kv_len"),
                       std::string::npos)
                 << "Row-local KV length must not replace the caller's continuation offset.";
+            EXPECT_NE(cuda_body.find("out[row].position_offset = position_offset + row"),
+                      std::string::npos)
+                << "CUDA must implement the same absolute-position contract as ROCm.";
+            EXPECT_NE(cuda_body.find("out[row].mask_stride = kv_len"),
+                      std::string::npos)
+                << "CUDA must implement the same full-stride contract as ROCm.";
         }
 
     } // namespace

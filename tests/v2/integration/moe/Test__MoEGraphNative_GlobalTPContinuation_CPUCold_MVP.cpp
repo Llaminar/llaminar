@@ -125,12 +125,12 @@ namespace llaminar2::test
             return weights;
         }
 
-        ExpertRoutedTier routedTier(const std::string &name,
+        RoutedExpertTier routedTier(const std::string &name,
                                     const std::string &domain,
                                     int priority,
                                     bool fallback = false)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             tier.priority = priority;
@@ -138,35 +138,35 @@ namespace llaminar2::test
             return tier;
         }
 
-        MoEExpertParallelPlan makeCpuColdPlan()
+        MoERoutedExpertPlacementPlan makeCpuColdPlan()
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "cpu_hot";
             plan.shared_expert_domain = "cpu_hot";
             plan.continuation_domain_spec.domain = "cpu_hot";
             plan.continuation_domain_spec.logical_root_participant = kContinuationRoot;
             plan.continuation_domain_spec.hidden_layout = MoEContinuationActivationLayout::ReplicatedHidden;
-            plan.residency_policy = ExpertResidencyPolicy::StaticById;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
 
-            ExpertComputeDomain hot;
+            RoutedExpertDomain hot;
             hot.name = "cpu_hot";
-            hot.kind = ExpertDomainKind::SingleDevice;
+            hot.scope = ExecutionDomainScope::SINGLE;
             hot.backend = CollectiveBackendType::MPI;
             hot.participants = {GlobalDeviceAddress::cpu(0)};
             hot.world_ranks = {0};
             hot.owner_rank = 0;
-            hot.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            hot.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
-            ExpertComputeDomain cold;
+            RoutedExpertDomain cold;
             cold.name = "cpu_cold";
-            cold.kind = ExpertDomainKind::SingleDevice;
+            cold.scope = ExecutionDomainScope::SINGLE;
             cold.backend = CollectiveBackendType::MPI;
             cold.participants = {GlobalDeviceAddress::cpu(1)};
             cold.world_ranks = {1};
             cold.owner_rank = 1;
-            cold.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            cold.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
             plan.domains = {hot, cold};
             plan.routed_tiers = {
@@ -174,7 +174,7 @@ namespace llaminar2::test
                 routedTier("cold", "cpu_cold", 1, true),
             };
             plan.placements = {
-                ExpertLayerPlacement{.layer = kLayer,
+                RoutedExpertLayerPlacement{.layer = kLayer,
                                      .routed_expert_tier = {kColdTier, kColdTier, kColdTier, kColdTier}},
             };
             return plan;
@@ -277,7 +277,10 @@ namespace llaminar2::test
             cpu_ctx_ = std::make_unique<llaminar2::testing::MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
             mpi_ctx_ = std::make_shared<MPIContext>(rank_, world_size_, MPI_COMM_WORLD);
             collective_ = std::make_unique<MoEOverlayMPISparseCollectiveContext>(
-                MoEOverlayMPISparseCollectiveContext::Config{.mpi_ctx = mpi_ctx_, .local_participant_id = rank_});
+                MoEOverlayMPISparseCollectiveContext::Config{
+                    .mpi_ctx = mpi_ctx_,
+                    .local_participant_ids = {rank_},
+                });
             continuation_tp_ = GlobalTPContext::createWithSplit(
                 MPI_COMM_WORLD,
                 /*domain_id=*/kDomain,

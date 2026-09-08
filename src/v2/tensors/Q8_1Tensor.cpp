@@ -201,10 +201,11 @@ namespace llaminar2
 
     Q8_1Tensor::~Q8_1Tensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 
@@ -1283,6 +1284,20 @@ namespace llaminar2
         ISA_DISPATCH_VOID(q8_1_requantize, row_blocks, blocks_per_row, inv_row_scale, output);
 
         return row_scale;
+    }
+
+    /**
+     * @brief Pack one Q8_1 source block into the normalized raw-INT8 layout.
+     *
+     * The source sum is derivable from `qs` and is not consumed by weight GEMM,
+     * so the device representation retains only exact values and scale.
+     */
+    void Q8_1Tensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
+        const auto *block = &typed_data()[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
+        std::memcpy(vnniPayloadDst(ctx, linear), block->qs, 32);
+        ctx.scales_array[linear] = block->d;
     }
 
 } // namespace llaminar2

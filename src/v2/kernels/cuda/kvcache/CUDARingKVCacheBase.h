@@ -3,7 +3,7 @@
  * @brief Common base class for CUDA ring buffer KV caches
  * @author David Sanftenberg
  *
- * Extracts shared ring buffer bookkeeping, graph capture support,
+ * Extracts shared device-resident ring metadata, graph capture support,
  * and common IKVCache implementations from CUDARingKVCache<P> and
  * CUDARingKVCacheTQ into a single base class.
  *
@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../../IKVCache.h"
+#include <vector>
 
 namespace llaminar2
 {
@@ -25,14 +26,10 @@ namespace llaminar2
     /**
      * @brief Common base for CUDA ring buffer KV caches.
      *
-     * Stores core dimensions (layers, batch, seq_len, heads, etc.),
-     * manages graph capture head params (d_head_params_/h_head_params_),
-     * and provides shared IKVCache implementations via abstract
-     * entry accessors that derived classes implement.
-     *
-     * Ring buffer state (head, count per entry) is owned by derived classes
-     * in their type-specific entry structs. This base accesses them through
-     * protected pure virtual methods, avoiding any state duplication.
+     * Stores core dimensions (layers, batch, seq_len, heads, etc.), owns the
+     * canonical device-resident head/count rows, and provides shared IKVCache
+     * control-boundary operations. Derived cache entries own payload pointers
+     * only; they must never retain a second host copy of mutable ring state.
      */
     class CUDARingKVCacheBase : public IKVCache
     {
@@ -43,10 +40,6 @@ namespace llaminar2
         CUDARingKVCacheBase(const CUDARingKVCacheBase &) = delete;
         CUDARingKVCacheBase &operator=(const CUDARingKVCacheBase &) = delete;
 
-        // Bring the base-class single-arg overload into scope so it isn't
-        // hidden by the two-arg override below (silences NVCC #611-D).
-        using IKVCache::clear_sequence;
-
         // =====================================================================
         // IKVCache implementations
         // =====================================================================
@@ -54,10 +47,23 @@ namespace llaminar2
         int n_layers() const override { return n_layers_; }
         int max_seq_len() const override { return max_seq_len_; }
         int get_cached_tokens(int layer, int seq_idx = 0) const override;
+        KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool truncateSequence(
+            int seq_idx,
+            int cached_tokens,
+            void *stream = nullptr) override;
 
-        void clear() override;
-        void clear_sequence(int layer, int seq_idx) override;
-        void clear_layer(int layer) override;
+        bool resetRequestState(const StateResetContext &context) override;
+        bool resetSequenceState(
+            int seq_idx,
+            const StateResetContext &context) override;
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &context) override;
+        bool resetLayerState(
+            int layer,
+            const StateResetContext &context) override;
 
         // =====================================================================
         // Graph Capture Support (IKVCache overrides)
@@ -65,23 +71,35 @@ namespace llaminar2
 
         bool isGraphCaptureReady() const override
         {
-            return d_head_params_ != nullptr && d_append_count_params_ != nullptr;
+            return d_head_params_ != nullptr && d_count_params_ != nullptr;
         }
-        bool supportsDynamicAppendState() const override { return true; }
         bool supportsDeviceResidentSequenceStatePublication() const override
         {
             return d_head_params_ != nullptr && d_count_params_ != nullptr;
         }
-        void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
-        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override;
-        void advanceHead(int layer, int seq_idx, int num_tokens) override;
+        bool bindGraphAppendCountSource(
+            int layer,
+            int seq_idx,
+            const int32_t *append_tokens_device,
+            int captured_max_tokens,
+            void *gpu_stream) override;
         const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override;
         const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
+        size_t deviceSequenceStateCheckpointBytes() const override;
+        bool captureDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr) const override;
+        bool restoreDeviceSequenceStateCheckpoint(
+            int seq_idx,
+            const void *checkpoint_device,
+            size_t checkpoint_bytes,
+            void *stream,
+            std::string *error = nullptr) override;
         bool publishSequenceStateFromDeviceMetadata(
             const DeviceSequenceStatePublicationRequest &request,
-            std::string *error = nullptr) override;
-        bool adoptSequenceStateFromHostMetadata(
-            const HostSequenceStatePublicationRequest &request,
             std::string *error = nullptr) override;
 
         // =====================================================================
@@ -114,21 +132,78 @@ namespace llaminar2
         int kv_dim_;
         int device_id_;
 
-        // Graph capture device params
+        // Canonical graph-captured device sequence state.
         // Layout: [n_layers_ * batch_size_] ints
         int *d_head_params_ = nullptr;  ///< Device-side head position buffer
-        int *h_head_params_ = nullptr;  ///< Pinned host-side head position buffer
         int *d_count_params_ = nullptr; ///< Device-side cached-token count buffer
-        int *h_count_params_ = nullptr; ///< Pinned host-side cached-token count buffer
-        int *d_append_count_params_ = nullptr; ///< Device-side real append count override
-        int *h_append_count_params_ = nullptr; ///< Pinned host-side real append count override
+        /**
+         * @brief Stable device sources for real append counts in padded graphs.
+         *
+         * A nullptr entry means the captured append width is exact. Otherwise
+         * the pointer names a persistent arena-owned INT32 request length that
+         * append and sequence-advance kernels read directly. This table holds
+         * device addresses only; it never mirrors sequence values on the host.
+         */
+        std::vector<const int32_t *> append_count_sources_;
         bool wrap_warned_ = false;     ///< One-time warning when ring buffer wraps
+
+        /**
+         * @brief Establish this cache's allocation device on the calling thread.
+         *
+         * LocalTP participant calls share a coordinator thread, so CUDA's
+         * ambient current device can still name the previously executed sibling.
+         * Device-resident sequence-state operations call this method before
+         * touching owned pointers or launching on an owned stream.
+         *
+         * @param operation Human-readable operation name used in diagnostics.
+         * @param error Optional detailed failure destination for public APIs.
+         * @return true when the CUDA runtime selected @ref device_id_.
+         */
+        bool activateOwningDevice(
+            const char *operation,
+            std::string *error = nullptr) const;
 
         void allocateDeviceParams();
         void freeDeviceParams();
-        void refreshHostDeviceParamMirror(int layer, int seq_idx);
-        bool uploadHostDeviceParamMirror(int layer, int seq_idx, void *gpu_stream);
         const int *deviceDynamicAppendCountPtr(int layer, int seq_idx) const;
+        bool setDeviceSequenceState(
+            int layer,
+            int seq_idx,
+            int head,
+            int count,
+            void *gpu_stream);
+
+        /**
+         * @brief Remove oldest visible rows by mutating canonical device metadata.
+         *
+         * The kernel reads the current count from device memory, subtracts
+         * `num_tokens` with saturation at zero, and leaves the ring head
+         * unchanged. The caller supplies the exact stream that owns the
+         * mutation; this method performs no D2H observation and no host wait.
+         *
+         * @param layer Local cache layer index.
+         * @param seq_idx Request index within the cache batch.
+         * @param num_tokens Number of oldest visible rows to discard.
+         * @param gpu_stream Explicit CUDA stream that owns the mutation.
+         * @return true when the metadata kernel was accepted for launch.
+         */
+        bool evictOldestDeviceSequenceState(
+            int layer,
+            int seq_idx,
+            int num_tokens,
+            void *gpu_stream);
+
+        /**
+         * @brief Materialize one immutable diagnostic snapshot from device state.
+         *
+         * This method is intentionally synchronous and must never be called by
+         * graph construction, capture, or replay. It creates a temporary value,
+         * not a cache-owned host mirror.
+         */
+        bool observeDeviceSequenceState(
+            int layer,
+            int seq_idx,
+            KVCacheSequenceState *state) const;
 
         bool validLayerSeq(int layer, int seq_idx) const
         {
@@ -137,36 +212,12 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Ring State Access (implemented by derived classes)
-        // =====================================================================
-
-        /// Get the head (write) position for an entry
-        virtual int entryHead(int layer, int seq_idx) const = 0;
-
-        /// Get the count (valid tokens) for an entry
-        virtual int entryCount(int layer, int seq_idx) const = 0;
-
-        /// Set the head position for an entry
-        virtual void setEntryHead(int layer, int seq_idx, int value) = 0;
-
-        /// Set the count for an entry
-        virtual void setEntryCount(int layer, int seq_idx, int value) = 0;
-
-        /// Reset an entry to empty state (head=0, count=0, plus type-specific cleanup)
-        virtual void resetEntry(int layer, int seq_idx) = 0;
-
-        // =====================================================================
         // Hooks for derived class behaviors
         // =====================================================================
 
-        /// Called after an entry is cleared (for scratch/shadow invalidation)
-        virtual void onClearSequence(int layer, int seq_idx) {}
+        /// Called after one entry becomes logically unreachable.
+        virtual void onResetLayerSequenceState(int layer, int seq_idx) {}
 
-        /// Called when tokens are evicted during advanceHead
-        virtual void onEviction(int layer, int seq_idx, int num_evicted) {}
-
-        /// Called after head is advanced and count is updated
-        virtual void onAdvanceComplete(int layer, int seq_idx) {}
     };
 
 } // namespace llaminar2

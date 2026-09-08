@@ -553,6 +553,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Drive one request by one non-blocking MPI progress operation.
+         * @throws std::invalid_argument for a null request owner.
+         * @throws std::runtime_error if MPI_Test fails.
+         */
+        bool test(
+            MPI_Request *request,
+            MPI_Status *status = nullptr) const override
+        {
+            if (!request)
+                throw std::invalid_argument("MPI_Test requires a non-null request owner");
+            int complete = 0;
+            const int ret = MPI_Test(
+                request,
+                &complete,
+                status ? status : MPI_STATUS_IGNORE);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length = 0;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(
+                    std::string("MPI_Test failed: ") + error_string);
+            }
+            return complete != 0;
+        }
+
+        /**
          * @brief Wait for all non-blocking operations to complete
          *
          * @param requests Vector of MPI_Request handles (all set to MPI_REQUEST_NULL on completion)
@@ -710,6 +737,26 @@ namespace llaminar2
                 }
                 instance = std::make_shared<MPIContext>(rank, world_size, local_rank, MPI_COMM_WORLD);
             }
+            return instance;
+        }
+
+        /**
+         * @brief Get a process-local MPI context backed by MPI_COMM_SELF.
+         *
+         * Participant-local device graphs use this context so ordinary graph
+         * setup cannot accidentally issue a collective on a larger
+         * orchestration communicator. Cross-rank graph edges must carry their
+         * own explicit domain context.
+         *
+         * @return Shared process-lifetime context with rank 0 and size 1.
+         */
+        static std::shared_ptr<MPIContext> self()
+        {
+            static auto instance = std::make_shared<MPIContext>(
+                /*rank=*/0,
+                /*world_size=*/1,
+                /*local_rank=*/0,
+                MPI_COMM_SELF);
             return instance;
         }
 

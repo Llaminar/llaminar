@@ -7,6 +7,7 @@ FROM ubuntu:24.04
 
 ARG INSTALL_CUDA=false
 ARG INSTALL_ROCM=false
+ARG NINJA_VERSION=1.13.0
 ENV INSTALL_CUDA=${INSTALL_CUDA}
 ENV INSTALL_ROCM=${INSTALL_ROCM}
 
@@ -33,12 +34,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # so the dev environment tracks production 1:1.
 COPY scripts/docker /tmp/install-scripts
 RUN chmod +x /tmp/install-scripts/*.sh
-RUN MODE=build /tmp/install-scripts/install-system-deps.sh
+RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
+    /tmp/install-scripts/install-system-deps.sh
 
 # Dev-only extras not in the release image: debuggers, editors, perf tools,
 # graphics libs for GPU debug, linux-tools for `perf`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bc \
+        git-lfs \
         ripgrep \
         bsdmainutils \
         htop \
@@ -55,6 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         python3.12-venv \
         strace \
+        tmux \
         tree \
         unzip \
         util-linux \
@@ -62,6 +66,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xterm \
         zip \
     && rm -rf /var/lib/apt/lists/*
+
+# Register LFS filters system-wide. Repository-specific tracking rules remain
+# in .gitattributes so ordinary generated benchmark directories stay ignored.
+RUN git lfs install --system
 
 # Fix perf symlink for the Ubuntu 24.04 linux-tools-$(uname -r) bug.
 RUN KERNEL_VERSION=$(uname -r) && \
@@ -77,7 +85,11 @@ ENV CUTLASS_DIR=/opt/cutlass
 
 # Conditional CUDA 13.
 RUN if [ "$INSTALL_CUDA" = "true" ]; then \
-        MODE=full /tmp/install-scripts/install-cuda.sh; \
+        INSTALL_CUDA_PROFILERS=1 MODE=full /tmp/install-scripts/install-cuda.sh; \
+        command -v ncu >/dev/null; \
+        ncu --version; \
+        command -v nsys >/dev/null; \
+        nsys --version; \
     else \
         echo "Skipping CUDA installation"; \
     fi
@@ -114,6 +126,10 @@ RUN mkdir -p /workspaces/llaminar && chown -R vscode:vscode /workspaces
 
 USER vscode
 WORKDIR /workspaces/llaminar
+
+# Seed the runtime mount point with vscode ownership. Docker copies this
+# metadata into a newly created named volume before postCreateCommand runs.
+RUN mkdir -p /home/vscode/.codex && chmod 700 /home/vscode/.codex
 
 # MPI, CUDA, ROCm env for vscode shells.
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \

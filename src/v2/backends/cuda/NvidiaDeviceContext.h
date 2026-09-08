@@ -18,12 +18,14 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <thread>
+#include <array>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <functional>
 #include <future>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -92,11 +94,8 @@ namespace llaminar2
         // IWorkerGPUContext Interface - Work Submission (thread-safe)
         // =========================================================================
 
-        /**
-         * @brief Submit work and wait for completion (blocking)
-         * @param work Function to execute on worker thread
-         */
-        void submitAndWait(std::function<void()> work) override;
+        /** @copydoc IWorkerGPUContext::ownsCurrentThread() */
+        bool ownsCurrentThread() const noexcept override;
 
         /**
          * @brief Submit work without waiting (non-blocking)
@@ -112,6 +111,13 @@ namespace llaminar2
         void *defaultStream() override;
         void *createStream() override;
         void destroyStream(void *stream) override;
+        void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) override;
+        /** @copydoc IWorkerGPUContext::getOrCreateAuxiliaryStream(const std::string &, GPUAuxiliaryStreamSchedulingClass, bool *) */
+        void *getOrCreateAuxiliaryStream(
+            const std::string &name,
+            GPUAuxiliaryStreamSchedulingClass scheduling_class,
+            bool *created = nullptr) override;
+        void resetAuxiliaryStreams() override;
 
         // =========================================================================
         // IWorkerGPUContext Interface - Event Access (worker-thread-only)
@@ -120,8 +126,16 @@ namespace llaminar2
         void *createEvent() override;
         void destroyEvent(void *event) override;
         void recordEvent(void *event, void *stream) override;
+        bool recordEventChecked(void *event, void *stream) override;
         void waitEvent(void *event, void *stream) override;
+        bool waitEventChecked(void *event, void *stream) override;
+        bool queryEventChecked(void *event, bool &ready) override;
+        /** @copydoc IWorkerGPUContext::queryStreamExecutionState */
+        [[nodiscard]] GPUStreamExecutionState queryStreamExecutionState(
+            void *stream,
+            std::string_view boundary) override;
         void synchronizeEvent(void *event) override;
+        bool synchronizeEventChecked(void *event) override;
         float eventElapsedTime(void *start, void *stop) override;
 
         // =========================================================================
@@ -143,13 +157,15 @@ namespace llaminar2
         // =========================================================================
 
         void synchronize() override;
+        bool synchronizeChecked() override;
         void synchronizeStream(void *stream) override;
         bool synchronizeStreamChecked(void *stream) override;
-        void insertStreamDependency(void *dependent_stream, void *dependency_stream) override;
+        bool insertStreamDependency(
+            void *dependent_stream,
+            void *dependency_stream) override;
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override;
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override;
-        void clearLastError() override;
         PointerValidationResult validatePointerDevice(const void *gpu_ptr, int expected_ordinal) override;
         PointerInspectionResult inspectPointer(const void *gpu_ptr) const override;
         bool debugSynchronize() override;
@@ -202,6 +218,36 @@ namespace llaminar2
         // =========================================================================
 
         cudaStream_t default_stream_ = nullptr;
+        std::unordered_map<std::string, cudaStream_t> auxiliary_streams_;
+        /** Immutable scheduling class paired with every named stream. */
+        std::unordered_map<
+            std::string,
+            GPUAuxiliaryStreamSchedulingClass>
+            auxiliary_stream_scheduling_classes_;
+        std::mutex auxiliary_streams_mutex_;
+
+        /**
+         * @brief Number of independently leasable inter-stream handoff events.
+         *
+         * A context normally has only a handful of concurrent graph owners.
+         * Thirty-two slots leave ample headroom while keeping acquisition
+         * lock-free in ordinary execution. A caller only waits on its selected
+         * slot if more than thirty-two host threads concurrently publish a
+         * dependency for the same physical GPU.
+         */
+        static constexpr size_t kStreamDependencyEventCount = 32;
+
+        /// Persistent events used only for non-timing stream-to-stream handoffs.
+        std::array<cudaEvent_t, kStreamDependencyEventCount>
+            stream_dependency_events_{};
+
+        /// Per-event lease flags prevent concurrent record/wait pairs from aliasing.
+        std::array<std::atomic_flag, kStreamDependencyEventCount>
+            stream_dependency_event_in_use_{};
+
+        /// Round-robin ticket spreads simultaneous publishers across the event pool.
+        std::atomic<size_t> next_stream_dependency_event_{0};
+
         cublasHandle_t cublas_handle_ = nullptr;
         cublasLtHandle_t cublas_lt_handle_ = nullptr;
         void *nccl_comm_ = nullptr;
@@ -211,6 +257,8 @@ namespace llaminar2
         // =========================================================================
 
         std::thread worker_thread_;
+        /// Immutable identity published before the context reports initialized.
+        std::thread::id worker_thread_id_{};
         std::atomic<bool> running_{false};
         std::atomic<bool> shutdown_requested_{false};
 

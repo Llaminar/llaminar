@@ -22,17 +22,25 @@
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../execution/config/ExecutionPolicy.h"
 #include "../execution/config/RuntimeConfig.h"
+#include "../execution/mtp/MTPRequestTerminalPublicationGraph.h"
+#include "../execution/mtp/MTPVerifierOutcomeGraph.h"
+#include "../execution/moe/MoEOverlayAuthorityExecution.h"
+#include "../execution/moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../config/TPDomain.h"
 #include "../loaders/WeightPlan.h"
+#include "../utils/DebugEnv.h"
 #include "../utils/ToolCallTypes.h"
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <functional>
 #include <exception>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -52,11 +60,30 @@ namespace llaminar2
     class TurboQuantContext;
     class ActivationRotation;
     class DecodeExpertHistogram;
-    struct MoEExpertParallelPlan;
+    class MoEOverlayResidencyAuthority;
+    class MoEOverlayParticipantResidencyRegistry;
+    struct MoERoutedExpertPlacementPlan;
     struct MoEExpertOverlayExecutionPlan;
     class MoEExpertOverlayRuntimePlan;
+    class MoEOverlayNodeLocalRouteExchange;
+    class MoEOverlayRankBatchTransportRegistry;
+    class MoEOverlayNodeLocalDeviceControllerFabric;
     struct PipelineConfig;
-    enum class MoERebalanceMode;
+
+    /**
+     * @enum MoEDurableResidencyAuthorityKind
+     * @brief Sole authority permitted to publish durable routed-expert placement.
+     *
+     * ExpertOverlay owns every multi-participant routed-expert placement,
+     * including a one-domain, one-tier topology. Current-batch LLEP is
+     * intentionally absent: it is a request-local child transaction pinned to
+     * one ExpertOverlay epoch and never owns durable state.
+     */
+    enum class MoEDurableResidencyAuthorityKind : uint8_t
+    {
+        None = 0,         ///< No durable placement writer is installed.
+        ExpertOverlayRCU, ///< One arbitrary-tier RCU authority owns placement.
+    };
 
     // =========================================================================
     // Configuration
@@ -116,6 +143,34 @@ namespace llaminar2
         /// Enable column-parallel QKV projection (weights sharded by head)
         bool qkv_column_parallel = false;
 
+        /// True when the dense/base graph is tensor-parallel sharded.
+        ///
+        /// Graph-native MoE overlays can still use a LocalTP context as an
+        /// expert-participant domain while keeping dense weights replicated.
+        /// In that mode this flag is false, tp_ctx remains populated for the
+        /// routed-expert reduction, and dense stages must not emit TP
+        /// allreduces or use sharded dimensions.
+        bool dense_tp_enabled = true;
+
+        /// When true, dense/non-expert decode graphs use replicated full dense
+        /// weights even if prefill uses dense tensor parallelism.
+        ///
+        /// This is the "prefill TP, decode replicated" mode for MoE overlays:
+        /// large prefill reductions stay tensor-parallel, while single-token
+        /// decode avoids the dense embedding/attention/LM-head collectives.
+        /// Routed expert reductions remain controlled by the MoE overlay plan.
+        bool dense_tp_decode_replicated = false;
+
+        /// When true, decode keeps dense TP except the vocab embedding table is
+        /// mirrored to avoid one tiny d_model allreduce per decode token.
+        bool dense_tp_decode_mirrored_embedding = false;
+
+        /// Explicit semantic policy for dense/shared always-on work.
+        ///
+        /// Shared experts intentionally follow this dense policy: they are
+        /// named "expert", but execution-wise they are always-on FFN work.
+        DenseParallelPolicy dense_parallel_policy = DenseParallelPolicy::TensorParallel;
+
         // Precision and execution
         float rms_norm_eps = 1e-6f;
         float rope_theta = 10000.0f;
@@ -142,9 +197,212 @@ namespace llaminar2
         /// Multi-token prediction feature gates and verification mode.
         MTPRuntimeConfig mtp;
 
+        /**
+         * @brief Resolve the participant-local MTP terminal-logits ownership.
+         * @return Typed full-vocabulary or vocabulary-shard layout.
+         *
+         * This is the sole model-graph authority for interpreting
+         * `mtp.terminal_head_policy` together with
+         * `lm_head_column_parallel`. Runtime code must query this method rather
+         * than rebuilding the two-axis decision ad hoc.
+         */
+        [[nodiscard]] MTPTerminalLogitsLayout mtpTerminalLogitsLayout() const noexcept
+        {
+            return resolveMTPTerminalLogitsLayout(
+                lm_head_column_parallel,
+                mtp.terminal_head_policy);
+        }
+
+        /**
+         * @brief Return whether each participant owns complete MTP logits.
+         * @return True when no terminal vocabulary collective is required.
+         */
+        [[nodiscard]] bool mtpParticipantOwnsFullVocabulary() const noexcept
+        {
+            return mtpTerminalLogitsLayout() ==
+                   MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        }
+
+        /**
+         * @brief Return whether MTP replaces a sharded primary head with a mirror.
+         * @return True when this participant must bind the replicated terminal
+         *         norm and full-vocabulary LM-head weight set.
+         *
+         * Single-device graphs also own full-vocabulary logits, but they use
+         * the primary model weights and therefore return false here. This
+         * distinction keeps weight planning separate from output ownership.
+         */
+        [[nodiscard]] bool mtpUsesMirroredTerminalHeadBinding() const noexcept
+        {
+            return lm_head_column_parallel &&
+                   mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
+        }
+
+        /**
+         * @brief Return whether TP participants bind a complete MTP predictor block.
+         * @return True only when a retained MTP graph family explicitly owns
+         *         replicated dense/shared sidecar weights.
+         *
+         * This predicate requires a resolved multi-participant TP assignment;
+         * `dense_tp_enabled` alone is only a capability bit during early graph
+         * construction. It does not cover routed experts. Their residency and
+         * sparse execution remain authoritative in the ExpertOverlay plan even
+         * when the compact predictor block is replicated.
+         */
+        [[nodiscard]] bool mtpUsesReplicatedDenseSidecarBinding() const noexcept
+        {
+            const int participant_count =
+                tp_config ? tp_config->worldSize() : 1;
+            return resolveMTPShiftedKVHeadLayout(
+                       mtp,
+                       dense_tp_enabled,
+                       participant_count) ==
+                   MTPShiftedKVHeadLayout::FullModelPerParticipant;
+        }
+
+        /**
+         * @brief Return whether each participant writes a vocabulary shard.
+         * @return True only for an explicitly vocabulary-sharded MTP head on a
+         *         column-parallel primary LM-head topology.
+         */
+        [[nodiscard]] bool mtpParticipantLogitsAreVocabularySharded() const noexcept
+        {
+            return mtpTerminalLogitsLayout() ==
+                   MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        }
+
+        /**
+         * @brief Whether startup must publish the complete forward graph family.
+         *
+         * A GPU workspace address becomes part of the executable ABI once a
+         * graph captures it, while an executable CPU stage likewise retains
+         * its bound workspace address. Any configuration that can select more
+         * than one forward topology must therefore materialize every topology
+         * before the first request executes. MTP contributes grouped verifier
+         * and sidecar graphs. The two phase-split dense policies contribute a
+         * prefill topology backed by sharded weights and a compact decode
+         * topology backed by mirrored or fully replicated weights. Dynamic MoE
+         * residency adds an asynchronous maintenance graph plus decode-only
+         * ready-wave application buffers, so it independently requires the
+         * same complete family declaration. A tiered ExpertOverlay also owns
+         * process-local immutable prepared banks whose initial epoch must be
+         * published before asynchronous maintenance starts; eagerly building
+         * its graph family is what resolves and validates those exact engine
+         * identities on every participant rank.
+         *
+         * Keeping this predicate on the declarative graph configuration prevents
+         * factory call sites from accidentally treating MTP as the only source of
+         * shape-dependent GPU graph families. In particular, serial-reference
+         * runners used by MTP parity tests disable MTP while retaining replicated
+         * dense decode, and still require the same eager family publication.
+         *
+         * @return true when graph-family workspace planning must run eagerly.
+         */
+        [[nodiscard]] bool requiresEagerWorkspaceFamilyManifest() const noexcept;
+
         /// Runtime-only decode verifier mode: compute LM-head logits for every
         /// input row instead of the selected final row.
         bool compute_all_position_logits = false;
+
+        /**
+         * @brief Runtime-only grouped MTP verifier graph policy.
+         *
+         * All-position logits are also required by main-model MTP prefill, so
+         * that output policy cannot identify verifier ownership. This explicit
+         * flag lets declarative graph builders omit state-publication and
+         * diagnostic stages that belong only to condition-producing main
+         * forwards.
+         */
+        bool grouped_mtp_verifier = false;
+
+        /**
+         * @brief Graph-owned compact verifier outcome policy for this build.
+         *
+         * `grouped_mtp_verifier` identifies semantic ownership of recurrent
+         * capture slots.  This independent enum identifies the terminal
+         * sampling/reduction topology.  Keeping both explicit prevents a
+         * stochastic verifier from reusing a cached greedy graph merely because
+         * both request all-position logits.
+         */
+        MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode =
+            MTPVerifierOutcomeGraphMode::Disabled;
+
+        /**
+         * @brief Declarative ownership of terminal verifier outcome reduction.
+         *
+         * Architecture config builders set this independently of runtime MTP
+         * enablement.  Runtime graph construction may select a sampling mode,
+         * but it may not invent an ownership topology or silently add a rank
+         * collective.
+         */
+        MTPVerifierOutcomeOwnershipPolicy mtp_verifier_outcome_ownership =
+            MTPVerifierOutcomeOwnershipPolicy::Unspecified;
+
+        /**
+         * @brief Declarative ownership of request-terminal hidden publication.
+         *
+         * Architecture builders choose this independently of prompt geometry.
+         * The graph/runtime system lowers it into a complete prebuilt graph
+         * family and may not add a prompt-specific runtime graph as a repair.
+         */
+        MTPRequestTerminalHiddenPublicationPolicy
+            mtp_request_terminal_hidden_publication =
+                MTPRequestTerminalHiddenPublicationPolicy::Unspecified;
+
+        /**
+         * @brief Declarative ownership of shifted-prefill hidden-row progress.
+         *
+         * Model graph definitions choose the semantic owner. Reusable graph
+         * machinery lowers that policy into backend stages and event edges;
+         * orchestrator call sites must not manufacture host row cursors.
+         */
+        MTPShiftedPrefillHiddenPublicationPolicy
+            mtp_shifted_prefill_hidden_publication =
+                MTPShiftedPrefillHiddenPublicationPolicy::Unspecified;
+
+        /**
+         * @brief Stable arena addresses used by the terminal outcome stage.
+         *
+         * The orchestrator installs these bindings once during arena
+         * initialization.  Graph builders copy only the addresses into stage
+         * parameters; request values are refreshed on device before replay.
+         */
+        MTPVerifierOutcomeGraphBinding mtp_verifier_outcome_graph_binding;
+
+        /**
+         * @brief Runtime-only live request-batch condition transaction.
+         *
+         * A request-batched MTP step first advances one ordinary main-model row
+         * per request, samples those target rows, and only then starts sidecar
+         * drafting. This mode tells graph builders that every input row is a
+         * live decode condition whose terminal logits must be projected. It is
+         * deliberately distinct from `compute_all_position_logits`: GDN,
+         * short-conv, and KV stages update request-owned live state rather than
+         * writing speculative verifier capture slots.
+         */
+        bool live_mtp_request_batch_condition = false;
+
+        /**
+         * @brief Whether small-M stages must use grouped serial-row-equivalent math.
+         *
+         * Both speculative verifier rows and the live grouped condition forward
+         * publish state that must be byte-identical to serial M=1 decode. This
+         * common predicate keeps kernel policy symmetric without conflating
+         * their recurrent-state ownership semantics.
+         */
+        bool usesMTPGroupedDecodeEquivalentRows() const
+        {
+            /*
+             * Graph construction follows retained capacity, not the request's
+             * current execution switch.  A capacity-only model context must
+             * declare the exact grouped verifier and live-condition kernels
+             * that an enabled lease will later capture; the runtime still
+             * consults `mtp.enabled` before launching either transaction.
+             */
+            return retainsMTPGraphCapacity(mtp) &&
+                   (compute_all_position_logits ||
+                    live_mtp_request_batch_condition);
+        }
 
         /// Runtime-only verifier optimization: pack selected hidden rows into a
         /// compact scratch before LM head instead of projecting every row in
@@ -171,12 +429,11 @@ namespace llaminar2
         /// rotated after the weighted-V accumulation. Not owned by GraphConfig.
         const ActivationRotation *kv_rotation = nullptr;
 
-        /// RoPE-on-read mode: store pre-RoPE K in the KV cache and apply
-        /// position embeddings lazily during attention (fused with TQ4 dequant).
-        /// Benefits: (1) fused dequant+RoPE is nearly free (O(D) vs O(D²) dequant),
-        /// (2) position-free cache enables speculative decoding,
-        /// (3) eliminates separate RoPE computation for K.
-        /// Currently supported for TQ4 (fused) and FP32 (in-place) KV precision.
+        /// GPU RoPE-on-read preference. CUDA/ROCm may store pre-RoPE K and apply
+        /// the positional transform in their captured device cache-read path.
+        /// CPU graph policy deliberately publishes post-RoPE native cache bytes
+        /// so Q8/Q16/TurboQuant attention never materializes a conversion shadow.
+        /// Cacheless graphs also rotate projected K before attention.
         bool rope_on_read = false;
 
         // Execution settings
@@ -200,6 +457,29 @@ namespace llaminar2
 
         /// Maximum sequence length for buffer allocation (when use_graph_buffer_management=true)
         int max_seq_len = 4096;
+
+        /**
+         * @brief Maximum flattened token rows retained by one captured graph family.
+         *
+         * This is the post-admission graph envelope: it includes the maximum
+         * concurrently admitted batch and is therefore allowed to differ from
+         * @ref max_seq_len, which remains the full KV-context horizon.  A
+         * positive value is published by the production memory planner and
+         * must bound every graph-stable model scratch allocation.  Zero is
+         * reserved for direct graph-builder construction, where the builder
+         * derives a conservative envelope from its explicit build request.
+         */
+        int max_activation_rows = 0;
+
+        /**
+         * @brief Maximum logical requests represented by one retained graph transaction.
+         *
+         * This is independent of flattened activation rows: MTP contributes
+         * several physical verifier rows per request. Distributed retained graph
+         * identities must hash the logical request capacity exactly, so graph
+         * builders may not infer it by dividing an activation envelope.
+         */
+        int max_request_count = 1;
 
         /// Execution policy controlling which operations run
         ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();
@@ -300,22 +580,57 @@ namespace llaminar2
         /// global DebugEnv::allreduce_precision ("fp32" by default).
         std::unordered_map<int, std::string> tp_allreduce_precision;
 
+        /// Optional explicit transport precision for all TP allreduces.
+        /// Empty/auto/schema/default preserves the per-layer schema policy.
+        std::string tp_allreduce_precision_override;
+
         /**
          * @brief Get allreduce precision for a specific layer
          *
          * Resolution order:
-         * 1. Per-layer override from tp_allreduce_precision map
-         * 2. Global fallback from debugEnv().allreduce_precision
+         * 1. LLAMINAR_ALLREDUCE_PRECISION, when explicitly set for perf/diagnostics
+         * 2. GraphConfig::tp_allreduce_precision_override, when explicitly set
+         * 3. Per-layer override from tp_allreduce_precision map
+         * 4. Empty string, which lets execution defer to DebugEnv's default
          *
          * @param layer_idx Transformer layer index (0-based)
          * @return Precision string ("fp32", "fp16", "bf16")
          */
         std::string getAllreducePrecisionForLayer(int layer_idx) const
         {
+            const auto &env = debugEnv();
+            if (env.presence.has("LLAMINAR_ALLREDUCE_PRECISION") &&
+                !env.allreduce_precision.empty())
+            {
+                auto normalized = normalizeAllreducePrecisionOverride(env.allreduce_precision);
+                if (!normalized.empty())
+                    return normalized;
+            }
+            auto override_precision =
+                normalizeAllreducePrecisionOverride(tp_allreduce_precision_override);
+            if (!override_precision.empty())
+                return override_precision;
+
             auto it = tp_allreduce_precision.find(layer_idx);
             if (it != tp_allreduce_precision.end())
                 return it->second;
             return ""; // Empty = defer to global DebugEnv default
+        }
+
+        static std::string normalizeAllreducePrecisionOverride(std::string value)
+        {
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char c)
+                           {
+                               return static_cast<char>(std::tolower(c));
+            });
+            if (value == "auto" || value == "schema" || value == "default" || value == "off")
+                return "";
+            if (value == "f32")
+                return "fp32";
+            if (value == "f16")
+                return "fp16";
+            return value;
         }
 
         /**
@@ -388,32 +703,79 @@ namespace llaminar2
             int shared_intermediate_size = 0; ///< Shared expert FFN intermediate dim
             bool shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
 
-            /// Routed expert execution mode for the standard graph path.
-            MoEExpertMode expert_mode = MoEExpertMode::ExpertParallel;
+            /// Physical distribution of each routed expert's weights and GEMMs.
+            RoutedExpertComputePolicy routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+
+            /// Phase-specific scheduling over complete routed-expert residents.
+            RoutedExpertPhasePolicy routed_phase_policy =
+                RoutedExpertPhasePolicy::Uniform;
+
+            /// M=1 decode and grouped-verifier row assignment policy.
+            RoutedExpertAssignmentPolicy routed_decode_assignment_policy =
+                RoutedExpertAssignmentPolicy::StaticOwner;
+
+            /// Ordinary prefill row assignment policy.
+            RoutedExpertAssignmentPolicy routed_prefill_assignment_policy =
+                RoutedExpertAssignmentPolicy::StaticOwner;
+
+            /// Explicit, non-combinatorial view of all MoE execution axes.
+            MoEExecutionPolicy execution_policy = makeMoEExecutionPolicy(
+                DenseParallelPolicy::TensorParallel,
+                RoutedExpertComputePolicy::Apportioned);
+
+            /// Model-independent ordering used for immutable whole-expert owners.
+            RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal;
+
+            /// Participant coordinates used to derive a per-layer owner mask.
+            int owner_participant_index = 0;
+            int owner_participant_count = 1;
 
             /// Static contiguous expert-id range owned by this TP participant.
-            /// count < 0 means the routed expert output is full/replicated.
+            /// This cached representation is valid only for Ordinal ordering;
+            /// count < 0 means callers must use the policy-derived mask or that
+            /// routed expert output is full/replicated.
             int local_expert_start = 0;
             int local_expert_count = -1;
 
-            /// Bounded remote hot-expert cache configuration for dynamic EP.
+            /// Bounded remote hot-expert cache configuration for dynamic placement.
             MoEHotExpertCacheConfig hot_expert_cache;
 
-            /// Runtime rebalance config carried for diagnostics and controller setup.
+            /// Explicit semantic policy for routed expert replicas.
+            ExpertReplicaPolicy expert_replica_policy =
+                ExpertReplicaPolicy::HotExpertReplicaCache;
+
+            /// Ordinary prefill assignment economy and graph-window policy.
+            RoutedExpertPrefillRuntimeConfig routed_prefill_config;
+
+            /// Durable residency-maintenance controller configuration.
             MoERebalanceRuntimeConfig rebalance_config;
 
-            /// Optional histogram for decode expert tracking.
-            /// Set by the orchestrator when MoE rebalancing is enabled.
-            /// Lifetime managed by MoERebalanceController. Not owned.
+            /// Optional host-visible histogram for decode expert tracking.
+            /// Host-resident ExpertOverlay owns this object; a captured
+            /// accelerator authority deliberately leaves the pointer null and
+            /// publishes its routing evidence into device-resident banks.
             DecodeExpertHistogram *decode_histogram = nullptr;
 
-            /// MoE rebalancing mode (OFF / OBSERVE / DYNAMIC).
-            /// Set by InferenceRunnerFactory from MoERebalanceController.
-            MoERebalanceMode rebalance_mode{}; // default-initialized to OFF (value 0)
+            /// Layer index that should advance the decode histogram token window.
+            ///
+            /// Some MoE models have non-routed tail layers. The histogram
+            /// allocates by transformer layer index, but the token window must
+            /// advance at the final routed MoE layer, not necessarily
+            /// n_layers - 1. A negative value preserves the legacy final-layer
+            /// default for models that do not specify this explicitly.
+            int decode_histogram_token_boundary_layer = -1;
 
-            /// Optional same-layer expert-parallel overlay plan.
-            /// Phase 1 stores the validated value only; graph execution remains unchanged.
-            std::shared_ptr<MoEExpertParallelPlan> expert_parallel_plan = nullptr;
+            /** Sole typed writer of durable routed-expert placement. */
+            MoEDurableResidencyAuthorityKind durable_residency_authority =
+                MoEDurableResidencyAuthorityKind::None;
+
+            /** Frozen physical execution backend of that sole authority. */
+            MoEOverlayAuthorityExecutionKind authority_execution =
+                MoEOverlayAuthorityExecutionKind::Unresolved;
+
+            /// Optional same-layer routed-expert placement/overlay plan.
+            std::shared_ptr<MoERoutedExpertPlacementPlan> routed_expert_plan = nullptr;
 
             /// Runtime-resolved overlay descriptor for domain devices, ranks, and MVP lowering.
             std::shared_ptr<MoEExpertOverlayRuntimePlan> expert_overlay_runtime_plan = nullptr;
@@ -421,14 +783,85 @@ namespace llaminar2
             /// Optional rank-role execution plan used by overlay preparation and diagnostics.
             std::shared_ptr<const MoEExpertOverlayExecutionPlan> expert_overlay_execution_plan = nullptr;
 
+            /**
+             * Process-local device-owned sparse publication fabric for a
+             * multi-GPU continuation domain. Every participant graph retains
+             * this exact owner so mapped aliases and epochs outlive captures.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
+                node_local_route_exchange = nullptr;
+
+            /**
+             * Physical continuation-local route publication selected before
+             * graph construction. Multi-GPU distributed continuation graphs
+             * reject `Unresolved` rather than inferring policy from a pointer.
+             */
+            MoEOverlayNodeLocalRouteTransport node_local_route_transport =
+                MoEOverlayNodeLocalRouteTransport::Unresolved;
+
+            /// Versioned, transactional authority for live overlay residency.
+            std::shared_ptr<MoEOverlayResidencyAuthority>
+                expert_overlay_residency_authority = nullptr;
+
+            /**
+             * @brief Return whether arbitrary-tier ExpertOverlay owns placement.
+             * @return True only for the shared RCU authority.
+             */
+            [[nodiscard]] bool usesExpertOverlayDurableResidencyAuthority() const noexcept
+            {
+                return durable_residency_authority ==
+                       MoEDurableResidencyAuthorityKind::ExpertOverlayRCU;
+            }
+
+            /** Process-local prepared-engine banks selected by packet epoch. */
+            std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
+                expert_overlay_participant_residency = nullptr;
+
             /// Optional MPI context dedicated to overlay domain-worker commands.
             /// It is intentionally separate from the graph-builder MPI context so
             /// continuation-root graphs can avoid unrelated world collectives.
             std::shared_ptr<IMPIContext> overlay_mpi_ctx = nullptr;
 
+            /**
+             * Setup-owned node-local activation channels after bilateral NUMA
+             * first-touch. Captured graph builders resolve these immutable
+             * objects and must never create a replacement lazily.
+             */
+            std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
+                rank_batch_transport_registry = nullptr;
+
+            /**
+             * Node-local mapped control pages for a heterogeneous or
+             * multi-group all-GPU ExpertOverlay authority.
+             *
+             * The object exposes process-local device aliases only. Policy
+             * and lifecycle mutations are performed by captured CUDA/HIP
+             * kernels; graph builders must never treat its POSIX mapping as a
+             * host-side placement mirror.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
+                device_controller_fabric = nullptr;
+
             /// Returns true if MoE is enabled
             bool enabled() const { return num_experts > 0 && top_k > 0; }
         } moe;
+
+        /// Refresh the explicit policy value after one of its source axes changes.
+        void refreshMoEExecutionPolicy()
+        {
+            dense_parallel_policy = denseParallelPolicyFromFlags(
+                dense_tp_enabled,
+                dense_tp_decode_replicated,
+                dense_tp_decode_mirrored_embedding);
+            moe.execution_policy = makeMoEExecutionPolicy(
+                dense_parallel_policy,
+                moe.routed_compute_policy,
+                moe.routed_decode_assignment_policy,
+                moe.routed_prefill_assignment_policy,
+                moe.routed_phase_policy);
+            moe.expert_replica_policy =
+                expertReplicaPolicyFromHotExpertCache(moe.hot_expert_cache);
+        }
 
         // =================================================================
         // Heterogeneous Layer Configuration (Phase B)
@@ -721,8 +1154,27 @@ namespace llaminar2
          */
         const void *position_ids_device = nullptr;
         const std::vector<int> *sequence_lengths = nullptr;
+        const int32_t *sequence_lengths_device = nullptr;
         int batch_size = 1;
         int seq_len = 1;
+        /**
+         * @brief First request-local sequence slot addressed by this sidecar graph.
+         *
+         * Ordinary grouped decode starts at zero. Batched shifted-prefill may
+         * group several temporal rows from one request, so its one-request
+         * graph must append to that request's actual cache slot instead of
+         * silently publishing every payload into slot zero.
+         */
+        int first_sequence_index = 0;
+        /**
+         * @brief Exact producer stream for one-time sidecar device-state publication.
+         *
+         * GPU MoE sidecar construction may publish immutable runtime
+         * descriptors before its first execution. The orchestrator supplies a
+         * non-null stream and orders the eventual execution stream after that
+         * producer with a named device event.
+         */
+        void *device_state_publication_stream = nullptr;
         DeviceId device = DeviceId::cpu();
         BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
         bool kv_cache_only = false;
@@ -730,7 +1182,26 @@ namespace llaminar2
 
     struct MTPForwardOutput
     {
+        /**
+         * @brief Native MTP-head output owned by this graph participant.
+         *
+         * The resolved terminal-head layout determines this tensor exactly: it
+         * is a local vocabulary shard for explicit vocabulary-sharded GlobalTP
+         * and a complete row for single-device or mirrored execution at any TP
+         * scope.
+         */
         TensorBase *logits = nullptr;
+
+        /**
+         * @brief Full-vocabulary GlobalTP sidecar rows produced by allgather.
+         *
+         * Explicit vocabulary-sharded GlobalTP gathers only its compact MTP
+         * sidecar rows for sampling. Mirrored terminal-head policy leaves this
+         * pointer null because every rank already owns the complete
+         * distribution; a schema placeholder must never be advertised as a
+         * produced tensor.
+         */
+        TensorBase *gathered_logits = nullptr;
         TensorBase *hidden = nullptr;
 
         TensorBase *embedding = nullptr;
@@ -742,6 +1213,8 @@ namespace llaminar2
         TensorBase *q = nullptr;
         TensorBase *k = nullptr;
         TensorBase *v = nullptr;
+        TensorBase *k_full_prefill = nullptr;
+        TensorBase *v_full_prefill = nullptr;
         TensorBase *q_raw = nullptr;
         TensorBase *q_gate = nullptr;
         TensorBase *attn_output = nullptr;
@@ -753,6 +1226,7 @@ namespace llaminar2
         TensorBase *moe_expert_indices = nullptr;
         TensorBase *moe_expert_weights = nullptr;
         TensorBase *moe_combined_output = nullptr;
+        TensorBase *moe_canonical_route_contributions = nullptr;
         TensorBase *moe_shared_expert_output = nullptr;
         TensorBase *moe_gate_scratch = nullptr;
         TensorBase *moe_up_scratch = nullptr;
@@ -1022,18 +1496,34 @@ namespace llaminar2
         return bindings;
     }
 
-    inline ModelWeightBindings makeModelWeightBindings(const FrozenModelWeightSet &weight_set)
+    /**
+     * @brief Adapt frozen bindings to graph-facing weight accessors.
+     *
+     * @p preferred_device is required when a frozen authority contains
+     * heterogeneous overlay slices for the same routed-expert parent.  The
+     * returned layer accessor then resolves each binding only on that device;
+     * it never selects a CPU or peer-GPU slice by plan insertion order.
+     */
+    inline ModelWeightBindings makeModelWeightBindings(
+        const FrozenModelWeightSet &weight_set,
+        std::optional<DeviceId> preferred_device = std::nullopt)
     {
         ModelWeightBindings bindings;
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
         bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");
         bindings.mtp = makeMTPWeightBindings(weight_set);
-        bindings.get_layer_weights = [&weight_set](int layer_idx)
+        bindings.get_layer_weights = [&weight_set, preferred_device](int layer_idx)
         {
             LayerWeightBindings layer;
-            auto get = [&weight_set, layer_idx](const std::string &suffix)
+            auto get = [&weight_set, layer_idx, preferred_device](
+                           const std::string &suffix)
             {
+                if (preferred_device)
+                {
+                    return weight_set.optionalLayerForDevice(
+                        layer_idx, suffix, *preferred_device);
+                }
                 return weight_set.optionalLayer(layer_idx, suffix);
             };
 
@@ -1109,6 +1599,8 @@ namespace llaminar2
         TensorBase *Q = nullptr;
         TensorBase *K = nullptr;
         TensorBase *V = nullptr;
+        TensorBase *K_full_prefill = nullptr;
+        TensorBase *V_full_prefill = nullptr;
         TensorBase *attn_output = nullptr;
         TensorBase *gate = nullptr;
         TensorBase *up = nullptr;

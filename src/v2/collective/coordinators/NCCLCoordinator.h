@@ -75,7 +75,10 @@ namespace llaminar2
          * @brief Initialize the coordinator with CUDA device ordinals
          *
          * Spawns the coordinator thread, creates per-device streams and events,
-         * and initializes NCCL communicators using ncclCommInitAll.
+         * and initializes one configured NCCL rank per device. Because every
+         * participant is inside this process, communicator construction selects
+         * NCCL's Socket network module while preserving CUDA P2P and shared
+         * memory as higher-priority local transports.
          *
          * @param device_ordinals CUDA device ordinals (e.g., {0, 1} for GPUs 0 and 1)
          * @return true if initialization succeeded
@@ -179,6 +182,32 @@ namespace llaminar2
                                            CollectiveDataType dtype, CollectiveOp op);
 
         /**
+         * @brief In-place allreduce across local GPUs on explicit producer streams.
+         *
+         * Enqueues one grouped NCCL collective over the supplied streams and
+         * returns after launch. The caller owns any subsequent stream waits or
+         * tensor coherence events.
+         */
+        bool allreduceMultiOnStreams(const std::vector<void *> &buffers, size_t count,
+                                     CollectiveDataType dtype, CollectiveOp op,
+                                     const std::vector<void *> &streams);
+
+        bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams);
+
+        /**
+         * @brief Enqueue an anchor-free sideband bundle as one NCCL group.
+         */
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams);
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Each device thread calls this independently. NCCL internally matches
@@ -213,6 +242,66 @@ namespace llaminar2
                                            CollectiveDataType dtype, CollectiveOp op,
                                            int device_idx, void *stream);
 
+        bool allgatherSingleDeviceOnStream(const void *send_buf,
+                                           void *recv_buf,
+                                           size_t send_count,
+                                           CollectiveDataType dtype,
+                                           int device_idx,
+                                           void *stream);
+
+        bool broadcastSingleDeviceOnStream(const void *send_buf,
+                                           void *recv_buf,
+                                           size_t count,
+                                           CollectiveDataType dtype,
+                                           int root,
+                                           int device_idx,
+                                           void *stream);
+
+        /**
+         * @brief Reduce one participant's device buffer to a fixed root on the
+         *        caller's explicit CUDA stream.
+         *
+         * Every participant in the communicator must submit the same count,
+         * datatype, operation, and root in collective order. The root receives
+         * the reduced values in @p recv_buf; NCCL ignores that pointer on
+         * non-root participants. The method only enqueues stream-ordered device
+         * work. It performs no allocation, host transfer, or synchronization,
+         * and is therefore suitable for participant-local CUDA graph capture.
+         *
+         * @param send_buf Participant-local device input.
+         * @param recv_buf Root-owned device output; ignored by non-root NCCL
+         *        participants but still required to be non-null so callers
+         *        cannot accidentally publish an incomplete buffer contract.
+         * @param count Number of elements contributed by every participant.
+         * @param dtype Collective element type.
+         * @param op Reduction operation, such as `ALLREDUCE_SUM`.
+         * @param root Fixed communicator-local root participant.
+         * @param device_idx Calling participant index.
+         * @param stream Exact non-null CUDA producer stream.
+         * @return true when NCCL accepted the operation for asynchronous
+         *         execution on @p stream.
+         */
+        bool reduceSingleDeviceOnStream(const void *send_buf,
+                                        void *recv_buf,
+                                        size_t count,
+                                        CollectiveDataType dtype,
+                                        CollectiveOp op,
+                                        int root,
+                                        int device_idx,
+                                        void *stream);
+
+        bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream);
+
+        bool broadcastMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                     const std::vector<void *> &recv_buffers,
+                                     size_t count,
+                                     CollectiveDataType dtype,
+                                     int root,
+                                     const std::vector<void *> &streams);
+
         /**
          * @brief Allgather across all local GPUs
          *
@@ -228,6 +317,20 @@ namespace llaminar2
         bool allgatherMulti(const std::vector<const void *> &send_buffers,
                             const std::vector<void *> &recv_buffers,
                             size_t send_count, CollectiveDataType dtype);
+
+        /**
+         * @brief Allgather with GPU stream dependency insertion.
+         *
+         * Enqueues the grouped NCCL allgather and inserts
+         * cudaStreamWaitEvent(compute_stream, completion_event) for each device
+         * so later compute-stream work observes the gathered receive buffers
+         * without blocking the host.
+         */
+        bool allgatherMultiWithComputeDeps(
+            const std::vector<const void *> &send_buffers,
+            const std::vector<void *> &recv_buffers,
+            size_t send_count,
+            CollectiveDataType dtype);
 
         /**
          * @brief Broadcast from root to all local GPUs
@@ -365,6 +468,7 @@ namespace llaminar2
         // Internal collective implementations (called ON coordinator thread)
         bool doAllreduceMulti(const std::vector<void *> &buffers, size_t count,
                               int dtype_int, int op_int);
+        bool doInsertCollectiveInputDeps(const char *operation);
         bool doSynchronizeAll();
         bool doInsertComputeStreamDeps();
         bool doAllgatherMulti(const std::vector<const void *> &send_buffers,
@@ -409,6 +513,16 @@ namespace llaminar2
         // Direct execution mutex — serializes direct-path allreduce calls
         // that bypass the coordinator thread (see allreduceMultiWithComputeDeps)
         std::mutex direct_exec_mutex_;
+
+        /**
+         * @brief Serialize the one fatal communicator-abort transaction.
+         *
+         * LocalTP can receive the same participant failure through more than
+         * one observer. Only one caller may detach and abort the communicator
+         * clique; later callers observe the already-invalidated handles and
+         * merely request coordinator shutdown.
+         */
+        std::mutex abort_mutex_;
     };
 
 } // namespace llaminar2

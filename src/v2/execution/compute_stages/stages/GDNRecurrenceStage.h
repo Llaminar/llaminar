@@ -31,7 +31,6 @@
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -57,7 +56,6 @@ namespace llaminar2
     {
     public:
         static constexpr const char *WS_DEINTERLEAVE_SCRATCH = "gdn_deinterleave_scratch";
-        static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_effective_seq_len_scalar";
         static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_speculative_state_slots";
         static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_speculative_state_work";
 
@@ -80,12 +78,38 @@ namespace llaminar2
 
             ITensor *output = nullptr; ///< Output [seq_len, n_heads * d_v]
 
-            // Recurrence state [n_heads, d_k, d_v] — persistent across decode steps
+            /**
+             * @brief CPU-owned live recurrence state, or null for a GPU stage.
+             *
+             * CPU kernels receive this stable host pointer directly. CUDA and
+             * ROCm kernels own their persistent live state internally, so GPU
+             * graph parameters deliberately leave this pointer null. This
+             * separation prevents a graph-captured GPU stage from adopting a
+             * host mirror whose lifetime or contents can diverge from the
+             * backend's resident state bank.
+             */
             float *recurrence_state = nullptr;
 
             int seq_len = 0;
             int request_count = 1;   ///< Number of independent requests in the flattened verifier tensor.
             int request_seq_len = 0; ///< Per-request rows before flattening; 0 means seq_len for legacy graphs.
+            /**
+             * @brief Host-owned real row counts for native CPU request grouping.
+             *
+             * GPU graph replay deliberately ignores this mirror and consumes
+             * `request_seq_lens_device`; CPU execution uses the stable host
+             * vector without staging or per-request scalar dispatch.
+             */
+            const std::vector<int> *request_seq_lens_host = nullptr;
+            /**
+             * @brief Device-owned real row count for each request.
+             *
+             * The stable arena pointer is the sole GPU owner for padded
+             * request-batched recurrence. It is consumed directly by the
+             * grouped kernel during graph capture/replay and is never adopted
+             * into a host scalar.
+             */
+            const int32_t *request_seq_lens_device = nullptr;
             int n_heads = 0;     ///< Value head count (recurrence operates with this)
             int n_k_heads = 0;   ///< Key head count (for QKV split; 0 = same as n_heads)
             int d_k = 0;         ///< Key head dimension
@@ -104,10 +128,15 @@ namespace llaminar2
             /**
              * @brief Stable graph/workspace namespace for capture-sensitive buffers.
              *
-             * Main verifier graphs and MTP sidecar graphs can both contain a GDN
-             * recurrence stage for the same logical layer.  Their verifier-row
-             * snapshot slots must not alias, so graph builders pass a role prefix
-             * such as `layer12` or `MTP0` here.
+             * Main inference, grouped verifier, and live request-batch graphs can
+             * execute independently on different streams. Their verifier-row
+             * snapshots and mutable prefill scratch must therefore not alias.
+             * Graph builders pass a graph-role prefix such as
+             * `grouped_mtp_verifier`; the stage appends the logical layer only
+             * for buffers whose contents are layer-persistent.
+             *
+             * An empty namespace denotes the main inference role and preserves
+             * its historical workspace keys.
              */
             std::string workspace_namespace;
             int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
@@ -126,7 +155,7 @@ namespace llaminar2
         static_assert(StageParamsRequired<Params>);
 
         explicit GDNRecurrenceStage(Params params);
-        ~GDNRecurrenceStage() override;
+        ~GDNRecurrenceStage() override = default;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::GDN_RECURRENCE; }
@@ -143,11 +172,20 @@ namespace llaminar2
         bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
-        void updateDynamicParams(int pos_offset, int seq_len) override
-        {
-            (void)pos_offset; // GDN layers don't use position offsets
-            params_.seq_len = seq_len;
-        }
+        /**
+         * @brief Refresh the logical row geometry for the next graph execution.
+         *
+         * @param pos_offset Unused by GDN recurrence because logical history is
+         *        represented by each request's recurrent state.
+         * @param seq_len Number of rows contributed by one request.  The GDN
+         *        grouped kernel sees `request_count * seq_len` flattened rows.
+         *
+         * Request-batched graph inputs describe their dynamic width per
+         * request, while `Params::seq_len` describes the complete flattened
+         * tensor passed to the backend.  Updating both fields here preserves
+         * that distinction across cold execution, graph capture, and replay.
+         */
+        void updateDynamicParams(int pos_offset, int seq_len) override;
         bool hasDynamicParams() const override { return true; }
         bool supportsDeviceResidentDynamicPositionReplay() const override
         {
@@ -161,7 +199,7 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             if (params_.kernel)
             {
-                params_.kernel->setGPUStream(nullptr);
+                params_.kernel->clearGPUStreamBinding();
                 clearKernelVerifierStateWorkspace();
             }
         }
@@ -169,11 +207,12 @@ namespace llaminar2
         /**
          * @brief Reset request-local GDN metadata while preserving capture slots.
          *
-         * Prefill graphs capture recurrent-state snapshot buffers and the
-         * effective-length scalar by address. The replay prelude refreshes the
-         * scalar before launch, and onGraphReplayed() rebinds the kernel for
-         * publication. Do not clear the verifier workspace binding while a
-         * Ready prefill executable is being preserved.
+         * Prefill graphs capture recurrent-state snapshot buffers by address
+         * and read each request's real length from the stable device request
+         * metadata allocation. Every explicit publication entry point establishes
+         * this stage's verifier-workspace binding before enqueueing its restore
+         * kernel; graph replay itself has no host callback. Do not clear the
+         * verifier workspace binding while a Ready prefill executable is preserved.
          */
         void resetSessionStatePreservingCapturedReplay() override
         {
@@ -182,7 +221,7 @@ namespace llaminar2
             prefill_bucket_seq_len_ = 0;
             prefill_replay_params_set_ = false;
             if (params_.kernel)
-                params_.kernel->setGPUStream(nullptr);
+                params_.kernel->clearGPUStreamBinding();
         }
 
         /**
@@ -202,6 +241,18 @@ namespace llaminar2
             return verifierStateCaptureWorkspaceRequired();
         }
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream = nullptr) override;
+        /**
+         * @brief Expose the selected CPU recurrence snapshot as a byte-copy plan.
+         *
+         * Planning binds no shared backend state and performs no copy. The
+         * central MTP publisher validates every layer plan before committing
+         * all independent recurrence matrices in one OpenMP team.
+         */
+        CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
             const int *device_row_index,
             void *stream) override;
@@ -218,8 +269,32 @@ namespace llaminar2
             int request_count,
             int row_index_stride,
             void *stream) override;
-        void onGraphReplayed() override;
-        bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
+        /**
+         * @brief Publish every request's real terminal recurrence state on device.
+         *
+         * No host row list is materialized: the backend combines resident real
+         * lengths with the fixed request row width inside one grouped launch.
+         */
+        bool restoreVerifierStateCaptureRequestTerminalRows(
+            const int *device_request_seq_lens,
+            int request_count,
+            int request_row_width,
+            void *stream) override;
+        /**
+         * @brief Report direct grouped publication into request-owned live banks.
+         *
+         * CPU, CUDA, and ROCm grouped request kernels all execute directly
+         * against their request state bank when the bounded verifier snapshot
+         * window cannot cover the complete padded request matrix. In that
+         * geometry the terminal states are already live when execution returns,
+         * so a second snapshot restore would be both redundant and incorrect.
+         */
+        bool requestBatchedTerminalStateCommittedDuringExecution(
+            int request_count,
+            int request_row_width) const override;
+        void clearVerifierStateCaptureBindingAfterPublication() override;
+        /// @brief Allows cold GPU prefill graph preflight before warmup allocates recurrence state.
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
         /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
 
@@ -228,43 +303,43 @@ namespace llaminar2
         const Params &getParams() const { return params_; }
 
     private:
-        struct GpuEffectiveSeqLenState;
-
         Params params_;
         int prefill_effective_seq_len_ = 0;
         int prefill_bucket_seq_len_ = 0;
         bool prefill_replay_params_set_ = false;
-        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         uint32_t workspace_slice_id_ = 0;
         bool verifier_capture_workspace_bound_ = false;
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
         int verifier_capture_state_size_bound_ = 0;
-        std::unique_ptr<float[]> host_verifier_state_slots_;
-        size_t host_verifier_state_slot_capacity_ = 0;
-
-        // Reusable scratch for QKV deinterleaving (grow-only)
-        mutable std::vector<float> q_deinterleave_;
-        mutable std::vector<float> k_deinterleave_;
-        mutable std::vector<float> v_deinterleave_;
-
         int effectivePrefillSeqLen() const;
-        bool shouldUseRealLengthContract() const;
+        bool shouldUseScalarRealLengthContract() const;
         std::string workspaceStableId() const;
-        std::string effectiveSeqLenScalarBufferName() const;
+        std::string deinterleaveScratchBufferName() const;
         std::string speculativeStateSlotsBufferName() const;
         std::string speculativeStateWorkBufferName() const;
         int requestedSpeculativeStateSlotRows() const;
         bool verifierStateCaptureWorkspaceRequired() const;
         bool ensureVerifierStateCaptureWorkspaceBound() const;
-        bool ensureGpuEffectiveSeqLenStateInitialized();
-        bool uploadGpuEffectiveSeqLen();
-        void refreshPinnedEffectiveSeqLen();
-        void releaseGpuEffectiveSeqLenState();
         void bindKernelWorkspace();
         void clearKernelVerifierStateWorkspace();
-        const float *cpuVerifierStateCaptureSource() const;
+        /**
+         * @brief Resolve the writable CPU verifier slots from the bound manager.
+         *
+         * @return The exact manager-owned buffer address, or null when this is a
+         *         GPU stage, no slots are bound, or the binding is incomplete.
+         *
+         * The stage deliberately owns no replacement host container. Returning
+         * null therefore makes an omitted graph-family workspace participant a
+         * fatal execution error instead of concealing it with private storage.
+         */
+        float *cpuVerifierStateCaptureWorkspace() const;
+        /**
+         * @brief Publish one accepted CPU verifier row into live recurrence state.
+         * @param row Zero-based row in the manager-owned verifier slot matrix.
+         * @return true after an exact state copy, otherwise false.
+         */
         bool restoreCPUVerifierStateCaptureRowDirect(int row);
         size_t deinterleaveScratchFloats(int seq_len) const;
         bool ensureGpuDeinterleaveWorkspaceBound(int seq_len) const;

@@ -12,6 +12,7 @@
 #include "NCCLDynamicLoader.h"
 #include "utils/Logger.h"
 
+#include <climits>
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
@@ -26,14 +27,51 @@ namespace llaminar2
 
         namespace
         {
+            /**
+             * @brief NCCL 2.28 communicator-configuration ABI.
+             *
+             * NCCL names the public structure ncclConfig_v22800. Keeping this
+             * definition private prevents NCCL's global C declarations from
+             * colliding with RCCL while still giving the dynamically loaded
+             * ncclCommInitRankConfig symbol its documented layout.
+             */
+            struct NCCLConfigV22800
+            {
+                size_t size;
+                unsigned int magic;
+                unsigned int version;
+                int blocking;
+                int cga_cluster_size;
+                int min_ctas;
+                int max_ctas;
+                const char *net_name;
+                int split_share;
+                int traffic_class;
+                const char *comm_name;
+                int collnet_enable;
+                int cta_policy;
+                int shrink_share;
+                int nvls_ctas;
+                int channels_per_net_peer;
+                int nvlink_centric_sched;
+            };
+
+            constexpr unsigned int kNCCLConfigMagic = 0xcafebeefU;
+
             std::mutex g_mutex;
             void *g_library_handle = nullptr;
             std::string g_last_error;
 
             // Function pointer types
+            using ncclGetVersion_t = ncclResult_t (*)(int *);
             using ncclGetUniqueId_t = ncclResult_t (*)(ncclUniqueId *);
             using ncclCommInitRank_t = ncclResult_t (*)(ncclComm_t *, int, ncclUniqueId, int);
-            using ncclCommInitAll_t = ncclResult_t (*)(ncclComm_t *, int, const int *);
+            using ncclCommInitRankConfig_t = ncclResult_t (*)(
+                ncclComm_t *,
+                int,
+                ncclUniqueId,
+                int,
+                NCCLConfigV22800 *);
             using ncclCommDestroy_t = ncclResult_t (*)(ncclComm_t);
             using ncclCommAbort_t = ncclResult_t (*)(ncclComm_t);
             using ncclCommCount_t = ncclResult_t (*)(const ncclComm_t, int *);
@@ -59,9 +97,10 @@ namespace llaminar2
             using ncclGroupEnd_t = ncclResult_t (*)();
 
             // Function pointers
+            ncclGetVersion_t fp_ncclGetVersion = nullptr;
             ncclGetUniqueId_t fp_ncclGetUniqueId = nullptr;
             ncclCommInitRank_t fp_ncclCommInitRank = nullptr;
-            ncclCommInitAll_t fp_ncclCommInitAll = nullptr;
+            ncclCommInitRankConfig_t fp_ncclCommInitRankConfig = nullptr;
             ncclCommDestroy_t fp_ncclCommDestroy = nullptr;
             ncclCommAbort_t fp_ncclCommAbort = nullptr;
             ncclCommCount_t fp_ncclCommCount = nullptr;
@@ -97,6 +136,12 @@ namespace llaminar2
         // Public API Implementation
         // =========================================================================
 
+        /**
+         * @brief Load the canonical capture-reentry NCCL once with local symbols.
+         * @param library_path Explicit test/deployment library, or null for the
+         *        installed canonical SONAME. Failure never selects another DSO.
+         * @return Whether all required NCCL entrypoints were resolved.
+         */
         bool load(const char *library_path)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -107,56 +152,40 @@ namespace llaminar2
                 return true;
             }
 
-            // Default library names to try
-            const char *lib_paths[] = {
-                library_path,   // User-specified path (may be nullptr)
-                "libnccl.so.2", // Standard versioned name
-                "libnccl.so",   // Unversioned
-                "/lib/x86_64-linux-gnu/libnccl.so.2",
-                "/usr/lib/x86_64-linux-gnu/libnccl.so.2",
-                "/usr/local/cuda/lib64/libnccl.so.2",
-                nullptr // Sentinel
-            };
+            // The distinct SONAME is deliberate: an unpatched system library
+            // fails when a retained parent resumes capture with the same ID.
+            // Resolve exactly one dependency; never hide a missing installation
+            // by loading the incompatible distribution package instead.
+            const char *path = library_path ? library_path : "libllaminar_nccl.so.2";
 
             // Clear any previous dlerror
             dlerror();
 
-            for (const char *path : lib_paths)
-            {
-                if (!path)
-                    continue;
+            LOG_DEBUG("NCCL Dynamic Loader: Trying to load '" << path << "'");
 
-                LOG_DEBUG("NCCL Dynamic Loader: Trying to load '" << path << "'");
-
-                // RTLD_NOW: Resolve all symbols immediately (fail fast)
-                // RTLD_LOCAL: Don't add symbols to global namespace (avoid RCCL conflicts)
-                g_library_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-                if (g_library_handle)
-                {
-                    LOG_INFO("NCCL Dynamic Loader: Successfully loaded '" << path << "'");
-                    break;
-                }
-                else
-                {
-                    LOG_DEBUG("NCCL Dynamic Loader: Failed to load '" << path << "': " << dlerror());
-                }
-            }
+            // Resolve immediately, but never export NCCL symbols into RCCL's
+            // namespace. The two vendors intentionally use identical names.
+            g_library_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            if (g_library_handle)
+                LOG_INFO("NCCL Dynamic Loader: Successfully loaded '" << path << "'");
+            else
+                LOG_DEBUG("NCCL Dynamic Loader: Failed to load '" << path << "': " << dlerror());
 
             if (!g_library_handle)
             {
-                g_last_error = "Failed to load NCCL library from any known path";
+                g_last_error = std::string("Failed to load canonical NCCL library: ") + path;
                 LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
                 return false;
             }
 
             // Load all required symbols
             bool success = true;
+            success = success && loadSymbol(fp_ncclGetVersion, "ncclGetVersion");
             success = success && loadSymbol(fp_ncclGetUniqueId, "ncclGetUniqueId");
             success = success && loadSymbol(fp_ncclCommInitRank, "ncclCommInitRank");
-            success = success && loadSymbol(fp_ncclCommInitAll, "ncclCommInitAll");
+            success = success && loadSymbol(fp_ncclCommInitRankConfig, "ncclCommInitRankConfig");
             success = success && loadSymbol(fp_ncclCommDestroy, "ncclCommDestroy");
-            // ncclCommAbort is optional (available in NCCL 2.4+)
-            loadSymbol(fp_ncclCommAbort, "ncclCommAbort");
+            success = success && loadSymbol(fp_ncclCommAbort, "ncclCommAbort");
             success = success && loadSymbol(fp_ncclCommCount, "ncclCommCount");
             success = success && loadSymbol(fp_ncclCommCuDevice, "ncclCommCuDevice");
             success = success && loadSymbol(fp_ncclCommUserRank, "ncclCommUserRank");
@@ -179,7 +208,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_INFO("NCCL Dynamic Loader: All " << 17 << " symbols loaded successfully");
+            LOG_INFO("NCCL Dynamic Loader: All " << 19 << " symbols loaded successfully");
             return true;
         }
 
@@ -193,9 +222,10 @@ namespace llaminar2
                 g_library_handle = nullptr;
 
                 // Clear function pointers
+                fp_ncclGetVersion = nullptr;
                 fp_ncclGetUniqueId = nullptr;
                 fp_ncclCommInitRank = nullptr;
-                fp_ncclCommInitAll = nullptr;
+                fp_ncclCommInitRankConfig = nullptr;
                 fp_ncclCommDestroy = nullptr;
                 fp_ncclCommAbort = nullptr;
                 fp_ncclCommCount = nullptr;
@@ -252,14 +282,57 @@ namespace llaminar2
             return fp_ncclCommInitRank(comm, nranks, commId, rank);
         }
 
-        ncclResult_t ncclCommInitAll(ncclComm_t *comms, int ndev, const int *devlist)
+        ncclResult_t ncclCommInitRankWithNetwork(
+            ncclComm_t *comm,
+            int nranks,
+            ncclUniqueId comm_id,
+            int rank,
+            const char *network_module)
         {
-            if (!fp_ncclCommInitAll)
+            if (network_module == nullptr || network_module[0] == '\0')
             {
-                LOG_ERROR("NCCL not loaded: ncclCommInitAll");
+                return ncclCommInitRank(comm, nranks, comm_id, rank);
+            }
+
+            if (!fp_ncclCommInitRankConfig || !fp_ncclGetVersion)
+            {
+                LOG_ERROR("NCCL not loaded: ncclCommInitRankConfig");
                 return ncclInternalError;
             }
-            return fp_ncclCommInitAll(comms, ndev, devlist);
+
+            int library_version = 0;
+            const ncclResult_t version_result = fp_ncclGetVersion(&library_version);
+            if (version_result != ncclSuccess)
+            {
+                return version_result;
+            }
+
+            const int undefined = INT_MIN;
+            NCCLConfigV22800 config{
+                .size = sizeof(NCCLConfigV22800),
+                .magic = kNCCLConfigMagic,
+                .version = static_cast<unsigned int>(library_version),
+                .blocking = undefined,
+                .cga_cluster_size = undefined,
+                .min_ctas = undefined,
+                .max_ctas = undefined,
+                .net_name = network_module,
+                .split_share = undefined,
+                .traffic_class = undefined,
+                .comm_name = nullptr,
+                .collnet_enable = undefined,
+                .cta_policy = undefined,
+                .shrink_share = undefined,
+                .nvls_ctas = undefined,
+                .channels_per_net_peer = undefined,
+                .nvlink_centric_sched = undefined,
+            };
+            return fp_ncclCommInitRankConfig(
+                comm,
+                nranks,
+                comm_id,
+                rank,
+                &config);
         }
 
         ncclResult_t ncclCommDestroy(ncclComm_t comm)
@@ -276,15 +349,10 @@ namespace llaminar2
         {
             if (!fp_ncclCommAbort)
             {
-                LOG_WARN("ncclCommAbort not available — falling back to ncclCommDestroy");
-                return ncclCommDestroy(comm);
+                LOG_ERROR("NCCL not loaded: ncclCommAbort");
+                return ncclInternalError;
             }
             return fp_ncclCommAbort(comm);
-        }
-
-        bool hasCommAbort()
-        {
-            return fp_ncclCommAbort != nullptr;
         }
 
         ncclResult_t ncclCommCount(const ncclComm_t comm, int *count)

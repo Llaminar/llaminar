@@ -2,7 +2,8 @@
  * @file ROCmEmbeddingKernels.hip
  * @brief ROCm/HIP kernels for embedding lookup operations
  *
- * Implements FP32, BF16, FP16, Q8_1, and EmbedQ8 (universal quantized) embedding lookups.
+ * Implements FP32, native FP16/BF16 source, typed output, and EmbedQ8
+ * (universal quantized) embedding lookups.
  */
 
 #include <hip/hip_runtime.h>
@@ -104,6 +105,66 @@ __global__ void rocm_embedding_fp32_kernel(
 
         output[idx] = embed_data[local_id * d_model + dim_idx];
     }
+}
+
+// ============================================================================
+// Native 16-bit Floating Embedding Tables with FP32 Output
+// ============================================================================
+
+/** @brief Read a resident FP16 embedding table and publish FP32 activations. */
+__global__ void rocm_embedding_fp16_source_fp32_kernel(
+    const uint16_t *__restrict__ embed_data,
+    const int *__restrict__ token_ids,
+    float *__restrict__ output,
+    int num_tokens,
+    int d_model,
+    int vocab_size,
+    int vocab_offset)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements = num_tokens * d_model;
+    if (idx >= total_elements)
+        return;
+
+    const int token_idx = idx / d_model;
+    const int dim_idx = idx % d_model;
+    const int local_id = token_ids[token_idx] - vocab_offset;
+    if (local_id < 0 || local_id >= vocab_size)
+    {
+        output[idx] = 0.0f;
+        return;
+    }
+
+    const uint16_t source_bits = embed_data[local_id * d_model + dim_idx];
+    output[idx] = __half2float(*reinterpret_cast<const __half *>(&source_bits));
+}
+
+/** @brief Read a resident BF16 embedding table and publish FP32 activations. */
+__global__ void rocm_embedding_bf16_source_fp32_kernel(
+    const uint16_t *__restrict__ embed_data,
+    const int *__restrict__ token_ids,
+    float *__restrict__ output,
+    int num_tokens,
+    int d_model,
+    int vocab_size,
+    int vocab_offset)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements = num_tokens * d_model;
+    if (idx >= total_elements)
+        return;
+
+    const int token_idx = idx / d_model;
+    const int dim_idx = idx % d_model;
+    const int local_id = token_ids[token_idx] - vocab_offset;
+    if (local_id < 0 || local_id >= vocab_size)
+    {
+        output[idx] = 0.0f;
+        return;
+    }
+
+    const uint16_t source_bits = embed_data[local_id * d_model + dim_idx];
+    output[idx] = __uint_as_float(static_cast<uint32_t>(source_bits) << 16);
 }
 
 // ============================================================================
@@ -332,6 +393,46 @@ extern "C"
             embed_data, token_ids, output, num_tokens, d_model, vocab_size, vocab_offset);
 
         // No sync needed - coherence system handles sync when data is read
+        return hipGetLastError();
+    }
+
+    /** @brief Launch native FP16-table to FP32 embedding lookup. */
+    hipError_t hipOps_embedding_fp16_source_fp32(
+        const uint16_t *embed_data,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset,
+        hipStream_t stream)
+    {
+        (void)hipGetLastError();
+        const int total_elements = num_tokens * d_model;
+        constexpr int block_size = 256;
+        const int grid_size = (total_elements + block_size - 1) / block_size;
+        rocm_embedding_fp16_source_fp32_kernel<<<grid_size, block_size, 0, stream>>>(
+            embed_data, token_ids, output, num_tokens, d_model, vocab_size, vocab_offset);
+        return hipGetLastError();
+    }
+
+    /** @brief Launch native BF16-table to FP32 embedding lookup. */
+    hipError_t hipOps_embedding_bf16_source_fp32(
+        const uint16_t *embed_data,
+        const int *token_ids,
+        float *output,
+        int num_tokens,
+        int d_model,
+        int vocab_size,
+        int vocab_offset,
+        hipStream_t stream)
+    {
+        (void)hipGetLastError();
+        const int total_elements = num_tokens * d_model;
+        constexpr int block_size = 256;
+        const int grid_size = (total_elements + block_size - 1) / block_size;
+        rocm_embedding_bf16_source_fp32_kernel<<<grid_size, block_size, 0, stream>>>(
+            embed_data, token_ids, output, num_tokens, d_model, vocab_size, vocab_offset);
         return hipGetLastError();
     }
 

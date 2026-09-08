@@ -1,6 +1,6 @@
 /**
  * @file BufferArena.h
- * @brief Single source of truth for all activation buffer management
+ * @brief Single source of truth for device-local activation buffer management
  *
  * BufferArena owns all activation/scratch/workspace buffers and provides:
  *   - Typed registration with BufferId keys
@@ -40,15 +40,16 @@ namespace llaminar2
     /**
      * @brief Configuration for BufferArena allocation behavior.
      *
-     * Controls mapped memory for snapshot/debugging and factory binding.
+     * Activation tensors are always ordinary host/device tensors. GPU-visible
+     * host mappings belong to explicit TransferEngine control/data-plane
+     * regions; allowing a diagnostic flag to change activation placement would
+     * make graph capture identity and replay performance depend on the caller.
      */
     struct ArenaConfig
     {
         /// TensorFactory for NUMA-aware allocation (required for allocate())
         TensorFactory *factory = nullptr;
 
-        /// Use mapped memory for GPU activation buffers (snapshot/debugging)
-        bool use_mapped_memory = false;
     };
 
     /**
@@ -58,13 +59,9 @@ namespace llaminar2
     {
         size_t total_buffers = 0;
         size_t total_bytes = 0;
-        size_t mapped_buffers = 0;
-        size_t mapped_bytes = 0;
-
         void reset()
         {
             total_buffers = total_bytes = 0;
-            mapped_buffers = mapped_bytes = 0;
         }
     };
 
@@ -123,6 +120,34 @@ namespace llaminar2
          */
         bool registerBuffer(BufferId id, size_t rows, size_t cols,
                             const char *dtype, DeviceId device);
+
+        /**
+         * @brief Register a graph-declared buffer without discarding tensor axes.
+         *
+         * BufferArena stores owned tensors as a two-dimensional matrix because
+         * the kernel-facing tensor classes expose rows and columns. Graph
+         * schemas, however, may declare tensors with any rank. This overload is
+         * the required bridge between those representations: axis zero remains
+         * the row dimension and every trailing axis is flattened into columns.
+         * Consequently, a schema shape of `[R, A, B]` is allocated as
+         * `[R, A * B]` while preserving exactly the same element capacity.
+         *
+         * Keeping this conversion inside BufferArena prevents graph callers
+         * from accidentally copying only `shape[0]` and `shape[1]`, which would
+         * silently under-allocate rank-three publication tensors. Empty shapes,
+         * zero dimensions, and products that cannot fit in `size_t` are invalid
+         * graph contracts and fail immediately before any allocation occurs.
+         *
+         * @param id Unique buffer identifier.
+         * @param descriptor Complete graph buffer descriptor, including shape,
+         *        tensor type, and target device.
+         * @return true on success, false when @p id was already registered.
+         * @throws std::invalid_argument if the descriptor has no dimensions or
+         *         contains a zero-sized dimension.
+         * @throws std::overflow_error if its flattened element count overflows
+         *         `size_t`.
+         */
+        bool registerBuffer(BufferId id, const BufferDescriptor &descriptor);
 
         /**
          * @brief Register an externally-owned buffer (weights).
@@ -197,13 +222,41 @@ namespace llaminar2
         bool allocate();
 
         /**
-         * @brief Log a per-buffer allocation summary at TRACE level.
+         * @brief Log the allocation summary and address-sorted memory map.
          *
-         * Shows each buffer's name, shape, dtype, and size. Called after
-         * allocate() to give deep visibility into activation memory usage
-         * without flooding normal DEBUG logs during graph rebuilds.
+         * The compact size summary remains TRACE-only. DEBUG logging adds an
+         * address-sorted map with half-open ranges, gaps or overlaps, device,
+         * ownership, shape, and alias group. The address map makes physical
+         * neighbors visible when diagnosing an out-of-bounds device writer.
          */
         void logAllocationSummary() const;
+
+        /**
+         * @brief Format the current arena allocation map in address order.
+         *
+         * GPU pointers are preferred whenever a tensor owns device storage;
+         * otherwise the host allocation is reported. Address spaces are
+         * grouped by device before sorting because equal virtual addresses on
+         * different GPUs are unrelated. Unbound registrations are retained at
+         * the end of their device group so a missing allocation is visible.
+         *
+         * @return Multi-line diagnostic map, or an empty string before the
+         *         arena has been allocated.
+         */
+        std::string allocationAddressMap() const;
+
+        /**
+         * @brief Establish storage for an arena buffer during graph construction.
+         *
+         * This allocation-only operation intentionally has no stream parameter:
+         * it cannot publish a write or establish device authority. Runtime
+         * producers must instead call prepareForWrite() with their exact stream.
+         *
+         * @param id Buffer whose stable GPU address is required.
+         * @param target GPU that will own the allocation.
+         * @return true after storage exists on @p target.
+         */
+        bool allocateDeviceStorage(BufferId id, DeviceId target);
 
         // =====================================================================
         // Runtime coherence (called per-stage by GraphExecutor)
@@ -225,7 +278,7 @@ namespace llaminar2
          *
          * @return true on success
          */
-        bool prepareForWrite(BufferId id, DeviceId target, void *stream = nullptr);
+        bool prepareForWrite(BufferId id, DeviceId target, void *stream);
 
         /**
          * @brief Mark buffer as written on the given device.
@@ -236,7 +289,8 @@ namespace llaminar2
          *
          * @param id      Buffer that was written
          * @param device  Device that now holds authoritative data
-         * @param stream  GPU stream where the kernel ran (nullptr = default)
+         * @param stream  Exact non-null GPU stream where the write was
+         *                enqueued. May be omitted only for CPU writes.
          */
         void markWritten(BufferId id, DeviceId device, void *stream = nullptr);
 
@@ -244,8 +298,9 @@ namespace llaminar2
          * @brief Lightweight mark for graph replay (Phase 3).
          *
          * Updates coherence state and tensor flags without recording
-         * a GPU completion event. Use when the executor will do a
-         * final synchronizeStream() at the end of the step.
+         * a per-tensor GPU completion event. Use only when the graph executor
+         * publishes the replay's graph-level completion event before any
+         * external consumer can observe the tensor.
          *
          * @param id      Buffer that was written
          * @param device  Device that now holds authoritative data

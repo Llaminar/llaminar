@@ -16,6 +16,7 @@
  *
  * Shorthand forms supported by parse():
  *   - "cuda:0" -> localhost:<current_numa>:cuda:0
+ *   - "cpu:1" -> localhost:1:cpu:0 (CPU indices name NUMA endpoints)
  *   - "0:cuda:0" -> localhost:0:cuda:0
  *   - "node1:0:cuda:0" -> full form
  *
@@ -101,6 +102,11 @@ namespace llaminar2
          *   - Full: "hostname:numa:type:ordinal" (e.g., "node1:0:cuda:0")
          *   - No host: "numa:type:ordinal" (e.g., "0:cuda:0" -> localhost:0:cuda:0)
          *   - Short: "type:ordinal" (e.g., "cuda:0" -> localhost:<current_numa>:cuda:0)
+         *   - CPU short: "cpu:numa" (e.g., "cpu:1" -> localhost:1:cpu:0)
+         *
+         * CPU execution endpoints are identified by NUMA node rather than a
+         * device ordinal. Consequently the CPU short form deliberately ignores
+         * @p current_numa and treats its numeric component as explicit locality.
          *
          * @param spec String specification
          * @param current_numa NUMA node to use for short form (NUMA_NODE_UNKNOWN if not known)
@@ -111,6 +117,10 @@ namespace llaminar2
 
         /**
          * @brief Try to parse address from string (returns nullopt on error)
+         *
+         * CPU short forms follow the same `cpu:numa` normalization documented
+         * by @ref parse.
+         *
          * @param spec String specification
          * @param current_numa NUMA node to use for short form (NUMA_NODE_UNKNOWN if not known)
          * @return Parsed GlobalDeviceAddress or nullopt if invalid

@@ -101,13 +101,29 @@ namespace llaminar2
      * data a graph runner needs: padded token IDs, absolute positions, and the
      * real/bucket shape metadata consumed by dynamic replay callbacks.
      */
+    /**
+     * @brief Authority that supplies token rows to a prepared prefill chunk.
+     *
+     * Host rows are owned and padded by `PrefillChunkExecutionInput`. Device
+     * rows have already crossed the request-admission boundary into a stable,
+     * fully initialized arena bank; the chunk then carries geometry only and
+     * must preserve the exact device pointer from `ForwardInput`.
+     */
+    enum class PrefillChunkTokenAuthority
+    {
+        HostPaddedRows,
+        DeviceResidentRows,
+    };
+
     struct PrefillChunkExecutionInput
     {
         bool ok = false;                 ///< True when all buffers were built successfully.
+        PrefillChunkTokenAuthority token_authority =
+            PrefillChunkTokenAuthority::HostPaddedRows; ///< Sole token-row owner.
         int token_offset = 0;            ///< Offset of this chunk in the original prompt.
         int real_count = 0;              ///< Real tokens in this chunk.
         int bucket_seq_len = 0;          ///< Fixed graph execution length for this chunk.
-        std::vector<int> token_ids;      ///< Owned padded token IDs [bucket_seq_len].
+        std::vector<int> token_ids;      ///< Host-owned padded rows; empty for resident device rows.
         std::vector<int> position_ids;   ///< Owned absolute position IDs [batch_size * bucket_seq_len].
         std::string error;               ///< Human-readable failure reason when ok is false.
 
@@ -126,6 +142,147 @@ namespace llaminar2
      * variable lists buckets out of order.
      */
     std::vector<int> normalizePrefillGraphBuckets(const std::vector<int> &buckets);
+
+    /**
+     * @brief Return resident graph-row candidates in throughput-first order.
+     *
+     * Only configured buckets at or below @p max_rows are candidates. When a
+     * valid context is shorter than every configured bucket, its exact length
+     * is returned as the sole candidate so short-context execution remains
+     * total without inventing intermediate capture shapes.
+     *
+     * @param buckets User/default captured-prefill bucket inventory.
+     * @param max_rows Maximum rows permitted by the request context.
+     * @return Unique positive candidates ordered from largest to smallest.
+     */
+    std::vector<int> residentPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_rows);
+
+    /**
+     * @brief Return captured-prefill candidates bounded by a segment contract.
+     *
+     * Heterogeneous execution may keep a full logical context in KV/request
+     * state while admitting only one smaller physical graph segment. This
+     * helper makes that distinction explicit so memory planning never builds
+     * a non-executable full-context workspace participant.
+     *
+     * @param buckets User/default captured-prefill bucket inventory.
+     * @param max_context_rows Logical request/KV context capacity.
+     * @param max_segment_rows Maximum rows in one physical graph transaction.
+     * @return Throughput-first candidates no larger than either capacity, or
+     *         an empty vector when either capacity is non-positive.
+     */
+    std::vector<int> segmentedPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_context_rows,
+        int max_segment_rows);
+
+    /**
+     * @brief Resolve the live prefill segment independently of shared graph capacity.
+     *
+     * MTP verifier rows and captured prefill rows may inhabit the same physical
+     * graph arena, but they are different executable shapes. A larger MTP
+     * capacity must never manufacture an extra prefill bucket. This helper is
+     * the sole clamping rule used while admitting and later publishing the
+     * prefill schedule.
+     *
+     * @param admitted_prefill_rows Prefill rows selected by capacity admission.
+     * @param configured_segment_rows Declarative upper bound for one segment.
+     * @return Positive admitted segment capacity, or zero for invalid inputs.
+     */
+    int resolvePrefillScheduleRowCapacity(
+        int admitted_prefill_rows,
+        int configured_segment_rows) noexcept;
+
+    /**
+     * @brief Restrict configured buckets to one resident graph-row capacity.
+     *
+     * The capacity itself is included as a final boundary when it is positive,
+     * allowing contexts shorter than the smallest global default bucket to
+     * remain total. The returned vector is sorted and deduplicated.
+     */
+    std::vector<int> prefillGraphBucketsAtOrBelowCapacity(
+        const std::vector<int> &buckets,
+        int resident_graph_rows);
+
+    /**
+     * @brief Select a cache-resident bucket ladder with minimum worst padding.
+     *
+     * The smallest and largest reachable buckets are retained. When the full
+     * configured inventory exceeds @p maximum_bucket_count, dynamic programming
+     * chooses the intermediate boundaries that minimize the worst multiplicative
+     * padding jump, then the sum of all jumps. This makes a finite captured
+     * graph cache a declared topology constraint instead of silently evicting
+     * setup-certified graphs and recapturing them during serving.
+     *
+     * @param buckets User/default bucket inventory.
+     * @param resident_graph_rows Largest admitted physical graph shape.
+     * @param maximum_bucket_count Number of retained prefill identities.
+     * @return Sorted non-empty ladder no larger than the cache budget, or empty
+     *         when the row capacity/count is invalid.
+     */
+    std::vector<int> retainedPrefillGraphBucketLadder(
+        const std::vector<int> &buckets,
+        int resident_graph_rows,
+        std::size_t maximum_bucket_count);
+
+    /**
+     * @brief Bound the raw-prompt bucket floor by resident graph capacity.
+     *
+     * The configured floor controls padding economy for ordinary contexts. A
+     * smaller memory-planned context has no graph shape at that global floor,
+     * so its exact resident capacity becomes the sole admissible padded
+     * bucket. Returning the configured floor unchanged in that case creates an
+     * impossible contract and would force an illegal eager fallback.
+     *
+     * @param configured_floor User/default minimum padded bucket length.
+     * @param resident_graph_rows Maximum rows owned by the resident graph; a
+     *        non-positive value means no capacity bound is available.
+     * @return Positive effective floor shared by selection and graph preflight.
+     */
+    int effectivePrefillGraphMinimumPaddedBucketSeqLen(
+        int configured_floor,
+        int resident_graph_rows) noexcept;
+
+    /**
+     * @brief Resolve the exact raw-prompt bucket inventory for one resident graph.
+     *
+     * Forward graph selection and any sideband protocol that authenticates
+     * physical row geometry must call this function. Keeping the capacity
+     * bound and minimum-padding floor here prevents an outer transaction from
+     * publishing the caller's real length while the forward engine captures a
+     * different physical bucket.
+     *
+     * @param configured_buckets User/default captured-prefill buckets.
+     * @param resident_graph_rows Maximum rows admitted by the memory plan.
+     * @param configured_floor Minimum economical raw-prompt bucket.
+     * @return Sorted unique buckets admitted by both bounds.
+     */
+    std::vector<int> rawPrefillGraphBucketsForResidentCapacity(
+        const std::vector<int> &configured_buckets,
+        int resident_graph_rows,
+        int configured_floor);
+
+    /**
+     * @brief Resolve the cache-resident raw-prompt ladder from one accounting truth.
+     *
+     * This composes the capacity/floor inventory used by forward preflight with
+     * the finite graph-cache optimizer. Memory accounting, distributed
+     * schedule publication, and execution therefore price and retain exactly
+     * the same physical graph identities.
+     *
+     * @param configured_buckets User/default captured-prefill buckets.
+     * @param resident_graph_rows Maximum rows admitted by the memory plan.
+     * @param configured_floor Minimum economical raw-prompt bucket.
+     * @param maximum_bucket_count Number of retained prefill identities.
+     * @return Sorted retained raw-prompt ladder, or empty for invalid bounds.
+     */
+    std::vector<int> retainedRawPrefillGraphBucketLadder(
+        const std::vector<int> &configured_buckets,
+        int resident_graph_rows,
+        int configured_floor,
+        std::size_t maximum_bucket_count);
 
     /**
      * @brief Select the smallest bucket that can contain real_seq_len tokens.

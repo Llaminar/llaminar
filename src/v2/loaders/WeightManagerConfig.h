@@ -88,6 +88,28 @@ namespace llaminar2
         bool has_lm_head = true;   ///< True if this PP stage loads output norm + LM head
     };
 
+    /**
+     * @brief Immutable whole-expert assignment used while slicing MoE weights.
+     *
+     * This is deliberately the same policy coordinate consumed by graph
+     * construction. Weight loading must never invent an independent contiguous
+     * rank rule, because that would let physical expert bytes disagree with the
+     * graph's router ownership mask.
+     */
+    struct RoutedExpertWeightAssignment
+    {
+        RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal;
+        int participant_index = 0;
+        int participant_count = 1;
+
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return participant_count > 0 &&
+                   participant_index >= 0 &&
+                   participant_index < participant_count;
+        }
+    };
+
     // WeightPreprocessor is defined in WeightTypes.h
 
     /**
@@ -127,6 +149,9 @@ namespace llaminar2
 
         /// Pipeline parallelism layer range (optional)
         std::optional<LayerRange> layer_range;
+
+        /// Exact static routed-expert owner coordinates for physical slicing.
+        RoutedExpertWeightAssignment routed_expert_assignment;
 
         /// Optional per-weight transform before GEMM packing
         WeightPreprocessor preprocessor;

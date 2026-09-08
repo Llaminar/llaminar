@@ -14,20 +14,34 @@
  * Each operation is benchmarked with warmup, then timed over many iterations.
  * Reports: ops/sec, throughput (GB/s for data-movement-bound ops), and
  * per-vector latency in nanoseconds.
+ *
+ * `ProductionFusedKVProfilePoint` provides the profiler-facing entry point.
+ * It repeats exactly one fully configured production operation after all
+ * allocation and TurboQuant context construction, so Linux perf samples are
+ * never polluted by a different quantizer, materializer, or setup operation.
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "kernels/cpu/turboquant/TurboQuantCodebook.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
+#include "kernels/cpu/turboquant/TurboQuantDequantizeSplitTQ.h"
 #include "kernels/cpu/turboquant/TurboQuantDequantizeTQ4.h"
 #include "kernels/cpu/turboquant/TurboQuantDequantizeTQ8.h"
+#include "kernels/cpu/turboquant/TurboQuantQuantizeKV.h"
 #include "kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
 #include "kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
 #include "kernels/cpu/CPURingKVCache.h"
@@ -688,4 +702,455 @@ TEST(Perf__TurboQuant, TQ8_DequantRow_MultiHead_D128)
     std::cout << "  Block B/W:     " << std::fixed << std::setprecision(2) << block_gb / r_bench.total_sec << " GB/s" << std::endl;
 
     EXPECT_GT(r_bench.ops_per_sec(), 0);
+}
+
+// ============================================================================
+// Production fused KV publication/materialization matrix
+// ============================================================================
+
+namespace
+{
+    struct ProductionKVGeometry
+    {
+        size_t tq4_block_bytes = 0;
+        size_t tq8_block_bytes = 0;
+    };
+
+    ProductionKVGeometry production_kv_geometry(int head_dim)
+    {
+        switch (head_dim)
+        {
+        case 64:
+            return {sizeof(TQ4Block_64), sizeof(TQ8Block_64)};
+        case 128:
+            return {sizeof(TQ4Block_128), sizeof(TQ8Block_128)};
+        case 256:
+            return {sizeof(TQ4Block_256), sizeof(TQ8Block_256)};
+        default:
+            throw std::invalid_argument("unsupported TurboQuant head dimension");
+        }
+    }
+
+    int production_kv_iterations(int rows)
+    {
+        if (rows <= 2)
+            return 100;
+        if (rows <= 8)
+            return 40;
+        if (rows <= 32)
+            return 12;
+        return 3;
+    }
+
+    /**
+     * @brief Own every persistent buffer required by one production KV point.
+     *
+     * Construction deliberately performs allocation and deterministic input
+     * generation once. The public operations below therefore contain exactly
+     * the CPU KV-cache hot paths used by append and attention materialization.
+     */
+    class ProductionKVCase final
+    {
+    public:
+        ProductionKVCase(
+            int head_dim,
+            int rows,
+            int n_kv_heads,
+            bool value_uses_tq8)
+            : head_dim_(head_dim),
+              rows_(rows),
+              n_kv_heads_(n_kv_heads),
+              value_uses_tq8_(value_uses_tq8),
+              geometry_(production_kv_geometry(head_dim)),
+              k_block_bytes_(geometry_.tq8_block_bytes),
+              v_block_bytes_(
+                  value_uses_tq8 ? geometry_.tq8_block_bytes
+                                 : geometry_.tq4_block_bytes),
+              k_row_bytes_(
+                  static_cast<size_t>(n_kv_heads) * k_block_bytes_),
+              v_row_bytes_(
+                  static_cast<size_t>(n_kv_heads) * v_block_bytes_),
+              elements_(
+                  static_cast<size_t>(rows) * n_kv_heads * head_dim),
+              k_fp32_(make_random_fp32(
+                  static_cast<int>(elements_),
+                  static_cast<unsigned>(1000 + head_dim + rows))),
+              v_fp32_(make_random_fp32(
+                  static_cast<int>(elements_),
+                  static_cast<unsigned>(2000 + head_dim + rows))),
+              k_output_(elements_),
+              v_output_(elements_),
+              k_blocks_(static_cast<size_t>(rows) * k_row_bytes_),
+              v_blocks_(static_cast<size_t>(rows) * v_row_bytes_),
+              context_(head_dim, 31, 131)
+        {
+        }
+
+        void quantize()
+        {
+            turboquant_quantize_kv_rows(
+                k_fp32_.data(),
+                v_fp32_.data(),
+                k_blocks_.data(),
+                v_blocks_.data(),
+                rows_,
+                head_dim_,
+                n_kv_heads_,
+                k_row_bytes_,
+                v_row_bytes_,
+                k_block_bytes_,
+                v_block_bytes_,
+                context_,
+                value_uses_tq8_);
+        }
+
+        void dequantize()
+        {
+            if (value_uses_tq8_)
+            {
+                turboquant_dequantize_tq8_kv_rows(
+                    k_blocks_.data(),
+                    v_blocks_.data(),
+                    context_,
+                    k_output_.data(),
+                    v_output_.data(),
+                    0,
+                    rows_,
+                    head_dim_,
+                    n_kv_heads_,
+                    k_row_bytes_,
+                    v_row_bytes_,
+                    k_block_bytes_,
+                    v_block_bytes_);
+                return;
+            }
+
+            turboquant_dequantize_split_kv_rows(
+                k_blocks_.data(),
+                v_blocks_.data(),
+                context_,
+                k_output_.data(),
+                v_output_.data(),
+                0,
+                rows_,
+                head_dim_,
+                n_kv_heads_,
+                k_row_bytes_,
+                v_row_bytes_,
+                k_block_bytes_,
+                v_block_bytes_);
+        }
+
+        void dequantizeWithRoPE()
+        {
+            constexpr float kRoPETheta = 1000000.0f;
+            constexpr int kPositionStart = 17;
+            if (value_uses_tq8_)
+            {
+                turboquant_dequantize_tq8_kv_rows_with_rope(
+                    k_blocks_.data(),
+                    v_blocks_.data(),
+                    context_,
+                    k_output_.data(),
+                    v_output_.data(),
+                    0,
+                    rows_,
+                    head_dim_,
+                    n_kv_heads_,
+                    k_row_bytes_,
+                    v_row_bytes_,
+                    k_block_bytes_,
+                    v_block_bytes_,
+                    kRoPETheta,
+                    kPositionStart);
+                return;
+            }
+
+            turboquant_dequantize_split_kv_rows_with_rope(
+                k_blocks_.data(),
+                v_blocks_.data(),
+                context_,
+                k_output_.data(),
+                v_output_.data(),
+                0,
+                rows_,
+                head_dim_,
+                n_kv_heads_,
+                k_row_bytes_,
+                v_row_bytes_,
+                k_block_bytes_,
+                v_block_bytes_,
+                kRoPETheta,
+                kPositionStart);
+        }
+
+        double vectorCount() const
+        {
+            return static_cast<double>(rows_) * n_kv_heads_ * 2.0;
+        }
+
+        float checksum() const
+        {
+            return k_output_.front() + v_output_.back();
+        }
+
+    private:
+        int head_dim_;
+        int rows_;
+        int n_kv_heads_;
+        bool value_uses_tq8_;
+        ProductionKVGeometry geometry_;
+        size_t k_block_bytes_;
+        size_t v_block_bytes_;
+        size_t k_row_bytes_;
+        size_t v_row_bytes_;
+        size_t elements_;
+        std::vector<float> k_fp32_;
+        std::vector<float> v_fp32_;
+        std::vector<float> k_output_;
+        std::vector<float> v_output_;
+        std::vector<uint8_t> k_blocks_;
+        std::vector<uint8_t> v_blocks_;
+        TurboQuantContext context_;
+    };
+
+    /**
+     * @brief Return the median duration of repeated invocation batches.
+     *
+     * Short CPU kernels are sensitive to worker wake-up and frequency changes.
+     * Five independent batches reject isolated scheduling outliers while
+     * retaining the full production call boundary inside every measurement.
+     */
+    template <typename Callable>
+    double production_kv_median_us(Callable &&callable, int iterations)
+    {
+        constexpr int kSamples = 5;
+        std::array<double, kSamples> samples{};
+        for (double &sample : samples)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            for (int iteration = 0; iteration < iterations; ++iteration)
+                callable();
+            const auto stop = std::chrono::steady_clock::now();
+            sample =
+                std::chrono::duration<double, std::micro>(stop - start).count() /
+                iterations;
+        }
+        std::sort(samples.begin(), samples.end());
+        return samples[kSamples / 2];
+    }
+
+    /**
+     * @brief Measure the exact helpers called by CPU KV append and attention.
+     *
+     * Context derivation, OpenMP region creation, ISA dispatch, K/V fusion,
+     * and output publication are all inside the timed call. Allocation and
+     * random input generation remain outside, matching production ownership.
+     */
+    void benchmark_production_kv_case(
+        int head_dim,
+        int rows,
+        int n_kv_heads,
+        bool value_uses_tq8)
+    {
+        ProductionKVCase test_case(
+            head_dim, rows, n_kv_heads, value_uses_tq8);
+
+        const auto quantize = [&]()
+        {
+            test_case.quantize();
+        };
+        const auto dequantize = [&]()
+        {
+            test_case.dequantize();
+        };
+        const auto dequantize_with_rope = [&]()
+        {
+            test_case.dequantizeWithRoPE();
+        };
+
+        // Resolve and cache every derived head context before timing.
+        quantize();
+        dequantize();
+        dequantize_with_rope();
+
+        const int iterations = production_kv_iterations(rows);
+        const double quant_us =
+            production_kv_median_us(quantize, iterations);
+        const double dequant_us =
+            production_kv_median_us(dequantize, iterations);
+        const double dequant_rope_us =
+            production_kv_median_us(dequantize_with_rope, iterations);
+        const double vectors = test_case.vectorCount();
+
+        // A visible dependency prevents the compiler from proving that the
+        // materialized output is dead while staying outside the timed region.
+        volatile float checksum = test_case.checksum();
+        (void)checksum;
+
+        std::cout << "production_kv,"
+                  << (value_uses_tq8 ? "tq8_k_tq8_v" : "tq8_k_tq4_v")
+                  << ',' << head_dim
+                  << ',' << rows
+                  << ',' << n_kv_heads
+                  << ',' << std::fixed << std::setprecision(3) << quant_us
+                  << ',' << dequant_us
+                  << ',' << dequant_rope_us
+                  << ',' << (quant_us * 1000.0 / vectors)
+                  << ',' << (dequant_us * 1000.0 / vectors)
+                  << ',' << (dequant_rope_us * 1000.0 / vectors)
+                  << '\n';
+
+        EXPECT_GT(quant_us, 0.0);
+        EXPECT_GT(dequant_us, 0.0);
+        EXPECT_GT(dequant_rope_us, 0.0);
+    }
+
+    /**
+     * @brief Read one positive integer profiler control from the environment.
+     */
+    int production_kv_profile_int(const char *name, int fallback)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || !*raw)
+            return fallback;
+
+        char *end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end == raw || *end != '\0' || parsed <= 0 ||
+            parsed > std::numeric_limits<int>::max())
+        {
+            throw std::invalid_argument(
+                std::string(name) + " must be a positive integer");
+        }
+        return static_cast<int>(parsed);
+    }
+
+    /**
+     * @brief Return a profiler string control without creating mutable state.
+     */
+    std::string production_kv_profile_string(
+        const char *name,
+        const char *fallback)
+    {
+        const char *raw = std::getenv(name);
+        return raw && *raw ? std::string(raw) : std::string(fallback);
+    }
+} // namespace
+
+/**
+ * @brief Sweep decode, verifier, and moderate-prefill CPU TurboQuant regimes.
+ *
+ * Output columns are:
+     * `name,mode,D,M,kv_heads,quant_us,dequant_us,dequant_rope_us,`
+     * `quant_ns_per_vector,dequant_ns_per_vector,`
+     * `dequant_rope_ns_per_vector`.
+ */
+TEST(Perf__TurboQuant, ProductionFusedKVMatrix)
+{
+    std::cout
+        << "name,mode,D,M,kv_heads,quant_us,dequant_us,"
+           "dequant_rope_us,quant_ns_per_vector,dequant_ns_per_vector,"
+           "dequant_rope_ns_per_vector\n";
+    constexpr std::array<int, 3> head_dims{64, 128, 256};
+    constexpr std::array<int, 7> rows{1, 2, 4, 8, 16, 32, 128};
+    constexpr int n_kv_heads = 4;
+
+    for (const int head_dim : head_dims)
+    {
+        for (const bool value_uses_tq8 : {false, true})
+        {
+            for (const int row_count : rows)
+            {
+                benchmark_production_kv_case(
+                    head_dim, row_count, n_kv_heads, value_uses_tq8);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Repeat one production operation for isolated Linux perf collection.
+ *
+ * Environment controls:
+ * - `LLAMINAR_TQ_PROFILE_OP`: `quantize`, `dequantize`, or `dequantize_rope`.
+ * - `LLAMINAR_TQ_PROFILE_MODE`: `tq8_k_tq4_v` or `tq8_k_tq8_v`.
+ * - `LLAMINAR_TQ_PROFILE_D`: head dimension 64, 128, or 256.
+ * - `LLAMINAR_TQ_PROFILE_M`: row count.
+ * - `LLAMINAR_TQ_PROFILE_KV_HEADS`: local KV head count.
+ * - `LLAMINAR_TQ_PROFILE_ITERS`: measured invocation count.
+ *
+ * Persistent buffers and the rotation context are constructed before warmup.
+ * The repeated loop invokes only the selected production helper, making each
+ * perf sample attributable to one operation and one geometry.
+ */
+TEST(Perf__TurboQuant, ProductionFusedKVProfilePoint)
+{
+    const std::string operation =
+        production_kv_profile_string("LLAMINAR_TQ_PROFILE_OP", "dequantize");
+    const std::string mode =
+        production_kv_profile_string(
+            "LLAMINAR_TQ_PROFILE_MODE", "tq8_k_tq4_v");
+    const int head_dim =
+        production_kv_profile_int("LLAMINAR_TQ_PROFILE_D", 128);
+    const int rows =
+        production_kv_profile_int("LLAMINAR_TQ_PROFILE_M", 16);
+    const int n_kv_heads =
+        production_kv_profile_int("LLAMINAR_TQ_PROFILE_KV_HEADS", 4);
+    const int iterations =
+        production_kv_profile_int("LLAMINAR_TQ_PROFILE_ITERS", 10000);
+
+    ASSERT_TRUE(head_dim == 64 || head_dim == 128 || head_dim == 256);
+    ASSERT_TRUE(mode == "tq8_k_tq4_v" || mode == "tq8_k_tq8_v");
+    ASSERT_TRUE(
+        operation == "quantize" ||
+        operation == "dequantize" ||
+        operation == "dequantize_rope");
+
+    ProductionKVCase test_case(
+        head_dim, rows, n_kv_heads, mode == "tq8_k_tq8_v");
+
+    /*
+     * Materialization profiling must consume representative compressed data.
+     * Populate K/V once before selecting the measured operation; otherwise
+     * zero-initialized block scales exercise a degenerate fast path that never
+     * represents a production cache populated from model activations.
+     */
+    test_case.quantize();
+
+    const auto invoke = [&]()
+    {
+        if (operation == "quantize")
+            test_case.quantize();
+        else if (operation == "dequantize")
+            test_case.dequantize();
+        else
+            test_case.dequantizeWithRoPE();
+    };
+
+    constexpr int kWarmupInvocations = 20;
+    for (int warmup = 0; warmup < kWarmupInvocations; ++warmup)
+        invoke();
+
+    const auto start = std::chrono::steady_clock::now();
+    for (int iteration = 0; iteration < iterations; ++iteration)
+        invoke();
+    const auto stop = std::chrono::steady_clock::now();
+
+    const double latency_us =
+        std::chrono::duration<double, std::micro>(stop - start).count() /
+        iterations;
+    volatile float checksum = test_case.checksum();
+    EXPECT_TRUE(std::isfinite(checksum));
+
+    std::cout
+        << "production_kv_profile,"
+        << operation << ','
+        << mode << ','
+        << head_dim << ','
+        << rows << ','
+        << n_kv_heads << ','
+        << iterations << ','
+        << std::fixed << std::setprecision(3) << latency_us
+        << '\n';
 }

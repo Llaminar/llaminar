@@ -76,12 +76,31 @@ TEST(Test__KVCacheConfigEstimate, Q8_1_MatchesEstimator)
     EXPECT_EQ(est_bytes, expected);
 }
 
-TEST(Test__KVCacheConfigEstimate, FP32_DoubleFP16)
+TEST(Test__KVCacheConfigEstimate, EveryConcretePrecisionMapsExactly)
 {
-    auto cfg_fp16 = makeConfig(ActivationPrecision::FP16);
-    auto cfg_fp32 = makeConfig(ActivationPrecision::FP32);
-
-    EXPECT_EQ(cfg_fp32.estimateBytes(), cfg_fp16.estimateBytes() * 2);
+    struct Case
+    {
+        ActivationPrecision precision;
+        const char *token;
+        DeviceId device;
+    };
+    const Case cases[] = {
+        {ActivationPrecision::BF16, "bf16", DeviceId::cuda(0)},
+        {ActivationPrecision::Q16_1, "q16_1", DeviceId::cpu()},
+        {ActivationPrecision::TQ4, "tq4", DeviceId::rocm(0)},
+        {ActivationPrecision::TQ8, "tq", DeviceId::cuda(0)},
+    };
+    for (const Case &test_case : cases)
+    {
+        SCOPED_TRACE(test_case.token);
+        auto cfg = makeConfig(
+            test_case.precision, 24, 4096, 2, 64, test_case.device);
+        EXPECT_EQ(
+            cfg.estimateBytes(),
+            KVCacheMemoryEstimator::estimate(
+                24, 1, 4096, 2, 64,
+                test_case.token, test_case.device));
+    }
 }
 
 TEST(Test__KVCacheConfigEstimate, Sharded_UsesLocalKVHeads)
@@ -93,7 +112,11 @@ TEST(Test__KVCacheConfigEstimate, Sharded_UsesLocalKVHeads)
     auto cfg_shard = makeConfig(ActivationPrecision::FP16, 24, 4096, 2, 64,
                                 DeviceId::cuda(0), /*local_n_kv_heads=*/1);
 
-    EXPECT_EQ(cfg_shard.estimateBytes(), cfg_full.estimateBytes() / 2);
+    EXPECT_EQ(
+        cfg_shard.estimateBytes(),
+        KVCacheMemoryEstimator::estimate(
+            24, 1, 4096, 1, 64, "fp16", DeviceId::cuda(0)));
+    EXPECT_LT(cfg_shard.estimateBytes(), cfg_full.estimateBytes());
 }
 
 TEST(Test__KVCacheConfigEstimate, ZeroLayers_ReturnsZero)
@@ -124,17 +147,23 @@ TEST(Test__KVCacheConfigEstimate, ScalesWithLayers)
 
 TEST(Test__KVCacheConfigEstimate, ScalesWithSeqLen)
 {
-    auto cfg2k = makeConfig(ActivationPrecision::FP16, 24, 2048);
-    auto cfg4k = makeConfig(ActivationPrecision::FP16, 24, 4096);
+    auto cfg2k = makeConfig(
+        ActivationPrecision::FP16, 24, 2048, 2, 64, DeviceId::cpu());
+    auto cfg4k = makeConfig(
+        ActivationPrecision::FP16, 24, 4096, 2, 64, DeviceId::cpu());
 
     EXPECT_EQ(cfg4k.estimateBytes(), cfg2k.estimateBytes() * 2);
 }
 
-TEST(Test__KVCacheConfigEstimate, UnknownPrecision_FallsBackToFP16)
+TEST(Test__KVCacheConfigEstimate, NonStoragePrecisionsFailClosed)
 {
-    // BF16 is not explicitly mapped in estimateBytes() → falls to default "fp16"
-    auto cfg_bf16 = makeConfig(ActivationPrecision::BF16);
-    auto cfg_fp16 = makeConfig(ActivationPrecision::FP16);
-
-    EXPECT_EQ(cfg_bf16.estimateBytes(), cfg_fp16.estimateBytes());
+    EXPECT_THROW(
+        makeConfig(ActivationPrecision::Hybrid).estimateBytes(),
+        std::invalid_argument);
+    EXPECT_THROW(
+        makeConfig(ActivationPrecision::HybridQ16).estimateBytes(),
+        std::invalid_argument);
+    EXPECT_THROW(
+        makeConfig(ActivationPrecision::AQ8).estimateBytes(),
+        std::invalid_argument);
 }

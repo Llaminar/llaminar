@@ -18,7 +18,14 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
+#include "backends/BackendManager.h"
+#include "MTPTerminalScratchCaptureProof.h"
+#include "MTPMainForwardReadRetirementProof.h"
+#include "GPUGraphMemoryContractProof.h"
 
+#include <hip/hip_runtime.h>
+
+#include <array>
 #include <memory>
 #include <string>
 
@@ -28,9 +35,11 @@ using namespace llaminar2;
 // Test Fixture
 // ===========================================================================
 
+/** @brief Run retained-graph and mailbox lifetime checks on the HIP worker. */
 class Test__HIPGraphCapture : public ::testing::Test
 {
 protected:
+    /** @brief Register HIP before admitting real-device work. */
     void SetUp() override
     {
         ensureAMDFactoryRegistered();
@@ -38,6 +47,7 @@ protected:
             GTEST_SKIP() << "ROCm not available";
     }
 
+    /** @return The exact device-zero owner of all test streams. */
     IWorkerGPUContext &ctx()
     {
         return GPUDeviceContextPool::instance().getAMDContext(0);
@@ -47,6 +57,42 @@ protected:
 // ===========================================================================
 // Factory Tests
 // ===========================================================================
+
+/** @test Scratch invalidation preserves in-flight readers and accepted bytes. */
+TEST_F(Test__HIPGraphCapture, MTPCatchupScratchRetiresBeforeAcceptedPublication)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPTerminalScratchCapture(ctx(), *backend); });
+}
+
+/** @test Every main-forward role protects a pending sidecar's terminal-hidden read. */
+TEST_F(Test__HIPGraphCapture, MTPMainForwardWaitsForSidecarReadRetirement)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPMainForwardReadRetirement(ctx(), *backend, DeviceId::rocm(0)); });
+}
+
+/** @test Forced tokens retain the current forward's completion boundary. */
+TEST_F(Test__HIPGraphCapture, MTPForcedTokenWaitsForCurrentForward)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPForcedTokenForwardBoundary(ctx(), *backend, DeviceId::rocm(0)); });
+}
+
+/** @test General control metadata must not receive a bounded helper charge. */
+TEST_F(Test__HIPGraphCapture, BoundedHelperRejectsEventNode)
+{
+    ctx().submitAndWait([&] {
+        test::proveBoundedHelperRejectsEventGraph(ctx(), [](void *event, void *stream) {
+            return hipEventRecordWithFlags(static_cast<hipEvent_t>(event),
+                       static_cast<hipStream_t>(stream), hipEventRecordExternal) ==
+                   hipSuccess;
+        });
+    });
+}
 
 TEST_F(Test__HIPGraphCapture, BackendNameIsHIP)
 {
@@ -140,6 +186,68 @@ TEST_F(Test__HIPGraphCapture, DoubleResetIsSafe)
 
         EXPECT_FALSE(capture->hasExecutable());
         EXPECT_EQ(capture->nodeCount(), 0u);
+    });
+}
+
+/**
+ * @test Ordered-timeline event instrumentation measures the retained child.
+ *
+ * The terminal stream synchronization is test-only observation. Production
+ * collection uses the same event query through the non-blocking snapshot API.
+ */
+TEST_F(Test__HIPGraphCapture, OrderedTimelinePerStepTimingIsConsumable)
+{
+    ctx().submitAndWait([&] {
+        auto *const stream =
+            static_cast<hipStream_t>(ctx().defaultStream());
+        ASSERT_NE(stream, nullptr);
+
+        void *device_bytes = nullptr;
+        ASSERT_EQ(hipMalloc(&device_bytes, 4096u), hipSuccess);
+
+        // The production controller creates the owner before any graph-only
+        // unit on both vendors, even though HIP can clone its native children.
+        auto parent = ctx().createGraphCapture();
+        ASSERT_NE(parent, nullptr);
+        auto child = parent->createOrderedTimelineFragment();
+        ASSERT_NE(child, nullptr);
+        ASSERT_TRUE(child->beginCapture());
+        ASSERT_EQ(
+            hipMemsetAsync(device_bytes, 0x5a, 4096u, stream),
+            hipSuccess);
+        ASSERT_TRUE(child->endCapture());
+        ASSERT_GT(child->nodeCount(), 0u);
+
+        const std::array<GPUOrderedTimelineStep, 1> steps{{{
+            .name = "timed_memset",
+            .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+            .capture = child.get(),
+        }}};
+        ASSERT_TRUE(parent->buildOrderedTimelineTransaction(
+            steps,
+            GPUOrderedTimelineInstrumentation::PerStepEvents));
+        EXPECT_EQ(parent->nodeCount(), child->nodeCount() + 2u);
+        EXPECT_EQ(
+            parent->consumeOrderedTimelineTiming().state,
+            GPUOrderedTimelineTimingState::AwaitingLaunch);
+
+        ASSERT_TRUE(parent->instantiate());
+        ASSERT_TRUE(parent->launch());
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const auto snapshot = parent->consumeOrderedTimelineTiming();
+        ASSERT_EQ(snapshot.state, GPUOrderedTimelineTimingState::Complete);
+        ASSERT_EQ(snapshot.samples.size(), 1u);
+        EXPECT_EQ(snapshot.samples.front().name, "timed_memset");
+        EXPECT_EQ(
+            snapshot.samples.front().kind,
+            GPUOrderedTimelineStepKind::CapturedFragment);
+        EXPECT_GE(snapshot.samples.front().elapsed_ms, 0.0);
+        EXPECT_EQ(
+            parent->consumeOrderedTimelineTiming().state,
+            GPUOrderedTimelineTimingState::AwaitingLaunch);
+
+        EXPECT_EQ(hipFree(device_bytes), hipSuccess);
     });
 }
 

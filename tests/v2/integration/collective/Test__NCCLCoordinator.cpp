@@ -29,13 +29,53 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <future>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
 using namespace llaminar2;
+
+namespace
+{
+    /** @brief Restore one process environment variable after a policy test. */
+    class ScopedEnvironment final
+    {
+    public:
+        ScopedEnvironment(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *previous = std::getenv(name))
+                previous_ = previous;
+            installed_ =
+                ::setenv(name, value, /*overwrite=*/1) == 0;
+        }
+
+        ~ScopedEnvironment()
+        {
+            if (previous_)
+                (void)::setenv(name_.c_str(), previous_->c_str(), 1);
+            else
+                (void)::unsetenv(name_.c_str());
+        }
+
+        ScopedEnvironment(const ScopedEnvironment &) = delete;
+        ScopedEnvironment &operator=(const ScopedEnvironment &) = delete;
+
+        /** @brief Return true when the requested value was installed. */
+        [[nodiscard]] bool installed() const noexcept { return installed_; }
+
+    private:
+        std::string name_;
+        std::optional<std::string> previous_;
+        bool installed_ = false;
+    };
+}
 
 // =============================================================================
 // Test Fixture
@@ -72,6 +112,16 @@ protected:
 
     void TearDown() override
     {
+        for (size_t i = 0; i < producer_streams_.size(); ++i)
+        {
+            if (producer_streams_[i] != nullptr)
+            {
+                cudaSetDevice(static_cast<int>(i));
+                cudaStreamDestroy(producer_streams_[i]);
+            }
+        }
+        producer_streams_.clear();
+
         // Synchronize all devices
         for (int i = 0; i < cuda_device_count_; ++i)
         {
@@ -133,8 +183,66 @@ protected:
         copyHostToDevice(device_id, buffer, host_data.data(), count * sizeof(float));
     }
 
+    /**
+     * @brief Register one explicit producer stream for every NCCL participant.
+     *
+     * The coordinator deliberately refuses to infer ownership from the legacy
+     * default stream. These streams model the production graph executors which
+     * publish each device buffer from a known producer stream.
+     *
+     * @param coordinator Coordinator receiving the producer-stream contract.
+     * @param device_ordinals CUDA devices participating in the communicator.
+     * @return true when every stream was created and registered.
+     */
+    bool registerProducerStreams(
+        NCCLCoordinator &coordinator,
+        const std::vector<int> &device_ordinals)
+    {
+        producer_streams_.assign(device_ordinals.size(), nullptr);
+        std::vector<void *> opaque_streams(device_ordinals.size(), nullptr);
+
+        for (size_t i = 0; i < device_ordinals.size(); ++i)
+        {
+            if (cudaSetDevice(device_ordinals[i]) != cudaSuccess)
+                return false;
+            if (cudaStreamCreateWithFlags(
+                    &producer_streams_[i],
+                    cudaStreamNonBlocking) != cudaSuccess)
+                return false;
+            opaque_streams[i] =
+                static_cast<void *>(producer_streams_[i]);
+        }
+
+        coordinator.setComputeStreams(opaque_streams);
+        return true;
+    }
+
     int cuda_device_count_ = 0;
+    std::vector<cudaStream_t> producer_streams_;
 };
+
+/**
+ * @brief Reject NCCL's event-injecting graph-mixing protocol before loading.
+ *
+ * CUDA WHILE/SWITCH bodies cannot contain event record/wait nodes. Llaminar's
+ * coordinator owns the complete explicit-stream ordering graph, so enabling a
+ * second NCCL ordering protocol is an invalid process configuration rather
+ * than a mode the runtime may tolerate.
+ */
+TEST_F(Test__NCCLCoordinator, RejectsNCCLGraphMixingProtocol)
+{
+    ScopedEnvironment graph_mixing(
+        "NCCL_GRAPH_MIXING_SUPPORT",
+        "1");
+    ASSERT_TRUE(graph_mixing.installed());
+
+    NCCLCoordinator coordinator;
+    EXPECT_FALSE(coordinator.initialize({0}));
+    EXPECT_NE(
+        coordinator.lastError().find("NCCL_GRAPH_MIXING_SUPPORT must be 0"),
+        std::string::npos);
+    EXPECT_FALSE(coordinator.isInitialized());
+}
 
 // =============================================================================
 // Initialization Tests
@@ -159,6 +267,10 @@ TEST_F(Test__NCCLCoordinator, InitializeSingleGPU)
     EXPECT_TRUE(coord.isInitialized());
     EXPECT_EQ(coord.numDevices(), 1);
     EXPECT_EQ(coord.deviceOrdinal(0), 0);
+    ASSERT_NE(std::getenv("NCCL_GRAPH_MIXING_SUPPORT"), nullptr);
+    EXPECT_STREQ(std::getenv("NCCL_GRAPH_MIXING_SUPPORT"), "0")
+        << "Coordinator initialization must install the conditional-graph-safe "
+           "NCCL ordering policy before loading the library.";
 
     // Clean shutdown
     coord.shutdown();
@@ -192,6 +304,49 @@ TEST_F(Test__NCCLCoordinator, InitializeMultiGPU)
     }
 
     coord.shutdown();
+}
+
+/**
+ * @brief Reproduce fatal CUDAx2 teardown with every local NCCL rank active.
+ *
+ * NCCL communicator abort is an intra-node collective lifecycle operation:
+ * every active rank must enter it. The production failure callback previously
+ * called rank aborts serially, allowing rank zero to wait forever for rank one
+ * and preventing RankOrchestrator destruction. This regression keeps both
+ * communicator ranks live, requests one fatal abort transaction, and verifies
+ * that communicator invalidation plus coordinator join complete promptly.
+ */
+TEST_F(Test__NCCLCoordinator, AbortMultiGPUCliqueCompletesAndShutdownJoins)
+{
+    using namespace std::chrono_literals;
+
+    if (cuda_device_count_ < 2)
+    {
+        GTEST_SKIP() << "Need at least 2 CUDA devices for communicator-abort coverage";
+    }
+
+    NCCLCoordinator coord;
+    ASSERT_TRUE(coord.initialize({0, 1}))
+        << "Failed to initialize CUDAx2 communicator clique: "
+        << coord.lastError();
+    ASSERT_TRUE(coord.isInitialized());
+
+    const auto abort_start = std::chrono::steady_clock::now();
+    coord.abortCommunicators();
+    const auto abort_elapsed =
+        std::chrono::steady_clock::now() - abort_start;
+
+    EXPECT_FALSE(coord.isInitialized());
+    EXPECT_LT(abort_elapsed, 5s)
+        << "All local NCCL ranks must enter abort concurrently; a serial rank "
+           "abort can wait forever for a later rank.";
+
+    const auto shutdown_start = std::chrono::steady_clock::now();
+    coord.shutdown();
+    const auto shutdown_elapsed =
+        std::chrono::steady_clock::now() - shutdown_start;
+    EXPECT_LT(shutdown_elapsed, 5s)
+        << "Coordinator shutdown must join promptly after fatal communicator abort.";
 }
 
 TEST_F(Test__NCCLCoordinator, InitializeNonContiguousDevices)
@@ -229,6 +384,7 @@ TEST_F(Test__NCCLCoordinator, AllreduceSingleGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0}));
 
     constexpr size_t COUNT = 1024;
 
@@ -269,6 +425,7 @@ TEST_F(Test__NCCLCoordinator, AllreduceMultiGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
 
@@ -320,6 +477,7 @@ TEST_F(Test__NCCLCoordinator, AllgatherMultiGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t SEND_COUNT = 512;
     constexpr size_t RECV_COUNT = SEND_COUNT * 2; // 2 devices
@@ -390,6 +548,7 @@ TEST_F(Test__NCCLCoordinator, BroadcastMultiGPU)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
 
@@ -442,6 +601,7 @@ TEST_F(Test__NCCLCoordinator, ThreadSafety)
 
     NCCLCoordinator coord;
     ASSERT_TRUE(coord.initialize({0, 1})) << "Failed to initialize: " << coord.lastError();
+    ASSERT_TRUE(registerProducerStreams(coord, {0, 1}));
 
     constexpr size_t COUNT = 1024;
     constexpr int NUM_ITERATIONS = 10;

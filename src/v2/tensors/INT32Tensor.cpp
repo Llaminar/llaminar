@@ -174,6 +174,11 @@ namespace llaminar2
         }
     }
 
+    INT32Tensor::~INT32Tensor()
+    {
+        retireHostTransferLifetimeBeforeStorageDestruction();
+    }
+
     // =============================================================================
     // DEVICE MANAGEMENT
     // =============================================================================

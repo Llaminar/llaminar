@@ -20,8 +20,11 @@
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
+#include "ICollectiveBackend.h"
 #include "ITPContext.h"
 #include <memory>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <utility>
@@ -31,6 +34,58 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class PhysicalMemoryAuthority;
+
+    /**
+     * @brief Operation semantics for compact LocalTP control sidebands.
+     *
+     * These are intentionally explicit instead of reusing an activation
+     * allreduce's type by convention. Rebalance histograms are additive and may
+     * use AllreduceSum. Command metadata is not additive and must use Allgather
+     * or Broadcast.
+     */
+    enum class LocalTPCollectiveSidebandKind
+    {
+        AllreduceSum,
+        Allgather,
+        Broadcast
+    };
+
+    inline const char *toString(LocalTPCollectiveSidebandKind kind)
+    {
+        switch (kind)
+        {
+        case LocalTPCollectiveSidebandKind::AllreduceSum:
+            return "AllreduceSum";
+        case LocalTPCollectiveSidebandKind::Allgather:
+            return "Allgather";
+        case LocalTPCollectiveSidebandKind::Broadcast:
+            return "Broadcast";
+        }
+        return "Unknown";
+    }
+
+    /**
+     * @brief One compact control sideband attached to a LocalTP collective stage.
+     *
+     * The buffers live on the participant identified by device_index in
+     * collectiveSidebandOnStream(). For AllreduceSum, recv_buffer is the mutable
+     * reduction buffer; send_buffer may be null for in-place reduction or point
+     * at a distinct device buffer for out-of-place implementations. For
+     * Allgather, send_buffer is the participant contribution and recv_buffer
+     * receives degree() contiguous slices. For Broadcast, root_device_index owns
+     * the source bytes and recv_buffer is overwritten on non-root participants.
+     */
+    struct LocalTPCollectiveSidebandBuffer
+    {
+        LocalTPCollectiveSidebandKind kind = LocalTPCollectiveSidebandKind::AllreduceSum;
+        const void *send_buffer = nullptr;
+        void *recv_buffer = nullptr;
+        size_t element_count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT32;
+        int root_device_index = 0;
+        std::string name;
+    };
 
     /**
      * @brief Interface for LOCAL tensor parallelism operations
@@ -51,9 +106,9 @@ namespace llaminar2
 
         /**
          * @brief LOCAL TP is always intra-rank
-         * @return Always TPScope::LOCAL for LOCAL TP contexts
+         * @return Always TPScope::RANK_LOCAL for LOCAL TP contexts
          */
-        TPScope scope() const override { return TPScope::LOCAL; }
+        TPScope scope() const override { return TPScope::RANK_LOCAL; }
 
         // =====================================================================
         // Configuration
@@ -157,6 +212,324 @@ namespace llaminar2
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override = 0;
 
         /**
+         * @brief All-gather raw device buffers across LOCAL devices.
+         *
+         * This is for graph-visible state handoffs that operate on backend-owned
+         * device allocations rather than TensorBase instances. It requires a
+         * non-null producer stream so callers cannot accidentally order GPU
+         * state transfers through the legacy default stream. Unsupported
+         * contexts must fail loudly by returning false.
+         *
+         * @param local_send Device buffer contributed by this participant.
+         * @param full_recv Device buffer receiving all participants' slices.
+         * @param send_count Elements contributed by each participant.
+         * @param dtype Element type for the collective.
+         * @param device_index Participant index in devices().
+         * @param producer_stream Explicit stream that produced local_send.
+         * @param stage_name Stage identifier for diagnostics.
+         * @return true on success, false when unsupported or failed.
+         */
+        virtual bool allgatherRawOnStream(
+            const void *local_send,
+            void *full_recv,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)local_send;
+            (void)full_recv;
+            (void)send_count;
+            (void)dtype;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief Reduce raw device buffers to one LocalTP root on an explicit stream.
+         *
+         * This primitive is intended for graph-visible activation protocols
+         * that need one deterministic root before a compact publication. It is
+         * enqueue-only and must map to native NCCL/RCCL reduce; host-mediated
+         * or allreduce-based emulation is forbidden.
+         */
+        virtual bool reduceRawOnStream(
+            const void *local_send,
+            void *root_recv,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root_device_index,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)local_send;
+            (void)root_recv;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)root_device_index;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief Broadcast a raw root-owned device buffer on an explicit stream.
+         *
+         * Every participant must enqueue the same count, datatype, and root in
+         * collective order. The operation is directly graph-capturable and
+         * may not synchronize or stage bytes through the host.
+         */
+        virtual bool broadcastRawOnStream(
+            const void *root_send,
+            void *local_recv,
+            size_t count,
+            CollectiveDataType dtype,
+            int root_device_index,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)root_send;
+            (void)local_recv;
+            (void)count;
+            (void)dtype;
+            (void)root_device_index;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief Execute graph-visible grouped send/recv operations on one participant.
+         *
+         * This is the directed counterpart to allgatherRawOnStream() for
+         * payloads where only a subset of participant edges carries useful
+         * bytes. The caller supplies only operations involving device_index.
+         * Each operation must use a non-null explicit producer stream.
+         */
+        virtual bool groupedP2PRawOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)ops;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief Execute compact graph-visible control sidebands on an explicit stream.
+         *
+         * This lower-level ABI enqueues sidebands on one participant's explicit
+         * graph stream. Production MoE rebalance traffic should prefer
+         * allreduceWithSidebandsOnStream() when a real activation collective
+         * already exists. Compact MTP outcome publication intentionally uses
+         * this anchor-free form because manufacturing a dummy allreduce would
+         * change both its economics and semantics. It must never use the legacy
+         * default stream or a host-synchronized implementation.
+         *
+         * @param sidebands Compact sideband collectives for this participant.
+         * @param device_index Participant index in devices().
+         * @param producer_stream Explicit stream that produced the sideband buffers.
+         * @param anchor_stage_name Owning graph stage, whether or not it has an
+         *        activation-collective anchor.
+         * @return true on success, false when unsupported or failed.
+         */
+        virtual bool collectiveSidebandOnStream(
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name)
+        {
+            return collectiveSidebandSpanOnStream(
+                sidebands,
+                device_index,
+                producer_stream,
+                anchor_stage_name);
+        }
+
+        /**
+         * @brief Allocation-free span form for graph-stage sideband bundles.
+         *
+         * Capturable stages own their descriptor storage for graph lifetime and
+         * pass a span here so execute() cannot allocate a temporary vector.
+         */
+        virtual bool collectiveSidebandSpanOnStream(
+            std::span<const LocalTPCollectiveSidebandBuffer> sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name)
+        {
+            (void)sidebands;
+            (void)device_index;
+            (void)anchor_stage_name;
+            if (!producer_stream)
+                throw std::invalid_argument("ILocalTPContext::collectiveSidebandOnStream requires a non-null GPU stream");
+            return sidebands.empty();
+        }
+
+        /**
+         * @brief Publish one complete sideband bundle across every LocalTP stream.
+         *
+         * This rank-level form makes participant ownership explicit: index @c i
+         * in @p participant_sidebands and @p producer_streams always belongs to
+         * devices()[i]. Implementations lower the participant-local descriptors
+         * into one NCCL/RCCL group launch. The call is enqueue-only; completion
+         * remains ordered by each supplied stream and is never observed through a
+         * host rendezvous.
+         *
+         * This is the required production contract for compact MTP outcome
+         * publication when there is no real activation allreduce to serve as an
+         * anchor. Supplying a dummy allreduce, invoking one host worker per
+         * participant, or falling back to host copies would all change the
+         * operation's economics and ordering and are therefore forbidden.
+         *
+         * @param participant_sidebands Sideband descriptors grouped by LocalTP
+         *        participant in devices() order.
+         * @param producer_streams Exact non-null stream for every participant.
+         * @param publication_name Stable diagnostic/PerfStats operation name.
+         * @return true only when the complete multi-device group was enqueued.
+         */
+        virtual bool collectiveSidebandsMultiOnStreams(
+            const std::vector<std::vector<LocalTPCollectiveSidebandBuffer>>
+                &participant_sidebands,
+            const std::vector<void *> &producer_streams,
+            const std::string &publication_name)
+        {
+            (void)participant_sidebands;
+            (void)publication_name;
+            for (void *stream : producer_streams)
+            {
+                if (!stream)
+                {
+                    throw std::invalid_argument(
+                        "ILocalTPContext::collectiveSidebandsMultiOnStreams requires non-null GPU streams");
+                }
+            }
+            return false;
+        }
+
+        /**
+         * @brief Execute an anchor allreduce and compact control sidebands as
+         *        one grouped backend launch on an explicit stream.
+         *
+         * Production MoE rebalance traffic uses this path for homogeneous
+         * NCCL/RCCL domains. The allreduce and sidebands are lowered together,
+         * allowing the backend to enqueue them inside the same group region
+         * instead of issuing separate rebalance-specific collectives.
+         */
+        virtual bool allreduceWithSidebandsOnStream(
+            TensorBase *tensor,
+            const std::string &stage_name,
+            size_t count,
+            void *producer_stream,
+            const std::string &precision,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index)
+        {
+            (void)tensor;
+            (void)stage_name;
+            (void)count;
+            (void)precision;
+            (void)sidebands;
+            (void)device_index;
+            if (!producer_stream)
+                throw std::invalid_argument("ILocalTPContext::allreduceWithSidebandsOnStream requires a non-null GPU stream");
+            return false;
+        }
+
+        /**
+         * @brief True when collectiveSidebandOnStream can be captured into a GPU graph.
+         */
+        virtual bool supportsCollectiveSidebandOnStreamGraphCapture() const { return false; }
+
+        /**
+         * @brief True when raw all-gather handoffs can be captured into a GPU graph.
+         *
+         * This requires a homogeneous GPU LocalTP backend that implements
+         * all-gather directly on the caller's explicit stream, without host
+         * synchronization or a coordinator-thread wait.
+         */
+        virtual bool supportsRawAllgatherOnStreamGraphCapture() const { return false; }
+
+        /**
+         * @brief Rendezvous all LocalTP participants at a GPU graph-capture boundary.
+         *
+         * LocalTP GPU graph capture is a domain-level lifecycle, not an
+         * independent per-device detail. A participant must not start recording a
+         * graph while a sibling is still draining the previous eager prefill
+         * chunk, and no participant should launch an immediately captured graph
+         * before every sibling has exited capture. Implementations that own a
+         * multi-device LocalTP domain should use this hook as a reusable cyclic
+         * barrier keyed by @p boundary_name.
+         *
+         * @param boundary_name Human-readable boundary identifier used for
+         *        contract checks and diagnostics.
+         * @param device_index Participant index in devices().
+         * @param timeout_ms Maximum wait time; non-positive means wait without a
+         *        timeout.
+         * @return true when all participants reached the same boundary, false on
+         *         timeout, mismatch, duplicate arrival, or backend abort.
+         */
+        virtual bool graphCaptureBoundaryRendezvous(
+            const std::string &boundary_name,
+            int device_index,
+            int timeout_ms)
+        {
+            (void)boundary_name;
+            (void)device_index;
+            (void)timeout_ms;
+            return true;
+        }
+
+        /**
+         * @brief Establish a device-domain fence before a graph lifecycle transition.
+         *
+         * A host rendezvous alone cannot order GPU work already queued by sibling
+         * participants. Homogeneous LocalTP implementations enqueue a tiny
+         * NCCL/RCCL collective on each participant's exact graph stream.
+         * Heterogeneous implementations publish a persistent event ticket on
+         * each CUDA/ROCm stream, observe those tickets with bounded nonblocking
+         * queries, and release the generation only after every ticket completes.
+         * Returning true guarantees that no participant enters or leaves native
+         * capture while a sibling's preceding stream generation remains live.
+         * This method is a graph-materialization lifecycle boundary; ordinary
+         * captured replay must not call it.
+         *
+         * @param boundary_name Stable lifecycle boundary identifier.
+         * @param device_index Participant index in devices().
+         * @param stream Exact stream that will begin capture or launch a graph.
+         * @param timeout_ms Host contract timeout for matching peer arrivals.
+         * @return true only when the backend fence/tickets and every contract
+         *         rendezvous complete.
+         */
+        virtual bool graphCaptureBoundaryOnStream(
+            const std::string &boundary_name,
+            int device_index,
+            void *stream,
+            int timeout_ms)
+        {
+            (void)boundary_name;
+            (void)device_index;
+            (void)timeout_ms;
+            if (!stream)
+                throw std::invalid_argument(
+                    "ILocalTPContext::graphCaptureBoundaryOnStream requires a non-null GPU stream");
+            return false;
+        }
+
+        /**
          * @brief Gather shards from multiple devices into a single output tensor
          *
          * This is the orchestrator-friendly variant of allgather. Instead of requiring
@@ -237,13 +610,17 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Request abort of all pending collective operations.
+         * @brief Publish fatal cancellation to every LocalTP participant.
          *
-         * Called when one device thread fails and others may be stuck in
-         * collective calls waiting for matching operations. Forcefully
-         * tears down communicators to unblock pending operations.
+         * This operation closes collective admission and wakes host-side
+         * rendezvous waiters, but it must not destroy NCCL/RCCL communicators.
+         * Captured CUDA/HIP graphs retain communicator references, so the
+         * enclosing graph owner must unwind those graph executables before the
+         * LocalTP context reaches its communicator-abort destruction boundary.
          *
-         * After calling this, the context is NOT usable for further collectives.
+         * After calling this, the context is not usable for further
+         * collectives. The request is idempotent and may be published by any
+         * participant that observes the fatal failure first.
          */
         virtual void requestAbort() = 0;
 
@@ -355,23 +732,41 @@ namespace llaminar2
         virtual void clearBARBackedOutputs() = 0;
 
         /**
-         * @brief Reserve temporary buffer capacity for collective operations
+         * @brief Reserve every persistent buffer required by collective execution.
          *
-         * Pre-allocates internal temp buffers to avoid allocation in the hot path.
-         * The buffer will grow if needed but never shrink during operation.
-         * Buffer is only freed during shutdown().
+         * This setup-only call makes the collective memory contract explicit:
+         * the backend receives its transport workspace byte capacity, while the
+         * LocalTP context receives the maximum logical element count needed by
+         * FP16 transport. Keeping these dimensions separate prevents quantized
+         * activation byte counts from accidentally under-sizing FP16 scratch.
+         *
+         * No collective execution method may grow either reservation. A request
+         * that exceeds this setup contract is a fatal planning error, not an
+         * invitation to allocate while a graph is executing or being captured.
          *
          * Call this during initialization after model dimensions are known:
          * @code
-         * size_t max_elements = max_seq_len * hidden_size;
-         * size_t buffer_bytes = activationPrecisionBufferBytes(max_elements, precision);
-         * tp_ctx->reserveTempBufferBytes(buffer_bytes * 1.1);  // 10% margin
+         * const size_t max_elements = max_seq_len * hidden_size;
+         * const size_t transport_bytes =
+         *     activationPrecisionBufferBytes(max_elements, precision);
+         * tp_ctx->reserveCollectiveResources(
+         *     transport_bytes_with_margin,
+         *     max_elements_with_margin);
          * @endcode
          *
-         * @param bytes Minimum buffer capacity in bytes
-         * @return true if reservation succeeded
+         * @param backend_payload_capacity_bytes Maximum logical payload the
+         *        backend must accept. This is not necessarily physical memory;
+         *        concrete backend allocations have their own BOM owner.
+         * @param fp16_scratch_elements Maximum logical FP16 transport element count.
+         * @param memory_authority Rank-local physical-memory ledger. Concrete
+         *        allocating contexts require this value; allocation-free test
+         *        doubles may ignore it.
+         * @return true only when every participant is fully reserved.
          */
-        virtual bool reserveTempBufferBytes(size_t bytes) = 0;
+        virtual bool reserveCollectiveResources(
+            size_t backend_payload_capacity_bytes,
+            size_t fp16_scratch_elements,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority) = 0;
     };
 
     /**

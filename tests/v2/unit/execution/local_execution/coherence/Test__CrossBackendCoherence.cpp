@@ -4,25 +4,27 @@
  *
  * Validates that:
  *   1. IBackend::backendDeviceType() returns correct DeviceType for each backend
- *   2. mark_device_dirty_with_event() detects cross-backend stream mismatches
- *      and skips event recording instead of crashing (e.g., CUDA stream → ROCm backend)
+ *   2. TransferEngine device-write publication detects backend/device
+ *      mismatches and fails before publishing device authority
  *   3. allocateOnDevice() correctly updates gpu_device_ when migrating between devices
- *   4. cohereOutputs() re-homes output tensors that were migrated by downstream stages
+ *   4. explicit output allocation re-homes tensors migrated by downstream stages
  *
  * These tests prevent regressions for the HybridPPTP crash where EmbeddingStage
- * called transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, CUDA_stream) on a tensor whose gpu_device_
- * was stale (ROCm:0 from a prior PP stage), causing hipEventRecord to receive
- * a CUDA stream pointer and segfault.
+ * published a CUDA write against a tensor whose gpu_device_ was stale (ROCm:0
+ * from a prior PP stage), causing hipEventRecord to receive a CUDA stream
+ * pointer and segfault.
  *
  * Uses MockBackend DI injection — no real GPU hardware required.
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 #include "backends/CPUBackend.h"
 
 #include "../../../../mocks/MockBackend.h"
+#include "../../../../mocks/MockWorkerGPUContext.h"
 
 #include <cstring>
 #include <memory>
@@ -69,7 +71,15 @@ public:
             setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
     void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
-    void injectCompletionEvent(void *event) { device_completion_event_ = event; }
+    void injectCompletionEvent(void *event)
+    {
+        device_completion_event_ = event;
+        completion_event_protection_ = event
+                                           ? CompletionEventProtection::DeviceValue
+                                           : CompletionEventProtection::None;
+        if (!event)
+            event_device_.reset();
+    }
     void injectEventDevice(DeviceId device) { event_device_ = device; }
 };
 
@@ -80,12 +90,17 @@ public:
 class Test__CrossBackendCoherence : public ::testing::Test
 {
 protected:
+    static void SetUpTestSuite()
+    {
+        llaminar2::testing::installHardwareFreeGPUContextFactories();
+    }
+
     static constexpr size_t kRows = 4;
     static constexpr size_t kCols = 8;
     static constexpr size_t kElements = kRows * kCols;
 
     // Two mock backends simulating different GPU types
-    MockBackend mock_backend_;
+    MockBackend mock_backend_{DeviceType::ROCm};
 
     DeviceId cuda_device_ = DeviceId::cuda(0);
     DeviceId rocm_device_ = DeviceId::rocm(0);
@@ -106,6 +121,8 @@ protected:
 
     void cleanupTensor(CrossBackendTensor *tensor)
     {
+        if (tensor->getCompletionEvent())
+            TransferEngine::publishSynchronized(tensor);
         void *gpu_ptr = tensor->getGpuDataPtr();
         if (gpu_ptr && mock_backend_.isAllocated(gpu_ptr))
         {
@@ -121,8 +138,10 @@ protected:
 
 TEST_F(Test__CrossBackendCoherence, MockBackend_ReturnsCorrectDeviceType)
 {
-    // MockBackend defaults to CPU type
-    EXPECT_EQ(mock_backend_.backendDeviceType(), DeviceType::CPU);
+    MockBackend default_backend;
+    EXPECT_EQ(default_backend.backendDeviceType(), DeviceType::CPU);
+    EXPECT_EQ(mock_backend_.backendDeviceType(), DeviceType::ROCm)
+        << "The coherence fixture must create events through the runtime named by its device.";
 }
 
 TEST_F(Test__CrossBackendCoherence, CPUBackend_ReturnsCorrectDeviceType)
@@ -139,7 +158,7 @@ TEST_F(Test__CrossBackendCoherence, CPUBackend_ReturnsCorrectDeviceType)
 // Category 2: mark_device_dirty_with_event() cross-backend safety
 // =============================================================================
 
-TEST_F(Test__CrossBackendCoherence, MarkDirtyWithEvent_SameBackend_RecordsEvent)
+TEST_F(Test__CrossBackendCoherence, MarkDirtyWithEvent_BackendMismatchFailsClosed)
 {
     // Setup: tensor on ROCm device with mock backend (mock returns CPU type,
     // but the injected gpu_device_ also needs to match for a real scenario).
@@ -150,49 +169,50 @@ TEST_F(Test__CrossBackendCoherence, MarkDirtyWithEvent_SameBackend_RecordsEvent)
     // Upload to device (mock always succeeds regardless of device type)
     ASSERT_TRUE(tensor->ensureOnDevice(rocm_device_));
     mock_backend_.resetAll();
-
-    // Clear existing event to force creation
-    tensor->injectCompletionEvent(nullptr);
+    mock_backend_.setMockDeviceType(DeviceType::CPU);
 
     void *fake_stream = reinterpret_cast<void *>(0xBEEF);
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, fake_stream);
+    EXPECT_THROW(
+        TransferEngine::publishCurrentDeviceWrite(
+            tensor.get(),
+            fake_stream),
+        std::runtime_error);
 
     // MockBackend's backendDeviceType() returns CPU, but gpu_device_ is ROCm.
     // The defensive check compares backend->backendDeviceType() vs gpu_device_->type.
     // Since they don't match (CPU != ROCm), event recording should be SKIPPED.
-    // This is the defensive behavior that prevents the HybridPPTP crash.
+    // This hard failure prevents the HybridPPTP crash without publishing a
+    // state that lacks a usable completion dependency.
     EXPECT_EQ(mock_backend_.getEventCreateCount(), 0u)
-        << "Event should NOT be created when backend type doesn't match gpu_device_ type";
+        << "Event must not be created through the wrong backend";
     EXPECT_EQ(mock_backend_.getEventRecordCount(), 0u)
-        << "Event should NOT be recorded when backend type doesn't match gpu_device_ type";
+        << "Event must not be recorded through the wrong backend";
+    EXPECT_TRUE(tensor->getHostValid());
+    EXPECT_TRUE(tensor->getDeviceValid())
+        << "The preceding upload remains SYNCED after rejected publication.";
 
-    // But the flags should still be updated correctly
-    EXPECT_TRUE(tensor->getDeviceValid());
-    EXPECT_FALSE(tensor->getHostValid());
-
+    mock_backend_.setMockDeviceType(DeviceType::ROCm);
     cleanupTensor(tensor.get());
 }
 
-TEST_F(Test__CrossBackendCoherence, MarkDirtyWithEvent_NullStream_SkipsBackendCheck)
+TEST_F(Test__CrossBackendCoherence, MarkDirtyWithEvent_NullStreamStillChecksBackend)
 {
     auto tensor = createTensor();
     ASSERT_TRUE(tensor->ensureOnDevice(rocm_device_));
     mock_backend_.resetAll();
-    tensor->injectCompletionEvent(nullptr);
+    mock_backend_.setMockDeviceType(DeviceType::CPU);
 
-    // Null stream: the defensive check is skipped (stream==nullptr is allowed
-    // for the default overload that uses the device's default stream)
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, nullptr);
-
-    // With null stream, the check `if (stream && ...)` is false, so we proceed
-    // to event creation and recording normally through the mock backend
-    EXPECT_GE(mock_backend_.getEventCreateCount(), 1u)
-        << "Null stream should not trigger cross-backend guard";
-
-    // Flags updated
+    EXPECT_THROW(
+        TransferEngine::publishCurrentDeviceWrite(
+            tensor.get(),
+            nullptr),
+        std::invalid_argument);
+    EXPECT_EQ(mock_backend_.getEventCreateCount(), 0u)
+        << "A null stream must fail before backend ownership is inspected.";
+    EXPECT_TRUE(tensor->getHostValid());
     EXPECT_TRUE(tensor->getDeviceValid());
-    EXPECT_FALSE(tensor->getHostValid());
 
+    mock_backend_.setMockDeviceType(DeviceType::ROCm);
     cleanupTensor(tensor.get());
 }
 
@@ -221,6 +241,7 @@ TEST_F(Test__CrossBackendCoherence, AllocateOnDevice_MigratesGpuDevice)
     void *second_ptr = tensor->getGpuDataPtr();
     EXPECT_NE(second_ptr, nullptr);
 
+    mock_backend_.setMockDeviceType(DeviceType::CUDA);
     cleanupTensor(tensor.get());
 }
 
@@ -251,7 +272,7 @@ TEST_F(Test__CrossBackendCoherence, PPMigration_OutputTensorRehomedByDownstreamS
     // 1. Tensor starts on CUDA:0 (PP stage 0 output)
     // 2. Downstream PP stage 1 on ROCm:0 calls ensureOnDevice → migrates to ROCm
     // 3. Next iteration: PP stage 0 needs to re-home the tensor back to CUDA:0
-    //    via cohereOutputs (allocateOnDevice)
+    //    via explicit output allocation
     auto tensor = createTensor(5.0f);
 
     // Step 1: Initial allocation on CUDA device
@@ -263,14 +284,18 @@ TEST_F(Test__CrossBackendCoherence, PPMigration_OutputTensorRehomedByDownstreamS
     EXPECT_EQ(tensor->getGpuDevice(), rocm_device_)
         << "After downstream migration, gpu_device_ should be ROCm";
 
-    // Step 3: cohereOutputs re-homes tensor back to CUDA before next PP stage 0 execute
+    // Complete and retire the ROCm upload before changing the injected
+    // backend identity to model the downstream CUDA participant.
+    TransferEngine::publishSynchronized(tensor);
+    mock_backend_.setMockDeviceType(DeviceType::CUDA);
+
+    // Step 3: output preparation re-homes the tensor before PP stage 0 executes.
     ASSERT_TRUE(tensor->allocateOnDevice(cuda_device_));
     EXPECT_EQ(tensor->getGpuDevice(), cuda_device_)
         << "After re-homing via allocateOnDevice, gpu_device_ should be CUDA again";
 
     // Step 4: mark_device_dirty_with_event should now be safe with a CUDA stream
     // (gpu_device_ correctly reflects CUDA, not stale ROCm)
-    tensor->injectCompletionEvent(nullptr);
     mock_backend_.resetAll();
 
     // Even with MockBackend (CPU type), the key validation is that gpu_device_
@@ -282,13 +307,13 @@ TEST_F(Test__CrossBackendCoherence, PPMigration_OutputTensorRehomedByDownstreamS
     cleanupTensor(tensor.get());
 }
 
-TEST_F(Test__CrossBackendCoherence, PPMigration_StaleGpuDevice_EventSkipped)
+TEST_F(Test__CrossBackendCoherence, PPMigration_StaleGpuDevice_EventFailsClosed)
 {
     // Demonstrate the exact crash scenario (now defended against):
     // 1. Tensor's gpu_device_ says ROCm:0 (stale from downstream)
     // 2. Caller passes a "CUDA stream" to mark_device_dirty_with_event
     // 3. Backend resolves to MockBackend (type=CPU), gpu_device_ type=ROCm → mismatch
-    // 4. Event recording is SKIPPED to prevent crash
+    // 4. Publication fails before event recording or coherence mutation
     auto tensor = createTensor(10.0f);
 
     // Simulate stale state: tensor thinks it's on ROCm
@@ -296,20 +321,26 @@ TEST_F(Test__CrossBackendCoherence, PPMigration_StaleGpuDevice_EventSkipped)
     EXPECT_EQ(tensor->getGpuDevice(), rocm_device_);
 
     mock_backend_.resetAll();
-    tensor->injectCompletionEvent(nullptr);
+    mock_backend_.setMockDeviceType(DeviceType::CPU);
 
     // Pass a non-null "CUDA stream" — triggers the defensive check
     void *cuda_stream = reinterpret_cast<void *>(0xC0DA);
-    tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, cuda_stream);
+    EXPECT_THROW(
+        TransferEngine::publishCurrentDeviceWrite(
+            tensor.get(),
+            cuda_stream),
+        std::runtime_error);
 
     // The defensive check fires: backend type (CPU) != gpu_device_ type (ROCm)
-    // Event recording should be skipped
+    // Event recording must not be attempted.
     EXPECT_EQ(mock_backend_.getEventRecordCount(), 0u)
         << "Must NOT record event when backend type mismatches gpu_device_ type";
 
-    // Flags should still be updated (device_valid=true, host_valid=false)
-    EXPECT_TRUE(tensor->getDeviceValid());
-    EXPECT_FALSE(tensor->getHostValid());
+    // The preceding allocation leaves host data authoritative. Failed
+    // publication cannot alter that ownership.
+    EXPECT_TRUE(tensor->getHostValid());
+    EXPECT_FALSE(tensor->getDeviceValid());
 
+    mock_backend_.setMockDeviceType(DeviceType::ROCm);
     cleanupTensor(tensor.get());
 }

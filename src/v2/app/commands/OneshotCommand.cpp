@@ -82,7 +82,8 @@ namespace llaminar2
         full_argv.push_back(const_cast<char *>(kSubcmd));
         for (int i = 1; i < argc; ++i)
             full_argv.push_back(argv[i]);
-        int full_argc = static_cast<int>(full_argv.size());
+        full_argv.push_back(nullptr);
+        int full_argc = static_cast<int>(full_argv.size() - 1);
 
         // MPI Bootstrap
         MPIBootstrapPhase bootstrap;

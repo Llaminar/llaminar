@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "backends/ExplicitGPUStream.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
@@ -44,7 +45,7 @@ namespace llaminar2
             workspace_ = workspace;
             if (workspace_)
             {
-                LOG_DEBUG("[CUDAKernelBase] Workspace bound with " << workspace_->bufferCount() << " buffers");
+                LOG_TRACE("[CUDAKernelBase] Workspace bound with " << workspace_->bufferCount() << " buffers");
             }
         }
 
@@ -89,23 +90,47 @@ namespace llaminar2
          * The default CUDA stream (stream 0) causes race conditions with
          * the executor's event-based coherence tracking.
          *
-         * @param stream Opaque CUDA stream pointer (cudaStream_t cast to void*)
+         * @param stream Validated non-null CUDA stream binding.
          */
-        void setGPUStream(void *stream) { gpu_stream_ = stream; }
+        void bindGPUStream(ExplicitGPUStream stream) { gpu_stream_ = stream.get(); }
 
         /**
-         * @brief Get the GPU stream for kernel dispatch
+         * @brief Explicitly release the borrowed execution-stream binding.
          *
-         * Returns the explicitly-set GPU stream, falling back to the device
-         * context's default stream if available.
+         * Clearing is a lifecycle action and therefore cannot be confused with
+         * assigning a null execution stream.
+         */
+        void clearGPUStreamBinding() noexcept { gpu_stream_ = nullptr; }
+
+        /**
+         * @brief Report whether a caller explicitly selected the launch stream.
          *
-         * @return cudaStream_t cast to void*, or nullptr if no stream is set
+         * Consumers use this query to verify that the current transaction
+         * explicitly named its launch stream.
+         *
+         * @return true only when bindGPUStream() received a non-null stream.
+         */
+        [[nodiscard]] bool hasExplicitGPUStream() const noexcept
+        {
+            return gpu_stream_ != nullptr;
+        }
+
+        /**
+         * @brief Get the non-null GPU stream for kernel dispatch.
+         *
+         * A kernel without an explicit binding is not launchable. Device
+         * contexts own streams but do not silently lend one to a kernel: the
+         * executor must name the exact producer stream for every invocation.
+         *
+         * @return cudaStream_t cast to a non-null opaque pointer.
+         * @throws std::runtime_error when no owned stream exists.
          */
         void *getStream() const
         {
             if (gpu_stream_)
                 return gpu_stream_;
-            return device_ctx_ ? device_ctx_->defaultStream() : nullptr;
+            throw std::runtime_error(
+                "[CUDAKernelBase] GPU execution requires an explicit non-null stream binding");
         }
 
         /**
@@ -121,16 +146,18 @@ namespace llaminar2
          */
         void *requireStream(const char *kernel_name = "CUDAKernel") const
         {
-            void *s = getStream();
-            if (!s)
+            try
+            {
+                return getStream();
+            }
+            catch (const std::runtime_error &)
             {
                 throw std::runtime_error(
                     std::string("[") + kernel_name +
-                    "] No GPU stream set. All CUDA kernels must have an explicit stream "
-                    "bound via setGPUStream() before execution. Running on the default "
-                    "stream causes race conditions with event-based coherence tracking.");
+                    "] No owned GPU stream is available. Bind an explicit "
+                    "stream or a worker context before execution; stream zero "
+                    "cannot participate in event-backed coherence.");
             }
-            return s;
         }
 
         /**

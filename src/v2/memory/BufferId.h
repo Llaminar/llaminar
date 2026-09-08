@@ -29,6 +29,15 @@ namespace llaminar2
         LOGITS_LOCAL, ///< Column-parallel partial logits (TP)
         ALL_POSITION_LOGITS,       ///< Verifier logits for every row [seq_len, vocab_size]
         ALL_POSITION_LOGITS_LOCAL, ///< Column-parallel verifier logits [seq_len, local_vocab]
+        REQUEST_TOKEN_IDS,         ///< Device-owned request token rows admitted once at the API boundary
+        REQUEST_POSITION_IDS,      ///< Device-owned absolute request positions paired with REQUEST_TOKEN_IDS
+        REQUEST_BATCH_GEOMETRY,    ///< Device-owned real lengths followed by the padded physical row stride
+        PREFILL_CHUNK_TOKEN_IDS,    ///< Captured device materialization of the current request-token bucket
+        PREFILL_CHUNK_POSITION_IDS, ///< Captured device materialization of current absolute-position rows
+        PREFILL_CHUNK_GEOMETRY,     ///< Captured current real-row count followed by the physical bucket stride
+        MTP_SHIFTED_PREFILL_TOKEN_IDS, ///< Device-owned shifted condition tokens produced inside the captured prefill graph
+        MTP_SHIFTED_PREFILL_POSITION_IDS, ///< Device-owned shifted positions paired with MTP_SHIFTED_PREFILL_TOKEN_IDS
+        MTP_SHIFTED_PREFILL_APPEND_LENGTHS, ///< Device-owned real shifted-KV append width for each request
 
         // ── Per-layer activation buffers (recycled across layers) ───────────
         NORMALIZED,  ///< RMSNorm output
@@ -36,6 +45,8 @@ namespace llaminar2
         Q_PROJ,      ///< Q projection output
         K_PROJ,      ///< K projection output
         V_PROJ,      ///< V projection output
+        K_FULL_PREFILL, ///< Full replicated K projection rows for phase-split decode cache seeding
+        V_FULL_PREFILL, ///< Full replicated V projection rows for phase-split decode cache seeding
         Q_ROPE,      ///< Post-RoPE Q
         K_ROPE,      ///< Post-RoPE K
         V_DEQUANT,   ///< Dequantized V
@@ -69,6 +80,7 @@ namespace llaminar2
         MOE_EXPERT_WEIGHTS,       ///< Top-k routing weights per token
         MOE_EXPERT_OUTPUT,        ///< Scratch for per-expert FFN output
         MOE_COMBINED_OUTPUT,      ///< Final combined expert output
+        MOE_CANONICAL_ROUTE_CONTRIBUTIONS, ///< LocalTP publication: route slots then rank-addressed shared banks
         MOE_SHARED_EXPERT_OUTPUT, ///< Shared expert FFN output
         MOE_SHARED_GATE_OUTPUT,   ///< Shared expert after sigmoid gating
         MOE_GATE_SCRATCH,         ///< Expert gate projection scratch [seq, intermediate]
@@ -108,6 +120,11 @@ namespace llaminar2
         STOCHASTIC_VERIFY_THRESHOLDS,   ///< Scalar stochastic verifier thresholds [1, 4]
         STOCHASTIC_BATCH_OUTPUT_TOKENS, ///< Reduced stochastic verifier output tokens [request, 5]
         STOCHASTIC_BATCH_OUTPUT_META,   ///< Reduced stochastic verifier metadata [request, 10]
+        MTP_FIRST_TRANSACTION_DIAGNOSTIC, ///< Retained device-only stochastic transaction-zero evidence
+        MTP_COMMITTED_VERIFIER_IDENTITY, ///< Last response-visible verifier transaction identity [request, fixed record]
+        MTP_GENERATION_RESPONSE_TOKENS, ///< Persistent device-owned response ledger [request, max_seq_len]
+        MTP_GENERATION_CONTROL,         ///< Persistent device-owned generation controller [request, control_words]
+        MTP_GENERATION_DISPATCH_TICKETS, ///< Narrow immutable HIP scheduler snapshots [request, ticket_words]
 
         // ── Prefix cache restore/harvest staging ───────────────────────────
         PREFIX_K_STAGING,
@@ -128,6 +145,8 @@ namespace llaminar2
         MTP_Q_PROJ,
         MTP_K_PROJ,
         MTP_V_PROJ,
+        MTP_K_FULL_PREFILL,
+        MTP_V_FULL_PREFILL,
         MTP_FA_Q_RAW,
         MTP_FA_GATE,
         MTP_Q_ROPE,
@@ -137,9 +156,18 @@ namespace llaminar2
         MTP_GATE_PROJ,
         MTP_UP_PROJ,
         MTP_FFN_OUTPUT,
-        MTP_LOGITS,
+        MTP_LOGITS, ///< Participant output: vocabulary shard or full row according to the resolved terminal-head layout
+        MTP_LOGITS_GATHERED, ///< Full-vocabulary explicit-sharded GlobalTP sidecar rows after allgather
         MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition-token rows for device-resident MTP sidecar input
+        MTP_POSITION_IDS, ///< Arena-owned INT32 request positions for device-resident batched MTP sidecar replay
         MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
+        MTP_VERIFIER_STOP_TOKENS, ///< Arena-owned fixed-width INT32 stop-token controls for captured verifier reduction
+        MTP_GREEDY_PENALTY_POLICY, ///< Arena-owned request policy read by captured grouped greedy sampling
+        MTP_GENERATED_TOKEN_COUNTS, ///< Arena-owned generated-token histogram for presence/frequency penalties
+        MTP_VERIFIER_POSITION_IDS, ///< Arena-owned INT32 absolute positions expanded from device-owned live KV counts
+        MTP_VERIFIER_REQUEST_LENGTHS, ///< Arena-owned INT32 valid grouped-verifier width for each request row
+        MTP_LOGICAL_SEQUENCE_STATE, ///< Arena-owned INT32 published logical-state rows that outlive graph workspace generations
+        MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS, ///< Opt-in device-only phase history for fatal MTP publication diagnostics
 
         _COUNT ///< Sentinel – must be last
     };
@@ -161,6 +189,18 @@ namespace llaminar2
             return "ALL_POSITION_LOGITS";
         case BufferId::ALL_POSITION_LOGITS_LOCAL:
             return "ALL_POSITION_LOGITS_LOCAL";
+        case BufferId::REQUEST_TOKEN_IDS:
+            return "REQUEST_TOKEN_IDS";
+        case BufferId::REQUEST_POSITION_IDS:
+            return "REQUEST_POSITION_IDS";
+        case BufferId::REQUEST_BATCH_GEOMETRY:
+            return "REQUEST_BATCH_GEOMETRY";
+        case BufferId::PREFILL_CHUNK_TOKEN_IDS:
+            return "PREFILL_CHUNK_TOKEN_IDS";
+        case BufferId::PREFILL_CHUNK_POSITION_IDS:
+            return "PREFILL_CHUNK_POSITION_IDS";
+        case BufferId::PREFILL_CHUNK_GEOMETRY:
+            return "PREFILL_CHUNK_GEOMETRY";
         case BufferId::NORMALIZED:
             return "NORMALIZED";
         case BufferId::RESIDUAL:
@@ -171,6 +211,10 @@ namespace llaminar2
             return "K_PROJ";
         case BufferId::V_PROJ:
             return "V_PROJ";
+        case BufferId::K_FULL_PREFILL:
+            return "K_FULL_PREFILL";
+        case BufferId::V_FULL_PREFILL:
+            return "V_FULL_PREFILL";
         case BufferId::Q_ROPE:
             return "Q_ROPE";
         case BufferId::K_ROPE:
@@ -217,6 +261,8 @@ namespace llaminar2
             return "MOE_EXPERT_OUTPUT";
         case BufferId::MOE_COMBINED_OUTPUT:
             return "MOE_COMBINED_OUTPUT";
+        case BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS:
+            return "MOE_CANONICAL_ROUTE_CONTRIBUTIONS";
         case BufferId::MOE_SHARED_EXPERT_OUTPUT:
             return "MOE_SHARED_EXPERT_OUTPUT";
         case BufferId::MOE_SHARED_GATE_OUTPUT:
@@ -263,6 +309,22 @@ namespace llaminar2
             return "STOCHASTIC_BATCH_OUTPUT_TOKENS";
         case BufferId::STOCHASTIC_BATCH_OUTPUT_META:
             return "STOCHASTIC_BATCH_OUTPUT_META";
+        case BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC:
+            return "MTP_FIRST_TRANSACTION_DIAGNOSTIC";
+        case BufferId::MTP_COMMITTED_VERIFIER_IDENTITY:
+            return "MTP_COMMITTED_VERIFIER_IDENTITY";
+        case BufferId::MTP_GENERATION_RESPONSE_TOKENS:
+            return "MTP_GENERATION_RESPONSE_TOKENS";
+        case BufferId::MTP_GENERATION_CONTROL:
+            return "MTP_GENERATION_CONTROL";
+        case BufferId::MTP_GENERATION_DISPATCH_TICKETS:
+            return "MTP_GENERATION_DISPATCH_TICKETS";
+        case BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS:
+            return "MTP_SHIFTED_PREFILL_TOKEN_IDS";
+        case BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS:
+            return "MTP_SHIFTED_PREFILL_POSITION_IDS";
+        case BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS:
+            return "MTP_SHIFTED_PREFILL_APPEND_LENGTHS";
         case BufferId::PREFIX_K_STAGING:
             return "PREFIX_K_STAGING";
         case BufferId::PREFIX_V_STAGING:
@@ -295,6 +357,10 @@ namespace llaminar2
             return "MTP_K_PROJ";
         case BufferId::MTP_V_PROJ:
             return "MTP_V_PROJ";
+        case BufferId::MTP_K_FULL_PREFILL:
+            return "MTP_K_FULL_PREFILL";
+        case BufferId::MTP_V_FULL_PREFILL:
+            return "MTP_V_FULL_PREFILL";
         case BufferId::MTP_FA_Q_RAW:
             return "MTP_FA_Q_RAW";
         case BufferId::MTP_FA_GATE:
@@ -315,10 +381,28 @@ namespace llaminar2
             return "MTP_FFN_OUTPUT";
         case BufferId::MTP_LOGITS:
             return "MTP_LOGITS";
+        case BufferId::MTP_LOGITS_GATHERED:
+            return "MTP_LOGITS_GATHERED";
         case BufferId::MTP_CONDITION_TOKEN:
             return "MTP_CONDITION_TOKEN";
+        case BufferId::MTP_POSITION_IDS:
+            return "MTP_POSITION_IDS";
         case BufferId::MTP_VERIFIER_INPUT_TOKENS:
             return "MTP_VERIFIER_INPUT_TOKENS";
+        case BufferId::MTP_VERIFIER_STOP_TOKENS:
+            return "MTP_VERIFIER_STOP_TOKENS";
+        case BufferId::MTP_GREEDY_PENALTY_POLICY:
+            return "MTP_GREEDY_PENALTY_POLICY";
+        case BufferId::MTP_GENERATED_TOKEN_COUNTS:
+            return "MTP_GENERATED_TOKEN_COUNTS";
+        case BufferId::MTP_VERIFIER_POSITION_IDS:
+            return "MTP_VERIFIER_POSITION_IDS";
+        case BufferId::MTP_VERIFIER_REQUEST_LENGTHS:
+            return "MTP_VERIFIER_REQUEST_LENGTHS";
+        case BufferId::MTP_LOGICAL_SEQUENCE_STATE:
+            return "MTP_LOGICAL_SEQUENCE_STATE";
+        case BufferId::MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS:
+            return "MTP_LOGICAL_SEQUENCE_STATE_DIAGNOSTIC_SNAPSHOTS";
         case BufferId::MOE_GATE_SCRATCH:
             return "MOE_GATE_SCRATCH";
         case BufferId::MOE_UP_SCRATCH:

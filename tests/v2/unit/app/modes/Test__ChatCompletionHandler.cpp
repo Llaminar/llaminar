@@ -4,6 +4,8 @@
  *
  * Tests request parsing, sampling parameter wiring, inference flow,
  * error handling, and response formatting — all via mock interfaces.
+ * Completion summaries must consume existing terminal observations, never
+ * invoke an intrusive live-state probe on either HTTP response path.
  */
 
 #include <gtest/gtest.h>
@@ -12,6 +14,7 @@
 #include "app/modes/ChatCompletionHandler.h"
 #include "mocks/MockOrchestrationRunner.h"
 #include "mocks/MockTokenizer.h"
+#include "utils/Logger.h"
 #include "nlohmann/json.hpp"
 
 #include <ctime>
@@ -41,12 +44,16 @@ protected:
 
         // Default: runner is initialized
         runner_->simulateInitialized();
-        EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        EXPECT_CALL(*runner_, maybeApplyMoERebalance(_))
             .Times(AnyNumber())
             .WillRepeatedly(Return(true));
         EXPECT_CALL(*runner_, prefixStateProbe())
+            .Times(0);
+        EXPECT_CALL(*runner_, requestRuntimeSummary())
             .Times(AnyNumber())
-            .WillRepeatedly(Return(PrefixRuntimeStateSnapshot{}));
+            .WillRepeatedly(Return(RequestRuntimeSummary{}));
+        previous_log_level_ = Logger::getInstance().getLogLevel();
+        Logger::getInstance().setLogLevel(LogLevel::INFO);
 
         ON_CALL(*tokenizer_, encodeChat(_, _, _, _))
             .WillByDefault(Invoke([this](const std::vector<ChatMessage> &messages,
@@ -61,6 +68,14 @@ protected:
     {
         return std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_);
     }
+
+    /** Restore process-local logging so the fixture cannot affect other suites. */
+    void TearDown() override
+    {
+        Logger::getInstance().setLogLevel(previous_log_level_);
+    }
+
+    LogLevel previous_log_level_ = LogLevel::INFO;
 
     /// Build a minimal valid request JSON
     static std::string minimalRequest(json overrides = json::object())
@@ -619,7 +634,38 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsumesMultiTokenDecodeStep)
     EXPECT_EQ(body["usage"]["completion_tokens"], 2);
 }
 
-TEST_F(Test__ChatCompletionHandler, HandleRequest_ProbesRuntimeStateForServeSummary)
+/** Ordinary completion logs must not inspect or synchronize live GPU state. */
+TEST_F(Test__ChatCompletionHandler, RuntimeSummaryNeverProbesLiveInferenceState)
+{
+    auto handler = makeHandler();
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return("A"));
+    EXPECT_CALL(*runner_, decodeStep())
+        .Times(4).WillRepeatedly(Return(makeToken(10)));
+    // A real probe reads ring metadata and can wait for unrelated maintenance.
+    // Both HTTP modes must use completed request observations instead.
+    EXPECT_CALL(*runner_, prefixStateProbe()).Times(0);
+    EXPECT_CALL(*runner_, requestRuntimeSummary())
+        .Times(2).WillRepeatedly(Return(RequestRuntimeSummary{}));
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 1;
+    request.enable_thinking = false;
+    for (const auto level : {LogLevel::INFO, LogLevel::WARN})
+    {
+        Logger::getInstance().setLogLevel(level);
+        request.stream = false;
+        EXPECT_TRUE(handler->handleRequest(request).ok);
+        request.stream = true;
+        EXPECT_TRUE(handler->handleStreamingRequest(request,
+            [](const std::string &) { return true; }).ok);
+    }
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_UsesTerminalRequestSummary)
 {
     auto handler = makeHandler();
 
@@ -632,8 +678,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ProbesRuntimeStateForServeSumm
     ON_CALL(*tokenizer_, decode_token(10))
         .WillByDefault(Return("A"));
 
-    PrefixRuntimeStateSnapshot snapshot;
-    snapshot.mtp_config_enabled = true;
+    RequestRuntimeSummary snapshot;
     snapshot.mtp_request.enabled = true;
     snapshot.mtp_request.adaptive_depth_enabled = true;
     snapshot.mtp_request.depth_policy_mode = "dynamic";
@@ -649,7 +694,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ProbesRuntimeStateForServeSumm
 
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(10)));
-    EXPECT_CALL(*runner_, prefixStateProbe())
+    EXPECT_CALL(*runner_, requestRuntimeSummary())
         .Times(1)
         .WillOnce(Return(snapshot));
 
@@ -856,13 +901,69 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterDecod
     EXPECT_CALL(*runner_, decodeStep())
         .Times(3)
         .WillRepeatedly(Return(makeToken(42, false)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
         .Times(3)
         .WillRepeatedly(Return(true));
 
     ChatCompletionRequest request;
     request.messages = {ChatMessage("user", "Hello")};
     request.max_tokens = 3;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterFinalCompletedStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Return("x"));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(42, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
+        .Times(1)
+        .WillOnce(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Hello")};
+    request.max_tokens = 8;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_UsesUnifiedDecodeBoundaryMaintenance)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(42, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
+        .Times(1)
+        .WillOnce(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Hello")};
+    request.max_tokens = 8;
     request.enable_thinking = false;
 
     auto response = handler->handleRequest(request);
@@ -2017,7 +2118,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_FirstChunk_HasRoleAssistant)
     EXPECT_EQ(first_json["object"], "chat.completion.chunk");
 }
 
-TEST_F(Test__ChatCompletionHandler, Streaming_ProbesRuntimeStateForServeSummary)
+TEST_F(Test__ChatCompletionHandler, Streaming_UsesTerminalRequestSummary)
 {
     auto handler = makeHandler();
 
@@ -2030,8 +2131,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_ProbesRuntimeStateForServeSummary)
     ON_CALL(*tokenizer_, decode_token(10))
         .WillByDefault(Return("A"));
 
-    PrefixRuntimeStateSnapshot snapshot;
-    snapshot.prefix_cache_config_enabled = true;
+    RequestRuntimeSummary snapshot;
     snapshot.prefix_request.enabled = true;
     snapshot.prefix_request.requested_tokens = 1;
     snapshot.prefix_request.matched_tokens = 1;
@@ -2040,7 +2140,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_ProbesRuntimeStateForServeSummary)
 
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(10)));
-    EXPECT_CALL(*runner_, prefixStateProbe())
+    EXPECT_CALL(*runner_, requestRuntimeSummary())
         .Times(1)
         .WillOnce(Return(snapshot));
 
@@ -2229,6 +2329,76 @@ TEST_F(Test__ChatCompletionHandler, Streaming_FinalChunk_HasFinishReason)
     size_t finish_idx = chunks.size() - 2; // before [DONE]
     auto finish_json = json::parse(chunks[finish_idx].substr(6, chunks[finish_idx].find("\n\n") - 6));
     EXPECT_EQ(finish_json["choices"][0]["finish_reason"], "stop");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_AppliesRebalanceHookAfterFinalCompletedStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(1, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
+        .Times(1)
+        .WillOnce(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 1u);
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_UsesUnifiedDecodeBoundaryMaintenance)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(1, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
+        .Times(1)
+        .WillOnce(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 1u);
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
 }
 
 TEST_F(Test__ChatCompletionHandler, Streaming_DoneSentinel_EmittedLast)
@@ -2576,12 +2746,12 @@ TEST_F(Test__ChatCompletionHandler, ThinkSplitter_AfterTransition_ContentField)
     EXPECT_EQ(r.text, "answer");
 }
 
-TEST_F(Test__ChatCompletionHandler, ThinkSplitter_DuplicateEndTagStopsContent)
+TEST_F(Test__ChatCompletionHandler, ThinkSplitter_DuplicateEndTagPreservesFollowingContent)
 {
     StreamingThinkSplitter splitter("</think>");
 
-    // The first marker closes reasoning; later markers are malformed answer
-    // text and should stop the stream before the marker is emitted.
+    // All closing markers are framing, not EOS. A later natural marker must
+    // not hide the final answer following a budget-injected marker.
     auto r1 = splitter.process("reasoning</think>\n\nAnswer ");
     EXPECT_EQ(r1.field, "reasoning_content");
     EXPECT_FALSE(splitter.inThinking());
@@ -2589,17 +2759,52 @@ TEST_F(Test__ChatCompletionHandler, ThinkSplitter_DuplicateEndTagStopsContent)
     auto first_content = splitter.flush();
     EXPECT_EQ(first_content.field, "content");
     EXPECT_EQ(first_content.text, "Answer ");
-    EXPECT_FALSE(first_content.stop_generation);
 
     auto r2 = splitter.process("</th");
     EXPECT_EQ(r2.field, "content");
     EXPECT_TRUE(r2.text.empty());
-    EXPECT_FALSE(r2.stop_generation);
 
-    auto r3 = splitter.process("ink>\n\nIgnored");
+    auto r3 = splitter.process("ink>\n\nFinal answer");
     EXPECT_EQ(r3.field, "content");
-    EXPECT_TRUE(r3.text.empty());
-    EXPECT_TRUE(r3.stop_generation);
+    EXPECT_EQ(r3.text, "\n\nFinal answer");
+}
+
+/** @brief Closing markers are idempotent before the answer for every chunk split. */
+TEST_F(Test__ChatCompletionHandler, ThinkSplitter_RedundantCloseBeforeAnswerIsChunkInvariant)
+{
+    const std::string text = "reasoning</think>\n </think>\t</think>\n13</think> preserved";
+    for (size_t width = 1; width <= text.size(); ++width)
+    {
+        SCOPED_TRACE(width);
+        StreamingThinkSplitter splitter("</think>");
+        std::string reasoning, content;
+        const auto collect = [&](const StreamingThinkSplitter::SplitResult &part)
+        {
+            (part.field == "content" ? content : reasoning) += part.text;
+        };
+        for (size_t offset = 0; offset < text.size(); offset += width)
+            collect(splitter.process(text.substr(offset, width)));
+        collect(splitter.flush());
+        EXPECT_EQ(reasoning, "reasoning");
+        EXPECT_EQ(content, "13 preserved");
+        EXPECT_FALSE(splitter.inThinking());
+        EXPECT_EQ(splitter.process(" more content").text, " more content");
+    }
+}
+
+/** @brief Whitespace and partial duplicate markers cannot invent a visible answer. */
+TEST_F(Test__ChatCompletionHandler, ThinkSplitter_AwaitingAnswerDoesNotStopAtRepeatedClose)
+{
+    StreamingThinkSplitter splitter("</think>");
+    for (const std::string piece : {"</think>", "\n", "</th", "ink>", "\t"})
+    {
+        const auto part = splitter.process(piece);
+        EXPECT_TRUE(part.text.empty());
+    }
+    EXPECT_TRUE(splitter.flush().text.empty());
+    EXPECT_EQ(splitter.process("13").text, "13");
+    EXPECT_TRUE(splitter.process("</think>").text.empty());
+    EXPECT_EQ(splitter.process(" final").text, " final");
 }
 
 TEST_F(Test__ChatCompletionHandler, ThinkSplitter_EndTagOnly_EmptyReasoning)
@@ -2824,7 +3029,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_InjectsStopSequ
     EXPECT_NE(content.find(" now"), std::string::npos);
 }
 
-TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_StopsAtDuplicateEndTag)
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_ConsumesEOSAfterDuplicateEndTag)
 {
     auto handler = makeHandler();
     auto tmpl = makeThinkingTemplate();
@@ -2862,7 +3067,9 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_StopsAtDuplicat
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(10))) // Exhausts the thinking budget.
         .WillOnce(Return(makeToken(11))) // First answer token after the forced close.
-        .WillOnce(Return(makeToken(12))); // Duplicate close tag stops generation.
+        .WillOnce(Return(makeToken(12))) // Delimiter is not EOS.
+        .WillOnce(Return(makeToken(13))) // Preserve the model's final answer.
+        .WillOnce(Return(makeToken(0, true)));
     EXPECT_CALL(*runner_, forceDecodeToken(90))
         .WillOnce(Return(makeToken(90)));
 
@@ -2879,12 +3086,155 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_StopsAtDuplicat
     auto message = body["choices"][0]["message"];
     const auto content = message["content"].get<std::string>();
 
-    EXPECT_EQ(content, "13\n");
+    EXPECT_EQ(content, "13\n\n\n13");
     EXPECT_EQ(content.find("</think>"), std::string::npos)
         << "Duplicate thinking end tags must not leak into answer content";
     ASSERT_TRUE(message.contains("reasoning_content"));
     EXPECT_NE(message["reasoning_content"].get<std::string>().find("reasoning"),
               std::string::npos);
+}
+
+/**
+ * @brief HTTP and SSE must both reach the answer after a forced/natural double close.
+ *
+ * Ornith emitted its own closing marker immediately after the injected budget
+ * phrase. The old handler stopped before sampling any visible answer. Keep
+ * the forced token, duplicate marker, actual answer and EOS as separate calls
+ * so a premature stop violates both mock expectations and response content.
+ */
+TEST_F(Test__ChatCompletionHandler, ThinkingBudget_RedundantCloseBeforeAnswer_HTTPAndSSE)
+{
+    auto tmpl = makeThinkingTemplate();
+    ON_CALL(*tokenizer_, hasChatTemplate()).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, getChatTemplate()).WillByDefault(::testing::ReturnRef(*tmpl));
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*runner_, getStopThinkingPrompt()).WillByDefault(Return("budget close</think>\n\n"));
+    ON_CALL(*tokenizer_, encode("budget close</think>\n\n", false, false))
+        .WillByDefault(Return(std::vector<int>{90}));
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return("reasoning"));
+    ON_CALL(*tokenizer_, decode_token(90)).WillByDefault(Return("budget close</think>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(11)).WillByDefault(Return("</th"));
+    ON_CALL(*tokenizer_, decode_token(12)).WillByDefault(Return("ink>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(13)).WillByDefault(Return("13"));
+
+    for (bool streaming : {false, true})
+    {
+        SCOPED_TRACE(streaming);
+        EXPECT_CALL(*runner_, decodeStep())
+            .WillOnce(Return(makeToken(10)))
+            .WillOnce(Return(makeToken(11)))
+            .WillOnce(Return(makeToken(12)))
+            .WillOnce(Return(makeToken(13)))
+            .WillOnce(Return(makeToken(0, true)));
+        EXPECT_CALL(*runner_, forceDecodeToken(90)).WillOnce(Return(makeToken(90)));
+        ChatCompletionRequest request;
+        request.messages = {ChatMessage("user", "think briefly")};
+        request.max_tokens = 20;
+        request.enable_thinking = true;
+        request.thinking_budget_tokens = 1;
+        auto handler = makeHandler();
+        std::string content, reasoning;
+        if (streaming)
+        {
+            auto response = handler->handleStreamingRequest(request, [&](const std::string &line)
+            {
+                if (line.starts_with("data: ") && !line.starts_with("data: [DONE]"))
+                {
+                    const auto delta = json::parse(line.substr(6))["choices"][0]["delta"];
+                    content += delta.value("content", "");
+                    reasoning += delta.value("reasoning_content", "");
+                }
+                return true;
+            });
+            EXPECT_TRUE(response.ok);
+        }
+        else
+        {
+            auto response = handler->handleRequest(request);
+            ASSERT_TRUE(response.ok);
+            const auto message = json::parse(response.json_body)["choices"][0]["message"];
+            content = message.value("content", "");
+            reasoning = message.value("reasoning_content", "");
+        }
+        EXPECT_EQ(content, "13");
+        EXPECT_EQ(reasoning, "reasoningbudget close");
+        EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(runner_.get()));
+    }
+}
+
+/**
+ * @brief A reasoning delimiter cannot terminate HTTP or SSE generation.
+ *
+ * The real Qwen3.6 CUDA E2E emitted more reasoning after the budget's forced
+ * close, then its natural close before the numeric answer. The field splitter
+ * must not treat that second delimiter as EOS and discard the actual answer.
+ * Ordered mock calls prove that both response modes consume the answer and EOS.
+ */
+TEST_F(Test__ChatCompletionHandler, ThinkingBudget_ContinuedReasoningCloseIsNotEOS_HTTPAndSSE)
+{
+    auto tmpl = makeThinkingTemplate();
+    ON_CALL(*tokenizer_, hasChatTemplate()).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, getChatTemplate()).WillByDefault(::testing::ReturnRef(*tmpl));
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*runner_, getStopThinkingPrompt()).WillByDefault(Return("budget close</think>\n\n"));
+    ON_CALL(*tokenizer_, encode("budget close</think>\n\n", false, false))
+        .WillByDefault(Return(std::vector<int>{90}));
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return("reasoning"));
+    ON_CALL(*tokenizer_, decode_token(90)).WillByDefault(Return("budget close</think>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(11)).WillByDefault(Return("6. Final check complete."));
+    ON_CALL(*tokenizer_, decode_token(12)).WillByDefault(Return("</th"));
+    ON_CALL(*tokenizer_, decode_token(13)).WillByDefault(Return("ink>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(14)).WillByDefault(Return("13"));
+
+    for (bool streaming : {false, true})
+    {
+        SCOPED_TRACE(streaming);
+        EXPECT_CALL(*runner_, decodeStep())
+            .WillOnce(Return(makeToken(10)))
+            .WillOnce(Return(makeToken(11)))
+            .WillOnce(Return(makeToken(12)))
+            .WillOnce(Return(makeToken(13)))
+            .WillOnce(Return(makeToken(14)))
+            .WillOnce(Return(makeToken(0, true)));
+        EXPECT_CALL(*runner_, forceDecodeToken(90)).WillOnce(Return(makeToken(90)));
+        ChatCompletionRequest request;
+        request.messages = {ChatMessage("user", "think briefly")};
+        request.max_tokens = 20;
+        request.enable_thinking = true;
+        request.thinking_budget_tokens = 1;
+        auto handler = makeHandler();
+        std::string content, finish;
+        if (streaming)
+        {
+            const auto response = handler->handleStreamingRequest(request, [&](const std::string &line)
+            {
+                if (line.starts_with("data: ") && !line.starts_with("data: [DONE]"))
+                {
+                    const auto choice = json::parse(line.substr(6))["choices"][0];
+                    content += choice["delta"].value("content", "");
+                    if (!choice["finish_reason"].is_null())
+                        finish = choice["finish_reason"].get<std::string>();
+                }
+                return true;
+            });
+            EXPECT_TRUE(response.ok);
+        }
+        else
+        {
+            const auto response = handler->handleRequest(request);
+            ASSERT_TRUE(response.ok);
+            const auto choice = json::parse(response.json_body)["choices"][0];
+            content = choice["message"].value("content", "");
+            finish = choice["finish_reason"].get<std::string>();
+        }
+        EXPECT_EQ(content, "6. Final check complete.\n\n13");
+        EXPECT_EQ(finish, "stop");
+        EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(runner_.get()));
+    }
 }
 
 TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_DisabledByDefault)

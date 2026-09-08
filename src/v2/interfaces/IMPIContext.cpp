@@ -170,6 +170,13 @@ namespace llaminar2
             }
         }
 
+        bool test(MPI_Request *request, MPI_Status * /*status*/) const override
+        {
+            if (request)
+                *request = MPI_REQUEST_NULL;
+            return request != nullptr;
+        }
+
         void waitAll(std::vector<MPI_Request> &requests) const override
         {
             for (auto &req : requests)

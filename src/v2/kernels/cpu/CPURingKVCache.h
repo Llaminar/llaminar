@@ -310,24 +310,30 @@ namespace llaminar2
         // Cache Management
         // =====================================================================
 
-        /** @brief Reset all entries across all layers and sequences (head=0, size=0). */
-        void clear() override;
+        /** @brief Reset all entries without releasing persistent cache storage. */
+        bool resetRequestState(const StateResetContext &context) override;
 
         /**
          * @brief Reset a single (layer, sequence) entry.
          *
          * The underlying tensor memory is not freed — only the ring pointers are reset.
          */
-        void clear_sequence(int layer, int seq_idx) override;
+        bool resetLayerSequenceState(
+            int layer,
+            int seq_idx,
+            const StateResetContext &context) override;
 
-        /** @brief Reset all sequences for a given layer. */
-        void clear_layer(int layer) override;
+        /** @brief Reset one request slot across all cache layers. */
+        bool resetSequenceState(
+            int seq_idx,
+            const StateResetContext &context) override;
+
+        /** @brief Reset all request slots for a given layer. */
+        bool resetLayerState(
+            int layer,
+            const StateResetContext &context) override;
 
         /** @brief Advance ring metadata after an externally managed append/replay. */
-        void advanceHead(int layer, int seq_idx, int num_tokens) override;
-
-        /// Bring in ICPUKVCache::clear_sequence(seq_idx) which clears across all layers.
-        using ICPUKVCache::clear_sequence;
 
         // =====================================================================
         // Sharding (Tensor Parallelism) Accessors
@@ -472,26 +478,6 @@ namespace llaminar2
         void reset_eviction_counter() override { total_evicted_ = 0; }
 
         // =====================================================================
-        // Converted KV Access (dequant-on-read with optional fused RoPE)
-        // =====================================================================
-
-        /**
-         * @brief Get K/V converted to target precision with optional fused RoPE.
-         *
-         * Manages internal FP32 shadow buffers per (layer, seq_idx). Only newly
-         * appended rows are dequantized each call (incremental conversion).
-         * When rope->rope_theta > 0, RoPE is fused into K dequantization.
-         *
-         * Supports all cache precisions: FP32 (passthrough), FP16, BF16, Q8_1,
-         * Q16_1, TQ4, TQ8, and split TQ (TQ8 K + TQ4 V).
-         */
-        bool get_kv_converted(int layer, int seq_idx,
-                              ActivationPrecision target,
-                              ITensor **out_k, ITensor **out_v,
-                              int *out_kv_len = nullptr,
-                              const KVReadParams *rope = nullptr) override;
-
-        // =====================================================================
         // Ring Buffer Inspection
         // =====================================================================
 
@@ -543,39 +529,6 @@ namespace llaminar2
 
         /// @brief Per-layer device placement (CPU, CUDA:0, etc.).
         std::vector<DeviceId> layer_devices_;
-
-        // =====================================================================
-        // FP32 Shadow Buffers (for get_kv_converted)
-        // =====================================================================
-
-        /**
-         * @brief Per-(layer, seq_idx) shadow state for incremental FP32 conversion.
-         *
-         * Lazily allocated on first get_kv_converted() call. Tracks how many rows
-         * have been converted so far, enabling O(1) incremental update per decode step.
-         */
-        struct FP32Shadow
-        {
-            std::unique_ptr<FP32Tensor> K; ///< FP32 K shadow [max_seq_len × kv_dim]
-            std::unique_ptr<FP32Tensor> V; ///< FP32 V shadow [max_seq_len × kv_dim]
-            int converted_rows = 0;        ///< How many rows have been converted so far
-            int last_head = -1;            ///< Last seen ring head (-1 = uninitialised)
-        };
-
-        /// @brief 2D array of FP32 shadow entries: fp32_shadows_[layer][seq_idx].
-        /// Lazily allocated (empty until first get_kv_converted call).
-        mutable std::vector<std::vector<FP32Shadow>> fp32_shadows_;
-
-        /// @brief Lazily allocate and return the FP32Shadow for (layer, seq_idx).
-        FP32Shadow &ensureFP32Shadow(int layer, int seq_idx) const;
-
-        /// @brief Invalidate any converted/RoPE shadow state for a cache entry.
-        void invalidateFP32Shadow(int layer, int seq_idx) const;
-
-        /// @brief Convert newly appended rows from native precision to FP32 (+ optional RoPE).
-        void convertNewRows(int layer, int seq_idx,
-                            FP32Shadow &shadow, const EntryT &entry,
-                            const KVReadParams *rope) const;
 
         /// @brief Factory for creating typed tensors with correct device placement.
         std::unique_ptr<TensorFactory> tensor_factory_;
@@ -651,8 +604,8 @@ namespace llaminar2
     using CPURingKVCacheFP16 = CPURingKVCache<ActivationPrecision::FP16>;   ///< Float16 KV cache.
     using CPURingKVCacheQ8_1 = CPURingKVCache<ActivationPrecision::Q8_1>;   ///< 8-bit quantized KV cache.
     using CPURingKVCacheQ16_1 = CPURingKVCache<ActivationPrecision::Q16_1>; ///< 16-bit quantized KV cache.
-    using CPURingKVCacheTQ4 = CPURingKVCache<ActivationPrecision::TQ4>;     ///< TurboQuant 4-bit KV cache.
-    using CPURingKVCacheTQ8 = CPURingKVCache<ActivationPrecision::TQ8>;     ///< TurboQuant 8-bit KV cache.
+    using CPURingKVCacheTQ4 = CPURingKVCache<ActivationPrecision::TQ4>;     ///< Legacy symmetric TQ4 test type.
+    using CPURingKVCacheTQ8 = CPURingKVCache<ActivationPrecision::TQ8>;     ///< Symmetric TQ8-K/TQ8-V cache.
     /// Asymmetric TQ: TQ8 for K (high-fidelity scores), TQ4 for V (graceful degradation).
     using CPURingKVCacheTQ = CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4>;
 

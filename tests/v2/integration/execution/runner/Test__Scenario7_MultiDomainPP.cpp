@@ -580,10 +580,11 @@ namespace
         EXPECT_EQ(plan.primary_device.device_ordinal, 0);
         EXPECT_EQ(plan.primary_device.numa_node, 1)
             << "Ambiguous map entry should prefer lowest NUMA among matching candidates";
-        EXPECT_FALSE(plan.primary_device_numa_explicit);
+        EXPECT_TRUE(plan.hasResolvedPrimaryDeviceNuma())
+            << "Inventory disambiguation must publish one strict resolved address";
     }
 
-    TEST_F(Test__Scenario7_MultiDomainPP, DeviceMapExplicit_PreservesExplicitNumaAndStrictFlag)
+    TEST_F(Test__Scenario7_MultiDomainPP, DeviceMapExplicit_PreservesResolvedNumaAddress)
     {
         auto args = buildDeviceMapArgs("0=2:rocm:0");
         auto [argc, argv] = toArgv(args);
@@ -598,7 +599,7 @@ namespace
         EXPECT_EQ(plan.primary_device.device_type, DeviceType::ROCm);
         EXPECT_EQ(plan.primary_device.device_ordinal, 0);
         EXPECT_EQ(plan.primary_device.numa_node, 2);
-        EXPECT_TRUE(plan.primary_device_numa_explicit);
+        EXPECT_TRUE(plan.hasResolvedPrimaryDeviceNuma());
     }
 
     TEST_F(Test__Scenario7_MultiDomainPP, CpuShorthandRuntimeMapping_ProducesGlobalTPAcrossWorld)
@@ -630,7 +631,7 @@ namespace
 
             EXPECT_EQ(plan.primary_device.device_type, DeviceType::CPU);
             EXPECT_EQ(plan.primary_device.numa_node, rank);
-            EXPECT_TRUE(plan.primary_device_numa_explicit);
+            EXPECT_TRUE(plan.hasResolvedPrimaryDeviceNuma());
 
             EXPECT_TRUE(plan.usesGlobalTP());
             EXPECT_EQ(plan.tp_scope, TPScope::GLOBAL);

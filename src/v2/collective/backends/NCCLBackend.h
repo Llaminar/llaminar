@@ -90,6 +90,18 @@ namespace llaminar2
         void shutdown() override;
         void abort() override;
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
+        [[nodiscard]] CollectiveSubmissionReceipt singleBufferSubmissionReceipt(
+            DeviceId device) const override
+        {
+#ifdef HAVE_NCCL
+            return device.is_cuda()
+                       ? CollectiveSubmissionReceipt::onDeviceStream(stream_)
+                       : CollectiveSubmissionReceipt{};
+#else
+            (void)device;
+            return {};
+#endif
+        }
 
         // =====================================================================
         // Collective Operations
@@ -235,6 +247,28 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op) override;
 
+        bool allreduceMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams) override;
+        bool supportsAllreduceMultiOnStreams() const override;
+
+        bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams) override;
+        bool supportsAllreduceWithSidebandsMultiOnStreams() const override;
+
+        bool collectiveSidebandsMultiOnStreams(
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams) override;
+        bool supportsCollectiveSidebandsMultiOnStreams() const override;
+
         bool allreduceSingleDeviceAsync(
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,
@@ -244,9 +278,61 @@ namespace llaminar2
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,
             int device_idx, void *stream) override;
+        bool supportsAllreduceSingleDeviceOnStream() const override;
+
+        bool reduceSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            int root,
+            int device_idx,
+            void *stream) override;
+        bool supportsReduceSingleDeviceOnStream() const override;
+
+        bool allgatherSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_idx,
+            void *stream) override;
+        bool supportsAllgatherSingleDeviceOnStream() const override;
+
+        bool broadcastSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            int device_idx,
+            void *stream) override;
+        bool supportsBroadcastSingleDeviceOnStream() const override;
+
+        bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream) override;
+        bool supportsGroupedP2PSingleDeviceOnStream() const override;
+
+        bool broadcastMultiOnStreams(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            const std::vector<void *> &streams) override;
+        bool supportsBroadcastMultiOnStreams() const override;
 
         /// Multi-GPU AllGather (each GPU sends from send_bufs, receives to recv_bufs)
         bool allgatherMulti(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype) override;
+
+        bool allgatherMultiWithComputeDeps(
             const std::vector<const void *> &send_bufs,
             const std::vector<void *> &recv_bufs,
             size_t send_count,

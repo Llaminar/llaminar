@@ -15,6 +15,8 @@
 #include "../../utils/Logger.h"
 
 #include <algorithm>
+#include <exception>
+#include <set>
 
 #ifdef HAVE_RCCL
 #include <mpi.h>
@@ -23,6 +25,7 @@
 #include <string>
 #include <cstring>
 #include <cstdlib> // for setenv
+#include <limits>
 
 // Forward declarations for HIP and RCCL wrappers (implemented in RCCLBackendHIP.cpp)
 namespace llaminar2
@@ -94,7 +97,6 @@ namespace llaminar2
         bool hipMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream);
         bool hipCanAccessPeerDevice(int dst_device, int src_device);
         bool hipEnablePeerAccessDevice(int peer_device);
-        bool hipDeviceSynchronizeWrapper();
 
         // Host staging memory operations (for non-P2P fallback)
         void *hipHostMallocWrapper(size_t bytes);
@@ -128,29 +130,203 @@ namespace llaminar2
     // =========================================================================
 
     std::mutex RCCLBackend::coordinator_pool_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<RCCLCoordinator>> RCCLBackend::coordinator_pool_;
+    std::vector<RCCLBackend::PooledCoordinatorEntry>
+        RCCLBackend::coordinator_pool_;
+    std::unordered_map<std::string, RCCLBackend::ActiveCoordinatorEntry>
+        RCCLBackend::active_coordinator_owners_;
 
     std::string RCCLBackend::makePoolKey(const std::vector<int> &device_ordinals)
     {
-        auto sorted = device_ordinals;
-        std::sort(sorted.begin(), sorted.end());
         std::string key;
-        for (size_t i = 0; i < sorted.size(); ++i)
+        for (size_t i = 0; i < device_ordinals.size(); ++i)
         {
             if (i > 0)
                 key += ",";
-            key += std::to_string(sorted[i]);
+            key += std::to_string(device_ordinals[i]);
         }
         return key;
     }
 
+    void RCCLBackend::registerActiveCoordinatorOwnerLocked()
+    {
+        if (coordinator_owner_registered_ || !coordinator_ ||
+            device_ordinals_.empty())
+        {
+            LOG_ERROR(
+                "[RCCLBackend] Invalid active coordinator-owner publication");
+            std::terminate();
+        }
+
+        const std::string key = makePoolKey(device_ordinals_);
+        auto [entry, inserted] = active_coordinator_owners_.try_emplace(
+            key,
+            ActiveCoordinatorEntry{
+                .device_ordinals = device_ordinals_,
+                .owners = 0u,
+            });
+        if (!inserted && entry->second.device_ordinals != device_ordinals_)
+        {
+            LOG_ERROR(
+                "[RCCLBackend] Active coordinator key collision for devices ["
+                << key << "]");
+            std::terminate();
+        }
+        ++entry->second.owners;
+        coordinator_owner_registered_ = true;
+    }
+
+    void RCCLBackend::unregisterActiveCoordinatorOwnerLocked() noexcept
+    {
+        if (!coordinator_owner_registered_)
+            return;
+
+        const std::string key = makePoolKey(device_ordinals_);
+        const auto entry = active_coordinator_owners_.find(key);
+        if (entry == active_coordinator_owners_.end() ||
+            entry->second.owners == 0u ||
+            entry->second.device_ordinals != device_ordinals_)
+        {
+            LOG_ERROR(
+                "[RCCLBackend] Lost active coordinator-owner publication for devices ["
+                << key << "]");
+            std::terminate();
+        }
+
+        --entry->second.owners;
+        if (entry->second.owners == 0u)
+            active_coordinator_owners_.erase(entry);
+        coordinator_owner_registered_ = false;
+    }
+
+    CollectiveRuntimeRetirementReceipt
+    RCCLBackend::retireRuntimeGenerationResources(DeviceId device)
+    {
+        CollectiveRuntimeRetirementReceipt receipt;
+        receipt.device = device;
+        if (!device.is_rocm())
+        {
+            receipt.state =
+                CollectiveRuntimeRetirementState::InvalidDevice;
+            receipt.diagnostic =
+                "RCCL runtime retirement requires one exact ROCm device";
+            return receipt;
+        }
+
+        std::vector<std::shared_ptr<RCCLCoordinator>> retiring;
+        {
+            std::lock_guard<std::mutex> lock(coordinator_pool_mutex_);
+
+            /* A pooled clique that intersects the requested device is one
+             * indivisible native-runtime owner. Include all of its peer
+             * ordinals when checking for a still-live backend so cleanup never
+             * tears down a communicator beside another active user. */
+            std::set<int> affected_ordinals{device.rocm_ordinal()};
+            bool expanded = true;
+            while (expanded)
+            {
+                expanded = false;
+                for (const auto &entry : coordinator_pool_)
+                {
+                    const bool intersects = std::any_of(
+                        entry.device_ordinals.begin(),
+                        entry.device_ordinals.end(),
+                        [&](int ordinal)
+                        { return affected_ordinals.contains(ordinal); });
+                    if (!intersects)
+                        continue;
+                    const std::size_t before = affected_ordinals.size();
+                    affected_ordinals.insert(
+                        entry.device_ordinals.begin(),
+                        entry.device_ordinals.end());
+                    expanded = expanded ||
+                               affected_ordinals.size() != before;
+                }
+            }
+
+            for (const auto &[key, active] :
+                 active_coordinator_owners_)
+            {
+                (void)key;
+                const bool intersects = std::any_of(
+                    active.device_ordinals.begin(),
+                    active.device_ordinals.end(),
+                    [&](int ordinal)
+                    { return affected_ordinals.contains(ordinal); });
+                if (intersects)
+                    receipt.active_owners += active.owners;
+            }
+            if (receipt.active_owners != 0u)
+            {
+                receipt.state =
+                    CollectiveRuntimeRetirementState::ActiveOwner;
+                receipt.diagnostic =
+                    "one or more live RCCL backends still own the requested HIP runtime generation";
+                return receipt;
+            }
+
+            for (auto entry = coordinator_pool_.begin();
+                 entry != coordinator_pool_.end();)
+            {
+                const bool intersects = std::any_of(
+                    entry->device_ordinals.begin(),
+                    entry->device_ordinals.end(),
+                    [&](int ordinal)
+                    { return affected_ordinals.contains(ordinal); });
+                if (!intersects)
+                {
+                    ++entry;
+                    continue;
+                }
+
+                if (entry->coordinator)
+                    retiring.push_back(std::move(entry->coordinator));
+                entry = coordinator_pool_.erase(entry);
+            }
+        }
+
+        /* Coordinator shutdown enters HIP/RCCL and joins its owner thread.
+         * Never hold the registry mutex across those external runtimes. */
+        for (auto &coordinator : retiring)
+        {
+            coordinator->shutdown();
+            coordinator.reset();
+        }
+
+        receipt.retired_inactive_owners = retiring.size();
+        receipt.state = CollectiveRuntimeRetirementState::Complete;
+        return receipt;
+    }
+
     void RCCLBackend::drainCoordinatorPool()
     {
-        std::lock_guard<std::mutex> lock(coordinator_pool_mutex_);
-        if (!coordinator_pool_.empty())
+        std::vector<std::shared_ptr<RCCLCoordinator>> retiring;
         {
-            LOG_DEBUG("[RCCLBackend] Draining coordinator pool (" << coordinator_pool_.size() << " entries)");
-            coordinator_pool_.clear(); // shared_ptr release → RCCLCoordinator dtor → ncclCommDestroy
+            std::lock_guard<std::mutex> lock(coordinator_pool_mutex_);
+            if (!active_coordinator_owners_.empty())
+            {
+                LOG_ERROR(
+                    "[RCCLBackend] Process shutdown found live coordinator owners");
+                std::terminate();
+            }
+            retiring.reserve(coordinator_pool_.size());
+            for (auto &entry : coordinator_pool_)
+            {
+                if (entry.coordinator)
+                    retiring.push_back(std::move(entry.coordinator));
+            }
+            coordinator_pool_.clear();
+        }
+
+        if (!retiring.empty())
+        {
+            LOG_DEBUG(
+                "[RCCLBackend] Draining coordinator pool ("
+                << retiring.size() << " entries)");
+        }
+        for (auto &coordinator : retiring)
+        {
+            coordinator->shutdown();
+            coordinator.reset();
         }
     }
 
@@ -210,6 +386,22 @@ namespace llaminar2
         default:
             return 0;
         }
+    }
+
+    static size_t collectiveDataTypeByteSize(CollectiveDataType dtype)
+    {
+        switch (dtype)
+        {
+        case CollectiveDataType::FLOAT32:
+        case CollectiveDataType::INT32:
+            return 4;
+        case CollectiveDataType::FLOAT16:
+        case CollectiveDataType::BFLOAT16:
+            return 2;
+        case CollectiveDataType::INT8:
+            return 1;
+        }
+        return 0;
     }
 
     int RCCLBackend::toRcclRedOpInt(CollectiveOp op)
@@ -372,12 +564,17 @@ namespace llaminar2
             // Create and initialize the coordinator (or reuse from pool)
             {
                 std::lock_guard<std::mutex> pool_lock(coordinator_pool_mutex_);
-                std::string pool_key = makePoolKey(device_ordinals_);
-                auto it = coordinator_pool_.find(pool_key);
-                if (it != coordinator_pool_.end() && it->second)
+                const std::string pool_key = makePoolKey(device_ordinals_);
+                const auto pooled = std::find_if(
+                    coordinator_pool_.begin(),
+                    coordinator_pool_.end(),
+                    [&](const PooledCoordinatorEntry &entry)
+                    { return entry.device_ordinals == device_ordinals_; });
+                if (pooled != coordinator_pool_.end() &&
+                    pooled->coordinator)
                 {
-                    coordinator_ = it->second;
-                    coordinator_pool_.erase(it);
+                    coordinator_ = std::move(pooled->coordinator);
+                    coordinator_pool_.erase(pooled);
                     LOG_DEBUG("RCCLBackend: Reused pooled RCCLCoordinator for devices [" << pool_key << "]");
                 }
             }
@@ -389,8 +586,16 @@ namespace llaminar2
                     last_error_ = "RCCLCoordinator initialization failed: " + coordinator_->lastError();
                     LOG_ERROR(last_error_);
                     coordinator_.reset();
+                    device_ordinals_.clear();
+                    is_multi_gpu_single_process_ = false;
                     return false;
                 }
+            }
+
+            {
+                std::lock_guard<std::mutex> pool_lock(
+                    coordinator_pool_mutex_);
+                registerActiveCoordinatorOwnerLocked();
             }
 
             LOG_DEBUG("RCCLBackend: Initialized multi-GPU single-process (via RCCLCoordinator) with "
@@ -420,6 +625,12 @@ namespace llaminar2
 #ifdef HAVE_RCCL
         if (!initialized_)
         {
+            if (coordinator_owner_registered_)
+            {
+                LOG_ERROR(
+                    "RCCLBackend: Uninitialized backend retained a live coordinator publication");
+                std::terminate();
+            }
             return;
         }
 
@@ -434,9 +645,19 @@ namespace llaminar2
             if (coordinator_)
             {
                 std::lock_guard<std::mutex> pool_lock(coordinator_pool_mutex_);
-                std::string pool_key = makePoolKey(device_ordinals_);
-                coordinator_pool_[pool_key] = std::move(coordinator_);
+                const std::string pool_key = makePoolKey(device_ordinals_);
+                unregisterActiveCoordinatorOwnerLocked();
+                coordinator_pool_.push_back(PooledCoordinatorEntry{
+                    .device_ordinals = device_ordinals_,
+                    .coordinator = std::move(coordinator_),
+                });
                 LOG_DEBUG("RCCLBackend: Parked RCCLCoordinator in pool for devices [" << pool_key << "]");
+            }
+            else if (coordinator_owner_registered_)
+            {
+                LOG_ERROR(
+                    "RCCLBackend: Live coordinator publication has no coordinator owner");
+                std::terminate();
             }
             coordinator_.reset();
             device_ordinals_.clear();
@@ -477,12 +698,25 @@ namespace llaminar2
 
         if (coordinator_)
         {
+            {
+                std::lock_guard<std::mutex> pool_lock(
+                    coordinator_pool_mutex_);
+                unregisterActiveCoordinatorOwnerLocked();
+            }
             coordinator_->abortCommunicators();
             // After abort, the coordinator is non-functional and must not be pooled.
             coordinator_->shutdown();
             coordinator_.reset();
         }
+        else if (coordinator_owner_registered_)
+        {
+            LOG_ERROR(
+                "RCCLBackend: Abort found a live publication without a coordinator");
+            std::terminate();
+        }
 
+        device_ordinals_.clear();
+        is_multi_gpu_single_process_ = false;
         initialized_ = false;
         LOG_WARN("RCCLBackend: Abort complete");
 #endif
@@ -1312,6 +1546,197 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::allreduceMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_) ||
+            streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer/stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allreduceMultiOnStreams(buffers, count, dtype, op, streams))
+        {
+            last_error_ = "RCCLCoordinator allreduceMultiOnStreams failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsAllreduceMultiOnStreams() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allreduceWithSidebandsMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceWithSidebandsMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_) ||
+            streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer/stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allreduceWithSidebandsMultiOnStreams(
+                buffers, count, dtype, op, sidebands, streams))
+        {
+            last_error_ = "RCCLCoordinator allreduceWithSidebandsMultiOnStreams failed: " +
+                          coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsAllreduceWithSidebandsMultiOnStreams() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::collectiveSidebandsMultiOnStreams(
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ =
+                "collectiveSidebandsMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        if (!coordinator_->collectiveSidebandsMultiOnStreams(
+                sidebands, streams))
+        {
+            last_error_ =
+                "RCCLCoordinator collectiveSidebandsMultiOnStreams failed: " +
+                coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsCollectiveSidebandsMultiOnStreams() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allreduceSingleDeviceAsync(
         void *buffer, size_t count,
         CollectiveDataType dtype, CollectiveOp op,
@@ -1387,6 +1812,289 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::supportsAllreduceSingleDeviceOnStream() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::reduceSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int root,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_ || !coordinator_)
+        {
+            last_error_ = initialized_
+                              ? "No RCCLCoordinator"
+                              : "RCCLBackend not initialized";
+            return false;
+        }
+        if (!coordinator_->reduceSingleDeviceOnStream(
+                send_buf,
+                recv_buf,
+                count,
+                dtype,
+                op,
+                root,
+                device_idx,
+                stream))
+        {
+            last_error_ =
+                "RCCLCoordinator reduceSingleDeviceOnStream failed: " +
+                coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsReduceSingleDeviceOnStream() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allgatherSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t send_count,
+        CollectiveDataType dtype,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "No RCCLCoordinator";
+            return false;
+        }
+
+        if (!coordinator_->allgatherSingleDeviceOnStream(
+                send_buf, recv_buf, send_count, dtype, device_idx, stream))
+        {
+            last_error_ = "RCCLCoordinator allgatherSingleDeviceOnStream failed: " +
+                          coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)send_count;
+        (void)dtype;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsAllgatherSingleDeviceOnStream() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::broadcastSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t count,
+        CollectiveDataType dtype,
+        int root,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "No RCCLCoordinator";
+            return false;
+        }
+
+        if (!coordinator_->broadcastSingleDeviceOnStream(
+                send_buf, recv_buf, count, dtype, root, device_idx, stream))
+        {
+            last_error_ = "RCCLCoordinator broadcastSingleDeviceOnStream failed: " +
+                          coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsBroadcastSingleDeviceOnStream() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::groupedP2PSingleDeviceOnStream(
+        const std::vector<CollectiveP2POp> &ops,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+        if (!coordinator_)
+        {
+            last_error_ = "No RCCLCoordinator";
+            return false;
+        }
+        if (!coordinator_->groupedP2PSingleDeviceOnStream(ops, device_idx, stream))
+        {
+            last_error_ = "RCCLCoordinator groupedP2PSingleDeviceOnStream failed: " +
+                          coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
+#else
+        (void)ops;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsGroupedP2PSingleDeviceOnStream() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::broadcastMultiOnStreams(
+        const std::vector<const void *> &send_bufs,
+        const std::vector<void *> &recv_bufs,
+        size_t count,
+        CollectiveDataType dtype,
+        int root,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "broadcastMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (send_bufs.size() != static_cast<size_t>(num_ranks_) ||
+            recv_bufs.size() != static_cast<size_t>(num_ranks_) ||
+            streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer/stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->broadcastMultiOnStreams(send_bufs, recv_bufs, count, dtype, root, streams))
+        {
+            last_error_ = "RCCLCoordinator broadcastMultiOnStreams failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_bufs;
+        (void)recv_bufs;
+        (void)count;
+        (void)dtype;
+        (void)root;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsBroadcastMultiOnStreams() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allgatherMulti(
         const std::vector<const void *> &send_bufs,
         const std::vector<void *> &recv_bufs,
@@ -1427,6 +2135,60 @@ namespace llaminar2
         if (!coordinator_->allgatherMulti(send_bufs, recv_bufs, send_count, dtype))
         {
             last_error_ = "RCCLCoordinator allgatherMulti failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_bufs;
+        (void)recv_bufs;
+        (void)send_count;
+        (void)dtype;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allgatherMultiWithComputeDeps(
+        const std::vector<const void *> &send_bufs,
+        const std::vector<void *> &recv_bufs,
+        size_t send_count,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allgatherMultiWithComputeDeps requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (send_bufs.size() != static_cast<size_t>(num_ranks_) ||
+            recv_bufs.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count doesn't match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allgatherMultiWithComputeDeps(send_bufs, recv_bufs, send_count, dtype))
+        {
+            last_error_ = "RCCLCoordinator allgatherMultiWithComputeDeps failed: " + coordinator_->lastError();
             LOG_ERROR(last_error_);
             return false;
         }
@@ -1622,6 +2384,16 @@ namespace llaminar2
             return false;
         }
 
+        if (count == 0)
+            return true;
+
+        if (!src_buffer || !dst_buffer)
+        {
+            last_error_ = "sendrecvMulti requires non-null buffers for non-zero transfers";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
         if (!is_multi_gpu_single_process_)
         {
             last_error_ = "sendrecvMulti requires multi-GPU single-process mode";
@@ -1629,24 +2401,45 @@ namespace llaminar2
             return false;
         }
 
-        if (src_gpu == dst_gpu)
+        if (src_gpu < 0 || src_gpu >= num_ranks_ || dst_gpu < 0 || dst_gpu >= num_ranks_)
         {
-            // Self-transfer: just log and succeed - caller shouldn't do this
-            LOG_DEBUG("sendrecvMulti: src_gpu == dst_gpu (" << src_gpu << "), treating as no-op");
-            return true;
+            last_error_ = "sendrecvMulti: Invalid GPU indices src=" + std::to_string(src_gpu) +
+                          ", dst=" + std::to_string(dst_gpu) +
+                          " (valid: 0-" + std::to_string(num_ranks_ - 1) + ")";
+            LOG_ERROR(last_error_);
+            return false;
         }
 
-        // sendrecvMulti not yet implemented in RCCLCoordinator
-        // TODO: Add sendrecvMulti to RCCLCoordinator when needed
-        (void)src_buffer;
-        (void)dst_buffer;
-        (void)count;
-        (void)dtype;
-        (void)src_gpu;
-        (void)dst_gpu;
-        last_error_ = "sendrecvMulti not yet implemented in coordinator mode";
-        LOG_ERROR(last_error_);
-        return false;
+        if (src_gpu == dst_gpu)
+        {
+            last_error_ = "sendrecvMulti requires distinct source and destination GPUs";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "sendrecvMulti requires an initialized RCCLCoordinator";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        const size_t dtype_bytes = collectiveDataTypeByteSize(dtype);
+        if (dtype_bytes == 0 || count > (std::numeric_limits<size_t>::max)() / dtype_bytes)
+        {
+            last_error_ = "sendrecvMulti invalid transfer size";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        const size_t bytes = count * dtype_bytes;
+        if (!coordinator_->copy(dst_buffer, dst_gpu, src_buffer, src_gpu, bytes))
+        {
+            last_error_ = "sendrecvMulti RCCLCoordinator copy failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        return true;
 #else
         (void)src_buffer;
         (void)dst_buffer;

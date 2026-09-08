@@ -242,13 +242,32 @@ namespace llaminar2
                                 ? params_.seq_len
                                 : static_cast<int>(input_base->rows());
 
-        const size_t d_model = input_base->shape().size() > 1 ? input_base->shape()[1] : input_base->numel();
+        const size_t backing_dim = input_base->shape().size() > 1 ? input_base->shape()[1] : input_base->numel();
+        const size_t d_model = params_.feature_dim > 0
+                                   ? static_cast<size_t>(params_.feature_dim)
+                                   : backing_dim;
+        const size_t gate_dim = gate_base->shape().size() > 1 ? gate_base->shape()[1] : gate_base->numel();
+        const size_t output_dim = output_base->shape().size() > 1 ? output_base->shape()[1] : output_base->numel();
+        if (d_model == 0 || d_model > backing_dim || d_model > gate_dim || d_model > output_dim)
+        {
+            LOG_ERROR("[GatedRMSNormStage] Invalid feature width: feature_dim=" << d_model
+                                                                                << " input_width=" << backing_dim
+                                                                                << " gate_width=" << gate_dim
+                                                                                << " output_width=" << output_dim);
+            return false;
+        }
 
         // Determine normalization dimension. When norm_dim > 0, normalize
         // over chunks of norm_dim (per-head normalization). Otherwise, full d_model.
         const size_t norm_dim = (params_.norm_dim > 0)
                                     ? static_cast<size_t>(params_.norm_dim)
                                     : d_model;
+        if (norm_dim == 0 || (d_model % norm_dim) != 0)
+        {
+            LOG_ERROR("[GatedRMSNormStage] Invalid norm width: feature_dim=" << d_model
+                                                                             << " norm_dim=" << norm_dim);
+            return false;
+        }
         const float eps = params_.eps;
         const bool subtract_one = params_.subtract_one;
         const bool gate_silu = params_.gate_silu;
@@ -414,7 +433,10 @@ namespace llaminar2
             const size_t rows = params_.seq_len > 0
                                     ? static_cast<size_t>(params_.seq_len)
                                     : out_base->rows();
-            info.addOutput("output", params_.output, rows, out_base->cols());
+            const size_t cols = params_.feature_dim > 0
+                                    ? static_cast<size_t>(params_.feature_dim)
+                                    : out_base->cols();
+            info.addOutput("output", params_.output, rows, cols);
         }
 
         return info;
@@ -427,13 +449,20 @@ namespace llaminar2
 
     StageBufferContract GatedRMSNormStage::bufferContract() const
     {
+        if (!params_.input_buffer_id || !params_.gate_buffer_id || !params_.output_buffer_id)
+            return {};
+
         StageBufferContract contract;
-        if (params_.input_buffer_id)
+        if (*params_.input_buffer_id == *params_.output_buffer_id)
+        {
+            contract.addInOut(*params_.input_buffer_id);
+        }
+        else
+        {
             contract.addInput(*params_.input_buffer_id);
-        if (params_.gate_buffer_id)
-            contract.addInput(*params_.gate_buffer_id);
-        if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        }
+        contract.addInput(*params_.gate_buffer_id);
         // gamma is a model weight, not arena-managed
         if (params_.gamma)
             contract.addWeight(const_cast<ITensor *>(params_.gamma));

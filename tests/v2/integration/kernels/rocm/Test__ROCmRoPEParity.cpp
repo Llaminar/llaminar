@@ -232,6 +232,28 @@ namespace
 class Test__ROCmRoPEParity : public ::testing::Test
 {
 protected:
+    void SetUp() override
+    {
+#ifdef HAVE_ROCM
+        if (!hasROCm())
+            return;
+        ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), hipSuccess);
+#endif
+    }
+
+    void TearDown() override
+    {
+#ifdef HAVE_ROCM
+        if (stream_)
+        {
+            EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+            EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+            stream_ = nullptr;
+        }
+#endif
+    }
+
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-1.0f, 1.0f};
 
@@ -244,6 +266,10 @@ protected:
         }
         return vec;
     }
+
+#ifdef HAVE_ROCM
+    hipStream_t stream_ = nullptr;
+#endif
 };
 
 // ============================================================================
@@ -286,6 +312,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Small)
 
     // ROCm kernel with workspace
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -358,6 +385,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Large)
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -428,6 +456,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_PartialRotaryKeepsFullHeadStride)
                                        rope_theta, -1, rotary_dim));
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -528,6 +557,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Small)
     std::vector<uint16_t> rocm_q = q_bf16;
     std::vector<uint16_t> rocm_k = k_bf16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::BF16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -611,6 +641,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Qwen35LongPartialRotary)
                                        rope_theta, -1, rotary_dim));
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024);
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -722,6 +753,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_RealQwen2Layer3ProjectionInputs)
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024);
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -794,6 +826,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Large)
     std::vector<uint16_t> rocm_q = q_bf16;
     std::vector<uint16_t> rocm_k = k_bf16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::BF16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -879,6 +912,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Small)
     std::vector<uint16_t> rocm_q = q_fp16;
     std::vector<uint16_t> rocm_k = k_fp16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -960,6 +994,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Large)
     std::vector<uint16_t> rocm_q = q_fp16;
     std::vector<uint16_t> rocm_k = k_fp16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";

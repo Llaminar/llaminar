@@ -9,9 +9,9 @@
  *   - createPPStageRunner            for concrete single-device PP stages
  *   - createTestableInferenceRunner  for model-light single-device tests
  *   - createRankOrchestrator         for local TP stages (via RankOrchestrator)
- *   - createInferenceRunner          for concrete global/node-local TP stages
+ *   - createInferenceRunner          for concrete global/NodeTP stages
  *                                   with an injected IGlobalTPContext
- *   - createTestableInferenceRunner  for model-light global/node-local TP tests
+ *   - createTestableInferenceRunner  for model-light global/NodeTP tests
  *
  * Phase 4: each returned StageRunnerEntry owns a StageWeightContext with a
  * stage-local PreparedWeightStore threaded into concrete runner creation.

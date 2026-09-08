@@ -16,8 +16,12 @@
 
 #include <gtest/gtest.h>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <numeric>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
@@ -42,6 +46,69 @@ namespace
     protected:
         void SetUp() override {}
     };
+
+    /**
+     * @test A ROCm GEMM launch cannot begin without an exact producer stream.
+     *
+     * This is intentionally CPU-only: the null input/output arguments would
+     * normally fail validation, but the stream contract must fail first. That
+     * ordering prevents any future launch branch from performing device work
+     * and only discovering at publication time that its producer stream is
+     * unknown.
+     */
+    TEST_F(
+        ROCmQuantisedGemmKernelUnitTest,
+        LaunchRequiresExplicitProducerStreamBeforeValidation)
+    {
+        ROCmPackedWeights packed;
+        packed.native_source_identity = {
+            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+            .present = true,
+        };
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+
+        EXPECT_THROW(
+            kernel.multiply_tensor(
+                nullptr,
+                nullptr,
+                1,
+                1,
+                1),
+            std::runtime_error);
+
+        int stream_sentinel = 0;
+        kernel.setGPUStream(&stream_sentinel);
+        EXPECT_EQ(kernel.requireGPUStream(), &stream_sentinel);
+    }
+
+    std::filesystem::path repoRoot()
+    {
+#ifdef LLAMINAR_REPO_ROOT
+        return std::filesystem::path(LLAMINAR_REPO_ROOT);
+#else
+        std::filesystem::path path = std::filesystem::current_path();
+        while (!path.empty())
+        {
+            if (std::filesystem::exists(path / "src/v2") &&
+                std::filesystem::exists(path / "tests/v2"))
+            {
+                return path;
+            }
+            path = path.parent_path();
+        }
+        return std::filesystem::current_path();
+#endif
+    }
+
+    std::string readTextFile(const std::filesystem::path &path)
+    {
+        std::ifstream input(path);
+        EXPECT_TRUE(input.good()) << "Could not open " << path;
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
 
     // =============================================================================
     // Phase 1: Weight Packing Tests (CPU-only)
@@ -805,5 +872,46 @@ namespace
     }
 
     // =============================================================================
+
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Q8PrefillLaunchFailuresDoNotFallback)
+    {
+        const std::string gemm_source = readTextFile(
+            repoRoot() / "src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp");
+        const std::string int8_source = readTextFile(
+            repoRoot() / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip");
+
+        ASSERT_FALSE(gemm_source.empty());
+        ASSERT_FALSE(int8_source.empty());
+
+        EXPECT_EQ(gemm_source.find("Wide-tile kernel failed; falling back"), std::string::npos)
+            << "Q8/INT8 selected wide-tile launch failures must hard fail, not cascade to another kernel family.";
+        EXPECT_EQ(gemm_source.find("grid-kpar launch failed once; falling back"), std::string::npos)
+            << "Q8/INT8 selected grid-kpar launch failures must hard fail, not run baseline as a silent fallback.";
+        EXPECT_EQ(gemm_source.find("Falling back to pageable host source"), std::string::npos)
+            << "Q8/INT8 startup upload must hard fail when pinned staging cannot be allocated.";
+        EXPECT_EQ(gemm_source.find("falling back to sync uploads"), std::string::npos)
+            << "Q8/INT8 startup upload must require an explicit async stream.";
+        EXPECT_EQ(gemm_source.find("return hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);"), std::string::npos)
+            << "Q8/INT8 startup upload must not retain a synchronous H2D fallback.";
+        EXPECT_EQ(gemm_source.find("Don't return"), std::string::npos)
+            << "Packed GPU upload failures must not fall through to another GEMM path.";
+        EXPECT_EQ(gemm_source.find("GEMV will use INT8-VNNI fallback"), std::string::npos)
+            << "Packed GPU upload failures must hard fail instead of silently selecting INT8-VNNI.";
+        EXPECT_EQ(gemm_source.find("falling back to INT8 GEMM"), std::string::npos)
+            << "A selected native-VNNI GEMM launch failure must be terminal.";
+        EXPECT_EQ(gemm_source.find("ROCm GEMV prefill paths may not work"), std::string::npos)
+            << "Missing packed layouts must hard fail instead of publishing ambiguous state.";
+        EXPECT_NE(gemm_source.find("Wide-tile INT8 prefill kernel failed; refusing fallback"), std::string::npos);
+        EXPECT_NE(gemm_source.find("INT8 prefill grid-kpar launch failed; refusing baseline fallback"), std::string::npos);
+        EXPECT_NE(gemm_source.find("Refusing pageable-host fallback"), std::string::npos);
+        EXPECT_NE(gemm_source.find("explicit H2D stream is required for startup upload"), std::string::npos);
+        EXPECT_NE(gemm_source.find("Failed to alloc native-VNNI payload; refusing alternate GEMM path"), std::string::npos);
+        EXPECT_NE(gemm_source.find("Native-VNNI GEMM failed; refusing INT8 GEMM fallback"), std::string::npos);
+        EXPECT_NE(gemm_source.find("No VNNI layout available; refusing implicit CPU or alternate packing path"), std::string::npos);
+        EXPECT_NE(gemm_source.find("if (upload.d_native_vnni_emins)"), std::string::npos)
+            << "Cached native-VNNI emins uploads must be released with the rest of the device upload.";
+        EXPECT_EQ(int8_source.find("keep using the CK fallback path"), std::string::npos)
+            << "The Q8/INT8 prefill launcher must document false as terminal now that CK fallback is retired.";
+    }
 
 } // namespace

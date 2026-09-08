@@ -20,6 +20,15 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
 #include "../qwen2/Qwen2ParityTestBase.h"
 #include "models/qwen35/Qwen35Schema.h"
 
@@ -43,62 +52,9 @@ namespace llaminar2::test::parity::qwen35
     protected:
         using Base = ConfigDrivenParityTest<Derived>;
 
-        void SetUp() override
-        {
-            Base::SetUp();
-        }
-
         void applyModelOverrides() override
         {
-            // Apply standard model_path / snapshot_dir overrides from TestConfig
             Base::applyModelOverrides();
-
-            // Qwen3.5 uses a different tokenizer (vocab_size=248320) than Qwen2/3
-            // (vocab_size=151936), so the default hardcoded token_ids are wrong.
-            // Read the actual token_ids used by the PyTorch reference generator.
-            //
-            // CRITICAL: metadata.txt is only written by the snapshot generator,
-            // which normally runs later in the test body. On a fresh checkout
-            // (e.g. CI) the metadata file does not exist yet and we would silently
-            // fall back to Qwen2's default token IDs, embedding the wrong tokens
-            // and producing catastrophic cosine drops (~0.18) at every stage.
-            //
-            // Trigger snapshot regeneration here if metadata is missing or stale
-            // (wrong snapshot_version), so token IDs are always consistent with
-            // what PyTorch will emit. Skip if the model file is missing (the test
-            // will GTEST_SKIP later in ParityTestBase::SetUp).
-            const auto metadata_path = std::filesystem::path(Base::config_.snapshot_dir) /
-                                       "metadata.txt";
-            bool needs_regen = !std::filesystem::exists(metadata_path);
-            if (!needs_regen)
-            {
-                int disk_ver = Base::readSnapshotVersion(metadata_path);
-                if (disk_ver < Base::kRequiredSnapshotVersion)
-                {
-                    LOG_INFO("[Qwen3.5 Parity] Stale snapshots (v" << disk_ver
-                             << " < required v" << Base::kRequiredSnapshotVersion
-                             << ") — regenerating");
-                    needs_regen = true;
-                }
-            }
-            if (needs_regen && std::filesystem::exists(Base::config_.model_path))
-            {
-                LOG_INFO("[Qwen3.5 Parity] Running PyTorch snapshot generator "
-                         "to obtain consistent prefill tokens and up-to-date snapshots");
-                if (!regeneratePyTorchSnapshots())
-                {
-                    LOG_ERROR("[Qwen3.5 Parity] Early snapshot regeneration failed; "
-                              "test will likely fail with stale Qwen2 token IDs");
-                }
-            }
-
-            auto prefill_tokens = Base::readPrefillTokensFromMetadata();
-            if (!prefill_tokens.empty())
-            {
-                Base::config_.token_ids = std::move(prefill_tokens);
-                LOG_INFO("[Qwen3.5 Parity] Loaded " << Base::config_.token_ids.size()
-                                                    << " prefill token IDs from metadata");
-            }
         }
 
         void configureModel(std::shared_ptr<ModelContext> model_ctx) override
@@ -113,6 +69,142 @@ namespace llaminar2::test::parity::qwen35
             }
         }
 
+        /** @return Whether this typed case requires recursive MTP checkpoints. */
+        virtual bool requiresMTPSidecarReferenceSnapshots() const
+        {
+            if constexpr (requires(const Derived &fixture)
+                          {
+                              fixture.modelParityCase().mtpEnabled();
+                          })
+            {
+                return static_cast<const Derived *>(this)
+                    ->modelParityCase()
+                    .mtpEnabled();
+            }
+            return false;
+        }
+
+        /**
+         * @brief Return the admitted recursive predictor capacity of this case.
+         * @return Maximum required draft depth, or zero when MTP is disabled.
+         */
+        virtual int requiredMTPSidecarReferenceDraftDepth() const
+        {
+            if constexpr (requires(const Derived &fixture)
+                          {
+                              fixture.modelParityCase()
+                                  .model.maximum_mtp_draft_depth;
+                          })
+            {
+                const auto &test_case =
+                    static_cast<const Derived *>(this)->modelParityCase();
+                return test_case.mtpEnabled()
+                           ? test_case.model.maximum_mtp_draft_depth
+                           : 0;
+            }
+            return requiresMTPSidecarReferenceSnapshots() ? 3 : 0;
+        }
+
+        /**
+         * @brief Authenticate the independently repairable recursive sidecar.
+         *
+         * Main-model identity is authenticated by ParityTestBase.  This layer
+         * validates the sidecar schema, admitted maximum depth, and both endpoint
+         * tensors so an interrupted expansion cannot masquerade as a complete
+         * predictor corpus.
+         */
+        typename Base::ReferenceSnapshotValidation
+        validateModelSpecificReferenceSnapshotMetadata(
+            const std::filesystem::path &metadata_path) const override
+        {
+            if (!requiresMTPSidecarReferenceSnapshots())
+                return {true, {}};
+
+            constexpr int kMTPSidecarSnapshotSchema = 5;
+            const int required_draft_depth =
+                requiredMTPSidecarReferenceDraftDepth();
+            if (required_draft_depth <= 0)
+                return {false, "MTP sidecar reference depth must be positive"};
+
+            std::ifstream schema_file(
+                metadata_path.parent_path() /
+                "mtp_sidecar_snapshot_schema.txt");
+            int observed_schema = 0;
+            if (!(schema_file >> observed_schema) ||
+                observed_schema != kMTPSidecarSnapshotSchema)
+            {
+                return {
+                    false,
+                    "MTP sidecar reference schema is missing or is not schema "
+                    "5 recursive chaining"};
+            }
+
+            const auto available_depth = Base::readSnapshotMetadataValue(
+                metadata_path,
+                "mtp_sidecar_max_draft_depth");
+            int parsed_available_depth = 0;
+            try
+            {
+                size_t parsed = 0;
+                parsed_available_depth = available_depth
+                                             ? std::stoi(*available_depth, &parsed)
+                                             : 0;
+                if (!available_depth || parsed != available_depth->size())
+                    parsed_available_depth = 0;
+            }
+            catch (...)
+            {
+                parsed_available_depth = 0;
+            }
+            if (parsed_available_depth < required_draft_depth)
+            {
+                return {
+                    false,
+                    "MTP sidecar reference pack admits depth " +
+                        std::to_string(parsed_available_depth) +
+                        ", but this cell requires depth " +
+                        std::to_string(required_draft_depth)};
+            }
+
+            const auto snapshot_dir = metadata_path.parent_path();
+            const std::array<std::string, 2> required_snapshots = {
+                "decode_step0_MTP0_EMBEDDING.npy",
+                "decode_step0_MTP" +
+                    std::to_string(required_draft_depth - 1) +
+                    "_LM_HEAD.npy",
+            };
+            for (const auto &required : required_snapshots)
+            {
+                if (!std::filesystem::exists(snapshot_dir / required))
+                {
+                    return {
+                        false,
+                        "MTP sidecar reference pack is missing " + required};
+                }
+            }
+            return {true, {}};
+        }
+
+        /**
+         * @brief Determine whether only the bounded MTP extension needs repair.
+         * @return true when the complete main trajectory remains authenticated.
+         */
+        bool canExtendAuthenticatedMainReferenceWithMTPSidecars() const
+        {
+            if (!requiresMTPSidecarReferenceSnapshots())
+                return false;
+            const auto metadata_path =
+                std::filesystem::path(Base::config_.snapshot_dir) /
+                "metadata.txt";
+            if (!std::filesystem::is_regular_file(metadata_path))
+                return false;
+            return Base::validateReferenceSnapshotMetadata(
+                       metadata_path,
+                       Base::productionParityCampaignEnabled(),
+                       false)
+                .usable;
+        }
+
         /**
          * @brief Regenerate PyTorch snapshots using Qwen3.5-specific generator.
          *
@@ -121,13 +213,18 @@ namespace llaminar2::test::parity::qwen35
          * heterogeneous layers (GDN + FA) requiring a dedicated generator
          * that uses the Qwen35ReferenceModel from the Python registry.
          */
-        bool regeneratePyTorchSnapshots()
+        bool regeneratePyTorchSnapshots() override
         {
+            const bool extend_mtp_sidecars =
+                canExtendAuthenticatedMainReferenceWithMTPSidecars();
             LOG_INFO("[" << Base::getBackendName()
-                         << " Parity] Regenerating Qwen3.5 PyTorch snapshots from GGUF: "
+                         << " Parity] "
+                         << (extend_mtp_sidecars
+                                 ? "Extending authenticated Qwen3.5 dense MTP sidecars from GGUF: "
+                                 : "Regenerating Qwen3.5 PyTorch snapshots from GGUF: ")
                          << Base::config_.model_path);
 
-            std::ostringstream cmd;
+            std::ostringstream script;
             // Source devcontainer venv if present, else fall back to system
             // python3 (CI builder image installs deps to system site-packages).
             //
@@ -137,16 +234,26 @@ namespace llaminar2::test::parity::qwen35
             // PyTorch's CPU forward pass to a single thread — catastrophic for large
             // models (e.g., 27B Qwen3.5 prefill takes ~14 min on 1 thread). We unset
             // them and let PyTorch/OpenMP/MKL use all available cores.
-            cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
-                << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
-                << " python/reference/generate_qwen35_pipeline_snapshots.py"
-                << " --model " << Base::config_.model_path
-                << " --prompt \"" << Base::config_.prompt << "\""
-                << " --output " << Base::config_.snapshot_dir
-                << " --decode-steps " << Base::config_.decode_steps
-                << "' 2>&1";
+            script << "unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+                   << "if [ -f /workspaces/llaminar/.venv/bin/activate ]; then "
+                   << "source /workspaces/llaminar/.venv/bin/activate; fi; "
+                   << "python3 python/reference/generate_qwen35_pipeline_snapshots.py"
+                   << " --model " << Base::parityShellQuote(Base::config_.model_path)
+                   << " --prompt " << Base::parityShellQuote(Base::config_.prompt)
+                   << " --output " << Base::parityShellQuote(Base::config_.snapshot_dir)
+                   << " --decode-steps " << Base::config_.decode_steps;
+            if (requiresMTPSidecarReferenceSnapshots())
+            {
+                script << " --mtp-sidecar-snapshots"
+                       << " --mtp-max-draft-depth "
+                       << requiredMTPSidecarReferenceDraftDepth();
+                if (extend_mtp_sidecars)
+                    script << " --mtp-sidecar-only";
+            }
+            const std::string command =
+                "bash -c " + Base::parityShellQuote(script.str()) + " 2>&1";
 
-            FILE *pipe = popen(cmd.str().c_str(), "r");
+            FILE *pipe = popen(command.c_str(), "r");
             if (!pipe)
             {
                 LOG_ERROR("[Parity] Failed to execute Qwen3.5 snapshot generator");
@@ -169,6 +276,109 @@ namespace llaminar2::test::parity::qwen35
             }
 
             LOG_INFO("[Parity] Qwen3.5 snapshots regenerated successfully");
+            return true;
+        }
+
+        /**
+         * @brief Generate an additive dense HF oracle for one observed branch.
+         *
+         * The generator loads only the dense sidecar allocation and reuses the
+         * authenticated main-model trajectory. The node-wide lease and final
+         * NPY validation are owned by ParityTestBase.
+         */
+        bool regeneratePyTorchMTPBranchSnapshots(
+            int reference_step,
+            const std::vector<int32_t> &condition_tokens) override
+        {
+            if (reference_step < 0 || condition_tokens.empty() ||
+                condition_tokens.size() >= 15u ||
+                std::any_of(
+                    condition_tokens.begin(),
+                    condition_tokens.end(),
+                    [](int32_t token) { return token < 0; }))
+            {
+                LOG_ERROR("[Parity] Invalid dense MTP branch identity");
+                return false;
+            }
+
+            const auto artifact_dir = Base::ensureResultsDir();
+            const auto request_path =
+                artifact_dir / "mtp_hf_branch_request.json";
+            std::ofstream request(request_path, std::ios::trunc);
+            if (!request.is_open())
+            {
+                LOG_ERROR("[Parity] Cannot write MTP branch request "
+                          << request_path);
+                return false;
+            }
+            request << "{\"" << reference_step << "\": [";
+            for (size_t index = 0; index < condition_tokens.size(); ++index)
+            {
+                if (index != 0u)
+                    request << ", ";
+                request << condition_tokens[index];
+            }
+            request << "]}\n";
+            request.flush();
+            if (!request.good())
+            {
+                LOG_ERROR("[Parity] Failed while writing MTP branch request "
+                          << request_path);
+                return false;
+            }
+            request.close();
+
+            std::ostringstream script;
+            script
+                << "unset OMP_NUM_THREADS MKL_NUM_THREADS "
+                   "OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES "
+                   "KMP_AFFINITY; "
+                << "if [ -f /workspaces/llaminar/.venv/bin/activate ]; then "
+                   "source /workspaces/llaminar/.venv/bin/activate; fi; "
+                << "python3 python/reference/"
+                   "generate_qwen35_pipeline_snapshots.py"
+                << " --model "
+                << Base::parityShellQuote(Base::config_.model_path)
+                << " --prompt "
+                << Base::parityShellQuote(Base::config_.prompt)
+                << " --output "
+                << Base::parityShellQuote(Base::config_.snapshot_dir)
+                << " --decode-steps " << Base::config_.decode_steps
+                << " --mtp-sidecar-snapshots --mtp-max-draft-depth "
+                << condition_tokens.size() + 1u
+                << " --mtp-branch-overrides "
+                << Base::parityShellQuote(request_path.string());
+            const std::string command =
+                "bash -c " + Base::parityShellQuote(script.str()) + " 2>&1";
+
+            LOG_INFO("[Parity] Generating dense forced-branch MTP oracle step="
+                     << reference_step << " depth=" << condition_tokens.size());
+            FILE *pipe = popen(command.c_str(), "r");
+            if (!pipe)
+            {
+                LOG_ERROR("[Parity] Failed to start dense MTP branch generator");
+                return false;
+            }
+
+            std::string output;
+            std::array<char, 512> buffer{};
+            while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+                output += buffer.data();
+            const int exit_code = pclose(pipe);
+
+            const auto log_path =
+                artifact_dir / "mtp_hf_branch_generation.log";
+            std::ofstream log(log_path, std::ios::trunc);
+            if (log.is_open())
+                log << output;
+            if (exit_code != 0)
+            {
+                LOG_ERROR("[Parity] Dense MTP branch generation failed:\n"
+                          << output);
+                return false;
+            }
+
+            LOG_INFO("[Parity] Dense forced-branch snapshots are durable");
             return true;
         }
     };

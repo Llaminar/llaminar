@@ -36,6 +36,32 @@ namespace
         return (err == cudaSuccess && count > 0);
     }
 
+    /// @brief Owns the explicit CUDA stream used by sharded-cache append tests.
+    class ScopedCudaStream
+    {
+    public:
+        ScopedCudaStream()
+        {
+            EXPECT_EQ(cudaStreamCreate(&stream_), cudaSuccess);
+        }
+
+        ~ScopedCudaStream()
+        {
+            if (stream_)
+                (void)cudaStreamDestroy(stream_);
+        }
+
+        cudaStream_t get() const { return stream_; }
+
+        void synchronize() const
+        {
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+    };
+
 } // namespace
 
 // =============================================================================
@@ -355,7 +381,10 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_AppendAndRetrieve)
     cudaMemcpy(d_V, h_V.data(), num_tokens * local_kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
     // Append to cache (layer 0)
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
+    ScopedCudaStream stream;
+    ASSERT_TRUE(cache->append(
+        0, 0, d_K, d_V, num_tokens, stream.get()));
+    stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     // Retrieve K/V

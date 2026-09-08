@@ -1,3 +1,15 @@
+/**
+ * @file MoEExpertOverlayPreparationPlan.cpp
+ * @brief Builds rank-local, exact-expert preparation requests for ExpertOverlay.
+ *
+ * The immutable owner map describes every participant in the distributed
+ * overlay, while a runtime plan marks only devices addressable by this MPI
+ * process with a valid local DeviceId.  Preparation must apply the global
+ * owner map before it narrows to those local devices; otherwise a rank with
+ * one local CPU NodeTP endpoint would incorrectly prepare the other
+ * endpoint's experts as well.
+ */
+
 #include "MoEExpertOverlayPreparationPlan.h"
 
 #include "MoEExpertOverlayExecutionPlan.h"
@@ -14,19 +26,19 @@ namespace llaminar2
 {
     namespace
     {
-        const char *residencyPolicyName(ExpertResidencyPolicy policy)
+        const char *residencyPolicyName(RoutedExpertResidencyPolicy policy)
         {
             switch (policy)
             {
-            case ExpertResidencyPolicy::Disabled:
+            case RoutedExpertResidencyPolicy::Disabled:
                 return "Disabled";
-            case ExpertResidencyPolicy::StaticById:
+            case RoutedExpertResidencyPolicy::StaticById:
                 return "StaticById";
-            case ExpertResidencyPolicy::HistogramTieredCache:
+            case RoutedExpertResidencyPolicy::HistogramTieredCache:
                 return "HistogramTieredCache";
-            case ExpertResidencyPolicy::ExplicitMasks:
+            case RoutedExpertResidencyPolicy::ExplicitMasks:
                 return "ExplicitMasks";
-            case ExpertResidencyPolicy::RoutedTierRebalanced:
+            case RoutedExpertResidencyPolicy::RoutedTierRebalanced:
                 return "RoutedTierRebalanced";
             }
             return "Unknown";
@@ -41,7 +53,7 @@ namespace llaminar2
             bool participant_world_rank_known,
             int owner_world_rank,
             WeightResidencyCategory residency_category,
-            ExpertResidencyPolicy residency_policy)
+            RoutedExpertResidencyPolicy residency_policy)
         {
             auto it = std::find_if(diagnostics.domains.begin(), diagnostics.domains.end(),
                                    [&](const auto &stats)
@@ -82,7 +94,7 @@ namespace llaminar2
         {
             if (participant.world_rank_known)
                 return participant.world_rank;
-            if (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0)
+            if (domain.scope == ExecutionDomainScope::RANK_LOCAL && domain.owner_rank >= 0)
                 return domain.owner_rank;
             if (domain.participants.size() == 1 && domain.owner_rank >= 0)
                 return domain.owner_rank;
@@ -92,7 +104,7 @@ namespace llaminar2
         bool effectiveParticipantRankKnown(const MoEOverlayRuntimeDomain &domain, const MoEOverlayDomainParticipant &participant)
         {
             return participant.world_rank_known ||
-                   (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0) ||
+                   (domain.scope == ExecutionDomainScope::RANK_LOCAL && domain.owner_rank >= 0) ||
                    (domain.participants.size() == 1 && domain.owner_rank >= 0);
         }
 
@@ -127,15 +139,36 @@ namespace llaminar2
             return participants;
         }
 
+        /**
+         * @brief Resolve the local preparation endpoint for one globally owned expert.
+         *
+         * The owner map is global, whereas only a subset of
+         * `domain.participants` has a valid local DeviceId on this rank.  A
+         * remote owner therefore produces no local request; it is not an error
+         * and must never be mistaken for a single-participant local domain.
+         *
+         * @param domain Runtime description of the expert's execution domain.
+         * @param owner_map Immutable global layer/expert ownership map.
+         * @param current_world_rank MPI world rank making this preparation plan.
+         * @param layer Canonical transformer layer containing the expert.
+         * @param expert_id Logical routed-expert identifier within the layer.
+         * @return Local endpoint requests, or an empty vector for a remote owner.
+         * @throws std::runtime_error when a locally owned expert has no usable endpoint.
+         */
         std::vector<PreparationParticipant> preparationParticipantsForExpert(
             const MoEOverlayRuntimeDomain &domain,
             const MoEExpertOwnerMap *owner_map,
+            int current_world_rank,
             int layer,
             int expert_id)
         {
             auto participants = preparationParticipantsFor(domain);
-            if (domain.compute_kind != ExpertDomainComputeKind::ReplicatedExperts ||
-                participants.size() <= 1 ||
+            // `participants` is intentionally rank-local.  Do not use its
+            // size to decide whether ownership is apportioned: a distributed
+            // NodeTP domain can have one local endpoint and several
+            // remote endpoints, all of which still divide the logical experts.
+            if (domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned ||
+                domain.participants.size() <= 1 ||
                 owner_map == nullptr)
             {
                 return participants;
@@ -163,6 +196,15 @@ namespace llaminar2
 
             if (participants.empty())
             {
+                // A known owner on another rank is normal: this rank must not
+                // materialize or repack its expert.  The matching remote graph
+                // builds the request using the same immutable owner map.
+                if (owner->owner_world_rank_known &&
+                    owner->owner_world_rank != current_world_rank)
+                {
+                    return {};
+                }
+
                 std::ostringstream message;
                 message << "MoE expert overlay preparation plan resolved owner participant "
                         << owner->domain_participant_index << " for layer " << layer
@@ -174,7 +216,7 @@ namespace llaminar2
             return participants;
         }
 
-        WeightResidencyCategory routedResidencyCategoryFor(const ExpertRoutedTier &tier, DeviceId device)
+        WeightResidencyCategory routedResidencyCategoryFor(const RoutedExpertTier &tier, DeviceId device)
         {
             if (tier.fallback || device.is_cpu())
                 return WeightResidencyCategory::CpuFallbackExpert;
@@ -198,7 +240,8 @@ namespace llaminar2
             const MoEExpertOverlayPreparationRequest &request,
             const OverlayRankPlan &rank_plan)
         {
-            if (request.fallback && request.device.is_cpu() && !rank_plan.builds_root_graph)
+            if (request.fallback && request.device.is_cpu() &&
+                rank_plan.usesExpertTransactionFollower())
                 return WeightResidencyCategory::WorkerFallbackExpert;
             return request.residency_category;
         }
@@ -344,7 +387,7 @@ namespace llaminar2
         size_t routed_expert_bytes_per_expert)
     {
         const auto &source = runtime_plan.sourcePlan();
-        if (!source.isTieredOverlay())
+        if (!source.usesExpertOverlayAuthority())
             return {};
 
         MoEExpertOverlayPreparationPlan result;
@@ -381,13 +424,13 @@ namespace llaminar2
         if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
                         [](const auto &domain)
                         {
-                            return domain.compute_kind == ExpertDomainComputeKind::ReplicatedExperts &&
+                            return domain.routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
                                    domain.participants.size() > 1;
                         }))
         {
             owner_map = MoEExpertOwnerMap::build(
                 source,
-                MoEExpertOwnerMapBuildOptions{.reject_tensor_parallel_experts = false});
+                MoEExpertOwnerMapBuildOptions{.reject_tensor_sharded_domains = false});
         }
 
         for (const auto &placement : source.placements)
@@ -409,6 +452,7 @@ namespace llaminar2
                 for (const auto &participant : preparationParticipantsForExpert(
                          domain,
                          owner_map ? &*owner_map : nullptr,
+                         runtime_plan.currentWorldRank(),
                          placement.layer,
                          static_cast<int>(expert_index)))
                 {
@@ -529,6 +573,61 @@ namespace llaminar2
             {
                 ++stats.assigned_routed_experts;
                 stats.estimated_routed_bytes += filtered_request.estimated_routed_bytes;
+            }
+        }
+
+        sortDiagnostics(filtered.diagnostics_);
+        return filtered;
+    }
+
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::filteredForDevice(
+        DeviceId device) const
+    {
+        return filteredForDevices({device});
+    }
+
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::filteredForDevices(
+        const std::vector<DeviceId> &devices) const
+    {
+        if (devices.empty() ||
+            std::any_of(
+                devices.begin(),
+                devices.end(),
+                [](DeviceId device)
+                { return !device.is_valid(); }))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay preparation device set must be non-empty and valid");
+        }
+        std::set<DeviceId> device_set(devices.begin(), devices.end());
+        if (device_set.size() != devices.size())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay preparation device set contains duplicates");
+        }
+
+        MoEExpertOverlayPreparationPlan filtered;
+        std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
+
+        for (const auto &request : requests_)
+        {
+            if (!device_set.contains(request.device))
+                continue;
+
+            filtered.requests_.push_back(request);
+            auto &stats = recordRequestStats(filtered.diagnostics_, request);
+            const auto expert_key = std::make_tuple(
+                request.domain_name,
+                request.device,
+                request.participant_index,
+                request.participant_world_rank,
+                request.residency_category,
+                request.layer,
+                request.expert_id);
+            if (counted_experts.insert(expert_key).second)
+            {
+                ++stats.assigned_routed_experts;
+                stats.estimated_routed_bytes += request.estimated_routed_bytes;
             }
         }
 

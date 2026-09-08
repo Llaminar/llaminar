@@ -20,7 +20,7 @@ namespace llaminar2::test
             explicit MockTPContext(TPScope scope) : scope_(scope) {}
 
             TPScope scope() const override { return scope_; }
-            int degree() const override { return scope_ == TPScope::LOCAL ? 2 : 3; }
+            int degree() const override { return scope_ == TPScope::RANK_LOCAL ? 2 : 3; }
             int myIndex() const override { return 0; }
             CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }
             bool allreduce(TensorBase *) override { return true; }
@@ -28,7 +28,7 @@ namespace llaminar2::test
             bool allgather(const TensorBase *, TensorBase *) override { return true; }
 
         private:
-            TPScope scope_ = TPScope::LOCAL;
+            TPScope scope_ = TPScope::RANK_LOCAL;
         };
 
         class RecordingGraphBuilder final : public IGraphBuilder
@@ -64,7 +64,7 @@ namespace llaminar2::test
                                           IGraphBuilder *, const std::string &, ITPContext *>,
                       "IGraphBuilder::setTPContext must accept ITPContext*");
 
-        MockTPContext local_ctx(TPScope::LOCAL);
+        MockTPContext local_ctx(TPScope::RANK_LOCAL);
         MockTPContext global_ctx(TPScope::GLOBAL);
 
         GraphConfig config;
@@ -79,7 +79,7 @@ namespace llaminar2::test
 
     TEST(Test__MoEContinuationTPContextPlumbing, GraphBuilderReceivesLocalAndGlobalITPContexts)
     {
-        MockTPContext local_ctx(TPScope::LOCAL);
+        MockTPContext local_ctx(TPScope::RANK_LOCAL);
         MockTPContext global_ctx(TPScope::GLOBAL);
         RecordingGraphBuilder builder;
 

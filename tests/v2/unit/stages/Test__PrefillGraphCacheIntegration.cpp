@@ -3,7 +3,7 @@
  * @brief Unit tests for PrefillGraphCache integration into ForwardExecutionEngine
  *
  * Tests the warmup → capture → replay lifecycle, preflight rejection paths,
- * failure propagation, replay callbacks, and snapshot bypass.
+ * failure propagation, device replay parameters, and snapshot bypass.
  */
 
 #include <gtest/gtest.h>
@@ -30,7 +30,6 @@ public:
 
     bool isGraphCapturable() const override { return true; }
     bool hasDynamicParams() const override { return has_dynamic_params_; }
-    bool needsOnGraphReplayed() const override { return needs_replay_callback_; }
 
     void updateDynamicParams(int position_offset, int seq_len) override
     {
@@ -39,24 +38,15 @@ public:
         last_seq_len_ = seq_len;
     }
 
-    void onGraphReplayed() override
-    {
-        replay_callback_calls_++;
-    }
-
     void setHasDynamicParams(bool v) { has_dynamic_params_ = v; }
-    void setNeedsReplayCallback(bool v) { needs_replay_callback_ = v; }
 
     int dynamicParamsCalls() const { return dynamic_params_calls_; }
-    int replayCallbackCalls() const { return replay_callback_calls_; }
     int lastPositionOffset() const { return last_position_offset_; }
     int lastSeqLen() const { return last_seq_len_; }
 
 private:
     bool has_dynamic_params_ = false;
-    bool needs_replay_callback_ = false;
     int dynamic_params_calls_ = 0;
-    int replay_callback_calls_ = 0;
     int last_position_offset_ = -1;
     int last_seq_len_ = -1;
 };
@@ -132,7 +122,7 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllClearsPrefillCache)
     // Create prefill cache with a warmed-up entry
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     PrefillGraphCacheKey key;
@@ -155,7 +145,7 @@ TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillExecutabl
 
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     PrefillGraphCacheKey key;
@@ -181,7 +171,7 @@ TEST(Test__PrefillGraphCacheIntegration, WorkspaceRebindInvalidatesPrefillCache)
 
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 1;
+    config.minimum_padded_bucket_seq_len = 1;
     cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     PrefillGraphCacheKey key;
@@ -207,7 +197,7 @@ TEST(Test__PrefillGraphCacheIntegration, PhaseTransitionsInForwardGraphCache)
     ForwardGraphCache fwd_cache;
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     fwd_cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
 
     auto dev = testGPUDevice();
@@ -240,7 +230,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsCPUDevice)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto cpu_dev = DeviceId::cpu();
@@ -259,14 +249,14 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsCPUDevice)
 }
 
 // =============================================================================
-// Test: Preflight rejects when snapshots are active
+// Test: Preflight allows snapshots because capture is drained after graph launch
 // =============================================================================
 
-TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsSnapshots)
+TEST(Test__PrefillGraphCacheIntegration, PreflightAllowsSnapshots)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -279,7 +269,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsSnapshots)
     std::unordered_set<std::string> no_collectives;
     auto reason = cache.preflight(graph, key, &no_collectives,
                                   /*snapshots_active=*/true, false);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SnapshotsActive);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
 // =============================================================================
@@ -290,7 +280,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsMoERebalancing)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -303,30 +293,37 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsMoERebalancing)
     std::unordered_set<std::string> no_collectives;
     auto reason = cache.preflight(graph, key, &no_collectives,
                                   false, /*moe_rebalancing_active=*/true);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::ActiveMoERebalancing);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
 // =============================================================================
-// Test: Preflight rejects when seq_len below minimum
+// Test: Preflight rejects padded physical buckets below the coalescing floor
 // =============================================================================
 
-TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsShortSeqLen)
+TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsPaddedBucketBelowFloor)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 256;
+    config.minimum_padded_bucket_seq_len = 256;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
     auto graph = buildIntegCapturableGraph(dev);
 
     PrefillGraphCacheKey key;
-    key.seq_len = 128; // Below min_seq_len=256
+    key.seq_len = 128;
     key.device_id = dev;
 
     std::unordered_set<std::string> no_collectives;
-    auto reason = cache.preflight(graph, key, &no_collectives, false, false);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SeqLenBelowMinimum);
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &no_collectives,
+        false,
+        false,
+        /*real_seq_len=*/64,
+        /*bucket_seq_len=*/128);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::PaddedBucketBelowMinimum);
 }
 
 // =============================================================================
@@ -337,7 +334,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsCollectives)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -360,7 +357,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsNonCapturableStage)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -376,49 +373,25 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsNonCapturableStage)
     key.device_id = dev;
 
     std::unordered_set<std::string> no_collectives;
-    auto reason = cache.preflight(graph, key, &no_collectives, false, false);
+    std::string reject_stage_name;
+    std::string reject_stage_type;
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &no_collectives,
+        false,
+        false,
+        512,
+        512,
+        PrefillGraphPreflightMode::Default,
+        false,
+        false,
+        PrefillMoEGraphStability::Unstable,
+        &reject_stage_name,
+        &reject_stage_type);
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
-}
-
-// =============================================================================
-// Test: Replay callbacks are called with correct stage list
-// =============================================================================
-
-TEST(Test__PrefillGraphCacheIntegration, ReplayCallbackStagesCached)
-{
-    ForwardGraphCache fwd_cache;
-    auto dev = testGPUDevice();
-
-    std::vector<IntegCapturableMockStage *> stage_ptrs;
-    auto graph = buildIntegCapturableGraph(dev, 4, &stage_ptrs);
-
-    // Mark stage 1 and 3 as needing replay callbacks
-    stage_ptrs[1]->setNeedsReplayCallback(true);
-    stage_ptrs[3]->setNeedsReplayCallback(true);
-
-    fwd_cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
-
-    // Cache replay callback stages (mimics executeCacheHit logic)
-    EXPECT_FALSE(fwd_cache.replay_callback_stages_cached);
-    const auto &order = fwd_cache.graph->getExecutionOrder();
-    for (const auto &node_name : order)
-    {
-        ComputeNode *node = fwd_cache.graph->getNode(node_name);
-        if (node && node->stage && node->stage->needsOnGraphReplayed())
-            fwd_cache.replay_callback_stages.push_back(node->stage.get());
-    }
-    fwd_cache.replay_callback_stages_cached = true;
-
-    EXPECT_EQ(fwd_cache.replay_callback_stages.size(), 2u);
-
-    // Simulate replay callbacks
-    for (auto *stage : fwd_cache.replay_callback_stages)
-        stage->onGraphReplayed();
-
-    EXPECT_EQ(stage_ptrs[1]->replayCallbackCalls(), 1);
-    EXPECT_EQ(stage_ptrs[3]->replayCallbackCalls(), 1);
-    EXPECT_EQ(stage_ptrs[0]->replayCallbackCalls(), 0);
-    EXPECT_EQ(stage_ptrs[2]->replayCallbackCalls(), 0);
+    EXPECT_EQ(reject_stage_name, "bad_stage");
+    EXPECT_EQ(reject_stage_type, "GEMM");
 }
 
 // =============================================================================
@@ -477,12 +450,22 @@ namespace
             return GraphBuildResult("not implemented");
         }
         IDeviceContext *getDeviceContext(DeviceId) override { return nullptr; }
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId) override { return nullptr; }
+        bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override { return {}; }
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int) override { return true; }
-        void syncLogitsAtBoundary(IDeviceContext *) override {}
-        TensorBase *logitsTensor() override { return nullptr; }
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &,
+            IDeviceContext *) override
+        {
+            return true;
+        }
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &) override
+        {
+        }
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
-            bool, IDeviceContext *, int) const override
+            bool, IDeviceContext *) const override
         {
             return {};
         }
@@ -494,7 +477,14 @@ TEST(Test__PrefillGraphCacheIntegration, DefaultHostMoERebalancingReturnsFalse)
 {
     MinimalTestHost host;
     EXPECT_FALSE(host.isMoeRebalancingActive());
+    EXPECT_FALSE(host.isMoeRebalancingGraphStableForPrefillCapture());
+    EXPECT_FALSE(host.prefillGraphCaptureDisabledByHost());
     EXPECT_EQ(host.moePlacementEpoch(), 0u);
+}
+
+TEST(Test__PrefillGraphCacheIntegration, HostPolicyDisabledReasonIsPrintable)
+{
+    EXPECT_STREQ(toString(PrefillGraphRejectReason::HostPolicyDisabled), "HostPolicyDisabled");
 }
 
 // =============================================================================
@@ -527,7 +517,7 @@ TEST(Test__PrefillGraphCacheIntegration, UnknownKeyReturnsCold)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     PrefillGraphCacheKey key;
@@ -545,7 +535,7 @@ TEST(Test__PrefillGraphCacheIntegration, MultipleSeqLenIndependent)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -577,7 +567,7 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllResetsEntries)
 {
     PrefillGraphConfig config;
     config.enabled = true;
-    config.min_seq_len = 64;
+    config.minimum_padded_bucket_seq_len = 64;
     PrefillGraphCache cache(config);
 
     auto dev = testGPUDevice();
@@ -607,7 +597,7 @@ TEST(Test__PrefillGraphCacheIntegration, RejectReasonToString)
 {
     EXPECT_NE(toString(PrefillGraphRejectReason::None), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::FeatureDisabled), nullptr);
-    EXPECT_NE(toString(PrefillGraphRejectReason::SeqLenBelowMinimum), nullptr);
+    EXPECT_NE(toString(PrefillGraphRejectReason::PaddedBucketBelowMinimum), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::NotGPUDevice), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::SnapshotsActive), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::ActiveMoERebalancing), nullptr);

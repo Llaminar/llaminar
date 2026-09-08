@@ -47,7 +47,9 @@
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -106,6 +108,36 @@ namespace
     }
 
 #ifdef HAVE_ROCM
+    /**
+     * @brief Waits at an explicit integration-test observation boundary.
+     *
+     * Production ordering remains entirely stream/event driven.  A test that
+     * must inspect host-visible results, begin capture after a warm-up launch,
+     * or destroy a completed graph may wait for this one recorded event.  This
+     * deliberately avoids device-wide and stream-wide synchronization, which
+     * would hide missing producer publication or consumer event joins.
+     *
+     * @param stream ROCm stream whose preceding work must be complete.
+     * @return true when the event was created, recorded, observed, and
+     *         destroyed successfully.
+     */
+    bool waitForROCmTestBoundary(hipStream_t stream)
+    {
+        hipEvent_t event = nullptr;
+        if (hipEventCreateWithFlags(&event, hipEventDisableTiming) != hipSuccess)
+        {
+            return false;
+        }
+
+        const hipError_t record_status = hipEventRecord(event, stream);
+        const hipError_t wait_status =
+            record_status == hipSuccess ? hipEventSynchronize(event) : record_status;
+        const hipError_t destroy_status = hipEventDestroy(event);
+        return record_status == hipSuccess &&
+               wait_status == hipSuccess &&
+               destroy_status == hipSuccess;
+    }
+
     /// hipBLAS FP32 reference GEMM: C[i,j] = sum_k(A[i,k] * W[j,k])
     /// A is [M x K] row-major, W is [N x K] row-major (weight layout)
     /// Row-major C = A * W^T is computed via the column-major identity:
@@ -142,14 +174,14 @@ namespace
             d_C, N          // ldc = N (C' is [N,M] col-major)
         );
 
-        (void)hipDeviceSynchronize();
-        (void)hipMemcpy(C_host, d_C, size_C, hipMemcpyDeviceToHost);
+        const hipError_t copy_status =
+            hipMemcpy(C_host, d_C, size_C, hipMemcpyDeviceToHost);
 
         (void)hipFree(d_A);
         (void)hipFree(d_W);
         (void)hipFree(d_C);
         hipblasDestroy(handle);
-        return (status == HIPBLAS_STATUS_SUCCESS);
+        return status == HIPBLAS_STATUS_SUCCESS && copy_status == hipSuccess;
     }
 #endif
 
@@ -191,9 +223,23 @@ namespace
                 hipDeviceProp_t props;
                 (void)hipGetDeviceProperties(&props, 0);
                 gpu_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
+                ASSERT_EQ(
+                    hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+                    hipSuccess);
             }
 #else
             has_gpu_ = false;
+#endif
+        }
+
+        void TearDown() override
+        {
+#ifdef HAVE_ROCM
+            if (stream_)
+            {
+                EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+                stream_ = nullptr;
+            }
 #endif
         }
 
@@ -201,6 +247,8 @@ namespace
         std::string gpu_name_;
 
 #ifdef HAVE_ROCM
+        /// Explicit stream shared by transfers, kernels, and test observations.
+        hipStream_t stream_ = nullptr;
         std::unique_ptr<DeviceWorkspaceManager> workspace_;
 
         bool setupWorkspace(ROCmQuantisedGemmKernel &kernel, int M, int N, int K)
@@ -298,6 +346,7 @@ namespace
 
         // 4. Kernel + workspace
         ROCmQuantisedGemmKernel kernel(&packed, 0);
+        kernel.setGPUStream(stream_);
         ASSERT_TRUE(setupWorkspace(kernel, p.M, p.N, p.K));
 
         // 5. Random input [M x K], zero-init output [M x N]
@@ -307,19 +356,15 @@ namespace
             {static_cast<size_t>(p.M), static_cast<size_t>(p.N)});
 
         // 5b. Upload input to GPU and allocate output on device
-        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)))
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream_))
             << p.name << ": failed to upload input to device";
-        ASSERT_TRUE(output_gpu->allocateOnDevice(DeviceId::rocm(0)))
+        ASSERT_TRUE(output_gpu->allocateOnDevice(DeviceId::rocm(0), stream_))
             << p.name << ": failed to allocate output on device";
 
         // 6. GPU GEMM
         ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(),
                                            p.M, p.N, p.K))
             << p.name << ": multiply_tensor failed";
-        (void)hipDeviceSynchronize();
-
-        // 6b. Mark output device-dirty so data() triggers D2H sync
-        output_gpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
         // 7. hipBLAS FP32 reference (fast GPU-based ground truth)
         const float *input_host = input->data(); // triggers D2H if needed
@@ -328,6 +373,8 @@ namespace
             << p.name << ": hipBLAS reference GEMM failed";
 
         // 8. Compare — per-row cosine + overall
+        ASSERT_TRUE(output_gpu->ensureOnHost(stream_))
+            << p.name << ": failed to observe event-published GPU output";
         const float *gpu = output_gpu->data();
         float worst_cos = 1.0f;
         int worst_row = -1;
@@ -421,6 +468,7 @@ namespace
             ASSERT_FALSE(packed.native_vnni_payload.empty()) << shape.name;
 
             ROCmQuantisedGemmKernel kernel(&packed, 0);
+            kernel.setGPUStream(stream_);
             ASSERT_TRUE(setupWorkspace(kernel, shape.M, shape.N, shape.K)) << shape.name;
 
             auto input = TestTensorFactory::createFP32Random(
@@ -428,8 +476,9 @@ namespace
             auto output_gpu = TestTensorFactory::createFP32(
                 {static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
 
-            ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0))) << shape.name;
-            ASSERT_TRUE(output_gpu->allocateOnDevice(DeviceId::rocm(0))) << shape.name;
+            ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream_)) << shape.name;
+            ASSERT_TRUE(output_gpu->allocateOnDevice(DeviceId::rocm(0), stream_))
+                << shape.name;
 
             std::vector<float> reference;
             for (int run = 0; run < kRepeatRuns; ++run)
@@ -437,8 +486,8 @@ namespace
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(),
                                                    shape.M, shape.N, shape.K))
                     << shape.name << " run=" << run;
-                (void)hipDeviceSynchronize();
-                output_gpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                ASSERT_TRUE(output_gpu->ensureOnHost(stream_))
+                    << shape.name << " run=" << run;
 
                 const float *gpu = output_gpu->data();
                 std::vector<float> snapshot(
@@ -466,6 +515,88 @@ namespace
 
             cleanupWorkspace(kernel);
         }
+#endif
+    }
+
+    TEST_F(NativeVNNIGEMMTest, IQ3S_GDNPaddedPrefillFusedProjectionGraphCaptures)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_gpu_)
+        {
+            GTEST_SKIP() << "No ROCm device";
+        }
+
+        const int M = 2560;
+        const int K = 2048;
+        const int N_qkv = 6144;
+        const int N_z = 2048;
+
+        auto w_qkv = TestTensorFactory::createIQ3_SRandom(
+            {static_cast<size_t>(N_qkv), static_cast<size_t>(K)});
+        auto w_z = TestTensorFactory::createIQ3_SRandom(
+            {static_cast<size_t>(N_z), static_cast<size_t>(K)});
+        ASSERT_NE(w_qkv, nullptr);
+        ASSERT_NE(w_z, nullptr);
+
+        ROCmPackedWeights packed_qkv;
+        ROCmPackedWeights packed_z;
+        ASSERT_TRUE(packWeightsToROCm(w_qkv.get(), packed_qkv));
+        ASSERT_TRUE(packWeightsToROCm(w_z.get(), packed_z));
+        ASSERT_FALSE(packed_qkv.native_vnni_payload.empty());
+        ASSERT_FALSE(packed_z.native_vnni_payload.empty());
+
+        ROCmQuantisedGemmKernel qkv_kernel(&packed_qkv, 0);
+        ROCmQuantisedGemmKernel z_kernel(&packed_z, 0);
+        qkv_kernel.setGPUStream(stream_);
+        z_kernel.setGPUStream(stream_);
+
+        auto reqs = qkv_kernel.getWorkspaceRequirements(M, N_qkv, K);
+        const size_t workspace_bytes = std::max(
+            static_cast<size_t>(256 * 1024 * 1024),
+            static_cast<size_t>(reqs.total_bytes() * 2));
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0), workspace_bytes);
+        ASSERT_TRUE(workspace_->allocate(reqs));
+        qkv_kernel.bindWorkspace(workspace_.get());
+        z_kernel.bindWorkspace(workspace_.get());
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)});
+        auto qkv_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N_qkv)});
+        auto z_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N_z)});
+
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0), stream_));
+        ASSERT_TRUE(qkv_output->allocateOnDevice(DeviceId::rocm(0), stream_));
+        ASSERT_TRUE(z_output->allocateOnDevice(DeviceId::rocm(0), stream_));
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections;
+        projections.emplace_back(&qkv_kernel, qkv_output.get(), N_qkv, nullptr, "qkv");
+        projections.emplace_back(&z_kernel, z_output.get(), N_z, nullptr, "z");
+
+        ASSERT_TRUE(qkv_kernel.multiply_fused_tensor(input.get(), projections, M, K))
+            << "Packed IQ3_S native-VNNI GDN padded prefill warmup failed";
+        ASSERT_TRUE(waitForROCmTestBoundary(stream_));
+
+        HIPGraphCapture capture(stream_, 0);
+        ScopedBackendGraphCapture capture_transaction(
+            capture,
+            "NativeVNNIGEMMTest.IQ3S_GDNPaddedPrefillFusedProjectionGraphCaptures");
+        ASSERT_TRUE(capture_transaction.begin());
+        const bool launch_ok = qkv_kernel.multiply_fused_tensor(
+            input.get(), projections, M, K);
+        capture_transaction.finish();
+
+        ASSERT_TRUE(launch_ok)
+            << "Packed IQ3_S native-VNNI GDN padded prefill launch failed during graph capture";
+        ASSERT_TRUE(capture.instantiate());
+        ASSERT_TRUE(capture.launch());
+        ASSERT_TRUE(waitForROCmTestBoundary(stream_));
+        qkv_kernel.unbindWorkspace();
+        z_kernel.unbindWorkspace();
 #endif
     }
 

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -654,6 +655,31 @@ namespace llaminar2
             graph_plan.verifier_logit_rows.push_back(*mapped);
         }
 
+        /*
+         * Make the dense identity case a first-class layout rather than asking
+         * graph construction and metadata publication to infer it independently.
+         * This is true only when every physical row is consumed exactly once in
+         * ascending order. A padded request batch therefore remains an explicit
+         * selection even when every logical verifier row is selected.
+         */
+        bool covers_full_physical_input =
+            input_plan.compact_logit_row_count ==
+            graph_plan.total_graph_tokens;
+        for (int row = 0;
+             covers_full_physical_input &&
+             row < graph_plan.total_graph_tokens;
+             ++row)
+        {
+            covers_full_physical_input =
+                graph_plan.verifier_logit_rows[
+                    static_cast<size_t>(row)] == row;
+        }
+        if (covers_full_physical_input)
+        {
+            graph_plan.logit_row_layout =
+                MTPSpecDecodeVerifierLogitRowLayout::FullPhysicalIdentity;
+        }
+
         const int bonus_count = std::min<int>(
             input_plan.request_count,
             static_cast<int>(input_plan.bonus_logit_rows.size()));
@@ -713,6 +739,23 @@ namespace llaminar2
         const std::vector<int32_t> &target_verifier_state_commit_counts,
         const std::vector<int32_t> &stopped_flags)
     {
+        return buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+            shape,
+            requests,
+            committed_output_counts,
+            target_verifier_state_commit_counts,
+            stopped_flags,
+            {});
+    }
+
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchWithStateCommitCounts(
+        const MTPSpecDecodeMetadataShape &shape,
+        const std::vector<MTPSpecDecodeRequest> &requests,
+        const std::vector<int32_t> &committed_output_counts,
+        const std::vector<int32_t> &target_verifier_state_commit_counts,
+        const std::vector<int32_t> &stopped_flags,
+        const std::vector<int32_t> &all_drafts_accepted_flags)
+    {
         if (!shape.valid())
             return metadataFailure(shape, "invalid MTP spec-decode metadata shape");
         if (requests.empty())
@@ -725,6 +768,13 @@ namespace llaminar2
             return metadataFailure(shape, "target verifier state commit count vector does not match request count");
         if (stopped_flags.size() != requests.size())
             return metadataFailure(shape, "stopped flag vector does not match request count");
+        if (!all_drafts_accepted_flags.empty() &&
+            all_drafts_accepted_flags.size() != requests.size())
+        {
+            return metadataFailure(
+                shape,
+                "all-drafts-accepted flag vector does not match request count");
+        }
 
         MTPSpecDecodeMetadataBatch batch;
         batch.ok = true;
@@ -819,7 +869,9 @@ namespace llaminar2
             batch.token_indices_to_sample[request_index] = tx.token_index_to_sample;
             batch.next_condition_tokens[request_index] = tx.next_condition_token;
             batch.all_drafts_accepted_flags[request_index] =
-                tx.allDraftsAccepted() ? 1 : 0;
+                all_drafts_accepted_flags.empty()
+                    ? (tx.allDraftsAccepted() ? 1 : 0)
+                    : (all_drafts_accepted_flags[request_index] != 0 ? 1 : 0);
             batch.stopped_flags[request_index] =
                 stopped_flags[request_index] != 0 ? 1 : 0;
             batch.query_start_locs[request_index] = query_cursor;
@@ -907,7 +959,7 @@ namespace llaminar2
         std::vector<int32_t> target_verifier_state_commit_counts;
         std::vector<int32_t> stopped_flags;
         std::vector<int> expected_accepted_verifier_prefixes;
-        std::vector<bool> expected_all_drafts_accepted_flags;
+        std::vector<int32_t> expected_all_drafts_accepted_flags;
         std::vector<int32_t> expected_next_condition_tokens;
         std::vector<int> expected_valid_sampled_counts;
         spec_requests.reserve(requests.size());
@@ -951,10 +1003,19 @@ namespace llaminar2
                 return fail_request("MTP spec-decode catch-up accepted all drafts without a ready token");
             }
 
+            /*
+             * Acceptance and continuation are independent predicates. A stop
+             * token can truncate an otherwise rejection-free transaction, and
+             * can itself be the final accepted draft. Preserve that acceptance
+             * fact in the transaction metadata while separately withholding the
+             * bonus row whenever output stopped.
+             */
             const bool expected_all_drafts_accepted =
-                result.all_speculative_accepted && !result.stopped_on_output;
+                result.all_speculative_accepted;
+            const bool has_bonus_ready_token =
+                expected_all_drafts_accepted && !result.stopped_on_output;
             const std::optional<int32_t> bonus_ready_token =
-                expected_all_drafts_accepted
+                has_bonus_ready_token
                     ? std::optional<int32_t>{result.ready_token}
                     : std::optional<int32_t>{};
             const int expected_accepted_verifier_prefix =
@@ -982,12 +1043,12 @@ namespace llaminar2
             expected_accepted_verifier_prefixes.push_back(
                 expected_accepted_verifier_prefix);
             expected_all_drafts_accepted_flags.push_back(
-                expected_all_drafts_accepted);
+                expected_all_drafts_accepted ? 1 : 0);
             expected_valid_sampled_counts.push_back(
                 static_cast<int>(result.accepted_tokens.size()) +
-                (expected_all_drafts_accepted ? 1 : 0));
+                (has_bonus_ready_token ? 1 : 0));
             expected_next_condition_tokens.push_back(
-                expected_all_drafts_accepted
+                has_bonus_ready_token
                     ? result.ready_token
                     : result.accepted_tokens.back());
         }
@@ -998,7 +1059,8 @@ namespace llaminar2
                 spec_requests,
                 committed_output_counts,
                 target_verifier_state_commit_counts,
-                stopped_flags);
+                stopped_flags,
+                expected_all_drafts_accepted_flags);
         if (!batch.ok)
             return batch;
         if (batch.transactions.size() != requests.size())
@@ -1015,7 +1077,8 @@ namespace llaminar2
                     "MTP spec-decode accepted-prefix mismatch between catch-up result and transaction");
             }
 
-            if (tx.allDraftsAccepted() != expected_all_drafts_accepted_flags[i])
+            if (!results[i].stopped_on_output &&
+                tx.allDraftsAccepted() != expected_all_drafts_accepted_flags[i])
             {
                 return metadataFailure(
                     shape,
@@ -1136,10 +1199,39 @@ namespace llaminar2
                 outcome.all_drafts_accepted &&
                 !outcome.stopped_on_output &&
                 outcome.bonus_ready_token.has_value();
+            const bool has_commit_boundary_ready =
+                outcome.commit_boundary_clipped &&
+                outcome.commit_boundary_ready_token.has_value();
+            if (outcome.commit_boundary_clipped)
+            {
+                if (outcome.all_drafts_accepted ||
+                    outcome.stopped_on_output ||
+                    outcome.bonus_ready_token.has_value() ||
+                    !has_commit_boundary_ready)
+                {
+                    return fail_request(
+                        "commit-boundary outcome has inconsistent terminal flags");
+                }
+                if (outcome.accepted_verifier_input_prefix <= 0 ||
+                    outcome.accepted_verifier_input_prefix >= outcome.draft_count ||
+                    committed_count != outcome.accepted_verifier_input_prefix)
+                {
+                    return fail_request(
+                        "commit-boundary outcome does not end at an interior committed prefix");
+                }
+            }
+            else if (outcome.commit_boundary_ready_token.has_value())
+            {
+                return fail_request(
+                    "non-boundary outcome carries a commit-boundary ready token");
+            }
             if (outcome.all_drafts_accepted)
             {
-                if (outcome.accepted_verifier_input_prefix != outcome.draft_count)
+                if (!outcome.stopped_on_output &&
+                    outcome.accepted_verifier_input_prefix != outcome.draft_count)
+                {
                     return fail_request("all-accepted outcome must publish every verifier input row");
+                }
                 if (!outcome.stopped_on_output &&
                     !outcome.bonus_ready_token.has_value())
                 {
@@ -1150,6 +1242,14 @@ namespace llaminar2
                 !tokenInVocab(*outcome.bonus_ready_token, outcome.vocab_size))
             {
                 return fail_request("accepted outcome bonus ready token is outside the vocabulary");
+            }
+            if (outcome.commit_boundary_ready_token.has_value() &&
+                !tokenInVocab(
+                    *outcome.commit_boundary_ready_token,
+                    outcome.vocab_size))
+            {
+                return fail_request(
+                    "accepted outcome commit-boundary ready token is outside the vocabulary");
             }
 
             const int valid_sampled_count =
@@ -1171,6 +1271,12 @@ namespace llaminar2
             {
                 return fail_request("accepted outcome state commit count is outside committed prefix");
             }
+            if (outcome.commit_boundary_clipped &&
+                state_commit_count != committed_count)
+            {
+                return fail_request(
+                    "commit-boundary outcome must publish its complete committed prefix");
+            }
 
             const int i = static_cast<int>(request_index);
             const int draft_offset = i * shape.max_draft_tokens;
@@ -1189,8 +1295,11 @@ namespace llaminar2
             batch.token_indices_to_sample[request_index] =
                 valid_sampled_count - 1;
             batch.next_condition_tokens[request_index] =
-                has_bonus_ready ? *outcome.bonus_ready_token
-                                : outcome.committed_output_tokens.back();
+                has_commit_boundary_ready
+                    ? *outcome.commit_boundary_ready_token
+                    : (has_bonus_ready
+                           ? *outcome.bonus_ready_token
+                           : outcome.committed_output_tokens.back());
             batch.all_drafts_accepted_flags[request_index] =
                 outcome.all_drafts_accepted ? 1 : 0;
             batch.stopped_flags[request_index] =
@@ -1318,11 +1427,40 @@ namespace llaminar2
     {
     }
 
-    void MTPSpecDecodeMetadataWorkspaceBinding::setShape(
-        MTPSpecDecodeMetadataShape shape)
+    void MTPSpecDecodeMetadataWorkspaceBinding::ensureCapacity(
+        MTPSpecDecodeMetadataShape minimum_capacity)
     {
-        shape_ = shape;
+        if (!minimum_capacity.valid())
+        {
+            throw std::invalid_argument(
+                "MTPSpecDecodeMetadataWorkspaceBinding::ensureCapacity requires "
+                "positive request and draft-token capacity");
+        }
+
+        const MTPSpecDecodeMetadataShape expanded{
+            .max_requests = std::max(
+                shape_.max_requests,
+                minimum_capacity.max_requests),
+            .max_draft_tokens = std::max(
+                shape_.max_draft_tokens,
+                minimum_capacity.max_draft_tokens),
+        };
+        if (expanded.max_requests == shape_.max_requests &&
+            expanded.max_draft_tokens == shape_.max_draft_tokens)
+        {
+            return;
+        }
+
+        shape_ = expanded;
         refreshDevicePointers();
+    }
+
+    bool MTPSpecDecodeMetadataWorkspaceBinding::covers(
+        MTPSpecDecodeMetadataShape requested_shape) const
+    {
+        return requested_shape.valid() && shape_.valid() &&
+               shape_.max_requests >= requested_shape.max_requests &&
+               shape_.max_draft_tokens >= requested_shape.max_draft_tokens;
     }
 
     MTPSpecDecodeMetadataShape MTPSpecDecodeMetadataWorkspaceBinding::effectiveShape(
@@ -1546,6 +1684,11 @@ namespace llaminar2
                            binding.bindingError();
             return result;
         }
+        if (!binding.covers(batch.shape))
+        {
+            result.error = "MTP metadata batch exceeds the setup-owned workspace capacity";
+            return result;
+        }
         if (device.is_gpu())
         {
             if (!stream)
@@ -1681,6 +1824,12 @@ namespace llaminar2
                            binding.bindingError();
             return result;
         }
+        if (!binding.covers(plan.shape))
+        {
+            result.error =
+                "MTP verifier input plan exceeds the setup-owned workspace capacity";
+            return result;
+        }
         if (plan.compact_logit_row_count < 0 ||
             plan.compact_logit_row_count >
                 plan.shape.max_requests * plan.shape.maxTargetQueryLen() ||
@@ -1702,6 +1851,17 @@ namespace llaminar2
             plan.compact_logit_row_count)
         {
             result.error = "MTP verifier graph row plan is undersized";
+            return result;
+        }
+        if (graph_plan.logit_row_layout ==
+            MTPSpecDecodeVerifierLogitRowLayout::FullPhysicalIdentity)
+        {
+            /*
+             * The graph consumes the normalized activation directly. Publishing
+             * an identity index vector would add a host-to-device transfer to
+             * every verifier replay without changing a single source row.
+             */
+            result.ok = true;
             return result;
         }
         if (device.is_gpu())
@@ -1743,9 +1903,9 @@ namespace llaminar2
             result.error = "MTP verifier row upload has an invalid row count";
             return result;
         }
-        const MTPSpecDecodeMetadataShape &shape = binding.shape();
-        if (shape.valid() &&
-            row_count > shape.max_requests * shape.maxTargetQueryLen())
+        const MTPSpecDecodeMetadataShape &capacity = binding.capacity();
+        if (capacity.valid() &&
+            row_count > capacity.max_requests * capacity.maxTargetQueryLen())
         {
             result.error = "MTP verifier row upload exceeds metadata workspace shape";
             return result;

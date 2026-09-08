@@ -7,8 +7,9 @@
  * timing which only measures kernel launch time, HIP events measure
  * actual kernel execution time on the GPU.
  *
- * Enable via LLAMINAR_PROFILING=1 environment variable (shared with
- * KernelProfiler.h and CUDAKernelProfiler.h for unified control).
+ * Enable the legacy hand-instrumented table via
+ * LLAMINAR_PROFILE_KERNELS=1. Production graph timing belongs to the
+ * PerfStats `stage_gpu` domain.
  *
  * Usage:
  *   // Option 1: Scoped timing (RAII)
@@ -1095,9 +1096,9 @@ namespace llaminar2
         /**
          * @brief Construct timer and record start event
          * @param type Kernel type for profiling categorization
-         * @param stream HIP stream (nullptr = default stream)
+         * @param stream Exact HIP producer stream. Must not be null.
          */
-        ScopedROCmKernelTimer(ROCmKernelType type, hipStream_t stream = nullptr);
+        ScopedROCmKernelTimer(ROCmKernelType type, hipStream_t stream);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
@@ -1127,9 +1128,9 @@ namespace llaminar2
 
         /**
          * @brief Record start event
-         * @param stream HIP stream (nullptr = default stream)
+         * @param stream Exact HIP producer stream. Must not be null.
          */
-        void begin(hipStream_t stream = nullptr);
+        void begin(hipStream_t stream);
 
         /**
          * @brief Record stop event, synchronize, and record elapsed time
@@ -1156,29 +1157,10 @@ namespace llaminar2
 // ============================================================================
 
 /**
- * @brief Scoped ROCm kernel profiling (RAII-based, synchronous)
- *
- * Usage:
- *   {
- *       ROCM_KERNEL_PROFILE_SCOPE(ROCmKernelType::FLASH_ATTN_DECODE);
- *       hipLaunchKernelGGL(...);
- *   } // Timer synchronizes and records here
- */
-#define ROCM_KERNEL_PROFILE_SCOPE(kernel_type) \
-    ::llaminar2::ScopedROCmKernelTimer _rocm_timer_##__LINE__(kernel_type)
-
-/**
  * @brief Scoped ROCm kernel profiling with stream
  */
 #define ROCM_KERNEL_PROFILE_SCOPE_STREAM(kernel_type, stream) \
     ::llaminar2::ScopedROCmKernelTimer _rocm_timer_##__LINE__(kernel_type, stream)
-
-/**
- * @brief Manual ROCm kernel profiling begin
- */
-#define ROCM_KERNEL_PROFILE_BEGIN(timer_name)      \
-    ::llaminar2::ManualROCmKernelTimer timer_name; \
-    timer_name.begin()
 
 #define ROCM_KERNEL_PROFILE_BEGIN_STREAM(timer_name, stream) \
     ::llaminar2::ManualROCmKernelTimer timer_name;           \

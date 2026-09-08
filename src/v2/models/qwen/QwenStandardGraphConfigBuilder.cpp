@@ -120,6 +120,23 @@ namespace llaminar2
         config.d_ff = model_config.intermediate_size;
         config.vocab_size = model_config.vocab_size;
 
+        // Qwen verifier heads are complete local sampling surfaces.  LocalTP
+        // mirrors the full head, so every participant owns the same terminal
+        // reduction and publishes it without a tiny rank collective.
+        config.mtp_verifier_outcome_ownership =
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
+
+        // Qwen prefill publishes one terminal hidden row per request from a
+        // single device-owned geometry record. The graph system builds the
+        // legal request-count family; prompt width remains replay data rather
+        // than graph topology.
+        config.mtp_request_terminal_hidden_publication =
+            MTPRequestTerminalHiddenPublicationPolicy::
+                GraphCapturedDeviceGeometry;
+        config.mtp_shifted_prefill_hidden_publication =
+            MTPShiftedPrefillHiddenPublicationPolicy::
+                GraphIntegratedKVTransaction;
+
         // Precision settings: use defaults from GraphConfig
         // (ModelConfig doesn't carry rms_norm_eps/rope_theta)
         // config.rms_norm_eps = 1e-6f;  // default
@@ -128,9 +145,9 @@ namespace llaminar2
         // Device settings
         config.default_device = plan.primary_device.toLocalDeviceId();
 
-        // Enable rope_on_read: fuses RoPE into KV cache read path
-        // (get_kv_converted applies RoPE during incremental dequant)
-        // Supported on CPU (all precisions) and GPU (via get_kv_converted override)
+        // GPU preference: CUDA/ROCm may fuse RoPE into their captured,
+        // device-owned cache read. CPU graph policy always publishes post-RoPE
+        // native cache bytes and never constructs a conversion shadow.
         {
             config.rope_on_read = debugEnv().runtime_debug.rope_on_read;
         }
@@ -366,6 +383,18 @@ namespace llaminar2
         config.n_kv_heads = ctx.headCountKV();
         config.vocab_size = ctx.vocabSize();
 
+        // Keep terminal MTP ownership architecture-declarative. Runtime code
+        // chooses the sampling mode only; Qwen graph machinery always lowers
+        // verifier outcomes as participant-local complete transactions.
+        config.mtp_verifier_outcome_ownership =
+            MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
+        config.mtp_request_terminal_hidden_publication =
+            MTPRequestTerminalHiddenPublicationPolicy::
+                GraphCapturedDeviceGeometry;
+        config.mtp_shifted_prefill_hidden_publication =
+            MTPShiftedPrefillHiddenPublicationPolicy::
+                GraphIntegratedKVTransaction;
+
         // head_dim: prefer explicit key_length, fall back to d_model / n_heads
         config.head_dim = ctx.keyLength() > 0
                               ? ctx.keyLength()
@@ -392,11 +421,8 @@ namespace llaminar2
             config.rms_norm_eps = loader->rmsNormEps();
         }
 
-        // Enable rope_on_read: fuses RoPE into KV cache read path.
-        // K is stored pre-RoPE in the cache; get_kv_converted() applies RoPE
-        // during read (fused with dequantization for quantized caches).
-        // Required for TQ caches (raw TQ blocks can't be read by attention),
-        // and saves a kernel launch for all cache types during decode.
+        // GPU rope_on_read stores pre-RoPE K and transforms it inside the
+        // captured device cache-read path. CPU retains post-RoPE native bytes.
         // TODO: Re-enable once the TQ pipeline parity is acceptable
         // config.rope_on_read = true;
 

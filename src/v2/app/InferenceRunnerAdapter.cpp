@@ -5,6 +5,7 @@
 
 #include "app/InferenceRunnerAdapter.h"
 
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -69,9 +70,19 @@ namespace llaminar2
         position_ = 0;
     }
 
+    bool InferenceRunnerAdapter::purgePrefixCache()
+    {
+        return orch_runner_ && orch_runner_->purgePrefixCache();
+    }
+
     int InferenceRunnerAdapter::get_position() const
     {
         return position_;
+    }
+
+    DeviceId InferenceRunnerAdapter::primaryDeviceId() const
+    {
+        return orch_runner_ ? orch_runner_->primaryDeviceId() : DeviceId::cpu();
     }
 
     ExecutionPath InferenceRunnerAdapter::executionPath() const
@@ -116,8 +127,13 @@ namespace llaminar2
 
     void InferenceRunnerAdapter::setDecodeSamplingParams(const SamplingParams &params)
     {
-        if (orch_runner_)
-            orch_runner_->setSamplingParams(params);
+        if (!orch_runner_)
+        {
+            throw std::logic_error(
+                "Cannot configure decode sampling on a null orchestration runner");
+        }
+        sampling_params_ = params;
+        orch_runner_->setSamplingParams(sampling_params_);
     }
 
     void InferenceRunnerAdapter::setDecodeStepTokenBudget(int max_tokens)
@@ -161,9 +177,37 @@ namespace llaminar2
         return output;
     }
 
-    bool InferenceRunnerAdapter::maybeApplyDecodeBoundaryMaintenance()
+    bool InferenceRunnerAdapter::maybeApplyDecodeBoundaryMaintenance(
+        uint64_t committed_tokens)
     {
-        return orch_runner_ ? orch_runner_->maybeApplyMoERebalance() : false;
+        return orch_runner_
+                   ? orch_runner_->maybeApplyMoERebalance(committed_tokens)
+                   : false;
+    }
+
+    void InferenceRunnerAdapter::drainCompletedDecodeBoundaryMaintenanceDiagnostics()
+    {
+        if (orch_runner_)
+            orch_runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+    }
+
+    bool InferenceRunnerAdapter::waitForLastInferenceCompletionForBenchmark()
+    {
+        return orch_runner_ &&
+               orch_runner_->waitForLastInferenceCompletionForBenchmark();
+    }
+
+    InferenceReadiness
+    InferenceRunnerAdapter::inferenceReadiness() const
+    {
+        if (!orch_runner_)
+        {
+            return {
+                .state = InferenceReadinessState::Failed,
+                .diagnostic = "measurement readiness requested from a null orchestration runner",
+            };
+        }
+        return orch_runner_->inferenceReadiness();
     }
 
     void InferenceRunnerAdapter::setSkipLogitsGatherDecode(bool skip)
@@ -194,6 +238,46 @@ namespace llaminar2
     PrefixRuntimeStateSnapshot InferenceRunnerAdapter::prefixStateProbe() const
     {
         return orch_runner_ ? orch_runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+    }
+
+    uint64_t InferenceRunnerAdapter::moeRuntimeMovementEpoch() const
+    {
+        return orch_runner_ ? orch_runner_->moeRuntimeMovementEpoch() : 0u;
+    }
+
+    MoEOptimizationStatus
+    InferenceRunnerAdapter::moeOptimizationStatus() const
+    {
+        return orch_runner_ ? orch_runner_->moeOptimizationStatus()
+                            : MoEOptimizationStatus{};
+    }
+
+    bool InferenceRunnerAdapter::configureMTPRequestStopTokens(
+        const std::vector<int32_t> &stop_tokens)
+    {
+        if (!orch_runner_)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request stop tokens on a null "
+                "orchestration runner");
+        }
+        orch_runner_->setStopTokens(stop_tokens);
+        return true;
+    }
+
+    bool InferenceRunnerAdapter::configureMTPRequestPenaltyPolicy(
+        const MTPRequestPenaltyPolicy &policy)
+    {
+        if (!orch_runner_)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request penalty policy on a null "
+                "orchestration runner");
+        }
+        sampling_params_.presence_penalty = policy.presence_penalty;
+        sampling_params_.frequency_penalty = policy.frequency_penalty;
+        orch_runner_->setSamplingParams(sampling_params_);
+        return true;
     }
 
 } // namespace llaminar2

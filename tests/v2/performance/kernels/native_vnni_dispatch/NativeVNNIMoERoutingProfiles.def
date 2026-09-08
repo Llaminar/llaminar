@@ -1,0 +1,13 @@
+/**
+ * @file NativeVNNIMoERoutingProfiles.def
+ * @brief Single-source identities for production MoE routing profiles.
+ *
+ * Include this file only after defining
+ * `LLAMINAR_MOE_ROUTING_PROFILE(EnumName, corpus_name)`. C++ trainers and the
+ * Python transaction parser consume the same ordered inventory so corpus
+ * planning cannot silently diverge from device execution.
+ */
+
+LLAMINAR_MOE_ROUTING_PROFILE(Uniform, uniform)
+LLAMINAR_MOE_ROUTING_PROFILE(Hotset, hotset)
+LLAMINAR_MOE_ROUTING_PROFILE(PowerLaw, power_law)

@@ -18,13 +18,24 @@ import numpy as np
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from python.reference.loaders.gguf_loader import GGUFLoader
+from python.reference.loaders import gguf_loader as gguf_loader_module
 from python.reference.loaders.tensor_name_mapper import (
     TensorNameMapper,
     detect_model_type_from_metadata,
 )
-from python.reference.qwen35_moe import Qwen35MoEReferenceModel
+from python.reference.qwen35_moe import (
+    Qwen35MoEReferenceModel,
+    materialize_route_contributions,
+    mtp_sidecar_replay_depth,
+    production_router_distribution,
+)
+from python.reference.generate_qwen35_moe_pipeline_snapshots import (
+    normalize_mtp_branch_override_batches,
+    promote_mtp_sidecar_metadata,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +71,74 @@ def _forward_reorder(tensor, dim, num_k, num_v_per_k, head_dim):
     return GGUFLoader._reorder_v_heads(tensor, dim, num_k, num_v_per_k, head_dim)
 
 
+def test_router_snapshot_uses_live_post_softmax_distribution():
+    """Main and MTP parity must not reconstruct retired raw router logits."""
+
+    probabilities = torch.tensor([[0.1, 0.2, 0.7]], dtype=torch.float32)
+    weights = torch.tensor([[0.7, 0.2]], dtype=torch.float32)
+    indices = torch.tensor([[2, 1]], dtype=torch.int64)
+    observed = production_router_distribution(
+        (probabilities, weights, indices)
+    )
+
+    assert observed is probabilities
+    assert torch.allclose(observed.sum(dim=-1), torch.ones(1))
+    with pytest.raises(RuntimeError, match="probabilities, weights, and indices"):
+        production_router_distribution((probabilities,))
+
+
+def test_route_contribution_oracle_preserves_slots_and_reduces_to_hf_sum():
+    """The movement oracle must expose the exact addends of the HF output."""
+
+    experts = SimpleNamespace(
+        num_experts=3,
+        gate_up_proj=torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+                [[2.0, 0.0], [0.0, 2.0], [1.0, 0.0], [0.0, 1.0]],
+                [[1.0, 1.0], [1.0, -1.0], [0.5, 0.0], [0.0, 0.5]],
+            ],
+            dtype=torch.float32,
+        ),
+        down_proj=torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.5, 0.0], [0.0, 0.5]],
+                [[1.0, -1.0], [0.5, 0.5]],
+            ],
+            dtype=torch.float32,
+        ),
+        act_fn=torch.nn.functional.silu,
+    )
+    hidden = torch.tensor([[1.0, 2.0], [3.0, -1.0]])
+    route_ids = torch.tensor([[2, 0], [1, 2]])
+    route_weights = torch.tensor([[0.75, 0.25], [0.6, 0.4]])
+
+    contributions = materialize_route_contributions(
+        experts, hidden, route_ids, route_weights
+    )
+
+    assert contributions.shape == (2, 2, 2)
+    expected_sum = torch.zeros_like(hidden)
+    for row in range(2):
+        for slot in range(2):
+            expert = int(route_ids[row, slot])
+            gate, up = torch.nn.functional.linear(
+                hidden[row : row + 1], experts.gate_up_proj[expert]
+            ).chunk(2, dim=-1)
+            expected = torch.nn.functional.linear(
+                experts.act_fn(gate) * up,
+                experts.down_proj[expert],
+            )[0] * route_weights[row, slot]
+            torch.testing.assert_close(contributions[row, slot], expected)
+            expected_sum[row] += expected
+
+    torch.testing.assert_close(
+        contributions.sum(dim=1),
+        expected_sum,
+    )
+
+
 def test_moe_snapshot_generator_help_exposes_diagnostic_snapshot_modes():
     """MoE parity can refresh metadata or decode-only diagnostic snapshots."""
     script = Path(__file__).resolve().parents[1] / "generate_qwen35_moe_pipeline_snapshots.py"
@@ -72,6 +151,152 @@ def test_moe_snapshot_generator_help_exposes_diagnostic_snapshot_modes():
 
     assert "--metadata-only" in result.stdout
     assert "--decode-snapshots-only" in result.stdout
+    assert "--mtp-max-draft-depth" in result.stdout
+    assert "--mtp-sidecar-only" in result.stdout
+
+
+def test_sidecar_capacity_promotion_preserves_authenticated_metadata(tmp_path):
+    """A bounded sidecar expansion mutates only its independent capacity."""
+
+    metadata = tmp_path / "metadata.txt"
+    original = [
+        "snapshot_version: 4",
+        "reference_engine: pytorch",
+        "model_filename: model.gguf",
+        "model_size_bytes: 1234",
+        "mtp_sidecar_max_draft_depth: 3",
+        "decode_tokens: 1,2,3,4",
+    ]
+    metadata.write_text("\n".join(original) + "\n", encoding="utf-8")
+
+    promote_mtp_sidecar_metadata(metadata, 15)
+
+    assert metadata.read_text(encoding="utf-8").splitlines() == [
+        *original[:4],
+        "mtp_sidecar_max_draft_depth: 15",
+        original[5],
+    ]
+    assert not list(tmp_path.glob(".metadata.txt.*.tmp"))
+
+
+def test_additive_mtp_branch_replays_only_committed_prefix_and_requested_depth():
+    """Branch generation does not recompute the combinatorial canonical pack."""
+
+    overrides = {2: [101, 202, 303, 404]}
+    assert mtp_sidecar_replay_depth(0, 15, overrides) == 1
+    assert mtp_sidecar_replay_depth(1, 15, overrides) == 1
+    assert mtp_sidecar_replay_depth(2, 15, overrides) == 5
+    assert mtp_sidecar_replay_depth(3, 15, overrides) == 1
+    assert mtp_sidecar_replay_depth(2, 15, {}) == 15
+
+
+def test_mtp_branch_override_campaign_batches_preserve_independent_trajectories():
+    """Many observed branches share one HF model without merging trajectories."""
+
+    assert normalize_mtp_branch_override_batches({"3": [11, 22]}) == [
+        {3: [11, 22]}
+    ]
+    assert normalize_mtp_branch_override_batches(
+        [{"1": [7]}, {"1": [8, 9]}, {"3": [10, 11, 12]}]
+    ) == [{1: [7]}, {1: [8, 9]}, {3: [10, 11, 12]}]
+
+    with pytest.raises(ValueError, match="flat token array"):
+        normalize_mtp_branch_override_batches({"2": [[1, 2], [3, 4]]})
+
+
+def test_streaming_loader_filters_before_read_and_dequantize(monkeypatch):
+    """Sidecar-only loading must not touch excluded main-model tensor bytes."""
+
+    class FakeMapper:
+        @staticmethod
+        def map_name(name):
+            return f"mapped.{name}"
+
+    class FakeParser:
+        metadata = {}
+        tensors = [
+            SimpleNamespace(name="skip", type=SimpleNamespace(name="F32"), shape=(1,)),
+            SimpleNamespace(name="keep", type=SimpleNamespace(name="F32"), shape=(1,)),
+        ]
+
+        def __init__(self):
+            self.read_names = []
+
+        @staticmethod
+        def get_model_type():
+            return "test"
+
+        def read_tensor_data(self, tensor_info):
+            self.read_names.append(tensor_info.name)
+            if tensor_info.name == "skip":
+                raise AssertionError("excluded tensor bytes were read")
+            return b"payload"
+
+    monkeypatch.setattr(
+        gguf_loader_module,
+        "create_mapper_from_metadata",
+        lambda _metadata: FakeMapper(),
+    )
+    monkeypatch.setattr(
+        gguf_loader_module.dequantize,
+        "dequantize",
+        lambda _raw, _type, _shape: np.array([7.0], dtype=np.float32),
+    )
+    loader = GGUFLoader.__new__(GGUFLoader)
+    loader.file_path = Path("unused.gguf")
+    loader.verbose = False
+    parser = FakeParser()
+
+    tensors = list(
+        loader.iter_state_dict(
+            parser=parser,
+            as_torch=False,
+            max_in_flight=1,
+            include_mapped_name=lambda name: name == "mapped.keep",
+        )
+    )
+
+    assert parser.read_names == ["keep"]
+    assert tensors[0][0] == "mapped.keep"
+    np.testing.assert_array_equal(tensors[0][1], np.array([7.0], dtype=np.float32))
+
+
+def test_mtp_sidecar_reference_pack_reuses_exact_main_trajectory(tmp_path):
+    """Additive branches consume canonical FP32 hidden rows and token history."""
+
+    (tmp_path / "metadata.txt").write_text(
+        "\n".join(
+            [
+                "reference_engine: pytorch",
+                "reference_dtype: float32",
+                "n_layers: 2",
+                "decode_steps: 2",
+                "token_ids: 10,20,30",
+                "decode_tokens: 40,50,60",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    expected = np.arange(12, dtype=np.float32).reshape(1, 3, 4)
+    np.save(tmp_path / "layer1_FFN_RESIDUAL.npy", expected)
+
+    model = Qwen35MoEReferenceModel.__new__(Qwen35MoEReferenceModel)
+    model._hook_handles = []
+    model._mtp_sidecar_reference_pack = tmp_path
+    model.hf_config = SimpleNamespace(num_hidden_layers=2, hidden_size=4)
+    model.device = torch.device("cpu")
+    model.tokenizer = lambda _prompt, return_tensors: {
+        "input_ids": torch.tensor([[10, 20, 30]])
+    }
+
+    token_ids, decode_tokens, hidden = model._load_mtp_reference_pack_trajectory(
+        "authenticated prompt", 2
+    )
+
+    assert token_ids == [10, 20, 30]
+    assert decode_tokens == [40, 50, 60]
+    torch.testing.assert_close(hidden, torch.from_numpy(expected))
 
 
 def test_bf16_gguf_tensor_type_dequantizes_to_fp32():
@@ -382,6 +607,69 @@ class TestApplyTransformsWithMetadata:
         base = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True))
         expected = base * torch.tensor([0.5, 1.25], dtype=torch.float32)
         torch.testing.assert_close(result, expected)
+
+    def test_streamed_expert_halves_fill_one_final_parameter(self):
+        """Bounded loading must not allocate a second fused expert tensor."""
+        target = torch.nn.Parameter(torch.zeros(2, 6, 4))
+        parameters = {"layer.mlp.experts.gate_up_proj": target}
+        loaded = set()
+        halves = {}
+        gate = torch.full((2, 3, 4), 2.0)
+        up = torch.full((2, 3, 4), 7.0)
+
+        assert Qwen35MoEReferenceModel._copy_streamed_parameter(
+            "layer.mlp.experts.gate_proj.weight",
+            gate,
+            parameters,
+            loaded,
+            halves,
+        )
+        assert loaded == set()
+        assert Qwen35MoEReferenceModel._copy_streamed_parameter(
+            "layer.mlp.experts.up_proj.weight",
+            up,
+            parameters,
+            loaded,
+            halves,
+        )
+
+        assert loaded == {"layer.mlp.experts.gate_up_proj"}
+        torch.testing.assert_close(target[:, :3, :], gate)
+        torch.testing.assert_close(target[:, 3:, :], up)
+
+    def test_streamed_sidecar_expert_name_has_no_model_prefix(self):
+        """A stripped MTP-layer name must still recognize fused experts."""
+        target = torch.nn.Parameter(torch.zeros(1, 4, 2))
+        parameters = {"mlp.experts.gate_up_proj": target}
+        loaded = set()
+        halves = {}
+        for projection, value in (("gate_proj", 3.0), ("up_proj", 5.0)):
+            assert Qwen35MoEReferenceModel._copy_streamed_parameter(
+                f"mlp.experts.{projection}.weight",
+                torch.full((1, 2, 2), value),
+                parameters,
+                loaded,
+                halves,
+            )
+        assert loaded == {"mlp.experts.gate_up_proj"}
+        torch.testing.assert_close(target[:, :2, :], torch.full((1, 2, 2), 3.0))
+        torch.testing.assert_close(target[:, 2:, :], torch.full((1, 2, 2), 5.0))
+
+    def test_streamed_shared_gate_restores_linear_weight_shape(self):
+        """The GGUF vector form must publish into HF's [1, hidden] tensor."""
+        target = torch.nn.Parameter(torch.zeros(1, 4))
+        loaded = set()
+        assert Qwen35MoEReferenceModel._copy_streamed_parameter(
+            "layer.mlp.shared_expert_gate.weight",
+            torch.arange(4, dtype=torch.float32),
+            {"layer.mlp.shared_expert_gate.weight": target},
+            loaded,
+            {},
+        )
+        assert loaded == {"layer.mlp.shared_expert_gate.weight"}
+        torch.testing.assert_close(
+            target, torch.arange(4, dtype=torch.float32).unsqueeze(0)
+        )
 
     def test_a_log_transform_with_metadata(self):
         """A_log transform + V-head reversal should both apply."""

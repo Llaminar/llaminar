@@ -24,7 +24,6 @@
 #include "utils/Logger.h"
 #include <algorithm>
 #include <cstring>
-#include <future>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -224,6 +223,23 @@ namespace llaminar2
                 void *stream; ///< Only valid for RECORD operations
             };
 
+            /**
+             * @brief Record of a single stream operation for test verification
+             */
+            struct StreamRecord
+            {
+                enum Type
+                {
+                    CREATE,
+                    DESTROY,
+                    SYNC
+                };
+
+                Type type;
+                void *stream;
+                int device_id;
+            };
+
             void *createEvent(int device_id) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -249,6 +265,35 @@ namespace llaminar2
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 event_records_.push_back({EventRecord::WAIT, event, device_id, nullptr});
+                return true;
+            }
+
+            void *createStream(int device_id) override
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                void *stream = reinterpret_cast<void *>(next_stream_id_++);
+                stream_records_.push_back({StreamRecord::CREATE, stream, device_id});
+                return stream;
+            }
+
+            void destroyStream(void *stream, int device_id) override
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stream_records_.push_back({StreamRecord::DESTROY, stream, device_id});
+            }
+
+            bool synchronizeStream(void *stream, int device_id) override
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stream_sync_count_++;
+                stream_records_.push_back({StreamRecord::SYNC, stream, device_id});
+                return true;
+            }
+
+            bool streamWaitEvent(void *stream, void *event, int device_id) override
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                event_records_.push_back({EventRecord::WAIT, event, device_id, stream});
                 return true;
             }
 
@@ -441,53 +486,6 @@ namespace llaminar2
             void setMockDeviceType(DeviceType type) { mock_device_type_ = type; }
 
             // =================================================================
-            // IBackend Async Operations (trivial mock implementations)
-            // =================================================================
-
-            std::future<bool> deviceToHostAsync(void *dst, const void *src, size_t bytes, int device_id) override
-            {
-                std::promise<bool> promise;
-                promise.set_value(deviceToHost(dst, src, bytes, device_id));
-                return promise.get_future();
-            }
-
-            std::future<bool> hostToDeviceAsync(void *dst, const void *src, size_t bytes, int device_id) override
-            {
-                std::promise<bool> promise;
-                promise.set_value(hostToDevice(dst, src, bytes, device_id));
-                return promise.get_future();
-            }
-
-            std::future<bool> synchronizeAsync(int device_id) override
-            {
-                std::promise<bool> promise;
-                promise.set_value(synchronize(device_id));
-                return promise.get_future();
-            }
-
-            std::future<void *> allocateAsync(size_t bytes, int device_id) override
-            {
-                std::promise<void *> promise;
-                promise.set_value(allocate(bytes, device_id));
-                return promise.get_future();
-            }
-
-            std::future<void> freeAsync(void *ptr, int device_id) override
-            {
-                free(ptr, device_id);
-                std::promise<void> promise;
-                promise.set_value();
-                return promise.get_future();
-            }
-
-            std::future<bool> memsetAsync(void *ptr, int value, size_t bytes, int device_id) override
-            {
-                std::promise<bool> promise;
-                promise.set_value(memset(ptr, value, bytes, device_id));
-                return promise.get_future();
-            }
-
-            // =================================================================
             // Transfer Tracking API (Test-specific)
             // =================================================================
 
@@ -658,10 +656,27 @@ namespace llaminar2
                 std::vector<EventRecord> result;
                 for (const auto &r : event_records_)
                 {
-                    if (r.type == EventRecord::RECORD && r.stream == stream)
+                    if ((r.type == EventRecord::RECORD || r.type == EventRecord::WAIT) &&
+                        r.stream == stream)
                         result.push_back(r);
                 }
                 return result;
+            }
+
+            size_t getStreamCreateCount() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return std::count_if(stream_records_.begin(), stream_records_.end(),
+                                     [](const StreamRecord &r)
+                                     { return r.type == StreamRecord::CREATE; });
+            }
+
+            size_t getStreamDestroyCount() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return std::count_if(stream_records_.begin(), stream_records_.end(),
+                                     [](const StreamRecord &r)
+                                     { return r.type == StreamRecord::DESTROY; });
             }
 
             /**
@@ -681,6 +696,7 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(mutex_);
                 stats_.clear();
                 event_records_.clear();
+                stream_records_.clear();
                 sync_count_ = 0;
                 stream_sync_count_ = 0;
             }
@@ -704,11 +720,13 @@ namespace llaminar2
             size_t sync_count_ = 0;
             size_t stream_sync_count_ = 0;
             std::vector<EventRecord> event_records_;
+            std::vector<StreamRecord> stream_records_;
             std::map<void *, AllocationInfo> allocations_;
             std::map<void *, AllocationInfo> mapped_allocations_;
             int num_devices_ = 1;
             int current_device_ = 0;
             uintptr_t next_event_id_ = 0x1000;
+            uintptr_t next_stream_id_ = 0x2000;
             DeviceType mock_device_type_ = DeviceType::CPU;
         };
 

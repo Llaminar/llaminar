@@ -5,17 +5,13 @@
 # Tests the Llaminar HTTP server (serve subcommand) with curl against the
 # /v1/chat/completions endpoint for multiple model × backend combinations.
 #
-# Default test suites:
-#   Suite 1: Qwen2.5 1.5B Q8_0 on cpu, cuda:0, rocm:0
-#   Suite 2: Qwen3.5 4B   Q8_0 on cpu, cuda:0, rocm:0
-#   Suite 3: Qwen3.5 35B MoE Q4_K_XL on cpu
-#   Suite 4: Qwen3.5 35B MoE Q4_K_XL on rocm:0
-#   Suite 5: Qwen3.5 27B dense Q4_K_M on cpu, rocm:0 (too large for single 24GB CUDA GPU)
-#   Suite 6: Qwen3.5 27B dense Q4_K_M TP2 on rocm:0,rocm:1
-#   Suite 7: Qwen3.5 27B dense Q4_K_M PP2 on cuda:0+rocm:0 (equal 32/32 layer split)
-#   Suite 8+: Qwen3.6 dense/MoE baseline, prefix-cache, and MTP server cases
+# Default selection comes from ModelParityDefinition::e2e_certifiable through
+# scripts/ci/run_model_parity_e2e.py. This file owns HTTP checks and server
+# lifecycle, not a second model/topology/feature matrix.
 #
 # Each backend test:
+#   Every MPI rank exports its own evidence; after shutdown the harness requires
+#   the runtime-declared communicator in full before validating an aggregate.
 #   1. Starts llaminar2 serve on a unique port
 #   2. Waits for /health to respond
 #   3. Sends a single-turn greedy chat request, validates response
@@ -39,7 +35,7 @@
 # contains a parsed size >= LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B (default: 4B).
 #
 # Environment:
-#   LLAMINAR_BINARY     Override binary path
+#   LLAMINAR_BINARY     Override binary path (default: build_v2_release/llaminar2)
 #   LLAMINAR_E2E_CONTAINER_IMAGE Run server from this Docker image instead of
 #                       launching LLAMINAR_BINARY on the host/devcontainer
 #   LLAMINAR_E2E_DOCKER_NETWORK Docker network mode for container server
@@ -89,6 +85,13 @@
 #   LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS Minimum helper prompt tokens (default: 900)
 #   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: 420)
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
+#   LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS Seconds to wait for server startup.
+#   LLAMINAR_E2E_THINKING_MODES both|non-thinking (default: both).
+#                       Canonical cells supply this from their typed profile;
+#                       model filenames never select or suppress reasoning tests.
+#                       Default: 60.
+#   LLAMINAR_E2E_SHUTDOWN_TIMEOUT Seconds to wait for graceful server shutdown.
+#                       Default: 120 with PerfStats enabled, 15 otherwise.
 #   LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS Seconds to poll for GPU VRAM release
 #                       after server shutdown before declaring a leak (default: 30)
 #   LLAMINAR_E2E_PERF_STATS Enable per-case PerfStats JSON artifacts and graph
@@ -99,6 +102,16 @@
 #                       NodeLocal CPU-cold ExpertOverlay suites. These are
 #                       intentionally off until production participant graphs
 #                       run matched MPI sparse dispatch/expert/return stages.
+#   LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE Enable CUDA2/ROCm2 Qwen3.6
+#                       MoE prefix-cache + dynamic-rebalance clear-cache probes
+#                       in the default suite list (default: 0).
+#   LLAMINAR_E2E_PREFIX_REBALANCE_CLEAR_PROBE_REQUESTS
+#                       Number of repeated requests in each targeted
+#                       prefix-cache/rebalance probe (default: 3). Raise this
+#                       for focused lifecycle stress without reloading the model.
+#   LLAMINAR_E2E_ENABLE_QWEN36_MOE_REBALANCE_E2E Enable CUDA2/ROCm2 Qwen3.6
+#                       MoE Dynamic/LLEP long-context rebalance suites in the
+#                       default list (default: 1).
 # =============================================================================
 
 set -euo pipefail
@@ -107,7 +120,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
-BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_integration/llaminar2}"
+BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_release/llaminar2}"
 SERVER_MODE="${LLAMINAR_E2E_SERVER_MODE:-local}"
 CONTAINER_IMAGE="${LLAMINAR_E2E_CONTAINER_IMAGE:-}"
 if [[ -n "$CONTAINER_IMAGE" && "${LLAMINAR_E2E_SERVER_MODE:-}" == "" ]]; then
@@ -140,9 +153,6 @@ if [[ "${LOG_LEVEL^^}" == "ERROR" ]]; then
 fi
 BASE_PORT=19080
 
-HOST_RSS_CPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_CPU_MODEL_MULTIPLIER:-5}"
-HOST_RSS_GPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_GPU_MODEL_MULTIPLIER:-2}"
-HOST_RSS_EXTRA_MB="${LLAMINAR_E2E_HOST_RSS_EXTRA_MB:-5120}"
 # CPU-only runs may still briefly create a vendor runtime context while the
 # server enumerates devices in a GPU-enabled host image. Keep the limit below
 # real model placement, but high enough for the fixed ROCm/HIP context charge.
@@ -151,6 +161,8 @@ GPU_ACTIVE_MIN_MB="${LLAMINAR_E2E_GPU_ACTIVE_MIN_MB:-256}"
 GPU_RELEASE_TIMEOUT_SECONDS="${LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS:-30}"
 TRACE_TOKENS="${LLAMINAR_E2E_TRACE_TOKENS:-0}"
 REMOTE_EXPERT_OVERLAY_E2E="${LLAMINAR_E2E_ENABLE_REMOTE_EXPERT_OVERLAY:-0}"
+MOE_REBALANCE_CLEAR_PROBE_E2E="${LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE:-0}"
+QWEN36_MOE_REBALANCE_E2E="${LLAMINAR_E2E_ENABLE_QWEN36_MOE_REBALANCE_E2E:-1}"
 PERF_STATS_ENABLED="${LLAMINAR_E2E_PERF_STATS:-1}"
 PERF_STATS_GPU_STAGE_TIMING="${LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING:-1}"
 # Thinking-capable Qwen models may spend hundreds of tokens deliberating before
@@ -159,6 +171,11 @@ PERF_STATS_GPU_STAGE_TIMING="${LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING:-1}"
 # to finish within the HTTP timeout. Set LLAMINAR_E2E_THINKING_BUDGET_TOKENS=""
 # to request the production default of no explicit budget.
 THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
+THINKING_MODES="${LLAMINAR_E2E_THINKING_MODES:-both}"
+case "$THINKING_MODES" in
+    both|non-thinking) ;;
+    *) echo "Invalid LLAMINAR_E2E_THINKING_MODES: $THINKING_MODES" >&2; exit 2 ;;
+esac
 
 # Model suites: "model_path|backend1,backend2,...[|max_tokens[|extra_flags[|label[|suite_options]]]]"
 #   or shorthand: "model_path|backend1,backend2,...|extra_flags" (max_tokens omitted → defaults to 200)
@@ -168,14 +185,28 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 # The optional 6th field (suite_options) is harness metadata. Supported:
 #   no-long-context  Skip duplicate optional long-context helper for feature variants.
 #   no-prefill-graph-buckets  Opt this suite out of default bucketed prefill graph capture.
+#   non-thinking-only  For targeted infrastructure probes, skip thinking-mode
+#                       variants even when the model family supports thinking.
 #   prefill-graph-probe  Send repeated same-key long-enough prompts to prove capture/replay.
 #   require-prefill-graph-capture  Fail unless perfstats record prefill capture/replay.
+#   require-cpu-fa2-context-parallel  For a CPU long-context lane, fail unless
+#                       PerfStats prove both query-sequence and K/V-context FA2.
+#   prefix-cache-rebalance-clear-probe  Exercise HTTP prefix-cache requests while
+#                       dynamic MoE rebalance leaves a prepared publish for request cleanup;
+#                       fail unless PerfStats prove prefix-cache harvest and restore.
+#   moe-rebalance-movement-probe  Fail unless PerfStats prove the MoE rebalance
+#                       path planned and applied or imported at least one expert.
+#   stochastic-mtp-probe  Send a deterministic seeded stochastic request twice
+#                       and fail unless PerfStats prove device-resident batched
+#                       stochastic verification on the configured GPU graph.
 # If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
 STARTED_SERVER_HANDLE=""
 OVERRIDE_MODEL=""
 OVERRIDE_BACKENDS=""
+SERVER_ARGS_FILE=""
+declare -a CANONICAL_SERVER_ARGS=()
 
 show_usage() {
     cat <<'EOF'
@@ -228,137 +259,52 @@ while [[ $# -gt 0 ]]; do
         --model)    OVERRIDE_MODEL="$2";    shift 2 ;;
         --backends) OVERRIDE_BACKENDS="$2"; shift 2 ;;
         --suite)    SUITES+=("$2");         shift 2 ;;
+        --server-args-file) SERVER_ARGS_FILE="$2"; shift 2 ;;
         --port)     BASE_PORT="$2";         shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-# Build suite list — if no explicit --suite flags, use defaults
-if [ ${#SUITES[@]} -eq 0 ]; then
-    # Suite 1: Qwen2.5 (small, fast — all backends)
-    S1_MODEL="${OVERRIDE_MODEL:-${LLAMINAR_MODEL:-${REPO_ROOT}/models/qwen2.5-1.5b-instruct-q8_0.gguf}}"
-    S1_BACKENDS="${OVERRIDE_BACKENDS:-${LLAMINAR_BACKENDS:-cpu,cuda:0,rocm:0}}"
-    SUITES+=("${S1_MODEL}|${S1_BACKENDS}")
-    S1_GRAPH_MODEL="${REPO_ROOT}/models/qwen2.5-0.5b-instruct-q8_0.gguf"
-    if [ ! -f "$S1_GRAPH_MODEL" ]; then
-        S1_GRAPH_MODEL="$S1_MODEL"
-    fi
-    if [ -f "$S1_GRAPH_MODEL" ] && [ -z "$OVERRIDE_MODEL" ] && [ -z "$OVERRIDE_BACKENDS" ] &&
-       [ -z "${LLAMINAR_MODEL:-}" ] && [ -z "${LLAMINAR_BACKENDS:-}" ]; then
-        SUITES+=("${S1_GRAPH_MODEL}|cuda:0|16||qwen25-cuda-prefill-graph-probe|prefill-graph-probe")
-    fi
-
-    # Suite 2: Qwen3.5 4B (hybrid GDN/FA architecture — all backends)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S2_MODEL="${REPO_ROOT}/models/Qwen3.5-4B-Q8_0.gguf"
-    if [ -f "$S2_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S2_MODEL}|cpu,cuda:0,rocm:0|200")
-    fi
-
-    # Suite 3: Qwen3.5 35B MoE (MoE + GDN/FA architecture — CPU only)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S3_MODEL="${REPO_ROOT}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
-    if [ -f "$S3_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S3_MODEL}|cpu|200")
-    fi
-
-    # Suite 4: Qwen3.5 35B MoE on ROCm (GPU MoE inference, graph capture)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S4_MODEL="${REPO_ROOT}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
-    if [ -f "$S4_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S4_MODEL}|rocm:0|200")
-    fi
-
-    # Suite 4b: Qwen3.5 35B MoE Q3_K_S on CUDA (single-device CUDA MoE path)
-    # This is the proving model for CUDA MoE enablement and mirrors the parity
-    # configuration that regenerates its own Q3_K_S PyTorch snapshots.
-    S4B_MODEL="/opt/llaminar-models/Qwen3.5-35B-A3B-Q3_K_S.gguf"
-    if [ -f "$S4B_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S4B_MODEL}|cuda:0|200")
-    fi
-
-    # Suite 5: Qwen3.5 27B dense (hybrid GDN/FA architecture — all backends)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S5_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
-    if [ -f "$S5_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S5_MODEL}|cpu,rocm:0|200")
-    fi
-
-    # Suite 6: Qwen3.5 27B dense TP2 on ROCm (tensor parallel across 2 GPUs)
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
-    # <think>...</think> tags before the actual answer.
-    S6_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
-    if [ -f "$S6_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S6_MODEL}|tp|200|--tp-devices rocm:0,rocm:1|qwen35-dense-rocm2tp|no-prefill-graph-buckets")
-    fi
-
-    # Suite 7: Qwen3.5 27B dense PP2 (pipeline parallel: cuda:0 + rocm:0, equal layer split)
-    # 64 layers total: layers 0-31 on cuda:0, layers 32-63 on rocm:0.
-    # Uses max_tokens=200 because Qwen3.5 is a thinking model.
-    S7_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
-    if [ -f "$S7_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S7_MODEL}|pp|200|--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-31 --pp-stage 1=rocm_pp:32-63|qwen35-dense-localpp-cuda-rocm|no-prefill-graph-buckets")
-    fi
-
-    # Suite 8: Qwen3.6 27B dense baseline and feature server cases.
-    # These are the current vLLM-style MTP target model family. Include
-    # `cpu` explicitly: in Llaminar device selection, -d cpu exercises all
-    # CPU sockets as a NodeLocal CPU domain rather than pinning one socket.
-    S8_MODEL="/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf"
-    S8_PREFIX_FLAGS="--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto"
-    S8_MTP_FLAGS="--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy"
-    if [ -f "$S8_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-dense-baseline")
-        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200|${S8_PREFIX_FLAGS}|qwen36-dense-prefix-ram|no-long-context")
-        SUITES+=("${S8_MODEL}|cpu,cuda:0,rocm:0|200|${S8_MTP_FLAGS}|qwen36-dense-mtp-greedy-d2|no-long-context")
-    fi
-
-    # Suite 9: Qwen3.6 35B-A3B MoE baseline and feature server cases.
-    # Prefix cache uses the placement fingerprint policy so routed-expert
-    # placement becomes part of the restore contract.
-    S9_MODEL="/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
-    S9_PREFIX_FLAGS="${S8_PREFIX_FLAGS} --prefix-cache-moe-policy placement-fingerprint"
-    S9_MTP_FLAGS="${S8_MTP_FLAGS}"
-    S9_TP_CUDA2_FLAGS="--tp-devices cuda:0,cuda:1"
-    S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
-    S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
-    # Remote NodeLocal CPU-cold ExpertOverlay shapes are the production target,
-    # but they must not run in the default gate until non-root participant ranks
-    # execute matched MPI sparse dispatch/local-expert/return-reduce stages.
-    S9_OVERLAY_ROCM2_CPU2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_rocm_hot --moe-expert-overlay-base-domain qwen36_moe_rocm_hot --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=replicated_experts;ranks=0,1 --moe-expert-overlay-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-expert-overlay-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
-    S9_OVERLAY_CUDA2_CPU2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_cuda_hot --moe-expert-overlay-base-domain qwen36_moe_cuda_hot --moe-expert-overlay-shared-domain qwen36_moe_cuda_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=replicated_experts;ranks=0,1 --moe-expert-overlay-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=240;memory-mb=4096 --moe-expert-overlay-tier cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
-    S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_cuda_hot --moe-expert-overlay-base-domain qwen36_moe_cuda_hot --moe-expert-overlay-shared-domain qwen36_moe_cuda_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_rocm_warm=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts;owner=0 --moe-expert-overlay-domain qwen36_moe_cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=replicated_experts;ranks=0,1 --moe-expert-overlay-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=192;memory-mb=4096 --moe-expert-overlay-tier warm@qwen36_moe_rocm_warm;priority=1;max-experts-per-layer=64;memory-mb=4096 --moe-expert-overlay-tier cold@qwen36_moe_cpu_cold;priority=2;max-experts-per-layer=0;memory-mb=0;fallback=true"
-    if [ -f "$S9_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200||qwen36-moe-baseline")
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_PREFIX_FLAGS}|qwen36-moe-prefix-ram|no-long-context")
-        SUITES+=("${S9_MODEL}|cpu,cuda:0,rocm:0|200|${S9_MTP_FLAGS}|qwen36-moe-mtp-greedy-d2|no-long-context")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-prefix-ram-cuda2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_CUDA2_FLAGS}|qwen36-moe-mtp-greedy-d2-cuda2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-prefix-ram-rocm2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,no-prefill-graph-buckets")
-        SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,no-prefill-graph-buckets")
-        if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-            SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_CUDA2_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-cuda2-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
-        fi
+# Preserve argv boundaries, including paths with spaces and domain semicolons.
+# Validate synchronously before mapfile; process-substitution errors alone do
+# not propagate through Bash's set -e and must not turn into empty arguments.
+if [[ -n "$SERVER_ARGS_FILE" ]]; then
+    python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); assert isinstance(a,list) and a and all(isinstance(v,str) and "\0" not in v for v in a)' "$SERVER_ARGS_FILE"
+    mapfile -d '' -t CANONICAL_SERVER_ARGS < <(python3 -c 'import json,sys; sys.stdout.buffer.write(b"\0".join(v.encode() for v in json.load(open(sys.argv[1])))+b"\0")' "$SERVER_ARGS_FILE")
+    if [[ ${#SUITES[@]} -ne 1 ]]; then
+        echo "Canonical server arguments require exactly one suite" >&2
+        exit 1
     fi
 fi
 
-STARTUP_TIMEOUT=300   # seconds to wait for server startup. Most models load in
-                      # <10s; the 4B Qwen3.5 GGUF on CPU needs ~60-120s for
-                      # weight load + GDN init. The smaller suites finish in
-                      # ~5s either way, so this is just an upper bound.
-SHUTDOWN_TIMEOUT=15   # seconds to wait for graceful SIGTERM shutdown
+# No second default model/topology matrix lives in this harness. Explicit
+# --suite invocations remain useful diagnostics; certification always comes
+# from the typed model-parity definitions and their E2E selectors.
+if [ ${#SUITES[@]} -eq 0 ]; then
+    if [[ -n "$OVERRIDE_MODEL" ]]; then
+        SUITES+=("${OVERRIDE_MODEL}|${OVERRIDE_BACKENDS:-cpu}")
+    else
+        canonical_args=(--binary "$BINARY")
+        if [[ -n "$CONTAINER_IMAGE" ]]; then
+            canonical_args+=(--container-image "$CONTAINER_IMAGE")
+        fi
+        exec python3 "$REPO_ROOT/scripts/ci/run_model_parity_e2e.py" "${canonical_args[@]}"
+    fi
+fi
+
+STARTUP_TIMEOUT="${LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS:-60}"
+                      # Seconds to wait for server startup. A production
+                      # Release server that cannot load and initialize within
+                      # this bound is unhealthy; do not hide stalls behind a
+                      # multi-minute harness timeout.
 REQUEST_TIMEOUT=180   # seconds per curl request
+if [[ -n "${LLAMINAR_E2E_SHUTDOWN_TIMEOUT:-}" ]]; then
+    SHUTDOWN_TIMEOUT="${LLAMINAR_E2E_SHUTDOWN_TIMEOUT}"
+elif [[ "$PERF_STATS_ENABLED" == "1" ]]; then
+    SHUTDOWN_TIMEOUT=120
+else
+    SHUTDOWN_TIMEOUT=15
+fi
 
 # Optional long-context helper controls. The helper is intentionally gated to
 # 4B+ models by default so small smoke-test suites keep their fast behavior.
@@ -483,6 +429,25 @@ server_client_host() {
 server_base_url() {
     local port="$1"
     echo "http://$(server_client_host):${port}"
+}
+
+port_accepts_connections() {
+    local port="$1"
+    local host
+    host="$(server_client_host)"
+
+    python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), timeout=0.25):
+        sys.exit(0)
+except OSError:
+    sys.exit(1)
+PY
 }
 
 resolve_docker_network() {
@@ -754,6 +719,31 @@ fi
 ' _ "$signal_name" >/dev/null 2>&1
 }
 
+signal_local_llaminar_processes() {
+    local root="$1"
+    local signal_name="${2:-TERM}"
+    local sent=0
+    local fallback_pid=""
+    local pid comm
+
+    for pid in $(collect_process_tree_pids "$root" 2>/dev/null || true); do
+        [[ -r "/proc/${pid}/comm" ]] || continue
+        comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+        [[ "$comm" == "llaminar2" ]] || continue
+
+        [[ -n "$fallback_pid" ]] || fallback_pid="$pid"
+        if tr "\000" "\n" <"/proc/${pid}/environ" 2>/dev/null | grep -qx "OMPI_COMM_WORLD_RANK=0"; then
+            kill "-${signal_name}" "$pid" >/dev/null 2>&1 && sent=1 || true
+        fi
+    done
+
+    if [[ "$sent" != 1 && -n "$fallback_pid" ]]; then
+        kill "-${signal_name}" "$fallback_pid" >/dev/null 2>&1 && sent=1 || true
+    fi
+
+    [[ "$sent" == 1 ]]
+}
+
 server_is_alive() {
     local handle="$1"
     if [[ "$handle" == docker:* ]]; then
@@ -925,12 +915,6 @@ start_server_process() {
     STARTED_SERVER_HANDLE="docker:${container_id}:${log_pid}"
 }
 
-is_thinking_model() {
-    local label="$1"
-    [[ "${label,,}" == *"qwen3.5"* || "${label,,}" == *"qwen35"* ||
-       "${label,,}" == *"qwen3.6"* || "${label,,}" == *"qwen36"* ]]
-}
-
 is_prefix_cache_case() {
     local extra_flags="$1"
     [[ " ${extra_flags} " == *" --prefix-cache "* ]]
@@ -939,6 +923,73 @@ is_prefix_cache_case() {
 is_mtp_case() {
     local extra_flags="$1"
     [[ " ${extra_flags} " == *" --mtp "* ]]
+}
+
+moe_policy_window_from_flags() {
+    local extra_flags="$1"
+
+    # Current-batch LLEP and durable residency maintenance own independent
+    # windows. Parse the declared routed-prefill policy first, then read the
+    # matching typed option exactly as the server will see it.
+    python3 - "$extra_flags" <<'PY'
+import shlex
+import sys
+
+try:
+    tokens = shlex.split(sys.argv[1])
+except Exception:
+    tokens = sys.argv[1].split()
+
+def values(flag):
+    result = []
+    for idx, token in enumerate(tokens):
+        if token == flag and idx + 1 < len(tokens):
+            result.append(tokens[idx + 1])
+        elif token.startswith(flag + "="):
+            result.append(token.split("=", 1)[1])
+    return result
+
+current_batch_llep = any(
+    "routed_prefill_assignment=least-loaded-resident" in domain
+    for domain in values("--moe-routed-expert-domain")
+)
+window_flag = (
+    "--moe-routed-prefill-assignment-window"
+    if current_batch_llep
+    else "--moe-residency-maintenance-window"
+)
+for idx, token in enumerate(tokens):
+    if token == window_flag and idx + 1 < len(tokens):
+        print(tokens[idx + 1])
+        break
+    if token.startswith(window_flag + "="):
+        print(token.split("=", 1)[1])
+        break
+PY
+}
+
+mtp_draft_tokens_from_flags() {
+    local extra_flags="$1"
+
+    # Keep this parser symmetric with moe_policy_window_from_flags(): both
+    # values participate in the same transaction-budget calculation below.
+    python3 - "$extra_flags" <<'PY'
+import shlex
+import sys
+
+try:
+    tokens = shlex.split(sys.argv[1])
+except Exception:
+    tokens = sys.argv[1].split()
+
+for idx, token in enumerate(tokens):
+    if token == "--mtp-draft-tokens" and idx + 1 < len(tokens):
+        print(tokens[idx + 1])
+        break
+    if token.startswith("--mtp-draft-tokens="):
+        print(token.split("=", 1)[1])
+        break
+PY
 }
 
 suite_disables_long_context() {
@@ -951,9 +1002,34 @@ suite_disables_prefill_graph_buckets() {
     [[ ",${suite_options}," == *",no-prefill-graph-buckets,"* ]]
 }
 
+suite_runs_non_thinking_only() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",non-thinking-only,"* ]]
+}
+
 suite_runs_prefill_graph_probe() {
     local suite_options="$1"
     [[ ",${suite_options}," == *",prefill-graph-probe,"* ]]
+}
+
+suite_runs_prefix_cache_rebalance_clear_probe() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",prefix-cache-rebalance-clear-probe,"* ]]
+}
+
+suite_runs_moe_rebalance_movement_probe() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",moe-rebalance-movement-probe,"* ]]
+}
+
+suite_runs_stochastic_mtp_probe() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",stochastic-mtp-probe,"* ]]
+}
+
+suite_requires_cpu_fa2_context_parallel() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",require-cpu-fa2-context-parallel,"* ]]
 }
 
 is_gpu_backend() {
@@ -1068,19 +1144,14 @@ cleanup_server() {
     fi
 }
 
-copy_container_artifact() {
-    local handle="$1"
-    local container_path="$2"
-    local host_path="$3"
-
-    [[ "$handle" == docker:* ]] || return 0
-    [[ -n "$container_path" && -n "$host_path" ]] || return 0
-    [[ -s "$host_path" ]] && return 0
-
-    local container
-    container="$(docker_handle_container "$handle")"
-    mkdir -p "$(dirname "$host_path")"
-    docker cp "${container}:${container_path}" "$host_path" >/dev/null 2>&1 || true
+request_server_shutdown() {
+    local port="$1"
+    local code
+    # An empty POST still needs Content-Length: 0. Otherwise the HTTP parser
+    # waits for a body and rejects the request; signalling every MPI process
+    # afterwards can kill followers before their orderly evidence export.
+    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -d '' --max-time 10 "$(server_base_url "$port")/admin/shutdown" 2>/dev/null || echo "000")
+    [[ "$code" == "202" ]]
 }
 
 # Graceful shutdown with exit code, VRAM release, and crash validation.
@@ -1088,23 +1159,40 @@ copy_container_artifact() {
 shutdown_and_validate() {
     local tag="$1"
     local handle="$2"
-    local gpu_before_mb="$3"
-    local backend="${4:-}"
-    local extra_flags="${5:-}"
+    local port="$3"
+    local gpu_before_mb="$4"
+    local backend="${5:-}"
+    local extra_flags="${6:-}"
+    local tracked_server_pids=""
+    tracked_server_pids="$(get_server_pids "$handle" 2>/dev/null || true)"
 
     # ─── Check 1: Clean SIGTERM exit ─────────────────────────────────
     local exit_code=0
+    local shutdown_requested=0
     if [[ "$handle" == docker:* ]]; then
         local container log_pid
         container="$(docker_handle_container "$handle")"
         log_pid="$(docker_handle_log_pid "$handle")"
 
         if server_is_alive "$handle"; then
-            signal_container_llaminar_processes "$container" TERM || true
+            shutdown_requested=1
+            local signalled=0
+            if ! request_server_shutdown "$port"; then
+                fail "[${tag}] Shutdown: HTTP authority did not accept coordinated shutdown"
+                signal_container_llaminar_processes "$container" TERM || true
+                signalled=1
+            fi
             local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
             while server_is_alive "$handle" && [ $SECONDS -lt $deadline ]; do
                 sleep 0.2
             done
+            if server_is_alive "$handle" && [ "$signalled" -eq 0 ]; then
+                signal_container_llaminar_processes "$container" TERM || true
+                deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+                while server_is_alive "$handle" && [ $SECONDS -lt $deadline ]; do
+                    sleep 0.2
+                done
+            fi
         fi
 
         if server_is_alive "$handle"; then
@@ -1127,19 +1215,34 @@ shutdown_and_validate() {
         local pid
         pid="$(pid_handle_pid "$handle")"
         if kill -0 "$pid" 2>/dev/null; then
-            # Kill the entire process tree (TP/PP spawns child ranks via mpirun)
-            local tree_pids
-            tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
-            kill $tree_pids 2>/dev/null || true
+            shutdown_requested=1
+            # Signal the serving rank first.  Killing the whole mpirun tree at
+            # once can bypass ServerMode's signal handler and skip runner
+            # shutdown hooks such as PerfStats export.
+            local signalled=0
+            if ! request_server_shutdown "$port"; then
+                fail "[${tag}] Shutdown: HTTP authority did not accept coordinated shutdown"
+                signal_local_llaminar_processes "$pid" TERM || kill "$pid" 2>/dev/null || true
+                signalled=1
+            fi
 
             # Wait with timeout — poll until root process exits or deadline
             local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
             while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
                 sleep 0.2
             done
+            if kill -0 "$pid" 2>/dev/null && [ "$signalled" -eq 0 ]; then
+                signal_local_llaminar_processes "$pid" TERM || kill "$pid" 2>/dev/null || true
+                deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+                while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
+                    sleep 0.2
+                done
+            fi
 
             if kill -0 "$pid" 2>/dev/null; then
                 # Process didn't exit gracefully — force kill entire tree
+                local tree_pids
+                tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
                 fail "[${tag}] Shutdown: process did not exit within ${SHUTDOWN_TIMEOUT}s after SIGTERM, sending SIGKILL"
                 kill -9 $tree_pids 2>/dev/null || true
                 wait "$pid" 2>/dev/null || true
@@ -1154,10 +1257,15 @@ shutdown_and_validate() {
         fi
     fi
 
+    if [ "$shutdown_requested" -ne 1 ]; then
+        fail "[${tag}] Shutdown: server exited before shutdown validation (exit code ${exit_code})"
+        return
+    fi
+
     # ─── Check 2: No crash/segfault on exit ──────────────────────────
     # exit_code meanings:
     #   0       = clean exit
-    #   143     = killed by SIGTERM (128 + 15) — acceptable for servers
+    #   143     = killed by SIGTERM (128 + 15) — not a clean lifecycle
     #   139     = SIGSEGV (segfault)
     #   134     = SIGABRT (abort/assertion)
     #   136     = SIGFPE (floating point exception)
@@ -1180,9 +1288,7 @@ shutdown_and_validate() {
             132) signal_name="SIGILL" ;;
         esac
         fail "[${tag}] Shutdown: process crashed with ${signal_name} (exit code ${exit_code})"
-    elif [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 143 ]; then
-        # 0 = clean exit, 1 = mpirun wrapper reporting child signal (normal),
-        # 143 = killed by SIGTERM directly (128+15)
+    elif [ "$exit_code" -eq 0 ]; then
         pass "[${tag}] Shutdown: clean exit (code ${exit_code})"
     else
         fail "[${tag}] Shutdown: unexpected exit code ${exit_code}"
@@ -1190,7 +1296,7 @@ shutdown_and_validate() {
 
     # Allow small variance (driver overhead, context caching) — 64 MiB tolerance
     local VRAM_LEAK_TOLERANCE_MB=64
-    local gpu_after_mb gpu_leaked_mb release_deadline
+    local gpu_after_mb gpu_leaked_mb release_deadline server_gpu_mb foreign_gpu_mb
 
     # ─── Check 3: GPU VRAM fully released ────────────────────────────
     if is_gpu_backend "$backend" && ! gpu_memory_telemetry_available_for_backend "$backend" "$extra_flags"; then
@@ -1203,9 +1309,15 @@ shutdown_and_validate() {
     # reporting a false leak while the driver is still releasing allocations.
     release_deadline=$((SECONDS + GPU_RELEASE_TIMEOUT_SECONDS))
     while true; do
-        gpu_after_mb=$(get_total_gpu_memory_mb)
+        server_gpu_mb=0
+        if [ -n "$tracked_server_pids" ]; then
+            server_gpu_mb=$(get_process_tree_gpu_memory_mb "$tracked_server_pids")
+        fi
+        foreign_gpu_mb=$(get_foreign_gpu_memory_mb_for_backend "$backend" "$extra_flags" "$tracked_server_pids")
+        gpu_after_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
         gpu_leaked_mb=$((gpu_after_mb - gpu_before_mb))
-        if [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
+        if [ "$server_gpu_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ] &&
+           { [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ] || [ "$foreign_gpu_mb" -gt 0 ]; }; then
             break
         fi
         if [ $SECONDS -ge $release_deadline ]; then
@@ -1214,8 +1326,12 @@ shutdown_and_validate() {
         sleep 1
     done
 
-    if [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
+    if [ "$server_gpu_mb" -gt "$VRAM_LEAK_TOLERANCE_MB" ]; then
+        fail "[${tag}] Shutdown: server process tree still owns GPU VRAM (server=${server_gpu_mb} MiB, before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB)"
+    elif [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
         pass "[${tag}] Shutdown: GPU VRAM released (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, delta=${gpu_leaked_mb} MiB)"
+    elif [ "$foreign_gpu_mb" -gt 0 ]; then
+        pass "[${tag}] Shutdown: server GPU VRAM released; global backend memory check ignored because foreign GPU users are active (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, foreign=${foreign_gpu_mb} MiB)"
     else
         fail "[${tag}] Shutdown: GPU VRAM leak detected (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, leaked=${gpu_leaked_mb} MiB)"
     fi
@@ -1256,7 +1372,13 @@ extract_numeric_answer() {
 import json, re, sys
 try:
     data = json.load(sys.stdin)
-    message = data.get('choices', [{}])[0].get('message', {})
+    choice = data.get('choices', [{}])[0]
+    # Short arithmetic must finish naturally. A repeated correct number cut
+    # off by the request budget is not a behavioral certificate.
+    if choice.get('finish_reason') != 'stop':
+        print('')
+        sys.exit(0)
+    message = choice.get('message', {})
     content = message.get('content') or ''
     matches = re.findall(r'-?\\d+', content)
     print(matches[-1] if matches else '')
@@ -1299,8 +1421,10 @@ make_chat_payload() {
     local max_tokens="$2"
     local enable_thinking="$3"
     local stream="${4:-false}"
+    local sampling_mode="${5:-greedy}"
+    local sampling_seed="${6:-12345}"
 
-    python3 - "$messages_json" "$max_tokens" "$enable_thinking" "$stream" "$THINKING_BUDGET_TOKENS" <<'PY'
+    python3 - "$messages_json" "$max_tokens" "$enable_thinking" "$stream" "$THINKING_BUDGET_TOKENS" "$sampling_mode" "$sampling_seed" <<'PY'
 import json
 import sys
 
@@ -1309,13 +1433,27 @@ max_tokens = int(sys.argv[2])
 enable_thinking = sys.argv[3] == "true"
 stream = sys.argv[4] == "true"
 thinking_budget = int(sys.argv[5]) if sys.argv[5] else -1
+sampling_mode = sys.argv[6]
+sampling_seed = int(sys.argv[7])
 
 payload = {
     "messages": messages,
     "max_tokens": max_tokens,
     "enable_thinking": enable_thinking,
-    "temperature": 0.0,
 }
+if sampling_mode == "stochastic":
+    payload.update(
+        {
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.9,
+            "seed": sampling_seed,
+        }
+    )
+elif sampling_mode == "greedy":
+    payload["temperature"] = 0.0
+else:
+    raise ValueError(f"unknown E2E sampling mode: {sampling_mode}")
 if stream:
     payload["stream"] = True
 if enable_thinking and thinking_budget >= 0:
@@ -1464,6 +1602,30 @@ get_total_gpu_memory_mb() {
     echo $((nvidia_mb + amd_mb))
 }
 
+get_gpu_memory_mb_for_backend() {
+    local backend="$1"
+    local extra_flags="${2:-}"
+    local expects_cuda=0
+    local expects_rocm=0
+    local total_mb=0
+
+    backend_expects_cuda_memory "$backend" "$extra_flags" && expects_cuda=1
+    backend_expects_rocm_memory "$backend" "$extra_flags" && expects_rocm=1
+
+    if [ "$expects_cuda" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_nvidia_total_gpu_mb)))
+    fi
+    if [ "$expects_rocm" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_amd_total_gpu_mb)))
+    fi
+
+    if [ "$expects_cuda" -eq 0 ] && [ "$expects_rocm" -eq 0 ]; then
+        total_mb=$(get_total_gpu_memory_mb)
+    fi
+
+    echo "$total_mb"
+}
+
 get_nvidia_process_gpu_mb() {
     local pids="$1"
     if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -1480,6 +1642,26 @@ get_nvidia_process_gpu_mb() {
                 gsub(/ /, "", $1)
                 gsub(/[^0-9]/, "", $2)
                 if (($1 in pid) && $2 != "") sum += $2
+            }
+            END {print sum + 0}'
+}
+
+get_nvidia_foreign_process_gpu_mb() {
+    local pids="$1"
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo 0
+        return
+    fi
+    { nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null || true; } |
+        awk -F',' -v owned="$pids" '
+            BEGIN {
+                split(owned, arr, " ")
+                for (i in arr) if (arr[i] != "") pid[arr[i]] = 1
+            }
+            {
+                gsub(/ /, "", $1)
+                gsub(/[^0-9]/, "", $2)
+                if (!($1 in pid) && $1 != "" && $2 != "") sum += $2
             }
             END {print sum + 0}'
 }
@@ -1555,12 +1737,107 @@ print(walk(data))
 PY
 }
 
+get_amd_foreign_process_gpu_mb() {
+    local pids="$1"
+    if ! command -v amd-smi >/dev/null 2>&1; then
+        echo 0
+        return
+    fi
+
+    local amd_json
+    amd_json=$(amd-smi process --general --json 2>/dev/null || echo '[]')
+    AMD_SMI_JSON="$amd_json" python3 - "$pids" <<'PY'
+import json
+import os
+import re
+import sys
+
+owned = {int(p) for p in sys.argv[1].split() if p.strip().isdigit()}
+try:
+    data = json.loads(os.environ.get("AMD_SMI_JSON", "[]"))
+except Exception:
+    print(0)
+    sys.exit(0)
+
+def parse_mib(value):
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+    if not match:
+        return 0
+    amount = float(match.group(1))
+    lower = text.lower()
+    if "gib" in lower or "gb" in lower:
+        amount *= 1024
+    elif "kib" in lower or "kb" in lower:
+        amount /= 1024
+    elif "b" in lower and "mb" not in lower and "mib" not in lower:
+        amount /= 1048576
+    return int(amount)
+
+def find_pid(obj):
+    if not isinstance(obj, dict):
+        return None
+    for key, value in obj.items():
+        normalized = key.lower().replace(" ", "_")
+        if normalized in {"pid", "process_id", "processid"}:
+            try:
+                return int(str(value).split()[0])
+            except Exception:
+                return None
+    return None
+
+def walk(obj):
+    total = 0
+    if isinstance(obj, dict):
+        pid = find_pid(obj)
+        if pid is not None and pid not in owned:
+            for key, value in obj.items():
+                lower = key.lower()
+                if ("mem" in lower or "vram" in lower or "gtt" in lower) and "total" not in lower and "free" not in lower:
+                    total += parse_mib(value)
+        for value in obj.values():
+            total += walk(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            total += walk(value)
+    return total
+
+print(walk(data))
+PY
+}
+
 get_process_tree_gpu_memory_mb() {
     local pids="$1"
     local nvidia_mb amd_mb
     nvidia_mb=$(get_nvidia_process_gpu_mb "$pids")
     amd_mb=$(get_amd_process_gpu_mb "$pids")
     echo $((nvidia_mb + amd_mb))
+}
+
+get_foreign_gpu_memory_mb_for_backend() {
+    local backend="$1"
+    local extra_flags="${2:-}"
+    local owned_pids="${3:-}"
+    local expects_cuda=0
+    local expects_rocm=0
+    local total_mb=0
+
+    backend_expects_cuda_memory "$backend" "$extra_flags" && expects_cuda=1
+    backend_expects_rocm_memory "$backend" "$extra_flags" && expects_rocm=1
+
+    if [ "$expects_cuda" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_nvidia_foreign_process_gpu_mb "$owned_pids")))
+    fi
+    if [ "$expects_rocm" -eq 1 ]; then
+        total_mb=$((total_mb + $(get_amd_foreign_process_gpu_mb "$owned_pids")))
+    fi
+    if [ "$expects_cuda" -eq 0 ] && [ "$expects_rocm" -eq 0 ]; then
+        total_mb=$(( $(get_nvidia_foreign_process_gpu_mb "$owned_pids") + $(get_amd_foreign_process_gpu_mb "$owned_pids") ))
+    fi
+
+    echo "$total_mb"
 }
 
 scan_server_log() {
@@ -1576,7 +1853,10 @@ scan_server_log() {
         count=$(printf '%s\n' "$matches" | wc -l | xargs)
         fail "[${tag}] Server log: ${count} WARN/ERROR entries in ${log_path}"
         echo -e "    ${RED}── WARN/ERROR lines ──${NC}"
-        printf '%s\n' "$matches" | head -40 | sed 's/^/    /'
+        # Drain the complete producer while printing a bounded excerpt. head
+        # closes the pipe early and can abort this fail-closed harness with
+        # SIGPIPE before it reports later checks or writes the final summary.
+        printf '%s\n' "$matches" | sed -n '1,40s/^/    /p'
         if [ "$count" -gt 40 ]; then
             echo "    ... (${count} total matches; see ${log_path})"
         fi
@@ -1591,7 +1871,7 @@ scan_server_log() {
     mpi_crash=$(grep -c "mpirun detected that one or more processes exited with non-zero status" "$log_path" 2>/dev/null || true)
     if [ "$mpi_crash" -gt 0 ]; then
         local mpi_exit_code
-        mpi_exit_code=$(grep -oP 'Exit code:\s+\K\d+' "$log_path" 2>/dev/null | head -1 || echo "unknown")
+        mpi_exit_code=$(grep -m1 -oP 'Exit code:\s+\K\d+' "$log_path" 2>/dev/null || echo "unknown")
         fail "[${tag}] Server log: mpirun detected child process crashed (exit code: ${mpi_exit_code})"
         has_failure=true
     fi
@@ -1616,38 +1896,29 @@ check_memory_usage() {
         return
     fi
 
-    local ram_mb gpu_process_mb gpu_after_mb gpu_delta_mb abs_gpu_delta_mb model_mb rss_multiplier rss_limit_mb
+    local ram_mb gpu_process_mb gpu_after_mb gpu_delta_mb abs_gpu_delta_mb
     ram_mb=$(get_server_ram_mb "$server_handle" "$pids")
     if [ "$ram_mb" -lt 0 ]; then
         fail "[${tag}] Memory: unable to measure server RAM"
         return
     fi
     gpu_process_mb=$(get_process_tree_gpu_memory_mb "$pids")
-    gpu_after_mb=$(get_total_gpu_memory_mb)
+    gpu_after_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
     gpu_delta_mb=$((gpu_after_mb - gpu_before_mb))
     abs_gpu_delta_mb=${gpu_delta_mb#-}
-    model_mb=$(du -m "$model" 2>/dev/null | awk '{print $1}' || echo 0)
-
-    if is_gpu_backend "$backend"; then
-        rss_multiplier="$HOST_RSS_GPU_MODEL_MULTIPLIER"
-    else
-        rss_multiplier="$HOST_RSS_CPU_MODEL_MULTIPLIER"
-    fi
-    rss_limit_mb=$((model_mb * rss_multiplier + HOST_RSS_EXTRA_MB))
-
-    if [ "$ram_mb" -le "$rss_limit_mb" ]; then
-        pass "[${tag}] Memory: RAM ${ram_mb} MiB within limit ${rss_limit_mb} MiB"
-    else
-        fail "[${tag}] Memory: RAM ${ram_mb} MiB exceeds limit ${rss_limit_mb} MiB"
-    fi
+    # Process-tree RSS includes shared/file-backed pages once per mapping and
+    # cannot be compared with the disk blocks of a symlink or first GGUF shard.
+    # It remains useful telemetry, but admission/owner bounds are certified
+    # from PhysicalMemoryAuthority below, never a second model-size estimator.
+    echo -e "  ${BLUE}INFO${NC} [${tag}] Memory: process-tree RAM ${ram_mb} MiB; canonical admission/ledger evidence is checked separately"
 
     if is_gpu_backend "$backend"; then
         if ! gpu_memory_telemetry_available_for_backend "$backend" "$extra_flags"; then
             echo -e "  ${YELLOW}SKIP${NC} [${tag}] GPU memory: host telemetry unavailable for backend ${backend}; relying on GPU PerfStats/server-log validation"
         elif [ "$gpu_process_mb" -ge "$GPU_ACTIVE_MIN_MB" ] || [ "$abs_gpu_delta_mb" -ge "$GPU_ACTIVE_MIN_MB" ]; then
-            pass "[${tag}] GPU memory: process ${gpu_process_mb} MiB, global delta ${gpu_delta_mb} MiB"
+            pass "[${tag}] GPU memory: process ${gpu_process_mb} MiB, backend delta ${gpu_delta_mb} MiB"
         else
-            fail "[${tag}] GPU memory: expected active GPU usage, process ${gpu_process_mb} MiB, global delta ${gpu_delta_mb} MiB"
+            fail "[${tag}] GPU memory: expected active GPU usage, process ${gpu_process_mb} MiB, backend delta ${gpu_delta_mb} MiB"
         fi
     else
         if [ "$gpu_process_mb" -le "$CPU_GPU_DELTA_LIMIT_MB" ] && [ "$abs_gpu_delta_mb" -le "$CPU_GPU_DELTA_LIMIT_MB" ]; then
@@ -1670,21 +1941,34 @@ validate_perf_stats() {
         return
     fi
 
-    if [ ! -s "$perf_path" ]; then
-        if is_mtp_case "$extra_flags" && is_gpu_backend "$backend"; then
-            fail "[${tag}] PerfStats: missing artifact for GPU MTP case (${perf_path})"
-        else
-            echo -e "  ${YELLOW}SKIP${NC} [${tag}] PerfStats: no records emitted (${perf_path})"
-        fi
-        return
-    fi
-
     local validation
-    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" <<'PY'
+    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" <<'PY'
 import json
+from pathlib import Path
+import shlex
 import sys
 
-path, backend, extra_flags, long_context_run, suite_options = sys.argv[1:6]
+path, backend, extra_flags, long_context_run, suite_options, policy_module_dir = sys.argv[1:7]
+sys.path.insert(0, policy_module_dir)
+
+from graph_capture_perf_policy import validate_graph_capture_policy
+from flash_attention_perf_policy import (
+    validate_cpu_flash_attention_execution_policy,
+    validate_flash_attention_plan_policy,
+)
+from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
+from llep_verifier_perf_policy import validate_llep_verifier_policy
+from mtp_device_generation_perf_policy import (
+    validate_cuda_dynamic_mtp_device_generation_policy,
+    validate_rocm_host_scheduled_mtp_device_generation_policy,
+)
+from request_input_lifetime_perf_policy import (
+    validate_request_input_lifetime_policy,
+)
+from ranked_perf_artifacts import collect_and_publish_ranked_perf_stats, validate_memory_authority
+from moe_route_scratch_perf_policy import validate_moe_route_scratch_policy
+from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
+
 is_gpu = backend.startswith(("cuda:", "rocm:")) or backend in {"tp", "pp"}
 is_mtp = f" {extra_flags} ".find(" --mtp ") >= 0
 suite_option_set = {
@@ -1702,19 +1986,78 @@ require_prefill_capture = (
     or "prefill-graph-probe" in suite_option_set
 )
 require_prefill_replay = "prefill-graph-probe" in suite_option_set
+require_prefix_rebalance_clear = "prefix-cache-rebalance-clear-probe" in suite_option_set
+require_moe_rebalance_movement = "moe-rebalance-movement-probe" in suite_option_set
+require_stochastic_mtp = "stochastic-mtp-probe" in suite_option_set
+require_cpu_fa2_context_parallel = (
+    "require-cpu-fa2-context-parallel" in suite_option_set
+)
 expect_decode_replay = (
     is_mtp
     or long_context_run == "true"
     or "require-decode-graph-replay" in suite_option_set
 )
 
-with open(path, "r", encoding="utf-8") as handle:
-    data = json.load(handle)
+try:
+    # Collection and validation share one owned document. Preserve the complete
+    # aggregate artifact without reparsing it or copying every rank's records.
+    data = collect_and_publish_ranked_perf_stats(Path(path))
+except (ValueError, OSError) as error:
+    print(f"FAIL: PerfStats rank collection failed: {error}")
+    sys.exit(0)
 
 records = data.get("records")
 if not isinstance(records, list):
     print("FAIL: missing records array")
     sys.exit(0)
+
+try:
+    validate_memory_authority(data)
+except ValueError as error:
+    print(f"FAIL: {error}")
+    sys.exit(0)
+
+if is_gpu:
+    graph_capture_validation = validate_graph_capture_policy(
+        records,
+        backend,
+        extra_flags,
+        require_prefill_lifecycle=expect_prefill_phase,
+    )
+    if graph_capture_validation.error:
+        print(f"FAIL: {graph_capture_validation.error}")
+        sys.exit(0)
+
+    flash_attention_validation = validate_flash_attention_plan_policy(
+        records,
+        backend,
+        extra_flags,
+    )
+    if flash_attention_validation.error:
+        print(f"FAIL: {flash_attention_validation.error}")
+        sys.exit(0)
+
+    request_input_validation = validate_request_input_lifetime_policy(records)
+    if request_input_validation.error:
+        print(f"FAIL: {request_input_validation.error}")
+        sys.exit(0)
+
+    host_transfer_validation = validate_gpu_host_transfer_policy(
+        records, device_kinds=graph_capture_validation.device_kinds)
+    if host_transfer_validation.error:
+        print(f"FAIL: {host_transfer_validation.error}")
+        sys.exit(0)
+
+if require_cpu_fa2_context_parallel:
+    if not backend.startswith("cpu"):
+        print(
+            "FAIL: CPU FA2 context-parallel probe requires an explicit CPU backend"
+        )
+        sys.exit(0)
+    cpu_fa2_validation = validate_cpu_flash_attention_execution_policy(records)
+    if cpu_fa2_validation.error:
+        print(f"FAIL: {cpu_fa2_validation.error}")
+        sys.exit(0)
 
 def has_record(name=None, domain=None, tags=None):
     tags = tags or {}
@@ -1728,44 +2071,137 @@ def has_record(name=None, domain=None, tags=None):
             return True
     return False
 
+def numeric(value):
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+def record_value_sum(names, domain=None):
+    wanted = set(names)
+    total = 0.0
+    for record in records:
+        if record.get("name") not in wanted:
+            continue
+        if domain is not None and record.get("domain") != domain:
+            continue
+        total += numeric(record.get("value", record.get("count", 0.0)))
+    return total
+
+def tag_value_sum(keys, names=None, domain=None):
+    wanted_names = set(names or [])
+    wanted_keys = set(keys)
+    total = 0.0
+    for record in records:
+        if wanted_names and record.get("name") not in wanted_names:
+            continue
+        if domain is not None and record.get("domain") != domain:
+            continue
+        for key, value in (record.get("tags") or {}).items():
+            if key in wanted_keys:
+                total += numeric(value)
+    return total
+
+def max_tag_value(key, names=None, domain=None, required_tags=None):
+    wanted_names = set(names or [])
+    required_tags = required_tags or {}
+    maximum = 0.0
+    for record in records:
+        if wanted_names and record.get("name") not in wanted_names:
+            continue
+        if domain is not None and record.get("domain") != domain:
+            continue
+        record_tags = record.get("tags") or {}
+        if any(record_tags.get(tag_key) != tag_value for tag_key, tag_value in required_tags.items()):
+            continue
+        maximum = max(maximum, numeric(record_tags.get(key)))
+    return maximum
+
+def flag_value(flag):
+    try:
+        tokens = shlex.split(extra_flags)
+    except ValueError:
+        tokens = extra_flags.split()
+    for idx, token in enumerate(tokens):
+        if token == flag and idx + 1 < len(tokens):
+            return tokens[idx + 1]
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return None
+
+def flag_values(flag):
+    try:
+        tokens = shlex.split(extra_flags)
+    except ValueError:
+        tokens = extra_flags.split()
+    values = []
+    for idx, token in enumerate(tokens):
+        if token == flag and idx + 1 < len(tokens):
+            values.append(tokens[idx + 1])
+        elif token.startswith(flag + "="):
+            values.append(token.split("=", 1)[1])
+    return values
+
+uses_current_batch_llep = any(
+    "routed_prefill_assignment=least-loaded-resident" in domain
+    for domain in flag_values("--moe-routed-expert-domain")
+)
+residency_maintenance_mode = flag_value("--moe-residency-maintenance")
+uses_dynamic_residency_maintenance = residency_maintenance_mode == "dynamic"
+
+if uses_current_batch_llep and residency_maintenance_mode != "off":
+    print(
+        "FAIL: current-batch LLEP must declare durable residency maintenance "
+        "off so the two independent policy axes cannot be conflated"
+    )
+    sys.exit(0)
+
+expect_shared_moe_route_scratch = (
+    is_gpu
+    and is_mtp
+    and flag_value("--moe-routed-expert-placement")
+    == "tiered-overlay"
+)
+if expect_shared_moe_route_scratch:
+    route_scratch_error = validate_moe_route_scratch_policy(records)
+    if route_scratch_error:
+        print(f"FAIL: {route_scratch_error}")
+        sys.exit(0)
+
 decode_graph_captured = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "capture"})
-    or has_record("decode_segmented_phase", "forward_graph", {"phase": "capture"})
 )
 decode_graph_replayed = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "replay"})
-    or has_record("decode_segmented_phase", "forward_graph", {"phase": "replay"})
-)
-decode_graph_explicitly_unsupported = has_record(
-    "decode_capture_policy",
-    "forward_graph",
-    {
-        "has_collectives": "true",
-        "collectives_graph_capturable": "false",
-    },
 )
 
 if is_mtp and not has_record(domain="mtp"):
     print("FAIL: MTP case emitted no mtp-domain counters")
     sys.exit(0)
 
+if "e2e-certification" in suite_option_set:
+    import os
+    try:
+        required_movement = MovementEvidence(os.environ["LLAMINAR_E2E_MOVEMENT_EVIDENCE"])
+    except (KeyError, ValueError):
+        print("FAIL: E2E certification requires canonical typed movement evidence")
+        sys.exit(0)
+    runtime_feature_error = validate_runtime_feature_policy(records, extra_flags, required_movement)
+    if runtime_feature_error:
+        print(f"FAIL: {runtime_feature_error}")
+        sys.exit(0)
+
 if is_gpu:
-    if not decode_graph_captured and not decode_graph_explicitly_unsupported:
+    if not decode_graph_captured:
         print("FAIL: GPU case emitted no decode graph capture counter")
         sys.exit(0)
     # Short arithmetic probes may finish immediately after warmup/capture,
     # especially on ROCm.  Require replay only for cases that deliberately
-    # create enough decode work or explicitly ask for a replay proof.  LocalTP
-    # and PP suites that include non-capturable collectives must emit an
-    # explicit policy counter instead of quietly pretending graph replay was
-    # available.
-    if expect_decode_replay and not decode_graph_replayed and not decode_graph_explicitly_unsupported:
+    # create enough decode work or explicitly ask for a replay proof.
+    if expect_decode_replay and not decode_graph_replayed:
         print("FAIL: GPU case expected decode graph replay but emitted no replay counter")
-        sys.exit(0)
-
-if expect_prefill_phase:
-    if not has_record("prefill_graph_phase", "forward_graph"):
-        print("FAIL: eligible GPU long-context case emitted no prefill graph phase counters")
         sys.exit(0)
 
 if require_prefill_capture:
@@ -1786,16 +2222,446 @@ if is_gpu and is_mtp:
     ):
         print("FAIL: GPU MTP case emitted no sidecar graph cache/capture counters")
         sys.exit(0)
-    if not has_record(
-        "live_prefix_replay_state_after_mutation",
-        "mtp",
-        {
-            "operation": "clear_cache",
-            "forward_replay_reset_scope": "request_boundary_preserve",
-            "kernel_dynamic_state": "preserved",
-        },
+    if not any(
+        has_record(
+            "live_prefix_replay_state_after_mutation",
+            "mtp",
+            {
+                "operation": operation,
+                "forward_replay_reset_scope": "request_boundary_preserve",
+                "kernel_dynamic_state": "preserved",
+            },
+        )
+        for operation in ("clear_cache", "request-clear-cache")
     ):
         print("FAIL: GPU MTP case did not preserve replay state at request-boundary clear_cache")
+        sys.exit(0)
+
+    # LLEP is confined to ordinary prefill. Its grouped verifier must prove the
+    # canonical economical path independently: runtime-table grouping over
+    # static expert owners, with no current-batch expert transport. Mirroring
+    # the terminal MTP head does not replicate routed experts.
+    if uses_current_batch_llep:
+        llep_validation = validate_llep_verifier_policy(records)
+        if llep_validation.error:
+            print(f"FAIL: {llep_validation.error}")
+            sys.exit(0)
+
+if require_stochastic_mtp:
+    if not is_gpu or not is_mtp:
+        print("FAIL: stochastic MTP probe requires a GPU MTP cell")
+        sys.exit(0)
+    if flag_value("--mtp-verify-mode") != "speculative-sampling":
+        print("FAIL: stochastic MTP probe requires --mtp-verify-mode speculative-sampling")
+        sys.exit(0)
+    if flag_value("--mtp-depth-policy") != "dynamic":
+        print("FAIL: stochastic MTP probe requires the production dynamic-depth controller")
+        sys.exit(0)
+    if record_value_sum(("stochastic_accept_tests",), "mtp") <= 0.0:
+        print("FAIL: stochastic MTP probe emitted no stochastic acceptance tests")
+        sys.exit(0)
+    resident_accept_tests = sum(
+        numeric(record.get("value", record.get("count", 0.0)))
+        for record in records
+        if record.get("domain") == "mtp"
+        and record.get("name") == "stochastic_accept_tests"
+        and (record.get("tags") or {}).get("device_resident") == "true"
+    )
+    if resident_accept_tests <= 0.0:
+        print("FAIL: stochastic MTP acceptance did not use the device-resident verifier")
+        sys.exit(0)
+    native_generation_parent = any(
+        record.get("domain") == "mtp"
+        and record.get("name")
+        == "device_generation_loop_graph_materializations"
+        and numeric(record.get("value", record.get("count", 0.0))) > 0.0
+        and (record.get("tags") or {}).get("execution")
+        == "native_device_controlled_selector_while"
+        and (record.get("tags") or {}).get("sampling_mode") == "stochastic"
+        for record in records
+    )
+    hosted_generation_parent = any(
+        record.get("domain") == "mtp"
+        and record.get("name")
+        == "device_generation_loop_graph_materializations"
+        and numeric(record.get("value", record.get("count", 0.0))) > 0.0
+        and (record.get("tags") or {}).get("execution")
+        == "hosted_captured_transactions_with_ticket_only_dispatch"
+        and (record.get("tags") or {}).get("sampling_mode") == "stochastic"
+        for record in records
+    )
+    request_batch_outcome_bridges = record_value_sum(
+        ("stochastic_verify_request_batch_outcomes",),
+        "mtp",
+    )
+    if request_batch_outcome_bridges > 0.0:
+        print(
+            "FAIL: stochastic GPU MTP entered the retired request-batched "
+            "host outcome bridge"
+        )
+        sys.exit(0)
+    if not native_generation_parent and not hosted_generation_parent:
+        print(
+            "FAIL: stochastic GPU MTP emitted neither a native conditional "
+            "parent nor an authenticated ticket-selected captured parent"
+        )
+        sys.exit(0)
+    native_reducer_records = [
+        record
+        for record in records
+        if record.get("domain") == "mtp"
+        and record.get("name")
+        == "device_generation_terminal_compact_outcome_reductions"
+        and numeric(record.get("value", record.get("count", 0.0))) > 0.0
+        and (record.get("tags") or {}).get("authority")
+        == "device_generation_controller"
+        and (record.get("tags") or {}).get("source")
+        == "captured_stochastic_compact_outcome"
+    ]
+    if native_generation_parent and not native_reducer_records:
+        print("FAIL: native stochastic MTP emitted no terminal compact-outcome reducer ledger")
+        sys.exit(0)
+    if record_value_sum(
+        ("stochastic_serial_equivalent_host_verifier_rows",),
+        "mtp",
+    ) > 0.0:
+        print("FAIL: stochastic GPU MTP entered the retired host verifier")
+        sys.exit(0)
+    if record_value_sum(("depth_policy_windows",), "mtp") <= 0.0:
+        print("FAIL: stochastic dynamic-depth MTP emitted no controller window")
+        sys.exit(0)
+    try:
+        expected_minimum_depth = int(
+            flag_value("--mtp-min-draft-tokens") or "0"
+        )
+        expected_maximum_depth = int(
+            flag_value("--mtp-max-draft-tokens") or "0"
+        )
+    except ValueError:
+        print("FAIL: stochastic GPU MTP has malformed dynamic depth bounds")
+        sys.exit(0)
+    if native_generation_parent:
+        device_generation_validation = (
+            validate_cuda_dynamic_mtp_device_generation_policy(
+                records,
+                expected_minimum_depth=expected_minimum_depth,
+                expected_maximum_depth=expected_maximum_depth,
+            )
+        )
+        if device_generation_validation.error:
+            print(f"FAIL: {device_generation_validation.error}")
+            sys.exit(0)
+    if hosted_generation_parent:
+        device_generation_validation = (
+            validate_rocm_host_scheduled_mtp_device_generation_policy(
+                records,
+                expected_minimum_depth=expected_minimum_depth,
+                expected_maximum_depth=expected_maximum_depth,
+            )
+        )
+        if device_generation_validation.error:
+            print(f"FAIL: {device_generation_validation.error}")
+            sys.exit(0)
+
+if require_prefix_rebalance_clear:
+    if not is_gpu:
+        print("FAIL: prefix-cache rebalance clear probe requires a GPU backend")
+        sys.exit(0)
+    if " --prefix-cache " not in f" {extra_flags} ":
+        print("FAIL: prefix-cache rebalance clear probe requires --prefix-cache")
+        sys.exit(0)
+    if not uses_dynamic_residency_maintenance and not uses_current_batch_llep:
+        print(
+            "FAIL: prefix-cache MoE policy clear probe requires either dynamic "
+            "residency maintenance or explicit current-batch LLEP"
+        )
+        sys.exit(0)
+    prefix_lookup_score = record_value_sum(
+        ("lookup_results",),
+        "prefix_cache",
+    )
+    prefix_harvest_score = record_value_sum(
+        ("harvest_inserts",),
+        "prefix_cache",
+    )
+    prefix_restore_score = record_value_sum(
+        (
+            "block_hits",
+            "populate_restores",
+            "model_runtime_state_restores",
+        ),
+        "prefix_cache",
+    )
+    if prefix_lookup_score <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe emitted no prefix-cache lookup counters")
+        sys.exit(0)
+    if prefix_harvest_score <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe emitted no prefix-cache harvest counters")
+        sys.exit(0)
+    if prefix_restore_score <= 0.0:
+        print("FAIL: prefix-cache rebalance clear probe emitted no prefix-cache hit/restore counters")
+        sys.exit(0)
+    if is_mtp and not has_record(
+        "populate_restores",
+        "prefix_cache",
+        {"includes_mtp_state": "true"},
+    ):
+        print("FAIL: prefix-cache+MTP rebalance case did not restore MTP-bearing prefix-cache state")
+        sys.exit(0)
+    payload_movement_score = (
+        record_value_sum(
+            (
+                "device_rebalance_prefill_current_batch_movement_layers",
+                "device_rebalance_prefill_active_transfer_slot_experts",
+                "device_rebalance_apply_applied_arrivals",
+                "device_rebalance_transfer_current_applied_arrivals",
+                "device_rebalance_wave_applied_arrivals",
+                "device_rebalance_wave_applied_arrivals_total",
+                "device_rebalance_windows_applied",
+                "gpu_direct_transfer_count",
+                "gpu_direct_transfer_bytes",
+                "gpu_direct_transfer_slot_publish_experts",
+                "replica_arrivals",
+                "new_placement_entries",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "applied_arrivals",
+                "copied_arrivals",
+                "windows_applied",
+            ),
+            domain="moe_rebalance",
+        )
+    )
+    resident_row_assignment_score = record_value_sum(
+        (
+            "device_rebalance_prefill_current_batch_non_owner_assignment_layers",
+        ),
+        "moe_rebalance",
+    )
+    effective_movement_score = payload_movement_score
+    if uses_current_batch_llep:
+        # Fully mirrored LLEP has no expert payload to migrate. Its economical
+        # production action is to send routed rows to an already-resident
+        # non-owner replica. The sticky counter comes from the real assignment
+        # consumer, not from a planner proposal, so it is applied-work evidence.
+        effective_movement_score += resident_row_assignment_score
+    if effective_movement_score <= 0.0:
+        print(
+            "FAIL: prefix-cache rebalance clear probe saw neither applied expert "
+            "movement nor proven resident LLEP row redistribution"
+        )
+        sys.exit(0)
+    maintenance_launch_score = record_value_sum(
+        ("device_maintenance_graph_launches",),
+        "moe_rebalance",
+    )
+    maintenance_consumer_wait_score = record_value_sum(
+        ("device_maintenance_graph_consumer_event_waits",),
+        "moe_rebalance",
+    )
+    if maintenance_launch_score > 0.0 and maintenance_consumer_wait_score <= 0.0:
+        print(
+            "FAIL: device MoE maintenance launched without a main/MTP graph "
+            "consumer event wait"
+        )
+        sys.exit(0)
+    pending_publish_drains = record_value_sum(
+        ("clear_cache_pending_publish_drains",),
+        "moe_rebalance",
+    )
+    device_request_reset_exports = 0.0
+    for record in records:
+        if record.get("name") != "device_maintenance_graph_request_reset_exports":
+            continue
+        if record.get("domain") != "moe_rebalance":
+            continue
+        record_tags = record.get("tags") or {}
+        if (
+            record_tags.get("reset") in {"clear_cache", "request-clear-cache"}
+            and record_tags.get("window") == "request_reset"
+        ):
+            device_request_reset_exports += numeric(record.get("value", record.get("count", 0.0)))
+    if (uses_dynamic_residency_maintenance and
+            pending_publish_drains + device_request_reset_exports <= 0.0):
+        print("FAIL: prefix-cache rebalance clear probe did not observe clear-cache rebalance drain/export")
+        sys.exit(0)
+    runtime_movement_epoch = max(
+        max_tag_value(
+            "moe_runtime_movement_epoch",
+            names=("live_prefix_replay_state_after_mutation",),
+            required_tags={
+                "operation": operation,
+                "forward_replay_reset_scope": "request_boundary_preserve",
+                "kernel_dynamic_state": "preserved",
+            },
+        )
+        for operation in ("clear_cache", "request-clear-cache")
+    )
+    if payload_movement_score > 0.0:
+        if runtime_movement_epoch <= 0.0:
+            print("FAIL: prefix-cache rebalance clear probe applied payload movement without advancing moe_runtime_movement_epoch")
+            sys.exit(0)
+    elif uses_current_batch_llep and resident_row_assignment_score > 0.0:
+        if runtime_movement_epoch != 0.0:
+            print(
+                "FAIL: resident-only LLEP row redistribution changed the placement "
+                "epoch even though ownership and residency were unchanged"
+            )
+            sys.exit(0)
+
+if require_moe_rebalance_movement:
+    if not is_gpu:
+        print("FAIL: MoE rebalance movement probe requires a GPU TP/PP backend")
+        sys.exit(0)
+    if not uses_dynamic_residency_maintenance and not uses_current_batch_llep:
+        print(
+            "FAIL: MoE policy movement probe requires either dynamic residency "
+            "maintenance or explicit current-batch LLEP"
+        )
+        sys.exit(0)
+    if not has_record(domain="moe_rebalance"):
+        print("FAIL: MoE rebalance movement probe emitted no moe_rebalance counters")
+        sys.exit(0)
+
+    if uses_current_batch_llep:
+        if "cuda:" in extra_flags:
+            expected_allgather_primitive = "ncclAllGather"
+        elif "rocm:" in extra_flags:
+            expected_allgather_primitive = "rcclAllGather"
+        else:
+            print("FAIL: LLEP movement probe could not identify its homogeneous GPU collective backend")
+            sys.exit(0)
+
+        raw_allgather_calls = [
+            record
+            for record in records
+            if record.get("domain") == "tp_raw_allgather_runtime"
+            and record.get("name") == "calls"
+        ]
+        if not raw_allgather_calls:
+            print("FAIL: LLEP movement probe emitted no raw allgather physical-primitive evidence")
+            sys.exit(0)
+        for record in raw_allgather_calls:
+            record_tags = record.get("tags") or {}
+            if (
+                record_tags.get("path") != "native_single_device_on_stream"
+                or record_tags.get("backend_primitive") != expected_allgather_primitive
+                or record_tags.get("host_rendezvous") != "false"
+            ):
+                print(
+                    "FAIL: LLEP raw allgather used a non-native or host-rendezvous path: "
+                    f"{record_tags}"
+                )
+                sys.exit(0)
+
+    # Sticky runtime observations are stronger than intermediate planner
+    # counters. Payload-backed movement is set by apply; resident-only LLEP is
+    # set by the production span consumer when it observes non-owner rows. Both
+    # survive later maintenance and count as applied work for their exact mode.
+    prefill_applied_movement = record_value_sum(
+        ("device_rebalance_prefill_current_batch_movement_layers",),
+        "moe_rebalance",
+    )
+    resident_row_assignment = record_value_sum(
+        (
+            "device_rebalance_prefill_current_batch_non_owner_assignment_layers",
+        ),
+        "moe_rebalance",
+    )
+    llep_applied_work = resident_row_assignment if uses_current_batch_llep else 0.0
+    # Request-reset diagnostics run after the transient planner status has
+    # advanced to WindowNotReady for the next window.  The controller's wave
+    # state is the durable device-owned transaction record: a nonzero planned
+    # layer count proves that the planner committed work to a specific wave,
+    # independently of the command and apply counters checked below.
+    planned_score = (
+        prefill_applied_movement
+        + llep_applied_work
+        + record_value_sum(
+            (
+                "device_rebalance_planned_arrivals",
+                "device_rebalance_dynamic_ownership_swap_accepts",
+                "device_rebalance_llep_weight_transfer_count",
+                "device_rebalance_llep_assignment_span_count",
+                "device_rebalance_wave_planned_layer_count",
+                "replica_arrivals",
+                "new_placement_entries",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "planned_arrivals",
+                "dynamic_ownership_swap_accepts",
+                "llep_weight_transfer_count",
+                "llep_assignment_span_count",
+                "selected_replicas",
+            ),
+            domain="moe_rebalance",
+        )
+    )
+    materialized_score = (
+        prefill_applied_movement
+        + llep_applied_work
+        + record_value_sum(
+            (
+                "device_rebalance_plan_count",
+                "device_rebalance_planned_arrivals",
+                "device_rebalance_payload_bucket_slots",
+                "device_rebalance_transfer_current_command_count",
+                "device_rebalance_transfer_useful_payload_bytes",
+                "device_rebalance_wave_command_count",
+                "device_rebalance_wave_command_count_total",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "planned_arrivals",
+                "payload_bucket_slots",
+                "command_count",
+            ),
+            domain="moe_rebalance",
+        )
+    )
+    applied_score = (
+        prefill_applied_movement
+        + llep_applied_work
+        + record_value_sum(
+            (
+                "device_rebalance_apply_applied_arrivals",
+                "device_rebalance_transfer_current_applied_arrivals",
+                "device_rebalance_wave_applied_arrivals",
+                "device_rebalance_wave_applied_arrivals_total",
+                "device_rebalance_windows_applied",
+                "gpu_direct_transfer_count",
+                "gpu_direct_transfer_bytes",
+                "gpu_direct_transfer_slot_publish_experts",
+                "replica_arrivals",
+                "new_placement_entries",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "applied_arrivals",
+                "copied_arrivals",
+                "windows_applied",
+            ),
+            domain="moe_rebalance",
+        )
+    )
+    if planned_score <= 0.0:
+        print("FAIL: MoE rebalance movement probe saw no planned expert movement")
+        sys.exit(0)
+    if materialized_score <= 0.0:
+        print("FAIL: MoE rebalance movement probe saw a policy proposal but no materialized payload or consumed resident-row assignment")
+        sys.exit(0)
+    if applied_score <= 0.0:
+        print("FAIL: MoE rebalance movement probe saw materialized work but no applied expert movement or resident-row redistribution")
         sys.exit(0)
 
 print(f"ok {len(records)}")
@@ -1844,7 +2710,7 @@ if is_docker_mode; then
 else
     if [ ! -x "$BINARY" ]; then
     echo -e "${RED}Error: Binary not found: ${BINARY}${NC}"
-    echo "Build with: cmake --build build_v2_integration --parallel"
+    echo "Build with: cmake --build build_v2_release --parallel --target llaminar2"
     exit 1
     fi
 
@@ -1856,6 +2722,19 @@ mkdir -p "$LOG_DIR"
 LOG_DIR="$(readlink -f "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")"
 
 LAST_RESPONSE=""
+
+# Retain exact black-box request/response bytes, including finish reason and
+# reasoning fields. Monotonic, harness-owned identities prevent repeated probes
+# from overwriting the evidence needed to distinguish truncation from drift.
+HTTP_CASE_SEQUENCE=0
+record_http_exchange() {
+    local payload="$1" response="$2" stem
+    HTTP_CASE_SEQUENCE=$((HTTP_CASE_SEQUENCE + 1))
+    printf -v stem '%s/http_%06d' "$LOG_DIR" "$HTTP_CASE_SEQUENCE"
+    printf '%s\n' "$payload" > "${stem}.request.json"
+    printf '%s\n' "$response" > "${stem}.response.json"
+    LAST_HTTP_RESPONSE_ARTIFACT="${stem}.response.json"
+}
 
 run_chat_answer_check() {
     local tag="$1"
@@ -1881,6 +2760,7 @@ run_chat_answer_check() {
             -d "$payload" \
             "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
         LAST_RESPONSE="$response"
+        record_http_exchange "$payload" "$response"
 
         content=$(printf '%s' "$response" | extract_content 2>/dev/null || echo "PARSE_ERROR")
         content_preview=$(printf '%s' "$content" | preview_text)
@@ -1889,7 +2769,7 @@ run_chat_answer_check() {
         if [ "$answer" = "$expected_answer" ]; then
             pass "[${tag}] ${test_name} (${mode}): got '${content_preview}' (answer ${expected_answer})"
         else
-            fail "[${tag}] ${test_name} (${mode}): expected answer ${expected_answer}, got '${content_preview}'"
+            fail "[${tag}] ${test_name} (${mode}): expected answer ${expected_answer}, got '${content_preview}' (response: ${LAST_HTTP_RESPONSE_ARTIFACT})"
         fi
 
         if [ "$thinking_model" = "true" ] && [ "$enable_thinking" = "true" ]; then
@@ -1910,6 +2790,19 @@ run_chat_answer_check() {
             fi
         fi
     done
+}
+
+# Prove restore with an exact prior prompt as well as distinct answers after a
+# shared textual prefix. Short shared prefixes need not reach a stored hybrid
+# state boundary, so the A/B pair alone is not a positive restore witness.
+run_prefix_cache_checks() {
+    local tag="$1" port="$2" max_tokens="$3" thinking_model="$4"
+    local prefix_a_messages prefix_b_messages
+    prefix_a_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 6+7?"}]'
+    prefix_b_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 9+5?"}]'
+    run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix A" "13" "$prefix_a_messages"
+    run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix B" "14" "$prefix_b_messages"
+    run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache exact-repeat A" "13" "$prefix_a_messages"
 }
 
 run_streaming_checks() {
@@ -2025,13 +2918,166 @@ print('ok')
     done
 }
 
+run_stochastic_mtp_probe() {
+    local tag="$1"
+    local port="$2"
+    local messages_json probe_max_tokens probe_repetitions
+    probe_max_tokens="${LLAMINAR_E2E_STOCHASTIC_MTP_PROBE_MAX_TOKENS:-64}"
+    probe_repetitions="${LLAMINAR_E2E_STOCHASTIC_MTP_PROBE_REPETITIONS:-1}"
+    if [[ ! "$probe_repetitions" =~ ^[1-9][0-9]*$ ]] ||
+       ((probe_repetitions > 20)); then
+        fail "[${tag}] Stochastic MTP probe repetitions must be an integer from 1 through 20, got '${probe_repetitions}'"
+        return
+    fi
+
+    local payload first_response second_response first_content second_content
+    local probe_iteration probe_marker
+    for ((probe_iteration = 1;
+          probe_iteration <= probe_repetitions;
+          ++probe_iteration)); do
+        # Every iteration uses a distinct fixed-width prompt marker. The first
+        # request therefore inserts a new prefix and the second request restores
+        # that exact prefix, instead of later loop iterations comparing two
+        # already-hot restores of the first prompt.
+        printf -v probe_marker "trial%02d" "$probe_iteration"
+        messages_json=$(python3 - "$probe_marker" <<'PY'
+import json
+import sys
+
+messages = [
+    {
+        "role": "system",
+        "content": (
+            "Write a continuous paragraph of at least sixty-four lowercase "
+            "English words. Do not use punctuation, lists, headings, or an "
+            "early conclusion."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "Describe a calm morning while following every length and "
+            f"formatting requirement. The private request marker is {sys.argv[1]}."
+        ),
+    },
+]
+print(json.dumps(messages, separators=(",", ":")))
+PY
+)
+
+        payload=$(make_chat_payload \
+            "$messages_json" "$probe_max_tokens" "false" "false" "stochastic" "12345")
+        first_response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null ||
+            echo '{"error":"curl_failed"}')
+        second_response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null ||
+            echo '{"error":"curl_failed"}')
+        first_content=$(printf '%s' "$first_response" | extract_content 2>/dev/null ||
+            echo "PARSE_ERROR")
+        second_content=$(printf '%s' "$second_response" | extract_content 2>/dev/null ||
+            echo "PARSE_ERROR")
+
+        if [[ -z "$first_content" || "$first_content" == "PARSE_ERROR" ||
+              -z "$second_content" || "$second_content" == "PARSE_ERROR" ]]; then
+            fail "[${tag}] Stochastic MTP probe iteration ${probe_iteration}/${probe_repetitions} returned an empty or malformed response"
+            return
+        fi
+        if [[ "$first_content" != "$second_content" ]]; then
+            local mismatch_diagnostics
+            mismatch_diagnostics=$(
+                printf '%s\0%s' "$first_response" "$second_response" |
+                    python3 -c '
+import hashlib
+import json
+import sys
+
+parts = sys.stdin.buffer.read().split(b"\0", 1)
+if len(parts) != 2:
+    print("diagnostic_error=missing_response_separator")
+    raise SystemExit(0)
+
+def summarize(raw):
+    response = json.loads(raw.decode("utf-8"))
+    choice = (response.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    encoded = content.encode("utf-8")
+    usage = response.get("usage") or {}
+    return {
+        "content": content,
+        "bytes": len(encoded),
+        "chars": len(content),
+        "sha256": hashlib.sha256(encoded).hexdigest()[:16],
+        "finish_reason": choice.get("finish_reason"),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "error": response.get("error"),
+    }
+
+try:
+    first = summarize(parts[0])
+    second = summarize(parts[1])
+except Exception as exc:
+    print(f"diagnostic_error={type(exc).__name__}:{exc}")
+    raise SystemExit(0)
+
+first_content = first.pop("content")
+second_content = second.pop("content")
+common = 0
+for lhs, rhs in zip(first_content, second_content):
+    if lhs != rhs:
+        break
+    common += 1
+
+radius = 32
+first_context = first_content[max(0, common - radius):common + radius]
+second_context = second_content[max(0, common - radius):common + radius]
+print("first=" + json.dumps(first, sort_keys=True, ensure_ascii=True))
+print("second=" + json.dumps(second, sort_keys=True, ensure_ascii=True))
+print("mismatch=" + json.dumps({
+    "common_prefix_chars": common,
+    "first_context": first_context,
+    "second_context": second_context,
+}, sort_keys=True, ensure_ascii=True))
+'
+            )
+            fail "[${tag}] Seeded stochastic MTP was not reproducible across prefix restore at iteration ${probe_iteration}/${probe_repetitions}"
+            while IFS= read -r diagnostic_line; do
+                echo -e "  ${BLUE}INFO${NC} [${tag}] Stochastic MTP mismatch iteration ${probe_iteration}/${probe_repetitions} ${diagnostic_line}"
+            done <<<"$mismatch_diagnostics"
+            return
+        fi
+    done
+    pass "[${tag}] Seeded stochastic MTP reproduced the same response across prefix restore for ${probe_repetitions}/${probe_repetitions} unique prefixes"
+}
+
 run_prefill_graph_probe() {
     local tag="$1"
     local port="$2"
 
-    local messages_json payload response validation i
-    messages_json=$(python3 - <<'PY'
+    local messages_json payload response validation i probe_marker
+    local reference_prompt_tokens="" observed_prompt_tokens=""
+
+    for i in 1 2 3; do
+        case "$i" in
+            1) probe_marker="A" ;;
+            2) probe_marker="B" ;;
+            3) probe_marker="C" ;;
+            *)
+                fail "[${tag}] Prefill graph probe has an invalid request index ${i}"
+                return
+                ;;
+        esac
+
+        messages_json=$(python3 - "$probe_marker" <<'PY'
 import json
+import sys
 
 filler = " ".join(
     "capture probe filler: alpha beta gamma delta epsilon zeta eta theta."
@@ -2040,7 +3086,15 @@ filler = " ".join(
 messages = [
     {
         "role": "system",
-        "content": "You are a calculator. Reply with only the numeric answer.",
+        # The one-token marker is intentionally the first cacheable payload
+        # token. Prefix-cache cells must execute all three prefills instead of
+        # satisfying requests two and three from a full RAM-tier prefix hit.
+        # The shell-side prompt-token assertion below proves A/B/C preserve the
+        # same graph geometry before accepting capture/replay evidence.
+        "content": (
+            f"{sys.argv[1]} You are a calculator. "
+            "Reply with only the numeric answer."
+        ),
     },
     {
         "role": "user",
@@ -2053,9 +3107,8 @@ messages = [
 ]
 print(json.dumps(messages, separators=(",", ":")))
 PY
-)
+        )
 
-    for i in 1 2 3; do
         payload=$(make_chat_payload "$messages_json" 8 "false" "false")
         response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
             -H "Content-Type: application/json" \
@@ -2091,6 +3144,20 @@ except Exception as exc:
     print(f'FAIL: malformed response: {exc}')
 ")
         if [[ "$validation" == ok* ]]; then
+            observed_prompt_tokens=$(
+                printf '%s\n' "$validation" |
+                    sed -n 's/.*prompt_tokens=\([0-9][0-9]*\).*/\1/p'
+            )
+            if [ -z "$observed_prompt_tokens" ]; then
+                fail "[${tag}] Prefill graph probe request ${i}: missing prompt-token geometry"
+                return
+            fi
+            if [ -z "$reference_prompt_tokens" ]; then
+                reference_prompt_tokens="$observed_prompt_tokens"
+            elif [ "$observed_prompt_tokens" != "$reference_prompt_tokens" ]; then
+                fail "[${tag}] Prefill graph probe request ${i}: prefix-distinct prompt changed graph geometry (${observed_prompt_tokens} != ${reference_prompt_tokens})"
+                return
+            fi
             continue
         fi
         fail "[${tag}] Prefill graph probe request ${i}: ${validation}"
@@ -2098,6 +3165,125 @@ except Exception as exc:
     done
 
     pass "[${tag}] Prefill graph probe: repeated same-key long prefill completed through replay request"
+}
+
+run_prefix_cache_rebalance_clear_probe() {
+    local tag="$1"
+    local port="$2"
+    local extra_flags="${3:-}"
+
+    local probe_max_tokens="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MAX_TOKENS:-16}"
+    local min_completion_tokens="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS:-8}"
+    local min_completion_tokens_overridden="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS+x}"
+    local rebalance_window
+    rebalance_window=$(moe_policy_window_from_flags "$extra_flags")
+    if [[ "$rebalance_window" =~ ^[0-9]+$ ]] && [ "$rebalance_window" -gt 0 ]; then
+        local completion_tokens_for_window=$((rebalance_window + 1))
+        if is_mtp_case "$extra_flags"; then
+            local mtp_draft_tokens
+            mtp_draft_tokens=$(mtp_draft_tokens_from_flags "$extra_flags")
+            if [[ "$mtp_draft_tokens" =~ ^[0-9]+$ ]]; then
+                # One verifier transaction can publish at most draft+1 output
+                # tokens.  To force W scheduler boundaries, request one token
+                # beyond the maximum that W-1 transactions could satisfy.
+                completion_tokens_for_window=$(( (rebalance_window - 1) * (mtp_draft_tokens + 1) + 1 ))
+            fi
+        fi
+        if [ -z "$min_completion_tokens_overridden" ] &&
+           [ "$min_completion_tokens" -lt "$completion_tokens_for_window" ]; then
+            min_completion_tokens="$completion_tokens_for_window"
+        fi
+        if [ "$probe_max_tokens" -lt "$min_completion_tokens" ]; then
+            probe_max_tokens="$min_completion_tokens"
+        fi
+    fi
+    local messages_json payload response validation i
+    messages_json=$(python3 - <<'PY'
+import json
+
+shared_prefix = " ".join(
+    "prefix-cache rebalance probe: keep this shared setup resident."
+    for _ in range(32)
+)
+messages = [
+    {
+        "role": "system",
+        "content": "You are a deterministic text generator.",
+    },
+    {
+        "role": "user",
+        "content": (
+            f"{shared_prefix}\n\n"
+            "Now print the digit 7 separated by spaces as many times as the "
+            "token budget allows. Do not explain."
+        ),
+    },
+]
+print(json.dumps(messages, separators=(",", ":")))
+PY
+)
+
+    local probe_request_count="${LLAMINAR_E2E_PREFIX_REBALANCE_CLEAR_PROBE_REQUESTS:-3}"
+    if [[ ! "$probe_request_count" =~ ^[1-9][0-9]*$ ]]; then
+        fail "[${tag}] Prefix-cache rebalance clear probe request count must be a positive integer, got '${probe_request_count}'"
+        return
+    fi
+
+    for ((i = 1; i <= probe_request_count; ++i)); do
+        payload=$(make_chat_payload "$messages_json" "$probe_max_tokens" "false" "false")
+        response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+
+        validation=$(python3 - "$min_completion_tokens" "$response" <<'PY'
+import json
+import sys
+
+min_completion_tokens = int(sys.argv[1])
+response_body = sys.argv[2]
+try:
+    data = json.loads(response_body)
+    error = data.get("error")
+    content = data.get("choices", [{}])[0].get("message", {}).get("content")
+    usage = data.get("usage", {})
+    prompt_tokens = int(usage.get("prompt_tokens", 0))
+    completion_tokens = int(usage.get("completion_tokens", 0))
+    if error:
+        if isinstance(error, dict):
+            error_type = error.get("type", "server_error")
+            error_message = error.get("message", repr(error))
+            print(f"FAIL: {error_type}: {error_message}")
+        else:
+            print(f"FAIL: server error: {error}")
+    elif not isinstance(content, str):
+        print("FAIL: missing assistant content")
+    elif not content.strip():
+        print("FAIL: empty assistant content")
+    elif prompt_tokens < 64:
+        print(f"FAIL: prompt_tokens {prompt_tokens} below prefix-cache probe threshold")
+    elif completion_tokens < min_completion_tokens:
+        print(
+            f"FAIL: completion_tokens {completion_tokens} below rebalance-window threshold "
+            f"{min_completion_tokens}"
+        )
+    else:
+        print(
+            f"ok prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
+            f"preview={content[:48]!r}"
+        )
+except Exception as exc:
+    print(f"FAIL: malformed response: {exc}")
+PY
+)
+        if [[ "$validation" == ok* ]]; then
+            continue
+        fi
+        fail "[${tag}] Prefix-cache rebalance clear probe request ${i}: ${validation}"
+        return
+    done
+
+    pass "[${tag}] Prefix-cache rebalance clear probe: repeated HTTP prefix-cache requests survived rebalance cleanup"
 }
 
 # ─── Test Runner Function ─────────────────────────────────────────────────────
@@ -2113,7 +3299,12 @@ run_backend_tests() {
     local suite_options="${7:-}"
     local tag="${label}/${backend}"
     local thinking_model="false"
-    if is_thinking_model "$label"; then
+    if [[ ",${suite_options}," == *,e2e-certification,* ]] &&
+       [ "$THINKING_MODES" = "both" ] && suite_runs_non_thinking_only "$suite_options"; then
+        echo "Canonical thinking coverage conflicts with non-thinking-only diagnostic option" >&2
+        return 2
+    fi
+    if [ "$THINKING_MODES" = "both" ] && ! suite_runs_non_thinking_only "$suite_options"; then
         thinking_model="true"
     fi
 
@@ -2125,7 +3316,7 @@ run_backend_tests() {
         model_size_b=$(parse_model_size_b "$model" "$label")
         if suite_disables_long_context "$suite_options"; then
             echo -e "  ${YELLOW}SKIP${NC} [${tag}] Long-context: suite option no-long-context"
-        elif model_size_meets_threshold "$model_size_b" "$LONG_MIN_MODEL_SIZE_B"; then
+        elif [[ ",$suite_options," == *,e2e-certification,* ]] || model_size_meets_threshold "$model_size_b" "$LONG_MIN_MODEL_SIZE_B"; then
             long_context_run="true"
             echo -e "  ${BLUE}INFO${NC} [${tag}] Long-context enabled: size ${model_size_b}B, tier ${LONG_CONTEXT_TIER}, context ${CONTEXT_LENGTH}"
         else
@@ -2137,9 +3328,13 @@ run_backend_tests() {
     safe_tag=$(sanitize_name "$tag")
     log_path="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_${safe_tag}_port${port}.log"
     perf_path="${log_path%.log}.perfstats.json"
-    gpu_before_mb=$(get_total_gpu_memory_mb)
+    gpu_before_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
     if [ "$PERF_STATS_ENABLED" = "1" ]; then
         echo -e "  ${BLUE}INFO${NC} [${tag}] PerfStats artifact: ${perf_path}"
+    fi
+    if port_accepts_connections "$port"; then
+        fail "[${tag}] Server port ${port} is already in use; pass --port with a free base port or stop the existing server"
+        return
     fi
 
     local context_args=()
@@ -2150,20 +3345,96 @@ run_backend_tests() {
     local -a server_env=(
         "LLAMINAR_LOG_LEVEL=$LOG_LEVEL"
         "LLAMINAR_TRACE_GENERATED_TOKENS=$TRACE_TOKENS"
+        "LLAMINAR_ENABLE_SERVER_SHUTDOWN_ENDPOINT=1"
     )
     if suite_disables_prefill_graph_buckets "$suite_options"; then
         echo -e "  ${BLUE}INFO${NC} [${tag}] Prefill graph buckets: disabled by suite option for unsupported collective topology"
         server_env+=("LLAMINAR_PREFILL_GRAPH_BUCKETS=0")
     fi
+    if suite_runs_prefix_cache_rebalance_clear_probe "$suite_options"; then
+        local probe_gpu_cache_experts="${LLAMINAR_E2E_PREFIX_REBALANCE_GPU_CACHE_EXPERTS_PER_LAYER:-2}"
+        echo -e "  ${BLUE}INFO${NC} [${tag}] Prefix-cache rebalance clear probe: gpu_cache_experts_per_layer=${probe_gpu_cache_experts}"
+        server_env+=("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER=${probe_gpu_cache_experts}")
+    fi
+    if suite_runs_moe_rebalance_movement_probe "$suite_options"; then
+        # Make the graph-level economy decision explicit for this forced
+        # movement probe. Production defaults retain the 8192-routed-row floor;
+        # the probe lowers it through the public typed CLI, never DebugEnv.
+        extra_flags+=" --moe-routed-prefill-least-loaded-min-routed-rows 0"
+        # One compact slot is sufficient to prove that the production LLEP
+        # payload lane plans, publishes, transports, and applies a real expert
+        # movement. Larger fixed capacities multiply the graph-captured
+        # allgather payload by every MoE layer even when those slots are empty;
+        # capacity/throughput sweeps belong in the dedicated transfer perf
+        # harness rather than this correctness-oriented server probe.
+        local probe_transfer_slots="${LLAMINAR_E2E_MOE_REBALANCE_COMPACT_PAYLOAD_SLOTS:-1}"
+        local probe_maintenance_slack=1
+        local probe_initial_maintenance_period=1
+        local probe_rebalance_window
+        local probe_effective_window
+        probe_rebalance_window=$(moe_policy_window_from_flags "$extra_flags")
+        probe_effective_window="${LLAMINAR_E2E_MOE_REBALANCE_WINDOW:-4}"
+        if [[ ! "$probe_effective_window" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid LLAMINAR_E2E_MOE_REBALANCE_WINDOW='${probe_effective_window}'" >&2
+            return 1
+        fi
+        if is_mtp_case "$extra_flags"; then
+            local probe_mtp_draft_tokens
+            probe_mtp_draft_tokens=$(mtp_draft_tokens_from_flags "$extra_flags")
+            if [[ "$probe_mtp_draft_tokens" =~ ^[0-9]+$ ]]; then
+                local probe_grouped_rows=$((probe_mtp_draft_tokens + 1))
+                if [ "$probe_grouped_rows" -lt "$probe_effective_window" ]; then
+                    probe_effective_window="$probe_grouped_rows"
+                fi
+            fi
+        fi
+        if [[ "$probe_rebalance_window" =~ ^[0-9]+$ ]] &&
+           [ "$probe_rebalance_window" -gt 0 ]; then
+            # The device controller defines readiness in routed work rows, not
+            # host-visible committed tokens. One grouped MTP transaction
+            # publishes at most draft+1 such rows, so cap the diagnostic
+            # evidence window at that real production launch geometry. The
+            # first replay remains window+slack, matching the ordinary
+            # scheduler cadence for the effective window.
+            probe_initial_maintenance_period=$((probe_effective_window + probe_maintenance_slack))
+        fi
+        echo -e "  ${BLUE}INFO${NC} [${tag}] MoE rebalance movement probe: forcing short windows, zero movement floors, evidence_window=${probe_effective_window}, compact_payload_slots=${probe_transfer_slots}, initial_maintenance_period=${probe_initial_maintenance_period}"
+        server_env+=(
+            "LLAMINAR_MOE_REBALANCE_WINDOW=${probe_effective_window}"
+            "LLAMINAR_MOE_REBALANCE_MAX_WINDOW=${probe_effective_window}"
+            "LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH=1"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_IMBALANCE_THRESHOLD_PER_MILLE=0"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_IMPROVEMENT_PER_MILLE=0"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_SWAPS_PER_LAYER=20"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE=20"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_WINDOW_ACTIVATIONS=0"
+            # The first replay waits for the complete evidence window derived
+            # above.  Subsequent windows retain the ordinary window+slack
+            # cadence, while request cleanup drains any prepared wave.
+            "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS=${probe_initial_maintenance_period}"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS=4"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS=${probe_maintenance_slack}"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PER_MILLE=1000"
+            "LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS=${probe_transfer_slots}"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS=${probe_transfer_slots}"
+        )
+    fi
     if [ "$PERF_STATS_ENABLED" = "1" ]; then
-        server_env+=("LLAMINAR_PERF_STATS_JSON=$perf_path")
+        server_env+=("LLAMINAR_PERF_STATS_JSON=${perf_path%.json}.rank-{rank}.json")
         if [ "$PERF_STATS_GPU_STAGE_TIMING" = "1" ]; then
             server_env+=("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1")
         fi
     fi
 
-    # Build server args — always pass the device explicitly unless this suite's
-    # extra_flags describe a TP/PP topology.
+    # Canonical argv owns all placement. The legacy backend label only selects
+    # diagnostic assertions, including CPU NodeTP's CPU-only evidence lane.
+    # Manual suites still obtain their single-device placement from the label.
     local server_model_path="$model"
     if is_docker_mode; then
         server_model_path="$(container_model_path "$model")"
@@ -2174,11 +3445,13 @@ run_backend_tests() {
         # so a loopback-only server inside the container is not reachable.
         server_args+=(--host 0.0.0.0)
     fi
-    if [[ "$backend" != "tp" && "$backend" != "pp" ]]; then
+    if [[ -z "$SERVER_ARGS_FILE" && "$backend" != "tp" && "$backend" != "pp" ]]; then
         server_args+=(-d "$backend")
     fi
     local -a extra_arg_list=()
-    if [[ -n "$extra_flags" ]]; then
+    if [[ -n "$SERVER_ARGS_FILE" ]]; then
+        server_args+=("${CANONICAL_SERVER_ARGS[@]}")
+    elif [[ -n "$extra_flags" ]]; then
         read -r -a extra_arg_list <<< "$extra_flags"
         server_args+=("${extra_arg_list[@]}")
     fi
@@ -2194,7 +3467,11 @@ run_backend_tests() {
 
     # Wait for health (pass PID so we detect early exit / OOM)
     if ! wait_for_health "$port" "$server_handle"; then
-        fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
+        if server_is_alive "$server_handle"; then
+            fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
+        else
+            fail "[${tag}] Server exited before readiness (see initialization error below)"
+        fi
         echo "    ── Last 80 lines of server log (${log_path}) ──"
         tail -n 80 "$log_path" 2>/dev/null | sed 's/^/    /' || echo "    (server log not available)"
         echo "    ────────────────────────────────────────────────────────────"
@@ -2211,6 +3488,14 @@ run_backend_tests() {
         pass "[${tag}] GET /health returns ok"
     else
         fail "[${tag}] GET /health unexpected: ${health_response}"
+    fi
+
+    # The stochastic probe is an HTTP production-path check, so it must run
+    # only after the server has crossed its explicit health publication
+    # boundary. Keeping it here also makes its first request the cache producer
+    # and its second same-seed request the unambiguous prefix-restore consumer.
+    if suite_runs_stochastic_mtp_probe "$suite_options"; then
+        run_stochastic_mtp_probe "$tag" "$port"
     fi
 
     # ─── Test 2: Single-turn greedy inference ─────────────────────────
@@ -2231,16 +3516,20 @@ run_backend_tests() {
     local response_format_sample="$LAST_RESPONSE"
 
     # ─── Prefix Cache Probe ───────────────────────────────────────────
-    # Feature suites that start the server with --prefix-cache get a pair of
-    # same-prefix requests. This keeps the check black-box and representative of
-    # served inference while still exercising lookup, restore/bypass, harvest,
-    # and ordinary response formatting through the HTTP path.
+    # Keep seed, different-answer and exact-repeat requests on the same public
+    # HTTP surface. Certification additionally requires actual restore counters.
     if is_prefix_cache_case "$extra_flags"; then
-        local prefix_a_messages prefix_b_messages
-        prefix_a_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 6+7?"}]'
-        prefix_b_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 9+5?"}]'
-        run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix A" "13" "$prefix_a_messages"
-        run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix B" "14" "$prefix_b_messages"
+        run_prefix_cache_checks "$tag" "$port" "$max_tokens" "$thinking_model"
+    fi
+
+    if suite_runs_prefix_cache_rebalance_clear_probe "$suite_options"; then
+        if ! is_prefix_cache_case "$extra_flags"; then
+            fail "[${tag}] Prefix-cache rebalance clear probe requested without --prefix-cache"
+        elif ! is_gpu_backend "$backend"; then
+            fail "[${tag}] Prefix-cache rebalance clear probe requested for non-GPU backend ${backend}"
+        else
+            run_prefix_cache_rebalance_clear_probe "$tag" "$port" "$extra_flags"
+        fi
     fi
 
     # ─── Test 5: Response format validation ───────────────────────────
@@ -2259,7 +3548,7 @@ run_backend_tests() {
 
     # ─── Test 8: Error handling — invalid JSON ────────────────────────
     local error_response error_msg
-    error_response=$(curl -s --max-time 5 -X POST \
+    error_response=$(curl -s --max-time "$REQUEST_TIMEOUT" -X POST \
         -H "Content-Type: application/json" \
         -d 'not valid json' \
         "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{}')
@@ -2277,7 +3566,7 @@ print(d.get('error', {}).get('type', ''))
     fi
 
     # ─── Test 9: Error handling — missing messages ────────────────────
-    error_response=$(curl -s --max-time 5 -X POST \
+    error_response=$(curl -s --max-time "$REQUEST_TIMEOUT" -X POST \
         -H "Content-Type: application/json" \
         -d '{"max_tokens": 10}' \
         "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{}')
@@ -2314,13 +3603,14 @@ print(d.get('error', {}).get('type', ''))
     check_memory_usage "$tag" "$backend" "$model" "$server_handle" "$gpu_before_mb" "$extra_flags"
 
     # ─── Test 11: Graceful shutdown validation ────────────────────────
-    shutdown_and_validate "$tag" "$server_handle" "$gpu_before_mb" "$backend" "$extra_flags"
-    copy_container_artifact "$server_handle" "$perf_path" "$perf_path"
-
+    shutdown_and_validate "$tag" "$server_handle" "$port" "$gpu_before_mb" "$backend" "$extra_flags"
     # ─── Test 12: Server log hygiene (after shutdown) ─────────────────
     # Scan AFTER shutdown so we catch errors during teardown too.
     # This covers exit code 1 from mpirun — if the child actually crashed
     # or errored, the log will have [ERROR]/[FATAL] entries.
+    # The validator also collects rank files in this same process. LOG_DIR is
+    # bound identically in container mode; membership, not rank zero, selects
+    # the request authority. No merged JSON needs to be parsed a second time.
     validate_perf_stats "$tag" "$backend" "$extra_flags" "$perf_path" "$long_context_run" "$suite_options"
     scan_server_log "$tag" "$log_path"
     echo ""
@@ -2393,6 +3683,11 @@ for suite in "${SUITES[@]}"; do
     SUITE_EXTRA_FLAGS="${SUITE_EXTRA_FLAGS:-}"   # Default: no extra flags
     SUITE_LABEL_SUFFIX="${SUITE_LABEL_SUFFIX:-}" # Default: derive from flags or model basename
     SUITE_OPTIONS="${SUITE_OPTIONS:-}"           # Default: no harness-only suite options
+    if [[ -n "$SERVER_ARGS_FILE" ]]; then
+        # A diagnostic string is only for existing feature detectors. Launch
+        # uses CANONICAL_SERVER_ARGS above and never reparses this rendering.
+        SUITE_EXTRA_FLAGS="${CANONICAL_SERVER_ARGS[*]}"
+    fi
     SUITE_LABEL="$(basename "$SUITE_MODEL" .gguf)"
     if [ -n "$SUITE_LABEL_SUFFIX" ]; then
         SUITE_LABEL="${SUITE_LABEL} [${SUITE_LABEL_SUFFIX}]"
@@ -2402,8 +3697,8 @@ for suite in "${SUITES[@]}"; do
 
     # Validate model exists
     if [ ! -f "$SUITE_MODEL" ]; then
-        echo -e "${RED}Warning: Model not found: ${SUITE_MODEL} — skipping suite${NC}"
-        continue
+        echo -e "${RED}Model not found: ${SUITE_MODEL}${NC}" >&2
+        exit 1
     fi
 
     echo -e "${BLUE}══ Model: ${SUITE_LABEL} ══${NC}"

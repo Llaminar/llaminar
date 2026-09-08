@@ -6,9 +6,11 @@
 
 #include "KernelFactory.h"
 #include "../backends/BackendManager.h"
+#include "../backends/GPUDeviceContextPool.h"
 #include "../planning/KVCacheMemoryEstimator.h"
-#include "cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
-#include "cpu/native_vnni/CPUPackedWeights.h"
+#include "../planning/PhysicalMemoryAuthority.h"
+#include "cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "cpu/gemm/CPUPackedWeights.h"
 #include "PackedWeightsSerialization.h"
 #include "cpu/gemm/FloatingPointGemmKernel.h"
 #include "../tensors/TensorSlice.h"
@@ -30,6 +32,7 @@
 #include "cpu/CPUHybridRingKVCache.h"
 #include "HybridKVCacheConfig.h"
 #include "IHybridKVCache.h"
+#include "kvcache/TurboQuantKVMode.h"
 #ifdef HAVE_CUDA
 #include "cuda/kvcache/CUDARingKVCache.h"
 #include "cuda/kvcache/CUDARingKVCacheTQ.h"
@@ -44,6 +47,7 @@
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
+#include "../loaders/MmapRegion.h"
 #include "common/EmbedQ8Repack.h"
 // CUDA kernel classes
 #ifdef HAVE_CUDA
@@ -2199,7 +2203,7 @@ namespace llaminar
                 auto reg_it = device_kernel_registry_.find(registry_key);
                 if (reg_it != device_kernel_registry_.end())
                 {
-                    LOG_DEBUG("[KernelFactory][RMSNORM] registry hit dev=" << static_cast<int>(target_device.type)
+                    LOG_TRACE("[KernelFactory][RMSNORM] registry hit dev=" << static_cast<int>(target_device.type)
                                                                            << ":" << target_device.ordinal
                                                                            << " tensor_type=" << static_cast<int>(tensor->native_type())
                                                                            << " kernel=" << reg_it->second.get());
@@ -2211,7 +2215,7 @@ namespace llaminar
                 {
                     auto *raw_ptr = it->second.get();
                     device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                    LOG_DEBUG("[KernelFactory][RMSNORM] cache hit dev=" << static_cast<int>(target_device.type)
+                    LOG_TRACE("[KernelFactory][RMSNORM] cache hit dev=" << static_cast<int>(target_device.type)
                                                                         << ":" << target_device.ordinal
                                                                         << " tensor_type=" << static_cast<int>(tensor->native_type())
                                                                         << " kernel=" << static_cast<const void *>(raw_ptr));
@@ -2407,7 +2411,7 @@ namespace llaminar
                 auto reg_it = device_kernel_registry_.find(registry_key);
                 if (reg_it != device_kernel_registry_.end())
                 {
-                    LOG_DEBUG("[KernelFactory][Registry] hit kind=ATTENTION dev=" << static_cast<int>(target_device.type)
+                    LOG_TRACE("[KernelFactory][Registry] hit kind=ATTENTION dev=" << static_cast<int>(target_device.type)
                                                                                   << ":" << target_device.ordinal
                                                                                   << " variant=" << static_cast<int>(tensor->native_type())
                                                                                   << " ptr=" << reg_it->second.get());
@@ -2510,32 +2514,9 @@ namespace llaminar
                 return raw_ptr;
             }
 
-            llaminar2::IMoEKernel *KernelFactory::getOrCreateMoEKernel(
+            std::unique_ptr<llaminar2::IMoEKernel> KernelFactory::createMoEKernel(
                 llaminar2::DeviceId target_device)
             {
-                const DeviceKernelKey registry_key{
-                    target_device,
-                    KernelKind::MOE,
-                    0}; // No variant (always FP32)
-
-                MoECacheKey key{target_device};
-
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                auto reg_it = device_kernel_registry_.find(registry_key);
-                if (reg_it != device_kernel_registry_.end())
-                {
-                    return static_cast<llaminar2::IMoEKernel *>(reg_it->second.get());
-                }
-
-                auto it = moe_cache_.find(key);
-                if (it != moe_cache_.end())
-                {
-                    auto *raw_ptr = it->second.get();
-                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                    return raw_ptr;
-                }
-
                 // Create device-appropriate MoE kernel. CUDA/ROCm devices must
                 // never silently fall through to CPU: that would pull routing
                 // tensors back to host and break graph-capture assumptions.
@@ -2549,7 +2530,7 @@ namespace llaminar
 #else
                 if (target_device.is_cuda())
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: CUDA device requested but HAVE_CUDA is OFF");
+                    throw std::runtime_error("KernelFactory::createMoEKernel: CUDA device requested but HAVE_CUDA is OFF");
                 }
                 else
 #endif
@@ -2562,7 +2543,7 @@ namespace llaminar
 #else
                 if (target_device.is_rocm())
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: ROCm device requested but HAVE_ROCM is OFF");
+                    throw std::runtime_error("KernelFactory::createMoEKernel: ROCm device requested but HAVE_ROCM is OFF");
                 }
                 else
 #endif
@@ -2572,16 +2553,13 @@ namespace llaminar
                 }
                 else
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: invalid target device " + target_device.to_string());
+                    throw std::runtime_error("KernelFactory::createMoEKernel: invalid target device " + target_device.to_string());
                 }
 
-                auto *raw_ptr = kernel.get();
-                moe_cache_[key] = std::move(kernel);
-                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                LOG_DEBUG("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
+                LOG_TRACE("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
                                                              << ":" << target_device.ordinal
-                                                             << " kernel=" << static_cast<const void *>(raw_ptr));
-                return raw_ptr;
+                                                             << " kernel=" << static_cast<const void *>(kernel.get()));
+                return kernel;
             }
 
             std::unique_ptr<llaminar2::ITensorRoPE> KernelFactory::createRoPE(
@@ -2935,7 +2913,6 @@ namespace llaminar
             std::unordered_map<KernelFactory::ResidualAddCacheKey, std::unique_ptr<llaminar2::ITensorResidualAdd>, KernelFactory::ResidualAddCacheKeyHash> KernelFactory::residual_add_cache_;
             std::unordered_map<KernelFactory::AttentionCacheKey, std::unique_ptr<llaminar2::ITensorAttention>, KernelFactory::AttentionCacheKeyHash> KernelFactory::attention_cache_;
             std::unordered_map<KernelFactory::EmbeddingCacheKey, std::unique_ptr<llaminar2::ITensorEmbedding>, KernelFactory::EmbeddingCacheKeyHash> KernelFactory::embedding_cache_;
-            std::unordered_map<KernelFactory::MoECacheKey, std::unique_ptr<llaminar2::IMoEKernel>, KernelFactory::MoECacheKeyHash> KernelFactory::moe_cache_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> KernelFactory::device_kernel_registry_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<KernelFactory::IGemmEngine>, DeviceKernelKeyHash> KernelFactory::device_gemm_engine_registry_;
             // NOTE: Device-level kernel caching (hipBLAS, cuBLAS handles, etc.)
@@ -3047,7 +3024,6 @@ namespace llaminar
                 residual_add_cache_.clear();
                 attention_cache_.clear();
                 embedding_cache_.clear();
-                moe_cache_.clear();
                 device_kernel_registry_.clear();
                 device_gemm_engine_registry_.clear();
 #ifdef HAVE_CUDA
@@ -3078,7 +3054,7 @@ namespace llaminar
                         if (!kernel)
                             continue;
                         kernel->resetDynamicState();
-                        kernel->setGPUStream(nullptr);
+                        kernel->clearGPUStreamBinding();
                     }
                 };
 
@@ -3090,8 +3066,6 @@ namespace llaminar
                 reset_kernel_cache(residual_add_cache_);
                 reset_kernel_cache(attention_cache_);
                 reset_kernel_cache(embedding_cache_);
-                reset_kernel_cache(moe_cache_);
-
 #if LLAMINAR_ASSERTIONS_ACTIVE
                 // Post-reset assertion: no kernel should retain stale dynamic state
                 for (const auto &[key, kernel] : embedding_cache_)
@@ -3107,8 +3081,7 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory] Reset dynamic state on "
                           << embedding_cache_.size() << " embedding, "
                           << attention_cache_.size() << " attention, "
-                          << rope_cache_.size() << " RoPE, "
-                          << moe_cache_.size() << " MoE kernels");
+                          << rope_cache_.size() << " RoPE kernels");
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -3117,7 +3090,7 @@ namespace llaminar
                 size_t total_bytes = 0;
                 // Note: packed_bytes not tracked per-kernel
                 // For now, just return count (includes all caches)
-                return {fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + moe_cache_.size() + device_kernel_registry_.size(), total_bytes};
+                return {fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size(), total_bytes};
             }
 
             std::shared_ptr<void> KernelFactory::getDeviceKernelEntry(const DeviceKernelKey &key)
@@ -3380,12 +3353,18 @@ namespace llaminar
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
                 const llaminar2::TensorBase *tensor,
                 llaminar2::DeviceId target_device,
-                GemmPreparationKind prep_kind)
+                GemmPreparationKind prep_kind,
+                llaminar2::CPUWeightStoragePlacement placement)
             {
                 if (!tensor)
                     return nullptr;
 
                 const bool quantized = isVnniPackableTensor(tensor);
+                if (!quantized)
+                {
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Floating-point expert preparation requires shared tensor ownership");
+                    return nullptr;
+                }
 
                 GemmPreparationKind resolved_kind = prep_kind;
                 if (resolved_kind == GemmPreparationKind::AUTO)
@@ -3434,8 +3413,17 @@ namespace llaminar
                 if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
                     (void)ensurePackedWeightsInTensorCache(tensor);
 
-                // Create the GEMM kernel bound to this tensor
-                auto kernel = createPreparedKernelForDevice(tensor, target_device);
+                // ExpertOverlay may move this logical matrix between CPU and
+                // GPU after any residency epoch. Bind the cross-backend
+                // arithmetic policy at preparation rather than inferring it
+                // later from whichever device happens to own the bytes.
+                auto kernel = std::make_unique<
+                    llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                    tensor,
+                    0,
+                    -1,
+                    llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert,
+                    placement);
                 if (!kernel)
                 {
                     LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Failed to create kernel for expert view");
@@ -3447,44 +3435,106 @@ namespace llaminar
                 return std::shared_ptr<llaminar2::ITensorGemm>(std::move(kernel));
             }
 
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
+                std::shared_ptr<llaminar2::TensorBase> tensor,
+                llaminar2::DeviceId target_device,
+                GemmPreparationKind prep_kind,
+                llaminar2::CPUWeightStoragePlacement placement)
+            {
+                if (!tensor)
+                    return nullptr;
+
+                const bool quantized = isVnniPackableTensor(tensor.get());
+                const GemmPreparationKind resolved_kind =
+                    resolveGemmPreparationKind(tensor.get(), target_device, prep_kind);
+
+                if (!quantized &&
+                    resolved_kind == GemmPreparationKind::FLOATING_POINT &&
+                    getDeviceType(target_device) == DeviceType::CPU)
+                {
+                    if (!tensor->raw_data())
+                    {
+                        LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Floating-point expert tensor has no raw data");
+                        return nullptr;
+                    }
+
+                    // The shared expert constructor copies native bytes into the
+                    // engine's final recyclable slot. Supplying shared ownership
+                    // here proves that the source cannot disappear during that
+                    // one preparation transaction.
+                    return std::make_shared<llaminar2::gemm::FloatingPointGemmKernel>(
+                        std::shared_ptr<const llaminar2::TensorBase>(std::move(tensor)),
+                        llaminar2::gemm::FloatingPointGemmKernel::NumericalPolicy::
+                            GPUAlignedExpert,
+                        placement);
+                }
+
+                // Packed CPU kernels own their final representation. GPU expert
+                // preparation is rejected by the raw overload and must use the
+                // PreparedWeightStore-backed load pipeline.
+                return prepareExpertGemmLocal(
+                    tensor.get(), target_device, resolved_kind, placement);
+            }
+
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
                 const std::vector<uint8_t> &blob)
             {
-                if (blob.empty())
+                return createExpertGemmFromTransferBlob(blob.data(), blob.size());
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
+                const uint8_t *data,
+                size_t size,
+                llaminar2::CPUWeightStoragePlacement placement)
+            {
+                if (!data || size == 0)
                     return nullptr;
 
                 auto packed_weights = llaminar2::packed_weights_serialization::deserialize(
-                    blob.data(), blob.size());
+                    data, size, placement);
                 if (!packed_weights)
                 {
                     LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
                               "Failed to deserialize transferred blob ("
-                              << blob.size() << " bytes)");
+                              << size << " bytes)");
                     return nullptr;
                 }
+
+                return createExpertGemmFromPackedWeights(
+                    std::move(packed_weights));
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm>
+            KernelFactory::createExpertGemmFromPackedWeights(
+                std::unique_ptr<llaminar2::IPackedWeights> packed_weights)
+            {
+                if (!packed_weights)
+                    return nullptr;
 
                 auto *cpu_pw = dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeights *>(
                     packed_weights.get());
                 if (!cpu_pw)
                 {
-                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
-                              "Deserialized weights are not CPUPackedWeights");
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromPackedWeights] "
+                              "Weights are not CPU NativeVNNI packed weights");
                     return nullptr;
                 }
 
-                if (dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *>(
-                        packed_weights.get()))
-                {
-                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
-                              "Deferred/native-block CPU VNNI blobs are no longer accepted; expected eager interleaved packed weights");
-                    return nullptr;
-                }
-
+                /*
+                 * A portable ExpertOverlay archive record deliberately carries
+                 * both eager CPU NativeVNNI data and the original quantized
+                 * blocks used by CUDA/ROCm repack.  The CPU destination consumes
+                 * the eager representation below and discards the additional
+                 * native-block section with the transfer wrapper.  Presence of
+                 * native blocks is therefore not a deferred-packing request;
+                 * hasInterleavedData() remains the authoritative CPU gate.
+                 */
                 auto kernel = std::make_shared<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
-                    cpu_pw->takePacked());
+                    cpu_pw->takePacked(),
+                    llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert);
                 if (!kernel->isValid())
                 {
-                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromPackedWeights] "
                               "Transferred CPU VNNI blob did not contain eager interleaved weights");
                     return nullptr;
                 }
@@ -3517,19 +3567,25 @@ namespace llaminar
                 if (!tensor)
                     throw std::runtime_error("prepareEmbeddingHandleLocal: null tensor");
 
-                if (!isVnniPackableTensor(tensor))
+                // Embedding preparation needs the format-neutral unpacking
+                // contract, not GEMM's NativeVNNI capability metadata. Q8_K is
+                // intentionally a legacy INT8-VNNI GEMM format and therefore
+                // has no NativeVnniFormatInfo, but it still provides complete
+                // IINT8Unpackable rows for the universal EmbedQ8 representation.
+                if (!dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor))
                     return nullptr;
 
                 const size_t shard_rows = tensor->rows();
                 const size_t effective_total = (total_vocab > 0) ? total_vocab : shard_rows;
                 const bool is_sharded = (shard_rows < effective_total);
 
-                auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model);
-
                 auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
-                weights->byte_size = repacked.byte_size;
-                weights->blocks_per_row = repacked.blocks_per_row;
-                weights->vocab_size = repacked.vocab_size;
+                weights->blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+                weights->vocab_size = shard_rows;
+                weights->byte_size =
+                    llaminar2::PreparedEmbeddingWeights::allocationBytes(
+                        shard_rows,
+                        d_model);
                 weights->vocab_offset = vocab_offset;
                 weights->total_vocab = effective_total;
                 weights->d_model = d_model;
@@ -3542,16 +3598,68 @@ namespace llaminar
                     return nullptr;
                 }
 
-                weights->device_data = backend->allocate(repacked.byte_size, target_device.ordinal);
+                weights->device_data = backend->allocate(weights->byte_size, target_device.ordinal);
                 if (!weights->device_data)
                 {
                     LOG_ERROR("[PreparedEmbeddingWeights] GPU allocation failed for "
-                              << target_device.to_string() << " (" << (repacked.byte_size / (1024 * 1024)) << " MB)");
+                              << target_device.to_string() << " (" << (weights->byte_size / (1024 * 1024)) << " MB)");
                     return nullptr;
                 }
 
-                const bool upload_ok = backend->hostToDevice(weights->device_data, repacked.data.data(),
-                                                             repacked.byte_size, target_device.ordinal);
+                // Repack and upload embeddings by contiguous vocabulary rows.
+                // The old path materialized the entire EmbedQ8 table in a host
+                // vector before the first H2D copy, which could independently
+                // exceed the load-pipeline staging cap for large vocabularies.
+                const auto &load_cfg = llaminar2::debugEnv().rocm;
+                const size_t staging_budget_bytes = load_cfg.repack_budget_mb > 0
+                                                        ? static_cast<size_t>(load_cfg.repack_budget_mb) *
+                                                              1024ULL * 1024ULL
+                                                        : weights->byte_size;
+                const size_t bytes_per_row = weights->blocks_per_row * sizeof(llaminar2::EmbedQ8Block);
+                const size_t rows_per_chunk = std::max<size_t>(
+                    1, staging_budget_bytes > 0 ? staging_budget_bytes / bytes_per_row : shard_rows);
+                const bool can_discard_mmap_rows = tensor->is_mmap_data() && shard_rows > 0 &&
+                                                   tensor->size_bytes() % shard_rows == 0;
+                const size_t raw_bytes_per_row = can_discard_mmap_rows
+                                                     ? tensor->size_bytes() / shard_rows
+                                                     : 0;
+                const auto *raw_base = static_cast<const uint8_t *>(tensor->raw_data());
+
+                bool upload_ok = true;
+                void *setup_stream = nullptr;
+                if (target_device.is_gpu())
+                {
+                    setup_stream = llaminar2::GPUDeviceContextPool::instance()
+                                       .getContext(target_device)
+                                       .defaultStream();
+                    if (!setup_stream)
+                    {
+                        backend->free(weights->device_data, target_device.ordinal);
+                        weights->device_data = nullptr;
+                        throw std::runtime_error(
+                            "prepareEmbeddingHandleLocal: target GPU has no explicit setup stream");
+                    }
+                }
+                for (size_t row = 0; row < shard_rows; row += rows_per_chunk)
+                {
+                    const size_t row_count = std::min(rows_per_chunk, shard_rows - row);
+                    auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model, row, row_count);
+                    auto *dst = static_cast<uint8_t *>(weights->device_data) + row * bytes_per_row;
+                    if (!backend->hostToDevice(dst, repacked.data.data(), repacked.byte_size,
+                                               target_device.ordinal, setup_stream))
+                    {
+                        upload_ok = false;
+                        break;
+                    }
+
+                    if (can_discard_mmap_rows && raw_base)
+                    {
+                        llaminar2::MmapRegion::adviseDontneedRange(
+                            raw_base + row * raw_bytes_per_row,
+                            row_count * raw_bytes_per_row);
+                    }
+                }
+
                 if (!upload_ok)
                 {
                     LOG_ERROR("[PreparedEmbeddingWeights] H2D upload failed for " << target_device.to_string());
@@ -3563,12 +3671,13 @@ namespace llaminar
                 LOG_DEBUG("[PreparedEmbeddingWeights] Prepared embedding for "
                           << target_device.to_string() << ": "
                           << llaminar2::tensorTypeName(tensor->native_type()) << " "
-                          << repacked.vocab_size << "x" << d_model
+                          << weights->vocab_size << "x" << d_model
                           << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
                                             " of " + std::to_string(effective_total) + ")")
                                          : "")
-                          << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                          << " (" << repacked.blocks_per_row << " blocks/row)");
+                          << " → " << (weights->byte_size / (1024 * 1024)) << " MB"
+                          << " (" << weights->blocks_per_row << " blocks/row, staging <= "
+                          << (staging_budget_bytes / (1024 * 1024)) << " MB)");
 
                 auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
                 handle->tensor = tensor;
@@ -3601,15 +3710,41 @@ namespace llaminar
                 {
                 }
 
-                // Propagate GPU stream to internal GEMM kernels so they
-                // launch on the correct stream during graph capture/replay.
-                void setGPUStream(void *stream) override
+                /**
+                 * @brief Propagate one validated producer stream to both GEMMs.
+                 *
+                 * The adapter receives only a non-null binding from the
+                 * ITensorKernel gateway, so both child launches are guaranteed
+                 * to join the same graph-capture or replay transaction.
+                 */
+                void bindGPUStream(llaminar2::ExplicitGPUStream stream) override
                 {
-                    llaminar2::ITensorFusedGateUpGemm::setGPUStream(stream);
                     if (gemm_gate_)
-                        gemm_gate_->setGPUStream(stream);
+                        gemm_gate_->bindGPUStream(stream);
                     if (gemm_up_)
-                        gemm_up_->setGPUStream(stream);
+                        gemm_up_->bindGPUStream(stream);
+                }
+
+                /**
+                 * @brief Explicitly end the borrowed child-stream lifetime.
+                 */
+                void clearGPUStreamBinding() override
+                {
+                    if (gemm_gate_)
+                        gemm_gate_->clearGPUStreamBinding();
+                    if (gemm_up_)
+                        gemm_up_->clearGPUStreamBinding();
+                }
+
+                bool prepareFusedProjectionGraphCapture(
+                    size_t projection_count) override
+                {
+                    if (projection_count != 2 || !gemm_gate_ || !gemm_up_)
+                        return false;
+                    return gemm_gate_->prepareFusedProjectionGraphCapture(
+                               projection_count) &&
+                           gemm_up_->prepareFusedProjectionGraphCapture(
+                               projection_count);
                 }
 
                 bool execute(
@@ -3709,6 +3844,28 @@ namespace llaminar
                     }
 
                     return combined;
+                }
+
+                /**
+                 * @brief Forward the typed fused-bundle scratch declaration.
+                 *
+                 * The gate kernel is the execution anchor for the two-child
+                 * transaction, so it is also the sole authority for any
+                 * backend-specific simultaneous projection arena.
+                 */
+                void appendFusedProjectionWorkspaceRequirements(
+                    llaminar2::WorkspaceRequirements &requirements,
+                    int m,
+                    std::span<const int> projection_columns,
+                    int k) const override
+                {
+                    auto *gate_consumer =
+                        dynamic_cast<llaminar2::IWorkspaceConsumer *>(gemm_gate_);
+                    if (gate_consumer)
+                    {
+                        gate_consumer->appendFusedProjectionWorkspaceRequirements(
+                            requirements, m, projection_columns, k);
+                    }
                 }
 
                 void bindWorkspace(llaminar2::DeviceWorkspaceManager *workspace) override
@@ -3817,7 +3974,10 @@ namespace llaminar
             size_t KVCacheConfig::estimateBytes() const
             {
                 int effective_kv_heads = (local_n_kv_heads > 0) ? local_n_kv_heads : n_kv_heads;
-                if (effective_kv_heads <= 0 || num_layers <= 0 || head_dim <= 0)
+                const int effective_layers =
+                    hybrid_config ? hybrid_config->countKVLayers()
+                                  : num_layers;
+                if (effective_kv_heads <= 0 || effective_layers <= 0 || head_dim <= 0)
                     return 0;
 
                 std::string prec_str;
@@ -3826,19 +3986,33 @@ namespace llaminar
                 case ::llaminar2::ActivationPrecision::FP32:
                     prec_str = "fp32";
                     break;
+                case ::llaminar2::ActivationPrecision::BF16:
+                    prec_str = "bf16";
+                    break;
                 case ::llaminar2::ActivationPrecision::FP16:
                     prec_str = "fp16";
                     break;
                 case ::llaminar2::ActivationPrecision::Q8_1:
                     prec_str = "q8_1";
                     break;
-                default:
-                    prec_str = "fp16";
+                case ::llaminar2::ActivationPrecision::Q16_1:
+                    prec_str = "q16_1";
                     break;
+                case ::llaminar2::ActivationPrecision::TQ4:
+                    prec_str = "tq4";
+                    break;
+                case ::llaminar2::ActivationPrecision::TQ8:
+                    prec_str = "tq";
+                    break;
+                case ::llaminar2::ActivationPrecision::Hybrid:
+                case ::llaminar2::ActivationPrecision::HybridQ16:
+                case ::llaminar2::ActivationPrecision::AQ8:
+                    throw std::invalid_argument(
+                        "KVCacheConfig::estimateBytes received a non-storage activation precision");
                 }
 
                 return ::llaminar2::KVCacheMemoryEstimator::estimate(
-                    num_layers, batch_size, max_seq_len,
+                    effective_layers, batch_size, max_seq_len,
                     effective_kv_heads, head_dim, prec_str, device);
             }
 
@@ -3848,59 +4022,155 @@ namespace llaminar
 
             std::unique_ptr<llaminar2::IKVCache> KernelFactory::createKVCache(const KVCacheConfig &config)
             {
-                // If hybrid config is provided, create a hybrid cache
-                if (config.is_hybrid())
+                std::shared_ptr<void> physical_memory_lease;
+                std::shared_ptr<void> recurrent_live_memory_lease;
+                if (config.physical_memory_authority)
                 {
-                    return createHybridKVCache(config);
+                    const size_t physical_bytes = config.estimateBytes();
+                    if (physical_bytes > 0)
+                    {
+                        auto typed_lease =
+                            config.physical_memory_authority->claimNewAllocation(
+                                config.device,
+                                llaminar2::PhysicalMemoryOwner::KVCache,
+                                physical_bytes);
+                        physical_memory_lease =
+                            std::make_shared<llaminar2::PhysicalMemoryAllocationLease>(
+                                std::move(typed_lease));
+                    }
+
+                    /*
+                     * CPU GDN vectors are a second physical owner beside the
+                     * compressed full-attention KV slab. Claim them before the
+                     * concrete constructor so allocation unwind cannot leave
+                     * the canonical ledger stale. GPU GDN arenas claim their
+                     * exact packed allocations internally.
+                     */
+                    if (config.device.is_cpu() && config.hybrid_config &&
+                        config.hybrid_config->countGDNLayers() > 0)
+                    {
+                        const size_t recurrent_bytes =
+                            config.hybrid_config->gdnStateGeometry()
+                                .localPayloadBytes(
+                                    config.hybrid_config->countGDNLayers());
+                        if (recurrent_bytes > 0)
+                        {
+                            auto typed_lease =
+                                config.physical_memory_authority
+                                    ->claimNewAllocation(
+                                        config.device,
+                                        llaminar2::PhysicalMemoryOwner::RecurrentLiveState,
+                                        recurrent_bytes);
+                            recurrent_live_memory_lease =
+                                std::make_shared<llaminar2::PhysicalMemoryAllocationLease>(
+                                    std::move(typed_lease));
+                        }
+                    }
                 }
 
-                if (config.device.is_cpu())
+                auto create_concrete = [&]() -> std::unique_ptr<llaminar2::IKVCache>
                 {
-                    return createCPUKVCache(config);
-                }
-                else if (config.device.is_cuda())
-                {
+                    // If hybrid config is provided, create a hybrid cache.
+                    if (config.is_hybrid())
+                    {
+                        return createHybridKVCache(config);
+                    }
+
+                    if (config.device.is_cpu())
+                    {
+                        return createCPUKVCache(config);
+                    }
+                    else if (config.device.is_cuda())
+                    {
 #ifdef HAVE_CUDA
                     // TQ precision uses a separate non-template class
-                    if (config.precision == llaminar2::ActivationPrecision::TQ4 ||
+                    if (config.precision == llaminar2::ActivationPrecision::Q8_1 ||
+                        config.precision == llaminar2::ActivationPrecision::TQ4 ||
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int cuda_device = config.device.cuda_ordinal();
+                        const auto tq_mode =
+                            llaminar2::turboQuantKVModeFromPrecision(config.precision);
+                        if (config.is_sharded())
+                        {
+                            return std::make_unique<llaminar2::CUDARingKVCacheTQ>(
+                                config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim,
+                                config.turboquant_ctx, cuda_device, tq_mode);
+                        }
                         return std::make_unique<llaminar2::CUDARingKVCacheTQ>(
                             config.num_layers, config.batch_size, config.max_seq_len,
                             config.n_kv_heads, config.head_dim,
-                            config.turboquant_ctx, cuda_device);
+                            config.turboquant_ctx, cuda_device, tq_mode);
                     }
                     return createCUDAKVCache(config);
 #else
                     LOG_ERROR("[KernelFactory] CUDA KVCache requested but HAVE_CUDA not defined");
                     throw std::runtime_error("KernelFactory::createKVCache: CUDA support not compiled in");
 #endif
-                }
-                else if (config.device.is_rocm())
-                {
+                    }
+                    else if (config.device.is_rocm())
+                    {
 #ifdef HAVE_ROCM
                     // TQ precision uses a separate non-template class
-                    if (config.precision == llaminar2::ActivationPrecision::TQ4 ||
+                    if (config.precision == llaminar2::ActivationPrecision::Q8_1 ||
+                        config.precision == llaminar2::ActivationPrecision::TQ4 ||
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int rocm_device = config.device.rocm_ordinal();
+                        const auto tq_mode =
+                            llaminar2::turboQuantKVModeFromPrecision(config.precision);
+                        if (config.is_sharded())
+                        {
+                            return llaminar2::createShardedROCmRingKVCacheTQ(
+                                config.num_layers, config.batch_size, config.max_seq_len,
+                                config.n_kv_heads, config.local_n_kv_heads,
+                                config.kv_head_start, config.head_dim,
+                                config.turboquant_ctx, rocm_device, tq_mode);
+                        }
                         return llaminar2::createROCmRingKVCacheTQ(
                             config.num_layers, config.batch_size, config.max_seq_len,
                             config.n_kv_heads, config.head_dim,
-                            config.turboquant_ctx, rocm_device);
+                            config.turboquant_ctx, rocm_device, tq_mode);
                     }
                     return createROCmKVCache(config);
 #else
                     LOG_ERROR("[KernelFactory] ROCm KVCache requested but HAVE_ROCM not defined");
                     throw std::runtime_error("KernelFactory::createKVCache: ROCm support not compiled in");
 #endif
-                }
-                else
+                    }
+                    else
+                    {
+                        LOG_ERROR("[KernelFactory] Unsupported device type for KVCache: " << config.device.to_string());
+                        throw std::runtime_error("KernelFactory::createKVCache: Unsupported device type");
+                    }
+                };
+
+                auto cache = create_concrete();
+                if (!cache)
                 {
-                    LOG_ERROR("[KernelFactory] Unsupported device type for KVCache: " << config.device.to_string());
-                    throw std::runtime_error("KernelFactory::createKVCache: Unsupported device type");
+                    throw std::runtime_error(
+                        "KernelFactory::createKVCache: backend returned a null cache");
                 }
+                if (physical_memory_lease)
+                {
+                    cache->bindPhysicalMemoryLease(
+                        std::move(physical_memory_lease));
+                }
+                if (recurrent_live_memory_lease)
+                {
+                    auto *hybrid =
+                        dynamic_cast<llaminar2::IHybridKVCache *>(cache.get());
+                    if (!hybrid)
+                    {
+                        throw std::logic_error(
+                            "KernelFactory recurrent-state claim requires a hybrid cache");
+                    }
+                    hybrid->bindRecurrentLiveMemoryLease(
+                        std::move(recurrent_live_memory_lease));
+                }
+                return cache;
             }
 
             std::unique_ptr<llaminar2::ICPUKVCache> KernelFactory::createCPUKVCache(const KVCacheConfig &config)
@@ -4296,25 +4566,29 @@ namespace llaminar
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP32>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::FP16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::BF16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheBF16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::Q8_1:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheQ8_1>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
                                 config.n_kv_heads, config.local_n_kv_heads, config.kv_head_start,
-                                config.head_dim, cuda_device);
+                                config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         default:
                             throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CUDA precision");
@@ -4327,22 +4601,26 @@ namespace llaminar
                         case llaminar2::ActivationPrecision::FP32:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP32>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::FP16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheFP16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::BF16:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheBF16>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         case llaminar2::ActivationPrecision::Q8_1:
                             cache = std::make_unique<llaminar2::CUDAHybridRingKVCacheQ8_1>(
                                 hc, config.num_layers, config.batch_size, config.max_seq_len,
-                                config.n_kv_heads, config.head_dim, cuda_device);
+                                config.n_kv_heads, config.head_dim, cuda_device,
+                                config.physical_memory_authority);
                             break;
                         default:
                             throw std::runtime_error("KernelFactory::createHybridKVCache: Unsupported CUDA precision");
@@ -4368,13 +4646,15 @@ namespace llaminar
                         cache = llaminar2::createShardedROCmHybridRingKVCache(
                             hc, config.precision, config.num_layers, config.batch_size,
                             config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
-                            config.kv_head_start, config.head_dim, rocm_device);
+                            config.kv_head_start, config.head_dim, rocm_device,
+                            config.physical_memory_authority);
                     }
                     else
                     {
                         cache = llaminar2::createROCmHybridRingKVCache(
                             hc, config.precision, config.num_layers, config.batch_size,
-                            config.max_seq_len, config.n_kv_heads, config.head_dim, rocm_device);
+                            config.max_seq_len, config.n_kv_heads, config.head_dim,
+                            rocm_device, config.physical_memory_authority);
                     }
                 }
 #endif // HAVE_ROCM
@@ -4384,9 +4664,9 @@ namespace llaminar
                                              config.device.to_string());
                 }
 
-                // Post-creation: initialize GDN kernel instances in each GDN layer's state.
-                // This must happen after cache construction since initHybrid() only allocates
-                // host-side state buffers — kernel creation requires KernelFactory access.
+                // Post-creation: initialize GDN kernel instances in each GDN layer's resources.
+                // Cache construction records local/full state shapes. CPU caches also allocate
+                // their host-owned live vectors; GPU caches deliberately do not.
                 auto *hybrid = dynamic_cast<llaminar2::IHybridKVCache *>(cache.get());
                 if (hybrid)
                 {
@@ -4406,16 +4686,32 @@ namespace llaminar
                         gdn_state->conv_kernel = createShortConvolution(dev_type, dev_ordinal);
                         gdn_state->rec_kernel = createGatedDeltaNet(dev_type, dev_ordinal);
 
-                        // Allocate device-resident state buffers for GPU kernels
-                        // (no-op for CPU via virtual dispatch)
-                        gdn_state->conv_kernel->allocateGPUState(
-                            static_cast<int>(gdn_state->conv_state.size()));
-                        // In-place prefill scratch is supplied by ShortConv1dStage
-                        // through DeviceWorkspaceManager. Keeping it out of the
-                        // per-layer KV-cache state avoids one persistent
-                        // max_seq_len * qkv_dim allocation for every GDN layer.
-                        gdn_state->rec_kernel->allocateGPUState(
-                            static_cast<int>(gdn_state->recurrence_state.size()));
+                        /*
+                         * GPU state belongs to the hybrid cache, whose arena planned
+                         * every layer's local/full/request slices during construction.
+                         * Kernels receive non-owning views only. Missing or malformed
+                         * bindings are fatal because allocating a replacement here
+                         * would hide a planner defect and invalidate captured pointers.
+                         */
+                        if (config.device.is_gpu())
+                        {
+                            if (!gdn_state->conv_kernel->bindDeviceState(
+                                    gdn_state->conv_device_state))
+                            {
+                                throw std::runtime_error(
+                                    "KernelFactory::createHybridKVCache: short-conv kernel rejected "
+                                    "cache-owned device state for layer " +
+                                    std::to_string(global_layer));
+                            }
+                            if (!gdn_state->rec_kernel->bindDeviceState(
+                                    gdn_state->recurrence_device_state))
+                            {
+                                throw std::runtime_error(
+                                    "KernelFactory::createHybridKVCache: recurrence kernel rejected "
+                                    "cache-owned device state for layer " +
+                                    std::to_string(global_layer));
+                            }
+                        }
                     }
 
                     LOG_DEBUG("[KernelFactory] Initialized GDN kernels for "

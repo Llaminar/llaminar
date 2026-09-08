@@ -155,7 +155,8 @@ namespace llaminar2
     /**
      * @brief Thread-safe transfer profiling accumulator for coherence system
      *
-     * Tracks bytes uploaded (H2D) and downloaded (D2H) when LLAMINAR_PROFILING is enabled.
+     * Tracks bytes uploaded (H2D) and downloaded (D2H) for PerfStats and
+     * explicitly requested legacy kernel profiling.
      * Uses atomic operations for thread-safe accumulation without locks.
      * Supports per-stage breakdown via setCurrentStage()/clearCurrentStage().
      */
@@ -203,7 +204,8 @@ namespace llaminar2
          */
         static bool isEnabled()
         {
-            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
+            return debugEnv().profile.enabled ||
+                   PerfStatsCollector::isDomainEnabled("transfer");
         }
 
         /**
@@ -674,11 +676,11 @@ namespace llaminar2
          */
         static bool isEnabled()
         {
-            // Structured perf export alone must stay passive. Kernel/forward
-            // timing changes hot execution paths and is opt-in through
-            // LLAMINAR_PROFILING, LLAMINAR_GPU_STAGE_TIMING, or the explicit
-            // perf-stats GPU timing request.
-            return debugEnv().profile.enabled || PerfStatsCollector::gpuStageEventTimingEnabled();
+            // A broad structured export remains passive, while an explicit
+            // `kernel` filter is a first-class request for this instrumentation.
+            return debugEnv().profile.enabled ||
+                   PerfStatsCollector::isDomainEnabled("kernel") ||
+                   PerfStatsCollector::gpuStageEventTimingEnabled();
         }
 
         /**
@@ -854,7 +856,7 @@ namespace llaminar2
         {
             if (!isEnabled())
             {
-                return "[Kernel profiling disabled. Set LLAMINAR_PROFILING=1 to enable]\n";
+                return "[Legacy kernel profiling disabled. Set LLAMINAR_PROFILE_KERNELS=1 to enable]\n";
             }
 
             auto &inst = getInstance();
@@ -1216,7 +1218,7 @@ namespace llaminar2
 
         static void recordUnified(KernelType type, uint64_t duration_ns, std::string device_key)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled("kernel"))
                 return;
             if (device_key.empty() && ProfilingContext::hasDeviceContext())
                 device_key = ProfilingContext::getCurrentDeviceKey();

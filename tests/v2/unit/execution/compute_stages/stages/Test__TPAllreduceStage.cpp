@@ -17,6 +17,12 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "execution/compute_stages/stages/TPAllreduceStage.h"
@@ -26,11 +32,58 @@
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "utils/DebugEnv.h"
 #include "utils/MPIContext.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h"
+#include "../../../../mocks/MockLocalTPContext.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
+
+namespace
+{
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+                old_value_ = std::string(old);
+            ::setenv(name_.c_str(), value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnv()
+        {
+            if (old_value_)
+                ::setenv(name_.c_str(), old_value_->c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> old_value_;
+    };
+
+    std::string readTextFile(const char *path)
+    {
+        std::ifstream input(path);
+        if (!input)
+            return {};
+
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
+} // namespace
 
 // =============================================================================
 // Test Fixture
@@ -131,6 +184,179 @@ TEST_F(Test__TPAllreduceStage, CoherencePolicyIsOutput)
     auto stage = std::make_unique<TPAllreduceStage>(params);
 
     EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::OUTPUT);
+}
+
+TEST_F(Test__TPAllreduceStage,
+       RootedCollectiveContractsEncodeEveryParticipantRole)
+{
+    llaminar2::test::MockLocalTPContext tp_ctx;
+    tp_ctx.setDevices({cuda0_, cuda1_});
+    tp_ctx.setBackend(CollectiveBackendType::NCCL);
+
+    struct ExpectedRole
+    {
+        TPLocalRootedCollectiveOperation operation;
+        int participant;
+        TPLocalRootedCollectiveTensorRole tensor_role;
+        BufferRole buffer_role;
+        size_t input_count;
+        size_t output_count;
+        size_t inout_count;
+    };
+
+    constexpr ExpectedRole cases[] = {
+        {.operation = TPLocalRootedCollectiveOperation::ReduceSum,
+         .participant = 1,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::ReduceRootInOut,
+         .buffer_role = BufferRole::INOUT,
+         .input_count = 0,
+         .output_count = 0,
+         .inout_count = 1},
+        {.operation = TPLocalRootedCollectiveOperation::ReduceSum,
+         .participant = 0,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::ReduceContributorInput,
+         .buffer_role = BufferRole::INPUT,
+         .input_count = 1,
+         .output_count = 0,
+         .inout_count = 0},
+        {.operation = TPLocalRootedCollectiveOperation::Broadcast,
+         .participant = 1,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::BroadcastRootInput,
+         .buffer_role = BufferRole::INPUT,
+         .input_count = 1,
+         .output_count = 0,
+         .inout_count = 0},
+        {.operation = TPLocalRootedCollectiveOperation::Broadcast,
+         .participant = 0,
+         .tensor_role =
+             TPLocalRootedCollectiveTensorRole::BroadcastReceiverOutput,
+         .buffer_role = BufferRole::OUTPUT,
+         .input_count = 0,
+         .output_count = 1,
+         .inout_count = 0},
+    };
+
+    for (const auto &expected : cases)
+    {
+        SCOPED_TRACE(
+            std::string(toString(expected.operation)) + "/participant=" +
+            std::to_string(expected.participant));
+
+        TPLocalRootedCollectiveStage::Params params;
+        params.device_id = DeviceId::cuda(expected.participant);
+        params.tp_ctx = &tp_ctx;
+        params.tensor = test_tensor_.get();
+        params.count = 129;
+        params.dtype = CollectiveDataType::FLOAT32;
+        params.operation = expected.operation;
+        params.root_device_index = 1;
+        params.participant_device_index = expected.participant;
+        params.stage_name = "canonical_routes_rooted_collective";
+        params.tensor_buffer_id =
+            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+
+        TPLocalRootedCollectiveStage stage(std::move(params));
+        EXPECT_EQ(stage.type(), ComputeStageType::ROOTED_COLLECTIVE);
+        EXPECT_EQ(stage.name(), "tp_local_rooted_collective");
+        EXPECT_TRUE(stage.requiresAllreduce());
+        EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::OUTPUT);
+        EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation())
+            << "Rooted collectives expose their complete static capture contract directly.";
+        EXPECT_TRUE(stage.isGraphCapturable());
+        EXPECT_EQ(stage.tensorRole(), expected.tensor_role);
+
+        const auto requirements = stage.getBufferRequirements();
+        ASSERT_EQ(requirements.buffers.size(), 1u);
+        EXPECT_EQ(requirements.buffers.front().role, expected.buffer_role);
+
+        const auto contract = stage.bufferContract();
+        EXPECT_EQ(contract.inputs.size(), expected.input_count);
+        EXPECT_EQ(contract.outputs.size(), expected.output_count);
+        EXPECT_EQ(contract.inouts.size(), expected.inout_count);
+        EXPECT_EQ(contract.bindingCount(), 1u);
+
+        if (!contract.inouts.empty())
+        {
+            EXPECT_FALSE(contract.inouts.front().prepare_write_storage)
+                << "The reduce root consumes the producer's existing allocation";
+        }
+        if (!contract.outputs.empty())
+        {
+            EXPECT_TRUE(contract.outputs.front().prepare_write_storage)
+                << "A broadcast receiver owns a newly prepared destination";
+        }
+    }
+}
+
+TEST_F(Test__TPAllreduceStage,
+       RootedCollectiveSidebandsRequireCapturableNativeSupport)
+{
+    llaminar2::test::MockLocalTPContext tp_ctx;
+    tp_ctx.setDevices({cuda0_, cuda1_});
+    tp_ctx.setBackend(CollectiveBackendType::NCCL);
+
+    TPLocalRootedCollectiveStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.tp_ctx = &tp_ctx;
+    params.tensor = test_tensor_.get();
+    params.count = 128;
+    params.root_device_index = 0;
+    params.participant_device_index = 0;
+    params.sideband_workspace_bindings.push_back(
+        TPAllreduceSidebandWorkspaceBinding{
+            .kind = LocalTPCollectiveSidebandKind::Allgather,
+            .send_buffer_name = "local_histogram",
+            .recv_buffer_name = "gathered_histogram",
+            .element_count = 32,
+            .dtype = CollectiveDataType::INT32,
+            .root_device_index = 0,
+            .name = "rebalance_histogram"});
+
+    TPLocalRootedCollectiveStage stage(std::move(params));
+    EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+    EXPECT_FALSE(stage.isGraphCapturable());
+
+    tp_ctx.setRawAllgatherGraphCaptureSupported(true);
+    EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "The same-stream sideband becomes directly capturable when the LocalTP context exposes its native primitive";
+}
+
+TEST_F(Test__TPAllreduceStage, SidebandsExecuteOnSameExplicitStreamAfterPrimaryAllreduce)
+{
+    const std::string source = readTextFile(LLAMINAR_TP_ALLREDUCE_STAGE_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t execute_fn = source.find("bool TPAllreduceStage::execute(");
+    ASSERT_NE(execute_fn, std::string::npos);
+    const size_t workspace_fn = source.find(
+        "WorkspaceRequirements TPAllreduceStage::getWorkspaceRequirements(",
+        execute_fn);
+    ASSERT_NE(workspace_fn, std::string::npos);
+    const std::string body = source.substr(execute_fn, workspace_fn - execute_fn);
+
+    EXPECT_NE(body.find("params_.sidebands"), std::string::npos);
+    EXPECT_NE(body.find("params_.sideband_workspace_bindings"), std::string::npos);
+    EXPECT_NE(body.find("bound_workspace_->getBuffer"), std::string::npos)
+        << "Workspace-backed sidebands must resolve buffers at capture/execution time.";
+    EXPECT_NE(body.find("workspace sidebands require a bound workspace"), std::string::npos);
+    EXPECT_NE(body.find("missing sideband send workspace buffer"), std::string::npos);
+    EXPECT_NE(body.find("missing sideband recv workspace buffer"), std::string::npos);
+    EXPECT_NE(body.find("dynamic_cast<ILocalTPContext *>"), std::string::npos);
+    EXPECT_NE(body.find("allreduceWithSidebandsOnStream"), std::string::npos);
+    EXPECT_EQ(body.find("collectiveSidebandOnStream"), std::string::npos)
+        << "Production TP sidebands must be grouped with the anchor allreduce, not launched after it.";
+    EXPECT_NE(body.find("stage_stream"), std::string::npos);
+    EXPECT_NE(body.find("params_.sideband_device_index"), std::string::npos);
+    EXPECT_NE(body.find("recordAllreduceSidebandBillOfMaterials(params_, sidebands, true)"), std::string::npos)
+        << "Sideband attachment must be visible in tp_allreduce_bom perfstats.";
+    EXPECT_NE(source.find("sideband_grouped_with_anchor_collective_calls"), std::string::npos);
+    EXPECT_NE(source.find("\"fused_with_anchor\", grouped_with_anchor ? \"true\" : \"false\""), std::string::npos);
+    EXPECT_NE(source.find("\"physical_fusion\", grouped_with_anchor ? \"grouped_with_anchor_collective\" : \"separate_backend_collective\""), std::string::npos);
+    EXPECT_NE(source.find("\"launch_relation\", grouped_with_anchor ? \"same_group_as_anchor\" : \"same_stream_after_anchor\""), std::string::npos);
 }
 
 /**
@@ -326,6 +552,54 @@ TEST_F(Test__TPAllreduceStage, ExecuteSucceedsSingleDeviceLocalTP)
     }
 }
 
+TEST_F(Test__TPAllreduceStage, GpuAllreduceFailsFastWithoutExplicitStream)
+{
+    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::HOST);
+    auto *tensor = test_tensor_.get();
+
+    TPAllreduceStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = tensor;
+    params.count = tensor->numel();
+    params.stage_name = "layer0_wo_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+    MockDeviceContext cuda_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    EXPECT_THROW((void)stage.execute(&cuda_ctx), std::logic_error);
+}
+
+TEST_F(Test__TPAllreduceStage, EmptyPrecisionResolvesBeforeOnStreamCollective)
+{
+    llaminar2::test::MockLocalTPContext tp_ctx;
+    tp_ctx.setDevices({cuda0_, cuda1_});
+    tp_ctx.setBackend(CollectiveBackendType::HOST);
+
+    auto *tensor = test_tensor_.get();
+    TPAllreduceStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.tp_ctx = &tp_ctx;
+    params.tensor = tensor;
+    params.count = 256;
+    params.stage_name = "embedding_allreduce";
+    params.precision = "";
+
+    TPAllreduceStage stage(params);
+    void *explicit_stream = reinterpret_cast<void *>(0x1234);
+    stage.setGPUStream(explicit_stream);
+
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const auto calls = tp_ctx.getAllreduceCalls();
+    ASSERT_EQ(calls.size(), 1u);
+    EXPECT_EQ(calls.front().stage_name, "embedding_allreduce");
+    EXPECT_EQ(calls.front().count, 256u);
+    EXPECT_EQ(calls.front().stream, explicit_stream);
+    EXPECT_EQ(calls.front().precision, "fp32");
+}
+
 // =============================================================================
 // Dump Info Tests
 // =============================================================================
@@ -383,7 +657,7 @@ TEST_F(Test__TPAllreduceStage, DumpInfoIncludesScalarsLocalTP)
         if (scalar.name == std::string_view("tp_scope"))
         {
             found_tp_scope = true;
-            EXPECT_EQ(static_cast<int>(scalar.value), static_cast<int>(TPScope::LOCAL));
+            EXPECT_EQ(static_cast<int>(scalar.value), static_cast<int>(TPScope::RANK_LOCAL));
         }
     }
     EXPECT_TRUE(found_tp_scope);
@@ -462,4 +736,212 @@ TEST_F(Test__TPAllreduceStage, StageNameParameterStored)
 
     // Single device execute should succeed
     EXPECT_TRUE(stage->execute(ctx_.get()));
+}
+
+/**
+ * @test Execute records a per-buffer bill of materials entry when perf stats are enabled
+ */
+TEST_F(Test__TPAllreduceStage, RecordsBillOfMaterialsForMoERoutedAllreduce)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = test_tensor_.get();
+    params.count = 256;
+    params.stage_name = "layer0_moe_expert_overlay_fast_allreduce";
+    params.precision = "fp16";
+
+    auto stage = std::make_unique<TPAllreduceStage>(params);
+
+    ASSERT_TRUE(stage->execute(ctx_.get()));
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    const PerfStatRecord *stages = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+        else if (record.name == "stages")
+            stages = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_EQ(bytes->domain, "tp_allreduce_bom");
+    EXPECT_DOUBLE_EQ(bytes->value, 256.0 * sizeof(float));
+    EXPECT_EQ(bytes->tags.at("role"), "moe_routed_expert");
+    EXPECT_EQ(bytes->tags.at("stage"), "layer0_moe_expert_overlay_fast_allreduce");
+    EXPECT_EQ(bytes->tags.at("elements"), "256");
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("tensor_numel"), std::to_string(test_tensor_->numel()));
+    EXPECT_EQ(bytes->tags.at("tensor_type"), "FP32");
+    EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
+    EXPECT_EQ(bytes->tags.at("scope"), "rank_local");
+    EXPECT_EQ(bytes->tags.at("degree"), "1");
+    EXPECT_EQ(bytes->tags.at("no_op"), "true");
+
+    ASSERT_NE(stages, nullptr);
+    EXPECT_DOUBLE_EQ(stages->value, 1.0);
+    EXPECT_EQ(stages->tags.at("role"), "moe_routed_expert");
+    EXPECT_EQ(stages->tags.at("elements"), "256");
+    EXPECT_EQ(stages->tags.at("precision"), "fp16");
+    EXPECT_EQ(stages->tags.at("no_op"), "true");
+
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @test FP16 transport threshold reports tiny allreduces as FP32 in the BOM
+ */
+TEST_F(Test__TPAllreduceStage, BillOfMaterialsHonorsFP16MinimumElementThreshold)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv fp16_min("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS", "1024");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = test_tensor_.get();
+    params.count = 256;
+    params.stage_name = "layer0_moe_combined_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_DOUBLE_EQ(bytes->value, 256.0 * sizeof(float));
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
+
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @test Grouped rows cannot cross the FP16 threshold when one serial row does not.
+ *
+ * Qwen3.6 exposes this with a 5120-wide hidden state: serial decode reduces
+ * 5120 elements, while a two-request grouped condition reduces 10240 elements.
+ * Applying the 8192 cutoff to the aggregate silently changed the grouped path
+ * to FP16 even though each row's serial witness used FP32.  The production
+ * stage must make the choice from one logical row and publish that decision in
+ * its bill of materials.
+ */
+TEST_F(Test__TPAllreduceStage,
+       BillOfMaterialsFP16ThresholdIsInvariantToGroupedRowCount)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv fp16_min("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS", "8192");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto grouped_tensor =
+        std::make_unique<FP32Tensor>(std::vector<size_t>{2u, 5120u});
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = grouped_tensor.get();
+    params.count = grouped_tensor->numel();
+    params.stage_name = "layer8_gdn_wo_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
+    EXPECT_EQ(bytes->tags.at("logical_row_elements"), "5120");
+    EXPECT_EQ(bytes->tags.at("precision_decision_elements"), "5120");
+    EXPECT_EQ(bytes->tags.at("elements"), "10240");
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_DOUBLE_EQ(bytes->value, 10240.0 * sizeof(float));
+
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @test Graph construction records a static allreduce BOM descriptor
+ */
+TEST_F(Test__TPAllreduceStage, GraphConstructionRecordsBillOfMaterials)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = test_tensor_.get();
+    params.count = 128;
+    params.stage_name = "layer0_moe_combined_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+
+    ASSERT_TRUE(stage.execute(nullptr));
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    const PerfStatRecord *stages = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+        else if (record.name == "stages")
+            stages = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_DOUBLE_EQ(bytes->value, 128.0 * sizeof(float));
+    EXPECT_EQ(bytes->tags.at("role"), "moe_combined");
+    EXPECT_EQ(bytes->tags.at("stage"), "layer0_moe_combined_allreduce");
+    EXPECT_EQ(bytes->tags.at("elements"), "128");
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
+    EXPECT_EQ(bytes->tags.at("no_op"), "true");
+    EXPECT_EQ(bytes->tags.at("accounting"), "graph_template_or_eager_launch");
+    EXPECT_EQ(
+        bytes->tags.at("device_loop_multiplier"),
+        "mtp.device_generation_terminal_transactions");
+
+    ASSERT_NE(stages, nullptr);
+    EXPECT_DOUBLE_EQ(stages->value, 1.0);
+    EXPECT_EQ(stages->tags.at("role"), "moe_combined");
+    EXPECT_EQ(stages->tags.at("elements"), "128");
+    EXPECT_EQ(stages->tags.at("precision"), "fp16");
+
+    PerfStatsCollector::reset();
 }

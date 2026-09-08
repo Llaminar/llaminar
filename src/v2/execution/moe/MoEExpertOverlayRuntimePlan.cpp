@@ -1,3 +1,16 @@
+/**
+ * @file MoEExpertOverlayRuntimePlan.cpp
+ * @brief Resolves configured expert-overlay domains into rank-local runtime descriptors.
+ *
+ * A global device address identifies where a participant belongs in the
+ * cluster, while the resolved MPI rank binding identifies which process owns
+ * that participant during this invocation.  This translation deliberately
+ * keeps those two concerns separate: inventory binding replaces the
+ * configuration wildcard host with the real host name, and rank ownership is
+ * the only authoritative answer to whether this process may use a local
+ * DeviceId.
+ */
+
 #include "MoEExpertOverlayRuntimePlan.h"
 #include "config/CollectiveBackendType.h"
 #include "utils/Logger.h"
@@ -11,7 +24,7 @@ namespace llaminar2
 {
     namespace
     {
-        std::string formatValidationErrors(const MoEExpertParallelValidationResult &validation)
+        std::string formatValidationErrors(const MoERoutedExpertPlacementValidationResult &validation)
         {
             std::ostringstream message;
             message << "Invalid MoE expert overlay runtime plan:";
@@ -20,25 +33,36 @@ namespace llaminar2
             return message.str();
         }
 
+        /**
+         * @brief Resolve the MPI process that owns one domain participant.
+         *
+         * A rank-local domain deliberately stores one `owner_rank` for the
+         * complete device pool and omits `world_ranks`; all participants in
+         * that pool therefore inherit the same owner.  Single-participant
+         * domains use the same compact representation.  NodeTP domains keep
+         * an explicit participant-indexed rank vector because their devices
+         * may span processes.
+         */
         int participantRankFor(
-            const ExpertComputeDomain &domain,
+            const RoutedExpertDomain &domain,
             size_t participant_index,
             int current_world_rank)
         {
             if (participant_index < domain.world_ranks.size())
                 return domain.world_ranks[participant_index];
-            if (domain.kind == ExpertDomainKind::NodeLocalTP)
+            if (domain.scope == ExecutionDomainScope::NODE_LOCAL)
                 return static_cast<int>(participant_index);
-            if (participant_index == 0 && domain.owner_rank >= 0)
+            if (domain.owner_rank >= 0)
                 return domain.owner_rank;
             return current_world_rank;
         }
 
-        bool participantRankKnown(const ExpertComputeDomain &domain, size_t participant_index)
+        /** @brief Return whether participantRankFor() used configured ownership. */
+        bool participantRankKnown(const RoutedExpertDomain &domain, size_t participant_index)
         {
             return participant_index < domain.world_ranks.size() ||
-                   domain.kind == ExpertDomainKind::NodeLocalTP ||
-                   (participant_index == 0 && domain.owner_rank >= 0);
+                   domain.scope == ExecutionDomainScope::NODE_LOCAL ||
+                   domain.owner_rank >= 0;
         }
 
         std::string describeDomainPrimary(const MoEOverlayRuntimeDomain &domain)
@@ -55,7 +79,7 @@ namespace llaminar2
 
         bool isCpuNodeLocalFallbackDomain(const MoEOverlayRuntimeDomain &domain)
         {
-            if (domain.kind != ExpertDomainKind::NodeLocalTP || domain.participants.empty())
+            if (domain.scope != ExecutionDomainScope::NODE_LOCAL || domain.participants.empty())
                 return false;
             return std::all_of(domain.participants.begin(), domain.participants.end(),
                                [](const auto &participant)
@@ -64,10 +88,10 @@ namespace llaminar2
                                });
         }
 
-        bool isAcceleratorLocalTPTensorParallelDomain(const MoEOverlayRuntimeDomain &domain)
+        bool isAcceleratorLocalTPTensorShardedDomain(const MoEOverlayRuntimeDomain &domain)
         {
-            if (domain.kind != ExpertDomainKind::LocalTP ||
-                domain.compute_kind != ExpertDomainComputeKind::TensorParallelExperts ||
+            if (domain.scope != ExecutionDomainScope::RANK_LOCAL ||
+                domain.routed_compute_policy != RoutedExpertComputePolicy::TensorSharded ||
                 domain.participants.size() < 2)
             {
                 return false;
@@ -82,10 +106,10 @@ namespace llaminar2
                                });
         }
 
-        bool isLocalTPReplicatedExpertsDomain(const MoEOverlayRuntimeDomain &domain)
+        bool isLocalTPExpertIdApportionedDomain(const MoEOverlayRuntimeDomain &domain)
         {
-            if (domain.kind != ExpertDomainKind::LocalTP ||
-                domain.compute_kind != ExpertDomainComputeKind::ReplicatedExperts ||
+            if (domain.scope != ExecutionDomainScope::RANK_LOCAL ||
+                domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned ||
                 domain.participants.size() < 2)
             {
                 return false;
@@ -99,11 +123,73 @@ namespace llaminar2
                                });
         }
 
+        /**
+         * @brief Return whether every LocalTP participant owns every routed expert.
+         *
+         * Replicated routed compute needs no routed-output collective: each
+         * participant independently produces the complete expert result. The
+         * runtime plan still has to preserve all participants so the graph
+         * builder can bind the correct device-local prepared-weight registry
+         * on every symmetric graph.
+         */
+        bool isLocalTPReplicatedDomain(
+            const MoEOverlayRuntimeDomain &domain)
+        {
+            if (domain.scope != ExecutionDomainScope::RANK_LOCAL ||
+                domain.routed_compute_policy !=
+                    RoutedExpertComputePolicy::Replicated ||
+                domain.participants.size() < 2)
+            {
+                return false;
+            }
+
+            return std::all_of(
+                domain.participants.begin(),
+                domain.participants.end(),
+                [](const auto &participant)
+                {
+                    return participant.locally_addressable &&
+                           participant.local_device.is_valid();
+                });
+        }
+
+        /**
+         * @brief Return whether one remote MPI rank can host the whole domain.
+         *
+         * The continuation rank does not locally address these devices, but
+         * the participant runner on their owning rank does. Rank-batched sparse
+         * dispatch is the domain-scoped executor in this case, so reporting the
+         * topology as pending would contradict the installed production path.
+         */
+        bool isRemoteRankBatchApportionedDomain(
+            const MoEOverlayRuntimeDomain &domain)
+        {
+            if (domain.routed_compute_policy !=
+                    RoutedExpertComputePolicy::Apportioned ||
+                domain.participants.size() < 2)
+            {
+                return false;
+            }
+            const int owner_rank =
+                domain.participants.front().world_rank;
+            return owner_rank >= 0 &&
+                   std::all_of(
+                       domain.participants.begin(),
+                       domain.participants.end(),
+                       [owner_rank](const auto &participant)
+                       {
+                           return participant.world_rank_known &&
+                                  participant.world_rank == owner_rank;
+                       });
+        }
+
         bool hasDomainScopedRuntimeSupport(const MoEOverlayRuntimeDomain &domain)
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
-                   isAcceleratorLocalTPTensorParallelDomain(domain) ||
-                   isLocalTPReplicatedExpertsDomain(domain);
+                   isAcceleratorLocalTPTensorShardedDomain(domain) ||
+                   isLocalTPExpertIdApportionedDomain(domain) ||
+                   isLocalTPReplicatedDomain(domain) ||
+                   isRemoteRankBatchApportionedDomain(domain);
         }
 
         std::string sanitizeDomainToken(std::string value)
@@ -141,15 +227,20 @@ namespace llaminar2
         }
 
         MoEOverlayRuntimeDomain resolveDomain(
-            const ExpertComputeDomain &domain,
+            const RoutedExpertDomain &domain,
             int current_world_rank)
         {
             const auto canonical = domain.toExecutionDomainDefinition();
             MoEOverlayRuntimeDomain resolved;
             resolved.name = canonical.name;
-            resolved.kind = domain.kind;
+            resolved.scope = domain.scope;
             resolved.backend = canonical.backend;
-            resolved.compute_kind = domain.compute_kind;
+            resolved.routed_compute_policy = domain.routed_compute_policy;
+            resolved.routed_phase_policy = domain.routed_phase_policy;
+            resolved.routed_decode_assignment_policy =
+                domain.routed_decode_assignment_policy;
+            resolved.routed_prefill_assignment_policy =
+                domain.routed_prefill_assignment_policy;
             resolved.owner_rank = canonical.owner_rank.value_or(-1);
 
             resolved.participants.reserve(canonical.participants.size());
@@ -160,8 +251,22 @@ namespace llaminar2
                 participant.participant_index = static_cast<int>(index);
                 participant.world_rank = participantRankFor(domain, index, current_world_rank);
                 participant.world_rank_known = participantRankKnown(domain, index);
+                // participantRankFor() deliberately assigns an unbound local
+                // domain to the current process, preserving the single-rank
+                // configuration contract.  A host-qualified address without a
+                // rank proof remains non-local below, so that convenience does
+                // not make an explicitly remote device usable.
                 participant.owned_by_current_rank = participant.world_rank == current_world_rank;
-                participant.locally_addressable = participant.address.isLocal();
+
+                // Inventory binding replaces the user-facing "localhost"
+                // wildcard with the concrete host name.  It must not turn a
+                // participant owned by this MPI process into a remote one:
+                // the resolved rank is the process-local authority.  An
+                // unbound single-process plan retains the legacy localhost
+                // interpretation because it has no rank ownership proof.
+                participant.locally_addressable =
+                    (participant.world_rank_known && participant.owned_by_current_rank) ||
+                    (!participant.world_rank_known && participant.address.isLocal());
                 participant.local_device = participant.locally_addressable
                                                ? participant.address.toLocalDeviceId()
                                                : DeviceId::invalid();
@@ -187,13 +292,13 @@ namespace llaminar2
                 domain.hasMultipleParticipants() && !resolved.domain_scoped_collective_context_ready;
             if (resolved.multi_participant_execution_pending)
             {
-                const bool tensor_parallel_experts =
-                    domain.compute_kind == ExpertDomainComputeKind::TensorParallelExperts;
+                const bool tensor_sharded =
+                    domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded;
                 std::ostringstream reason;
                 reason << "Domain-scoped runtime support is not available for this "
-                       << (tensor_parallel_experts ? "TensorParallelExperts" : "multi-participant")
+                       << (tensor_sharded ? "tensor-sharded" : "multi-participant")
                        << " domain shape. Bridge Phase 5C covers accelerator LocalTP "
-                       << "TensorParallelExperts and CPU NodeLocalTP fallback helpers; Bridge Phase 5D "
+                       << "tensor-sharded and CPU NodeTP fallback helpers; Bridge Phase 5D "
                        << "still wires the accelerator LocalTP executor into the Qwen graph. "
                        << "Primary-only lowering to " << resolved.primary_device.to_string()
                        << " is no longer used for routed tier work";
@@ -204,7 +309,7 @@ namespace llaminar2
     } // namespace
 
     MoEExpertOverlayRuntimePlan::MoEExpertOverlayRuntimePlan(
-        std::shared_ptr<const MoEExpertParallelPlan> source_plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan,
         int current_world_rank,
         std::vector<MoEOverlayRuntimeDomain> domains,
         std::vector<MoEOverlayRuntimeTier> routed_tiers)
@@ -320,9 +425,18 @@ namespace llaminar2
         for (const auto &domain : domains_)
         {
             out << "\n  domain " << domain.name
-                << ": kind=" << toString(domain.kind)
+                << ": scope=" << executionDomainScopeToString(domain.scope)
                 << " backend=" << collectiveBackendTypeToString(domain.backend)
-                << " compute=" << toString(domain.compute_kind)
+                << " routed_compute="
+                << routedExpertComputePolicyToString(domain.routed_compute_policy)
+                << " routed_phase="
+                << routedExpertPhasePolicyToString(domain.routed_phase_policy)
+                << " routed_decode_assignment="
+                << routedExpertAssignmentPolicyToString(
+                       domain.routed_decode_assignment_policy)
+                << " routed_prefill_assignment="
+                << routedExpertAssignmentPolicyToString(
+                       domain.routed_prefill_assignment_policy)
                 << " participants=" << domain.participants.size()
                 << " primary=" << domain.primary_participant.toShortString()
                 << " primary_device=" << domain.primary_device.to_string()
@@ -356,21 +470,19 @@ namespace llaminar2
     }
 
     std::shared_ptr<MoEExpertOverlayRuntimePlan> resolveMoEExpertOverlayRuntimePlan(
-        std::shared_ptr<const MoEExpertParallelPlan> plan,
+        std::shared_ptr<const MoERoutedExpertPlacementPlan> plan,
         const MoEExpertOverlayRuntimeResolverOptions &options)
     {
-        if (!plan || !plan->isTieredOverlay())
+        if (!plan || !plan->usesExpertOverlayAuthority())
             return nullptr;
 
-        const auto validation = validateMoEExpertParallelPlan(
-            *plan,
-            MoEExpertParallelValidationOptions{.allow_routed_tensor_parallel_experts = true});
+        const auto validation = validateMoERoutedExpertPlacementPlan(*plan);
         if (!validation.ok())
             throw std::invalid_argument(formatValidationErrors(validation));
 
         std::vector<MoEOverlayRuntimeDomain> domains;
         domains.reserve(plan->dense_domains.size() + plan->domains.size());
-        auto addDomainIfAbsent = [&](const ExpertComputeDomain &domain)
+        auto addDomainIfAbsent = [&](const RoutedExpertDomain &domain)
         {
             const auto exists = std::any_of(domains.begin(), domains.end(), [&](const auto &resolved)
                                             { return resolved.name == domain.name; });
@@ -378,7 +490,7 @@ namespace llaminar2
                 domains.push_back(resolveDomain(domain, options.current_world_rank));
         };
         for (const auto &domain : plan->dense_domains)
-            addDomainIfAbsent(ExpertComputeDomain::fromExecutionDomainDefinition(domain));
+            addDomainIfAbsent(RoutedExpertDomain::fromExecutionDomainDefinition(domain));
         for (const auto &domain : plan->domains)
             addDomainIfAbsent(domain);
 
@@ -446,7 +558,8 @@ namespace llaminar2
             if (domain.multi_participant_execution_pending)
             {
                 LOG_WARN("[MoEExpertOverlayRuntimePlan] Domain '" << domain.name
-                                                                  << "' requests " << toString(domain.compute_kind)
+                                                                  << "' requests "
+                                                                  << routedExpertComputePolicyToString(domain.routed_compute_policy)
                                                                   << " over " << domain.participants.size()
                                                                   << " participants; " << domain.pending_reason);
             }

@@ -36,6 +36,7 @@
 
 #pragma once
 
+#include <span>
 #include <string>
 #include <vector>
 
@@ -86,6 +87,40 @@ namespace llaminar2
          */
         virtual WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const = 0;
+
+        /**
+         * @brief Append scratch required by one fused projection transaction.
+         *
+         * Ordinary per-kernel requirements describe a projection that executes
+         * by itself.  A first-class fused GEMM may additionally keep several
+         * projection partials live at once.  The stage that owns that bundle
+         * calls this method exactly once on its anchor kernel with the complete
+         * ordered output-width inventory.  This prevents a large singleton,
+         * such as an LM head, from being mistaken for a maximum-width fused
+         * bundle while still letting a backend declare its exact concurrent
+         * layout.
+         *
+         * The default implementation is intentionally empty: backends whose
+         * fused implementation does not need extra simultaneous scratch retain
+         * only their ordinary per-kernel requirements.
+         *
+         * @param requirements Aggregate requirements owned by the calling stage.
+         * @param m Maximum rows represented by the captured fused transaction.
+         * @param projection_columns Ordered output width of every projection in
+         *        the transaction. Repeated widths are significant.
+         * @param k Shared input width for the fused transaction.
+         */
+        virtual void appendFusedProjectionWorkspaceRequirements(
+            WorkspaceRequirements &requirements,
+            int m,
+            std::span<const int> projection_columns,
+            int k) const
+        {
+            (void)requirements;
+            (void)m;
+            (void)projection_columns;
+            (void)k;
+        }
 
         // =========================================================================
         // Workspace Binding
@@ -152,7 +187,7 @@ namespace llaminar2
         constexpr const char *QUANT_A = "gemm_quant_a";                       ///< [M × K] INT8 quantized activations
         constexpr const char *SCALES_A = "gemm_scales_a";                     ///< [M] FP32 per-row activation scales (row-wise mode)
         constexpr const char *SCALES_A_BLOCKWISE = "gemm_scales_a_blockwise"; ///< [M × blocks_per_row] FP32 per-block activation scales (blockwise mode)
-        constexpr const char *SUMS_A_BLOCKWISE = "gemm_sums_a_blockwise";     ///< [M × blocks_per_row] INT32 per-block activation sums
+        constexpr const char *SUMS_A_BLOCKWISE = "gemm_sums_a_blockwise";     ///< M * blocks_per_row INT32 sums; CUDA block-major, ROCm row-major
         constexpr const char *ACC_INT32 = "gemm_acc_int32";                   ///< [M × N] INT32 accumulator
 
         // FP32 temporary buffers
@@ -185,14 +220,12 @@ namespace llaminar2
         constexpr const char *CUDA_FP32_MAPPED_REDIRECT = "cuda_fp32_mapped_redirect"; ///< [batch × M × N] HBM redirect for mapped FP32 outputs
 
         // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
-        constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × N] FP32 reduction partials
-        constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< per-side-stream [kpar × M × max_N] FP32 GEMV partials
+        constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × bounded verifier rows × N] FP32 serial/grouped reduction arena
+        constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< aligned side-stream [kpar × bounded rows × stream_N] FP32 GEMV partials
 
-        // CUDA NativeVNNI prefill scratch. These buffers are intentionally
-        // workspace-owned so split-K and stream-K cannot grow hidden VRAM
-        // allocations behind graph capture / workspace planning.
-        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS = "cuda_native_vnni_prefill_splitk_partials"; ///< serial [split_k × M × N], concurrent [slot × split_k × M × max_N] FP32 partials
-        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP = "cuda_native_vnni_prefill_streamk_fixup";       ///< serial [tiles × BM × BN], concurrent [slot × tiles × BM × BN] FP32 stream-K fixup
+        // CUDA NativeVNNI public-M1 K-partition scratch. This persistent arena
+        // is sized before capture and shared only across non-concurrent graphs.
+        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS = "cuda_native_vnni_prefill_canonical_kpart_partials"; ///< serial [kpart × M × N], concurrent [slot × kpart × M × max_N] FP32 partials
         constexpr const char *CUDA_CONCURRENT_PREFILL_ACC_INT32 = "cuda_concurrent_prefill_acc_int32";               ///< per-slot [M × max_N] INT32 accumulator
     }
 
@@ -208,8 +241,7 @@ namespace llaminar2
      */
     namespace EmbeddingWorkspaceBuffers
     {
-        constexpr const char *TOKEN_IDS = "embed_token_ids";    ///< [max_seq_len] INT32 token IDs
-        constexpr const char *EMBED_TABLE = "embed_table_temp"; ///< [vocab_size × d_model] FP32 temp for non-GPU embed tables
+        constexpr const char *TOKEN_IDS = "embed_token_ids"; ///< [max_seq_len] INT32 token IDs
     }
 
     /**
@@ -221,7 +253,7 @@ namespace llaminar2
     namespace RoPEWorkspaceBuffers
     {
         constexpr const char *POSITION_IDS = "rope_position_ids";   ///< [max_seq_len] INT32 position IDs
-        constexpr const char *INV_FREQ = "rope_inv_freq";           ///< [head_dim/2] FP32 inverse frequency table
+        constexpr const char *INV_FREQ = "rope_inv_freq";           ///< Fixed slots of immutable [head_dim/2] FP32 frequency tables
         constexpr const char *DEVICE_PARAMS = "rope_device_params"; ///< RoPEDeviceParams struct for graph capture
     }
 

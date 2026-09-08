@@ -7,13 +7,17 @@
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/GpuTensorView.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/TQ8Tensor.h"
 #include "../../../tensors/TQ4Tensor.h"
 #include "../../../tensors/FP16Utils.h"
 #include "../../../tensors/SIMDHelpers.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../kernels/attention/AttentionDeviceParams.h"
+#include "../../../kernels/attention/AttentionWorkspaceContract.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
@@ -29,6 +33,13 @@
 #if defined(HAVE_CUDA)
 #include "../../../kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
 #include "../../../kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
+#include "../../../kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
+#include <cuda_runtime_api.h>
+#endif
+
+#if defined(HAVE_ROCM)
+#include "../../../kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
+#include "../../../kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #endif
 
 namespace llaminar2
@@ -36,176 +47,128 @@ namespace llaminar2
 
     namespace
     {
-        constexpr int kMTPVerifierSmallDecodeMaxRows = 4;
-
-        size_t debugElementSize(TensorType type)
-        {
-            switch (type)
-            {
-            case TensorType::FP32:
-                return sizeof(float);
-            case TensorType::FP16:
-            case TensorType::BF16:
-                return sizeof(uint16_t);
-            default:
-                return 0;
-            }
-        }
-
-        bool copyTensorBytesForAttentionSnapshot(
+        /**
+         * @brief Verify that a cache tensor exposes its declared storage type.
+         *
+         * The stage uses this guard before handing a persistent CPU ring tensor
+         * to native attention. A mismatch is an ownership/configuration defect;
+         * it must not trigger conversion to a different representation.
+         */
+        [[nodiscard]] bool tensorMatchesActivationPrecision(
             const ITensor *tensor,
-            DeviceId device,
-            void *stream,
-            std::vector<uint8_t> &bytes)
+            ActivationPrecision precision)
         {
-            if (!tensor || bytes.empty())
+            if (!tensor)
                 return false;
-
-            if (const void *host = tensor->raw_data())
+            switch (precision)
             {
-                std::memcpy(bytes.data(), host, bytes.size());
-                return true;
-            }
-
-            const void *device_ptr = tensor->gpu_data_ptr();
-            if (!device_ptr || !device.is_gpu())
-                return false;
-
-            IBackend *backend = getBackendFor(device);
-            if (!backend)
-                return false;
-
-            return backend->deviceToHostFast(
-                bytes.data(), device_ptr, bytes.size(), device.toKernelDeviceIndex(), stream);
-        }
-
-        bool tensorToFP32AttentionSnapshot(
-            const ITensor *tensor,
-            DeviceId device,
-            void *stream,
-            size_t rows,
-            size_t cols,
-            std::vector<float> &out)
-        {
-            if (!tensor || rows == 0 || cols == 0)
-            {
-                out.clear();
+            case ActivationPrecision::FP32:
+                return tensor->native_type() == TensorType::FP32;
+            case ActivationPrecision::FP16:
+                return tensor->native_type() == TensorType::FP16;
+            case ActivationPrecision::BF16:
+                return tensor->native_type() == TensorType::BF16;
+            case ActivationPrecision::Q8_1:
+                return tensor->native_type() == TensorType::Q8_1;
+            case ActivationPrecision::Q16_1:
+                return tensor->native_type() == TensorType::Q16_1;
+            case ActivationPrecision::TQ4:
+                return tensor->native_type() == TensorType::TQ4;
+            case ActivationPrecision::TQ8:
+                return tensor->native_type() == TensorType::TQ8;
+            case ActivationPrecision::Hybrid:
+            case ActivationPrecision::HybridQ16:
                 return false;
             }
-
-            const size_t count = rows * cols;
-            const size_t elem_size = debugElementSize(tensor->native_type());
-            if (elem_size == 0)
-            {
-                out.clear();
-                return false;
-            }
-
-            std::vector<uint8_t> bytes(count * elem_size);
-            if (!copyTensorBytesForAttentionSnapshot(tensor, device, stream, bytes))
-            {
-                out.clear();
-                return false;
-            }
-
-            out.resize(count);
-            switch (tensor->native_type())
-            {
-            case TensorType::FP32:
-                std::memcpy(out.data(), bytes.data(), count * sizeof(float));
-                return true;
-            case TensorType::FP16:
-            {
-                const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-                for (size_t i = 0; i < count; ++i)
-                    out[i] = fp16_to_fp32(src[i]);
-                return true;
-            }
-            case TensorType::BF16:
-            {
-                const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-                for (size_t i = 0; i < count; ++i)
-                    out[i] = simd::bf16_to_fp32(src[i]);
-                return true;
-            }
-            default:
-                out.clear();
-                return false;
-            }
-        }
-
-        int rocmAttentionRequestedDecodeSplitCap(int kv_len)
-        {
-            if (debugEnv().gemm.deterministic)
-                return 1;
-            if (kv_len <= 64)
-                return 1;
-            if (kv_len < 128)
-                return 2;
-            if (kv_len < 256)
-                return 4;
-            return 8;
-        }
-
-        int cudaAttentionSMCount(int device_ordinal)
-        {
-            static int sm_count_cache[8] = {0};
-            const int cache_idx = device_ordinal & 7;
-            int num_sms = sm_count_cache[cache_idx];
-            if (num_sms > 0)
-                return num_sms;
-
-            num_sms = 82;
-#if defined(HAVE_CUDA)
-            int queried_sms = 0;
-            if (cudaDeviceGetAttribute(&queried_sms,
-                                       cudaDevAttrMultiProcessorCount,
-                                       device_ordinal) == cudaSuccess &&
-                queried_sms > 0)
-            {
-                num_sms = queried_sms;
-            }
-#endif
-            sm_count_cache[cache_idx] = num_sms;
-            return num_sms;
+            return false;
         }
 
         /**
-         * @brief CUDA small-M decode split count used as a graph capture bucket.
-         *
-         * This mirrors CUDAFlashAttentionKernelT::computeNumSplitsForDevice().
-         * The previous capture signature used raw `kv_len / 16`; that kept
-         * recapturing every sixteen decode tokens even after the actual CUDA
-         * launcher had already capped `num_splits` by SM occupancy or
-         * MAX_NUM_SPLITS.  The signature should encode launch topology, not
-         * exact token position, so long-context verifier graphs can replay
-         * until the real split count changes.
+         * @brief Bind one immutable per-layer TurboQuant context to a raw tensor.
+         * @return True for TQ4/TQ8 tensors; false for an invalid type pairing.
          */
-        int cudaAttentionDecodeSplitBucket(int kv_len, int n_heads, int device_ordinal)
+        [[nodiscard]] bool bindCPUAttentionTurboQuantContext(
+            ITensor *tensor,
+            const TurboQuantContext *layer_context)
         {
-            constexpr int kMinKVPerSplit = 16;
-            constexpr int kMaxNumSplits = 32;
-            constexpr int kMaxBlocksPerSM = 4;
-            if (debugEnv().gemm.deterministic || kv_len <= 1)
-                return 1;
-            if (n_heads <= 0)
-                return 1;
-
-            const int desired_splits =
-                std::max(1, (kMaxBlocksPerSM * cudaAttentionSMCount(device_ordinal)) / n_heads);
-            const int max_splits_by_kv = std::max(1, kv_len / kMinKVPerSplit);
-            return std::clamp(std::min(desired_splits, max_splits_by_kv),
-                              1,
-                              kMaxNumSplits);
+            if (!tensor || !layer_context)
+                return false;
+            if (auto *tq4 = dynamic_cast<TQ4Tensor *>(tensor))
+            {
+                tq4->set_turboquant_context(layer_context);
+                return true;
+            }
+            if (auto *tq8 = dynamic_cast<TQ8Tensor *>(tensor))
+            {
+                tq8->set_turboquant_context(layer_context);
+                return true;
+            }
+            return false;
         }
 
-        int attentionDecodeLaunchBucket(DeviceId device, int kv_len, int n_heads)
+        /**
+         * @brief Authenticate and prepare one native CPU K/V tensor pair.
+         *
+         * Tensor storage must agree exactly with the cache's declared policy.
+         * TurboQuant pairs additionally receive the immutable layer context
+         * required by their direct score/value primitives. The function never
+         * converts, allocates, or substitutes a different tensor format.
+         */
+        [[nodiscard]] bool prepareCPUAttentionNativePair(
+            ITensor *key,
+            ITensor *value,
+            ActivationPrecision key_precision,
+            ActivationPrecision value_precision,
+            const TurboQuantContext *turboquant_context,
+            int layer)
         {
-            if (device.is_cuda())
-                return cudaAttentionDecodeSplitBucket(kv_len, n_heads, device.cuda_ordinal());
-            if (device.is_rocm())
-                return rocmAttentionRequestedDecodeSplitCap(kv_len);
-            return 0;
+            if (!tensorMatchesActivationPrecision(key, key_precision) ||
+                !tensorMatchesActivationPrecision(value, value_precision))
+            {
+                LOG_ERROR("[AttentionComputeStage] Native CPU KV tensor type disagrees with cache policy"
+                          << " layer=" << layer
+                          << " declared_k="
+                          << activationPrecisionToString(key_precision)
+                          << " actual_k="
+                          << (key ? key->dtype_name() : "null")
+                          << " declared_v="
+                          << activationPrecisionToString(value_precision)
+                          << " actual_v="
+                          << (value ? value->dtype_name() : "null"));
+                return false;
+            }
+
+            const bool key_is_tq =
+                key_precision == ActivationPrecision::TQ4 ||
+                key_precision == ActivationPrecision::TQ8;
+            const bool value_is_tq =
+                value_precision == ActivationPrecision::TQ4 ||
+                value_precision == ActivationPrecision::TQ8;
+            if (key_is_tq != value_is_tq)
+            {
+                LOG_ERROR("[AttentionComputeStage] CPU TurboQuant attention requires both K and V to use native TQ storage"
+                          << " layer=" << layer);
+                return false;
+            }
+            if (!key_is_tq)
+                return true;
+
+            if (!turboquant_context)
+            {
+                LOG_ERROR("[AttentionComputeStage] Native CPU TurboQuant attention is missing its immutable context"
+                          << " layer=" << layer);
+                return false;
+            }
+            const auto &layer_context =
+                turboquant_context->for_layer(layer);
+            if (!bindCPUAttentionTurboQuantContext(key, &layer_context) ||
+                !bindCPUAttentionTurboQuantContext(value, &layer_context))
+            {
+                LOG_ERROR("[AttentionComputeStage] Failed to bind native CPU TurboQuant tensor context"
+                          << " layer=" << layer);
+                return false;
+            }
+            return true;
         }
 
         /**
@@ -299,69 +262,6 @@ namespace llaminar2
             return true;
         }
 
-        void combineAttentionVariant(uint64_t &h, uint64_t value)
-        {
-            constexpr uint64_t kPrime = 1099511628211ull;
-            h ^= value;
-            h *= kPrime;
-        }
-
-        std::shared_ptr<FP32Tensor> makeAttentionScratchFP32(
-            size_t rows,
-            size_t cols,
-            DeviceId device,
-            void *stream)
-        {
-            auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{rows, cols});
-            if (device.is_gpu())
-                tensor->allocateOnDevice(device, stream);
-            return tensor;
-        }
-
-        bool ensureAttentionScratchFP32(
-            std::shared_ptr<FP32Tensor> &tensor,
-            size_t rows,
-            size_t cols,
-            DeviceId device,
-            void *stream,
-            const char *name)
-        {
-            const std::vector<size_t> expected_shape{rows, cols};
-            if (!tensor || tensor->shape() != expected_shape)
-            {
-                if (device.is_gpu() && isGraphCaptureActive())
-                {
-                    LOG_ERROR("[AttentionComputeStage] Cannot allocate verifier scratch tensor '"
-                              << name << "' during graph capture");
-                    return false;
-                }
-                tensor = makeAttentionScratchFP32(rows, cols, device, stream);
-            }
-
-            if (device.is_gpu() && !tensor->gpu_data_ptr())
-            {
-                if (isGraphCaptureActive())
-                {
-                    LOG_ERROR("[AttentionComputeStage] Verifier scratch tensor '"
-                              << name << "' was not device-resident before graph capture");
-                    return false;
-                }
-                if (!tensor->allocateOnDevice(device, stream))
-                {
-                    LOG_ERROR("[AttentionComputeStage] Failed to allocate verifier scratch tensor '"
-                              << name << "' on " << device.to_string());
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        void markAttentionGpuTensorWritten(TensorBase *tensor, DeviceId device, void *stream)
-        {
-            if (tensor && device.is_gpu())
-                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
-        }
-
         bool copyAttentionFP32DeviceRow(
             TensorBase *dst,
             int dst_row,
@@ -423,8 +323,87 @@ namespace llaminar2
     // =============================================================================
 
     AttentionComputeStage::AttentionComputeStage(Params params)
-        : IComputeStage(params.device_id), params_(std::move(params))
+        : IComputeStage(params.device_id),
+          params_(std::move(params)),
+          cpu_grouped_k_views_(static_cast<size_t>(std::max(0, params_.batch_size)), nullptr),
+          cpu_grouped_v_views_(static_cast<size_t>(std::max(0, params_.batch_size)), nullptr),
+          cpu_grouped_kv_lens_(static_cast<size_t>(std::max(0, params_.batch_size)), 0),
+          cpu_grouped_kv_logical_views_(
+              static_cast<size_t>(std::max(0, params_.batch_size)))
     {
+        const auto &key_cache_policy = params_.execution_policy.key_cache;
+        if (key_cache_policy.transformsOnRead())
+        {
+            if (!params_.device_id.is_gpu() || !params_.kv_cache ||
+                !params_.read_kv_from_cache)
+            {
+                throw std::invalid_argument(
+                    "pre-RoPE key-cache encoding requires a cache-backed GPU attention stage");
+            }
+            if (!(key_cache_policy.rope_theta > 0.0f) ||
+                !(key_cache_policy.partial_rotary_factor > 0.0f) ||
+                key_cache_policy.partial_rotary_factor > 1.0f)
+            {
+                throw std::invalid_argument(
+                    "pre-RoPE key-cache encoding requires positive theta and a rotary fraction in (0, 1]");
+            }
+        }
+
+        if (params_.device_id.is_gpu() &&
+            params_.kv_cache &&
+            debugEnv().attention.debug_effective_kv_snapshot &&
+            debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(
+                params_.layer_idx))
+        {
+            const int request_count = std::max(1, params_.batch_size);
+            debug_device_kv_count_views_.reserve(
+                static_cast<size_t>(request_count));
+            debug_device_kv_head_views_.reserve(
+                static_cast<size_t>(request_count));
+            debug_device_kv_count_names_.reserve(
+                static_cast<size_t>(request_count));
+            debug_device_kv_head_names_.reserve(
+                static_cast<size_t>(request_count));
+
+            for (int request = 0; request < request_count; ++request)
+            {
+                const int *count =
+                    params_.kv_cache->deviceCachedTokenCountPtr(
+                        params_.layer_idx,
+                        request);
+                const int *head =
+                    params_.kv_cache->deviceRingHeadPtr(
+                        params_.layer_idx,
+                        request);
+                if (!count || !head)
+                {
+                    throw std::runtime_error(
+                        "effective-KV diagnostics require canonical device "
+                        "count and ring-head pointers for every request");
+                }
+
+                debug_device_kv_count_names_.push_back(
+                    "device_kv_count_request_" +
+                    std::to_string(request));
+                debug_device_kv_head_names_.push_back(
+                    "device_kv_head_request_" +
+                    std::to_string(request));
+                debug_device_kv_count_views_.push_back(
+                    std::make_unique<GpuTensorView>(
+                        const_cast<int *>(count),
+                        /*rows=*/1,
+                        /*cols=*/1,
+                        TensorType::INT32,
+                        params_.device_id));
+                debug_device_kv_head_views_.push_back(
+                    std::make_unique<GpuTensorView>(
+                        const_cast<int *>(head),
+                        /*rows=*/1,
+                        /*cols=*/1,
+                        TensorType::INT32,
+                        params_.device_id));
+            }
+        }
     }
 
     int AttentionComputeStage::dynamicAttentionParamRows(int logical_seq_len, int kv_len) const
@@ -432,47 +411,48 @@ namespace llaminar2
         if (!params_.kv_cache)
             return 1;
 
-        if (params_.device_id.is_rocm())
-        {
-            const auto &rocm_env = debugEnv().rocm;
-            const auto kp = params_.kv_cache->k_precision();
-            const auto vp = params_.kv_cache->v_precision();
-            const bool native_kv =
-                !rocm_env.fa_disable_native_kv &&
-                params_.head_dim >= 64 &&
-                ((kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
-                 (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1 &&
-                  params_.head_dim % 32 == 0));
-            const bool small_native_decode =
-                native_kv &&
-                params_.batch_size == 1 &&
-                params_.causal &&
-                !rocm_env.fa_decode_via_prefill &&
-                logical_seq_len > 1 &&
-                logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
-                kv_len > logical_seq_len;
-            return small_native_decode ? logical_seq_len : 1;
-        }
-
-        const auto kp = params_.kv_cache->k_precision();
-        const auto vp = params_.kv_cache->v_precision();
-        const bool cuda_small_fp16_decode =
-            params_.device_id.is_cuda() &&
-            kp == ActivationPrecision::FP16 &&
-            vp == ActivationPrecision::FP16 &&
+        /*
+         * Every GPU grouped verifier call below is row-local and consumes one
+         * AttentionDeviceParams record per logical row. Cache storage format
+         * cannot change that launch contract: native FP16/BF16/FP32/Q8 caches
+         * and RoPE-on-read converted views all enter the same grouped API.
+         * Returning one row for any format leaves rows 1..M uninitialized and
+         * silently turns a valid grouped launch into zero output.
+         */
+        /*
+         * A padded continuation-prefill can have a logical suffix width in
+         * the grouped-verifier range even though the captured kernel still
+         * launches the full prefill bucket.  Such a launch uses one shared
+         * AttentionDeviceParams record: FA2 derives each query row's causal
+         * boundary internally and active_query_rows_device suppresses padded
+         * rows.  Classifying that launch from logical width alone leaves the
+         * kernel object advertising M records while compute_tensor() sees the
+         * physical bucket and requires one.
+         *
+         * True grouped verification is never padded: its physical and logical
+         * row counts are identical.  Requiring that identity makes the launch
+         * regime explicit and prevents a partial-prefix suffix from silently
+         * changing the captured attention contract.
+         */
+        const bool gpu_grouped_verifier =
+            params_.device_id.is_gpu() &&
             params_.batch_size == 1 &&
             params_.causal &&
+            params_.seq_len == logical_seq_len &&
             logical_seq_len > 1 &&
-            logical_seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            logical_seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
             kv_len > logical_seq_len;
-        return cuda_small_fp16_decode ? logical_seq_len : 1;
+        return gpu_grouped_verifier ? logical_seq_len : 1;
     }
 
     void AttentionComputeStage::updateDynamicParams(int pos_offset, int seq_len)
     {
         params_.position_offset = pos_offset;
-        if (!cached_kernel_ || !params_.kv_cache || params_.layer_idx < 0)
+        if (!params_.kv_cache || params_.layer_idx < 0)
         {
+            dynamic_pre_append_cached_tokens_ = -1;
+            dynamic_logical_seq_len_ = 0;
+            dynamic_post_append_kv_len_ = 0;
             return;
         }
 
@@ -486,38 +466,55 @@ namespace llaminar2
                                         ? prefill_effective_seq_len_
                                         : seq_len;
 
-        // Propagate current stage stream to the kernel so device-side dynamic
-        // params are uploaded on the same explicit stream used for capture/replay.
-        cached_kernel_->setGPUStream(gpuStream());
+        /*
+         * `pos_offset` is the admitted request range, supplied before capture
+         * or replay. It is sufficient for fixed host launch geometry and does
+         * not require observing canonical GPU sequence state. The attention
+         * kernel below still derives its live row lengths from the device count
+         * written by the preceding captured append.
+         */
+        const int cache_capacity = std::max(1, params_.kv_cache->max_seq_len());
+        const int pre_append_cached_tokens =
+            std::clamp(pos_offset, 0, cache_capacity);
+        dynamic_pre_append_cached_tokens_ = pre_append_cached_tokens;
+        dynamic_logical_seq_len_ = logical_seq_len;
+        dynamic_post_append_kv_len_ = std::clamp(
+            pre_append_cached_tokens + logical_seq_len,
+            1,
+            cache_capacity);
 
-        int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-        kv_len += logical_seq_len; // This step will append logical_seq_len real tokens.
+        if (!cached_kernel_)
+        {
+            return;
+        }
+
+        // Propagate the current stage stream so every device-side parameter
+        // writer is ordered with the attention graph that consumes it.
+        bindStageStream(cached_kernel_);
+
+        const int kv_len = dynamic_post_append_kv_len_;
         const int logical_pos_offset = std::max(0, kv_len - logical_seq_len);
         const int query_rows_for_params =
             dynamicAttentionParamRows(logical_seq_len, kv_len);
 
-        const auto kp = params_.kv_cache->k_precision();
-        const auto vp = params_.kv_cache->v_precision();
-        const bool tq_cache =
-            kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8 ||
-            vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
         /*
-         * Device-derived attention params are for decode/replay, where the
-         * cache already contains older tokens and the graph body must discover
-         * the post-append KV length without a host scalar upload.  Ordinary
-         * prefill has `kv_len == logical_seq_len`; deriving params from the
-         * live cache counter there adds an unnecessary state owner and can make
-         * CUDA FA2 prefill consume stale/double-advanced cache metadata.
+         * GPU prefill graphs are reusable across request lifetimes. A graph
+         * captured for the first prompt chunk (pre_append_cached_tokens == 0)
+         * can later replay as a suffix after prefix restore. Always recording
+         * the device-count derivation node makes the graph topology invariant:
+         * the KV append kernel owns the device sequence state, and attention
+         * consumes that post-append state on the same stream.
          */
-        const bool decode_like_step = kv_len > logical_seq_len;
         const bool will_derive_from_device_count =
             params_.device_id.is_gpu() &&
-            decode_like_step &&
-            !tq_cache &&
             params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0) != nullptr;
         if (!will_derive_from_device_count &&
             !cached_kernel_->prepareDynamicAttnParams(
-                kv_len, logical_pos_offset, query_rows_for_params, gpuStream()))
+                kv_len,
+                logical_pos_offset,
+                query_rows_for_params,
+                gpuStream(),
+                cache_capacity))
         {
             const std::string msg =
                 "[AttentionComputeStage] Failed to prepare dynamic attention params for layer " +
@@ -527,17 +524,6 @@ namespace llaminar2
             throw std::runtime_error(msg);
         }
 
-        // TQ dequant: pre-upload device params for graph-capturable reads.
-        // setDynamicDequantParams computes ring_pos, out_offset, rope_position
-        // from the pre-append entry state; the captured dequant path records
-        // only the dynamic kernel that reads those params.
-        // position_start=0 matches execute() which always passes 0 — cache
-        // rows are stored in position order, so position = entry.count.
-        const float dequant_rope_theta =
-            params_.apply_rope_to_k ? params_.rope_theta : 0.0f;
-        params_.kv_cache->setDynamicDequantParams(
-            params_.layer_idx, 0, dequant_rope_theta,
-            0, gpuStream());
     }
 
     bool AttentionComputeStage::supportsDeviceResidentDynamicPositionReplay() const
@@ -549,13 +535,7 @@ namespace llaminar2
             return false;
         }
 
-        const auto kp = params_.kv_cache->k_precision();
-        const auto vp = params_.kv_cache->v_precision();
-        const bool tq_cache =
-            kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8 ||
-            vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
-        return !tq_cache &&
-               params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0) != nullptr;
+        return params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0) != nullptr;
     }
 
     void AttentionComputeStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
@@ -564,133 +544,6 @@ namespace llaminar2
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
         prefill_replay_params_set_ = true;
-    }
-
-    uint64_t AttentionComputeStage::graphCaptureVariantSignature() const
-    {
-        if (!params_.device_id.is_gpu() ||
-            !params_.kv_cache ||
-            params_.layer_idx < 0 ||
-            params_.batch_size != 1 ||
-            params_.seq_len <= 0 ||
-            params_.head_dim <= 0)
-        {
-            return 0;
-        }
-        if (params_.device_id.is_rocm() && debugEnv().rocm.fa_decode_via_prefill)
-        {
-            return 0;
-        }
-
-        int effective_kv_len = params_.seq_len;
-        const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-        if (cached_tokens > 0)
-        {
-            // graphCaptureVariantSignature() is queried before KVCacheAppendStage
-            // executes for this step. Attention execution sees the post-append
-            // length, so mirror updateDynamicParams() and add this query row count.
-            effective_kv_len = cached_tokens + params_.seq_len;
-        }
-
-        AttentionMode mode = params_.attention_mode;
-        if (params_.auto_detect_mode)
-        {
-            mode = detect_attention_mode(params_.batch_size, params_.seq_len, effective_kv_len);
-        }
-
-        const bool decode_like =
-            mode == AttentionMode::DECODE ||
-            mode == AttentionMode::BATCHED_DECODE ||
-            (params_.seq_len < effective_kv_len && params_.batch_size == 1);
-        if (!decode_like)
-        {
-            return 0;
-        }
-
-        /*
-         * Multirow MTP verifier graphs append M=2..4 rows and then run the
-         * native-KV M=2..4 verifier path.  The row count is a first-class
-         * replay signature input, but exact token positions are not: dynamic
-         * attention params and device sequence state carry row-local KV lengths
-         * into the captured kernel arguments before every replay.  The graph
-         * signature therefore records only the launch regime bucket that can
-         * change kernel topology or split count.
-         */
-        const bool multirow_verifier_decode =
-            params_.seq_len > 1 &&
-            params_.seq_len <= kMTPVerifierSmallDecodeMaxRows &&
-            params_.seq_len < effective_kv_len;
-        if (!multirow_verifier_decode && params_.device_id.is_cuda())
-        {
-            return 0;
-        }
-
-        const int decode_rows = std::min(params_.seq_len, kMTPVerifierSmallDecodeMaxRows);
-        if (decode_rows <= 0 || params_.seq_len > kMTPVerifierSmallDecodeMaxRows)
-        {
-            return 0;
-        }
-
-        uint64_t signature = 1469598103934665603ull;
-        combineAttentionVariant(signature, 0xA77E0002ull);
-        combineAttentionVariant(signature, params_.device_id.is_cuda() ? 1ull : 2ull);
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.seq_len));
-        /*
-         * MTP verifier rows must be decode-equivalent before they are allowed to
-         * publish live KV/GDN state.  CUDA FA2 prefill currently converts Q to
-         * half for WMMA; that is a good throughput path for ordinary prefill but
-         * can drift enough on real Qwen3.6 MoE verifier rows to change the next
-         * token.  Keep the capture signature tied to the row-local decode bucket
-         * until a fused multi-row verifier kernel proves serial-decode parity.
-         */
-        combineAttentionVariant(signature, multirow_verifier_decode
-                                               ? static_cast<uint64_t>(
-                                                     attentionDecodeLaunchBucket(params_.device_id,
-                                                                                 effective_kv_len,
-                                                                                 params_.n_heads))
-                                               : 0ull);
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_heads));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_kv_heads));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.head_dim));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->k_precision()));
-        combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->v_precision()));
-        combineAttentionVariant(signature, params_.apply_rope_to_k ? 1ull : 0ull);
-        combineAttentionVariant(signature, static_cast<uint64_t>(
-                                             std::max(0, static_cast<int>(
-                                                             params_.partial_rotary_factor *
-                                                             params_.head_dim))));
-
-        if (params_.device_id.is_rocm())
-        {
-            const auto &rocm_env = debugEnv().rocm;
-            combineAttentionVariant(signature, rocm_env.fa_decode_num_splits_present ? 1ull : 0ull);
-            combineAttentionVariant(signature, rocm_env.fa_decode_num_splits
-                                                   ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_num_splits))
-                                                   : 0ull);
-            combineAttentionVariant(signature, rocm_env.fa_decode_tpb
-                                                   ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_tpb))
-                                                   : 0ull);
-        }
-
-        for (int row = 0; row < decode_rows; ++row)
-        {
-            const int row_kv_len =
-                std::max(1, effective_kv_len - (decode_rows - 1 - row));
-            combineAttentionVariant(signature, static_cast<uint64_t>(row));
-            combineAttentionVariant(signature, multirow_verifier_decode
-                                                   ? static_cast<uint64_t>(
-                                                         attentionDecodeLaunchBucket(params_.device_id,
-                                                                                     row_kv_len,
-                                                                                     params_.n_heads))
-                                                   : 0ull);
-            if (params_.device_id.is_rocm())
-            {
-                const int requested_split_cap = rocmAttentionRequestedDecodeSplitCap(row_kv_len);
-                combineAttentionVariant(signature, static_cast<uint64_t>(requested_split_cap));
-            }
-        }
-
-        return signature;
     }
 
     // =============================================================================
@@ -721,7 +574,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        LOG_DEBUG("[AttentionComputeStage::getOrCreateKernel] Created and cached attention kernel for "
+        LOG_TRACE("[AttentionComputeStage::getOrCreateKernel] Created and cached attention kernel for "
                   << params_.Q->dtype_name() << " on " << params_.device_id.to_string());
 
         return kernel;
@@ -747,34 +600,261 @@ namespace llaminar2
             return WorkspaceRequirements{};
         }
 
-        // The generic workspace allocator only has model-level sizing hints.
-        // Qwen3.5 MoE uses local/tensor-parallel attention dimensions that can
-        // differ from those hints.  Size attention scratch from the stage's
-        // actual runtime shape so split-decode partial buffers cannot be
-        // undersized and overlap PARTIAL_M/PARTIAL_L.
-        const int workspace_batch = std::max({1, m, params_.batch_size});
+        /*
+         * The generic workspace allocator visits the ordinary one-row decode
+         * graph.  That same graph is later replayed for an MTP verifier group,
+         * however, and split attention indexes its partial-output/M/L buffers
+         * by every query row.  Reserve the complete production verifier span
+         * even when the allocator's model-level M hint is one.  Stage-local
+         * head dimensions remain authoritative because TP/MoE graph hints can
+         * describe a smaller shard than the concrete attention stage.
+         */
+        const attention::AttentionWorkspaceCardinality
+            workspace_cardinality =
+                attention::planAttentionWorkspaceCardinality(
+                    m,
+                    params_.batch_size);
+        const int workspace_partial_rows =
+            workspace_cardinality.compact_query_rows;
         const int workspace_heads = std::max(n, params_.n_heads);
         const int workspace_head_dim = std::max(k, params_.head_dim);
+        const int workspace_kv_capacity =
+            params_.kv_cache
+                ? params_.kv_cache->max_seq_len()
+                : std::max(params_.kv_len, params_.seq_len);
 
         auto reqs = consumer->getWorkspaceRequirements(
-            workspace_batch,
+            workspace_partial_rows,
             workspace_heads,
             workspace_head_dim);
 
-        const int workspace_kv_heads = std::max(1, params_.n_kv_heads);
-        const size_t kv_convert_bytes = static_cast<size_t>(workspace_batch) *
-                                        4096ULL *
-                                        static_cast<size_t>(workspace_kv_heads) *
-                                        static_cast<size_t>(workspace_head_dim) *
-                                        sizeof(float);
-        for (auto &buffer : reqs.buffers)
+#if defined(HAVE_CUDA)
+        if (params_.device_id.is_cuda())
         {
-            if (buffer.name == "attn_k_tmp_fp32" ||
-                buffer.name == "attn_v_tmp_fp32")
+            cudaDeviceProp properties{};
+            const int device_index =
+                params_.device_id.toKernelDeviceIndex();
+            const cudaError_t property_status =
+                cudaGetDeviceProperties(&properties, device_index);
+            if (property_status != cudaSuccess)
             {
-                buffer.size_bytes = kv_convert_bytes;
+                throw std::runtime_error(
+                    "AttentionComputeStage could not query immutable CUDA "
+                    "capture geometry for " +
+                    params_.device_id.toString() + ": " +
+                    cudaGetErrorString(property_status));
             }
+
+            const cuda::fa2_policy::FA2PrefillParallelPlan prefill_plan =
+                cuda::fa2_policy::selectFA2PrefillParallelPlan({
+                    .batch_size = params_.batch_size,
+                    .query_rows = params_.seq_len,
+                    .local_query_heads = params_.n_heads,
+                    .head_dim = params_.head_dim,
+                    .kv_capacity = workspace_kv_capacity,
+                    .sm_count = properties.multiProcessorCount,
+                    .requested_axis =
+                        params_.execution_policy.prefill_parallel_axis,
+                });
+            if (!prefill_plan.valid)
+            {
+                throw std::runtime_error(
+                    "AttentionComputeStage received an invalid CUDA FA2 "
+                    "capture plan for " + params_.device_id.toString());
+            }
+
+            if (prefill_plan.usesContextParallelism())
+            {
+                const auto require_capacity = [&reqs](
+                                                  const char *name,
+                                                  std::size_t bytes)
+                {
+                    for (auto &buffer : reqs.buffers)
+                    {
+                        if (buffer.name == name)
+                        {
+                            buffer.size_bytes =
+                                std::max(buffer.size_bytes, bytes);
+                            return;
+                        }
+                    }
+                    reqs.buffers.push_back({name, bytes, 256, true});
+                };
+                require_capacity(
+                    cuda::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                    prefill_plan.partial_output_bytes);
+                require_capacity(
+                    cuda::AttentionWorkspaceBuffers::PARTIAL_M,
+                    prefill_plan.partial_m_bytes);
+                require_capacity(
+                    cuda::AttentionWorkspaceBuffers::PARTIAL_L,
+                    prefill_plan.partial_l_bytes);
+            }
+
+            LOG_TRACE(
+                "[AttentionComputeStage] CUDA prefill capture plan"
+                << " device=" << params_.device_id.toString()
+                << " requested="
+                << attention::attentionPrefillParallelAxisName(
+                       params_.execution_policy.prefill_parallel_axis)
+                << " selected="
+                << (prefill_plan.usesContextParallelism()
+                        ? "key_value_context"
+                        : "query_sequence")
+                << " query_blocks=" << prefill_plan.query_grid_blocks
+                << " context_partitions="
+                << prefill_plan.max_context_partitions
+                << " partial_output_bytes="
+                << prefill_plan.partial_output_bytes);
         }
+#endif
+
+#if defined(HAVE_ROCM)
+        if (params_.device_id.is_rocm())
+        {
+            const int device_index =
+                params_.device_id.toKernelDeviceIndex();
+            const rocm::fa2_policy::ROCmFA2PhysicalDeviceProperties
+                properties =
+                    rocm::queryROCmFlashAttentionDeviceProperties(
+                        device_index);
+
+            const rocm::fa2_policy::ROCmFA2PrefillParallelPlan prefill_plan =
+                rocm::fa2_policy::selectROCmFA2PrefillParallelPlan({
+                    .batch_size = params_.batch_size,
+                    .query_rows = params_.seq_len,
+                    .local_query_heads = params_.n_heads,
+                    .head_dim = params_.head_dim,
+                    .kv_capacity = workspace_kv_capacity,
+                    .compute_unit_count = properties.compute_unit_count,
+                    .lds_capacity_bytes = properties.lds_capacity_bytes,
+                    .requested_axis =
+                        params_.execution_policy.prefill_parallel_axis,
+                });
+            if (!prefill_plan.valid)
+            {
+                throw std::runtime_error(
+                    "AttentionComputeStage received an invalid ROCm FA2 "
+                    "capture plan for " + params_.device_id.toString());
+            }
+
+            const auto require_capacity = [&reqs](
+                                              const char *name,
+                                              std::size_t bytes)
+            {
+                for (auto &buffer : reqs.buffers)
+                {
+                    if (buffer.name == name)
+                    {
+                        buffer.size_bytes =
+                            std::max(buffer.size_bytes, bytes);
+                        return;
+                    }
+                }
+                reqs.buffers.push_back({name, bytes, 256, true});
+            };
+
+            if (prefill_plan.usesContextParallelism())
+            {
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                    prefill_plan.partial_output_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_M,
+                    prefill_plan.partial_m_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_L,
+                    prefill_plan.partial_l_bytes);
+            }
+
+            /*
+             * Geometry selection is non-monotonic in M on MI50. Medium query
+             * grids use context summaries, but large prefill grids return to
+             * direct query parallelism and report zero partial bytes. Reserve
+             * the policy-computed maximum over the complete admitted M range
+             * now, before any graph captures the shared arena address. This is
+             * a family capacity declaration only; runtime graph selection
+             * remains tied to the exact captured bucket above.
+             */
+            const rocm::fa2_policy::ROCmFA2PrefillParallelPlan
+                family_workspace_plan =
+                    rocm::fa2_policy::
+                        selectROCmFA2GeometrySelectedWorkspaceEnvelope({
+                            .batch_size = params_.batch_size,
+                            .query_rows = workspace_kv_capacity,
+                            .local_query_heads = params_.n_heads,
+                            .head_dim = params_.head_dim,
+                            .kv_capacity = workspace_kv_capacity,
+                            .compute_unit_count =
+                                properties.compute_unit_count,
+                            .lds_capacity_bytes =
+                                properties.lds_capacity_bytes,
+                            .requested_axis = params_.execution_policy
+                                                  .prefill_parallel_axis,
+                        });
+            if (family_workspace_plan.valid &&
+                family_workspace_plan.usesContextParallelism())
+            {
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                    family_workspace_plan.partial_output_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_M,
+                    family_workspace_plan.partial_m_bytes);
+                require_capacity(
+                    rocm::AttentionWorkspaceBuffers::PARTIAL_L,
+                    family_workspace_plan.partial_l_bytes);
+            }
+
+            LOG_TRACE(
+                "[AttentionComputeStage] ROCm prefill capture plan"
+                << " device=" << params_.device_id.toString()
+                << " requested="
+                << attention::attentionPrefillParallelAxisName(
+                       params_.execution_policy.prefill_parallel_axis)
+                << " selected="
+                << rocm::fa2_policy::rocmFA2PrefillPhysicalModeName(
+                       prefill_plan.mode)
+                << " query_blocks=" << prefill_plan.query_grid_blocks
+                << " context_partitions="
+                << prefill_plan.max_context_partitions
+                << " context_slots="
+                << prefill_plan.context_partition_slots
+                << " context_phase_block_slots="
+                << prefill_plan.context_phase_block_slots
+                << " device_direct_partition_limit="
+                << prefill_plan.device_direct_partition_limit
+                << " reducer_wavefronts="
+                << prefill_plan.reducer_dimension_wavefronts
+                << " reducer_block_slots="
+                << prefill_plan.reducer_block_slots
+                << " partial_output_bytes="
+                << prefill_plan.partial_output_bytes
+                << " family_partial_output_bytes="
+                << family_workspace_plan.partial_output_bytes);
+        }
+#endif
+
+        /*
+         * Mixed-precision KV conversion has a different index space from the
+         * split-attention partials: it stores one cache per independent request,
+         * not one cache per verifier query row.  Restore these two descriptors
+         * to the real request count after asking the backend for conservatively
+         * grouped partial buffers.  This preserves correctness without paying
+         * four complete 4096-token KV conversion buffers for one request.
+         */
+        attention_workspace::applyExactControlAndConversionGeometry(
+            reqs,
+            attention_workspace::Geometry{
+                .compact_query_rows = workspace_partial_rows,
+                .request_count = workspace_cardinality.request_count,
+                .local_query_heads = workspace_heads,
+                .local_kv_heads = std::max(1, params_.n_kv_heads),
+                .head_dim = workspace_head_dim,
+                .context_rows = workspace_kv_capacity,
+                .decode_splits =
+                    attention_workspace::kMaximumDecodeSplits,
+            });
 
         return reqs;
     }
@@ -782,33 +862,79 @@ namespace llaminar2
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
     {
         const bool gpu_stage = params_.device_id.is_gpu();
-        if (gpu_stage && !gpuStream())
+        const auto &key_cache_policy = params_.execution_policy.key_cache;
+        const bool transform_cached_keys = key_cache_policy.transformsOnRead();
+        if (gpu_stage)
+            (void)requireGPUStream();
+        if (gpu_stage && params_.kv_cache && !params_.read_kv_from_cache)
         {
-            LOG_ERROR("[AttentionComputeStage] GPU attention/KV read requires an explicit non-null stage stream");
+            LOG_ERROR("[AttentionComputeStage] GPU attention with a KV cache requires the device-owned post-append cache path"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.toString());
             return false;
         }
 
-        // Dynamic kv_len: query from KV cache at execution time if available
-        // This enables declarative graph construction where the stage runs after
-        // KVCacheAppendStage has already appended tokens
+        const bool padded_prefill_replay =
+            prefill_replay_params_set_ &&
+            prefill_effective_seq_len_ > 0 &&
+            prefill_bucket_seq_len_ > 0 &&
+            prefill_bucket_seq_len_ == params_.seq_len &&
+            prefill_effective_seq_len_ < params_.seq_len;
+        const int logical_seq_len = padded_prefill_replay
+                                        ? prefill_effective_seq_len_
+                                        : params_.seq_len;
+        const bool has_current_dynamic_sequence_state =
+            dynamic_pre_append_cached_tokens_ >= 0 &&
+            dynamic_logical_seq_len_ == logical_seq_len &&
+            dynamic_post_append_kv_len_ >= logical_seq_len;
+
+        // The scalar horizon controls only host-side launch geometry. GPU
+        // kernels consume the canonical post-append device count below; CPU
+        // caches retain their ordinary synchronous sequence-state interface.
         int effective_kv_len = params_.kv_len;
         if (params_.kv_cache && params_.layer_idx >= 0)
         {
-            effective_kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-            if (effective_kv_len == 0)
+            if (has_current_dynamic_sequence_state)
             {
-                effective_kv_len = params_.seq_len; // Prefill case
+                effective_kv_len = dynamic_post_append_kv_len_;
+            }
+            else
+            {
+                if (gpu_stage)
+                {
+                    effective_kv_len = std::clamp(
+                        std::max(0, params_.position_offset) + logical_seq_len,
+                        std::max(1, logical_seq_len),
+                        std::max(1, params_.kv_cache->max_seq_len()));
+                }
+                else
+                {
+                    effective_kv_len = params_.kv_cache->get_cached_tokens(
+                        params_.layer_idx,
+                        0);
+                    if (effective_kv_len == 0)
+                    {
+                        effective_kv_len = params_.seq_len;
+                    }
+                }
             }
             LOG_TRACE("[AttentionComputeStage] Dynamic kv_len from cache: " << effective_kv_len
                                                                             << " (static was: " << params_.kv_len << ")");
         }
-
+        const int effective_kv_stride =
+            gpu_stage && params_.kv_cache
+                ? std::max(1, params_.kv_cache->max_seq_len())
+                : std::max(1, effective_kv_len);
         // Read K/V from cache at execution time when requested.
-        // This allows GPU prefill to use the FP16 tensors in the KV cache
-        // (populated by KVCacheAppendStage) instead of the Q8_1 projection
-        // buffers, eliminating the Q8_1→FP32→FP16 triple conversion.
+        // This gives every phase the same post-append native cache source rather
+        // than a phase-dependent projection tensor.
         ITensor *effective_K = params_.K;
         ITensor *effective_V = params_.V;
+        attention::AttentionKVLogicalView kv_logical_view{};
+        const int *device_ring_head = nullptr;
+        const int *device_ring_count = nullptr;
+        int device_ring_capacity = 0;
+        bool cpu_grouped_request_cache = false;
         if (params_.kv_cache && params_.layer_idx >= 0)
         {
             // Always override K/V from KV cache when:
@@ -818,240 +944,288 @@ namespace llaminar2
             //    scratch buffers. During decode, those buffers only hold the current token's
             //    projection. The full KV history lives in the cache (populated by
             //    KVCacheAppendStage which runs before this stage).
-            // 3. apply_rope_to_k is set (rope_on_read mode) - K is stored pre-RoPE
-            //    in the cache, so we must read through get_kv_converted() which
-            //    fuses RoPE into the read path. This applies to BOTH prefill and decode.
-            if (params_.read_kv_from_cache || effective_kv_len > params_.seq_len || params_.apply_rope_to_k)
+            // 3. the key-cache policy stores pre-RoPE GPU bytes, which requires
+            //    the captured device transform for both prefill and decode.
+            if (params_.read_kv_from_cache || effective_kv_len > params_.seq_len ||
+                transform_cached_keys)
             {
                 ITensor *cache_k = nullptr;
                 ITensor *cache_v = nullptr;
 
-                // For CPU, use get_kv_converted<FP32>() which handles:
-                // - Incremental dequant for all cache precisions (FP16, BF16, Q8_1, TQ4, split TQ)
-                // - Optional fused RoPE-on-read (when apply_rope_to_k is set)
-                // - Lazy shadow buffer management inside the cache
-                // This covers both decode (full KV history) and prefill with rope_on_read
-                // (K stored pre-RoPE, needs RoPE applied during read).
-                const bool is_cpu_path = (gpuStream() == nullptr);
-                if (is_cpu_path && (effective_kv_len > params_.seq_len || params_.apply_rope_to_k))
+                /*
+                 * CPU attention consumes the persistent native cache tensors
+                 * directly. The accompanying logical view names the ring origin,
+                 * so wrapped histories do not require linearization or an FP32
+                 * coherence shadow. Request batches still carry independent
+                 * descriptors and are handled by their grouped contract below.
+                 */
+                const bool is_cpu_path = !gpu_stage;
+                if (is_cpu_path)
                 {
-                    // =====================================================================
-                    // Fused TQ attention path: pass raw TQ8/TQ4 tensors directly to the
-                    // attention kernel, eliminating FP32 shadow buffers entirely.
-                    //
-                    // Conditions for fused path:
-                    //   - Decode mode (effective_kv_len > seq_len)
-                    //   - TQ cache format (TQ8-K / TQ4-V)
-                    //   - NOT rope_on_read (RoPE already applied at write time)
-                    //   - TurboQuantContext available (for rotation matrices)
-                    //
-                    // When active, the kernel exploits rotation orthogonality:
-                    //   dot(Q, dequant(K)) = (norm/D) · dot(Π·Q, centroids(K))
-                    // reducing per-position cost from O(D²) to O(D).
-                    // =====================================================================
-                    const bool is_tq_decode = (effective_kv_len > params_.seq_len &&
-                                               !params_.apply_rope_to_k &&
-                                               params_.turboquant_ctx);
-                    if (is_tq_decode)
+                    if (params_.batch_size > 1)
                     {
-                        ITensor *raw_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                        ITensor *raw_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-
-                        if (raw_k && raw_v &&
-                            raw_k->native_type() == TensorType::TQ8 &&
-                            raw_v->native_type() == TensorType::TQ4)
+                        if (cpu_grouped_k_views_.size() !=
+                                static_cast<size_t>(params_.batch_size) ||
+                            cpu_grouped_v_views_.size() !=
+                                static_cast<size_t>(params_.batch_size) ||
+                            cpu_grouped_kv_lens_.size() !=
+                                static_cast<size_t>(params_.batch_size) ||
+                            cpu_grouped_kv_logical_views_.size() !=
+                                static_cast<size_t>(params_.batch_size))
                         {
-                            // Set per-layer TQ context on tensors (needed by kernel for rotation)
-                            const auto &layer_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
-                            auto *k_tq8 = dynamic_cast<TQ8Tensor *>(raw_k);
-                            auto *v_tq4 = dynamic_cast<TQ4Tensor *>(raw_v);
-                            if (k_tq8 && v_tq4)
-                            {
-                                k_tq8->set_turboquant_context(&layer_ctx);
-                                v_tq4->set_turboquant_context(&layer_ctx);
-                                effective_K = raw_k;
-                                effective_V = raw_v;
-                                LOG_TRACE("[AttentionComputeStage] Fused TQ path: passing raw TQ8/TQ4 tensors for layer "
-                                          << params_.layer_idx << " kv_len=" << effective_kv_len);
-                            }
-                        }
-                    }
-
-                    // =====================================================================
-                    // Fused Q16_1/Q8_1 attention path: pass raw quantized tensors directly
-                    // to the attention kernel, eliminating FP32 shadow buffers.
-                    //
-                    // Q16_1: VNNI int16 QK dot product (VPDPWSSD) + int16 V accumulation
-                    // Q8_1: int8→float inline dequant in attention's inner loop
-                    //
-                    // Conditions: decode mode, NOT rope_on_read, matching cache format
-                    // =====================================================================
-                    if (effective_K == params_.K && // not overridden by fused TQ path
-                        effective_kv_len > params_.seq_len &&
-                        !params_.apply_rope_to_k)
-                    {
-                        const auto kp = params_.kv_cache->k_precision();
-                        const auto vp = params_.kv_cache->v_precision();
-                        if ((kp == ActivationPrecision::Q16_1 && vp == ActivationPrecision::Q16_1) ||
-                            (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1))
-                        {
-                            ITensor *raw_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                            ITensor *raw_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-                            if (raw_k && raw_v)
-                            {
-                                effective_K = raw_k;
-                                effective_V = raw_v;
-                                LOG_TRACE("[AttentionComputeStage] Fused " << activationPrecisionToString(kp)
-                                                                           << " path: passing raw tensors for layer "
-                                                                           << params_.layer_idx << " kv_len=" << effective_kv_len);
-                            }
-                        }
-                    }
-
-                    // Converted-cache path: dequantize through get_kv_converted
-                    // when fused raw attention cannot consume the cache format.
-                    if (effective_K == params_.K) // not overridden by any fused path above
-                    {
-                        IKVCache::KVReadParams read_params;
-                        if (params_.apply_rope_to_k)
-                        {
-                            read_params.rope_theta = params_.rope_theta;
-                            read_params.position_start = 0; // Cache rows are stored in position order
-                            read_params.rope_dim = static_cast<int>(
-                                params_.partial_rotary_factor * params_.head_dim);
-                        }
-                        read_params.n_kv_heads = params_.n_kv_heads;
-                        read_params.head_dim = params_.head_dim;
-                        read_params.turboquant_ctx = params_.turboquant_ctx;
-                        read_params.gpu_stream = gpuStream();
-
-                        int kv_len_out = 0;
-                        if (params_.kv_cache->get_kv_converted(
-                                params_.layer_idx, 0,
-                                ActivationPrecision::FP32,
-                                &cache_k, &cache_v, &kv_len_out,
-                                &read_params))
-                        {
-                            effective_K = cache_k;
-                            effective_V = cache_v;
-                            if (kv_len_out <= 0)
-                            {
-                                LOG_ERROR("[AttentionComputeStage] get_kv_converted returned invalid kv_len="
-                                          << kv_len_out << " for layer " << params_.layer_idx);
-                                return false;
-                            }
-                            effective_kv_len = kv_len_out;
-                            LOG_TRACE("[AttentionComputeStage] Using cache get_kv<FP32> ("
-                                      << cache_k->dtype_name() << ") for layer " << params_.layer_idx
-                                      << " kv_len=" << kv_len_out);
-                        }
-                        else
-                        {
-                            LOG_ERROR("[AttentionComputeStage] get_kv_converted failed for layer "
-                                      << params_.layer_idx << "; failing instead of substituting raw cache tensors");
+                            LOG_ERROR("[AttentionComputeStage] CPU grouped KV descriptor capacity drifted from graph batch size");
                             return false;
                         }
-                    } // end converted-cache get_kv_converted
+
+                        const ActivationPrecision key_precision =
+                            params_.kv_cache->k_precision();
+                        const ActivationPrecision value_precision =
+                            params_.kv_cache->v_precision();
+                        const int physical_capacity =
+                            params_.kv_cache->max_seq_len();
+                        if (physical_capacity <= 0)
+                        {
+                            LOG_ERROR("[AttentionComputeStage] CPU grouped KV cache has invalid physical capacity"
+                                      << " layer=" << params_.layer_idx
+                                      << " capacity=" << physical_capacity);
+                            return false;
+                        }
+                        int max_request_kv_len = 0;
+                        for (int request = 0; request < params_.batch_size; ++request)
+                        {
+                            ITensor *request_k = nullptr;
+                            ITensor *request_v = nullptr;
+                            int request_kv_len = 0;
+                            if (!params_.kv_cache->get_kv(
+                                    params_.layer_idx,
+                                    request,
+                                    &request_k,
+                                    &request_v,
+                                    &request_kv_len) ||
+                                !request_k || !request_v ||
+                                request_kv_len < params_.seq_len)
+                            {
+                                LOG_ERROR("[AttentionComputeStage] Native CPU grouped cache retrieval failed"
+                                          << " layer=" << params_.layer_idx
+                                          << " request=" << request
+                                          << " kv_len=" << request_kv_len);
+                                return false;
+                            }
+
+                            if (!prepareCPUAttentionNativePair(
+                                    request_k,
+                                    request_v,
+                                    key_precision,
+                                    value_precision,
+                                    params_.turboquant_ctx,
+                                    params_.layer_idx))
+                            {
+                                return false;
+                            }
+
+                            const IKVCache::KVCacheSequenceState state =
+                                params_.kv_cache->sequenceState(
+                                    params_.layer_idx,
+                                    request);
+                            if (state.cached_tokens != request_kv_len ||
+                                request_kv_len > physical_capacity ||
+                                state.implementation_head < 0 ||
+                                state.implementation_head >= physical_capacity)
+                            {
+                                LOG_ERROR("[AttentionComputeStage] Native CPU grouped KV sequence state is incoherent"
+                                          << " layer=" << params_.layer_idx
+                                          << " request=" << request
+                                          << " tensor_kv_len=" << request_kv_len
+                                          << " state_kv_len=" << state.cached_tokens
+                                          << " ring_head=" << state.implementation_head
+                                          << " capacity=" << physical_capacity);
+                                return false;
+                            }
+
+                            const size_t request_index =
+                                static_cast<size_t>(request);
+                            cpu_grouped_k_views_[request_index] = request_k;
+                            cpu_grouped_v_views_[request_index] = request_v;
+                            cpu_grouped_kv_lens_[request_index] = request_kv_len;
+                            cpu_grouped_kv_logical_views_[request_index] = {
+                                .logical_row_origin =
+                                    state.implementation_head,
+                                .physical_row_capacity = physical_capacity,
+                            };
+                            max_request_kv_len = std::max(max_request_kv_len, request_kv_len);
+                        }
+
+                        effective_K = const_cast<ITensor *>(cpu_grouped_k_views_.front());
+                        effective_V = const_cast<ITensor *>(cpu_grouped_v_views_.front());
+                        effective_kv_len = max_request_kv_len;
+                        cpu_grouped_request_cache = true;
+                    }
+
+                    else
+                    {
+                        int kv_len_out = 0;
+                        if (!params_.kv_cache->get_kv(
+                                params_.layer_idx,
+                                /*seq_idx=*/0,
+                                &cache_k,
+                                &cache_v,
+                                &kv_len_out) ||
+                            !cache_k || !cache_v || kv_len_out <= 0)
+                        {
+                            LOG_ERROR("[AttentionComputeStage] Native CPU KV retrieval failed"
+                                      << " layer=" << params_.layer_idx
+                                      << " kv_len=" << kv_len_out);
+                            return false;
+                        }
+
+                        if (!prepareCPUAttentionNativePair(
+                                cache_k,
+                                cache_v,
+                                params_.kv_cache->k_precision(),
+                                params_.kv_cache->v_precision(),
+                                params_.turboquant_ctx,
+                                params_.layer_idx))
+                            return false;
+
+                        const IKVCache::KVCacheSequenceState sequence_state =
+                            params_.kv_cache->sequenceState(
+                                params_.layer_idx,
+                                /*seq_idx=*/0);
+                        const int physical_capacity =
+                            params_.kv_cache->max_seq_len();
+                        /*
+                         * The append-complete CPU cache is the sole authority
+                         * for its logical length. updateDynamicParams() runs
+                         * before append and supplies only a launch/read hint;
+                         * MTP sidecars can deliberately publish fewer shifted
+                         * rows than that generic prediction. Comparing the two
+                         * would recreate an informal state mirror and reject a
+                         * coherent native cache.
+                         */
+                        if (sequence_state.cached_tokens != kv_len_out ||
+                            physical_capacity <= 0 ||
+                            kv_len_out > physical_capacity ||
+                            sequence_state.implementation_head < 0 ||
+                            sequence_state.implementation_head >= physical_capacity)
+                        {
+                            LOG_ERROR("[AttentionComputeStage] Native CPU KV sequence state is incoherent"
+                                      << " layer=" << params_.layer_idx
+                                      << " stage_kv_len=" << effective_kv_len
+                                      << " tensor_kv_len=" << kv_len_out
+                                      << " state_kv_len=" << sequence_state.cached_tokens
+                                      << " ring_head=" << sequence_state.implementation_head
+                                      << " capacity=" << physical_capacity);
+                            return false;
+                        }
+
+                        effective_K = cache_k;
+                        effective_V = cache_v;
+                        effective_kv_len = kv_len_out;
+                        kv_logical_view = {
+                            .logical_row_origin =
+                                sequence_state.implementation_head,
+                            .physical_row_capacity = physical_capacity,
+                        };
+                        LOG_TRACE("[AttentionComputeStage] Using native CPU ring tensors"
+                                  << " layer=" << params_.layer_idx
+                                  << " kv_len=" << effective_kv_len
+                                  << " ring_head="
+                                  << kv_logical_view.logical_row_origin
+                                  << " capacity="
+                                  << kv_logical_view.physical_row_capacity
+                                  << " K=" << cache_k->dtype_name()
+                                  << " V=" << cache_v->dtype_name());
+                    }
                 }
                 else
                 {
-                    // GPU path: use get_kv_converted() for TQ dequant + fused RoPE,
-                    // otherwise use raw cache tensors directly.
-
-                    // =====================================================================
-                    // Fused Q8_1 GPU attention path: pass raw Q8_1 tensors to the CUDA
-                    // kernel which does inline int8→float dequant in the attention loop.
-                    // This eliminates the Q8_1→FP16/FP32 workspace conversion entirely.
-                    //
-                    // Conditions: decode mode, NOT rope_on_read, Q8_1 cache format
-                    // =====================================================================
-                    const bool is_q8_gpu_decode = (effective_kv_len > params_.seq_len &&
-                                                   !params_.apply_rope_to_k &&
-                                                   params_.seq_len == 1);
-                    if (is_q8_gpu_decode)
+                    /*
+                     * All GPU attention cache reads use one request-batched,
+                     * graph-capturable operation, including batch size one.
+                     * The cache reads canonical device head/count values and
+                     * emits a fixed-stride view; no host-sized tensor wrapper,
+                     * scalar snapshot path, or stale-shadow validity decision
+                     * participates in production execution.
+                     */
+                    bool cache_read_ok = false;
+                    const ActivationPrecision cache_precision =
+                        params_.kv_cache->k_precision();
+                    const bool native_floating_ring =
+                        !transform_cached_keys && params_.batch_size == 1 &&
+                        (cache_precision == ActivationPrecision::FP16 ||
+                         cache_precision == ActivationPrecision::BF16 ||
+                         cache_precision == ActivationPrecision::FP32);
+                    if (native_floating_ring)
                     {
-                        const auto kp = params_.kv_cache->k_precision();
-                        const auto vp = params_.kv_cache->v_precision();
-                        if (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1)
-                        {
-                            ITensor *raw_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                            ITensor *raw_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-                            if (raw_k && raw_v)
-                            {
-                                effective_K = raw_k;
-                                effective_V = raw_v;
-                                LOG_TRACE("[AttentionComputeStage] GPU fused Q8_1 path: passing raw Q8_1 tensors for layer "
-                                          << params_.layer_idx << " kv_len=" << effective_kv_len);
-                            }
-                        }
+                        /*
+                         * The append stage has already published post-RoPE K
+                         * into a stable physical ring. Pass that allocation and
+                         * its canonical device metadata directly to attention;
+                         * the following parameter writer derives the logical
+                         * origin in graph order. No live row is copied here.
+                         */
+                        cache_read_ok =
+                            params_.kv_cache->get_kv_device_ring_view(
+                                params_.layer_idx,
+                                /*seq_idx=*/0,
+                                &cache_k,
+                                &cache_v,
+                                &device_ring_head,
+                                &device_ring_count,
+                                &device_ring_capacity,
+                                gpuStream());
                     }
-
-                    if (effective_K == params_.K &&
-                        (params_.apply_rope_to_k || effective_kv_len > params_.seq_len))
+                    else if (transform_cached_keys)
                     {
-                        LOG_DEBUG("[AttentionComputeStage] GPU KV CONVERTED PATH layer=" << params_.layer_idx
-                                                                                         << " apply_rope=" << params_.apply_rope_to_k
-                                                                                         << " rope_theta=" << params_.rope_theta
-                                                                                         << " eff_kv_len=" << effective_kv_len
-                                                                                         << " seq_len=" << params_.seq_len);
                         IKVCache::KVReadParams read_params;
-                        if (params_.apply_rope_to_k)
-                        {
-                            read_params.rope_theta = params_.rope_theta;
-                            read_params.position_start = 0;
-                            read_params.rope_dim = static_cast<int>(
-                                params_.partial_rotary_factor * params_.head_dim);
-                        }
+                        read_params.rope_theta = key_cache_policy.rope_theta;
+                        read_params.position_start = 0;
                         read_params.n_kv_heads = params_.n_kv_heads;
                         read_params.head_dim = params_.head_dim;
+                        read_params.rope_dim = static_cast<int>(
+                            key_cache_policy.partial_rotary_factor *
+                            params_.head_dim);
                         read_params.turboquant_ctx = params_.turboquant_ctx;
                         read_params.gpu_stream = gpuStream();
-
-                        int kv_len_out = 0;
-                        if (params_.kv_cache->get_kv_converted(
-                                params_.layer_idx, 0,
+                        cache_read_ok =
+                            params_.kv_cache->get_kv_batched_converted_device_view(
+                                params_.layer_idx,
+                                /*first_seq_idx=*/0,
+                                params_.batch_size,
                                 ActivationPrecision::FP16,
-                                &cache_k, &cache_v, &kv_len_out,
-                                &read_params))
-                        {
-                            effective_K = cache_k;
-                            effective_V = cache_v;
-                            if (kv_len_out <= 0)
-                            {
-                                LOG_ERROR("[AttentionComputeStage] GPU get_kv_converted returned invalid kv_len="
-                                          << kv_len_out << " for layer " << params_.layer_idx);
-                                return false;
-                            }
-                            effective_kv_len = kv_len_out;
-                            LOG_TRACE("[AttentionComputeStage] GPU: Using cache get_kv_converted<FP16> ("
-                                      << cache_k->dtype_name() << ") for layer " << params_.layer_idx
-                                      << " kv_len=" << kv_len_out);
-                        }
-                        else
-                        {
-                            LOG_ERROR("[AttentionComputeStage] GPU get_kv_converted failed for layer "
-                                      << params_.layer_idx << "; failing instead of substituting raw cache tensors");
-                            return false;
-                        }
+                                &cache_k,
+                                &cache_v,
+                                read_params);
                     }
                     else
                     {
-                        cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                        cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-                        if (cache_k && cache_v)
-                        {
-                            effective_K = cache_k;
-                            effective_V = cache_v;
-                            LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
-                                      << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
-                        }
-                        else
-                        {
-                            LOG_ERROR("[AttentionComputeStage] Requested cache K/V for layer "
-                                      << params_.layer_idx << " but cache tensors are unavailable");
-                            return false;
-                        }
+                        cache_read_ok = params_.kv_cache->get_kv_batched_device_view(
+                            params_.layer_idx,
+                            /*first_seq_idx=*/0,
+                            params_.batch_size,
+                            &cache_k,
+                            &cache_v,
+                            gpuStream());
                     }
+                    if (!cache_read_ok || !cache_k || !cache_v)
+                    {
+                        LOG_ERROR("[AttentionComputeStage] Device-owned grouped KV read failed"
+                                  << " layer=" << params_.layer_idx
+                                  << " batch=" << params_.batch_size
+                                  << " max_kv_len=" << effective_kv_len
+                                  << " transformed=" << transform_cached_keys
+                                  << " device=" << params_.device_id.to_string());
+                        return false;
+                    }
+                    effective_K = cache_k;
+                    effective_V = cache_v;
+                    LOG_TRACE("[AttentionComputeStage] Using device-owned grouped cache view"
+                              << " layer=" << params_.layer_idx
+                              << " batch=" << params_.batch_size
+                              << " max_kv_len=" << effective_kv_len
+                              << " type=" << cache_k->dtype_name()
+                              << " direct_ring=" << native_floating_ring
+                              << " ring_capacity=" << device_ring_capacity);
                 }
             }
         }
@@ -1066,7 +1240,7 @@ namespace llaminar2
         const bool is_decode_mode = (mode == AttentionMode::DECODE ||
                                      (params_.seq_len < effective_kv_len && params_.batch_size == 1));
 
-        LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size
+        LOG_TRACE("[AttentionComputeStage] Execute: batch=" << params_.batch_size
                                                             << " seq_len=" << params_.seq_len
                                                             << " kv_len=" << effective_kv_len
                                                             << " n_heads=" << params_.n_heads
@@ -1113,37 +1287,128 @@ namespace llaminar2
         }
         bindStageStream(kernel);
 
+        /*
+         * Independent GPU requests use separate KV banks and separate live
+         * device counts.  They must never enter the ordinary batch path, whose
+         * single AttentionDeviceParams row describes only equal-length batches.
+         * The explicit request contract below supports compact per-request rows
+         * up to the same sixteen-row bound used by grouped MTP verification.
+         */
+        /*
+         * Small independent request batches always use the row-local resident
+         * kernel, including the first prompt block where every cache count is
+         * equal to the query-row count.  The same captured graph may replay
+         * after prefix restore or a later append has grown those device-owned
+         * counts.  Selecting ordinary prefill from the host launch horizon and
+         * grouped decode only after observing a larger host KV length would
+         * make the arithmetic regime depend on stale host state: graph replay
+         * would keep prefill reduction order while an isolated request entered
+         * the serial-decode-equivalent grouped path.
+         *
+         * The grouped request kernel derives every row's visible prefix and
+         * launch policy from canonical cache counts on the execution stream.
+         * Its fixed maximum-stride grid is valid for both initial prefill and
+         * grown-prefix replay, making the regime choice graph-stable and fully
+         * device-owned.
+         */
+        const bool gpu_grouped_request_decode =
+            gpu_stage &&
+            params_.kv_cache &&
+            params_.layer_idx >= 0 &&
+            params_.batch_size > 1 &&
+            logical_seq_len > 0 &&
+            params_.batch_size * logical_seq_len <=
+                attention::kMaxGroupedVerifierAttentionRows &&
+            params_.causal;
+
+        const attention::AttentionPrefillCaptureGeometry prefill_capture{
+            .batch_size = params_.batch_size,
+            .query_rows = params_.seq_len,
+            .local_query_heads = params_.n_heads,
+            .head_dim = params_.head_dim,
+            .kv_capacity = effective_kv_stride,
+            .execution_policy = params_.execution_policy,
+        };
+
         if (gpu_stage && params_.kv_cache && params_.layer_idx >= 0)
         {
-            const auto kp = params_.kv_cache->k_precision();
-            const auto vp = params_.kv_cache->v_precision();
-            const bool tq_cache =
-                kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8 ||
-                vp == ActivationPrecision::TQ4 || vp == ActivationPrecision::TQ8;
             const int *device_cached_tokens =
-                tq_cache ? nullptr : params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0);
-            const bool padded_prefill_replay =
-                prefill_replay_params_set_ &&
-                prefill_effective_seq_len_ > 0 &&
-                prefill_bucket_seq_len_ > 0 &&
-                prefill_bucket_seq_len_ == params_.seq_len &&
-                prefill_effective_seq_len_ < params_.seq_len;
-            const int logical_seq_len = padded_prefill_replay
-                                            ? prefill_effective_seq_len_
-                                            : params_.seq_len;
-            const bool decode_like_step = effective_kv_len > logical_seq_len;
-            if (device_cached_tokens && decode_like_step)
+                params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0);
+            if (device_ring_count &&
+                device_cached_tokens != device_ring_count)
             {
+                LOG_ERROR("[AttentionComputeStage] Direct ring view and attention parameter writer disagree on canonical count ownership"
+                          << " layer=" << params_.layer_idx
+                          << " device=" << params_.device_id.toString());
+                return false;
+            }
+            const bool needs_device_sequence_params =
+                has_current_dynamic_sequence_state ||
+                effective_kv_len > logical_seq_len ||
+                isGraphCaptureActive();
+            if (device_cached_tokens && needs_device_sequence_params)
+            {
+                if (!gpu_grouped_request_decode)
+                {
+                    /*
+                     * Setup-only capture has no admitted request and therefore
+                     * no host dynamic-sequence mirror. It still records the
+                     * production device-count parameter writer: at transaction
+                     * zero the preceding KV append owns the live count, and the
+                     * adaptive CUDA predicate plus attention body consume that
+                     * value entirely on the captured stream. Restricting this
+                     * to host-observed prefix growth omits the conditional
+                     * transaction from a cold materialized executable.
+                     */
+                    const int query_rows_for_params =
+                        dynamicAttentionParamRows(logical_seq_len, effective_kv_len);
+                    if (!kernel->prepareDynamicAttnParamsFromDeviceSequenceState(
+                            device_cached_tokens,
+                            logical_seq_len,
+                            query_rows_for_params,
+                            gpuStream(),
+                            effective_kv_stride,
+                            params_.active_query_rows_device,
+                            prefill_capture,
+                            device_ring_head,
+                            device_ring_capacity))
+                    {
+                        LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
+                                  << params_.layer_idx << " on " << params_.device_id.toString());
+                        return false;
+                    }
+                }
+            }
+            else
+            {
+                /*
+                 * KernelFactory may reuse one attention kernel object across
+                 * graph signatures and request lifetimes. An earlier grouped
+                 * verifier can therefore leave device-derived M=2..16 params on
+                 * the object. Ordinary prefill must explicitly replace that
+                 * ownership with its one-row static launch metadata; otherwise
+                 * compute_tensor() can consume the stale verifier mode even
+                 * though this stage never requested device sequence state.
+                 *
+                 * During capture, updateDynamicParams() has already prepared
+                 * this identical row before beginCapture(), so this call only
+                 * validates the existing device buffer and records no duplicate
+                 * parameter writer.
+                 */
                 const int query_rows_for_params =
                     dynamicAttentionParamRows(logical_seq_len, effective_kv_len);
-                if (!kernel->prepareDynamicAttnParamsFromDeviceSequenceState(
-                        device_cached_tokens,
-                        logical_seq_len,
+                const int logical_position_offset =
+                    std::max(0, effective_kv_len - logical_seq_len);
+                if (!kernel->prepareDynamicAttnParams(
+                        effective_kv_len,
+                        logical_position_offset,
                         query_rows_for_params,
-                        gpuStream()))
+                        gpuStream(),
+                        effective_kv_stride))
                 {
-                    LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
-                              << params_.layer_idx << " on " << params_.device_id.toString());
+                    LOG_ERROR("[AttentionComputeStage] Failed to establish static attention params for layer "
+                              << params_.layer_idx << " on "
+                              << params_.device_id.toString());
                     return false;
                 }
             }
@@ -1163,7 +1428,8 @@ namespace llaminar2
         }
 
         // Dispatch to kernel's compute method. Decode kernels get the logical
-        // query start through setDynamicAttnParams()/kv_len-seq_len fallback.
+        // query start through setDynamicAttnParams() or canonical kv_len-seq_len
+        // geometry.
         const bool kernel_causal = params_.causal;
 
         // Device-agnostic unified path using compute_tensor()
@@ -1185,7 +1451,7 @@ namespace llaminar2
         // Device coherence is now handled automatically by DeviceGraphExecutor at stage boundaries
         // based on the stage's coherencePolicy() (FULL by default)
 
-        LOG_DEBUG("[AttentionComputeStage] Executing kernel: Q_type=" << params_.Q->dtype_name()
+        LOG_TRACE("[AttentionComputeStage] Executing kernel: Q_type=" << params_.Q->dtype_name()
                                                                       << " device=" << params_.device_id.to_string()
                                                                       << " device_idx=" << device_idx);
 
@@ -1361,7 +1627,10 @@ namespace llaminar2
             float *q_fp32 = params_.Q->mutable_data();
             if (q_fp32)
             {
-                kv_rot->rotate_rows_inplace(q_fp32, params_.seq_len, q_dim);
+                kv_rot->rotate_rows_inplace(
+                    q_fp32,
+                    params_.batch_size * params_.seq_len,
+                    q_dim);
             }
 
             // Prefill path: K/V are original projections, not from cache.
@@ -1380,29 +1649,46 @@ namespace llaminar2
         if (debugEnv().attention.debug_effective_kv_snapshot &&
             debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
         {
-            const size_t k_rows = static_cast<size_t>(effective_kv_len);
-            const size_t v_rows = static_cast<size_t>(effective_kv_len);
-            // CPU get_kv_converted() shadows are flat [max_seq_len * kv_dim]
-            // tensors, while ROCm cache views are [kv_len, kv_dim]. Compare
-            // the logical attention layout consumed by the kernel.
+            /*
+             * GPU request gathers are request-major fixed-stride tensors.  A
+             * diagnostic snapshot must retain every request bank; recording
+             * only `effective_kv_len` rows silently captured request zero and
+             * made unequal-length batch failures impossible to localize.
+             */
+            const size_t effective_request_count =
+                gpu_stage ? static_cast<size_t>(std::max(1, params_.batch_size))
+                          : size_t{1};
+            /*
+             * GPU resident views retain one max-sequence-capacity bank per
+             * request. Snapshot copy nodes are part of the captured graph, so
+             * their byte count must use that immutable physical stride rather
+             * than the host logical length observed during capture. Consumers
+             * still use device-owned live counts; inactive capacity is copied
+             * only for diagnostics and never enters attention arithmetic.
+             */
+            const size_t diagnostic_kv_stride =
+                gpu_stage ? static_cast<size_t>(effective_kv_stride)
+                          : static_cast<size_t>(effective_kv_len);
+            const size_t k_rows =
+                effective_request_count * diagnostic_kv_stride;
+            const size_t v_rows =
+                effective_request_count * diagnostic_kv_stride;
+            // Native CPU rings and fixed-stride GPU request banks have different
+            // physical row capacities. Compare the logical head width consumed
+            // by attention while retaining the backend's stable row envelope.
             const size_t logical_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
             const size_t k_cols = effective_K ? logical_kv_cols : 0;
             const size_t v_cols = effective_V ? logical_kv_cols : 0;
-            const bool have_k = tensorToFP32AttentionSnapshot(
-                effective_K, params_.device_id, gpuStream(), k_rows, k_cols,
-                debug_effective_k_snapshot_);
-            const bool have_v = tensorToFP32AttentionSnapshot(
-                effective_V, params_.device_id, gpuStream(), v_rows, v_cols,
-                debug_effective_v_snapshot_);
-
-            debug_effective_k_rows_ = have_k ? k_rows : 0;
-            debug_effective_k_cols_ = have_k ? k_cols : 0;
-            debug_effective_v_rows_ = have_v ? v_rows : 0;
-            debug_effective_v_cols_ = have_v ? v_cols : 0;
+            debug_effective_k_tensor_ = effective_K;
+            debug_effective_v_tensor_ = effective_V;
+            debug_effective_k_rows_ = (effective_K && k_rows > 0 && k_cols > 0) ? k_rows : 0;
+            debug_effective_k_cols_ = (effective_K && k_rows > 0 && k_cols > 0) ? k_cols : 0;
+            debug_effective_v_rows_ = (effective_V && v_rows > 0 && v_cols > 0) ? v_rows : 0;
+            debug_effective_v_cols_ = (effective_V && v_rows > 0 && v_cols > 0) ? v_cols : 0;
 
             // Snapshot callbacks reuse dump info first built before execute()
             // for coherence. Force post-execute getDumpInfo() to include these
-            // just-captured vectors.
+            // just-resolved tensor-backed diagnostic outputs.
             invalidateDumpInfoCache();
         }
 
@@ -1411,12 +1697,93 @@ namespace llaminar2
             params_.batch_size == 1 &&
             params_.causal &&
             params_.seq_len > 1 &&
-            params_.seq_len <= kMTPVerifierSmallDecodeMaxRows &&
+            params_.seq_len <= attention::kMaxGroupedVerifierAttentionRows &&
             effective_kv_len > params_.seq_len;
         bool success = false;
-        if (small_verifier_decode)
+        if (cpu_grouped_request_cache)
         {
-            LOG_DEBUG("[AttentionComputeStage] Using grouped decode-equivalent verifier attention"
+            LOG_TRACE("[AttentionComputeStage] Using grouped CPU request-cache attention"
+                      << " layer=" << params_.layer_idx
+                      << " requests=" << params_.batch_size
+                      << " query_rows=" << params_.seq_len);
+            success = kernel->compute_request_batch_decode_equivalent(
+                params_.Q,
+                cpu_grouped_k_views_.data(),
+                cpu_grouped_v_views_.data(),
+                cpu_grouped_kv_lens_.data(),
+                params_.output,
+                params_.batch_size,
+                params_.seq_len,
+                params_.n_heads,
+                params_.n_kv_heads,
+                params_.head_dim,
+                kernel_causal,
+                params_.window_size,
+                params_.mpi_ctx,
+                device_idx,
+                params_.head_start,
+                params_.gqa_n_rep,
+                params_.execution_policy,
+                cpu_grouped_kv_logical_views_.data());
+            if (!success)
+            {
+                LOG_ERROR("[AttentionComputeStage] Backend lacks grouped request-cache decode attention"
+                          << " layer=" << params_.layer_idx
+                          << " requests=" << params_.batch_size
+                          << " device=" << params_.device_id.to_string());
+            }
+        }
+        else if (gpu_grouped_request_decode)
+        {
+            const int *device_request_counts =
+                params_.kv_cache->deviceCachedTokenCountPtr(
+                    params_.layer_idx,
+                    /*seq_idx=*/0);
+            if (!device_request_counts)
+            {
+                LOG_ERROR("[AttentionComputeStage] Grouped GPU request attention requires canonical device KV counts"
+                          << " layer=" << params_.layer_idx
+                          << " requests=" << params_.batch_size
+                          << " device=" << params_.device_id.to_string());
+                return false;
+            }
+
+            LOG_TRACE("[AttentionComputeStage] Using device-owned grouped GPU request-cache attention"
+                      << " layer=" << params_.layer_idx
+                      << " requests=" << params_.batch_size
+                      << " query_rows=" << logical_seq_len
+                      << " logical_kv_len=" << effective_kv_len
+                      << " resident_kv_stride=" << effective_kv_stride);
+            success = kernel->compute_device_request_batch_decode_equivalent(
+                params_.Q,
+                effective_K,
+                effective_V,
+                device_request_counts,
+                params_.output,
+                params_.batch_size,
+                logical_seq_len,
+                effective_kv_stride,
+                params_.n_heads,
+                params_.n_kv_heads,
+                params_.head_dim,
+                kernel_causal,
+                params_.window_size,
+                params_.mpi_ctx,
+                device_idx,
+                params_.head_start,
+                params_.gqa_n_rep);
+            if (!success)
+            {
+                LOG_ERROR("[AttentionComputeStage] Backend lacks grouped device request-cache decode attention"
+                          << " layer=" << params_.layer_idx
+                          << " requests=" << params_.batch_size
+                          << " query_rows=" << logical_seq_len
+                          << " device=" << params_.device_id.to_string());
+            }
+        }
+        else if (small_verifier_decode)
+        {
+            LOG_TRACE("[AttentionComputeStage] Using grouped decode-equivalent verifier attention"
                       << " layer=" << params_.layer_idx
                       << " rows=" << params_.seq_len
                       << " effective_kv_len=" << effective_kv_len
@@ -1436,7 +1803,9 @@ namespace llaminar2
                 params_.mpi_ctx,
                 device_idx,
                 params_.head_start,
-                params_.gqa_n_rep);
+                params_.gqa_n_rep,
+                kv_logical_view,
+                params_.execution_policy);
             if (!success)
             {
                 LOG_ERROR("[AttentionComputeStage] Backend lacks grouped decode-equivalent verifier attention"
@@ -1465,7 +1834,9 @@ namespace llaminar2
                 params_.head_start,
                 -1, // local_n_heads (n_heads is already local)
                 -1, // local_n_kv_heads (n_kv_heads is already local)
-                params_.gqa_n_rep);
+                params_.gqa_n_rep,
+                params_.execution_policy,
+                kv_logical_view);
         }
 
         if (!success)
@@ -1481,8 +1852,10 @@ namespace llaminar2
             float *out_fp32 = params_.output->mutable_data();
             if (out_fp32)
             {
-                kv_rot->inverse_rotate_rows_inplace(out_fp32,
-                                                    params_.seq_len, q_dim);
+                kv_rot->inverse_rotate_rows_inplace(
+                    out_fp32,
+                    params_.batch_size * params_.seq_len,
+                    q_dim);
             }
 
             // Q, K, V do NOT need inverse-rotation:
@@ -1546,19 +1919,34 @@ namespace llaminar2
         const ITensor *dump_K = params_.K;
         const ITensor *dump_V = params_.V;
 
-        // Decode graph construction may cache GpuTensorView pointers while the
-        // KV cache still has N rows. The immediately preceding kv_append stage
-        // can replace those wrappers with N+1-row views, leaving params_.K/V
-        // stale before execute() has a chance to re-query the cache. Snapshot
-        // and validation metadata must therefore refresh cache-backed K/V views
-        // here, mirroring the execution path's live-cache read.
-        if (params_.kv_cache && params_.layer_idx >= 0)
+        // GPU dump metadata is assembled twice for a captured transaction:
+        // once while each participant prepares its immutable snapshot manifest,
+        // and again while the copy nodes are recorded.  TP participants may be
+        // in different phases at that instant.  Consequently this descriptor
+        // builder must never observe a GPU cache head/count on the host: a
+        // synchronous observation on one worker can invalidate a peer's HIP or
+        // CUDA capture even though both workers are individually well ordered.
+        //
+        // execute() publishes the exact cache-owned tensors consumed by
+        // attention into these diagnostic fields.  Their allocation and shape
+        // are graph-stable, so they are the one authority in both preparation
+        // and recording phases.  CPU caches remain host-owned and retain their
+        // ordinary synchronous descriptor path below.
+        if (debug_effective_k_tensor_ && debug_effective_v_tensor_)
+        {
+            dump_K = debug_effective_k_tensor_;
+            dump_V = debug_effective_v_tensor_;
+            total_kv_tokens = debug_effective_k_rows_;
+        }
+        else if (params_.kv_cache && params_.layer_idx >= 0 &&
+                 !params_.device_id.is_gpu())
         {
             const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
             const bool should_read_cache = cached_tokens > 0 &&
                                            (params_.read_kv_from_cache ||
                                             cached_tokens > params_.seq_len ||
-                                            params_.apply_rope_to_k);
+                                            params_.execution_policy.key_cache
+                                                .transformsOnRead());
 
             if (should_read_cache)
             {
@@ -1615,15 +2003,73 @@ namespace llaminar2
         if (debugEnv().attention.debug_effective_kv_snapshot &&
             debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
         {
-            if (!debug_effective_k_snapshot_.empty() && debug_effective_k_rows_ > 0 && debug_effective_k_cols_ > 0)
+            /*
+             * GPU cache/projection buffers are allocated at request capacity,
+             * and the captured D2D snapshot node must retain one immutable byte
+             * count across warmup, capture, and replay. The live logical token
+             * count still governs attention arithmetic through device-owned
+             * params; it must not resize diagnostic graph nodes. CPU snapshots
+             * remain synchronous and may describe only their logical rows.
+             */
+            const size_t expected_kv_rows =
+                params_.device_id.is_gpu() && params_.kv_cache
+                    ? static_cast<size_t>(std::max(1, params_.batch_size)) *
+                          static_cast<size_t>(std::max(1, params_.kv_cache->max_seq_len()))
+                    : (total_kv_tokens > 0
+                           ? total_kv_tokens
+                           : static_cast<size_t>(params_.seq_len > 0 ? params_.seq_len : 0));
+            const size_t expected_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            /*
+             * execute() resolves the exact cache-owned view consumed by the
+             * attention kernel.  Keep that pointer for both eager and captured
+             * snapshot publication.  Falling back to dump_K/dump_V after a
+             * captured replay selects sequence zero's raw cache view; labeling
+             * that storage as `request_count * max_kv_len` rows makes every
+             * later request appear zero even though the grouped kernel consumed
+             * the correctly gathered request-major tensor.
+             */
+            /*
+             * GPU effective-K/V diagnostics exist only after execute() resolves
+             * the production cache view. Omitting an unresolved diagnostic from
+             * pre-execution metadata is intentional: the executor requires a
+             * finalized warmup manifest before capture and hard-fails if the
+             * post-execute outputs disappear or change. CPU execution remains
+             * synchronous and may describe its directly selected dump tensors.
+             */
+            const ITensor *effective_k_tensor =
+                debug_effective_k_tensor_
+                    ? debug_effective_k_tensor_
+                    : (params_.device_id.is_gpu() ? nullptr : dump_K);
+            const ITensor *effective_v_tensor =
+                debug_effective_v_tensor_
+                    ? debug_effective_v_tensor_
+                    : (params_.device_id.is_gpu() ? nullptr : dump_V);
+            const size_t effective_k_rows = debug_effective_k_rows_ > 0 ? debug_effective_k_rows_ : expected_kv_rows;
+            const size_t effective_v_rows = debug_effective_v_rows_ > 0 ? debug_effective_v_rows_ : expected_kv_rows;
+            const size_t effective_k_cols = debug_effective_k_cols_ > 0 ? debug_effective_k_cols_ : expected_kv_cols;
+            const size_t effective_v_cols = debug_effective_v_cols_ > 0 ? debug_effective_v_cols_ : expected_kv_cols;
+            if (effective_k_tensor && effective_k_rows > 0 && effective_k_cols > 0)
             {
-                info.addOutput("effective_k", debug_effective_k_snapshot_.data(),
-                               debug_effective_k_rows_, debug_effective_k_cols_);
+                info.addOutput("effective_k", effective_k_tensor, effective_k_rows, effective_k_cols);
             }
-            if (!debug_effective_v_snapshot_.empty() && debug_effective_v_rows_ > 0 && debug_effective_v_cols_ > 0)
+            if (effective_v_tensor && effective_v_rows > 0 && effective_v_cols > 0)
             {
-                info.addOutput("effective_v", debug_effective_v_snapshot_.data(),
-                               debug_effective_v_rows_, debug_effective_v_cols_);
+                info.addOutput("effective_v", effective_v_tensor, effective_v_rows, effective_v_cols);
+            }
+            for (size_t request = 0;
+                 request < debug_device_kv_count_views_.size();
+                 ++request)
+            {
+                info.addOutput(
+                    debug_device_kv_count_names_[request].c_str(),
+                    debug_device_kv_count_views_[request].get(),
+                    /*rows=*/1,
+                    /*cols=*/1);
+                info.addOutput(
+                    debug_device_kv_head_names_[request].c_str(),
+                    debug_device_kv_head_views_[request].get(),
+                    /*rows=*/1,
+                    /*cols=*/1);
             }
         }
 

@@ -42,6 +42,29 @@ namespace
         int argc() const { return static_cast<int>(ptrs.size()); }
         char **argv() { return ptrs.data(); }
     };
+
+    class SentinelProbeCommand : public ICommand
+    {
+    public:
+        const char *name() const override { return "probe"; }
+        const char *description() const override { return "probe command"; }
+
+        int execute(int argc, char *argv[]) override
+        {
+            called = true;
+            received_argc = argc;
+            argv_sentinel_was_null = argv != nullptr && argv[argc] == nullptr;
+            received_args.clear();
+            for (int i = 0; i < argc; ++i)
+                received_args.emplace_back(argv[i] ? argv[i] : "");
+            return 0;
+        }
+
+        bool called = false;
+        int received_argc = 0;
+        bool argv_sentinel_was_null = false;
+        std::vector<std::string> received_args;
+    };
 } // namespace
 
 // ============================================================================
@@ -83,7 +106,8 @@ TEST(Test__Commands, BenchmarkPrefillBucketsStayEnabledForDenseDefaultMoEConfig)
 {
     const auto reason = benchmarkPrefillBucketDisableReason(
         /*uses_collectives=*/false,
-        /*dynamic_moe_rebalance_active=*/false);
+        /*dynamic_moe_rebalance_active=*/false,
+        /*segmented_collective_capture_authority=*/false);
     EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::None);
 }
 
@@ -91,7 +115,8 @@ TEST(Test__Commands, BenchmarkPrefillBucketsStillDisableForActualMoERebalance)
 {
     const auto reason = benchmarkPrefillBucketDisableReason(
         /*uses_collectives=*/false,
-        /*dynamic_moe_rebalance_active=*/true);
+        /*dynamic_moe_rebalance_active=*/true,
+        /*segmented_collective_capture_authority=*/false);
     EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::DynamicMoERebalance);
 }
 
@@ -99,8 +124,18 @@ TEST(Test__Commands, BenchmarkPrefillBucketsStillDisableForCollectives)
 {
     const auto reason = benchmarkPrefillBucketDisableReason(
         /*uses_collectives=*/true,
-        /*dynamic_moe_rebalance_active=*/false);
+        /*dynamic_moe_rebalance_active=*/false,
+        /*segmented_collective_capture_authority=*/false);
     EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::Collectives);
+}
+
+TEST(Test__Commands, BenchmarkPrefillBucketsStayEnabledForExpertOverlaySegments)
+{
+    const auto reason = benchmarkPrefillBucketDisableReason(
+        /*uses_collectives=*/true,
+        /*dynamic_moe_rebalance_active=*/false,
+        /*segmented_collective_capture_authority=*/true);
+    EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::None);
 }
 
 // ============================================================================
@@ -309,6 +344,24 @@ TEST(Test__Commands, RouterBareHelp_PrintsHelpReturns0)
     EXPECT_EQ(router.dispatch(args.argc(), args.argv()), 0);
 }
 
+TEST(Test__Commands, RouterDispatchPassesNullTerminatedArgv)
+{
+    SubcommandRouter router;
+    auto *probe = new SentinelProbeCommand();
+    router.add(std::unique_ptr<ICommand>(probe));
+
+    ArgvBuilder args("llaminar2", "probe", "--no-mpi-bootstrap", "-m", "model.gguf");
+    EXPECT_EQ(router.dispatch(args.argc(), args.argv()), 0);
+
+    ASSERT_TRUE(probe->called);
+    ASSERT_EQ(probe->received_argc, 4);
+    EXPECT_EQ(probe->received_args[0], "llaminar2");
+    EXPECT_EQ(probe->received_args[1], "--no-mpi-bootstrap");
+    EXPECT_EQ(probe->received_args[2], "-m");
+    EXPECT_EQ(probe->received_args[3], "model.gguf");
+    EXPECT_TRUE(probe->argv_sentinel_was_null);
+}
+
 // ============================================================================
 // BenchmarkCommand tests
 // ============================================================================
@@ -352,7 +405,7 @@ TEST(Test__Commands, OneshotRejectsBenchmarkFlag)
 TEST(Test__Commands, OneshotRejectsTensorParallelMoEBeforeRuntime)
 {
     OneshotCommand oneshot;
-    ArgvBuilder args("llaminar2", "--moe-expert-mode", "tensor-parallel",
+    ArgvBuilder args("llaminar2", "--moe-routed-expert-compute", "tensor-sharded",
                      "-m", "/tmp/does-not-need-to-exist.gguf", "-p", "test");
     EXPECT_EQ(oneshot.execute(args.argc(), args.argv()), 1);
 }
@@ -360,14 +413,14 @@ TEST(Test__Commands, OneshotRejectsTensorParallelMoEBeforeRuntime)
 TEST(Test__Commands, OneshotValidateOnlyReturns0BeforeRuntime)
 {
     OneshotCommand oneshot;
-    ArgvBuilder args("llaminar2", "--validate-only", "--moe-expert-mode", "expert-parallel");
+    ArgvBuilder args("llaminar2", "--validate-only", "--moe-routed-expert-compute", "apportioned");
     EXPECT_EQ(oneshot.execute(args.argc(), args.argv()), 0);
 }
 
 TEST(Test__Commands, ServeRejectsTensorParallelMoEBeforeRuntime)
 {
     ServeCommand serve;
-    ArgvBuilder args("llaminar2", "--moe-expert-mode", "tensor-parallel",
+    ArgvBuilder args("llaminar2", "--moe-routed-expert-compute", "tensor-sharded",
                      "-m", "/tmp/does-not-need-to-exist.gguf");
     EXPECT_EQ(serve.execute(args.argc(), args.argv()), 1);
 }

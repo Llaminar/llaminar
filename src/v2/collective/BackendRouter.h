@@ -34,6 +34,7 @@
 
 #include "ICollectiveBackend.h"
 #include "DeviceGroup.h"
+#include "CollectiveRuntimeLifecycle.h"
 #include "../execution/mpi_orchestration/DeviceInventory.h"
 #include "../utils/MPIContext.h"
 #include <algorithm>
@@ -353,6 +354,18 @@ namespace llaminar2
         CollectiveBackendType selectBackendType(const DeviceGroup &group) const;
         std::string makeGroupKey(const DeviceGroup &group) const;
 
+        /**
+         * @brief Resolve this process's rank-local participant inventory.
+         *
+         * Full cluster inventories are indexed by MPI rank. Participant-scoped
+         * LocalTP inventories contain one record whose `rank` field names its
+         * owner. Supporting both shapes keeps backend pre-initialization tied
+         * to declared participants rather than array position or discovery.
+         *
+         * @return Local rank inventory, or nullptr when none was supplied.
+         */
+        [[nodiscard]] const RankInventory *localRankInventory() const noexcept;
+
         // Pre-initialize GPU backends to avoid CUDA/HIP context corruption
         void preInitializeNCCLBackend();
         void preInitializeRCCLBackend();
@@ -418,6 +431,22 @@ namespace llaminar2
 
         static BackendRouter *get();
 
+        /**
+         * @brief Retire process collective state before native device reset.
+         *
+         * This is an infrastructure boundary used only by TransferEngine's
+         * exclusive model-retirement transaction. It destroys the singleton
+         * router, then retires inactive vendor coordinators while their native
+         * runtime generation is still valid. A live non-global owner is
+         * reported rather than interrupted.
+         *
+         * @param device Exact CUDA/HIP runtime about to be reset.
+         * @return Typed ownership and teardown evidence.
+         */
+        [[nodiscard]] static CollectiveRuntimeRetirementReceipt
+        retireForExclusiveDeviceRuntimeReset(DeviceId device);
+
+        /** @brief Retire the singleton and all inactive collective owners. */
         static void shutdown();
 
     private:

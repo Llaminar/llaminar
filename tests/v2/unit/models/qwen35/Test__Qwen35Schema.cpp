@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -35,6 +36,7 @@
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/AttentionOutputGateStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "config/TensorParallelConfig.h"
 #include "kernels/IKVCache.h"
 #include "kernels/IHybridKVCache.h"
@@ -72,6 +74,13 @@ namespace
         bool chunk_forward(const float *, const float *, const float *,
                            const float *, const float *, const float *, const float *,
                            float *, float *, int, int, int, int, int, bool) override
+        {
+            return true;
+        }
+        bool chunkForwardMergedQKV(
+            const float *, int,
+            const float *, const float *, const float *, const float *,
+            float *, float *, int, int, int, int, int, int, int, bool) override
         {
             return true;
         }
@@ -116,7 +125,7 @@ namespace
                     s.d_k = d_k;
                     s.d_v = d_v;
                     s.conv_kernel_size = config.gdn.conv_kernel_size;
-                    s.initialize(qkv_dim);
+                    s.initializeCPUState(qkv_dim);
                     s.conv_kernel = std::make_shared<StubShortConvolution>();
                     s.rec_kernel = std::make_shared<StubGatedDeltaNet>();
                 }
@@ -176,7 +185,7 @@ namespace
         {
             size_t total = 0;
             for (const auto &s : gdn_states_)
-                total += s.memoryBytes();
+                total += s.cpuMemoryBytes();
             return total;
         }
         HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
@@ -268,9 +277,16 @@ namespace
         ITensor *get_v(int, int) override { return nullptr; }
         const ITensor *get_v(int, int) const override { return nullptr; }
         bool append(int, int, const ITensor *, const ITensor *, int) override { return false; }
-        void clear() override {}
-        void clear_sequence(int, int) override {}
-        void clear_layer(int) override {}
+        bool resetRequestState(const StateResetContext &) override { return true; }
+        bool resetSequenceState(int, const StateResetContext &) override { return true; }
+        bool resetLayerSequenceState(
+            int,
+            int,
+            const StateResetContext &) override
+        {
+            return true;
+        }
+        bool resetLayerState(int, const StateResetContext &) override { return true; }
 
         mutable std::vector<int> queried_cache_layers;
 
@@ -327,6 +343,50 @@ TEST(Test__Qwen35Schema, CreatesValidSchema)
     EXPECT_FALSE(schema.required_params.empty());
 }
 
+TEST(Test__Qwen35Schema, SnapshotShardingDeclaresCapturedDenseSemanticKeys)
+{
+    Qwen35SchemaFactory factory;
+    StageShardingConfig sharding = factory.getStageShardingConfig();
+
+    EXPECT_EQ(sharding.at("EMBEDDING"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("EMBEDDING_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("ATTENTION_OUTPUT"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("ATTENTION_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("FFN_DOWN"), SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(sharding.at("FFN_DOWN_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(sharding.at("Q_NORM"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("K_NORM"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("KV_APPEND_SOURCE_K"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(sharding.at("KV_CACHE_K"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(
+        sharding.at("ATTENTION_DEVICE_KV_COUNT_REQUEST_*"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("ATTENTION_DEVICE_KV_HEAD_REQUEST_*"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("QKV_PROJECTION"),
+        SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
+    EXPECT_EQ(
+        sharding.at("GDN_CONV1D_OUTPUT"),
+        SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
+    for (const char *stage : {
+             "GDN_Z_PROJECTION",
+             "GDN_ALPHA",
+             "GDN_BETA",
+             "GDN_RECURRENCE",
+             "GDN_DELTA_RULE_OUTPUT",
+             "GATED_RMSNORM",
+             "GDN_NORM_GATE_OUTPUT",
+         })
+    {
+        EXPECT_EQ(
+            sharding.at(stage),
+            SnapshotShardingMode::PACKED_COLUMN_PARALLEL)
+            << stage;
+    }
+}
+
 TEST(Test__Qwen35Schema, GDNValueHeadWeightsUseProportionalHeadSharding)
 {
     Qwen35SchemaFactory factory;
@@ -341,55 +401,6 @@ TEST(Test__Qwen35Schema, GDNValueHeadWeightsUseProportionalHeadSharding)
               WeightShardingMode::InputParallel);
     EXPECT_EQ(sharding.getDimensionType("blk.0.ssm_out.weight"),
               WeightDimensionType::ProportionalHeads);
-}
-
-TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetPrefersValueProjectionSlice)
-{
-    // Qwen3.5-4B dense GDN has 36 FA/Q heads but 32 GDN V heads.
-    // TP=2 rank 1 therefore starts at Q-head 18, but V-head 16.
-    GraphConfig config;
-    config.n_heads = 36;
-    config.head_start = 18;
-    config.local_rank = 1;
-    config.tp_config = std::make_shared<TensorParallelConfig>(
-        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
-
-    WeightBinding value_projection_binding;
-    value_projection_binding.slice.source_rows = 4096;
-    value_projection_binding.slice.row_start = 16 * 128;
-    value_projection_binding.slice.row_count = 16 * 128;
-
-    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
-        &value_projection_binding,
-        128,
-        16,
-        32,
-        config,
-        nullptr);
-
-    EXPECT_EQ(offset, 16);
-    EXPECT_NE(offset, config.head_start);
-}
-
-TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetFallbackMapsQHeadsToVHeads)
-{
-    GraphConfig config;
-    config.n_heads = 36;
-    config.local_rank = 1;
-    config.tp_config = std::make_shared<TensorParallelConfig>(
-        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
-
-    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
-        nullptr,
-        128,
-        16,
-        32,
-        config,
-        nullptr);
-
-    EXPECT_EQ(config.tp_config->forRank(1).head_start, 18);
-    EXPECT_EQ(offset, 16);
-    EXPECT_NE(offset, config.tp_config->forRank(1).head_start);
 }
 
 TEST(Test__Qwen35Schema, HasNamedTemplates)
@@ -482,6 +493,47 @@ TEST(Test__Qwen35Schema, GDNTemplate_HasCorrectStageOrder)
 
     // Gated norm follows recurrence
     EXPECT_TRUE(hasStageNamed(stages, "gated_norm"));
+}
+
+/**
+ * @brief Prove the declarative GDN graph exposes an out-of-place convolution handoff.
+ *
+ * Short convolution reads neighboring projection rows while producing each
+ * transformed recurrence row. The source and destination must consequently be
+ * distinct live buffers. This schema regression prevents a future graph or
+ * arena refactor from restoring the former in-place repair copy or aliasing the
+ * two physical allocations.
+ */
+TEST(Test__Qwen35Schema, GDNTemplate_DeclaresDistinctRecurrenceInputLifetime)
+{
+    Qwen35SchemaFactory factory;
+    const GraphSchema schema = factory.createSchema();
+    const auto &stages = schema.named_templates.at("gdn").attention_stages;
+
+    const StageSpec *short_conv = findStage(stages, "short_conv");
+    const StageSpec *recurrence = findStage(stages, "gdn_recurrence");
+    ASSERT_NE(short_conv, nullptr);
+    ASSERT_NE(recurrence, nullptr);
+
+    ASSERT_EQ(short_conv->inputs.size(), 2u);
+    ASSERT_EQ(short_conv->outputs.size(), 1u);
+    EXPECT_EQ(short_conv->inputs.front().name, "gdn_qkv");
+    EXPECT_EQ(short_conv->inputs.front().semantic, BufferSemantic::Input);
+    EXPECT_EQ(short_conv->outputs.front().name, "gdn_recurrence_in");
+    EXPECT_EQ(short_conv->outputs.front().semantic, BufferSemantic::Output);
+
+    ASSERT_FALSE(recurrence->inputs.empty());
+    EXPECT_EQ(recurrence->inputs.front().name, "gdn_recurrence_in");
+    EXPECT_EQ(recurrence->inputs.front().semantic, BufferSemantic::Input);
+
+    const auto recurrence_buffer = std::find_if(
+        schema.layer_buffers.begin(),
+        schema.layer_buffers.end(),
+        [](const BufferSpec &spec)
+        { return spec.name == "gdn_recurrence_in"; });
+    ASSERT_NE(recurrence_buffer, schema.layer_buffers.end());
+    EXPECT_TRUE(recurrence_buffer->alias_group.empty())
+        << "Projection source and convolution destination overlap in lifetime.";
 }
 
 TEST(Test__Qwen35Schema, GDNTemplate_NoKVCache)
@@ -979,6 +1031,7 @@ namespace
             hidden_ = TestTensorFactory::createFP32({2, d});
             normalized_ = TestTensorFactory::createFP32({2, d});
             gdn_qkv_ = TestTensorFactory::createFP32({2, qkv_total});
+            gdn_recurrence_in_ = TestTensorFactory::createFP32({2, qkv_total});
             gdn_z_ = TestTensorFactory::createFP32({2, value_total});
             gdn_alpha_ = TestTensorFactory::createFP32({2, static_cast<size_t>(n_v)});
             gdn_beta_ = TestTensorFactory::createFP32({2, static_cast<size_t>(n_v)});
@@ -1005,6 +1058,8 @@ namespace
             buffers_.current_hidden = hidden_.get();
             buffers_.normalized = normalized_.get();
             buffers_.extensions[BufferId::GDN_QKV] = gdn_qkv_.get();
+            buffers_.extensions[BufferId::GDN_RECURRENCE_IN] =
+                gdn_recurrence_in_.get();
             buffers_.extensions[BufferId::GDN_Z] = gdn_z_.get();
             buffers_.extensions[BufferId::GDN_ALPHA] = gdn_alpha_.get();
             buffers_.extensions[BufferId::GDN_BETA] = gdn_beta_.get();
@@ -1037,6 +1092,7 @@ namespace
         std::unique_ptr<FP32Tensor> hidden_;
         std::unique_ptr<FP32Tensor> normalized_;
         std::unique_ptr<FP32Tensor> gdn_qkv_;
+        std::unique_ptr<FP32Tensor> gdn_recurrence_in_;
         std::unique_ptr<FP32Tensor> gdn_z_;
         std::unique_ptr<FP32Tensor> gdn_alpha_;
         std::unique_ptr<FP32Tensor> gdn_beta_;
@@ -1172,6 +1228,130 @@ TEST_F(Qwen35GraphBuildTest, GDNProjection_AllWeightsWired)
     EXPECT_EQ(params.w_z, layer_.attn_gate);
     EXPECT_EQ(params.w_a, layer_.ssm_alpha);
     EXPECT_EQ(params.w_b, layer_.ssm_beta);
+}
+
+/**
+ * @brief Live request-batch conditions require serial-equivalent grouped GDN math.
+ *
+ * The live condition graph advances request-owned short-conv and recurrence
+ * banks, so it must not enable speculative verifier state capture.  That state
+ * ownership distinction must not disable decode-equivalent projection kernels:
+ * its M=2 QKV/Z/alpha/beta rows are still publishable main-model state and must
+ * be byte-identical to two ordinary M=1 decode projections.
+ */
+TEST_F(Qwen35GraphBuildTest, LiveMTPRequestBatchConditionUsesDecodeEquivalentGDNProjection)
+{
+    config_.mtp.enabled = true;
+    config_.live_mtp_request_batch_condition = true;
+
+    Qwen35Graph graph(config_, nullptr);
+    const std::vector<int> request_lengths = {1, 1};
+    ComputeGraph condition_graph = graph.buildAttentionGraph(
+        layer_,
+        buffers_,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/2,
+        stub_cache_.get(),
+        /*position_ids=*/nullptr,
+        DeviceId::cpu(),
+        &request_lengths);
+
+    ComputeNode *projection_node = condition_graph.getNode("layer0_gdn_proj");
+    ASSERT_NE(projection_node, nullptr);
+    auto *projection = dynamic_cast<GDNProjectionStage *>(
+        projection_node->stage.get());
+    ASSERT_NE(projection, nullptr);
+    EXPECT_TRUE(
+        projection->getParams().force_decode_equivalent_verifier_prefill)
+        << "Grouped live conditions must select the serial-row-equivalent GDN projection route";
+}
+
+/**
+ * @brief Live request conditions must not reinterpret logical lengths as copy widths.
+ *
+ * The device row passed to a live condition contains absolute sequence lengths
+ * such as `[17, 12]`.  Its full-attention KV append has captured width one and
+ * must therefore use exact-shape publication, while the same logical row stays
+ * available to recurrent state and terminal-logit selection elsewhere in the
+ * declarative graph.
+ */
+TEST_F(Qwen35GraphBuildTest, LiveMTPRequestBatchConditionUsesExactShapeKVAppend)
+{
+    config_.mtp.enabled = true;
+    config_.live_mtp_request_batch_condition = true;
+
+    Qwen35Graph graph(config_, nullptr);
+    const size_t d = static_cast<size_t>(config_.d_model);
+    const size_t q_dim =
+        static_cast<size_t>(config_.n_heads * config_.head_dim);
+    const size_t kv_dim =
+        static_cast<size_t>(config_.n_kv_heads * config_.head_dim);
+    constexpr int request_count = 2;
+    constexpr int query_rows = 1;
+    constexpr int total_rows = request_count * query_rows;
+
+    auto attn_norm = TestTensorFactory::createFP32Ones({d});
+    auto wq = TestTensorFactory::createFP32Random({q_dim * 2, d});
+    auto wk = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wv = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wo = TestTensorFactory::createFP32Random({d, q_dim});
+    LayerWeights fa_layer;
+    fa_layer.attn_norm = attn_norm.get();
+    fa_layer.wq = wq.get();
+    fa_layer.wk = wk.get();
+    fa_layer.wv = wv.get();
+    fa_layer.wo = wo.get();
+
+    ActivationBuffers fa_buffers;
+    auto hidden = TestTensorFactory::createFP32({total_rows, d});
+    auto residual = TestTensorFactory::createFP32({total_rows, d});
+    auto normalized = TestTensorFactory::createFP32({total_rows, d});
+    auto fa_q_raw = TestTensorFactory::createFP32({total_rows, q_dim * 2});
+    auto fa_gate = TestTensorFactory::createFP32({total_rows, q_dim});
+    auto q = TestTensorFactory::createFP32({total_rows, q_dim});
+    auto k = TestTensorFactory::createFP32({total_rows, kv_dim});
+    auto v = TestTensorFactory::createFP32({total_rows, kv_dim});
+    auto attn_output = TestTensorFactory::createFP32({total_rows, q_dim});
+    auto attn_proj = TestTensorFactory::createFP32({total_rows, d});
+    fa_buffers.current_hidden = hidden.get();
+    fa_buffers.residual = residual.get();
+    fa_buffers.normalized = normalized.get();
+    fa_buffers.Q = q.get();
+    fa_buffers.K = k.get();
+    fa_buffers.V = v.get();
+    fa_buffers.attn_output = attn_output.get();
+    fa_buffers.attn_proj = attn_proj.get();
+    fa_buffers.extensions[BufferId::FA_Q_RAW] = fa_q_raw.get();
+    fa_buffers.extensions[BufferId::FA_GATE] = fa_gate.get();
+
+    const std::vector<int> logical_lengths_host = {17, 12};
+    const std::array<int32_t, 2> logical_lengths_device_sentinel = {17, 12};
+    ComputeGraph condition_graph = graph.buildAttentionGraph(
+        fa_layer,
+        fa_buffers,
+        /*layer_idx=*/3,
+        /*seq_len=*/query_rows,
+        /*batch_size=*/request_count,
+        stub_cache_.get(),
+        /*position_ids=*/nullptr,
+        DeviceId::cpu(),
+        &logical_lengths_host,
+        /*position_ids_device=*/nullptr,
+        logical_lengths_device_sentinel.data());
+
+    ComputeNode *append_node = condition_graph.getNode("layer3_kv_append");
+    ASSERT_NE(append_node, nullptr);
+    auto *append = dynamic_cast<KVCacheAppendStage *>(append_node->stage.get());
+    ASSERT_NE(append, nullptr);
+    EXPECT_EQ(append->getParams().seq_len, 1);
+    EXPECT_EQ(append->getParams().batch_size, 2);
+    EXPECT_EQ(append->getParams().request_sequence_lengths_device, nullptr)
+        << "Absolute live sequence lengths must never become captured KV copy widths";
+    EXPECT_EQ(
+        append->getParams().append_semantics,
+        KVCacheAppendSemantics::Standard)
+        << "A live main-model condition is not a speculative verifier append";
 }
 
 TEST_F(Qwen35GraphBuildTest, HybridPPFullAttentionUsesGlobalLayerIdsForCacheStages)
@@ -1483,6 +1663,84 @@ TEST(Test__Qwen35Schema, ResolverConfig_AttnOutputDim_WithTP)
 
     EXPECT_GE(it->second, static_cast<size_t>(1280))
         << "attn_output_dim must also accommodate FA local_qkv_dim";
+}
+
+/**
+ * @brief A replicated MTP predictor reserves full sidecar buffers without
+ *        widening the tensor-parallel main graph.
+ */
+TEST(Test__Qwen35Schema, ResolverConfig_ReplicatedMTPSidecarHasIndependentFullGeometry)
+{
+    GraphConfig config;
+    config.n_layers = 4;
+    config.d_model = 2560;
+    config.n_heads = 20;
+    config.n_kv_heads = 4;
+    config.head_dim = 128;
+    config.d_ff = 8960;
+    config.d_ff_local = 4480;
+    config.vocab_size = 248320;
+    config.vocab_local = 124160;
+    config.default_device = DeviceId::cpu();
+    config.max_seq_len = 2048;
+    config.qkv_column_parallel = true;
+    config.ffn_column_parallel = true;
+    config.dense_tp_enabled = true;
+    config.local_n_heads = 10;
+    config.local_n_kv_heads = 2;
+    config.mtp.enabled = true;
+    config.mtp.sidecar_dense_policy =
+        MTPSidecarDensePolicy::ReplicatedPerParticipant;
+    config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            config.n_heads,
+            config.n_kv_heads,
+            config.d_ff,
+            config.vocab_size));
+    config.gdn.conv_kernel_size = 4;
+    config.gdn.state_size = 64;
+    config.gdn.inner_size = 4096;
+    config.gdn.group_count = 16;
+    config.gdn.time_step_rank = 32;
+    config.gdn.full_attention_interval = 4;
+    config.layer_types = {"gdn", "gdn", "gdn", "full_attention"};
+
+    Qwen35Graph graph(config, nullptr);
+    const auto resolver = graph.getResolverConfig(/*seq_len=*/18);
+
+    EXPECT_EQ(resolver.local_n_heads, 10)
+        << "main prefill geometry must remain TP-local";
+    EXPECT_EQ(resolver.local_n_kv_heads, 2)
+        << "main prefill KV geometry must remain TP-local";
+    EXPECT_EQ(resolver.local_d_ff, 4480)
+        << "main prefill FFN geometry must remain TP-local";
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_q_dim"), 2560u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_kv_dim"), 512u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_fa_q_full_dim"), 5120u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_attn_output_dim"), 2560u);
+    EXPECT_EQ(resolver.custom_formulas.at("mtp_d_ff"), 8960u);
+
+    const Qwen35SchemaFactory factory;
+    const auto requirements =
+        BufferAllocator::resolveLayerBuffers(factory.createSchema(), resolver);
+    const auto find_buffer = [&](std::string_view name) -> const BufferDescriptor *
+    {
+        const auto it = std::find_if(
+            requirements.buffers.begin(),
+            requirements.buffers.end(),
+            [&](const BufferDescriptor &buffer)
+            {
+                return buffer.name == name;
+            });
+        return it == requirements.buffers.end() ? nullptr : &*it;
+    };
+    const auto *mtp_k = find_buffer("mtp_k");
+    const auto *main_k = find_buffer("K");
+    ASSERT_NE(mtp_k, nullptr);
+    ASSERT_NE(main_k, nullptr);
+    EXPECT_EQ(mtp_k->shape[1], 512u);
+    EXPECT_EQ(main_k->shape[1], 256u);
 }
 
 TEST_F(Qwen35GraphBuildTest, GDNOutProj_KDimMatchesGDNInner)

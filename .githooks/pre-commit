@@ -1,269 +1,34 @@
-#!/bin/bash
-# Pre-commit hook template for Llaminar project
-# 
-# Installation:
-#   cp .githooks/pre-commit .git/hooks/pre-commit
-#   chmod +x .git/hooks/pre-commit
-#
-# This hook builds and runs tests before allowing a commit.
-# Feature branches run a 6-step suite:
-#   1. Integration build
-#   2. Unit tests (parallel)
-#   3. Focused parity baseline (48 tests, all model families, sequential)
-#   4. E2E release build
-#   5. E2E server integration tests
-#   6. Performance regression benchmarks
-# develop/master add full integration as step 3 and shift the later steps to 4-7.
-# Override with: git commit --no-verify
+#!/usr/bin/env bash
+# Llaminar pre-commit gate: complete Unit and model-free production preflight.
+# CMake owns both executable inventories; CTest owns test selection, resource
+# locks, and timeouts. No model campaign, E2E server, or benchmark runs here.
+# Register with: git config --local core.hooksPath .githooks
+# An explicit `git commit --no-verify` bypasses this hook.
+set -euo pipefail
 
-set -e
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Determine current branch and run mode
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")"
-if [[ "$CURRENT_BRANCH" == "develop" || "$CURRENT_BRANCH" == "master" ]]; then
-    FULL_SUITE=true
-else
-    FULL_SUITE=false
-fi
-
-if $FULL_SUITE; then
-    echo -e "${BLUE}==============================================================${NC}"
-    echo -e "${BLUE}Pre-commit Hook: Build, Unit, Integration, Parity, E2E & Benchmarks${NC}"
-    echo -e "${BLUE}==============================================================${NC}"
-else
-    echo -e "${BLUE}==============================================================${NC}"
-    echo -e "${BLUE}Pre-commit Hook [feature branch: ${CURRENT_BRANCH}]: Build, Unit, Parity, E2E & Benchmarks${NC}"
-    echo -e "${BLUE}==============================================================${NC}"
-fi
-echo ""
-
-# Build directories
-BUILD_V2_INTEGRATION="build_v2_integration"
-BUILD_V2_RELEASE="build_v2_release"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-E2E_CONTAINER_MODE="${LLAMINAR_PRECOMMIT_E2E_CONTAINER:-0}"
-E2E_CONTAINER_IMAGE="${LLAMINAR_E2E_CONTAINER_IMAGE:-llaminar:precommit}"
-E2E_CONTAINER_BUILD="${LLAMINAR_PRECOMMIT_E2E_CONTAINER_BUILD:-1}"
-E2E_CONTAINER_CUDA_ARCHS="${LLAMINAR_PRECOMMIT_E2E_CUDA_ARCHS:-${LLAMINAR_CUDA_ARCHS:-86}}"
-if $FULL_SUITE; then
-    TOTAL_STEPS=7
-else
-    TOTAL_STEPS=6
-fi
+cd "$REPO_ROOT"
+BUILD_DIR="$REPO_ROOT/build_v2_integration"
+LLAMINAR_NINJA_BIN="$(command -v ninja)"
 
-# Step 1: Build Integration (Release optimizations + debug symbols + assertions)
-echo -e "${YELLOW}[1/${TOTAL_STEPS}] Building V2 Integration...${NC}"
-if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1; then
-    echo -e "${RED}❌ CMake configuration failed (Integration)${NC}"
-    exit 1
-fi
+echo '[pre-commit] Configuring the Integration build...'
+# Resolve the active devcontainer Ninja once; never switch executables on an
+# existing tree implicitly. Preserve unrelated cached ISA/toolchain options.
+cmake -B "$BUILD_DIR" -S "$REPO_ROOT/src/v2" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Integration \
+    -DCMAKE_MAKE_PROGRAM:FILEPATH="$LLAMINAR_NINJA_BIN" \
+    -DLLAMINAR_BUILD_TESTS=ON -DHAVE_CUDA=ON -DHAVE_ROCM=ON
 
-if ! cmake --build "$BUILD_V2_INTEGRATION" --parallel > /dev/null 2>&1; then
-    echo -e "${RED}❌ Build failed (Integration)${NC}"
-    echo -e "${YELLOW}Run manually to see errors: cmake --build $BUILD_V2_INTEGRATION --parallel${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Integration build successful${NC}"
-echo ""
+echo '[pre-commit] Building only Unit and production-preflight dependencies...'
+cmake --build "$BUILD_DIR" --parallel \
+    --target v2_unit_gate v2_production_parity_preflight_gate
 
-# Step 2: Run Unit Tests (Integration build — fast, isolated component tests only)
-echo -e "${YELLOW}[2/${TOTAL_STEPS}] Running V2 unit tests (Integration build)...${NC}"
-echo ""
+echo '[pre-commit] [1/2] Running the full Unit suite...'
+ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
+    --no-tests=error -R '^V2_Unit_'
 
-# Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
-# --parallel: Run unit tests in parallel for faster execution
-set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Unit_" --output-on-failure --parallel
-UNIT_EXIT_CODE=$?
-set -e
+echo '[pre-commit] [2/2] Running the full ProductionParityPreflight suite...'
+ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
+    --no-tests=error -L '^ProductionParityPreflight$'
 
-if [ $UNIT_EXIT_CODE -ne 0 ]; then
-    echo ""
-    echo -e "${RED}❌ Unit tests failed.${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Unit tests passed${NC}"
-echo ""
-
-# Step 3 (develop/master only): Run Integration Tests
-# Full integration test suite (excludes Parity and RCCL tests).
-# RCCL tests are excluded due to known driver-level flakiness.
-if $FULL_SUITE; then
-    INTEG_STEP=3
-    echo -e "${YELLOW}[${INTEG_STEP}/${TOTAL_STEPS}] Running V2 integration tests (excluding Parity & RCCL)...${NC}"
-    echo ""
-
-    set +e
-    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" -E "Parity|RCCL" --output-on-failure
-    INTEG_EXIT_CODE=$?
-    set -e
-
-    if [ $INTEG_EXIT_CODE -ne 0 ]; then
-        echo ""
-        echo -e "${RED}❌ Integration tests failed.${NC}"
-        echo ""
-        echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-        echo -e "${YELLOW}  git commit --no-verify${NC}"
-        echo -e "${YELLOW}to skip this check.${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}✓ Integration tests passed${NC}"
-    echo ""
-fi
-
-# Step 3/4: Run Focused Parity Baseline (48 tests, all model families, sequential)
-# Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
-# Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
-# HybridPPTP (pipeline+tensor parallel),
-# and ExpertOverlay (tiered same-layer expert residency).
-# Runs on ALL branches to catch accuracy regressions early.
-if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
-echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (48 tests, all model families)...${NC}"
-echo ""
-
-set +e
-"$REPO_ROOT/.githooks/run_parity_baseline.sh" "$BUILD_V2_INTEGRATION"
-PARITY_EXIT_CODE=$?
-set -e
-
-echo ""
-if [ $PARITY_EXIT_CODE -ne 0 ]; then
-    echo -e "${RED}❌ Parity baseline failed — possible accuracy regression.${NC}"
-    echo ""
-    echo -e "${YELLOW}Re-run standalone for details:${NC}"
-    echo -e "${YELLOW}  .githooks/run_parity_baseline.sh $BUILD_V2_INTEGRATION${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Parity baseline passed${NC}"
-echo ""
-
-# Step 4: Build Release (for E2E — no assertions/debug overhead = faster inference)
-if $FULL_SUITE; then E2E_BUILD_STEP=5; else E2E_BUILD_STEP=4; fi
-echo -e "${YELLOW}[${E2E_BUILD_STEP}/${TOTAL_STEPS}] Building V2 Release for E2E tests...${NC}"
-if ! cmake -B "$BUILD_V2_RELEASE" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1; then
-    echo -e "${RED}❌ CMake configuration failed (Release)${NC}"
-    exit 1
-fi
-
-if ! cmake --build "$BUILD_V2_RELEASE" --parallel > /dev/null 2>&1; then
-    echo -e "${RED}❌ Build failed (Release)${NC}"
-    echo -e "${YELLOW}Run manually to see errors: cmake --build $BUILD_V2_RELEASE --parallel${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Release build successful${NC}"
-if [[ "$E2E_CONTAINER_MODE" == "1" ]]; then
-    if [[ "$E2E_CONTAINER_BUILD" == "1" ]]; then
-        echo -e "${YELLOW}Packaging Llaminar runtime container for E2E tests (${E2E_CONTAINER_IMAGE})...${NC}"
-        if ! "$REPO_ROOT/scripts/docker/build-runtime-image.sh" \
-            --tag "$E2E_CONTAINER_IMAGE" \
-            --cuda-archs "$E2E_CONTAINER_CUDA_ARCHS"; then
-            echo -e "${RED}❌ Runtime container build failed${NC}"
-            echo -e "${YELLOW}Run manually for details:${NC}"
-            echo -e "${YELLOW}  scripts/docker/build-runtime-image.sh --tag $E2E_CONTAINER_IMAGE --cuda-archs $E2E_CONTAINER_CUDA_ARCHS${NC}"
-            exit 1
-        fi
-        echo -e "${GREEN}✓ Runtime container packaged (${E2E_CONTAINER_IMAGE})${NC}"
-    else
-        echo -e "${YELLOW}Using existing runtime container for E2E tests (${E2E_CONTAINER_IMAGE})${NC}"
-    fi
-fi
-echo ""
-
-# Step 5: E2E Server Integration Tests (Release binary — no assertions = faster inference)
-# Spins up llaminar2 --serve on CPU, CUDA, and ROCm, validates multi-turn
-# inference via the REST API with curl, and runs long-context checks for the
-# default 35B CPU/ROCm suites. The 30B gate keeps smaller smoke models fast.
-if $FULL_SUITE; then E2E_STEP=6; else E2E_STEP=5; fi
-echo -e "${YELLOW}[${E2E_STEP}/${TOTAL_STEPS}] Running E2E Server integration tests (cpu, cuda:0, rocm:0 + 35B long-context)...${NC}"
-echo ""
-
-E2E_SERVER_ARGS=(--backends "cpu,cuda:0,rocm:0")
-if [[ "$E2E_CONTAINER_MODE" == "1" ]]; then
-    E2E_SERVER_ARGS=(--container-image "$E2E_CONTAINER_IMAGE" "${E2E_SERVER_ARGS[@]}")
-else
-    E2E_SERVER_ARGS=(--binary "$BUILD_V2_RELEASE/llaminar2" "${E2E_SERVER_ARGS[@]}")
-fi
-
-set +e
-LLAMINAR_E2E_LONG_CONTEXT=1 \
-LLAMINAR_E2E_LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-full}" \
-LLAMINAR_E2E_CONTEXT_LENGTH="${LLAMINAR_E2E_CONTEXT_LENGTH:-4096}" \
-LLAMINAR_E2E_LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-1024}" \
-LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS="${LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS:-900}" \
-LLAMINAR_E2E_LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-1800}" \
-LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B="${LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B:-4}" \
-tests/v2/e2e/server/test_server_e2e.sh "${E2E_SERVER_ARGS[@]}"
-SERVER_EXIT_CODE=$?
-set -e
-
-echo ""
-if [ $SERVER_EXIT_CODE -ne 0 ]; then
-    echo -e "${RED}❌ E2E Server tests failed.${NC}"
-    echo ""
-    echo -e "${YELLOW}Run manually for details:${NC}"
-    echo -e "${YELLOW}  tests/v2/e2e/server/test_server_e2e.sh${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ E2E server tests passed${NC}"
-echo ""
-
-# Step 6: Performance Regression Benchmarks
-# Runs 'llaminar2 benchmark' for each model × device combination defined in
-# benchmark_baseline.json and compares prefill/decode throughput against
-# canonical baselines. Devices that are unavailable are skipped gracefully.
-if $FULL_SUITE; then BENCH_STEP=7; else BENCH_STEP=6; fi
-echo -e "${YELLOW}[${BENCH_STEP}/${TOTAL_STEPS}] Running performance regression benchmarks...${NC}"
-echo ""
-
-set +e
-"$REPO_ROOT/.githooks/run_benchmark_check.sh"
-BENCH_EXIT_CODE=$?
-set -e
-
-echo ""
-if [ $BENCH_EXIT_CODE -ne 0 ]; then
-    echo -e "${RED}❌ Performance regression detected.${NC}"
-    echo ""
-    echo -e "${YELLOW}If the regression is expected, update the baseline:${NC}"
-    echo -e "${YELLOW}  .githooks/run_benchmark_check.sh --update-baseline${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix performance or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Performance benchmarks passed${NC}"
-echo ""
-
-echo "================================================"
-echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
-echo -e "${GREEN}  • Integration build: OK${NC}"
-echo -e "${GREEN}  • Unit tests: OK${NC}"
-if $FULL_SUITE; then
-echo -e "${GREEN}  • Integration tests: OK${NC}"
-fi
-echo -e "${GREEN}  • Parity baseline (48 tests): OK${NC}"
-echo -e "${GREEN}  • E2E server tests: OK${NC}"
-echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
-echo ""
-echo -e "${GREEN}Proceeding with commit...${NC}"
-exit 0
+echo '[pre-commit] Unit and ProductionParityPreflight passed.'

@@ -18,7 +18,9 @@
 #include <cmath>
 
 #include "loaders/WeightManager.h"
+#include "execution/moe/RoutedExpertOwnerAssignment.h"
 #include "models/qwen/Qwen2Schema.h"
+#include "tensors/TensorSlice.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 #include "mocks/MockModelLoader.h"
@@ -1302,6 +1304,10 @@ protected:
         // Embedding
         mock_loader_->addFP32RandomTensor("token_embd.weight",
                                           {VOCAB_SIZE, HIDDEN_DIM}, -1.0f, 1.0f, 55);
+        // Complete MoE expert tensors are immutable host-side preparation
+        // sources. The expert service creates the actual per-device slabs.
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_gate_exps.weight",
+                                          {128, 64, 8}, -1.0f, 1.0f, 56);
 
         // Create TensorParallelConfig for 2-way TP (LOCAL) using equalSplit factory
         std::vector<DeviceId> devices = {
@@ -1326,6 +1332,156 @@ protected:
     DeviceShardingAssignment assignment0_;
     DeviceShardingAssignment assignment1_;
 };
+
+/**
+ * @brief Replicated MoE sources must not be cloned once per GPU participant.
+ *
+ * This regression models the Qwen3.6 LocalTP startup path. Before the source
+ * ownership distinction was made in the REPLICATE branch, every device copied
+ * each complete 3D expert tensor into anonymous host memory before the expert
+ * service packed its device slabs. The copies were unused and pushed a 35B
+ * two-GPU server beyond the startup gate.
+ */
+TEST_F(WeightManagerComputeSliceBoundariesTest,
+       ReplicatedMoEPreparationSourceIsSharedAcrossGpuParticipants)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    const DeviceId cuda0(DeviceType::CUDA, 0);
+    const DeviceId cuda1(DeviceType::CUDA, 1);
+    auto expert0 =
+        wm.getWeightForDevice("blk.0.ffn_gate_exps.weight", cuda0, 0);
+    auto expert1 =
+        wm.getWeightForDevice("blk.0.ffn_gate_exps.weight", cuda1, 0);
+
+    ASSERT_NE(expert0, nullptr);
+    ASSERT_NE(expert1, nullptr);
+    EXPECT_EQ(expert0.get(), expert1.get());
+    EXPECT_EQ(expert0->raw_data(), expert1->raw_data());
+    EXPECT_TRUE(expert0->isHostResident());
+}
+
+/**
+ * @brief A packed expert cache entry must identify its exact global experts.
+ *
+ * Ordinal and random ownership both pack four experts into this fixture's
+ * tensor, so accepting the cache by shape would silently execute the wrong
+ * experts after a policy change. The cache contract must reject that stale
+ * identity instead of erasing it and loading a replacement.
+ */
+TEST_F(WeightManagerComputeSliceBoundariesTest,
+       ExpertApportionmentCacheRejectsDifferentOwnerPolicy)
+{
+    constexpr const char *kExpertWeight = "blk.0.ffn_gate_exps.weight";
+    const DeviceId cuda0(DeviceType::CUDA, 0);
+
+    Qwen2SchemaFactory schema_factory;
+    WeightManagerConfig config;
+    config.sharding = schema_factory.getWeightShardingConfig();
+    config.sharding.exact_matches[kExpertWeight] =
+        WeightShardingMode::ExpertIdApportioned;
+    config.tp_config = tp_config_;
+    config.routed_expert_assignment = {
+        .owner_order = RoutedExpertOwnerOrder::Ordinal,
+        .participant_index = 0,
+        .participant_count = 2,
+    };
+
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+    wm.configure(config);
+
+    auto ordinal = wm.getShardedWeightForAssignment(
+        kExpertWeight, cuda0, assignment0_, 0);
+    ASSERT_NE(ordinal, nullptr);
+
+    const auto ordinal_ids =
+        routed_expert_ownership::expertIdsForParticipant(
+            8, 2, 0, 0, RoutedExpertOwnerOrder::Ordinal);
+    const auto random_ids =
+        routed_expert_ownership::expertIdsForParticipant(
+            8, 2, 0, 0, RoutedExpertOwnerOrder::Random);
+    ASSERT_NE(ordinal_ids, random_ids);
+
+    const auto metadata = wm.weightMetadataRegistry()->metadata(ordinal.get());
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->slice.expert_ids, ordinal_ids);
+
+    config.routed_expert_assignment.owner_order =
+        RoutedExpertOwnerOrder::Random;
+    wm.configure(config);
+
+    EXPECT_THROW(
+        (void)wm.getShardedWeightForAssignment(
+            kExpertWeight, cuda0, assignment0_, 0),
+        std::runtime_error);
+}
+
+/**
+ * @brief A pre-topology full clone must become the exact random expert slice.
+ *
+ * Model-context setup may request complete routed weights before a LocalTP
+ * runner installs its final placement policy. The historical device/name cache
+ * key then contains a full clone. It is a typed source, not an ordinal slice,
+ * and must be retired in favor of the requested random ExpertSlice while stale
+ * ExpertSlice identities remain fatal in the preceding regression.
+ */
+TEST_F(WeightManagerComputeSliceBoundariesTest,
+       ExpertApportionmentReplacesPreTopologyFullSourceClone)
+{
+    constexpr const char *kExpertWeight = "blk.0.ffn_gate_exps.weight";
+    const DeviceId cpu = DeviceId::cpu();
+    const DeviceId cuda0(DeviceType::CUDA, 0);
+
+    Qwen2SchemaFactory schema_factory;
+    WeightManagerConfig source_config;
+    source_config.sharding = schema_factory.getWeightShardingConfig();
+    source_config.sharding.exact_matches[kExpertWeight] =
+        WeightShardingMode::Replicate;
+
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+    wm.configure(source_config);
+
+    ASSERT_NE(wm.getWeightForDevice(kExpertWeight, cpu, 0), nullptr);
+    auto full_clone = wm.getWeightForDevice(kExpertWeight, cuda0, 0);
+    ASSERT_NE(full_clone, nullptr);
+    ASSERT_EQ(full_clone->shape(), (std::vector<size_t>{128, 64, 8}));
+
+    WeightManagerConfig random_config = source_config;
+    random_config.sharding.exact_matches[kExpertWeight] =
+        WeightShardingMode::ExpertIdApportioned;
+    random_config.tp_config = tp_config_;
+    random_config.routed_expert_assignment = {
+        .owner_order = RoutedExpertOwnerOrder::Random,
+        .participant_index = 0,
+        .participant_count = 2,
+    };
+    wm.configure(random_config);
+
+    auto random_slice = wm.getShardedWeightForAssignment(
+        kExpertWeight, cuda0, assignment0_, 0);
+    ASSERT_NE(random_slice, nullptr);
+    EXPECT_NE(random_slice.get(), full_clone.get());
+
+    const auto expected_ids =
+        routed_expert_ownership::expertIdsForParticipant(
+            8, 2, 0, 0, RoutedExpertOwnerOrder::Random);
+    EXPECT_EQ(random_slice->shape(), (std::vector<size_t>{128, 64, 4}));
+    const auto metadata =
+        wm.weightMetadataRegistry()->metadata(random_slice.get());
+    ASSERT_TRUE(metadata.has_value());
+    EXPECT_EQ(metadata->identity.derivation, WeightDerivationKind::ExpertSlice);
+    EXPECT_EQ(metadata->slice.expert_ids, expected_ids);
+}
 
 TEST_F(WeightManagerComputeSliceBoundariesTest, HeadsDimension_QWeight)
 {
@@ -1499,6 +1655,47 @@ TEST_F(WeightManagerComputeSliceBoundariesTest, Bias1D_QBias)
     ASSERT_NE(q_bias, nullptr);
     // Sliced 1D tensor becomes [N, 1] shape after column slicing
     EXPECT_EQ(q_bias->rows(), 448); // 7 heads * 64 = 448
+
+    const auto *slice = dynamic_cast<const TensorSlice *>(q_bias.get());
+    ASSERT_NE(slice, nullptr);
+    EXPECT_TRUE(slice->is_column_parallel());
+    EXPECT_EQ(slice->metadata().rank, assignment0_.local_rank);
+    EXPECT_EQ(slice->metadata().world_size, tp_config_->worldSize());
+
+    auto cached = wm.getShardedWeightForAssignment(
+        "blk.0.attn_q.bias", DeviceId(DeviceType::CUDA, 0), assignment0_, 0);
+    ASSERT_NE(cached, nullptr);
+    EXPECT_EQ(cached.get(), q_bias.get());
+}
+
+/**
+ * @brief A process-local device name cannot substitute for TP participant identity.
+ *
+ * Global MPI ranks commonly address their own processor with the same DeviceId.
+ * An equally shaped cache entry from another participant must therefore fail
+ * before execution rather than being accepted merely because its row/column
+ * mode agrees with the request.
+ */
+TEST_F(WeightManagerComputeSliceBoundariesTest,
+       CacheRejectsSameDeviceDifferentParticipantAssignment)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    Qwen2SchemaFactory schema_factory;
+    wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+    wm.setTensorParallelConfig(tp_config_);
+
+    const DeviceId process_local_device = DeviceId::cpu();
+    auto rank0 = wm.getShardedWeightForAssignment(
+        "blk.0.ffn_gate.weight", process_local_device, assignment0_, 0);
+    ASSERT_NE(rank0, nullptr);
+
+    EXPECT_THROW(
+        (void)wm.getShardedWeightForAssignment(
+            "blk.0.ffn_gate.weight", process_local_device, assignment1_, 0),
+        std::runtime_error);
 }
 
 TEST_F(WeightManagerComputeSliceBoundariesTest, Bias1D_KVBias)

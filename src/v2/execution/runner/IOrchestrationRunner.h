@@ -21,13 +21,21 @@
 
 #pragma once
 
+#include "../../backends/DeviceId.h"
 #include "../../config/OrchestrationConfig.h"
 #include "../prefix_cache/PrefixCacheStateProbe.h"
+#include "../InferenceReadiness.h"
+#include "../moe/MoEOptimizationStatus.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
+#include "../../transfer/TransferEngine.h"
+#include "../../planning/GraphSnapshotMemoryCapacity.h"
 #include "../../utils/Sampler.h"
 #include "../../utils/ToolCallTypes.h"
+#include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <optional>
 
@@ -35,11 +43,333 @@ namespace llaminar2
 {
     class ITokenizer;          // Forward declaration
     class IMPIContext;         // Forward declaration
+    class IModelContext;       // Forward declaration
+    class ModelContext;        // Forward declaration
+    class PhysicalMemoryAuthority; // CPU/GPU admission and live-allocation owner
+    class ReusableExecutionWorkspaceRegistry; // Model-lifetime workspace owner
+    struct MoEOverlaySealedMigrationMeasurements;
+    struct MoEOverlayResolvedCapacityPlan;
     struct GraphExecutorStats; // Forward declaration
 }
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Exclusive lifecycle for one reusable prepared model authority.
+     *
+     * A contract can be copied into a process campaign cache, but exactly one
+     * runner may own its prepared weights at a time. Dynamic ExpertOverlay also
+     * needs a terminal sealing interval in which logical placement is restored
+     * and registry bindings are atomically rebased. Encoding those transitions
+     * here prevents a caller from constructing a new runner while the previous
+     * graph, maintenance wave, or physical slot assignment is still live.
+     */
+    class ModelContextReuseAuthority final
+    {
+    public:
+        /** @brief Complete reusable-context lifecycle states. */
+        enum class State : std::uint8_t
+        {
+            RunnerExclusive, ///< Exactly one runner owns mutable execution state.
+            Sealing,         ///< Teardown is restoring/rebinding prepared weights.
+            Reusable,        ///< No runner state remains and a consumer may acquire.
+            Invalid,         ///< Sealing failed; reuse is permanently forbidden.
+        };
+
+        /** @brief Create authority initially owned by the exporting runner. */
+        ModelContextReuseAuthority() = default;
+
+        ModelContextReuseAuthority(const ModelContextReuseAuthority &) = delete;
+        ModelContextReuseAuthority &operator=(
+            const ModelContextReuseAuthority &) = delete;
+
+        /**
+         * @brief Acquire a reusable contract for exactly one new runner.
+         * @param error Optional state-specific rejection diagnostic.
+         * @return True only for the `Reusable -> RunnerExclusive` transition.
+         */
+        [[nodiscard]] bool acquireRunnerExclusive(
+            std::string *error = nullptr)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::Reusable)
+            {
+                if (error)
+                {
+                    *error = state_ == State::Invalid
+                        ? (diagnostic_.empty()
+                               ? "prepared model context is invalid"
+                               : diagnostic_)
+                        : "prepared model context is not at its reusable lifecycle boundary";
+                }
+                return false;
+            }
+            state_ = State::RunnerExclusive;
+            diagnostic_.clear();
+            sealed_device_memory_retention_.clear();
+            retention_published_ = false;
+            ++generation_;
+            return true;
+        }
+
+        /**
+         * @brief Close runner admission and begin terminal physical sealing.
+         * @param error Optional transition diagnostic.
+         * @return True only for `RunnerExclusive -> Sealing`.
+         */
+        [[nodiscard]] bool beginSealing(std::string *error = nullptr)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::RunnerExclusive)
+            {
+                if (error)
+                    *error = "prepared model context cannot enter sealing from its current lifecycle state";
+                return false;
+            }
+            state_ = State::Sealing;
+            return true;
+        }
+
+        /**
+         * @brief Publish successful teardown and its exact retained allocation BOM.
+         * @param retention Per-GPU allocations still owned after runner teardown.
+         * @param error Optional transition diagnostic.
+         * @return True only for `Sealing -> Reusable`.
+         *
+         * Admission describes peak construction and execution storage. Dynamic
+         * teardown may release shadow pools before the model becomes reusable,
+         * so only this terminal seal may publish the final owner's retirement
+         * obligation.
+         */
+        [[nodiscard]] bool publishReusable(
+            std::vector<ModelDeviceMemoryRetention> retention,
+            std::string *error = nullptr)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::Sealing)
+            {
+                if (error)
+                    *error = "prepared model context can become reusable only after sealing";
+                return false;
+            }
+            std::vector<DeviceId> devices;
+            devices.reserve(retention.size());
+            for (const auto &row : retention)
+            {
+                if (!row.valid() ||
+                    std::find(devices.begin(), devices.end(), row.device) !=
+                        devices.end())
+                {
+                    if (error)
+                    {
+                        *error =
+                            "prepared model context cannot publish an invalid or duplicate device-memory retention row";
+                    }
+                    return false;
+                }
+                devices.push_back(row.device);
+            }
+            sealed_device_memory_retention_ = std::move(retention);
+            retention_published_ = true;
+            state_ = State::Reusable;
+            diagnostic_.clear();
+            return true;
+        }
+
+        /**
+         * @brief Read the final-owner allocation BOM at a reusable boundary.
+         * @param error Optional lifecycle-specific rejection diagnostic.
+         * @return A copy of the sealed BOM, including an empty CPU-only value.
+         *
+         * The optional distinguishes a valid CPU-only empty BOM from an attempt
+         * to inspect mutable runner state. Retirement tickets must be captured
+         * before the contract's final allocation owners are dropped.
+         */
+        [[nodiscard]] std::optional<std::vector<ModelDeviceMemoryRetention>>
+        sealedDeviceMemoryRetention(std::string *error = nullptr) const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::Reusable || !retention_published_)
+            {
+                if (error)
+                {
+                    *error = state_ == State::Invalid
+                        ? (diagnostic_.empty()
+                               ? "prepared model context is invalid"
+                               : diagnostic_)
+                        : "prepared model context has no sealed reusable device-memory retention BOM";
+                }
+                return std::nullopt;
+            }
+            return sealed_device_memory_retention_;
+        }
+
+        /**
+         * @brief Permanently reject reuse after an incomplete seal.
+         * @param diagnostic Precise failure retained for every later consumer.
+         */
+        void invalidate(std::string diagnostic)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_ = State::Invalid;
+            sealed_device_memory_retention_.clear();
+            retention_published_ = false;
+            diagnostic_ = diagnostic.empty()
+                ? "prepared model context sealing failed"
+                : std::move(diagnostic);
+        }
+
+        /** @return Race-safe current lifecycle state. */
+        [[nodiscard]] State state() const noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return state_;
+        }
+
+        /** @return Number of runners that have exclusively owned this context. */
+        [[nodiscard]] std::uint64_t generation() const noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return generation_;
+        }
+
+        /** @return Retained invalidation diagnostic, if any. */
+        [[nodiscard]] std::string diagnostic() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return diagnostic_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        State state_ = State::RunnerExclusive;
+        std::uint64_t generation_ = 1u;
+        std::vector<ModelDeviceMemoryRetention>
+            sealed_device_memory_retention_;
+        bool retention_published_ = false;
+        std::string diagnostic_;
+    };
+
+    /**
+     * @brief Exact model-state effect of a caller-selected generation token.
+     *
+     * Ordinary decode returns a sampled token before that token necessarily
+     * owns a model row. Forced continuations likewise differ in whether the
+     * returned token is merely selected for the next transaction or has
+     * already been forwarded by a device-resident transaction. Publishing the
+     * distinction prevents callers from guessing from backend or MTP policy
+     * and accidentally forwarding a token twice.
+     */
+    enum class ReturnedTokenCommitState : std::uint8_t
+    {
+        Unspecified = 0, ///< Operation publishes no forced-token contract.
+        NoModelRow = 1, ///< Control-only token (for example EOS) made no row.
+        Pending = 2, ///< Token is authoritative but has not been forwarded.
+        Committed = 3, ///< Model state and terminal logits include the token.
+    };
+
+    /**
+     * @brief Model authority plus the production plan that prepared its weights.
+     *
+     * Packed weights may outlive one runner, but their validity is narrower than
+     * the underlying GGUF metadata: device ordinal, layer ownership, sharding,
+     * and whether trailing MTP weights were required all affect the prepared
+     * set.  Carrying the certifying plan with the shared context prevents a new
+     * runner from treating an arbitrary preloaded ModelContext as complete
+     * device residency.  The consumer still builds its own current plan and
+     * validates the weight-affecting fields before using this contract.
+     *
+     * Mutable graph, arena, stream, controller, and request state are never part
+     * of this object. A separately typed workspace registry may retain only an
+     * unnamed backing allocation after every graph borrower has been destroyed;
+     * named mappings and publications remain runner-owned.
+     */
+    struct ModelContextReuseContract
+    {
+        std::shared_ptr<ModelContext> context;
+        /** Shared exclusive/sealing authority required by every consumer. */
+        std::shared_ptr<ModelContextReuseAuthority> reuse_authority;
+        /**
+         * Sealed primary workspace blocks retained beside prepared weights.
+         * No graph, stream, publication, or request state belongs here.
+         */
+        std::shared_ptr<ReusableExecutionWorkspaceRegistry>
+            reusable_execution_workspaces;
+        /**
+         * Exact admission/materialization ledger retained by model-owned
+         * weights and workspace backing. A consumer must keep this same object
+         * identity; rebuilding it from current free-memory telemetry would
+         * count those live allocations under two authorities.
+         */
+        std::shared_ptr<PhysicalMemoryAuthority>
+            physical_memory_authority;
+        RankExecutionPlan prepared_weight_plan;
+        /**
+         * Model-frozen quotas and initial placements whose prepared engines are
+         * retained by @ref context. Null when no routed authority participated.
+         * Consumers may install this immutable physical plan only after the
+         * requested identity below matches exactly.
+         */
+        std::shared_ptr<const MoERoutedExpertPlacementPlan>
+            prepared_routed_weight_plan;
+        /**
+         * Complete CPU/GPU physical-memory certificate that admitted the
+         * model-frozen ExpertOverlay plan above.  Capacity resolution and
+         * final preflight consume this same immutable value; a reused model
+         * context must never reconstruct its bill from allocator telemetry.
+         * Null exactly when no ExpertOverlay authority participated.
+         */
+        std::shared_ptr<const MoEOverlayResolvedCapacityPlan>
+            expert_overlay_memory_admission;
+        /**
+         * Canonical, collision-free identity of the requested routed-weight
+         * topology that populated @ref context.
+         *
+         * The identity is empty when no ExpertOverlay plan participated.  It
+         * includes participant/device topology, whole-expert owner order,
+         * tier capacities, explicit placements, capacity-affecting maintenance
+         * policy, and normalized retained-graph geometry. This prevents a
+         * consumer from re-solving automatic capacity against VRAM already
+         * occupied by the retained physical plan.
+         */
+        std::string routed_weight_authority_identity;
+        /**
+         * Pointer-free physical transfer evidence retained across compatible
+         * runner lifetimes. No graph, stream, controller, histogram, service
+         * timing, or mutable placement state is shared through this value.
+         */
+        std::shared_ptr<const MoEOverlaySealedMigrationMeasurements>
+            expert_overlay_migration_profile;
+        /**
+         * Exact model/topology/catalog identity that admits the profile above.
+         * A consumer may reuse the evidence only on byte-identical equality.
+         */
+        std::string expert_overlay_migration_profile_identity;
+    };
+
+    /**
+     * @brief Typed proof that this runner consumed a prepared-model contract.
+     *
+     * This observation comes from constructor admission, exact plan
+     * validation, and model-owned PreparedWeightStore accounting. Optional
+     * PerfStats counters may mirror it for diagnostics, but must never be used
+     * to decide whether reuse occurred or whether the retained state is valid.
+     */
+    struct ModelContextReuseStatus
+    {
+        bool imported_contract = false;
+        bool prepared_weight_plan_validated = false;
+        std::size_t prepared_entry_count = 0u;
+        std::uint64_t authority_generation = 0u;
+
+        /** @return Whether certified prepared weights were actually consumed. */
+        [[nodiscard]] bool reusedPreparedWeights() const noexcept
+        {
+            return imported_contract && prepared_weight_plan_validated &&
+                   prepared_entry_count > 0u && authority_generation > 1u;
+        }
+    };
 
     /**
      * @brief Result of a generation step or full generation
@@ -50,6 +380,9 @@ namespace llaminar2
         std::vector<float> logprobs; ///< Log probabilities (optional)
         bool is_complete{false};     ///< Whether generation is complete (EOS reached)
         std::string error;           ///< Error message if failed (empty on success)
+        /** Typed state effect populated by forced-continuation operations. */
+        ReturnedTokenCommitState returned_token_commit =
+            ReturnedTokenCommitState::Unspecified;
 
         /**
          * @brief Check if generation was successful
@@ -163,6 +496,49 @@ namespace llaminar2
         virtual bool prefill(const std::vector<int32_t> &tokens) = 0;
 
         /**
+         * @brief Observe completion of the latest inference transaction for host timing.
+         *
+         * GPU implementations wait on the exact durable terminal event published
+         * by either the complete graph transaction or a full prefix-terminal
+         * restore, including shifted MTP KV population during prefill. This is a
+         * benchmark result boundary, not permission to add a stream/device
+         * synchronization to production inference.
+         *
+         * @return true when the latest inference transaction has completed.
+         */
+        virtual bool waitForLastInferenceCompletionForBenchmark()
+        {
+            return !primaryDeviceId().is_gpu();
+        }
+
+        /**
+         * @brief Report mandatory production preparation before timing.
+         *
+         * This is a read-only lifecycle snapshot.  It never advances a
+         * controller or waits for a transfer; ordinary inference and the
+         * background maintenance owner remain responsible for progress.
+         */
+        virtual InferenceReadiness inferenceReadiness() const
+        {
+            return {};
+        }
+
+        /**
+         * @brief Complete all mandatory internal preparation for inference.
+         *
+         * The concrete runner owns any production-shaped setup workload and
+         * protocol progress. Applications call this same idempotent boundary
+         * before serving, benchmarking, parity, or interactive inference and
+         * never learn which subsystem required preparation.
+         *
+         * @return True only when @ref inferenceReadiness is Ready.
+         */
+        virtual bool prepareForInference()
+        {
+            return inferenceReadiness().ready();
+        }
+
+        /**
          * @brief Whether prefillBatch() is implemented for this runner.
          *
          * A request-batched decode lane is valid only if every request slot has
@@ -213,6 +589,8 @@ namespace llaminar2
          *
          * Unlike appending text at the HTTP layer, this keeps model state,
          * sampler history, and later decode output coherent.
+         * The result publishes whether the returned token's model row was
+         * committed by this call or remains pending for the next transaction.
          */
         virtual GenerationResult forceDecodeToken(int32_t token)
         {
@@ -284,13 +662,56 @@ namespace llaminar2
         virtual void setDecodeStepTokenBudget(int max_tokens) { (void)max_tokens; }
 
         /**
-         * @brief Apply any decode-boundary maintenance after a successful token step.
+         * @brief Retire a completed decode transaction into maintenance policy.
          *
          * Server and streaming paths drive decodeStep() directly instead of using
-         * generate(), so they call this hook to share maintenance such as dynamic
-         * MoE hot-expert replica updates.
+         * generate(), so they call this hook after the complete transaction has
+         * committed.  The exact token count matters for grouped MTP: one verifier
+         * transaction may advance several logical decode tokens, and maintenance
+         * cadence must observe every committed token without inspecting MTP state.
+         *
+         * @param committed_tokens Number of logical decode tokens durably committed
+         *        by the completed transaction. Must be positive.
          */
-        virtual bool maybeApplyMoERebalance() { return true; }
+        virtual bool maybeApplyMoERebalance(uint64_t committed_tokens)
+        {
+            return committed_tokens != 0u;
+        }
+
+        /**
+         * @brief Observable MoE expert movement epoch for parity/diagnostics.
+         *
+         * Unlike placement epochs used for graph and prefix-cache keys, this
+         * advances for graph-stable device-side runtime-table mutations too.
+         */
+        virtual uint64_t moeRuntimeMovementEpoch() const { return 0; }
+
+        /**
+         * @brief Observe adaptive MoE lifecycle state from its sole authority.
+         *
+         * This passive diagnostic never polls a controller, advances a wave,
+         * or reads PerfStats. Production request admission continues to use
+         * @ref inferenceReadiness; correctness tests may use this narrower
+         * surface to wait for background optimization without interpreting
+         * instrumentation counters as control state.
+         */
+        virtual MoEOptimizationStatus moeOptimizationStatus() const
+        {
+            return {};
+        }
+
+        /**
+         * @brief Snapshot exact completed movement identities from their owner.
+         *
+         * Unlike PerfStats, this typed ledger is model state evidence. The
+         * snapshot is passive and must not poll, advance, or synchronize the
+         * movement lifecycle.
+         */
+        virtual MoEOptimizationMovementLedger
+        moeOptimizationMovementLedger() const
+        {
+            return {};
+        }
 
         // =====================================================================
         // Configuration
@@ -317,6 +738,30 @@ namespace llaminar2
          * @return Reference to OrchestrationConfig
          */
         virtual const OrchestrationConfig &config() const = 0;
+
+        /**
+         * @brief Select MTP behavior for the next reset request lifetime.
+         *
+         * The runner's graph width, request-batch capacity, sidecar placement,
+         * and terminal-head placement remain immutable. Implementations must
+         * reject this transition while request state is live or when the
+         * requested depth exceeds the retained physical envelope; they must
+         * never allocate, rebind, or recapture in response to this call.
+         *
+         * Multi-rank implementations apply one identical policy on every
+         * participant before admitting the next prefill.
+         *
+         * @param policy Typed request-selectable execution policy.
+         * @return True only when the idle runner accepted the complete policy.
+         */
+        virtual bool configureMTPRequestPolicy(
+            const MTPRequestPolicy &policy) = 0;
+
+        /**
+         * @brief Return the request-selectable policy currently installed.
+         * @return A value copy independent of immutable physical capacity.
+         */
+        [[nodiscard]] virtual MTPRequestPolicy mtpRequestPolicy() const = 0;
 
         // =====================================================================
         // Status
@@ -361,9 +806,53 @@ namespace llaminar2
         virtual void clearCache() = 0;
 
         /**
-         * @brief Read-only runtime state probe for prefix-cache/MTP development.
+         * @brief Destructively retire the reusable prefix archive on all participants.
+         *
+         * This administrative operation is separate from clearCache(): it does
+         * not reset the live request and must not invalidate captured graphs,
+         * prepared weights, or model topology. Multi-rank implementations
+         * coordinate the operation through their ordinary command authority.
+         *
+         * @return True after no reusable prefix record remains addressable.
+         */
+        virtual bool purgePrefixCache() = 0;
+
+        /**
+         * @brief Drain completed decode-boundary maintenance diagnostics.
+         *
+         * This is an epilogue hook, not a request reset. Implementations should
+         * export already-completed async maintenance diagnostics without
+         * mutating live decode state beyond retiring diagnostic event
+         * bookkeeping.
+         */
+        virtual void drainCompletedDecodeBoundaryMaintenanceDiagnostics() {}
+
+        /**
+         * @brief Return existing request/terminal observations without device work.
+         * @return Serving metadata, never a live execution-state snapshot.
+         *
+         * Implementations must not issue transfers, synchronize streams/devices,
+         * or delegate to prefixStateProbe. Logging cannot join background work.
+         */
+        virtual RequestRuntimeSummary requestRuntimeSummary() const { return {}; }
+
+        /**
+         * @brief Explicit, potentially intrusive prefix-cache/MTP diagnostic.
+         *
+         * May observe device state and synchronize. Ordinary serving summaries
+         * must use requestRuntimeSummary instead, regardless of logging level.
          */
         virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
+
+        /**
+         * @brief Get the primary compute device backing this orchestration runner.
+         *
+         * Adapters that expose IOrchestrationRunner through IInferenceRunner use
+         * this to preserve GPU-vs-CPU policy decisions such as decode logits
+         * gather suppression. Composite runners should report the underlying
+         * runner's primary device.
+         */
+        virtual DeviceId primaryDeviceId() const { return DeviceId::cpu(); }
 
         // =====================================================================
         // Advanced
@@ -401,6 +890,47 @@ namespace llaminar2
          */
         virtual const std::string &architecture() const = 0;
 
+        /**
+         * @brief Read-only model authority for diagnostics and parity tooling.
+         *
+         * The returned context remains owned by the runner and is valid only
+         * for the runner's initialized lifetime.  The const boundary prevents
+         * diagnostic callers from loading weights or mutating the runner's
+         * sole model authority.  Lightweight mocks may return nullptr.
+         */
+        virtual const IModelContext *modelContextForDiagnostics() const
+        {
+            return nullptr;
+        }
+
+        /**
+         * @brief Retain the exact model authority for a later compatible runner.
+         *
+         * This is a setup/teardown boundary, never a hot-path accessor.  The
+         * returned context owns its WeightManager and additive
+         * PreparedWeightStore, while graphs, arenas, streams, controllers, and
+         * request state remain owned by this runner.  Callers may retain and
+         * pass the pointer back to the factory's preloaded-context overload but
+         * must not mutate its weight-placement or loader policy.  Implementations
+         * that span multiple independent model authorities return nullptr.
+         *
+         * @return Shared rank-local model authority, or nullptr when unsupported.
+         */
+        virtual std::optional<ModelContextReuseContract>
+        modelContextReuseContract() const
+        {
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Observe imported prepared-model consumption without telemetry.
+         * @return Typed reuse proof; all-zero for runners without this feature.
+         */
+        virtual ModelContextReuseStatus modelContextReuseStatus() const
+        {
+            return {};
+        }
+
         // =====================================================================
         // Snapshot Capture (for parity testing)
         // =====================================================================
@@ -415,6 +945,66 @@ namespace llaminar2
          * @param output_dir Optional directory to save snapshots
          */
         virtual void enableSnapshotCapture(const std::string &output_dir = "") = 0;
+
+        /**
+         * @brief Restrict snapshot capture to a set of published snapshot keys.
+         *
+         * Empty means capture all snapshots.
+         */
+        virtual void setSnapshotCaptureFilter(const std::vector<std::string> &keys)
+        {
+            (void)keys;
+        }
+
+        /**
+         * @brief Declare graph-resident diagnostic storage before initialize().
+         *
+         * The caller that selects checkpoint topology supplies a complete
+         * per-accelerator bound. Production runners charge it through the
+         * physical-memory authority before graph or expert admission.
+         *
+         * @param capacity Maximum simultaneously live snapshot backing.
+         * @return True only when the pre-initialization declaration is accepted.
+         */
+        virtual bool setSnapshotMemoryCapacity(
+            GraphSnapshotMemoryCapacity capacity)
+        {
+            (void)capacity;
+            return false;
+        }
+
+        /**
+         * @brief Declare a diagnostic graph family that starts inference inactive.
+         *
+         * The implementation must materialize both the requested diagnostic
+         * topology and the lean topology before request admission. This is a
+         * readiness policy, not permission to capture after inference starts.
+         * The caller supplies the snapshot filter through
+         * @ref setSnapshotCaptureFilter before this transition.
+         *
+         * @param output_dir Optional diagnostic destination.
+         * @return True when the pre-initialization policy was accepted.
+         */
+        virtual bool prepareInactiveSnapshotCapture(
+            const std::string &output_dir = "")
+        {
+            (void)output_dir;
+            return false;
+        }
+
+        /**
+         * @brief Select a previously materialized diagnostic graph family.
+         *
+         * This transition may clear request-local snapshot values, but it must
+         * not capture, instantiate, allocate, synchronize, or alter serving
+         * geometry. Implementations fail when preparation was not completed.
+         *
+         * @return True only when the selected executable family was setup-ready.
+         */
+        virtual bool activatePreparedSnapshotCapture()
+        {
+            return false;
+        }
 
         /**
          * @brief Disable snapshot capture and clear stored snapshots
@@ -449,8 +1039,10 @@ namespace llaminar2
         /**
          * @brief Get executor profiling statistics
          *
-         * Returns per-stage overhead breakdown (coherence, allocation, etc.)
-         * when profiling is enabled (LLAMINAR_PROFILING=1).
+         * Returns per-stage overhead breakdown (coherence, allocation, etc.).
+         * The benchmark runner exports populated statistics through PerfStats;
+         * `LLAMINAR_EXECUTOR_PROFILING=1` explicitly enables additional legacy
+         * executor instrumentation when diagnosing eager execution.
          *
          * @return Pointer to GraphExecutorStats, or nullptr if not available
          */
@@ -471,7 +1063,9 @@ namespace llaminar2
          * Avoids D2H transfer of logits + CPU scan. Each device runs argmax
          * on its local logits shard, then the host picks the global winner.
          *
-         * @return Token ID (>= 0) on success, -1 if not supported or failed
+         * @return Token ID (>= 0) on success, -1 if not supported or failed.
+         *         GPU decode callers must treat -1 as a hard failure rather
+         *         than silently falling back to host logits.
          */
         virtual int sampleGreedyOnDevice() { return -1; }
 
@@ -554,17 +1148,36 @@ namespace llaminar2
         /**
          * @brief Run as MPI worker for non-root ranks in server mode.
          *
-         * Blocks in a loop, participating in inference collectives when
-         * rank 0 initiates them. Returns when rank 0 signals shutdown.
+         * Blocks in a loop, participating in inference collectives when the
+         * inventory-resolved continuation authority initiates them. Returns
+         * when that authority signals shutdown.
          * Default implementation is a no-op (single-rank doesn't need this).
          */
         virtual void runMPIWorkerLoop() {}
 
         /**
-         * @brief Signal all MPI worker ranks to shut down their worker loops.
+         * @brief Leave the coordinated worker loop while retaining this runner.
          *
-         * Called by rank 0 when the server is stopping. Workers will return
-         * from runMPIWorkerLoop() after receiving this signal.
+         * This is a nonterminal serving-session boundary. The caller must have
+         * reset all request-owned state first. Multi-rank implementations send
+         * one typed command that makes every follower return without draining
+         * or destroying model-lifetime graph, weight, stream, or maintenance
+         * owners. A later @ref setMPICoordinatedMode call reopens command
+         * admission on the same participants.
+         *
+         * @return True only when every participant entered the retained idle
+         *         state; the default rejects runners without this lifecycle.
+         */
+        virtual bool yieldMPIWorkersForRetainedRunner() { return false; }
+
+        /**
+         * @brief Close coordinated inference admission and drain maintenance.
+         *
+         * Called by the continuation authority when serving is stopping.
+         * Multi-rank workers return from runMPIWorkerLoop() after receiving the
+         * terminal signal. A single-rank implementation has no command to send,
+         * but must still drain model-lifetime background maintenance before
+         * terminal diagnostics are inspected.
          */
         virtual void shutdownMPIWorkers() {}
 
@@ -587,11 +1200,23 @@ namespace llaminar2
         virtual void setMoEExpertOverlayMPIContext(std::shared_ptr<IMPIContext> /*mpi_ctx*/) {}
 
         /**
+         * @brief Return the MPI rank that owns coordinated request execution.
+         *
+         * Ordinary TP/PP runners retain rank zero. A rank-agnostic heterogeneous
+         * ExpertOverlay returns its inventory-resolved continuation root so the
+         * process owning dense model state, tokenizer output, logits, sampling,
+         * prefix state, and terminal results is also the command authority.
+         *
+         * @return Valid rank in the runner's coordinated MPI communicator.
+         */
+        virtual int coordinatedRootRank() const { return 0; }
+
+        /**
          * @brief Enable MPI coordinated mode.
          *
-         * When enabled, rank 0 broadcasts commands so non-root ranks
-         * (in their worker loops) can participate in inference collectives.
-         * Must be called on rank 0 before workers enter runMPIWorkerLoop().
+         * When enabled, coordinatedRootRank() broadcasts commands so every
+         * other rank can participate in inference collectives from its worker
+         * loop. The root must enable this before workers enter that loop.
          *
          * Modes where all ranks run the same code (SingleShotChat, Completion)
          * must NOT enable this — they already coordinate inline.

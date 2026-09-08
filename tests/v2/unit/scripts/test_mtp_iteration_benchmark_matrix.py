@@ -103,7 +103,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--tp-devices rocm:0\\,rocm:1", result.stdout)
-        self.assertIn("--tp-scope local", result.stdout)
+        self.assertIn("--tp-scope rank_local", result.stdout)
         self.assertIn("--backend rccl", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
 
@@ -116,7 +116,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--pipeline-parallelism-degree 2", result.stdout)
-        self.assertIn("--define-domain stage0=rocm:0\\;scope=local\\;owner=0", result.stdout)
+        self.assertIn("--define-domain stage0=rocm:0\\;scope=rank_local\\;owner=0", result.stdout)
         self.assertIn("--pp-stage 0=stage0:0-31", result.stdout)
         self.assertIn("--pp-stage 1=stage1:32-63", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
@@ -132,18 +132,32 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         self.assertIn("--mpi-procs 2", result.stdout)
         self.assertIn("--device-map 0=cpu:0\\,1=cpu:1", result.stdout)
         self.assertIn("--tp-scope node_local", result.stdout)
+        self.assertIn("--backend upi", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
 
-    def test_expert_overlay_topology_uses_moe_overlay_flags(self) -> None:
+    def test_nodelocaltp_topology_accepts_moe_models(self) -> None:
+        """CPU2 MoE is a production lane, not a dense-only topology."""
         result = self.run_matrix(
             "baseline",
-            topologies="expert_overlay_rocm2_cpu2",
+            topologies="nodelocaltp_cpu2",
             models="moe",
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--moe-expert-overlay tiered", result.stdout)
-        self.assertIn("--moe-expert-overlay-continuation qwen36_moe_rocm_hot", result.stdout)
+        self.assertIn("--device-map 0=cpu:0\\,1=cpu:1", result.stdout)
+        self.assertIn("--backend upi", result.stdout)
+        self.assertIn("moe.gguf", result.stdout)
+
+    def test_tiered_routed_expert_topology_uses_explicit_policy_flags(self) -> None:
+        result = self.run_matrix(
+            "baseline",
+            topologies="routed_expert_tiered_rocm2_cpu2",
+            models="moe",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--moe-routed-expert-placement tiered-overlay", result.stdout)
+        self.assertIn("--moe-routed-expert-continuation-domain qwen36_moe_rocm_hot", result.stdout)
         self.assertIn("qwen36_moe_rocm_hot=rocm:0\\,rocm:1", result.stdout)
         self.assertIn("qwen36_moe_cpu_cold=cpu:0\\,cpu:1", result.stdout)
         self.assertIn("cold@qwen36_moe_cpu_cold\\;priority=1", result.stdout)
@@ -257,7 +271,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             header = lines[0].split("\t")
             row = lines[1].split("\t")
             self.assertEqual(len(header), len(row))
-            self.assertGreaterEqual(len(header), 122)
+            self.assertGreaterEqual(len(header), 120)
             self.assertEqual(len(header), len(set(header)))
             self.assertIn("topology", header)
             self.assertEqual(row[header.index("topology")], "single")
@@ -276,8 +290,6 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
                 "stochastic_semantic_verify_rows",
                 "stochastic_post_reject_rows",
                 "stochastic_seeded_device_threshold_rows",
-                "verifier_economy_dense",
-                "verifier_economy_moe",
                 "condition_skipped_pending",
                 "pending_condition_rows",
                 "first_token_pending_condition_rows",

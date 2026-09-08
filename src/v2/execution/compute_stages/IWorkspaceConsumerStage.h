@@ -125,7 +125,7 @@ namespace llaminar2
             if (consumer)
             {
                 consumer->bindWorkspace(workspace);
-                LOG_DEBUG("[IWorkspaceConsumerStage] Bound workspace to kernel");
+                LOG_TRACE("[IWorkspaceConsumerStage] Bound workspace to kernel");
             }
             else
             {

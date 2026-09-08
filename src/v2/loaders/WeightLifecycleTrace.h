@@ -26,10 +26,12 @@ namespace llaminar2
         Unknown,
         SingleDevice,
         LocalTP,
-        NodeLocalTP,
+        NodeTP,
         GlobalTP,
         LocalPP,
         HybridPPTP,
+        /** Rank-local independently apportioned ExpertOverlay endpoints. */
+        ExpertOverlayRank,
     };
 
     struct WeightLifecycleEvent

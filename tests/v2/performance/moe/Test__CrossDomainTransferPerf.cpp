@@ -160,6 +160,8 @@ TEST_F(Test__CrossDomainTransferPerf, GPUD2D_SameDevice_Bandwidth)
         uint8_t *d_src = nullptr, *d_dst = nullptr;
         ASSERT_EQ(hipMalloc(&d_src, sz), hipSuccess);
         ASSERT_EQ(hipMalloc(&d_dst, sz), hipSuccess);
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
         // Initialize source
         std::vector<uint8_t> fill(sz, 0xAB);
@@ -172,14 +174,15 @@ TEST_F(Test__CrossDomainTransferPerf, GPUD2D_SameDevice_Bandwidth)
             GPUExpertTransfer::transferExpert(
                 src_ptrs, dst_ptrs,
                 DeviceId::rocm(0), DeviceId::rocm(0),
-                sz, 0, 0, 0, nullptr);
-            hipDeviceSynchronize();
+                sz, 0, 0, 0, stream);
+            hipStreamSynchronize(stream);
         }, sz, /*warmup=*/3, /*iterations=*/10);
 
         char label[64];
         snprintf(label, sizeof(label), "D2D same-dev %zuKB", sz / 1024);
         printBW(label, result);
 
+        hipStreamDestroy(stream);
         hipFree(d_src);
         hipFree(d_dst);
     }
@@ -208,6 +211,8 @@ TEST_F(Test__CrossDomainTransferPerf, GPUD2D_CrossDevice_Bandwidth)
     hipSetDevice(1);
     uint8_t *d_dst = nullptr;
     ASSERT_EQ(hipMalloc(&d_dst, expert_size), hipSuccess);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
     hipSetDevice(0);
 
@@ -218,8 +223,8 @@ TEST_F(Test__CrossDomainTransferPerf, GPUD2D_CrossDevice_Bandwidth)
         GPUExpertTransfer::transferExpert(
             src_ptrs, dst_ptrs,
             DeviceId::rocm(0), DeviceId::rocm(1),
-            expert_size, 0, 0, 0, nullptr);
-        hipDeviceSynchronize();
+            expert_size, 0, 0, 0, stream);
+        hipStreamSynchronize(stream);
     }, expert_size, /*warmup=*/3, /*iterations=*/10);
 
     printBW("D2D cross-dev (0→1) 3MB", result);
@@ -242,7 +247,7 @@ TEST_F(Test__CrossDomainTransferPerf, GPUD2D_CrossDevice_Bandwidth)
     std::cout << "╚══════════════════════════════════════════════════════════════════════╝\n\n";
 
     hipSetDevice(0); hipFree(d_src);
-    hipSetDevice(1); hipFree(d_dst);
+    hipSetDevice(1); hipStreamDestroy(stream); hipFree(d_dst);
 }
 
 // ===========================================================================
@@ -396,7 +401,10 @@ TEST_F(Test__CrossDomainTransferPerf, GpuCacheMasks_Scalability)
         rcfg.top_k = 2;
         rcfg.window_size = 128;
         rcfg.sockets = {DeviceId::rocm(0), DeviceId::cpu()};
-        rcfg.initial_expert_to_socket.assign(cfg.experts, 0);
+        rcfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+            cfg.layers,
+            2,
+            std::vector<int>(static_cast<size_t>(cfg.experts), 0));
 
         MoERebalanceController controller(rcfg);
 
@@ -488,24 +496,26 @@ TEST_F(Test__CrossDomainTransferPerf, FullExpertGPUTransfer_ThreeComponents)
     auto [gate_src, gate_dst] = allocBuf(gate_vnni, gate_scales);
     auto [up_src, up_dst] = allocBuf(up_vnni, up_scales);
     auto [down_src, down_dst] = allocBuf(down_vnni, down_scales);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
     auto result = benchmarkBandwidth([&]() {
         GPUExpertPointers g_src{gate_src.vnni, gate_src.scales, nullptr, nullptr};
         GPUExpertPointers g_dst{gate_dst.vnni, gate_dst.scales, nullptr, nullptr};
         GPUExpertTransfer::transferExpert(g_src, g_dst,
-            DeviceId::rocm(0), DeviceId::rocm(0), gate_vnni, gate_scales, 0, 0, nullptr);
+            DeviceId::rocm(0), DeviceId::rocm(0), gate_vnni, gate_scales, 0, 0, stream);
 
         GPUExpertPointers u_src{up_src.vnni, up_src.scales, nullptr, nullptr};
         GPUExpertPointers u_dst{up_dst.vnni, up_dst.scales, nullptr, nullptr};
         GPUExpertTransfer::transferExpert(u_src, u_dst,
-            DeviceId::rocm(0), DeviceId::rocm(0), up_vnni, up_scales, 0, 0, nullptr);
+            DeviceId::rocm(0), DeviceId::rocm(0), up_vnni, up_scales, 0, 0, stream);
 
         GPUExpertPointers d_src{down_src.vnni, down_src.scales, nullptr, nullptr};
         GPUExpertPointers d_dst{down_dst.vnni, down_dst.scales, nullptr, nullptr};
         GPUExpertTransfer::transferExpert(d_src, d_dst,
-            DeviceId::rocm(0), DeviceId::rocm(0), down_vnni, down_scales, 0, 0, nullptr);
+            DeviceId::rocm(0), DeviceId::rocm(0), down_vnni, down_scales, 0, 0, stream);
 
-        hipDeviceSynchronize();
+        hipStreamSynchronize(stream);
     }, total_bytes, /*warmup=*/3, /*iterations=*/10);
 
     printBW("Full expert (gate+up+down) 3×3MB", result);
@@ -521,6 +531,7 @@ TEST_F(Test__CrossDomainTransferPerf, FullExpertGPUTransfer_ThreeComponents)
     std::cout << "╚══════════════════════════════════════════════════════════════════════╝\n\n";
 
     // Cleanup
+    hipStreamDestroy(stream);
     hipFree(gate_src.vnni); hipFree(gate_src.scales);
     hipFree(gate_dst.vnni); hipFree(gate_dst.scales);
     hipFree(up_src.vnni); hipFree(up_src.scales);

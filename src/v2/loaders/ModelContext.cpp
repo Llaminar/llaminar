@@ -62,6 +62,16 @@ namespace llaminar2
             return loader_.loadTensorExpertSlice(name, expert_start, expert_end, device, weight_precision);
         }
 
+        std::shared_ptr<TensorBase> loadTensorExpertSelection(
+            const std::string &name,
+            const std::vector<size_t> &expert_ids,
+            DeviceId device,
+            WeightPrecision weight_precision) override
+        {
+            return loader_.loadTensorExpertSelection(
+                name, expert_ids, device, weight_precision);
+        }
+
         bool hasTensor(const std::string &name) const override { return loader_.hasTensor(name); }
         std::vector<std::string> tensorNames() const override { return loader_.tensorNames(); }
         std::string architecture() const override { return loader_.architecture(); }
@@ -208,7 +218,7 @@ namespace llaminar2
         // Configure mmap before loading (must precede loadModel)
         ctx->loader_.setUseMmap(config.use_mmap);
         ctx->loader_.setSkipMmapCacheEviction(config.skip_mmap_cache_eviction);
-        ctx->loader_.setTargetIsGpu(config.target_is_gpu);
+        ctx->loader_.setPayloadAccessPattern(config.payload_access_pattern);
 
         // Load model metadata
         try
@@ -305,7 +315,8 @@ namespace llaminar2
     std::shared_ptr<ModelContext> ModelContext::createForTesting(
         const std::string &model_path,
         std::shared_ptr<IMPIContext> mpi_ctx,
-        uint32_t block_count)
+        uint32_t block_count,
+        bool with_weight_manager)
     {
         // Create TensorFactory from MPI context (if provided) to prevent ModelLoader
         // from creating internal MPI_COMM_NULL context that conflicts with test's MPI_COMM_WORLD
@@ -331,7 +342,11 @@ namespace llaminar2
 
         // Set up interface wrappers (no WeightManager for test contexts by default)
         ctx->loader_interface_ = std::make_shared<ModelLoaderInterfaceWrapper>(ctx->loader_);
-        // weight_manager_interface_ remains nullptr - tests should use MockModelContext instead
+        if (with_weight_manager)
+        {
+            ctx->weight_manager_ = std::make_shared<WeightManager>(
+                ctx->loader_, mpi_ctx, nullptr, WeightDistributionStrategy::REPLICATED);
+        }
 
         return ctx;
     }

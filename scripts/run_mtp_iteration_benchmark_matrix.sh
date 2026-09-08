@@ -25,8 +25,8 @@ Options:
   --moe-model PATH       MoE Qwen3.6 GGUF
   --topologies LIST      Comma list: single,localtp_rocm2,localtp_cuda2,
                          localpp_rocm2,nodelocaltp_cpu2,
-                         expert_overlay_rocm2_hot,
-                         expert_overlay_rocm2_cpu2
+                         routed_expert_tiered_rocm2_hot,
+                         routed_expert_tiered_rocm2_cpu2
   --devices LIST         Comma list, e.g. cuda:0,rocm:0,cpu:0
                          Used only by the single topology.
   --models LIST          Comma list: dense,moe
@@ -254,11 +254,14 @@ topology_model_supported() {
     single)
       return 0
       ;;
-    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2)
+    localtp_rocm2|localtp_cuda2|localpp_rocm2)
       [[ "${model}" == "dense" ]]
       return
       ;;
-    expert_overlay_rocm2_hot|expert_overlay_rocm2_cpu2)
+    nodelocaltp_cpu2)
+      return 0
+      ;;
+    routed_expert_tiered_rocm2_hot|routed_expert_tiered_rocm2_cpu2)
       [[ "${model}" == "moe" ]]
       return
       ;;
@@ -275,7 +278,7 @@ topology_lane_devices() {
     single)
       split_csv "${devices}"
       ;;
-    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2|expert_overlay_rocm2_hot|expert_overlay_rocm2_cpu2)
+    localtp_rocm2|localtp_cuda2|localpp_rocm2|nodelocaltp_cpu2|routed_expert_tiered_rocm2_hot|routed_expert_tiered_rocm2_cpu2)
       echo "${topology}"
       ;;
     *)
@@ -302,7 +305,7 @@ describe_topology() {
       topology_args=(
         --tp-devices "rocm:0,rocm:1"
         --tensor-parallelism-degree 2
-        --tp-scope local
+        --tp-scope rank_local
         --backend rccl
       )
       ;;
@@ -311,7 +314,7 @@ describe_topology() {
       topology_args=(
         --tp-devices "cuda:0,cuda:1"
         --tensor-parallelism-degree 2
-        --tp-scope local
+        --tp-scope rank_local
         --backend nccl
       )
       ;;
@@ -320,8 +323,8 @@ describe_topology() {
       topology_args=(
         --pipeline-parallelism-degree 2
         --pp-split manual
-        --define-domain "stage0=rocm:0;scope=local;owner=0"
-        --define-domain "stage1=rocm:1;scope=local;owner=0"
+        --define-domain "stage0=rocm:0;scope=rank_local;owner=0"
+        --define-domain "stage1=rocm:1;scope=rank_local;owner=0"
         --pp-stage "0=stage0:0-31"
         --pp-stage "1=stage1:32-63"
       )
@@ -333,33 +336,33 @@ describe_topology() {
         --device-map "0=cpu:0,1=cpu:1"
         --tensor-parallelism-degree 2
         --tp-scope node_local
-        --backend mpi
+        --backend upi
       )
       ;;
-    expert_overlay_rocm2_hot)
+    routed_expert_tiered_rocm2_hot)
       topology_device_label="rocm:0+rocm:1"
       topology_args=(
-        --moe-expert-overlay tiered
-        --moe-expert-overlay-continuation qwen36_moe_rocm_hot
-        --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-residency static-by-id
-        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts"
-        --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+        --moe-routed-expert-placement tiered-overlay
+        --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-shared-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-residency static-by-id
+        --moe-routed-expert-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=rank_local;backend=rccl;routed_compute=apportioned"
+        --moe-routed-expert-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
       )
       ;;
-    expert_overlay_rocm2_cpu2)
+    routed_expert_tiered_rocm2_cpu2)
       topology_device_label="rocm:0+rocm:1+cpu:0+cpu:1"
       topology_args=(
-        --moe-expert-overlay tiered
-        --moe-expert-overlay-continuation qwen36_moe_rocm_hot
-        --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
-        --moe-expert-overlay-residency static-by-id
-        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts"
-        --moe-expert-overlay-domain "qwen36_moe_cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;compute=replicated_experts"
-        --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096"
-        --moe-expert-overlay-tier "cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
+        --moe-routed-expert-placement tiered-overlay
+        --moe-routed-expert-continuation-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-base-model-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-shared-domain qwen36_moe_rocm_hot
+        --moe-routed-expert-residency static-by-id
+        --moe-routed-expert-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=rank_local;backend=rccl;routed_compute=apportioned"
+        --moe-routed-expert-domain "qwen36_moe_cpu_cold=cpu:0,cpu:1;scope=rank_local;backend=upi;routed_compute=apportioned"
+        --moe-routed-expert-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096"
+        --moe-routed-expert-tier "cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0"
       )
       ;;
     *)
@@ -475,7 +478,7 @@ if [[ ! -x "${perf_summary_script}" ]]; then
   chmod +x "${perf_summary_script}" 2>/dev/null || true
 fi
 
-printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\trequest_batch\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tstochastic_physical_verify_rows\tstochastic_semantic_verify_rows\tstochastic_post_reject_rows\tstochastic_seeded_device_threshold_rows\tverifier_economy_dense\tverifier_economy_moe\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcondition_skipped_pending\tpending_condition_rows\tfirst_token_pending_condition_rows\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tsidecar_resident_decode_ms\tsidecar_resident_decode_count\tsidecar_resident_decode_avg_ms\tsidecar_resident_segmented_replay_ms\tsidecar_resident_segmented_replay_count\tsidecar_resident_segmented_count\tsidecar_resident_plain_after_build_count\tsidecar_chain_decode_ms\tsidecar_chain_decode_count\tsidecar_chain_decode_avg_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_distribution_build_gpu_ms\tstochastic_distribution_batch_build_gpu_ms\tstochastic_processed_rows_build_gpu_ms\tstochastic_batch_outcome_ms\tresident_outcome_enqueue_ms\tresident_outcome_host_bridge_ms\tstochastic_batch_gpu_reducer_ms\tfirst_sidecar_prelaunch_ms\tfirst_sidecar_prelaunches\tfirst_sidecar_prelaunch_reuses\tfirst_sidecar_prelaunch_drops\tfirst_sidecar_prelaunch_discarded_complete\tfirst_sidecar_resident_ready_inputs\tfirst_sidecar_resident_condition_inputs\tsidecar_device_token_inputs\tsidecar_device_token_inputs_from_host\tsidecar_device_token_inputs_from_device\toutcome_catchup_plan_ms\ttransaction_plan_ms\thost_state_adoption_ms\ttransaction_output_commit_ms\tstochastic_batch_d2h_sync_ms\tstochastic_batch_response_ready_wait_ms\tstochastic_batch_d2h_enqueue_ms\tstochastic_batch_d2h_wait_ms\tbridge_stream_create_ms\tbridge_stream_creations\tbridge_stream_reuses\tmain_decode_graph_replay_gpu_ms\tmain_verifier_graph_replay_gpu_ms\tmain_verifier_stage_sample_gpu_ms\tmain_verifier_moe_expert_ffn_gpu_ms\tmain_verifier_moe_router_gpu_ms\tmain_verifier_gdn_projection_gpu_ms\tmain_verifier_gdn_recurrence_gpu_ms\tmain_verifier_attention_gpu_ms\tmain_verifier_lm_head_gpu_ms\tsidecar_graph_replay_gpu_ms\tsidecar_replay_reset_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\tsidecar_replay_reset_after_spec_publication\tsidecar_replay_preserved_for_spec_publication\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
+printf 'topology\tdevice\tmodel\tmode\tvariant\tsuccess\tdecode_tps\tspeedup_vs_baseline\toverall_tps\tprefill_tokens\tdecode_tokens\tpolicy\tgenerated_policy\tdraft\tdepth\tmin_depth\tmax_depth\trequest_batch\tdepth_updates\tdepth_promotions\tdepth_demotions\tdepth_windows\tlast_depth_reason\taccepted\trejected\trollbacks\tacceptance_pct\tverifier_runs\tverifier_tokens\tdecode_step_ms\tverifier_ms\tstochastic_physical_verify_rows\tstochastic_semantic_verify_rows\tstochastic_post_reject_rows\tstochastic_seeded_device_threshold_rows\tcondition_ms\tcondition_count\tcondition_skipped_ready\tcondition_skipped_pending\tpending_condition_rows\tfirst_token_pending_condition_rows\tcorrection_ms\tcorrection_count\tdeferred_corrections\trejection_no_ready\tpublish_ms\tpublish_count\tpublish_avg_ms\tsidecar_ms\tsidecar_depth0_decode_ms\tsidecar_resident_decode_ms\tsidecar_resident_decode_count\tsidecar_resident_decode_avg_ms\tsidecar_resident_segmented_replay_ms\tsidecar_resident_segmented_replay_count\tsidecar_resident_segmented_count\tsidecar_resident_plain_after_build_count\tsidecar_chain_decode_ms\tsidecar_chain_decode_count\tsidecar_chain_decode_avg_ms\tshifted_initial_ms\tshifted_initial_commits\tshifted_initial_reused\tshifted_prefix_ms\tshifted_deferred_ms\tshifted_row_ms\tshifted_kv_ready_events\tshifted_kv_ready_waits\tshifted_kv_syncs_deferred\tsampling_ms\tsampling_enqueue_ms\tstochastic_distribution_build_gpu_ms\tstochastic_distribution_batch_build_gpu_ms\tstochastic_processed_rows_build_gpu_ms\tstochastic_batch_outcome_ms\tresident_outcome_enqueue_ms\tresident_outcome_host_bridge_ms\tstochastic_batch_gpu_reducer_ms\tfirst_sidecar_prelaunch_ms\tfirst_sidecar_prelaunches\tfirst_sidecar_prelaunch_reuses\tfirst_sidecar_prelaunch_drops\tfirst_sidecar_prelaunch_discarded_complete\tfirst_sidecar_resident_ready_inputs\tfirst_sidecar_resident_condition_inputs\tsidecar_device_token_inputs\tsidecar_device_token_inputs_from_host\tsidecar_device_token_inputs_from_device\toutcome_catchup_plan_ms\ttransaction_plan_ms\thost_state_adoption_ms\ttransaction_output_commit_ms\tstochastic_batch_d2h_sync_ms\tstochastic_batch_response_ready_wait_ms\tstochastic_batch_d2h_enqueue_ms\tstochastic_batch_d2h_wait_ms\tbridge_stream_create_ms\tbridge_stream_creations\tbridge_stream_reuses\tmain_decode_graph_replay_gpu_ms\tmain_verifier_graph_replay_gpu_ms\tmain_verifier_stage_sample_gpu_ms\tmain_verifier_moe_expert_ffn_gpu_ms\tmain_verifier_moe_router_gpu_ms\tmain_verifier_gdn_projection_gpu_ms\tmain_verifier_gdn_recurrence_gpu_ms\tmain_verifier_attention_gpu_ms\tmain_verifier_lm_head_gpu_ms\tsidecar_graph_replay_gpu_ms\tsidecar_replay_reset_ms\tgreedy_summary_ms\tcheckpoint_ms\tsidecar_graph_hits\tsidecar_graph_misses\tmain_decode_warmup\tmain_decode_capture\tmain_decode_replay\tmain_verifier_warmup\tmain_verifier_capture\tmain_verifier_replay\treplay_resets\treplay_preserves\tsidecar_replay_reset_after_spec_publication\tsidecar_replay_preserved_for_spec_publication\treplay_reset_caches\treplay_rebind_caches\treplay_ordinary_decode_resets\treplay_verifier_rebinds\treplay_other_rebinds\tjson\tperfstats\n' > "${summary_path}"
 printf 'topology\tdevice\tmodel\tmode\tvariant\tdomain\tphase\tcontext\tname\ttotal_ms\tcount\tavg_us\tstage_count\tsource\tperfstats\n' > "${stage_summary_path}"
 : > "${commands_path}"
 

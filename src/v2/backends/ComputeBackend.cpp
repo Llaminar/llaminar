@@ -19,6 +19,7 @@
 
 #include "ComputeBackend.h"
 #include "HardwareInventory.h"
+#include "HostMemoryCapacity.h"
 #include "GPUEnumeration.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -92,68 +93,16 @@ namespace llaminar2
         dev.compute_capability = 0;
         dev.numa_node = numa_node;
 
-        // Get memory info - prefer NUMA-local memory if node specified
+        // Use the same typed observation as inventory, CPUBackend, and
+        // preflight so automatic capacity cannot disagree across lifecycle
+        // boundaries as page-cache and tmpfs residency change.
 #ifdef __linux__
-        if (numa_node >= 0 && numa_available() >= 0)
-        {
-            // Get NUMA-local memory for this node
-            long long numa_size = numa_node_size64(numa_node, nullptr);
-            if (numa_size > 0)
-            {
-                dev.total_memory_bytes = static_cast<size_t>(numa_size);
-                // Free memory approximation: assume ~90% available
-                long long numa_free = 0;
-                numa_node_size64(numa_node, &numa_free);
-                dev.free_memory_bytes = (numa_free > 0) ? static_cast<size_t>(numa_free) : dev.total_memory_bytes;
-            }
-            else
-            {
-                // Fallback to system memory divided by NUMA nodes
-                int num_nodes = numa_num_configured_nodes();
-                FILE *meminfo = fopen("/proc/meminfo", "r");
-                if (meminfo)
-                {
-                    char line[256];
-                    while (fgets(line, sizeof(line), meminfo))
-                    {
-                        if (strncmp(line, "MemAvailable:", 13) == 0)
-                        {
-                            unsigned long kb = 0;
-                            if (sscanf(line + 13, "%lu", &kb) == 1)
-                            {
-                                dev.total_memory_bytes = static_cast<size_t>(kb) * 1024 / (num_nodes > 0 ? num_nodes : 1);
-                                dev.free_memory_bytes = dev.total_memory_bytes;
-                            }
-                            break;
-                        }
-                    }
-                    fclose(meminfo);
-                }
-            }
-        }
-        else
-        {
-            // No NUMA node specified, get total system memory
-            FILE *meminfo = fopen("/proc/meminfo", "r");
-            if (meminfo)
-            {
-                char line[256];
-                while (fgets(line, sizeof(line), meminfo))
-                {
-                    if (strncmp(line, "MemAvailable:", 13) == 0)
-                    {
-                        unsigned long kb = 0;
-                        if (sscanf(line + 13, "%lu", &kb) == 1)
-                        {
-                            dev.total_memory_bytes = static_cast<size_t>(kb) * 1024;
-                            dev.free_memory_bytes = dev.total_memory_bytes;
-                        }
-                        break;
-                    }
-                }
-                fclose(meminfo);
-            }
-        }
+        const auto memory =
+            numa_node >= 0
+                ? observeNUMAMemoryCapacity(numa_node)
+                : observeSystemMemoryCapacity();
+        dev.total_memory_bytes = memory.total_bytes;
+        dev.free_memory_bytes = memory.admission_available_bytes;
 #else
         // Fallback: assume 16 GB
         dev.total_memory_bytes = 16ULL * 1024 * 1024 * 1024;
@@ -444,7 +393,12 @@ namespace llaminar2
 
             log_table(table.to_string());
 
-            // Print degraded link warnings after the table
+            /*
+             * Enumeration precedes model traffic, and autonomous PCIe power
+             * management may temporarily reduce link speed or width. Keep the
+             * observation available as a diagnostic without presenting this
+             * pre-workload snapshot as an inference failure.
+             */
             for (const auto &dev : devices)
             {
                 if (dev.pcie.degraded)
@@ -464,16 +418,16 @@ namespace llaminar2
                     const char *type_prefix = (dev.type == ComputeBackendType::GPU_CUDA) ? "cuda" : "rocm";
                     if (!dev.pcie.bottleneck_bdf.empty())
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
-                                        << " link degraded: " << format_pcie_link(dev.pcie)
-                                        << " — capable of " << cap_buf
-                                        << " (bottleneck at upstream bridge " << dev.pcie.bottleneck_bdf << ")");
+                        LOG_DEBUG("  " << type_prefix << ":" << dev.device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(dev.pcie)
+                                       << "; capable of " << cap_buf
+                                       << " (narrowest upstream bridge " << dev.pcie.bottleneck_bdf << ")");
                     }
                     else
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
-                                        << " link degraded: " << format_pcie_link(dev.pcie)
-                                        << " — capable of " << cap_buf);
+                        LOG_DEBUG("  " << type_prefix << ":" << dev.device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(dev.pcie)
+                                       << "; capable of " << cap_buf);
                     }
                 }
             }
@@ -562,29 +516,25 @@ namespace llaminar2
         auto cpu_dev = enumerate_cpu_device(local_numa_node >= 0 ? local_numa_node : 0);
         devices_.push_back(cpu_dev);
 
-        const char *cpu_only_env = std::getenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
-        const bool force_cpu_only_startup = (cpu_only_env && std::atoi(cpu_only_env) != 0);
-
-        // Selective backend skip: when we know the target backend, skip the other(s)
-        // to avoid expensive GPU driver initialization (~250ms per CUDA device).
-        const char *skip_cuda_env = std::getenv("LLAMINAR_SKIP_CUDA_STARTUP");
-        const bool skip_cuda = (skip_cuda_env && std::atoi(skip_cuda_env) != 0);
-        const char *skip_rocm_env = std::getenv("LLAMINAR_SKIP_ROCM_STARTUP");
-        const bool skip_rocm = (skip_rocm_env && std::atoi(skip_rocm_env) != 0);
+        // DeviceManager, HardwareInventory, vendor context factories, and
+        // collective construction all consume this exact parsed authority.
+        // A rank must not initialize a foreign GPU backend merely because its
+        // implementation was linked into the production binary.
+        const auto &startup = debugEnv().backend_startup;
 
         // Enumerate GPUs with optional NUMA filtering
         std::vector<ComputeDevice> cuda_devices;
         std::vector<ComputeDevice> rocm_devices;
         std::vector<ComputeDevice> vulkan_devices;
 
-        if (!force_cpu_only_startup)
+        if (startup.acceleratorsEnabled())
         {
-            if (!skip_cuda)
+            if (startup.cudaEnabled())
                 cuda_devices = enumerate_cuda_devices();
             else
                 LOG_INFO("[DeviceManager] Skipping CUDA enumeration (LLAMINAR_SKIP_CUDA_STARTUP=1)");
 
-            if (!skip_rocm)
+            if (startup.rocmEnabled())
                 rocm_devices = enumerate_rocm_devices();
             else
                 LOG_INFO("[DeviceManager] Skipping ROCm enumeration (LLAMINAR_SKIP_ROCM_STARTUP=1)");
@@ -669,6 +619,29 @@ namespace llaminar2
         {
             dev.numa_node = -1; // Unknown
         }
+
+        /*
+         * Peer topology is an execution-policy input, not a presentation
+         * detail. Query it on every inventory generation even when table
+         * logging is disabled; otherwise ordinary MPI startup would silently
+         * classify a P2P-capable cell as host-only merely because it requested
+         * quiet device discovery.
+         */
+        p2p_matrices_.clear();
+#ifdef HAVE_CUDA
+        if (cuda_devices.size() > 1u)
+        {
+            p2p_matrices_.push_back(
+                cuda_enumeration::query_p2p_matrix(cuda_devices));
+        }
+#endif
+#ifdef HAVE_ROCM
+        if (rocm_devices.size() > 1u)
+        {
+            p2p_matrices_.push_back(
+                rocm_enumeration::query_p2p_matrix(rocm_devices));
+        }
+#endif
 
         devices_.insert(devices_.end(), cuda_devices.begin(), cuda_devices.end());
         devices_.insert(devices_.end(), rocm_devices.begin(), rocm_devices.end());
@@ -945,25 +918,13 @@ namespace llaminar2
             }
 
             // --- P2P access matrices ---
-            p2p_matrices_.clear();
-
-#ifdef HAVE_CUDA
-            if (cuda_devices.size() > 1)
+            for (const auto &matrix : p2p_matrices_)
             {
-                auto cuda_p2p = cuda_enumeration::query_p2p_matrix(cuda_devices);
-                log_p2p_table("CUDA", cuda_p2p);
-                p2p_matrices_.push_back(std::move(cuda_p2p));
+                if (matrix.backend == ComputeBackendType::GPU_CUDA)
+                    log_p2p_table("CUDA", matrix);
+                else if (matrix.backend == ComputeBackendType::GPU_ROCM)
+                    log_p2p_table("ROCm", matrix);
             }
-#endif
-
-#ifdef HAVE_ROCM
-            if (rocm_devices.size() > 1)
-            {
-                auto rocm_p2p = rocm_enumeration::query_p2p_matrix(rocm_devices);
-                log_p2p_table("ROCm", rocm_p2p);
-                p2p_matrices_.push_back(std::move(rocm_p2p));
-            }
-#endif
 
         } // end if (!inventory_logged_)
 
@@ -1002,91 +963,7 @@ namespace llaminar2
             ctx = std::make_shared<CPUComputeContext>();
             break;
 
-#if 0 // GPU context creation disabled (Phase 3)
-#ifdef HAVE_CUDA
-        case ComputeBackendType::GPU_CUDA:
-        {
-            auto cuda_ctx = std::make_shared<CUDAComputeContext>();
-            if (cudaSetDevice(device.device_id) != cudaSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to set CUDA device "
-                          << device.device_id << "");
-                return nullptr;
-            }
-
-            cudaStream_t stream;
-            if (cudaStreamCreate(&stream) != cudaSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create CUDA stream");
-                return nullptr;
-            }
-            cuda_ctx->stream = stream;
-            cuda_ctx->device_id = device.device_id;
-
-            cublasHandle_t cublas_handle;
-            if (cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create cuBLAS handle");
-                cudaStreamDestroy(stream);
-                return nullptr;
-            }
-            cublasSetStream(cublas_handle, stream);
-            cuda_ctx->cublas_handle = cublas_handle;
-            ctx = cuda_ctx;
-            break;
-        }
-#endif
-
-#ifdef HAVE_ROCM
-        case ComputeBackendType::GPU_ROCM:
-        {
-            auto rocm_ctx = std::make_shared<ROCmComputeContext>();
-            if (hipSetDevice(device.device_id) != hipSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to set ROCm device "
-                          << device.device_id << "");
-                return nullptr;
-            }
-
-            hipStream_t stream;
-            if (hipStreamCreate(&stream) != hipSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create HIP stream");
-                return nullptr;
-            }
-            rocm_ctx->stream = stream;
-            rocm_ctx->device_id = device.device_id;
-
-            hipblasHandle_t hipblas_handle;
-            if (hipblasCreate(&hipblas_handle) != HIPBLAS_STATUS_SUCCESS)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create hipBLAS handle");
-                hipStreamDestroy(stream);
-                return nullptr;
-            }
-            hipblasSetStream(hipblas_handle, stream);
-            // Disable atomic reductions for deterministic GEMM output.
-            hipblasSetAtomicsMode(hipblas_handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
-            rocm_ctx->hipblas_handle = hipblas_handle;
-            ctx = rocm_ctx;
-            break;
-        }
-#endif
-
-#ifdef HAVE_VULKAN
-        case ComputeBackendType::GPU_VULKAN:
-            // TODO: Vulkan context initialization
-            ctx = std::make_shared<VulkanComputeContext>();
-            LOG_ERROR("[DeviceManager] Vulkan context creation not fully implemented");
-            break;
-#else
-        case ComputeBackendType::GPU_VULKAN:
-            LOG_ERROR("[DeviceManager] Vulkan not available in this build");
-            return nullptr;
-#endif
-#endif // #if 0 - GPU context creation disabled (Phase 3)
-
-        // GPU context creation now handled by IBackend (Phase 3)
+        // GPU context creation is owned by IBackend.
         case ComputeBackendType::GPU_CUDA:
         case ComputeBackendType::GPU_ROCM:
         case ComputeBackendType::GPU_VULKAN:
@@ -1147,6 +1024,62 @@ namespace llaminar2
         }
 
         return find_device(backend_type, device.ordinal) >= 0;
+    }
+
+    std::optional<PeerAccessCoverage> DeviceManager::peerAccessCoverage(
+        const std::vector<DeviceId> &devices) const
+    {
+        if (devices.size() < 2u || !devices.front().is_gpu())
+            return std::nullopt;
+
+        const DeviceType backend_type = devices.front().type;
+        std::vector<int> ordinals;
+        ordinals.reserve(devices.size());
+        for (const DeviceId &device : devices)
+        {
+            if (!device.is_gpu() || device.type != backend_type)
+                return std::nullopt;
+            ordinals.push_back(device.ordinal);
+        }
+
+        const ComputeBackendType matrix_backend =
+            backend_type == DeviceType::CUDA
+                ? ComputeBackendType::GPU_CUDA
+                : ComputeBackendType::GPU_ROCM;
+        for (const auto &matrix : p2p_matrices_)
+        {
+            if (matrix.backend == matrix_backend)
+                return matrix.coverageForDevices(ordinals);
+        }
+        return std::nullopt;
+    }
+
+    std::optional<bool> DeviceManager::peerAccessAvailable(
+        DeviceId accessor,
+        DeviceId peer) const
+    {
+        if (!accessor.is_gpu() || !peer.is_gpu() || accessor == peer ||
+            accessor.type != peer.type)
+        {
+            return std::nullopt;
+        }
+
+        const ComputeBackendType matrix_backend =
+            accessor.type == DeviceType::CUDA
+                ? ComputeBackendType::GPU_CUDA
+                : ComputeBackendType::GPU_ROCM;
+        for (const auto &matrix : p2p_matrices_)
+        {
+            if (matrix.backend != matrix_backend)
+                continue;
+            if (!matrix.indexForDevice(accessor.ordinal).has_value() ||
+                !matrix.indexForDevice(peer.ordinal).has_value())
+            {
+                return std::nullopt;
+            }
+            return matrix.canAccessDevice(accessor.ordinal, peer.ordinal);
+        }
+        return std::nullopt;
     }
 
     bool DeviceManager::deviceExists(const GlobalDeviceAddress &device, bool strict_numa) const
@@ -1392,161 +1325,5 @@ namespace llaminar2
         // Use KernelFactory::createSwiGLU() instead.
         return nullptr;
     }
-
-    // ============================================================================
-    // CUDAComputeContext Implementation (DEPRECATED - Phase 3)
-    // ============================================================================
-    // GPU context implementations moved to IBackend interface.
-    // See backends/cuda/CUDABackend.cu for new CUDA implementation.
-    // ============================================================================
-
-#if 0 // CUDA context methods disabled (Phase 3)
-#ifdef HAVE_CUDA
-    void *CUDAComputeContext::allocate(size_t bytes)
-    {
-        void *ptr = nullptr;
-        cudaError_t err = cudaMalloc(&ptr, bytes);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDA] Failed to allocate " << bytes << " bytes: "
-                                                   << cudaGetErrorString(err) << "");
-            return nullptr;
-        }
-        return ptr;
-    }
-
-    void CUDAComputeContext::free(void *ptr)
-    {
-        if (ptr)
-        {
-            cudaFree(ptr);
-        }
-    }
-
-    void CUDAComputeContext::copy_to_device(void *dst, const void *src, size_t bytes)
-    {
-        cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDA] copy_to_device failed: " << cudaGetErrorString(err) << "");
-        }
-    }
-
-    void CUDAComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
-    {
-        cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDA] copy_from_device failed: " << cudaGetErrorString(err) << "");
-        }
-    }
-
-    void CUDAComputeContext::synchronize()
-    {
-        if (stream)
-        {
-            cudaStreamSynchronize(stream);
-        }
-        else
-        {
-            cudaDeviceSynchronize();
-        }
-    }
-#endif
-
-    // ============================================================================
-    // ROCmComputeContext Implementation (DEPRECATED - Phase 3)
-    // ============================================================================
-    // GPU context implementations moved to IBackend interface.
-    // See backends/rocm/ROCmBackend.cpp for new ROCm implementation.
-    // ============================================================================
-
-#ifdef HAVE_ROCM
-    void *ROCmComputeContext::allocate(size_t bytes)
-    {
-        void *ptr = nullptr;
-        hipError_t err = hipMalloc(&ptr, bytes);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCm] Failed to allocate " << bytes << " bytes");
-            return nullptr;
-        }
-        return ptr;
-    }
-
-    void ROCmComputeContext::free(void *ptr)
-    {
-        if (ptr)
-        {
-            hipFree(ptr);
-        }
-    }
-
-    void ROCmComputeContext::copy_to_device(void *dst, const void *src, size_t bytes)
-    {
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCm] copy_to_device failed");
-        }
-    }
-
-    void ROCmComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
-    {
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCm] copy_from_device failed");
-        }
-    }
-
-    void ROCmComputeContext::synchronize()
-    {
-        if (stream)
-        {
-            hipStreamSynchronize(stream);
-        }
-        else
-        {
-            hipDeviceSynchronize();
-        }
-    }
-#endif
-
-    // ============================================================================
-    // VulkanComputeContext Implementation (Stub)
-    // ============================================================================
-
-#ifdef HAVE_VULKAN
-    void *VulkanComputeContext::allocate(size_t bytes)
-    {
-        // TODO: Vulkan buffer allocation
-        LOG_ERROR("[Vulkan] allocate() not yet implemented");
-        return nullptr;
-    }
-
-    void VulkanComputeContext::free(void *ptr)
-    {
-        // TODO: Vulkan buffer deallocation
-    }
-
-    void VulkanComputeContext::copy_to_device(void *dst, const void *src, size_t bytes)
-    {
-        // TODO: Vulkan staging buffer upload
-        LOG_ERROR("[Vulkan] copy_to_device() not yet implemented");
-    }
-
-    void VulkanComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
-    {
-        // TODO: Vulkan staging buffer download
-        LOG_ERROR("[Vulkan] copy_from_device() not yet implemented");
-    }
-
-    void VulkanComputeContext::synchronize()
-    {
-        // TODO: Vulkan queue submit + wait
-    }
-#endif
-#endif // #if 0 - GPU context methods disabled (Phase 3)
 
 } // namespace llaminar2

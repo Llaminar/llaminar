@@ -95,7 +95,7 @@ namespace llaminar2
             (void)seq_len;
             if (cached_kernel_ && params_.num_tokens > 0)
             {
-                cached_kernel_->setGPUStream(gpuStream());
+                bindStageStream(cached_kernel_);
                 if (params_.token_ids_device)
                 {
                     cached_kernel_->setDynamicDeviceTokenIds(
@@ -115,7 +115,7 @@ namespace llaminar2
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
             }
         }
 
@@ -132,7 +132,7 @@ namespace llaminar2
         {
             IComputeStage::resetSessionState();
             if (cached_kernel_)
-                cached_kernel_->setGPUStream(nullptr);
+                cached_kernel_->clearGPUStreamBinding();
         }
 
         /**

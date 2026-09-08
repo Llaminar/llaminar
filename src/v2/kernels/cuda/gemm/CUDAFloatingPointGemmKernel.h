@@ -151,7 +151,7 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
 
-            bool supports_fused_projection() const override { return precision_ == Precision::FP32; }
+            bool supports_fused_projection() const override { return true; }
 
             bool multiply_fused_tensor(
                 const TensorBase *input,
@@ -165,6 +165,37 @@ namespace llaminar2
                 const std::vector<TensorProjectionDesc> &projections,
                 int m, int k,
                 const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
+             * @brief Fixed-order floating SwiGLU/down for decode-sized rows.
+             *
+             * Floating shared-expert decode uses FP32 gate/up activations even
+             * when the down weights are FP16 or BF16.  This entry point handles
+             * runtime-M rows with a graph-capturable CUDA kernel whose reduction
+             * order is shared with the verifier grouped hook below.
+             */
+            bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            /**
+             * @brief Grouped verifier SwiGLU/down with serial-decode math order.
+             *
+             * The implementation is a real grouped CUDA path: rows are launched
+             * together for runtime M, but each output dot product walks K and
+             * reduces in the same order as the M=1 decode call.
+             */
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
             /**
@@ -199,7 +230,8 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
-            void setGPUStream(void *stream) override;
+            void bindGPUStream(ExplicitGPUStream stream) override;
+            void clearGPUStreamBinding() override;
 
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
             void bindWorkspace(DeviceWorkspaceManager *workspace) override;
@@ -212,6 +244,10 @@ namespace llaminar2
             // =========================================================================
 
             KernelSnapshotInfo getKernelSnapshotInfo() const override;
+
+            /** @brief Export the exact live row-major GPU floating weights. */
+            bool exportContiguousFloatingPointWeights(
+                ContiguousFloatingPointWeightDescriptor &out) const override;
 
             // =========================================================================
             // Accessors
@@ -240,6 +276,18 @@ namespace llaminar2
             void *gpu_stream_ = nullptr;
 
             DeviceWorkspaceManager *bound_workspace_ = nullptr;
+
+            bool run_fixed_order_swiglu_down(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m,
+                int n,
+                int k,
+                float alpha,
+                float beta,
+                DeviceWorkspaceManager *workspace,
+                bool verifier_grouped_call);
 
         };
 
