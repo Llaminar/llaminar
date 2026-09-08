@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -11,6 +14,105 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 PIPELINE = REPOSITORY_ROOT / "scripts" / "train_native_vnni_dispatch.sh"
 REFRESH = REPOSITORY_ROOT / "scripts" / "refresh_native_vnni_dispatch_tables.sh"
+
+
+def test_default_publication_uses_optional_corpus_submodule(tmp_path: Path) -> None:
+    """Planning targets the data repository without fetching or creating it."""
+
+    result = subprocess.run(
+        (str(PIPELINE), "--backend", "cpu", "--workspace-root",
+         str(tmp_path / "work"), "--skip-build", "--skip-scorer-tests",
+         "--no-lfs-pull", "--dry-run"),
+        cwd=REPOSITORY_ROOT, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(REPOSITORY_ROOT / "corpora" / "native_vnni_dispatch") in result.stdout
+    assert "submodule update" not in result.stdout
+
+
+@pytest.mark.parametrize("empty_submodule_directory", (False, True))
+def test_missing_corpus_checkout_fails_before_build_or_collection(
+    tmp_path: Path, empty_submodule_directory: bool,
+) -> None:
+    """An absent data checkout cannot become an in-source publication tree."""
+
+    source = tmp_path / "source"
+    scripts = source / "scripts"
+    scripts.mkdir(parents=True)
+    pipeline = scripts / PIPELINE.name
+    shutil.copy2(PIPELINE, pipeline)
+    subprocess.run(("git", "init", "-q", str(source)), check=True)
+    if empty_submodule_directory:
+        (source / "corpora").mkdir()
+
+    result = subprocess.run(
+        (str(pipeline), "--backend", "cpu"),
+        cwd=source, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 2
+    assert "published corpora require a separate Llaminar/corpora checkout" in result.stderr
+    assert result.stdout == ""
+    assert not (source / "benchmark_results").exists()
+    assert not (source / "corpora" / "native_vnni_dispatch").exists()
+
+
+def test_publication_cannot_target_source_repository() -> None:
+    """Even an explicit override cannot publish large datasets into source."""
+
+    result = subprocess.run(
+        (str(PIPELINE), "--backend", "cpu", "--corpus-root", str(REPOSITORY_ROOT)),
+        cwd=REPOSITORY_ROOT, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 2
+    assert "published corpora require a separate Llaminar/corpora checkout" in result.stderr
+    assert result.stdout == ""
+
+
+def test_fit_only_lfs_pull_is_scoped_to_data_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selected payload paths are relative to the data repo, including spaces."""
+
+    # A source-only Unit run must not require git-lfs or access its network.
+    # The dry-run may probe availability, but any actual LFS operation is a bug.
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    lfs = tools / "git-lfs"
+    lfs.write_text('#!/bin/sh\n[ "$1" = version ] || exit 91\nprintf "git-lfs/test-stub\\n"\n')
+    lfs.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+
+    data = tmp_path / "corpus checkout"
+    data.mkdir()
+    subprocess.run(("git", "init", "-q", str(data)), check=True)
+    family = data / "native_vnni_dispatch"
+    family.mkdir()
+    common = (
+        str(PIPELINE), "--backend", "cpu", "--corpus-root", str(family),
+        "--workspace-root", str(tmp_path / "work"), "--skip-build",
+        "--skip-scorer-tests", "--dry-run",
+    )
+    discovery = subprocess.run(
+        common, cwd=REPOSITORY_ROOT, text=True, capture_output=True, check=False,
+    )
+    assert discovery.returncode == 0, discovery.stderr
+    prefix = "Published NativeVNNI Git LFS corpus: "
+    corpus = Path(next(line.removeprefix(prefix)
+                       for line in discovery.stdout.splitlines()
+                       if line.startswith(prefix)))
+    corpus.mkdir(parents=True)
+    (corpus / "corpus.manifest.json").write_text("{}\n", encoding="utf-8")
+    replay = subprocess.run(
+        common, cwd=REPOSITORY_ROOT, text=True, capture_output=True, check=False,
+    )
+    assert replay.returncode == 0, replay.stderr
+    commands = [shlex.split(line.removeprefix("dry-run:"))
+                for line in replay.stdout.splitlines()
+                if line.startswith("dry-run:")]
+    assert ["git", "-C", str(data), "lfs", "pull", "--include",
+            f"{corpus.relative_to(data)}/**", "--exclude", ""] in commands
+    verification = next(command for command in commands if "verify" in command)
+    assert verification[verification.index("--repository-root") + 1] == str(REPOSITORY_ROOT)
 
 
 def test_dry_run_builds_both_scorers_and_seals_one_backend(tmp_path: Path) -> None:

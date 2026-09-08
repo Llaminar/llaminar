@@ -390,9 +390,13 @@ published, fits and certifies, and atomically installs the generated include.
 Additional refresh options belong after `--`.
 
 Published generations live under
-`benchmark_results/native_vnni_dispatch/corpora/<backend>/<architecture>/<shape-digest>-<configuration-digest>/`.
-`corpus.manifest.json` is ordinary Git metadata; large timing/profiler payloads
-are Git LFS objects. Never hand-edit a sealed generation. The corpus verifier
+`corpora/native_vnni_dispatch/<backend>/<architecture>/<shape-digest>-<configuration-digest>/`
+in the optional `Llaminar/corpora` submodule. All published corpus families
+belong in that data repository; the source repository pins only its gitlink.
+Initialize and selectively pull LFS through the canonical tuning skill's
+corpus workflow, never during ordinary builds or Unit/preflight gates.
+`corpus.manifest.json` is ordinary Git metadata there; large timing/profiler
+payloads are Git LFS objects. Never hand-edit a sealed generation. The corpus verifier
 must reject unresolved LFS pointers, partial files, symlinks, changed payload
 digests, and stale resolved shape inventories. Fit-only replay materializes a
 disposable workspace and uses `--skip-sweep --reuse-profiler-evidence`; it may

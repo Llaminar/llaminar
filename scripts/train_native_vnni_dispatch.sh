@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# @file train_native_vnni_dispatch.sh
+# @brief Collect, certify, publish, or refit one immutable NativeVNNI corpus.
+# Source owns trainers and inventory provenance; the separate corpus repository
+# owns published payloads and LFS transfers. Disposable collection/fit work stays
+# ignored so neither an interrupted run nor an absent submodule bloats source.
 set -euo pipefail
 
 usage() {
@@ -19,8 +24,8 @@ things:
 Options:
   --backend cpu|cpu-prefill|cuda|rocm|all
                               Policy backend/surface to train (required)
-  --corpus-root DIR           Published Git LFS corpus root (default:
-                              benchmark_results/native_vnni_dispatch/corpora)
+  --corpus-root DIR           Published root inside a Llaminar/corpora checkout
+                              (default: corpora/native_vnni_dispatch)
   --workspace-root DIR        Ignored resumable collection/refit root (default:
                               benchmark_results/native_vnni_dispatch/work)
   --install                   Atomically install certified M=1/grouped .inc
@@ -60,12 +65,12 @@ USAGE
 }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/.." && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd -P)"
 python_root="${repo_root}/tests/v2/performance/kernels"
 refresh_script="${script_dir}/refresh_native_vnni_dispatch_tables.sh"
 
 backend=""
-corpus_root="${repo_root}/benchmark_results/native_vnni_dispatch/corpora"
+corpus_root="${repo_root}/corpora/native_vnni_dispatch"
 workspace_root="${repo_root}/benchmark_results/native_vnni_dispatch/work"
 install=0
 skip_build=0
@@ -314,6 +319,23 @@ run() {
   "$@"
 }
 
+# Source checkouts intentionally leave the data submodule uninitialized. Refuse
+# publication into the source repository (including an empty submodule path)
+# before building or measuring anything. An explicit alternate corpus checkout
+# may have a not-yet-created family directory, so resolve its existing ancestor.
+# Dry-run describes commands only and does not require or initialize data.
+if (( ! dry_run )); then
+  corpus_probe="$(realpath -m -- "${corpus_root}")"
+  while [[ ! -d "${corpus_probe}" ]]; do
+    corpus_probe="$(dirname "${corpus_probe}")"
+  done
+  corpus_repository="$(git -C "${corpus_probe}" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -z "${corpus_repository}" || "${corpus_repository}" == "${repo_root}" ]]; then
+    echo "error: published corpora require a separate Llaminar/corpora checkout; initialize it with GIT_LFS_SKIP_SMUDGE=1 git submodule update --init -- corpora" >&2
+    exit 2
+  fi
+fi
+
 inventory_sources=()
 if [[ "${backend}" == "cpu-prefill" ]]; then
   inventory_sources=(
@@ -462,12 +484,16 @@ validate_scorers
 
 if [[ -f "${manifest}" ]]; then
   if (( lfs_pull )); then
-    if ! git -C "${repo_root}" lfs version >/dev/null 2>&1; then
+    # Git LFS paths are relative to the data repository, not to the source
+    # repository that owns the trainer and shape-inventory provenance.
+    corpus_repository="$(git -C "${corpus_dir}" rev-parse --show-toplevel)"
+    if ! git -C "${corpus_repository}" lfs version >/dev/null 2>&1; then
       echo "error: git-lfs is required to materialize ${manifest}; install it or use --no-lfs-pull only for an already-materialized checkout" >&2
       exit 2
     fi
-    corpus_relative="${corpus_dir#"${repo_root}/"}"
-    run git -C "${repo_root}" lfs pull --include "${corpus_relative}/**"
+    corpus_relative="$(realpath --relative-to="${corpus_repository}" "${corpus_dir}")"
+    run git -C "${corpus_repository}" lfs pull \
+      --include "${corpus_relative}/**" --exclude ""
   fi
   run env "PYTHONPATH=${python_root}" \
     python3 -m native_vnni_dispatch.corpus_bundle verify \

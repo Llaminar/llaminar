@@ -198,7 +198,8 @@ broken, or uneconomical implementation.
 39. **Keep changes scoped and the tree clean.** Preserve unrelated user edits,
     avoid incidental rewrites, remove generated debris, and never commit local
     result directories. Checkpoint meaningful green slices; publish large
-    certified corpora through Git LFS, not ordinary Git blobs.
+    certified corpora through Git LFS in `Llaminar/corpora`, the optional
+    top-level `corpora/` submodule, never as payloads in this source repository.
 
 **Architecture Note (V2)**: The active architecture is **Llaminar V2** in `src/v2/`, a kernel-centric design with **DeviceGraphOrchestrator** (single-device) and **RankOrchestrator** (multi-device TP/PP) as execution paths.
 
@@ -254,6 +255,21 @@ documentation.
 Files under `docs/v2/projects/` are dated plans, investigations, and handoffs.
 They provide historical context, not the current architecture, unless a live
 source explicitly points to one.
+
+### Corpus Repository Boundary
+
+All published corpus families belong in `https://github.com/Llaminar/corpora`,
+pinned by the source repository's `corpora/` gitlink. Keep collection work and
+local results ignored. Installed policy source and small device-free test
+fixtures remain here; corpus payloads do not.
+
+Ordinary source checkouts, builds, container builds, and Unit/preflight gates
+must not initialize this optional submodule or download its LFS objects. When
+corpus work is requested, initialize metadata with
+`GIT_LFS_SKIP_SMUDGE=1 git submodule update --init -- corpora`, then use
+`git -C corpora lfs pull --include '<family>/<selected-generation>/**' --exclude ''`.
+Publish the corpus commit and LFS objects in the data repository first, then
+commit the updated source gitlink. Never restore the old in-source corpus root.
 
 ## Architecture Orientation
 

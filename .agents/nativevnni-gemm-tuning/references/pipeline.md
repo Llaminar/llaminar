@@ -79,7 +79,10 @@ It collects into
 `benchmark_results/native_vnni_dispatch/work/collect-*`. CPU partials are
 published by atomic rename and resumed only when their collection contract
 matches. A successful complete refresh is sealed by `corpus_bundle.py`, then
-the whole directory is renamed into `corpora/`.
+the whole directory is renamed into `corpora/native_vnni_dispatch/` in the
+optional `Llaminar/corpora` submodule. The data repository owns LFS pulls and
+payload commits; the source repository still owns inventory-source provenance.
+Push the data commit and its LFS objects before advancing the source gitlink.
 
 The corpus manifest binds:
 

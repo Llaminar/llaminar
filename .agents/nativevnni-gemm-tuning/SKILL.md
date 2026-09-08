@@ -215,12 +215,23 @@ turnkey driver delegates internally.
 Published generations live at:
 
 ```text
-benchmark_results/native_vnni_dispatch/corpora/
+corpora/native_vnni_dispatch/
   <backend>/<architecture>/<shape-digest>-<configuration-digest>/
 ```
 
-`corpus.manifest.json` is reviewable ordinary Git. Large CSV, JSON, profiler,
-trace, and archive payloads are Git LFS objects according to `.gitattributes`.
+The top-level `corpora/` directory is the optional `Llaminar/corpora` submodule,
+the home for all published corpus families. Initialize only for corpus work:
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init -- corpora
+git -C corpora lfs pull --include 'native_vnni_dispatch/<backend>/**' --exclude ''
+```
+
+`corpus.manifest.json` is reviewable ordinary Git in the data repository. Large
+CSV, JSON, profiler, trace, and archive payloads use its `.gitattributes` LFS
+policy. Push the data commit and LFS payloads before updating the source
+repository's gitlink. Never add corpus payloads to the source repository or
+fetch them during ordinary builds or Unit/preflight gates.
 The corpus sealer/verifier is:
 
 ```bash

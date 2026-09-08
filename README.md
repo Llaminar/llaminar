@@ -37,6 +37,23 @@ https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/e126900d/ben
 
 ## Quickstart
 
+### Optional tuning and certification corpora
+
+All published corpora live in [Llaminar/corpora](https://github.com/Llaminar/corpora),
+pinned here as the optional `corpora/` submodule. Normal source checkouts,
+builds, and Unit/preflight tests do not fetch or require these large datasets.
+Only initialize them when working with corpus evidence:
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init -- corpora
+git -C corpora lfs pull --include 'native_vnni_dispatch/cpu/**' --exclude ''
+```
+
+Narrow the include pattern to the generation you need. Publish new corpus
+families and their LFS objects in that repository, then update this repository's
+submodule pointer. See `corpora/README.md` after initialization for publication
+details. Corpus data is excluded from Docker build contexts.
+
 ### Building Llaminar
 
 Llaminar uses a predefined devcontainer and the recommended development environment is vscode on a Linux machine with AVX512-VNNI or AVX2, and access to gfx906 / sm86 hardware.

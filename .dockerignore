@@ -34,6 +34,7 @@ vgcore.*
 # Test / benchmark outputs
 results.*
 benchmark_results/
+corpora/
 parity-results/
 *_snapshots/
 *_captures/

@@ -1,0 +1,4 @@
+[submodule "corpora"]
+	path = corpora
+	url = https://github.com/Llaminar/corpora.git
+	fetchRecurseSubmodules = false
