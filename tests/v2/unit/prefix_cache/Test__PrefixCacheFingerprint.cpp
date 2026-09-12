@@ -1,3 +1,10 @@
+/**
+ * @file Test__PrefixCacheFingerprint.cpp
+ * @brief Device-free prefix identity and placement-publication regressions.
+ *
+ * Exercise stable field hashing, policy-dependent epoch invalidation, and
+ * immutable provenance without executing models or accessing accelerators.
+ */
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -99,6 +106,18 @@ namespace
     }
 } // namespace
 
+/** @brief Persistent pre-fix cache arithmetic must not alias current execution. */
+TEST(Test__PrefixCacheFingerprint, LegacyChunkMeanArithmeticCannotRestore)
+{
+    const PrefixFingerprintParts parts{
+        .model = 11, .tokenizer = 22, .runtime = 33, .topology = 44,
+        .hybrid = 55, .moe = 66, .mtp = 77};
+    // Golden digest of these exact parts under the old prefix-cache-v1
+    // FNV wire identity. Those archives may contain chunk-mean AQ8 bases.
+    constexpr uint64_t legacy_key = 544840603072160241ull;
+    EXPECT_NE(combinePrefixFingerprintParts(parts), legacy_key);
+}
+
 TEST(Test__PrefixCacheFingerprint, DeterministicAndFieldOrderIndependent)
 {
     PrefixFingerprintMaterial material = makeMaterial();
@@ -189,6 +208,37 @@ TEST(Test__PrefixCacheFingerprint, MoEPlacementEpochChangesKeyMaterial)
                                         .key;
 
     EXPECT_NE(stable_key, rebalanced_key);
+}
+
+/** @brief Key invalidation and returned provenance share exactly one epoch. */
+TEST(Test__PrefixCacheFingerprint, EpochAndKeyComeFromOneObservation)
+{
+    const auto material = makeMaterial();
+    const auto admitted = buildPrefixCacheFingerprint(
+        material, true, PrefixCacheMoEPolicy::InvalidateOnRebalance, 7);
+    const auto published = buildPrefixCacheFingerprint(
+        material, true, PrefixCacheMoEPolicy::InvalidateOnRebalance, 8);
+    EXPECT_EQ(admitted.placement_epoch, 7u);
+    EXPECT_EQ(published.placement_epoch, 8u);
+    EXPECT_NE(admitted.key, published.key);
+
+    const auto compatible_before = buildPrefixCacheFingerprint(
+        material, true, PrefixCacheMoEPolicy::PlacementFingerprint, 7);
+    const auto compatible_after = buildPrefixCacheFingerprint(
+        material, true, PrefixCacheMoEPolicy::PlacementFingerprint, 8);
+    EXPECT_EQ(compatible_before.key, compatible_after.key);
+    EXPECT_EQ(compatible_before.placement_epoch, 7u);
+    EXPECT_EQ(compatible_after.placement_epoch, 8u);
+}
+
+/** @brief Callers cannot supply a second contradictory movement observation. */
+TEST(Test__PrefixCacheFingerprint, RejectsParallelMovementEpochMaterial)
+{
+    auto material = makeMaterial();
+    material.moe.push_back({"runtime_movement_epoch", "7"});
+    EXPECT_THROW(buildPrefixCacheFingerprint(
+        material, true, PrefixCacheMoEPolicy::InvalidateOnRebalance, 8),
+        std::invalid_argument);
 }
 
 TEST(Test__PrefixCacheFingerprint, MoERuntimePlacementChangesKeyButHistogramDoesNot)

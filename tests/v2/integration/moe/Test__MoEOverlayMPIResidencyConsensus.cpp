@@ -22,6 +22,7 @@
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "execution/moe/CpuExpertSlotPool.h"
 #include "utils/MPIContext.h"
+#include "../../utils/ObservedExpertDemandFixture.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -33,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -368,8 +370,8 @@ namespace llaminar2::test
             DecodeExpertHistogramConfig histogram_config;
             histogram_config.num_layers = 1;
             histogram_config.num_experts = 4;
-            histogram_config.top_k = 2;
-            histogram_config.window_size = 4;
+            histogram_config.top_k = 1;
+            histogram_config.window_size = 193;
             histogram_config.token_boundary_layer_idx = 0;
             histogram_config.sockets = {
                 DeviceId::cuda(0),
@@ -377,17 +379,18 @@ namespace llaminar2::test
             };
             histogram_config.ownership =
                 MoELayeredExpertOwnership::uniform(1, 2, {0, 0, 1, 1});
+            constexpr moe_overlay_economy::TransactionDemandCapacity capacity{193, 193, 1};
+            // Original proposal, replacement and received sample may coexist;
+            // the persistent proposal mailbox uses this same physical ledger.
+            admitObservedExpertDemand(histogram_config, capacity, 3,
+                worldContext()->rank(),
+                moeOverlayDistributedResidencyProposalWireBytes(1, 4, &capacity));
 
             RealTransactionFixture fixture;
             fixture.histogram =
                 std::make_unique<DecodeExpertHistogram>(histogram_config);
             const std::vector<std::uint64_t> counts{1, 2, 100, 90};
-            fixture.histogram->mergeLayerCounts(
-                0,
-                counts.data(),
-                static_cast<int>(counts.size()),
-                false);
-            fixture.histogram->recordTokenBoundary(0, 4);
+            recordObservedPrefillBatch(*fixture.histogram, 0, counts);
             fixture.authority =
                 std::make_unique<MoEOverlayResidencyAuthority>(
                     MoEOverlayResidencyAuthority::Config{
@@ -609,34 +612,30 @@ namespace llaminar2::test
                 }
             }
 
-            auto window = std::make_shared<DecodeExpertHistogramWindow>();
-            window->generation = 1;
-            window->num_layers = layer_count;
-            window->num_experts = expert_count;
-            window->expert_counts = {
-                100, 10, 800, 800, 800, 800,
-                1'000, 50, 50, 900, 0, 0,
-                101, 101, 101, 101, 101, 101,
-                100, 90, 80, 1, 1, 1,
-            };
-            window->source_expert_counts.assign(
-                window->expert_counts.size() *
-                    kExpertHistogramProductionSourceCount,
-                0u);
-            std::copy(
-                window->expert_counts.begin(),
-                window->expert_counts.end(),
-                window->source_expert_counts.begin());
-            for (const std::uint64_t count : window->expert_counts)
-                window->token_count += count;
-            window->source_token_counts[0] = window->token_count;
-            if (!window->valid())
-                throw std::logic_error(
-                    "MPI two-axis admission window is invalid");
-
+            const std::array<std::vector<std::uint64_t>, layer_count> layer_rows{{
+                {100, 10, 800, 800, 800, 800, 1'000, 50, 50, 900, 0, 0},
+                {101, 101, 101, 101, 101, 101, 100, 90, 80, 1, 1, 1},
+            }};
+            std::uint32_t largest_batch = 0;
+            for (const auto &rows : layer_rows)
+                largest_batch = std::max(largest_batch, static_cast<std::uint32_t>(
+                    std::accumulate(rows.begin(), rows.end(), std::uint64_t{0})));
+            histogram_config.top_k = 1;
+            histogram_config.window_size = static_cast<int>(largest_batch);
+            histogram_config.token_boundary_layer_idx = 0;
+            const moe_overlay_economy::TransactionDemandCapacity capacity{
+                largest_batch, largest_batch, 1};
+            admitObservedExpertDemand(histogram_config, capacity, 3,
+                worldContext()->rank(),
+                moeOverlayDistributedResidencyProposalWireBytes(layer_count, expert_count, &capacity));
             TwoAxisAdmissionFixture fixture;
-            fixture.histogram =
-                std::make_unique<DecodeExpertHistogram>(histogram_config);
+            fixture.histogram = std::make_unique<DecodeExpertHistogram>(histogram_config);
+            (void)fixture.histogram->freezeAndRotateWindow();
+            for (int layer = 0; layer < layer_count; ++layer)
+                recordObservedPrefillBatch(*fixture.histogram, layer,
+                    layer_rows[static_cast<std::size_t>(layer)]);
+            auto window = std::make_shared<const DecodeExpertHistogramWindow>(
+                fixture.histogram->freezeAndRotateWindow());
             fixture.authority =
                 std::make_unique<MoEOverlayResidencyAuthority>(
                     MoEOverlayResidencyAuthority::Config{
@@ -2044,6 +2043,9 @@ namespace llaminar2::test
             DeviceId::cpu(),
         };
         histogram_config.ownership = owner_map.layeredOwnership(1, 2);
+        constexpr moe_overlay_economy::TransactionDemandCapacity capacity{101, 101, 1};
+        admitObservedExpertDemand(histogram_config, capacity, 3, context->rank(),
+            moeOverlayDistributedResidencyProposalWireBytes(1, 2, &capacity));
         auto histogram = std::make_shared<DecodeExpertHistogram>(
             histogram_config);
 
@@ -2123,8 +2125,7 @@ namespace llaminar2::test
          * after the root has discarded its pre-certification generation so
          * root and follower exercise the same executable proposal. */
         const std::uint64_t counts[]{1, 100};
-        histogram->mergeLayerCounts(0, counts, 2, false);
-        histogram->recordTokenBoundary(0, 2);
+        recordObservedPrefillBatch(*histogram, 0, counts);
         const auto initial_snapshot = authority->snapshot();
         ASSERT_NE(initial_snapshot, nullptr);
 
@@ -2218,6 +2219,7 @@ namespace llaminar2::test
             .num_layers = 1,
             .num_experts = 2,
             .perf_device = "mpi-distributed-physical-cpu",
+            .transaction_demand = histogram->config().transaction_demand,
         });
         MoEOverlayResidencyTransaction transaction;
         if (proposal_publisher.isCoordinator())
@@ -2893,6 +2895,7 @@ namespace llaminar2::test
             .num_layers = 2,
             .num_experts = 12,
             .perf_device = "mpi-two-axis-admission",
+            .transaction_demand = fixture.histogram->config().transaction_demand,
         });
 
         MoEOverlayResidencyTransaction transaction;
@@ -3106,12 +3109,7 @@ namespace llaminar2::test
                 if (context->rank() == coordinator_world_rank)
                 {
                     const std::vector<std::uint64_t> counts{1, 2, 100, 90};
-                    fixture.histogram->mergeLayerCounts(
-                        0,
-                        counts.data(),
-                        static_cast<int>(counts.size()),
-                        false);
-                    fixture.histogram->recordTokenBoundary(0, 4);
+                    recordObservedPrefillBatch(*fixture.histogram, 0, counts);
                 }
                 else
                 {
@@ -3147,6 +3145,7 @@ namespace llaminar2::test
                             .num_experts = 4,
                             .perf_device =
                                 "repeated_mpi_maintenance_test",
+                            .transaction_demand = fixture.histogram->config().transaction_demand,
                         });
                 auto authority =
                     std::shared_ptr<MoEOverlayResidencyAuthority>(
@@ -3500,12 +3499,7 @@ namespace llaminar2::test
              * which the coordinator can cross drain barrier two while the
              * follower still owns its posted acknowledgement. */
             const std::vector<std::uint64_t> counts{100, 90, 2, 1};
-            fixture.histogram->mergeLayerCounts(
-                0,
-                counts.data(),
-                static_cast<int>(counts.size()),
-                false);
-            fixture.histogram->recordTokenBoundary(0, 4);
+            recordObservedPrefillBatch(*fixture.histogram, 0, counts);
         }
         else
         {
@@ -3535,6 +3529,7 @@ namespace llaminar2::test
                     .num_layers = 1,
                     .num_experts = 4,
                     .perf_device = "real_mpi_maintenance_test",
+                    .transaction_demand = fixture.histogram->config().transaction_demand,
                 });
         auto poll_gate =
             std::make_shared<PollGatedProposalPublisher>(

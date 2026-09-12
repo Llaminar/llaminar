@@ -345,7 +345,7 @@ TEST(Test__GPUDeviceContextPool,
             {32, 64, 128},
             retained_mtp);
     const MTPGraphOwnerPlan owner_plan(retained_mtp);
-    ASSERT_EQ(inventory.fixed_executable_count, 5u);
+    ASSERT_EQ(inventory.fixed_executable_count, 6u);
     ASSERT_EQ(
         inventory.mtp_graph_owners.auxiliaryExecutableSlotCount(),
         107u);
@@ -390,7 +390,7 @@ TEST(Test__GPUDeviceContextPool,
             cfg.device,
             CapturedGraphExecutableInventory{
                 .model_graph_identity_count =
-                    /*two prefill + decode + prefix bridge + three MTP forwards=*/7u,
+                    /*two prefill + decode + prefix bridge + four MTP forwards=*/8u,
                 .model_graph_topology_variant_count = 1u,
                 // Match the physical classes declared by runtime graph owners;
                 // the total slot count alone overprices bounded CUDA helpers.
@@ -403,7 +403,7 @@ TEST(Test__GPUDeviceContextPool,
         plan.devices.front().captured_graph_bytes(),
         estimateCapturedGraphExecutableBytes(
             cfg.device,
-            /*two prefill + decode + prefix bridge + three MTP forwards=*/7u));
+            /*two prefill + decode + prefix bridge + four MTP forwards=*/8u));
 }
 
 TEST(Test__GPUDeviceContextPool, SingletonInstance)

@@ -8,6 +8,11 @@
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/MoEOverlayCanonicalHostReturn.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
+#include "tensors/Tensors.h"
+#include "../../mocks/MockComputeStage.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "execution/moe/MoESparseRequestIdentity.h"
@@ -289,6 +294,80 @@ namespace llaminar2::test
 
         auto stale_return = collective_->returnReduce(return_key, outbound_return, &inbound_return, nullptr);
         EXPECT_FALSE(stale_return.ok);
+    }
+
+    /** @brief Every two-rank expert placement preserves the serial FP32 fold. */
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, CanonicalReturnIsPlacementInvariantAcrossRanks)
+    {
+        constexpr int columns = 4;
+        const std::array<float, 4> values{0x1p24f, 1.0f, -0x1p24f, 1.0f};
+        FP32Tensor bank(std::vector<size_t>{4 * (columns + 1) + 1});
+        FP32Tensor weights(std::vector<size_t>{1, 4});
+        FP32Tensor output(std::vector<size_t>{1, columns});
+        std::fill_n(weights.mutable_data(), 4, 1.0f);
+        MoECanonicalRouteReduceStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.canonical_route_contributions = &bank;
+        params.routing_weights = &weights;
+        params.output = &output;
+        params.seq_len = 1;
+        params.top_k = 4;
+        params.d_model = columns;
+        params.canonical_route_arithmetic = MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA;
+        params.canonical_route_layout = MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows;
+        params.reduction_role = MoECanonicalRouteReductionRole::RootOwner;
+        MoECanonicalRouteReduceStage reducer(params);
+        llaminar2::testing::MockDeviceContext context(DeviceId::cpu(), ComputeBackendType::CPU);
+
+        for (int placement = 0; placement < 16; ++placement)
+        {
+            const auto key = makeMoEOverlayCollectiveKey(
+                71, static_cast<uint64_t>(placement + 1), 0, 0, 0, 0,
+                MoEOverlayCollectiveDirection::ReturnReduce);
+            auto outbound = workspace_.localExpertOutput(0, 0);
+            outbound.key = key;
+            outbound.residency_epoch = static_cast<uint64_t>(placement + 1);
+            outbound.source_participant = rank_;
+            outbound.target_participant = 0;
+            outbound.layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
+            for (int slot = 0; slot < 4; ++slot)
+            {
+                if (((placement >> slot) & 1) != rank_) continue;
+                const size_t row = outbound.live_row_count++;
+                outbound.row_ids_host[row] = slot;
+                std::fill_n(outbound.output_rows_fp32 + row * columns, columns, values[slot]);
+            }
+            auto inbound = workspace_.returnReceive(0, 0);
+            MoESparseReturnReduceStage::Params returned;
+            returned.device_id = DeviceId::cpu();
+            returned.collective_context = collective_.get();
+            returned.key = key;
+            returned.source_participant = rank_;
+            returned.target_participant = 0;
+            returned.outbound_rows = &outbound;
+            returned.inbound_rows = &inbound;
+            returned.dense_output = rank_ == 0 ? &bank : nullptr;
+            returned.return_layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
+            returned.inbound_consumer_role = rank_ == 0
+                ? MoESparseReturnReduceStage::InboundConsumerRole::ContinuationAccumulator
+                : MoESparseReturnReduceStage::InboundConsumerRole::ProtocolParticipant;
+            returned.seq_len = 1;
+            returned.d_model = columns;
+            returned.clear_output_before_scatter = rank_ == 0;
+            returned.require_explicit_transaction_identity = true;
+            MoESparseReturnReduceStage return_stage(returned);
+            return_stage.updateMoEOverlayCollectiveRuntimeParams({
+                .generation_id = 71,
+                .step_id = static_cast<uint64_t>(placement + 1),
+            });
+            ASSERT_TRUE(return_stage.execute(&context));
+            if (rank_ != 0) continue;
+            ASSERT_EQ(inbound.layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
+            ASSERT_EQ(inbound.live_row_count, 4u);
+            ASSERT_TRUE(reducer.execute(&context));
+            for (int column = 0; column < columns; ++column)
+                EXPECT_EQ(output.data()[column], 1.0f) << "placement=" << placement;
+        }
     }
 
     TEST_F(Test__MoEOverlaySparseTransport_MPI, MTPNamespacedDispatchAndReturnPreserveKeyAcrossRanks)

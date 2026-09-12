@@ -6,10 +6,13 @@
  * validate one reusable final owner, capture every device ticket, release all
  * model/workspace owners, then complete every runtime-generation retirement.
  * No driver free-memory heuristic or safety reserve participates in the proof.
+ * Ordinary disposal must not perform physical restoration for an absent reuse
+ * owner; the terminal overlay policy below makes that distinction explicit.
  */
 
 #include "ModelContextRetirement.h"
 
+#include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "transfer/TransferEngine.h"
 
 #if defined(__GLIBC__)
@@ -23,6 +26,36 @@
 
 namespace llaminar2
 {
+    MoEOverlayDeviceControllerDrainIntent modelContextOverlayDrainIntent(
+        const std::shared_ptr<ModelContextReuseAuthority> &authority,
+        MoERebalanceRuntimeMode movement)
+    {
+        switch (movement)
+        {
+        case MoERebalanceRuntimeMode::Off:
+        case MoERebalanceRuntimeMode::Observe:
+        case MoERebalanceRuntimeMode::Dynamic:
+            break;
+        default:
+            throw std::logic_error("Model disposal has an invalid movement policy");
+        }
+
+        // No consumer can reuse these prepared weights. Finish admitted work,
+        // then release it; restoring a soon-to-be-freed owner table wastes IO.
+        if (!authority)
+            return MoEOverlayDeviceControllerDrainIntent::ReleaseResources;
+
+        const auto state = authority->state();
+        if (state != ModelContextReuseAuthority::State::RunnerExclusive &&
+            state != ModelContextReuseAuthority::State::Sealing)
+        {
+            throw std::logic_error(
+                "Overlay disposal does not own its retained model context");
+        }
+        return movement == MoERebalanceRuntimeMode::Dynamic
+            ? MoEOverlayDeviceControllerDrainIntent::RestorePreparedContext
+            : MoEOverlayDeviceControllerDrainIntent::ReleaseResources;
+    }
 
     PendingExclusiveModelRetirement
     PendingExclusiveModelRetirement::begin(

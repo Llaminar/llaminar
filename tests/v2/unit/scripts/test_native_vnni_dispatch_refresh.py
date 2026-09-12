@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Regression tests for the NativeVNNI dispatch refresh wrapper."""
+"""Device-free regressions for the NativeVNNI dispatch refresh wrapper.
+
+Subprocess fixtures own their binaries, output and Git provenance. These tests
+also run from installed source archives: an enclosing developer checkout must
+not silently supply metadata that a real container does not have.
+"""
 
 from __future__ import annotations
 
@@ -2683,6 +2688,19 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         """Completed shard names cannot be reused with different M or formats."""
 
         with tempfile.TemporaryDirectory() as tmp:
+            # This exercises a real (non-dry-run) provenance check before the
+            # rejected resume. Give it a tiny private Git repository instead of
+            # depending on the surrounding checkout or weakening the trainer.
+            repository = Path(tmp) / "git"
+            subprocess.run(["git", "init", "--quiet", "--bare", "--initial-branch=test",
+                            str(repository)], check=True)
+            git_env = {**os.environ, "GIT_DIR": str(repository)}
+            tree = subprocess.check_output(["git", "hash-object", "-w", "-t", "tree", "--stdin"],
+                                           input="", text=True, env=git_env).strip()
+            commit = subprocess.check_output(["git", "-c", "user.name=Unit fixture",
+                "-c", "user.email=unit@example.invalid", "commit-tree", tree, "-m", "Fixture"],
+                text=True, env=git_env).strip()
+            subprocess.run(["git", "update-ref", "HEAD", commit], check=True, env=git_env)
             output = Path(tmp) / "out"
             output.mkdir()
             (output / "cpu_collection_contract.sha256").write_text(
@@ -2714,13 +2732,14 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
                     "--skip-profiler-evidence",
                 ],
                 cwd=REPO_ROOT,
+                env=git_env,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
             )
 
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("collection contract changed", result.stderr)
 
     def test_cpu_prefill_fails_before_collection_when_isa_binary_is_stale(self) -> None:

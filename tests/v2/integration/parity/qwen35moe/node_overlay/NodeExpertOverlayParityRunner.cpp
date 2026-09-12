@@ -553,6 +553,17 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             }
         }
 
+        // Scope exact snapshot publication to the authenticated request.
+        // Training and later prefix seeds intentionally retain lifetime stats.
+        std::optional<ParityPrefillSnapshotEvidence> prefill_snapshot_before;
+        if (isSegmentedPrefillProductionTest())
+        {
+            const uint64_t chunks =
+                (config_.token_ids.size() + activeSegmentedPrefillCaptureRows() - 1u) /
+                activeSegmentedPrefillCaptureRows();
+            prefill_snapshot_before = ParityPrefillSnapshotEvidence::capture(
+                PerfStatsCollector::snapshot({"forward_graph"}), chunks);
+        }
         ParityTestSummary prefill;
         try
         {
@@ -584,7 +595,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 prefill.overall_passed,
                 prefill.lm_head_cosine);
             if (isSegmentedPrefillProductionTest())
-                assertSegmentedPrefillCheckpointCoverage();
+                assertSegmentedPrefillCheckpointCoverage(*prefill_snapshot_before);
             assertProductionParitySnapshotInfrastructure();
             cacheDeviceRouteAssignmentEvidence();
             writeExpertOwnerTopologyBaselineCsv();

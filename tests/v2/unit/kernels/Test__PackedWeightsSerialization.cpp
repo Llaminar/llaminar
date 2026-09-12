@@ -128,6 +128,46 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_BasicQ4_0)
     EXPECT_EQ(dynamic_cast<const CPUPackedWeightsWithNativeBlocks*>(result.get()), nullptr);
 }
 
+TEST(Test__PackedWeightsSerialization, CompactMultiScalePreservesEveryNativeMetadataBit)
+{
+    for (const auto &entry : native_vnni_formats::kAllSourceFormats)
+    {
+        const auto &format = *entry.metadata;
+        if (!hasCompactMultiScaleVnniPayload(format.codebook_id))
+            continue;
+        SCOPED_TRACE(std::string(entry.quant_type));
+        auto packed = buildTestPacked(
+            67, 544, format.codebook_id, 17, format.payload_bytes,
+            false, true, true, 1024, 1536, 2 * 17 * 1536, 0, 0);
+        packed.encoding = CPUNativeVNNIEncoding::CompactMultiScale;
+        CPUPackedWeights owner(std::move(packed));
+        const auto blob = serialize(owner);
+        ASSERT_FALSE(blob.empty());
+        auto result = deserialize(blob.data(), blob.size());
+        ASSERT_NE(result, nullptr);
+        const auto *native = dynamic_cast<const CPUPackedWeights *>(result.get());
+        ASSERT_NE(native, nullptr);
+        const auto &received = native->packed();
+        ASSERT_TRUE(received.usesCompactMultiScale());
+        EXPECT_FALSE(received.usesInlineCompensation());
+        EXPECT_EQ(received.payload_bytes, format.payload_bytes);
+        ASSERT_EQ(received.native_interleaved.size(), owner.packed().native_interleaved.size());
+        EXPECT_EQ(std::memcmp(received.native_interleaved.data(),
+                              owner.packed().native_interleaved.data(),
+                              received.native_interleaved.size()), 0);
+        EXPECT_TRUE(received.int8_flat.empty());
+
+        // Older producers encoded these same source identities using a lossy
+        // single-scale representation. The archive version is an arithmetic
+        // contract too, not merely a check that the struct fields fit.
+        auto legacy_blob = blob;
+        const uint32_t legacy_version = 2;
+        std::memcpy(legacy_blob.data() + offsetof(PackedWeightsHeader, version),
+                    &legacy_version, sizeof(legacy_version));
+        EXPECT_EQ(deserialize(legacy_blob.data(), legacy_blob.size()), nullptr);
+    }
+}
+
 TEST(Test__PackedWeightsSerialization, SerializeDeserialize_AsymmetricQ4_1)
 {
     auto packed = buildTestPacked(

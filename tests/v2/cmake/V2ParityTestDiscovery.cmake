@@ -7,6 +7,10 @@
 # Production binaries identify their model/scope and matrix role, never one
 # placement, precision, or MTP cell. Discovery enforces that role before it
 # publishes campaign registrations; focused-only binaries remain independent.
+# Console parameter comments are opaque and may contain truncated JSON. Remove
+# them before converting lines to a CMake list: unmatched brackets in comments
+# otherwise absorb later test names. Structured parameters belong exclusively
+# to Google's complete JSON export, not this registration-name parser.
 #
 # Inputs (via -D):
 #   TEST_EXECUTABLE  - Full path to the GTest binary
@@ -35,18 +39,17 @@ set(_production_campaign_completion_timeout_seconds 21600)
 execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
         "HWLOC_COMPONENTS=-gl,-opencl"
+        "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
         "OMPI_MCA_btl_vader_single_copy_mechanism=none"
         "${TEST_EXECUTABLE}" --gtest_list_tests
     OUTPUT_VARIABLE _test_list_output
-    ERROR_QUIET
+    ERROR_VARIABLE _discovery_error
     RESULT_VARIABLE _result
     TIMEOUT 30
 )
 
 if(NOT _result EQUAL 0)
-    message(STATUS "V2ParityTestDiscovery: Failed to list tests from ${TEST_EXECUTABLE} (exit ${_result})")
-    file(WRITE "${CTEST_FILE}" "# Discovery failed for ${TEST_EXECUTABLE}\n")
-    return()
+    message(FATAL_ERROR "V2ParityTestDiscovery: Failed to list tests from ${TEST_EXECUTABLE} (exit ${_result}): ${_discovery_error}")
 endif()
 
 # --- Parse gtest_list_tests output -------------------------------------------
@@ -62,7 +65,8 @@ endif()
 set(_current_suite "")
 set(_all_tests "")
 
-string(REPLACE "\n" ";" _lines "${_test_list_output}")
+string(REGEX REPLACE "  #[^\n]*" "" _test_names_output "${_test_list_output}")
+string(REPLACE "\n" ";" _lines "${_test_names_output}")
 foreach(_line IN LISTS _lines)
     # Skip empty lines
     if("${_line}" STREQUAL "")
@@ -75,11 +79,8 @@ foreach(_line IN LISTS _lines)
         # Suite line: strip trailing whitespace, keep the trailing dot
         string(STRIP "${_line}" _current_suite)
     else()
-        # Test case line: strip leading whitespace and trailing comments
+        # Parameter comments were removed before list conversion above.
         string(STRIP "${_line}" _case_name)
-        # Remove gtest parameter comment:  "  # GetParam() = ..."
-        string(REGEX REPLACE "  # .*$" "" _case_name "${_case_name}")
-        string(STRIP "${_case_name}" _case_name)
 
         if(NOT "${_case_name}" STREQUAL "" AND NOT "${_current_suite}" STREQUAL "")
             # Full GTest name: SuiteName.TestCase  (suite already has trailing dot)
@@ -91,9 +92,7 @@ endforeach()
 
 list(LENGTH _all_tests _test_count)
 if(_test_count EQUAL 0)
-    message(STATUS "V2ParityTestDiscovery: No tests discovered from ${TEST_EXECUTABLE}")
-    file(WRITE "${CTEST_FILE}" "# No tests discovered from ${TEST_EXECUTABLE}\n")
-    return()
+    message(FATAL_ERROR "V2ParityTestDiscovery: No tests discovered from ${TEST_EXECUTABLE}")
 endif()
 
 # --- Establish the default MPI world ----------------------------------------

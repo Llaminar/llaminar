@@ -1,16 +1,23 @@
 /**
  * @file MoEOverlaySparseCollective.cpp
  * @brief Compact sparse payload transport for graph-native MoE overlay collectives.
+ *
+ * Every transport preserves the packet's epoch and typed row arithmetic.
+ * Canonical expert records retain original router slots; transporting them
+ * must never collapse them into participant-local token sums. Fixed-capacity
+ * views carry only their live prefix, independently of allocation capacity.
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
+#include "execution/moe/DeviceMoEOverlayEpochABI.h"
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "interfaces/IMPIContext.h"
 #include "transfer/TransferEngine.h"
+#include "tensors/Tensors.h"
 
 #include <algorithm>
 #include <atomic>
@@ -138,7 +145,8 @@ namespace llaminar2
         int d_model,
         DeviceId source_device,
         uint64_t workspace_generation,
-        std::shared_ptr<MappedHostTransferArena> mapped_arena)
+        std::shared_ptr<MappedHostTransferArena> mapped_arena,
+        const DeviceMoEOverlayEpochTicket *captured_request_epoch)
     {
         if (layer_idx < 0 || bucket_rows <= 0 || top_k <= 0 ||
             d_model <= 0 || !source_device.is_valid() ||
@@ -153,6 +161,8 @@ namespace llaminar2
             throw std::logic_error(
                 "MoE overlay dispatch ticket capacity is immutable after binding");
         }
+        if (captured_request_epoch && !source_device.is_gpu())
+            throw std::invalid_argument("Captured dispatch epoch requires a GPU source");
 
         const size_t row_count = static_cast<size_t>(bucket_rows);
         const size_t route_count = checkedTicketProduct(
@@ -264,6 +274,7 @@ namespace llaminar2
         top_k_ = top_k;
         d_model_ = d_model;
         workspace_generation_ = workspace_generation;
+        captured_request_epoch_ = captured_request_epoch;
     }
 
     bool MoEOverlayDispatchTicketStorage::hasValidBoundIdentity() const noexcept
@@ -360,6 +371,17 @@ namespace llaminar2
                     payload.logical_row_count,
                     &ticket_.header->logical_row_count,
                     sizeof(ticket_.header->logical_row_count));
+            }
+            if (captured_request_epoch_)
+            {
+                // The request acquire precedes this publisher in the graph.
+                // Copy its pinned epoch, not the concurrently advancing active
+                // selector. The existing release edge publishes this word
+                // together with the routes; no host/device synchronization or
+                // additional host observation is introduced.
+                enqueue(&captured_request_epoch_->epoch,
+                        &ticket_.header->residency_epoch,
+                        sizeof(ticket_.header->residency_epoch));
             }
             enqueue(
                 payload.routing_indices,
@@ -958,8 +980,8 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kPacketMagic = 0x32454f4dU; // "MOE2"
-        /* Version 5 adds authenticated original/compact route-slot identities. */
-        constexpr uint32_t kPacketVersion = 5;
+        /* Version 6 authenticates return arithmetic as well as route identities. */
+        constexpr uint32_t kPacketVersion = 6;
         constexpr uint8_t kPacketKindDispatch = 1;
         constexpr uint8_t kPacketKindReturn = 2;
 
@@ -1060,7 +1082,7 @@ namespace llaminar2
         bool validateReturnRows(const MoEOverlayReturnRows &rows,
                                 std::string *error)
         {
-            if (rows.d_model <= 0)
+            if (rows.d_model <= 0 || !isValidMoEOverlayReturnLayout(rows.layout))
             {
                 if (error)
                     *error = "invalid return payload dimensions";
@@ -1151,6 +1173,7 @@ namespace llaminar2
             int32_t source_participant = -1;
             int32_t target_participant = -1;
             int32_t d_model = 0;
+            MoEOverlayReturnLayout layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
             std::vector<int32_t> row_ids;
             std::vector<float> output_rows;
         };
@@ -1207,6 +1230,7 @@ namespace llaminar2
             copy.source_participant = rows.source_participant;
             copy.target_participant = rows.target_participant;
             copy.d_model = rows.d_model;
+            copy.layout = rows.layout;
             copy.row_ids.assign(rows.row_ids_host, rows.row_ids_host + rows.live_row_count);
             copy.output_rows.assign(rows.output_rows_fp32,
                                     rows.output_rows_fp32 + rows.live_row_count * static_cast<size_t>(rows.d_model));
@@ -1302,7 +1326,9 @@ namespace llaminar2
             if (!ensureReturnInboundCapacity(inbound, total_rows, error))
                 return false;
 
-            if (inbound->d_model != payload.d_model)
+            if (inbound->d_model != payload.d_model ||
+                !isValidMoEOverlayReturnLayout(payload.layout) ||
+                (inbound->live_row_count != 0 && inbound->layout != payload.layout))
             {
                 if (error)
                     *error = "inbound return payload dimension mismatch";
@@ -1321,6 +1347,7 @@ namespace llaminar2
                 inbound->residency_epoch = payload.residency_epoch;
             }
 
+            inbound->layout = payload.layout;
             const size_t d_model = static_cast<size_t>(inbound->d_model);
             std::copy(payload.row_ids.begin(),
                       payload.row_ids.end(),
@@ -1549,6 +1576,7 @@ namespace llaminar2
             appendPod(bytes, payload.source_participant);
             appendPod(bytes, payload.target_participant);
             appendPod(bytes, payload.d_model);
+            appendPod(bytes, payload.layout);
 
             const uint32_t row_count = static_cast<uint32_t>(payload.row_ids.size());
             appendPod(bytes, row_count);
@@ -1614,6 +1642,7 @@ namespace llaminar2
                 !readPod(data, size, &offset, &out->source_participant) ||
                 !readPod(data, size, &offset, &out->target_participant) ||
                 !readPod(data, size, &offset, &out->d_model) ||
+                !readPod(data, size, &offset, &out->layout) ||
                 !readPod(data, size, &offset, &row_count))
             {
                 if (error)
@@ -1625,7 +1654,8 @@ namespace llaminar2
             out->key.histogram_source =
                 static_cast<ExpertHistogramSource>(histogram_source);
             out->key.direction = static_cast<MoEOverlayCollectiveDirection>(direction);
-            if (out->key.direction != MoEOverlayCollectiveDirection::ReturnReduce)
+            if (out->key.direction != MoEOverlayCollectiveDirection::ReturnReduce ||
+                out->d_model <= 0 || !isValidMoEOverlayReturnLayout(out->layout))
             {
                 if (error)
                     *error = "return packet has wrong collective direction";
@@ -1964,10 +1994,11 @@ namespace llaminar2
           top_k_(config.top_k),
           device_(config.device),
           reuse_policy_(config.reuse_policy),
-          fixed_capacity_(true)
+          fixed_capacity_(true),
+          return_layout_(config.return_layout)
     {
         if (max_rows_ == 0 || max_entries_ == 0 || d_model_ <= 0 ||
-            top_k_ <= 0 || !device_.is_valid())
+            top_k_ <= 0 || !device_.is_valid() || !isValidMoEOverlayReturnLayout(return_layout_))
         {
             throw std::invalid_argument(
                 "Fixed ExpertOverlay collective workspace requires positive "
@@ -2070,11 +2101,19 @@ namespace llaminar2
         if (max_rows_ == 0 || d_model_ <= 0)
             return;
 
-        if (storage.row_ids_host.size() < max_rows_)
-            storage.row_ids_host.resize(max_rows_);
-        const size_t output_count = max_rows_ * static_cast<size_t>(d_model_);
-        if (storage.output_rows_fp32.size() < output_count)
-            storage.output_rows_fp32.resize(output_count);
+        const size_t return_rows = return_layout_ == MoEOverlayReturnLayout::CanonicalExpertRoutes
+                                       ? max_entries_ : max_rows_;
+        if (return_rows > std::numeric_limits<size_t>::max() / static_cast<size_t>(d_model_) / sizeof(float))
+            throw std::overflow_error("MoE host return payload geometry exceeds addressable bytes");
+        if (storage.row_ids_host.size() < return_rows)
+            storage.row_ids_host.resize(return_rows);
+        const size_t output_count = return_rows * static_cast<size_t>(d_model_);
+        if (!storage.output_rows_fp32 || storage.output_rows_fp32->numel() < output_count)
+        {
+            storage.output_rows_fp32 = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{return_rows, static_cast<size_t>(d_model_)});
+            storage.output_rows_fp32->setDebugName("moe_overlay_host_return_payload");
+        }
     }
 
     MoEOverlaySparseRows MoEOverlayCollectiveWorkspace::dispatchReceive(int layer_idx, int tier_idx)
@@ -2136,9 +2175,10 @@ namespace llaminar2
         auto &storage = buffersFor(layer_idx, tier_idx).local_expert_output;
         MoEOverlayReturnRows view;
         view.d_model = d_model_;
+        view.layout = return_layout_;
         view.row_capacity = storage.row_ids_host.size();
         view.row_ids_host = storage.row_ids_host.data();
-        view.output_rows_fp32 = storage.output_rows_fp32.data();
+        view.output_rows_fp32 = storage.output_rows_fp32 ? storage.output_rows_fp32->mutable_data() : nullptr;
         view.live_row_count = 0;
         return view;
     }
@@ -2148,9 +2188,10 @@ namespace llaminar2
         auto &storage = buffersFor(layer_idx, tier_idx).return_receive;
         MoEOverlayReturnRows view;
         view.d_model = d_model_;
+        view.layout = return_layout_;
         view.row_capacity = storage.row_ids_host.size();
         view.row_ids_host = storage.row_ids_host.data();
-        view.output_rows_fp32 = storage.output_rows_fp32.data();
+        view.output_rows_fp32 = storage.output_rows_fp32 ? storage.output_rows_fp32->mutable_data() : nullptr;
         view.live_row_count = 0;
         return view;
     }
@@ -2352,6 +2393,7 @@ namespace llaminar2
         inbound->target_participant = outbound.target_participant;
         inbound->d_model = outbound.d_model;
         inbound->live_row_count = outbound.live_row_count;
+        inbound->layout = outbound.layout;
         if (inbound->row_ids_host != outbound.row_ids_host)
         {
             std::memmove(

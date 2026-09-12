@@ -8,6 +8,12 @@
  * - executeWithGraphCapture (single-graph capture/replay)
  * - executeDecodeWithCapturePolicy (policy-based mode selection)
  * - executeWithCachedGraphReplay (cached graph replay)
+ *
+ * Retained-parent evidence comes from its sealed physical unit inventory.
+ * Successful submission records follow both native launch and CPU ticket-service
+ * retirement; they do not imply a host wait for GPU completion. This lets an
+ * HTTP observer prove a rank-local heterogeneous boundary without pretending
+ * that the graph contains a cross-rank coordinator or TP collective.
  */
 
 #include "DeviceGraphExecutor.h"
@@ -2552,7 +2558,13 @@ namespace llaminar2
                 "decode",
                 ctx->deviceId().toString(),
                 {{"context", segment_cache.perf_context},
-                 {"child_units", std::to_string(plan.child_unit_count)}});
+                 {"child_units", std::to_string(plan.child_unit_count)},
+                 {"boundary_authority",
+                  plan.concurrent_ticket_service_segment_indices.empty()
+                      ? "captured_device_units"
+                      : "concurrent_ticket_service"},
+                 {"ticket_service_units", std::to_string(
+                      plan.concurrent_ticket_service_segment_indices.size())}});
             return true;
         };
 
@@ -2740,6 +2752,9 @@ namespace llaminar2
 
                 if (PerfStatsCollector::isDomainEnabled("forward_graph"))
                 {
+                    // Mirror the sealed inventory only after the launch and
+                    // concurrent service have succeeded. These are physical
+                    // programs, not a guessed count of logical MoE layers.
                     PerfStatsCollector::addCounter(
                         "forward_graph",
                         initial_launch_pending
@@ -2751,6 +2766,12 @@ namespace llaminar2
                         {{"context", segment_cache.perf_context},
                          {"child_units", std::to_string(
                              retained_parent_plan.child_unit_count)},
+                         {"boundary_authority",
+                          retained_parent_plan.concurrent_ticket_service_segment_indices.empty()
+                              ? "captured_device_units"
+                              : "concurrent_ticket_service"},
+                         {"ticket_service_units", std::to_string(
+                              retained_parent_plan.concurrent_ticket_service_segment_indices.size())},
                          {"materialized_during_setup",
                           initial_launch_pending ? "true" : "false"}});
                 }

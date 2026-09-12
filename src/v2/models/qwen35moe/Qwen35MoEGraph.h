@@ -13,6 +13,7 @@
 #include "../../execution/moe/DeviceMoERebalanceController.h"
 #include "../../execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "../../execution/moe/MoERuntimeTable.h"
+#include "../../execution/moe/MoEOverlayReturnLayout.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -458,7 +459,8 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayCollectiveWorkspace>
         overlayProtocolWorkspaceForParticipant(
             DeviceId graph_device,
-            int participant);
+            int participant,
+            MoEOverlayReturnLayout return_layout);
         /**
          * @brief Return the shared direct MPI transport for one remote rank group.
          *

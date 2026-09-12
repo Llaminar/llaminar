@@ -43,6 +43,7 @@ namespace llaminar2::test::parity::qwen35
             .transformer_layers = 24,
             .attention_heads = 8,
             .kv_heads = 2,
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
     }
 
@@ -60,6 +61,7 @@ namespace llaminar2::test::parity::qwen35
             .transformer_layers = 32,
             .attention_heads = 16,
             .kv_heads = 4,
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
     }
 
@@ -87,6 +89,7 @@ namespace llaminar2::test::parity::qwen35
             .transformer_layers = 64,
             .attention_heads = 24,
             .kv_heads = 4,
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
     }
 

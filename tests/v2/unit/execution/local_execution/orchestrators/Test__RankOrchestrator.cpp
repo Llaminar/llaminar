@@ -8,8 +8,8 @@
  * coordination logic. The mocks enable testing LOCAL tensor parallelism
  * coordination without real devices.
  *
- * Note: Tests for the actual RankOrchestrator class will be enabled
- * once the implementation is added to the build.
+ * The actual RankOrchestrator is exercised with injected participant runners,
+ * including prefix admission/restore, MTP, and collective ownership contracts.
  */
 
 #include <gmock/gmock.h>
@@ -97,6 +97,11 @@ struct DeviceMoETicketProtocolProbe
     std::atomic<bool> submission_preceded_full_observation{false};
 };
 
+/**
+ * @brief Read a policy source relative to CTest's canonical repository root.
+ * @param path Repository-relative source path, independent of checkout location.
+ * @return Source text, or an empty string for the assertion to reject on failure.
+ */
 std::string readSourceFileForRankOrchestratorTest(const std::string &path)
 {
     std::ifstream input(path);
@@ -161,8 +166,10 @@ public:
         return logits_.data();
     }
 
-    PrefixRuntimeStateSnapshot prefixStateProbe() const override
+    PrefixRuntimeStateSnapshot prefixStateProbe(
+        const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override
     {
+        observed_prefix_probe_policy_ = capture_policy;
         if (!prefix_probe_position_override_)
             return {};
 
@@ -2001,10 +2008,11 @@ public:
             return {};
 
         return SnapshotInfo{
-            it->second.data(),
-            it->second.size(),
-            shape_it->second.first,
-            shape_it->second.second};
+            .data = it->second.data(),
+            .size = it->second.size(),
+            .rows = shape_it->second.first,
+            .cols = shape_it->second.second,
+            .publication = snapshot_publications_.at(key)};
     }
 
     std::vector<std::string> getSnapshotKeys() const override
@@ -2194,12 +2202,14 @@ public:
         const std::string &key,
         size_t rows,
         size_t cols,
-        std::vector<float> data)
+        std::vector<float> data,
+        SnapshotPublication publication = SnapshotPublication::SchemaPartition)
     {
         if (data.size() != rows * cols)
             throw std::invalid_argument("mock snapshot size does not match rows*cols");
         snapshots_[key] = std::move(data);
         snapshot_shapes_[key] = {rows, cols};
+        snapshot_publications_[key] = publication;
     }
 
     void set_vocab_size(int size)
@@ -2291,6 +2301,11 @@ public:
     void set_prefix_probe_position_override(int position)
     {
         prefix_probe_position_override_ = position;
+    }
+    /** @return Exact diagnostic policy last received from the parent runner. */
+    const PrefixProbeCapturePolicy &observedPrefixProbePolicy() const
+    {
+        return observed_prefix_probe_policy_;
     }
     /**
      * @brief Install the mock's committed grouped-verifier proposal identity.
@@ -2724,6 +2739,7 @@ private:
     std::vector<float> all_position_logits_;
     std::unordered_map<std::string, std::vector<float>> snapshots_;
     std::unordered_map<std::string, std::pair<size_t, size_t>> snapshot_shapes_;
+    std::unordered_map<std::string, SnapshotPublication> snapshot_publications_;
     std::shared_ptr<FP32Tensor> logits_local_;
     std::shared_ptr<FP32Tensor> mtp_logits_local_;
     std::shared_ptr<FP32Tensor> all_position_logits_local_;
@@ -2747,6 +2763,7 @@ private:
     bool device_moe_ticket_submission_ok_ = true;
     bool device_moe_known_non_due_boundary_ok_ = true;
     std::optional<int> prefix_probe_position_override_;
+    mutable PrefixProbeCapturePolicy observed_prefix_probe_policy_;
     std::vector<int32_t> prefix_probe_verifier_draft_tokens_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
@@ -4475,10 +4492,10 @@ TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferStagesAsyncAndPublish
 {
     const std::string rank_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
     const std::string dgo_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(rank_source.empty());
     ASSERT_FALSE(dgo_source.empty());
 
@@ -4617,28 +4634,28 @@ TEST_F(Test__RankOrchestrator, GpuDynamicMoERebalanceRefreshesStableGraphTables)
 {
     const std::string dgo_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const std::string stage_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp");
+            "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp");
     const std::string stage_header =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/compute_stages/stages/MoEExpertComputeStage.h");
+            "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.h");
     const std::string forward_engine_header =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/engine/ForwardExecutionEngine.h");
+            "src/v2/execution/local_execution/engine/ForwardExecutionEngine.h");
     const std::string forward_engine_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp");
+            "src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp");
     const std::string kernel_iface =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/kernels/IMoEKernel.h");
+            "src/v2/kernels/IMoEKernel.h");
     const std::string cuda_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
+            "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
     const std::string rocm_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp");
+            "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp");
     ASSERT_FALSE(dgo_source.empty());
     ASSERT_FALSE(stage_source.empty());
     ASSERT_FALSE(stage_header.empty());
@@ -4831,7 +4848,7 @@ TEST_F(Test__RankOrchestrator, TopLevelRunnerCannotPublishLegacyMoEPlacement)
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+            "src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
 
     ASSERT_EQ(runner_source.find("std::async("), std::string::npos)
@@ -4867,7 +4884,7 @@ TEST_F(
 {
     const std::string source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+            "src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto begin = source.find(
@@ -4913,7 +4930,7 @@ TEST_F(
 {
     const std::string source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+            "src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto begin = source.find(
@@ -4944,7 +4961,7 @@ TEST_F(Test__RankOrchestrator, RequestResetCannotPublishOrDiscardExpertPlacement
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+            "src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
 
     const auto clear_pos = runner_source.find("void OrchestrationRunner::clearCache()");
@@ -4999,11 +5016,11 @@ TEST_F(Test__RankOrchestrator,
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+            "src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
     const std::string device_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(device_source.empty());
 
     const auto shutdown_begin =
@@ -5090,7 +5107,7 @@ TEST_F(Test__RankOrchestrator, DeviceResidentExpertOverlaySkipsHostRuntimeHistog
 {
     const std::string source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto wire_pos = source.find("void RankOrchestrator::wireLocalTPMoERuntimeHistogramSyncs()");
@@ -5114,7 +5131,7 @@ TEST_F(Test__RankOrchestrator, ProductionDecodeBoundaryCannotEnterLegacyLocalTPP
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+            "src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
 
     const auto maybe_pos = runner_source.find(
@@ -5543,17 +5560,27 @@ TEST_F(Test__RankOrchestrator, OwnershipArrivalSnapshotKeepsTransferMaskSeparate
         << "expert 3 moved from participant 0 to participant 1";
 }
 
+/**
+ * @brief Clamp payload coverage while retaining the epochs actually looked up.
+ *
+ * Both live participants have advanced after their lookups. Coordination must
+ * carry the admitted epochs, not use those later values to relabel the cache.
+ */
 TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
-    runner0_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
-    runner0_ptr->set_moe_placement_epoch(7);
+    auto lookup0 = makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true);
+    lookup0.placement_epochs = PrefixPlacementEpochSpan::at(7);
+    runner0_ptr->set_prefix_lookup_result(lookup0);
+    runner0_ptr->set_moe_placement_epoch(77);
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
-    runner1_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/2, /*terminal_logits=*/false));
-    runner1_ptr->set_moe_placement_epoch(19);
+    auto lookup1 = makePrefixHit(/*cached_tokens=*/2, /*terminal_logits=*/false);
+    lookup1.placement_epochs = PrefixPlacementEpochSpan::at(19);
+    runner1_ptr->set_prefix_lookup_result(lookup1);
+    runner1_ptr->set_moe_placement_epoch(99);
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
     runners.push_back(std::move(runner0));
@@ -5570,8 +5597,8 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
     EXPECT_TRUE(hit.cache_enabled);
     EXPECT_TRUE(hit.supported);
     EXPECT_EQ(hit.cached_tokens, 2);
-    EXPECT_EQ(hit.placement_epoch, 19u);
-    EXPECT_EQ(orchestrator->moePlacementEpoch(), 19u);
+    EXPECT_EQ(hit.placement_epochs, PrefixPlacementEpochSpan::covering(7, 19));
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 99u);
     EXPECT_FALSE(hit.has_terminal_logits)
         << "Rank-level terminal state is usable only when all children have it";
     EXPECT_EQ(runner0_ptr->prefix_lookup_tokens(), prompt);
@@ -5885,12 +5912,75 @@ TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreRunsOnAllChildrenAtCommonLen
 }
 
 /**
- * @brief Prove a CPU TP prefix restore cannot expose the previous request's logits.
+ * @brief PP restore retains device-owned GPU logits and refreshes the CPU mirror.
  *
- * The child runners own the restored column-parallel terminal rows, while
- * RankOrchestrator owns the full-vocabulary CPU sampling aggregate. A restore
- * must update both ownership layers atomically; otherwise seeded stochastic
- * MTP can sample the old request's next token immediately after clearCache().
+ * Only host-owning inference needs a rank-level copy of the terminal row.
+ * CUDA and ROCm are typed mock identities here, not initialized devices.
+ */
+TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreHonorsPipelineLogitsOwnership)
+{
+    /** @brief Observe host reads without allocating or invoking a GPU backend. */
+    class ObservedTerminalRunner final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @brief Construct the ordinary device-free participant with four logits. */
+        ObservedTerminalRunner() : MockDeviceGraphOrchestrator([] {
+            Config config;
+            config.vocab_size = 4;
+            return config;
+        }()) {}
+
+        /** @return Host logits, recording whether the parent requested a mirror. */
+        const float *logits() const override
+        {
+            ++host_reads;
+            return MockDeviceGraphOrchestrator::logits();
+        }
+        mutable int host_reads = 0; ///< Observation only, never runtime authority.
+    };
+
+    for (const DeviceId device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        auto first = std::make_unique<MockDeviceGraphOrchestrator>();
+        first->set_prefix_lookup_result(makePrefixHit(
+            4, false, true, false, false, false, false));
+        auto terminal = std::make_unique<ObservedTerminalRunner>();
+        auto *observed = terminal.get();
+        terminal->set_primary_device_id(device);
+        terminal->set_mock_logits({1.0f, 2.0f, 3.0f, 4.0f});
+        terminal->set_prefix_lookup_result(makePrefixHit(
+            4, true, true, false, false, true, false));
+        std::vector<std::unique_ptr<IInferenceRunner>> stages;
+        stages.push_back(std::move(first));
+        stages.push_back(std::move(terminal));
+        auto pipeline = RankOrchestrator::createForTestWithPipelineStages(
+            llaminar2::test::MockModelContextBuilder()
+                .usePreset(llaminar2::test::ModelPreset::MINIMAL)
+                .setVocabSize(4).build(),
+            std::move(stages), makeRankConfigForRunnerCount(2));
+        pipeline->setSkipLogitsGatherPrefill(device.is_gpu());
+        pipeline->setSkipLogitsGatherDecode(device.is_gpu());
+        const auto hit = pipeline->lookupPrefix({1, 2, 3, 4});
+        ASSERT_TRUE(hit.has_terminal_logits);
+        ASSERT_TRUE(pipeline->restorePrefixTerminalState(hit));
+        EXPECT_EQ(observed->host_reads, device.is_gpu() ? 0 : 1);
+        EXPECT_EQ(observed->terminal_restored_tokens(), std::vector<int>({4}));
+        if (device.is_cpu())
+        {
+            const float *logits = pipeline->logits();
+            ASSERT_NE(logits, nullptr);
+            EXPECT_THAT(std::vector<float>(logits, logits + 4),
+                        ::testing::ElementsAre(1.0f, 2.0f, 3.0f, 4.0f));
+        }
+    }
+}
+
+/**
+ * @brief A CPU TP prefix restore cannot expose the previous request's logits.
+ *
+ * Children restore column-parallel rows; the rank must refresh its separate
+ * CPU sampling aggregate in the same transaction before it can be sampled.
  */
 TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreRefreshesCPUTPLogitsAggregate)
 {
@@ -7152,7 +7242,7 @@ TEST_F(Test__RankOrchestrator,
 {
     const std::string source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const size_t begin = source.find(
@@ -7187,7 +7277,7 @@ TEST_F(Test__RankOrchestrator,
 {
     const std::string source =
         readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const size_t begin = source.find(
@@ -7891,8 +7981,30 @@ TEST_F(Test__RankOrchestrator,
     runner0_ptr->set_prefix_probe_position_override(596);
     runner1_ptr->set_prefix_probe_position_override(596);
 
+    PrefixProbeCapturePolicy policy;
+    policy.capture_requested_kv_segment_payloads = true;
+    policy.kv_continuation_partitions = {
+        {.owner = "main", .device = DeviceId::cuda(0), .copied_tokens = 9},
+        {.owner = "mtp:0", .device = DeviceId::cuda(0), .copied_tokens = 8},
+        {.owner = "main", .device = DeviceId::cuda(1), .copied_tokens = 9},
+        {.owner = "mtp:0", .device = DeviceId::cuda(1), .copied_tokens = 8}};
     const PrefixRuntimeStateSnapshot snapshot =
-        orchestrator->prefixStateProbe();
+        orchestrator->prefixStateProbe(policy);
+    for (const auto *child : {runner0_ptr, runner1_ptr})
+    {
+        const auto &observed = child->observedPrefixProbePolicy();
+        EXPECT_TRUE(observed.capture_requested_kv_segment_payloads);
+        ASSERT_EQ(observed.kv_continuation_partitions.size(), 4u);
+        for (size_t index = 0; index < 4; ++index)
+        {
+            EXPECT_EQ(observed.kv_continuation_partitions[index].owner,
+                      policy.kv_continuation_partitions[index].owner);
+            EXPECT_EQ(observed.kv_continuation_partitions[index].device,
+                      policy.kv_continuation_partitions[index].device);
+            EXPECT_EQ(observed.kv_continuation_partitions[index].copied_tokens,
+                      policy.kv_continuation_partitions[index].copied_tokens);
+        }
+    }
     EXPECT_TRUE(snapshot.initialized);
     EXPECT_EQ(snapshot.current_position, 596);
     EXPECT_THAT(snapshot.positions, ::testing::ElementsAre(596));
@@ -9879,6 +9991,69 @@ TEST_F(
         << "the MTP placement policy must not widen the main graph";
     ASSERT_TRUE(main_q.computeCombined());
     EXPECT_EQ(main_q.combined_cols, partial0.size() + partial1.size());
+}
+
+/**
+ * @brief Completed routed publications supersede shards at every TP degree.
+ *
+ * Exercise a nonzero rooted finalizer, replicated completion, and conflicting
+ * completions. A completed row must never be summed with stale partials, but
+ * declaring completeness must not hide disagreement between final publishers.
+ * Mock runners make this a device-free check of the CPU/CUDA/ROCm contract.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_CompletePublicationOwnsAssembly)
+{
+    const std::vector<float> complete = {11.0f, 22.0f, 33.0f, 44.0f};
+    for (const std::string key : {"MTP0_MOE_EXPERT_OUTPUT", "EMBEDDING",
+                                 "MTP0_EMBEDDING", "MTP15_EMBEDDING",
+                                 "MTP_CHAINED_DRAFT_MTP0_EMBEDDING"})
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    for (int degree = 1; degree <= 8; ++degree)
+    for (int completion_count : {1, degree})
+    for (const bool conflict : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "key=" << key << " backend=" << static_cast<int>(backend)
+            << " degree=" << degree << " completions=" << completion_count
+            << " conflict=" << conflict);
+        RankOrchestrator::Config config;
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        for (int i = 0; i < degree; ++i)
+        {
+            config.devices.push_back(
+                backend == DeviceType::CPU ? GlobalDeviceAddress::cpu(i) :
+                backend == DeviceType::CUDA ? GlobalDeviceAddress::cuda(i) :
+                                             GlobalDeviceAddress::rocm(i));
+            config.weights.push_back(1.0f / degree);
+            auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+            const bool is_complete = i >= degree - completion_count;
+            auto values = complete;
+            if (is_complete && conflict && completion_count > 1 && i == 0)
+                values[0] += 1.0f;
+            if (!is_complete)
+                values.assign(complete.size(), 123.0f);
+            runner->set_mock_snapshot(key, 1, values.size(), values,
+                is_complete ? SnapshotPublication::CompleteValue :
+                              SnapshotPublication::SchemaPartition);
+            runners.push_back(std::move(runner));
+        }
+        auto model = llaminar2::test::MockModelContext::createMinimal();
+        model->setArchitecture("qwen35moe");
+        MockLocalTPContext::Config tp;
+        tp.devices = config.devices;
+        tp.weights = config.weights;
+        auto orchestrator = RankOrchestrator::createForTest(model, std::move(runners),
+            std::make_unique<MockLocalTPContext>(tp), config);
+        auto view = orchestrator->getSnapshotWithShape(key);
+        ASSERT_TRUE(view);
+        EXPECT_EQ(view.publication, SnapshotPublication::CompleteValue);
+        auto snapshot = orchestrator->getTPSnapshot(key);
+        EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
+        EXPECT_EQ(snapshot.device_data.size(), static_cast<size_t>(completion_count));
+        const bool agrees = !(conflict && completion_count > 1);
+        EXPECT_EQ(snapshot.computeCombined(), agrees);
+        if (agrees)
+            EXPECT_EQ(snapshot.combined_data, complete);
+    }
 }
 
 TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutputReplicated)

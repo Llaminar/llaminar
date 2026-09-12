@@ -225,6 +225,26 @@ Use the per-rank `expert_residency_diagnostics*.csv` files to reconcile a
 cross-rank failure before treating a missing rank-zero counter as missing
 movement.
 
+### HTTP transport evidence
+
+The shared HTTP harness validates physical publication after every rank has
+shut down and exported diagnostics. Host movement needs actual
+`placement_published_payload_bytes` plus equal bounded
+`placement_transport_publications` / `placement_owner_publications` sequences
+for each rank/device/phase. Their words are candidate epoch and migration count;
+identifiers must not become unbounded telemetry tags. No-op ranks may explicitly
+report zero local bytes, but the cohort must publish a nonzero physical payload.
+Calibration and prepared-context restoration cannot provide these witnesses.
+
+All-GPU completion counters must join within one rank/device/phase and exact
+transaction/candidate epoch. Do not combine positive totals from unrelated
+publications. Generation additionally uses
+`validate_movement_transport_mirrors()` to require a matching committed identity
+for every edge in the HTTP authority journal, including its expert, endpoints
+and objective. Extra later process-lifetime movement is allowed; duplicated
+rank mirrors cannot replace missing edges. These checks corroborate the owner;
+they never infer placement, estimate transferred bytes or control inference.
+
 ## From evidence to regression
 
 Reduce to the earliest bad stage and one exact configuration. Preserve the

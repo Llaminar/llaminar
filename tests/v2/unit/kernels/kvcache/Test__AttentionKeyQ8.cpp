@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "kernels/kvcache/AttentionKeyQ8Reference.h"
+#include "../../../utils/AttentionKeyOutlierFixture.h"
 
 #include <algorithm>
 #include <array>
@@ -26,43 +27,12 @@ namespace llaminar2
 {
     namespace
     {
-        constexpr int kHeadDim = 64;
-        constexpr int kTokens = 9;
-        constexpr int kKVHeads = 2;
-        constexpr int kQueryHeads = 14;
+        using QualityFixture = test::AttentionKeyOutlierFixture;
+        constexpr int kHeadDim = QualityFixture::head_dim;
+        constexpr int kTokens = QualityFixture::tokens;
+        constexpr int kKVHeads = QualityFixture::kv_heads;
+        constexpr int kQueryHeads = QualityFixture::query_heads;
         constexpr int kQueriesPerKVHead = kQueryHeads / kKVHeads;
-
-        /**
-         * @brief Small deterministic generator with exactly specified integer state.
-         *
-         * The fixture avoids implementation-defined standard-library random
-         * distributions so every platform constructs identical FP32 inputs.
-         */
-        class XorShift32
-        {
-        public:
-            /** @brief Construct the generator from a required non-zero seed. */
-            explicit XorShift32(uint32_t seed) : state_(seed)
-            {
-                if (seed == 0)
-                {
-                    throw std::invalid_argument("XorShift32 seed must be non-zero");
-                }
-            }
-
-            /** @brief Return a deterministic FP32 value in [-1, 1). */
-            float symmetricUnit()
-            {
-                state_ ^= state_ << 13U;
-                state_ ^= state_ >> 17U;
-                state_ ^= state_ << 5U;
-                const uint32_t mantissa = state_ >> 8U;
-                return static_cast<float>(mantissa) * (1.0f / 8388608.0f) - 1.0f;
-            }
-
-        private:
-            uint32_t state_; ///< Sole generator authority; never shared across fixture fields.
-        };
 
         /** @brief Return the flat offset for one token/head/coordinate tuple. */
         constexpr size_t offset(int token, int head, int coordinate, int heads)
@@ -269,47 +239,10 @@ namespace llaminar2
 
     TEST(Test__AttentionKeyQ8, AnchoredQwenScaleCausalAttentionPreservesContext)
     {
-        std::vector<float> keys(kTokens * kKVHeads * kHeadDim);
-        std::vector<float> queries(kTokens * kQueryHeads * kHeadDim);
-        std::vector<float> values(kTokens * kKVHeads * kHeadDim);
-
-        XorShift32 key_rng(2U);
-        for (float &value : keys)
-        {
-            value = key_rng.symmetricUnit();
-        }
-        // Qwen2 layer-0 keys observed by the parity campaign reach roughly 130
-        // while many score-relevant coordinates remain near one. Keeping these
-        // common coordinates equal across tokens makes their score contribution
-        // cancel, as happens for shared outlier structure in real model keys.
-        for (int token = 0; token < kTokens; ++token)
-        {
-            for (int head = 0; head < kKVHeads; ++head)
-            {
-                keys[offset(token, head, 0, kKVHeads)] = 128.0f;
-                keys[offset(token, head, 32, kKVHeads)] = -102.4f;
-            }
-        }
-
-        XorShift32 query_rng(2U ^ 0x9e3779b9U);
-        for (float &value : queries)
-        {
-            value = 8.0f * query_rng.symmetricUnit();
-        }
-        for (int token = 0; token < kTokens; ++token)
-        {
-            for (int head = 0; head < kQueryHeads; ++head)
-            {
-                queries[offset(token, head, 0, kQueryHeads)] = 0.0f;
-                queries[offset(token, head, 32, kQueryHeads)] = 0.0f;
-            }
-        }
-
-        XorShift32 value_rng(2U ^ 0x243f6a88U);
-        for (float &value : values)
-        {
-            value = value_rng.symmetricUnit();
-        }
+        const test::AttentionKeyOutlierFixture fixture;
+        const auto &keys = fixture.keys;
+        const auto &queries = fixture.queries;
+        const auto &values = fixture.values;
 
         std::vector<float> linear_keys(keys.size());
         std::vector<float> attention_q8_keys(keys.size());

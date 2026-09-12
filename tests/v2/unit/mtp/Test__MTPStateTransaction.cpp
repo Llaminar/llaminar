@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -166,41 +168,47 @@ namespace
 
     /**
      * @brief Install exact-prefix and retained-suffix evidence on a snapshot.
-     * @param snapshot Snapshot whose one main-KV layer receives the evidence.
+     * @param snapshot Snapshot whose selected KV layer receives the evidence.
      * @param precision Native K/V precision under test.
-     * @param k_payload Complete logical values for the one-token K suffix.
-     * @param v_payload Complete logical values for the one-token V suffix.
+     * @param k_payload Complete logical values for the K suffix.
+     * @param v_payload Complete logical values for the V suffix.
+     * @param shifted Select the independently seeded shifted-MTP cache.
+     * @param copied_tokens Length of the immutable copied prefix.
+     * @param suffix_tokens Number of recomputed rows retained in full.
      */
     void installPartialPrefixKVEvidence(
         PrefixRuntimeStateSnapshot *snapshot,
         ActivationPrecision precision,
         std::vector<uint8_t> k_payload,
-        std::vector<uint8_t> v_payload)
+        std::vector<uint8_t> v_payload,
+        bool shifted = false,
+        int copied_tokens = 6,
+        int suffix_tokens = 1)
     {
         ASSERT_NE(snapshot, nullptr);
-        PrefixKVCacheProbe &cache = snapshot->kv_caches.front();
+        PrefixKVCacheProbe &cache = shifted ? snapshot->mtp_kv_caches.front() : snapshot->kv_caches.front();
         PrefixKVLayerProbe &layer = cache.layers.front();
         cache.k_precision = precision;
         cache.v_precision = precision;
 
-        const size_t row_k_bytes = k_payload.size();
-        const size_t row_v_bytes = v_payload.size();
-        layer.k_payload_bytes = 7u * row_k_bytes;
-        layer.v_payload_bytes = 7u * row_v_bytes;
+        const size_t row_k_bytes = k_payload.size() / suffix_tokens;
+        const size_t row_v_bytes = v_payload.size() / suffix_tokens;
+        layer.k_payload_bytes = (copied_tokens + suffix_tokens) * row_k_bytes;
+        layer.v_payload_bytes = (copied_tokens + suffix_tokens) * row_v_bytes;
         layer.leading_segment_hash_available = true;
-        layer.leading_segment_tokens = 6;
-        layer.leading_k_payload_bytes = 6u * row_k_bytes;
-        layer.leading_v_payload_bytes = 6u * row_v_bytes;
+        layer.leading_segment_tokens = copied_tokens;
+        layer.leading_k_payload_bytes = copied_tokens * row_k_bytes;
+        layer.leading_v_payload_bytes = copied_tokens * row_v_bytes;
         layer.leading_k_payload_hash = 0xabc001;
         layer.leading_v_payload_hash = 0xabc002;
 
         PrefixKVSegmentProbe suffix;
         suffix.name = "recomputed_suffix";
-        suffix.token_start = 6;
-        suffix.token_count = 1;
+        suffix.token_start = copied_tokens;
+        suffix.token_count = suffix_tokens;
         suffix.hash_available = true;
-        suffix.k_payload_bytes = row_k_bytes;
-        suffix.v_payload_bytes = row_v_bytes;
+        suffix.k_payload_bytes = k_payload.size();
+        suffix.v_payload_bytes = v_payload.size();
         suffix.k_payload_hash = 0xdef001;
         suffix.v_payload_hash = 0xdef002;
         suffix.k_payload = std::move(k_payload);
@@ -208,7 +216,295 @@ namespace
         layer.segments = {std::move(suffix)};
     }
 
+    /**
+     * @brief Three independent request boundaries around a moved-expert reseed.
+     *
+     * The seed's six cached rows differ from the older seven-row serial oracle.
+     * A valid restore retains the new seed exactly and recomputes a numerically
+     * equivalent suffix. Device IDs are metadata only; no accelerator is used.
+     */
+    struct ReseededPrefixProof
+    {
+        PrefixRuntimeStateSnapshot serial = makeRuntimeSnapshot(7);
+        PrefixRuntimeStateSnapshot seed = makeRuntimeSnapshot(6);
+        PrefixRuntimeStateSnapshot restored = makeRuntimeSnapshot(7);
+        MTPRuntimeSnapshotComparisonOptions options;
+
+        /**
+         * @brief Populate one native-format, participant-local proof fixture.
+         * @param precision Floating format for retained numerical suffix bytes.
+         * @param device Participant identity, without acquiring a real device.
+         */
+        ReseededPrefixProof(ActivationPrecision precision, DeviceId device)
+        {
+            for (auto *state : {&serial, &seed, &restored})
+            {
+                installPartialPrefixKVEvidence(
+                    state, precision,
+                    encodeKVValues({1.f, 2.f, 3.f, 4.f}, precision),
+                    encodeKVValues({5.f, 6.f, 7.f, 8.f}, precision));
+                state->kv_caches.front().device = device;
+                // Main copies six rows, while the shifted seed owns only five.
+                // Two recomputed shifted rows must be certified, not just last.
+                installPartialPrefixKVEvidence(
+                    state, precision,
+                    encodeKVValues({1.f, 2.f, 3.f, 4.f, 1.f, 2.f, 3.f, 4.f}, precision),
+                    encodeKVValues({5.f, 6.f, 7.f, 8.f, 5.f, 6.f, 7.f, 8.f}, precision),
+                    true, 5, 2);
+                state->mtp_kv_caches.front().device = device;
+                state->mtp_kv_caches.front().layers.front().cached_tokens = 7;
+            }
+            serial.moe_runtime_movement_epoch = 4;
+            seed.moe_runtime_movement_epoch = 6;
+            restored.moe_runtime_movement_epoch = 7;
+            auto &seed_layer = seed.kv_caches.front().layers.front();
+            seed_layer.leading_k_payload_hash ^= 0x10;
+            seed_layer.leading_v_payload_hash ^= 0x20;
+            seed_layer.k_payload_hash = seed_layer.leading_k_payload_hash;
+            seed_layer.v_payload_hash = seed_layer.leading_v_payload_hash;
+            seed_layer.k_payload_bytes = seed_layer.leading_k_payload_bytes;
+            seed_layer.v_payload_bytes = seed_layer.leading_v_payload_bytes;
+            seed_layer.segments.clear();
+            // The production legacy split always leaves at least one trailing
+            // row; only the seed's full digest owns all six cached rows.
+            seed_layer.leading_segment_tokens = 5;
+            seed_layer.leading_k_payload_hash ^= 0x100;
+            seed_layer.leading_v_payload_hash ^= 0x200;
+            auto &restored_layer = restored.kv_caches.front().layers.front();
+            restored_layer.leading_k_payload_hash = seed_layer.k_payload_hash;
+            restored_layer.leading_v_payload_hash = seed_layer.v_payload_hash;
+            restored_layer.k_payload_hash ^= 0x10;
+            restored_layer.v_payload_hash ^= 0x20;
+            auto &shifted_seed = seed.mtp_kv_caches.front().layers.front();
+            shifted_seed.cached_tokens = 5;
+            shifted_seed.k_payload_hash = shifted_seed.leading_k_payload_hash;
+            shifted_seed.v_payload_hash = shifted_seed.leading_v_payload_hash;
+            shifted_seed.k_payload_bytes = shifted_seed.leading_k_payload_bytes;
+            shifted_seed.v_payload_bytes = shifted_seed.leading_v_payload_bytes;
+            shifted_seed.segments.clear();
+            auto &shifted_restored = restored.mtp_kv_caches.front().layers.front();
+            shifted_restored.k_payload_hash ^= 0x10;
+            shifted_restored.v_payload_hash ^= 0x20;
+            options.kv_payload_policy = MTPKVPayloadComparisonPolicy::
+                ExactPrefixNumericalSuffixAfterMoEPlacementChange;
+            options.main_kv_exact_prefix_tokens = 6;
+        }
+
+        /** @brief Compare immutable seed and continuation authorities. */
+        MTPStateValidationResult compare() const
+        {
+            return compareMTPPartialPrefixRestoreSnapshots(
+                {.cached_prefix = seed, .serial_continuation = serial},
+                restored, options);
+        }
+    };
+
 } // namespace
+
+TEST(Test__MTPStateTransaction,
+     PartialRestoreUsesActualSeedAcrossFloatingFormatsAndBackendIdentities)
+{
+    for (const auto precision : {ActivationPrecision::FP16,
+                                 ActivationPrecision::BF16,
+                                 ActivationPrecision::FP32})
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(1), DeviceId::rocm(2)})
+        {
+            ReseededPrefixProof proof(precision, device);
+            // The historical two-state oracle conflates a new seed with old bytes.
+            EXPECT_FALSE(compareMTPRuntimeStateSnapshots(
+                proof.serial, proof.restored, proof.options));
+            auto result = proof.compare();
+            ASSERT_TRUE(result) << result.reason;
+            EXPECT_TRUE(result.main_kv_numerical.passed);
+            EXPECT_EQ(result.main_kv_numerical.exact_prefix_segments, 1u);
+            EXPECT_EQ(result.main_kv_numerical.numerical_suffix_payloads, 2u);
+            EXPECT_TRUE(result.shifted_mtp_kv_numerical.passed);
+            EXPECT_EQ(result.shifted_mtp_kv_numerical.exact_prefix_segments, 1u);
+            EXPECT_EQ(result.shifted_mtp_kv_numerical.numerical_suffix_payloads, 2u);
+            EXPECT_EQ(result.shifted_mtp_kv_numerical.elements, 16u);
+        }
+}
+
+TEST(Test__MTPStateTransaction,
+     PartialRestoreShiftedKVRejectsMissingRowsCorruptionAndScaleErrors)
+{
+    for (const auto precision : {ActivationPrecision::FP16, ActivationPrecision::BF16,
+                                 ActivationPrecision::FP32})
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(1), DeviceId::rocm(2)})
+        {
+            // These are metadata identities; the unit gate never opens a GPU.
+            const std::vector<std::function<void(ReseededPrefixProof &)>> corruptions = {
+                [](auto &p) { p.seed.mtp_kv_caches.clear(); },
+                [](auto &p) { p.seed.mtp_kv_caches.front().owner = "wrong-owner"; },
+                [](auto &p) { p.seed.mtp_kv_caches.front().layers.front().cached_tokens++; },
+                [](auto &p) { p.seed.mtp_kv_caches.front().layers.front().k_payload_hash ^= 1; },
+                [](auto &p) { p.restored.mtp_kv_caches.front().layers.front().leading_v_payload_hash ^= 1; },
+                [](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.clear(); },
+                [](auto &p) { auto &s = p.restored.mtp_kv_caches.front().layers.front().segments; s.push_back(s.front()); },
+                [](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.front().token_start++; },
+                [](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.front().token_count--; },
+                [](auto &p) { auto &s = p.restored.mtp_kv_caches.front().layers.front().segments.front(); s.k_payload.resize(s.k_payload.size() / 2); },
+                [&](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.front().k_payload =
+                    encodeKVValues({-1.f, -2.f, -3.f, -4.f, 1.f, 2.f, 3.f, 4.f}, precision); },
+                [&](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.front().k_payload =
+                    encodeKVValues({1.f, 2.f, 3.f, 4.f, -1.f, -2.f, -3.f, -4.f}, precision); },
+                // Multiplying by two preserves cosine exactly but breaks KV scale.
+                [&](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.front().k_payload =
+                    encodeKVValues({2.f, 4.f, 6.f, 8.f, 2.f, 4.f, 6.f, 8.f}, precision); },
+                [&](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.front().v_payload =
+                    encodeKVValues({std::numeric_limits<float>::infinity(), 6.f, 7.f, 8.f, 5.f, 6.f, 7.f, 8.f}, precision); },
+                [&](auto &p) { p.restored.mtp_kv_caches.front().layers.front().segments.front().v_payload =
+                    encodeKVValues({5.f, 6.f, 7.f, 8.f, std::numeric_limits<float>::quiet_NaN(), 6.f, 7.f, 8.f}, precision); },
+            };
+            for (size_t index = 0; index < corruptions.size(); ++index)
+            {
+                SCOPED_TRACE(index);
+                ReseededPrefixProof proof(precision, device);
+                ASSERT_TRUE(proof.compare());
+                corruptions[index](proof);
+                EXPECT_FALSE(proof.compare());
+            }
+            ReseededPrefixProof proof(precision, device);
+            proof.serial.kv_caches = proof.restored.kv_caches;
+            proof.restored.moe_runtime_movement_epoch = proof.serial.moe_runtime_movement_epoch;
+            const auto exact_epoch = proof.compare();
+            EXPECT_FALSE(exact_epoch);
+            EXPECT_NE(exact_epoch.reason.find("shifted MTP KV payload hash mismatch"), std::string::npos);
+            // Matching an older full hash cannot hide a corrupted restored prefix.
+            proof.restored = proof.serial;
+            proof.restored.mtp_kv_caches.front().layers.front().leading_k_payload_hash ^= 1;
+            EXPECT_FALSE(proof.compare());
+        }
+}
+
+TEST(Test__MTPStateTransaction,
+     PartialRestoreRejectsStaleSerialBytesEvenWhenFullSerialHashesMatch)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        ReseededPrefixProof proof(ActivationPrecision::FP32, device);
+        proof.restored = proof.serial;
+        proof.restored.moe_runtime_movement_epoch = 7;
+        ASSERT_TRUE(compareMTPRuntimeStateSnapshots(
+            proof.serial, proof.restored, proof.options));
+        const auto result = proof.compare();
+        EXPECT_FALSE(result);
+        EXPECT_NE(result.reason.find("cached-prefix bytes changed"), std::string::npos)
+            << result.reason;
+    }
+}
+
+TEST(Test__MTPStateTransaction,
+     PartialRestoreStaticRequiresSeedRangeEvidenceEvenWithExactSerialState)
+{
+    ReseededPrefixProof proof(ActivationPrecision::FP32, DeviceId::cpu());
+    proof.serial = proof.restored;
+    proof.seed.moe_runtime_movement_epoch = proof.serial.moe_runtime_movement_epoch;
+    auto &layer = proof.restored.kv_caches.front().layers.front();
+    // Full continuation equality alone cannot prove that the actual seed was
+    // restored. Static's partial proof must request this diagnostic range too.
+    layer.leading_segment_hash_available = false;
+    EXPECT_FALSE(proof.compare());
+    layer.leading_segment_hash_available = true;
+    const auto result = proof.compare();
+    EXPECT_TRUE(result) << result.reason;
+    EXPECT_FALSE(result.main_kv_numerical.compared);
+}
+
+TEST(Test__MTPStateTransaction,
+     PartialRestoreRejectsCorruptSeedIdentityPayloadAndContinuation)
+{
+    const std::vector<std::function<void(ReseededPrefixProof &)>> corruptions = {
+        [](auto &p) { p.seed.initialized = false; },
+        [](auto &p) { p.seed.current_position++; },
+        [](auto &p) { p.seed.kv_caches.clear(); },
+        [](auto &p) { p.seed.kv_caches.front().owner = "unrelated"; },
+        [](auto &p) { p.seed.kv_caches.front().device = DeviceId::cuda(7); },
+        [](auto &p) { p.seed.kv_caches.front().kv_head_start++; },
+        [](auto &p) { p.seed.kv_caches.front().layers.clear(); },
+        [](auto &p) { p.seed.kv_caches.front().layers.front().seq_idx++; },
+        [](auto &p) { p.seed.kv_caches.front().layers.front().cached_tokens--; },
+        [](auto &p) { p.seed.kv_caches.front().layers.front().payload_hash_available = false; },
+        [](auto &p) { p.seed.kv_caches.front().layers.front().k_payload_hash ^= 1; },
+        [](auto &p) { p.restored.kv_caches.front().layers.front().leading_k_payload_hash ^= 1; },
+        [](auto &p) { p.restored.kv_caches.front().layers.front().leading_v_payload_hash ^= 1; },
+        [](auto &p) { p.restored.kv_caches.front().layers.front().leading_k_payload_bytes++; },
+        [](auto &p) { p.restored.kv_caches.front().layers.front().leading_v_payload_bytes++; },
+        [](auto &p) { p.restored.kv_caches.front().layers.front().segments.clear(); },
+        [](auto &p) { auto &s = p.restored.kv_caches.front().layers.front().segments; s.push_back(s.front()); },
+        [](auto &p) { p.restored.kv_caches.front().layers.front().segments.front().k_payload.clear(); },
+        [](auto &p) {
+            p.restored.kv_caches.front().layers.front().segments.front().v_payload =
+                encodeKVValues({-5.f, -6.f, -7.f, -8.f}, ActivationPrecision::FP32);
+        },
+        [](auto &p) { p.restored.moe_runtime_movement_epoch = p.serial.moe_runtime_movement_epoch; },
+        [](auto &p) { p.restored.gdn_layers.front().recurrence_hash ^= 1; },
+        [](auto &p) { p.restored.mtp_kv_caches.front().layers.front().leading_k_payload_hash ^= 1; },
+        [](auto &p) { p.restored.terminal_logits_hash ^= 1; },
+        [](auto &p) { p.options.compare_main_kv_payload_hashes = false; },
+        [](auto &p) { p.options.kv_payload_policy = MTPKVPayloadComparisonPolicy::ExactBytes; },
+    };
+    for (size_t index = 0; index < corruptions.size(); ++index)
+    {
+        SCOPED_TRACE(index);
+        ReseededPrefixProof proof(ActivationPrecision::FP32, DeviceId::cpu());
+        corruptions[index](proof);
+        EXPECT_FALSE(proof.compare());
+    }
+}
+
+TEST(Test__MTPStateTransaction,
+     PartialRestoreExactSeedCheckIsIndependentOfKVStorageFormat)
+{
+    // Opaque hash identity needs no codec. Cover asymmetric K/V metadata too;
+    // numerical decoding is deliberately confined to the floating test above.
+    const auto formats = {ActivationPrecision::FP32, ActivationPrecision::FP16,
+        ActivationPrecision::BF16, ActivationPrecision::Q8_1,
+        ActivationPrecision::Q16_1, ActivationPrecision::TQ4,
+        ActivationPrecision::TQ8, ActivationPrecision::AQ8};
+    for (auto k : formats)
+        for (auto v : formats)
+        {
+            ReseededPrefixProof proof(ActivationPrecision::FP32, DeviceId::cpu());
+            proof.serial = proof.restored;
+            for (auto *state : {&proof.seed, &proof.serial, &proof.restored})
+            {
+                state->kv_caches.front().k_precision = k;
+                state->kv_caches.front().v_precision = v;
+                state->mtp_kv_caches.front().k_precision = k;
+                state->mtp_kv_caches.front().v_precision = v;
+            }
+            ASSERT_TRUE(proof.compare());
+            proof.restored.kv_caches.front().layers.front().leading_v_payload_hash ^= 1;
+            EXPECT_FALSE(proof.compare());
+            proof.restored.kv_caches.front().layers.front().leading_v_payload_hash ^= 1;
+            proof.restored.mtp_kv_caches.front().layers.front().leading_v_payload_hash ^= 1;
+            EXPECT_FALSE(proof.compare());
+        }
+}
+
+TEST(Test__MTPStateTransaction,
+     PartialRestoreDistinguishesGDNOnlyLayersFromLostKVPayloads)
+{
+    ReseededPrefixProof proof(ActivationPrecision::FP32, DeviceId::cpu());
+    PrefixKVLayerProbe recurrent_only;
+    recurrent_only.global_layer = 1;
+    recurrent_only.cache_layer = 1;
+    for (auto *state : {&proof.seed, &proof.serial, &proof.restored})
+        state->kv_caches.front().layers.push_back(recurrent_only);
+    ASSERT_TRUE(proof.compare());
+
+    proof.restored.kv_caches.front().layers.back().cached_tokens = 1;
+    EXPECT_FALSE(proof.compare());
+    proof.restored.kv_caches.front().layers.back() = recurrent_only;
+    // Both seed and restore losing a real attention layer must still fail
+    // against the independent serial oracle's live layer metadata.
+    recurrent_only.global_layer = 0;
+    recurrent_only.cache_layer = 0;
+    proof.seed.kv_caches.front().layers.front() = recurrent_only;
+    proof.restored.kv_caches.front().layers.front() = recurrent_only;
+    EXPECT_FALSE(proof.compare());
+}
 
 TEST(Test__MTPStateTransaction, ExpectedShiftedTokensLagMainByOne)
 {
@@ -651,8 +947,8 @@ TEST(Test__MTPStateTransaction,
     candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
-    options.main_kv_payload_policy =
-        MTPMainKVPayloadComparisonPolicy::
+    options.kv_payload_policy =
+        MTPKVPayloadComparisonPolicy::
             ExactPrefixNumericalSuffixAfterMoEPlacementChange;
     options.main_kv_exact_prefix_tokens = 6;
     const auto result =
@@ -694,11 +990,11 @@ TEST(Test__MTPStateTransaction,
             .segments.front().v_payload_hash ^= 0x2;
 
         MTPRuntimeSnapshotComparisonOptions options;
-        options.main_kv_payload_policy =
-            MTPMainKVPayloadComparisonPolicy::
+        options.kv_payload_policy =
+            MTPKVPayloadComparisonPolicy::
                 ExactPrefixNumericalSuffixAfterMoEPlacementChange;
         options.main_kv_exact_prefix_tokens = 6;
-        options.main_kv_suffix_min_cosine = 0.99;
+        options.kv_suffix_min_cosine = 0.99;
         const auto result =
             compareMTPRuntimeStateSnapshots(oracle, candidate, options);
 
@@ -731,8 +1027,8 @@ TEST(Test__MTPStateTransaction,
     candidate.kv_caches.front().layers.front().leading_k_payload_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
-    options.main_kv_payload_policy =
-        MTPMainKVPayloadComparisonPolicy::
+    options.kv_payload_policy =
+        MTPKVPayloadComparisonPolicy::
             ExactPrefixNumericalSuffixAfterMoEPlacementChange;
     options.main_kv_exact_prefix_tokens = 6;
     const auto result =
@@ -759,11 +1055,11 @@ TEST(Test__MTPStateTransaction,
     candidate.kv_caches.front().layers.front().k_payload_hash ^= 0x1;
 
     MTPRuntimeSnapshotComparisonOptions options;
-    options.main_kv_payload_policy =
-        MTPMainKVPayloadComparisonPolicy::
+    options.kv_payload_policy =
+        MTPKVPayloadComparisonPolicy::
             ExactPrefixNumericalSuffixAfterMoEPlacementChange;
     options.main_kv_exact_prefix_tokens = 6;
-    options.main_kv_suffix_min_cosine = 0.99;
+    options.kv_suffix_min_cosine = 0.99;
 
     candidate.kv_caches.front().layers.front()
         .segments.front().k_payload.clear();

@@ -16,6 +16,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <thread>
 
 namespace llaminar2
 {
@@ -704,6 +705,104 @@ namespace llaminar2
         remote_group.status_code = static_cast<std::uint32_t>(
             MoEOverlayDeviceControllerError::InvalidState);
         EXPECT_TRUE(transport.authorityRejected(acquired.batch));
+    }
+
+    /** The exact fuller phase, including undelivered commands, bounds admission. */
+    TEST(MoEOverlayMaintenanceBoundaryGate,
+         PublishesPhaseHeadroomWithoutInventingHostHistograms)
+    {
+        MoEOverlayMaintenanceBoundaryGate gate(64u);
+        auto window = gate.demandWindow();
+        EXPECT_TRUE(window.valid());
+        EXPECT_EQ(window.scope, MoEOptimizationDemandScope::PrefillCadence);
+        EXPECT_TRUE(window.canAdmitExclusiveCohort(63u));
+        EXPECT_FALSE(window.canAdmitExclusiveCohort(64u));
+        gate.notify(MoEOverlayInferencePhase::Prefill, 9u);
+        gate.notify(MoEOverlayInferencePhase::Decode, 12u);
+        window = gate.demandWindow();
+        EXPECT_EQ(window.scope, MoEOptimizationDemandScope::DecodeCadence);
+        EXPECT_EQ(window.collected_routed_rows, 12u);
+        EXPECT_EQ(window.remainingRoutedRows(), 52u);
+
+        // The next command already owes 55 prefill notifications. Reading just
+        // the gate's current nine would falsely admit another 54-row cohort.
+        window = gate.demandWindow({55u, 0u});
+        EXPECT_EQ(window.scope, MoEOptimizationDemandScope::PrefillCadence);
+        EXPECT_EQ(window.pending_submission_rows, 55u);
+        EXPECT_EQ(window.remainingRoutedRows(), 0u);
+        EXPECT_FALSE(window.canAdmitExclusiveCohort(1u));
+        EXPECT_FALSE(gate.ready()) << "Observation cannot deliver the sideband";
+
+        gate.notify(MoEOverlayInferencePhase::Prefill, 55u);
+        ASSERT_TRUE(gate.consumeReadyForPhase(MoEOverlayInferencePhase::Prefill));
+        window = gate.demandWindow();
+        EXPECT_EQ(window.generation, 1u);
+        EXPECT_EQ(window.scope, MoEOptimizationDemandScope::DecodeCadence);
+        EXPECT_EQ(window.collected_routed_rows, 12u);
+        EXPECT_EQ(window.pending_submission_rows, 0u);
+        EXPECT_FALSE(gate.consumeReady());
+        EXPECT_EQ(gate.demandWindow().generation, 1u);
+    }
+
+    /** Oversized coalesced batches saturate headroom, not actual execution counts. */
+    TEST(MoEOverlayMaintenanceBoundaryGate,
+         ObservationClampsOvershootAndRetainsDeviceOwnedCooldown)
+    {
+        MoEOverlayMaintenanceBoundaryGate gate(9u);
+        gate.notify(MoEOverlayInferencePhase::Decode, 18u);
+        auto window = gate.demandWindow({0u, std::numeric_limits<std::uint64_t>::max()});
+        EXPECT_EQ(window.collected_routed_rows, 9u);
+        EXPECT_EQ(window.remainingRoutedRows(), 0u);
+        const auto consumed = gate.consumeReady();
+        ASSERT_TRUE(consumed);
+        EXPECT_EQ(consumed.completed_tokens, 18u);
+        ASSERT_EQ(gate.advanceAfterReceipt(4096u, 4096.0 / 9.0,
+            MoEOverlayMaintenanceCadenceReceipt::fromDynamicTransaction(72u, 0u)), 4096u);
+        window = gate.demandWindow();
+        EXPECT_EQ(window.generation, 1u);
+        EXPECT_EQ(window.capacity_routed_rows, 4096u);
+        EXPECT_TRUE(window.canAdmitExclusiveCohort(384u));
+    }
+
+    /** Concurrent inference notifications never disappear across observed resets. */
+    TEST(MoEOverlayMaintenanceBoundaryGate,
+         ConcurrentPublicationAndConsumptionRetainMonotonicObservations)
+    {
+        for (int repetition = 0; repetition < 20; ++repetition)
+        {
+            MoEOverlayMaintenanceBoundaryGate gate(9u);
+            std::atomic<unsigned> finished{0u};
+            const auto publish = [&](MoEOverlayInferencePhase phase)
+            {
+                for (unsigned row = 0u; row < 1000u; ++row)
+                    gate.notify(phase, 1u);
+                finished.fetch_add(1u, std::memory_order_release);
+            };
+            std::jthread prefill(publish, MoEOverlayInferencePhase::Prefill);
+            std::jthread decode(publish, MoEOverlayInferencePhase::Decode);
+            std::atomic<std::uint64_t> consumed{0u};
+            std::atomic<bool> consumption_finished{false};
+            std::jthread consumer([&]
+            {
+                while (finished.load(std::memory_order_acquire) != 2u || gate.ready())
+                {
+                    if (auto batch = gate.consumeReady())
+                        consumed.fetch_add(batch.completed_tokens, std::memory_order_relaxed);
+                }
+                consumption_finished.store(true, std::memory_order_release);
+            });
+            auto previous = gate.demandWindow();
+            while (!consumption_finished.load(std::memory_order_acquire))
+            {
+                const auto current = gate.demandWindow();
+                EXPECT_GE(current.generation, previous.generation);
+                if (current.generation == previous.generation)
+                    EXPECT_GE(current.collected_routed_rows, previous.collected_routed_rows);
+                previous = current;
+            }
+            const auto pending = gate.pendingTokens();
+            EXPECT_EQ(consumed.load(std::memory_order_relaxed) + pending[0] + pending[1], 2000u);
+        }
     }
 
     TEST(MoEOverlayMaintenanceBoundaryGate,

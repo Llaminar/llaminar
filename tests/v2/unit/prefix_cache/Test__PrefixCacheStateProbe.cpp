@@ -141,6 +141,50 @@ TEST(Test__PrefixCacheStateProbe, CapturesCPURingKVInventory)
     EXPECT_EQ(probe.layers[1].cached_tokens, 3);
 }
 
+/** @brief Each cache's seed length owns its exact-prefix and complete-suffix export. */
+TEST(Test__PrefixCacheStateProbe, ContinuationPartitionsUseActualCacheSeeds)
+{
+    for (const int copied_tokens : {0, 1, 2, 3})
+    {
+        CPURingKVCacheFP32 cache(getTestMPIContext(), 1, 1, 8, 1, 2, DeviceId::cpu());
+        auto k = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 2});
+        auto v = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 2});
+        std::fill(k->mutable_data(), k->mutable_data() + 8, 1.f);
+        std::fill(v->mutable_data(), v->mutable_data() + 8, 2.f);
+        PrefixProbeCapturePolicy base;
+        base.hash_full_kv_payloads = true;
+        base.capture_requested_kv_segment_payloads = true;
+        if (copied_tokens)
+            ASSERT_TRUE(cache.append_kv(0, 0, k.get(), v.get(), copied_tokens));
+        PrefixRuntimeStateSnapshot seed;
+        seed.initialized = true;
+        seed.mtp_kv_caches.push_back(inspectKVCacheForPrefixProbe(
+            cache, "mtp:0", DeviceId::cpu(), 1, nullptr, base));
+        auto policy = base.forKVContinuationOf(seed);
+        ASSERT_TRUE(cache.append_kv(0, 0, k.get(), v.get(), 4 - copied_tokens));
+        const auto probe = inspectKVCacheForPrefixProbe(
+            cache, "mtp:0", DeviceId::cpu(), 1, nullptr, policy);
+        const auto &layer = probe.layers.front();
+        EXPECT_EQ(layer.leading_segment_tokens, copied_tokens);
+        if (copied_tokens)
+        {
+            EXPECT_EQ(layer.leading_k_payload_hash, seed.mtp_kv_caches.front().layers.front().k_payload_hash);
+            EXPECT_EQ(layer.leading_v_payload_hash, seed.mtp_kv_caches.front().layers.front().v_payload_hash);
+        }
+        ASSERT_EQ(layer.segments.size(), 1u);
+        EXPECT_EQ(layer.segments.front().token_start, copied_tokens);
+        EXPECT_EQ(layer.segments.front().token_count, 4 - copied_tokens);
+        EXPECT_EQ(layer.segments.front().k_payload.size(), (4 - copied_tokens) * 2u * sizeof(float));
+        EXPECT_THROW(inspectKVCacheForPrefixProbe(
+            cache, "wrong-owner", DeviceId::cpu(), 1, nullptr, policy), std::invalid_argument);
+        policy.kv_continuation_partitions.push_back(policy.kv_continuation_partitions.front());
+        EXPECT_THROW(inspectKVCacheForPrefixProbe(
+            cache, "mtp:0", DeviceId::cpu(), 1, nullptr, policy), std::invalid_argument);
+        seed.kv_caches = seed.mtp_kv_caches;
+        EXPECT_THROW(base.forKVContinuationOf(seed), std::invalid_argument);
+    }
+}
+
 TEST(Test__PrefixCacheStateProbe, CapturesClearedCPURingKVInventory)
 {
     CPURingKVCacheFP32 cache(getTestMPIContext(), 1, 1, 4, 1, 2, DeviceId::cpu());

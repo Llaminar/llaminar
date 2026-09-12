@@ -572,6 +572,7 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
         source->sharedReturnRows(kParticipants[1])};
     populateReturn(target_return[0], 2, 10, 2, 300.0f);
     populateReturn(target_return[1], 2, 20, 1, 400.0f);
+    target_return[0].layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
 
     std::array<const MoEOverlayReturnRows *, 2> return_out{
         &target_return[0], &target_return[1]};
@@ -596,6 +597,8 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
     ASSERT_TRUE(return_consume.ok) << return_consume.error;
 
     EXPECT_EQ(source_return[0].source_participant, kParticipants[0]);
+    EXPECT_EQ(source_return[0].layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
+    EXPECT_EQ(source_return[1].layout, MoEOverlayReturnLayout::ParticipantTokenPartials);
     EXPECT_EQ(source_return[0].target_participant, 2);
     EXPECT_EQ(source_return[0].live_row_count, 2u);
     EXPECT_EQ(source_return[0].row_ids_host[1], 11);

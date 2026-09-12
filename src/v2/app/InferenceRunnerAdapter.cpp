@@ -235,9 +235,10 @@ namespace llaminar2
         orch_runner_->flushStageTimeline();
     }
 
-    PrefixRuntimeStateSnapshot InferenceRunnerAdapter::prefixStateProbe() const
+    PrefixRuntimeStateSnapshot InferenceRunnerAdapter::prefixStateProbe(
+        const PrefixProbeCapturePolicy &capture_policy) const
     {
-        return orch_runner_ ? orch_runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+        return orch_runner_ ? orch_runner_->prefixStateProbe(capture_policy) : PrefixRuntimeStateSnapshot{};
     }
 
     uint64_t InferenceRunnerAdapter::moeRuntimeMovementEpoch() const

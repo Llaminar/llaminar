@@ -201,6 +201,9 @@ namespace llaminar2
      * from a persistent device scalar on every graph replay. When
      * @p d_row_count is non-null, rows at or beyond that resident count no-op;
      * this preserves fixed bucket launch geometry for unequal request batches.
+     * An empty cache copies its first input key as its immutable basis, even
+     * when that row is evicted by an oversized append. Non-empty/restored
+     * caches preserve their basis. Every phase obeys this same contract.
      */
     extern "C" bool cuda_tq_quantize_grouped_ring_dynamic(
         const float *d_K_input, const float *d_V_input,
@@ -211,7 +214,6 @@ namespace llaminar2
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
         TurboQuantKVMode mode,
-        AttentionKeyAnchorPolicy anchor_policy,
         cudaStream_t stream);
 
     // =========================================================================

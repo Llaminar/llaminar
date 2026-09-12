@@ -24,7 +24,9 @@
 
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
+#include "execution/moe/DeviceMoERebalancePublication.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
+#include "execution/moe/DeviceMoERebalanceMovementJournal.h"
 #include "execution/moe/LeastLoadedExpertAssignment.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
@@ -840,6 +842,7 @@ namespace
         uint32_t destination_previous_layer;
         uint32_t destination_previous_expert;
         uint32_t destination_generation;
+        uint64_t activation_count;
     };
     static_assert(
         sizeof(DeviceMoERebalancePlanEntryView) ==
@@ -880,7 +883,10 @@ namespace
         uint32_t command_capacity;
         uint32_t participant_id;
         uint32_t participant_count;
+        llaminar2::DeviceMoERebalanceMovementDecision movement_decision;
     };
+    static_assert(sizeof(DeviceMoERebalanceCommandBufferHeaderView) ==
+                  llaminar2::moe_rebalance_abi::kCommandHeaderBytes);
 
     struct DeviceMoERebalanceWaveStateView
     {
@@ -918,6 +924,7 @@ namespace
         uint32_t payload_bucket_index;
         uint32_t payload_bucket_overflow;
         uint32_t error_participant;
+        uint64_t copied_payload_bytes;
     };
 
     struct DeviceMoERebalanceGraphControllerStateView
@@ -952,8 +959,14 @@ namespace
         uint32_t maintenance_due;
         uint32_t decode_boundary_advanced;
         DeviceMoERebalanceWaveProgressView waves[2];
+        llaminar2::DeviceMoERebalanceMovementJournalState movement_journal;
         llaminar2::DeviceMoERebalanceDispatchTicket dispatch_ticket;
     };
+
+    static_assert(sizeof(DeviceMoERebalanceWaveProgressView) ==
+                  llaminar2::moe_rebalance_abi::kWaveProgressBytes);
+    static_assert(sizeof(DeviceMoERebalanceGraphControllerStateView) ==
+                  llaminar2::moe_rebalance_abi::kGraphControllerBytes);
 
     struct DeviceMoEExpertDirectoryEntryView
     {
@@ -994,7 +1007,11 @@ namespace
         uint32_t transaction_wave_index;
         uint32_t transaction_epoch;
         uint32_t transaction_command_count;
+        uint64_t copied_payload_bytes;
     };
+
+    static_assert(sizeof(DeviceMoERebalanceApplyStatusView) ==
+                  llaminar2::moe_rebalance_abi::kApplyStatusBytes);
 
     /**
      * @brief Detect two local arrivals that cannot coexist in one transaction.
@@ -1335,6 +1352,7 @@ namespace
                wave.state == kDeviceMoERebalanceLifecycleTransferInFlight ||
                wave.state == kDeviceMoERebalanceLifecycleReadyToApply ||
                wave.state == kDeviceMoERebalanceLifecycleApplying ||
+               wave.state == llaminar2::moe_rebalance_publication::kPreparedForPublication ||
                wave.state == kDeviceMoERebalanceLifecycleError;
     }
 
@@ -1356,6 +1374,7 @@ namespace
         wave.version = kDeviceMoERebalanceVersion;
         wave.state = kDeviceMoERebalanceLifecycleIdle;
         wave.error_participant = kDeviceMoEInvalidSlot;
+        wave.copied_payload_bytes = 0;
     }
 
     /**
@@ -1446,6 +1465,7 @@ namespace
         header->command_capacity = command_capacity;
         header->participant_id = participant_id;
         header->participant_count = participant_count;
+        header->movement_decision = {};
     }
 
     __device__ __forceinline__ uint32_t rebalance_layer_window_count(
@@ -5093,6 +5113,7 @@ namespace
                     heavy_entry.op = kDeviceMoERebalancePlanOwnershipTransfer;
                     heavy_entry.layer = layer;
                     heavy_entry.expert = swap_choice.heavy_expert;
+                    heavy_entry.activation_count = shared_expert_counts[swap_choice.heavy_expert];
                     heavy_entry.source_participant = heavy_source;
                     heavy_entry.destination_participant = heavy_destination;
                     heavy_entry.destination_overlay_participant =
@@ -5107,6 +5128,7 @@ namespace
                     light_entry.op = kDeviceMoERebalancePlanOwnershipTransfer;
                     light_entry.layer = layer;
                     light_entry.expert = swap_choice.light_expert;
+                    light_entry.activation_count = shared_expert_counts[swap_choice.light_expert];
                     light_entry.source_participant = light_source;
                     light_entry.destination_participant = light_destination;
                     light_entry.destination_overlay_participant =
@@ -6297,6 +6319,24 @@ namespace
                                             ? shared_plan_epoch
                                             : last_epoch;
                 command_header->command_count = command_count;
+                command_header->movement_decision = {};
+                // The general planner can also emit an ownership-only wave.
+                // Seal it at the same post-admission boundary as the dedicated
+                // ownership kernel; mixed replica/assignment waves are distinct.
+                if (!LeastLoadedAssignment && command_count > 0u &&
+                    dynamic_ownership_swap_accepts <= UINT32_MAX / 2u &&
+                    command_count == dynamic_ownership_swap_accepts * 2u)
+                {
+                    auto &decision = command_header->movement_decision;
+                    decision.kind = llaminar2::DeviceMoERebalanceMovementDecisionKind::NativeOwnershipSpread;
+                    decision.load = {
+                        accepted_load_spread_improvement_total,
+                        pre_wave_load_spread, post_wave_load_spread,
+                        pre_wave_load_total, post_wave_load_total,
+                        pre_max - pre_min, post_max - post_min, pre_total, post_total,
+                        requested_payload_slots, config.min_wave_spread_improvement_per_payload_slot,
+                        config.max_post_wave_load_spread_per_mille, dynamic_ownership_swap_accepts};
+                }
             }
             if (wave_state)
             {
@@ -6913,6 +6953,7 @@ namespace
                     heavy_entry.layer = layer;
                     heavy_entry.expert = swap_choice.heavy_expert;
                     heavy_entry.source_participant = heavy_source;
+                    heavy_entry.activation_count = shared_expert_counts[swap_choice.heavy_expert];
                     heavy_entry.destination_participant = heavy_destination;
                     heavy_entry.destination_overlay_participant =
                         heavy_destination_overlay_participant;
@@ -6927,6 +6968,7 @@ namespace
                     light_entry.layer = layer;
                     light_entry.expert = swap_choice.light_expert;
                     light_entry.source_participant = light_source;
+                    light_entry.activation_count = shared_expert_counts[swap_choice.light_expert];
                     light_entry.destination_participant = light_destination;
                     light_entry.destination_overlay_participant =
                         light_destination_overlay_participant;
@@ -7235,6 +7277,21 @@ namespace
             {
                 command_header->epoch = command_count > 0u ? shared_plan_epoch : last_epoch;
                 command_header->command_count = command_count;
+                // Seal policy inputs beside the commands before reusable
+                // status/histograms can observe another planning window.
+                command_header->movement_decision = {};
+                if (command_count > 0u)
+                {
+                    auto &decision = command_header->movement_decision;
+                    decision.kind = llaminar2::DeviceMoERebalanceMovementDecisionKind::NativeOwnershipSpread;
+                    decision.load = {
+                        accepted_load_spread_improvement_total,
+                        pre_wave_load_spread, post_wave_load_spread,
+                        pre_wave_load_total, post_wave_load_total,
+                        pre_max - pre_min, post_max - post_min, pre_total, post_total,
+                        requested_payload_slots, config.min_wave_spread_improvement_per_payload_slot,
+                        config.max_post_wave_load_spread_per_mille, dynamic_ownership_swap_accepts};
+                }
             }
             if (wave_state)
             {
@@ -8241,6 +8298,7 @@ namespace
             plan_entries + static_cast<unsigned long long>(wave_index) * plan_capacity;
         bool transfer_complete = true;
         uint32_t copied_arrivals_total = 0u;
+        uint64_t copied_payload_bytes_total = 0u;
         uint32_t failing_participant = kDeviceMoEInvalidSlot;
         uint32_t failing_expected_arrivals = 0u;
         uint32_t failing_copied_arrivals = 0u;
@@ -8292,6 +8350,16 @@ namespace
                 break;
             }
             copied_arrivals_total += peer_status.copied_arrivals;
+            // This is the existing authenticated arrival collective, not a
+            // byte estimate from the plan or an additional host observation.
+            if (peer_status.copied_payload_bytes > UINT64_MAX - copied_payload_bytes_total)
+            {
+                transfer_complete = false;
+                failing_participant = participant;
+                failing_copy_status_code = kDeviceMoERebalanceApplyStatusInvalidRuntime;
+                break;
+            }
+            copied_payload_bytes_total += peer_status.copied_payload_bytes;
         }
         if (transfer_complete)
         {
@@ -8332,6 +8400,7 @@ namespace
         wave.planned_layer_count = wave_state->planned_layer_count;
         wave.command_count = command_count;
         wave.copied_arrivals = copied_arrivals_total;
+        wave.copied_payload_bytes = copied_payload_bytes_total;
         wave.applied_arrivals = 0u;
         wave.applied_layer_count = 0u;
         wave.error_code = 0u;
@@ -9087,6 +9156,7 @@ namespace
                     config))
             {
                 projected.epoch = root_header.epoch;
+                projected.movement_decision = root_header.movement_decision;
                 const uint32_t header_capacity =
                     root_header.command_capacity < plan_capacity
                         ? root_header.command_capacity
@@ -10988,6 +11058,7 @@ namespace
             dst.flags |= kDeviceMoEDirectoryFlagResident |
                          kDeviceMoEDirectoryFlagCopyComplete;
             atomicAdd(&status->copied_arrivals, 1u);
+            atomicAdd(reinterpret_cast<unsigned long long *>(&status->copied_payload_bytes), offset);
         }
     }
 
@@ -11399,6 +11470,9 @@ namespace
                         if (command_header)
                             shared_command_header = command_header + shared_ready_wave_index;
                         shared_ready_wave->state = kDeviceMoERebalanceLifecycleApplying;
+                        status->transaction_wave_index = shared_ready_wave_index;
+                        status->transaction_epoch = shared_ready_wave->epoch;
+                        status->transaction_command_count = shared_ready_wave->command_count;
                         ++controller_state->decode_apply_hits;
                     }
                 }
@@ -11987,11 +12061,21 @@ namespace
                         : shared_ready_wave->planned_layer_count;
                 if (shared_ready_wave->applied_layer_count >= shared_ready_wave->planned_layer_count)
                 {
-                    clear_rebalance_command_header_device(shared_command_header);
-                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleApplied;
-                    controller_state->active_wave =
-                        (controller_state->active_wave + 1u) %
-                        rebalance_command_buffer_count(command_buffer_count);
+                    if (shared_overlay_enabled != 0u)
+                    {
+                        // Candidate preparation is not durable publication.
+                        // Keep the commands and wave leased to the finalizer.
+                        shared_ready_wave->state =
+                            llaminar2::moe_rebalance_publication::kPreparedForPublication;
+                    }
+                    else
+                    {
+                        clear_rebalance_command_header_device(shared_command_header);
+                        shared_ready_wave->state = kDeviceMoERebalanceLifecycleApplied;
+                        controller_state->active_wave =
+                            (controller_state->active_wave + 1u) %
+                            rebalance_command_buffer_count(command_buffer_count);
+                    }
                 }
                 else
                 {
@@ -12070,17 +12154,28 @@ namespace
      * published bank. Main and every MTP sidecar then observe the same immutable
      * bank through their shared ticket and canonical placement pointer.
      */
-    __global__ void finalize_overlay_rebalance_publication_kernel(
+    // The launch is exactly 256 threads. Advertising the compiler's default
+    // 1024-thread ceiling needlessly caps registers and spills control metadata.
+    __global__ __launch_bounds__(kDeviceMoERebalanceApplyThreads, 2)
+    void finalize_overlay_rebalance_publication_kernel(
         DeviceMoELayerRuntimeView *runtime_layers,
         uint32_t layer_count,
         uint32_t expert_count,
         llaminar2::DeviceMoEOverlayEpochControl *control,
         uint64_t *candidate_epoch_ptr,
         llaminar2::DeviceMoEOverlayEpochStatus *status,
-        const DeviceMoERebalanceApplyStatusView *apply_status)
+        const DeviceMoERebalanceApplyStatusView *apply_status,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        DeviceMoERebalanceCommandBufferHeaderView *command_headers,
+        uint32_t command_buffer_count,
+        const DeviceMoERebalancePlanEntryView *plan_entries,
+        uint32_t plan_capacity,
+        uint64_t estimated_expert_bytes,
+        llaminar2::DeviceMoERebalanceMovementJournalView journal)
     {
         if (blockIdx.x != 0u || !runtime_layers || !control ||
-            !candidate_epoch_ptr || !status || !apply_status)
+            !candidate_epoch_ptr || !status || !apply_status ||
+            !controller_state || !command_headers)
         {
             return;
         }
@@ -12090,9 +12185,20 @@ namespace
         __shared__ uint32_t candidate_bank;
         __shared__ uint64_t candidate_epoch;
         __shared__ uint64_t old_selector;
+        // One writer owns reservation/commit; edge copies use all block lanes.
+        // Shared storage prevents a per-thread copy of the sealed policy proof.
+        __shared__ uint64_t journal_append_storage[
+            (sizeof(llaminar2::DeviceMoEMovementJournalAppend) + sizeof(uint64_t) - 1u) /
+            sizeof(uint64_t)];
+        auto &journal_append =
+            *reinterpret_cast<llaminar2::DeviceMoEMovementJournalAppend *>(journal_append_storage);
+        __shared__ uint32_t journal_required;
+        __shared__ uint64_t plan_offset;
 
         if (threadIdx.x == 0u)
         {
+            journal_required = 0u;
+            plan_offset = 0u;
             /* Capture the reserve result before this same record becomes the
              * final publication result. A failed/busy reserve is deliberately
              * left intact for an ordered diagnostic consumer. */
@@ -12114,8 +12220,12 @@ namespace
             {
                 const bool apply_record_valid =
                 apply_status->magic == kDeviceMoERebalanceMagic &&
-                apply_status->version == kDeviceMoERebalanceVersion &&
-                apply_status->status_code == kDeviceMoERebalanceStatusOk;
+                    apply_status->version == kDeviceMoERebalanceVersion &&
+                    apply_status->status_code == kDeviceMoERebalanceStatusOk &&
+                    (apply_status->changed_layers == 0u ||
+                     llaminar2::moe_rebalance_publication::preparedWaveMatches(
+                         controller_state, command_headers, command_buffer_count,
+                         apply_status));
                 const bool topology_valid =
                 layer_count > 0u &&
                 layer_count <= static_cast<uint32_t>(kDeviceMoEMaxExperts) &&
@@ -12137,7 +12247,40 @@ namespace
                 overlay_atomic_load64(&control->published_selector) ==
                     old_selector;
 
-                if (!apply_record_valid || !topology_valid)
+                bool journal_valid = journal.state == &controller_state->movement_journal &&
+                    journal.valid();
+                if (apply_record_valid && topology_valid &&
+                    apply_status->changed_layers != 0u)
+                {
+                    const auto &header = command_headers[apply_status->transaction_wave_index];
+                    const auto kind = header.movement_decision.kind;
+                    journal_required = kind ==
+                        llaminar2::DeviceMoERebalanceMovementDecisionKind::NativeOwnershipSpread;
+                    journal_valid = journal_valid && (journal_required != 0u || kind ==
+                        llaminar2::DeviceMoERebalanceMovementDecisionKind::None);
+                    if (journal_required != 0u)
+                    {
+                        const auto &wave = controller_state->waves[apply_status->transaction_wave_index];
+                        journal_append = llaminar2::prepareDeviceMoEMovementJournalAppend(
+                            journal, candidate_epoch, header.epoch, header.command_count,
+                            header.movement_decision.load, wave.copied_payload_bytes);
+                        journal_valid = journal_valid && plan_entries && plan_capacity != 0u &&
+                            header.command_count <= plan_capacity && estimated_expert_bytes != 0u &&
+                            journal_append.disposition !=
+                                llaminar2::DeviceMoEMovementJournalDisposition::Invalid;
+                        plan_offset = static_cast<uint64_t>(apply_status->transaction_wave_index) *
+                            plan_capacity;
+                        // This bounded metadata walk is performed only for an
+                        // accepted maintenance wave, never for each decode token.
+                        for (uint32_t i = 0u; journal_valid && i < header.command_count; i += 2u)
+                            journal_valid = llaminar2::nativeMovementPairValid(
+                                plan_entries[plan_offset + i], plan_entries[plan_offset + i + 1u],
+                                layer_count, expert_count, controller_state->participant_count,
+                                kDeviceMoERebalancePlanOwnershipTransfer);
+                    }
+                }
+
+                if (!apply_record_valid || !topology_valid || !journal_valid)
                 {
                     uint32_t prior = static_cast<uint32_t>(
                         llaminar2::DeviceMoEOverlayEpochBankState::Empty);
@@ -12246,7 +12389,34 @@ namespace
         }
         __syncthreads();
         if (valid == 0u)
+        {
+            // A failed reservation/no-work poll is benign; corrupt publication
+            // is terminal. Preserve its commands and poison the existing owner
+            // so later replay cannot turn this into an indefinitely busy wave.
+            if (threadIdx.x == 0u && status->code == static_cast<uint32_t>(
+                    llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl))
+            {
+                poison_rebalance_graph_controller(
+                    controller_state, kDeviceMoERebalanceStatusInvalidRuntime,
+                    apply_status->transaction_wave_index, apply_status->transaction_epoch,
+                    0u, 0u, apply_status->status_code, controller_state->participant_id);
+            }
             return;
+        }
+
+        // Reserved payload bytes are not visible history until the selector
+        // publishes. Exhaustion skips writes but records the whole missing wave.
+        if (journal_required != 0u && journal_append.disposition ==
+            llaminar2::DeviceMoEMovementJournalDisposition::Record)
+        {
+            for (uint32_t i = threadIdx.x; i < journal_append.edge_count; i += blockDim.x)
+            {
+                const auto &plan = plan_entries[plan_offset + i];
+                journal.edges[journal_append.first_edge + i] = {
+                    plan.layer, plan.expert, plan.source_participant, plan.destination_participant,
+                    plan.activation_count, estimated_expert_bytes};
+            }
+        }
 
         for (uint32_t layer = 0u; layer < layer_count; ++layer)
         {
@@ -12322,6 +12492,10 @@ namespace
                     old_selector,
                     candidate_bank,
                     llaminar2::DeviceMoEOverlayEpochBankState::Ready);
+                poison_rebalance_graph_controller(
+                    controller_state, kDeviceMoERebalanceStatusInvalidRuntime,
+                    apply_status->transaction_wave_index, apply_status->transaction_epoch,
+                    0u, 0u, apply_status->status_code, controller_state->participant_id);
                 return;
             }
 
@@ -12340,6 +12514,30 @@ namespace
                 static_cast<uint32_t>(
                     llaminar2::DeviceMoEOverlayEpochBankState::Retiring));
             *candidate_epoch_ptr = candidate_epoch + 1u;
+            // The same device owner publishes placement and its immutable
+            // receipt. No telemetry enablement can alter this lifecycle edge.
+            if (journal_required != 0u &&
+                !llaminar2::commitDeviceMoEMovementJournalAppend(journal, journal_append))
+            {
+                finish_overlay_publication_status(
+                    status, llaminar2::DeviceMoEOverlayEpochOperation::PublishCandidate,
+                    llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                    candidate_epoch, next_selector, candidate_bank,
+                    llaminar2::DeviceMoEOverlayEpochBankState::Published);
+                poison_rebalance_graph_controller(
+                    controller_state, kDeviceMoERebalanceStatusInvalidRuntime,
+                    apply_status->transaction_wave_index, apply_status->transaction_epoch,
+                    0u, 0u, apply_status->status_code, controller_state->participant_id);
+                return;
+            }
+            // The selector is now published. Only this successful finalizer
+            // can release the exact command generation and advertise Applied.
+            const uint32_t completed_wave = apply_status->transaction_wave_index;
+            clear_rebalance_command_header_device(&command_headers[completed_wave]);
+            controller_state->waves[completed_wave].state =
+                kDeviceMoERebalanceLifecycleApplied;
+            controller_state->active_wave =
+                (completed_wave + 1u) % command_buffer_count;
             __threadfence();
             finish_overlay_publication_status(
                 status,
@@ -17716,11 +17914,20 @@ bool hipMoE_finalize_overlay_rebalance_publication(
     uint64_t *candidate_epoch,
     llaminar2::DeviceMoEOverlayEpochStatus *status,
     const void *apply_status,
+    void *controller_state,
+    void *command_headers,
+    uint32_t command_buffer_count,
+    const void *plan_entries,
+    uint32_t plan_capacity,
+    uint64_t estimated_expert_bytes,
+    llaminar2::DeviceMoERebalanceMovementJournalView journal,
     int device_idx,
     void *stream)
 {
     if (!runtime_layers || layer_count == 0u || expert_count == 0u ||
-        !control || !candidate_epoch || !status || !apply_status || !stream)
+        !control || !candidate_epoch || !status || !apply_status || !stream ||
+        !controller_state || !command_headers || command_buffer_count == 0u ||
+        command_buffer_count > 2u || !plan_entries || plan_capacity == 0u)
     {
         return false;
     }
@@ -17736,7 +17943,12 @@ bool hipMoE_finalize_overlay_rebalance_publication(
         control,
         candidate_epoch,
         status,
-        static_cast<const DeviceMoERebalanceApplyStatusView *>(apply_status));
+        static_cast<const DeviceMoERebalanceApplyStatusView *>(apply_status),
+        static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+        static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(command_headers),
+        command_buffer_count,
+        static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries),
+        plan_capacity, estimated_expert_bytes, journal);
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)

@@ -1469,6 +1469,11 @@ namespace llaminar2::cpu::native_vnni
                     const Q8_1Block &a_blk = A_q8[kb];
                     float a_scale = nativeVNNIFP16ScaleToFP32(a_blk.d);
 
+                    if (packed.usesCompactMultiScale())
+                    {
+                        acc += multi_scale::scalarReferenceBlock(packed, a_blk, chunk, kb, n_local);
+                        continue;
+                    }
                     if (packed.usesQ6KNativeDualScale())
                     {
                         int32_t dot_low = 0;
@@ -2735,6 +2740,12 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate = false)
     {
+        if (packed.usesCompactMultiScale())
+        {
+            multi_scale::dispatch<16>(packed, std::array{A_q8}, std::array{C},
+                                      chunk, kb_start, kb_end, accumulate);
+            return;
+        }
         if (packed.usesQ6KNativeDualScale())
         {
             gemvQ6KNativeAVX512Chunk(
@@ -3336,6 +3347,67 @@ namespace llaminar2::cpu::native_vnni
     // Full GEMV dispatcher (M=1) — unified eager-interleaved entrypoint
     // =========================================================================
 
+    /**
+     * @brief Publish one Q8 block under the matrix's arithmetic policy.
+     * @param source Source FP32 values.
+     * @param destination Destination Q8_1 block.
+     * @param valid_elements Number of valid source values.
+     * @param policy Backend-native or placement-invariant publication.
+     */
+    inline void quantizeActivationBlock(
+        const float *source,
+        Q8_1Block &destination,
+        int valid_elements,
+        CPUProjectionNumericalPolicy policy)
+    {
+        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+        {
+            gpu_aligned_expert_q8::quantizeBlock(
+                source, destination, valid_elements);
+            return;
+        }
+        simd::quantize_single_block(
+            source, destination, valid_elements);
+    }
+
+    /**
+     * @brief Publish two complete adjacent Q8 blocks under one policy.
+     * @param source Source pointer containing 64 FP32 values.
+     * @param first First destination block.
+     * @param second Second destination block.
+     * @param policy Backend-native or placement-invariant publication.
+     */
+    inline void quantizeTwoActivationBlocks(
+        const float *source,
+        Q8_1Block &first,
+        Q8_1Block &second,
+        CPUProjectionNumericalPolicy policy)
+    {
+        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
+        {
+            gpu_aligned_expert_q8::quantizeTwoBlocks(source, first, second);
+            return;
+        }
+#if defined(__AVX512F__)
+        simd::quantize_two_blocks_avx512(source, first, second);
+#else
+        simd::quantize_single_block(source, first);
+        simd::quantize_single_block(
+            source + Q8_1Block::BLOCK_SIZE, second);
+#endif
+    }
+
+    /**
+     * @brief Quantize and execute one row using its prepared arithmetic policy.
+     * @param packed Immutable weight layout and numerical policy.
+     * @param A_fp32 One row of K FP32 activation values.
+     * @param C Destination for N FP32 projection values.
+     *
+     * Serial and grouped callers share block publication helpers. Selecting
+     * backend-native quantization here for a GPU-aligned expert would change
+     * its input bytes solely because M became one. Quantization stays serial
+     * and reuses caller-local storage; this adds no team launch or row replay.
+     */
     inline void gemv_native_vnni(
         const CPUNativeVNNIPackedWeights &packed,
         const float *A_fp32,
@@ -3358,7 +3430,9 @@ namespace llaminar2::cpu::native_vnni
         {
             for (; kb + 1 < K_blocks; kb += 2)
             {
-                simd::quantize_two_blocks_avx512(A_fp32 + kb * 32, A_q8[kb], A_q8[kb + 1]);
+                quantizeTwoActivationBlocks(
+                    A_fp32 + kb * 32, A_q8[kb], A_q8[kb + 1],
+                    packed.numerical_policy);
             }
         }
 #endif
@@ -3366,7 +3440,9 @@ namespace llaminar2::cpu::native_vnni
         {
             int block_start = kb * 32;
             int block_len = std::min(32, K - block_start);
-            simd::quantize_single_block(A_fp32 + block_start, A_q8[kb], block_len);
+            quantizeActivationBlock(
+                A_fp32 + block_start, A_q8[kb], block_len,
+                packed.numerical_policy);
         }
 
         // Step 2+: Delegate to pre-quantized compute path
@@ -3639,6 +3715,12 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate)
     {
+        if (packed.usesCompactMultiScale())
+        {
+            multi_scale::dispatch<16>(packed, std::array{A_q8_row0, A_q8_row1},
+                                      std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate);
+            return;
+        }
         if (packed.usesQ6KNativeDualScale())
         {
             gemmQ6KNativeTwoRowsAVX512Chunk(
@@ -4387,6 +4469,12 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate)
     {
+        if (packed.usesCompactMultiScale())
+        {
+            multi_scale::dispatch<16>(packed, std::array{A_q8_row0, A_q8_row1, A_q8_row2},
+                                      std::array{C_row0, C_row1, C_row2}, chunk, kb_start, kb_end, accumulate);
+            return;
+        }
         if (packed.usesQ6KNativeDualScale())
         {
             gemmQ6KNativeThreeRowsAVX512Chunk(
@@ -4683,6 +4771,12 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate)
     {
+        if (packed.usesCompactMultiScale())
+        {
+            multi_scale::dispatch<16>(packed, std::array{A_q8_row0, A_q8_row1, A_q8_row2, A_q8_row3},
+                                      std::array{C_row0, C_row1, C_row2, C_row3}, chunk, kb_start, kb_end, accumulate);
+            return;
+        }
         if (packed.usesQ6KNativeDualScale())
         {
             gemmQ6KNativeFourRowsAVX512Chunk(
@@ -4852,56 +4946,6 @@ namespace llaminar2::cpu::native_vnni
     // =========================================================================
     // Shared activation quantization (for multiply_fused quantize-once)
     // =========================================================================
-
-    /**
-     * @brief Publish one Q8 block under the matrix's arithmetic policy.
-     * @param source Source FP32 values.
-     * @param destination Destination Q8_1 block.
-     * @param valid_elements Number of valid source values.
-     * @param policy Backend-native or placement-invariant publication.
-     */
-    inline void quantizeActivationBlock(
-        const float *source,
-        Q8_1Block &destination,
-        int valid_elements,
-        CPUProjectionNumericalPolicy policy)
-    {
-        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-        {
-            gpu_aligned_expert_q8::quantizeBlock(
-                source, destination, valid_elements);
-            return;
-        }
-        simd::quantize_single_block(
-            source, destination, valid_elements);
-    }
-
-    /**
-     * @brief Publish two complete adjacent Q8 blocks under one policy.
-     * @param source Source pointer containing 64 FP32 values.
-     * @param first First destination block.
-     * @param second Second destination block.
-     * @param policy Backend-native or placement-invariant publication.
-     */
-    inline void quantizeTwoActivationBlocks(
-        const float *source,
-        Q8_1Block &first,
-        Q8_1Block &second,
-        CPUProjectionNumericalPolicy policy)
-    {
-        if (policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-        {
-            gpu_aligned_expert_q8::quantizeTwoBlocks(source, first, second);
-            return;
-        }
-#if defined(__AVX512F__)
-        simd::quantize_two_blocks_avx512(source, first, second);
-#else
-        simd::quantize_single_block(source, first);
-        simd::quantize_single_block(
-            source + Q8_1Block::BLOCK_SIZE, second);
-#endif
-    }
 
     inline void quantize_activations_to_q8_1(
         const float *A_fp32,

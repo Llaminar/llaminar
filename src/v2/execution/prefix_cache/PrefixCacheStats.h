@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "execution/prefix_cache/PrefixPlacementEpochSpan.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -100,8 +102,9 @@ namespace llaminar2
      * ExpertOverlay movement may publish while an already admitted request is
      * executing.  The request remains correct under its RCU lease, but its
      * completed state cannot be archived under a newer placement fingerprint.
-     * The two movement epochs make that interval explicit without asking a
-     * diagnostic counter to reconstruct lifecycle state after the fact.
+     * The admission span includes movement between participant lookups, while
+     * the completion epoch includes movement through harvest. Neither bound
+     * is reconstructed from optional diagnostic counters.
      */
     struct PrefixCacheRequestSummary
     {
@@ -118,8 +121,8 @@ namespace llaminar2
         bool mtp_state_restored = false;
         bool hybrid_state_restored = false;
         std::string storage_tier = "none";
-        /** Placement epoch selected by the coordinated prefix lookup. */
-        uint64_t admission_movement_epoch = 0;
+        /** Complete epoch span selected by the coordinated prefix lookup. */
+        PrefixPlacementEpochSpan admission_placement_epochs;
         /** Live placement epoch sampled after prefix harvest completed. */
         uint64_t completion_movement_epoch = 0;
 
@@ -132,7 +135,7 @@ namespace llaminar2
          */
         [[nodiscard]] bool crossedMovementEpoch() const noexcept
         {
-            return completion_movement_epoch > admission_movement_epoch;
+            return completion_movement_epoch > admission_placement_epochs.earliest();
         }
 
         /**
@@ -152,7 +155,7 @@ namespace llaminar2
             const PrefixCacheRequestSummary &next) const noexcept
         {
             return crossedMovementEpoch() ||
-                   next.admission_movement_epoch >
+                   next.admission_placement_epochs.latest() >
                        completion_movement_epoch;
         }
     };

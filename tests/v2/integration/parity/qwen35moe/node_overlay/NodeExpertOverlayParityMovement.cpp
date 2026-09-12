@@ -20,9 +20,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * initial stationary timing cohort are complete before this method begins.
      * This driver replays those exact prompt identities while optimizing, so
      * phase-weighted placement sees the same prefill and decode trajectories
-     * that the A/B gate will judge. Only a typed demand-window-rotation phase
-     * uses cache-distinct identities after the movement objective is already
-     * satisfied. The background worker owns interval
+     * that the A/B gate will judge. Typed demand-window closure keeps the
+     * authenticated prompt stationary and purges the reusable prefix archive
+     * to guarantee actual routed rows. The background worker owns interval
      * selection, staging, transfer, overlap validation, and publication; no
      * histogram, placement, or completion value is injected here.
      *
@@ -137,7 +137,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         const ConvergenceBoundaryPurpose boundary_purpose =
             requiresObservedConvergenceSpeedup()
                 ? ConvergenceBoundaryPurpose::ObservedSpeedupCohort
-                : ConvergenceBoundaryPurpose::MovementProof;
+                : activeMTPEnabled()
+                ? ConvergenceBoundaryPurpose::MTPNumericalParity
+                : ConvergenceBoundaryPurpose::NumericalParity;
         std::optional<SubmittedDemandWindowAdmission>
             submitted_demand_admission;
         const auto observeMovement = [&]()
@@ -188,11 +190,11 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         /**
          * Stop adding demand and classify the next measurement boundary.
          *
-         * Quiescence proves that no complete window or admitted wave exists.
-         * That is the complete contract for a movement-only parity cell. The
-         * observed-speedup cell additionally proves that the partially
-         * collected window can contain all 57 routed timing rows plus the
-         * canonical numerical-parity tail in one epoch. The authority
+         * Quiescence alone does not reserve the next request's epoch. Every
+         * numerical proof needs room for its prefix seed and complete restore.
+         * MTP numerical parity additionally needs room for its serial oracle,
+         * grouped transaction and prefix-restore checks; observed-speedup
+         * cells need their timing cohort and numerical tail. The authority
          * publishes exact active-bank occupancy for that purpose. A newly
          * rotated empty bank requests one authenticated seed; an insufficient
          * partial bank returns one typed exact closure. A submitted-admission
@@ -573,13 +575,62 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                     return reportConvergenceFailure();
                 }
 
-                const int corpus_request =
-                    convergenceMovementPromptIdentity(
-                        ConvergenceMovementTraffic::DemandWindowClosure,
-                        admitted_requests);
+                if (settlement.closure->kind ==
+                    DemandWindowClosureKind::DeliverPendingProgress)
+                {
+                    // An ordinary captured command delivers the already-retired
+                    // sideband to every participant. Polling alone cannot do it.
+                    if (!runDynamicEconomyDecode(1, "pending-progress-delivery"))
+                        return false;
+                    submitted_demand_admission = SubmittedDemandWindowAdmission{
+                        .generation = settlement.closure->generation,
+                        .observed_routed_rows = settlement.closure->observed_routed_rows,
+                    };
+                    ++admitted_requests;
+                    continue;
+                }
+                if (settlement.closure->scope ==
+                    MoEOptimizationDemandScope::DecodeCadence)
+                {
+                    // Cadence counts committed tokens, not router activations.
+                    // Budget one retains the real captured serial transaction
+                    // even in an MTP cell and advances exactly one notification.
+                    for (std::uint64_t row = 0u;
+                         row < settlement.closure->routed_rows; ++row)
+                    {
+                        const auto complete = runDynamicEconomyDecode(
+                            1, "decode-cadence-closure");
+                        if (!complete)
+                            return false;
+                        if (*complete && !runDynamicEconomyPrefill(
+                                config_.token_ids, "decode-cadence-next-request"))
+                            return false;
+                    }
+                    // Deliver the final decode sideband through the next real
+                    // request, including any naturally occurring prefix hit.
+                    if (!runDynamicEconomyPrefill(
+                            config_.token_ids, "decode-cadence-publication"))
+                        return false;
+                    submitted_demand_admission = SubmittedDemandWindowAdmission{
+                        .generation = settlement.closure->generation,
+                        .observed_routed_rows = settlement.closure->observed_routed_rows,
+                    };
+                    ++admitted_requests;
+                    continue;
+                }
+
+                // End the preceding request's cache lease before eviction.
+                // Keep the workload stationary: a nonce in the leading token
+                // changes router demand, it is not merely a cache-busting key.
+                activeClearCache();
+                if (!orch_runner_->purgePrefixCache())
+                {
+                    LOG_ERROR("[Qwen3.5 MoE GraphNative] Demand closure could not purge reusable prefixes: "
+                              << orch_runner_->lastError());
+                    return false;
+                }
                 if (!runDynamicEconomyPrefill(
                         makeDemandWindowClosurePrompt(
-                            corpus_request,
                             settlement.closure->routed_rows),
                         "demand-window-closure"))
                 {

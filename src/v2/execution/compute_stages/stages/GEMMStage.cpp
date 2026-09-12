@@ -1,6 +1,11 @@
-/** @file GEMMStage.cpp
- * @brief Implementation of GEMMStage
- * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
+/**
+ * @file GEMMStage.cpp
+ * @brief Prepared participant-local projections with ordered output publication.
+ *
+ * Verifier scopes borrow device counts; adapters retain physical scratch and
+ * exact stream ordering. Fused SwiGLU consumes two [M,K] operands before the
+ * projection produces [M,N]. Diagnostic descriptors preserve those distinct
+ * dimensions so a stage dump cannot truncate or overread the gate operand.
  */
 
 #include "GEMMStage.h"
@@ -601,7 +606,9 @@ namespace llaminar2
         }
         if (params_.gate_input)
         {
-            info.addInput("gate_input", params_.gate_input, params_.m, params_.n);
+            // Gate and up are multiplied before projection: both reduce over
+            // K. N is only the output width and may be smaller or larger.
+            info.addInput("gate_input", params_.gate_input, params_.m, params_.k);
         }
 
         // Scalar params

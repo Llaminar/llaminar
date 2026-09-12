@@ -1,6 +1,11 @@
 /**
  * @file AttentionComputeStage.h
- * @brief Pure attention compute stage (no KV cache management)
+ * @brief Participant-local attention over explicit prepared cache read storage.
+ *
+ * Append remains a separate graph stage. Cache-owned read destinations are
+ * described before capture, while device-owned head/count values determine
+ * which rows are consumed at replay. Diagnostic views borrow those immutable
+ * destinations and never trigger a cache read merely to discover its address.
  */
 
 #pragma once
@@ -86,7 +91,13 @@ namespace llaminar2
             ITensor *workspace_context = nullptr;
             ITensor *workspace_mask = nullptr;
 
-            // KV cache for dynamic length query at execution time
+            /**
+             * @brief Sole post-append K/V source when non-null, on every backend.
+             *
+             * Cache-backed graphs order append before attention. A missing
+             * cache selects the explicit K/V tensors instead; request length
+             * and phase never change that source or its storage precision.
+             */
             IKVCache *kv_cache = nullptr;
             int layer_idx = -1;
 
@@ -99,11 +110,6 @@ namespace llaminar2
              * no host length participates in capture or replay.
              */
             const int32_t *active_query_rows_device = nullptr;
-
-            // When true, read native K/V from kv_cache at execution time instead
-            // of using transient projection tensors. GPU cache-backed attention
-            // requires this path for every phase.
-            bool read_kv_from_cache = false;
 
             // Position offset for decode mode causal masking
             int position_offset = 0;
@@ -183,12 +189,7 @@ namespace llaminar2
             dynamic_pre_append_cached_tokens_ = -1;
             dynamic_logical_seq_len_ = 0;
             dynamic_post_append_kv_len_ = 0;
-            debug_effective_k_tensor_ = nullptr;
-            debug_effective_v_tensor_ = nullptr;
-            debug_effective_k_rows_ = 0;
-            debug_effective_k_cols_ = 0;
-            debug_effective_v_rows_ = 0;
-            debug_effective_v_cols_ = 0;
+            resetEffectiveKVDumpData();
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();
@@ -214,26 +215,8 @@ namespace llaminar2
             dynamic_pre_append_cached_tokens_ = -1;
             dynamic_logical_seq_len_ = 0;
             dynamic_post_append_kv_len_ = 0;
-            /*
-             * Effective K/V descriptors describe the source selected by one
-             * execution, not durable graph state. A prior decode can select an
-             * FP16 cache view while the next phase-split prefill intentionally
-             * consumes its FP32 projection buffer. Retaining the old descriptor
-             * makes pre-capture snapshot preparation allocate an FP16 slot for
-             * a capture that records an FP32 source.
-             *
-             * Captured snapshot lifetime belongs exclusively to
-             * DeviceGraphExecutor's immutable D2D slot manifest. Clearing this
-             * stage-local diagnostic mirror cannot invalidate a captured graph;
-             * it only prevents stale request/phase metadata from contaminating
-             * the next warmup or capture preparation pass.
-             */
-            debug_effective_k_tensor_ = nullptr;
-            debug_effective_v_tensor_ = nullptr;
-            debug_effective_k_rows_ = 0;
-            debug_effective_k_cols_ = 0;
-            debug_effective_v_rows_ = 0;
-            debug_effective_v_cols_ = 0;
+            // A request resets payload state, not captured source addresses.
+            resetEffectiveKVDumpData();
             if (cached_kernel_)
                 cached_kernel_->clearGPUStreamBinding();
         }
@@ -265,9 +248,35 @@ namespace llaminar2
     private:
         Params params_;
 
+        /** @return The one physical read policy used by execution and diagnostics. */
+        IKVCache::DeviceReadStorageKind deviceCacheReadKind() const;
+
+        /**
+         * @brief Bind immutable GPU diagnostic views before snapshot sizing.
+         * @throws std::runtime_error for missing storage or changed identity.
+         * This performs no GPU work and never observes a live cache cursor.
+         */
+        void prepareEffectiveKVDumpStorage() const;
+
+        /** @brief Reset CPU observations while retaining GPU topology metadata. */
+        void resetEffectiveKVDumpData()
+        {
+            if (params_.device_id.is_gpu())
+                return;
+            debug_effective_k_tensor_ = nullptr;
+            debug_effective_v_tensor_ = nullptr;
+            debug_effective_k_rows_ = debug_effective_k_cols_ = 0;
+            debug_effective_v_rows_ = debug_effective_v_cols_ = 0;
+        }
+
         /// Cached attention kernel for workspace binding
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
+
+        /// Stage-owned non-owning views retain descriptor identity even when a
+        /// different graph uses another request-count view of shared scratch.
+        mutable std::unique_ptr<ITensor> debug_effective_k_view_;
+        mutable std::unique_ptr<ITensor> debug_effective_v_view_;
 
         /// Debug-only effective K/V tensor metadata for graph snapshots. The
         /// executor performs graph-captured D2D snapshot copies and post-graph

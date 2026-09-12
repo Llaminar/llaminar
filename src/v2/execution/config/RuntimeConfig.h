@@ -16,6 +16,7 @@
 #include "../../utils/Logger.h"
 #include "RoutedExpertPolicy.h"
 #include "MTPDepthDefaults.h"
+#include "../mtp/MTPConditionForwardPurpose.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
 #include <cctype>
@@ -1277,9 +1278,9 @@ namespace llaminar2
     /**
      * @brief Count complete model forwards retained by the MTP serving family.
      * @param config Frozen runtime and graph-capacity policy.
-     * @return Three identities when MTP capacity is retained, otherwise zero.
+     * @return All condition purposes and two verifiers when capacity is retained.
      *
-     * The MTP serving family owns one condition forward plus two grouped
+     * The MTP serving family owns speculative and committed condition forwards plus two grouped
      * verifier forwards (greedy terminal reduction and stochastic/disabled
      * terminal reduction). These are complete transformer graphs, not small
      * controller fragments, and must therefore pay the per-layer graph-memory
@@ -1291,8 +1292,9 @@ namespace llaminar2
     resolveMTPRetainedServingForwardModelGraphIdentityCount(
         const MTPRuntimeConfig &config) noexcept
     {
-        return retainsMTPGraphCapacity(config) ? std::size_t{3}
-                                               : std::size_t{0};
+        return retainsMTPGraphCapacity(config)
+                   ? kMTPConditionForwardPurposes.size() + std::size_t{2}
+                   : std::size_t{0};
     }
 
     /**

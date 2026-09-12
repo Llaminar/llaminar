@@ -777,7 +777,7 @@ namespace llaminar2
         /**
          * @test Verify that when kv_cache is nullptr, static kv_len is used
          */
-        TEST_F(Test__AttentionComputeStage_DynamicKVLen, FallsBackToStaticKVLen)
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, CachelessAttentionUsesExplicitKVLen)
         {
             const int static_kv_len = 4;
 
@@ -834,11 +834,12 @@ namespace llaminar2
         }
 
         /**
-         * @test Verify prefill case: when cache has 0 tokens, use seq_len
+         * @test Reject cache-backed prefill before append publishes its rows.
          *
-         * For prefill, the cache starts empty. The stage should use seq_len as kv_len.
+         * Starting a request does not make unpublished cache bytes valid. The
+         * graph must execute its append dependency before this consumer.
          */
-        TEST_F(Test__AttentionComputeStage_DynamicKVLen, PrefillWithEmptyCache)
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, PrefillRejectsUnpublishedCache)
         {
             const int layer_idx = 0;
             const int seq_len = 4;
@@ -893,18 +894,10 @@ namespace llaminar2
             auto stage = ComputeStageFactory::createAttentionCompute(params);
             ASSERT_NE(stage, nullptr);
 
-            // With empty cache, dynamic query returns 0, so stage falls back to seq_len
+            // Cache-backed attention requires the preceding append to publish
+            // its rows. Unpublished cache state must not select raw projections.
             bool success = stage->execute(nullptr);
-            EXPECT_TRUE(success) << "Prefill with empty cache should succeed";
-
-            // Verify output
-            const float *out_data = output_prefill->data();
-            float sum = 0.0f;
-            for (size_t i = 0; i < output_prefill->numel(); ++i)
-            {
-                sum += std::abs(out_data[i]);
-            }
-            EXPECT_GT(sum, 0.0f) << "Prefill output should have non-zero values";
+            EXPECT_FALSE(success) << "Unpublished cache must fail closed";
         }
 
         /**
@@ -986,9 +979,9 @@ namespace llaminar2
         }
 
         /**
-         * @test Verify invalid layer_idx is handled gracefully
+         * @test Reject an invalid cache layer instead of selecting projections.
          */
-        TEST_F(Test__AttentionComputeStage_DynamicKVLen, InvalidLayerIndexFallsBackToStatic)
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, InvalidCacheLayerFailsClosed)
         {
             const int invalid_layer_idx = 999; // Out of range
             const int static_kv_len = 4;
@@ -1030,9 +1023,9 @@ namespace llaminar2
             auto stage = ComputeStageFactory::createAttentionCompute(params);
             ASSERT_NE(stage, nullptr);
 
-            // Should fall back to static kv_len since cache query returns 0
+            // A bad source descriptor cannot authorize different operands.
             bool success = stage->execute(nullptr);
-            EXPECT_TRUE(success) << "Should succeed with fallback to static kv_len";
+            EXPECT_FALSE(success) << "Invalid cache layer must fail closed";
         }
 
         /**

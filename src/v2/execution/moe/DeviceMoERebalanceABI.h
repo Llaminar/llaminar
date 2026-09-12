@@ -22,7 +22,7 @@ namespace llaminar2::moe_rebalance_abi
      * Any field-layout change to a cross-backend record must increment this
      * value and update the corresponding byte-size assertion below.
      */
-    inline constexpr uint32_t kVersion = 12u;
+    inline constexpr uint32_t kVersion = 14u;
 
     /**
      * @brief Exact byte size of one device-owned rebalance command.
@@ -32,7 +32,15 @@ namespace llaminar2::moe_rebalance_abi
      * command prevents apply kernels from guessing that two unrelated
      * participant namespaces happen to use the same integer.
      */
-    inline constexpr uint32_t kPlanEntryBytes = 52u;
+    inline constexpr uint32_t kPlanEntryBytes = 64u;
+    /** Immutable native admission proof travels with the existing command sideband. */
+    inline constexpr uint32_t kCommandHeaderBytes = 128u;
+    /** Authenticated wave completion, including actual payload bytes. */
+    inline constexpr uint32_t kWaveProgressBytes = 72u;
+    /** Two reusable waves plus the bounded journal prefix and scheduler ticket. */
+    inline constexpr uint32_t kGraphControllerBytes = 360u;
+    /** Participant-local copy/apply completion with its physical-byte counter. */
+    inline constexpr uint32_t kApplyStatusBytes = 104u;
 
     /**
      * @brief Exact byte size of DeviceMoERebalanceConfig and device views.

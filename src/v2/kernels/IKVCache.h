@@ -5,6 +5,9 @@
  * This interface abstracts the common operations between CPU (CPUKVCache)
  * and GPU (CUDARingKVCache) implementations, allowing stages to work with
  * either cache type through a single pointer.
+ * Prepared read-storage descriptors expose immutable device addresses and
+ * geometry without executing a read or observing live GPU sequence state.
+ * This separates capture-time binding from replay-time payload publication.
  */
 
 #pragma once
@@ -15,6 +18,7 @@
 #include "../utils/Logger.h"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -797,6 +801,55 @@ namespace llaminar2
         virtual bool get_kv(int layer, int seq_idx,
                             const ITensor **out_k, const ITensor **out_v,
                             int *out_kv_len = nullptr) const = 0;
+
+        /** @brief Physical destination selected by a captured device cache read. */
+        enum class DeviceReadStorageKind : uint8_t
+        {
+            NativeRing,           ///< One request's persistent floating ring.
+            NativeRequestMajor,   ///< Native gathered or cache-decoded request bank.
+            ConvertedRequestMajor ///< FP16 bank after the declared read transform.
+        };
+
+        /** @brief Immutable geometry, never the device-owned live token count. */
+        struct DeviceReadStorageRequest
+        {
+            int layer;
+            int first_sequence;
+            int request_count;
+            DeviceReadStorageKind kind;
+        };
+
+        /**
+         * @brief Borrowed prepared storage, not a materialization or state mirror.
+         *
+         * The cache owns the addresses and their lifetime. A consumer may bind
+         * immutable views before recording the operation that fills them. No
+         * payload bytes or live head/count values are inspected by this query.
+         */
+        struct DeviceReadStorage
+        {
+            void *key;
+            void *value;
+            size_t rows;
+            size_t columns;
+            TensorType type;
+            DeviceId device;
+        };
+
+        /**
+         * @brief Describe the exact destination of an already prepared GPU read.
+         * @param request Layer, request range and physical read policy.
+         * @return Borrowed immutable storage, or no value for an invalid or
+         *         unprepared read. Callers must fail rather than choose another
+         *         representation. This method enqueues no work, allocates no
+         *         storage and reads no GPU state; it is safe before cold capture.
+         */
+        virtual std::optional<DeviceReadStorage> describeDeviceReadStorage(
+            const DeviceReadStorageRequest &request) const
+        {
+            (void)request;
+            return std::nullopt;
+        }
 
         /**
          * @brief Return a graph-snapshot-only direct physical KV view.

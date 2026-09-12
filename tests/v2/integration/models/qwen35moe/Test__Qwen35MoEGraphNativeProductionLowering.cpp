@@ -1320,6 +1320,127 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief A colocated CPU return cannot replace the local GPU producer edge.
+     *
+     * CPU and GPU computation may overlap, but their final writes are not
+     * disjoint: GPU canonical publication also zeroes non-local route slots.
+     * Ticket ingress must follow that publication before replacing the remote
+     * slots. A fold that merely joins both writers leaves a write/write race.
+     * Inspect the actual production lowering for serial decode and prefill;
+     * no model file or test-owned execution path is needed.
+     * @param device GPU endpoint whose native graph owns the final reduction.
+     */
+    static void assertRankLocalCanonicalTicketFoldJoinsBothExpertProducers(
+        DeviceId device)
+    {
+        SCOPED_TRACE(device.to_string());
+        auto plan = makeDistributedSingleGPUContinuationPlan();
+        plan->domains[0] = domain(
+            "continuation_domain",
+            device.is_cuda() ? GlobalDeviceAddress::cuda(0)
+                             : GlobalDeviceAddress::rocm(0));
+        plan->domains[0].backend = device.is_cuda()
+            ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        plan->domains[0].owner_rank = 0;
+        plan->domains[1] = domain(
+            "remote_domain", GlobalDeviceAddress::cpu(0));
+        plan->domains[1].owner_rank = 0;
+        validateMoERoutedExpertPlacementPlanOrThrow(
+            *plan, {.layer_count = 1, .routed_expert_count = kNumExperts});
+        const auto owner_map = MoEExpertOwnerMap::build(*plan);
+        GraphConfig config = makeConfig(plan, /*layer_count=*/1);
+        config.default_device = device;
+        config.max_activation_rows = kSeqLen;
+        config.moe.overlay_mpi_ctx = std::make_shared<MockMPIContext>(0, 1);
+        config.moe.expert_overlay_runtime_plan =
+            resolveMoEExpertOverlayRuntimePlan(
+                plan, {.current_world_rank = 0});
+        auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
+            MoEOverlayResidencyAuthority::Config{
+                .initial_plan = *plan,
+                .model_metadata = {
+                    .num_layers = 1,
+                    .num_experts = kNumExperts,
+                    .d_model = kDModel,
+                    .routed_intermediate_size = kIntermediate,
+                },
+                .maintenance_mode = MoERebalanceRuntimeMode::Off,
+                .histogram = nullptr,
+                .perf_device = "rank_local_join_test",
+            });
+        const auto snapshot = authority->snapshot();
+        ASSERT_NE(snapshot, nullptr);
+        config.moe.expert_overlay_residency_authority = authority;
+        config.moe.durable_residency_authority =
+            MoEDurableResidencyAuthorityKind::ExpertOverlayRCU;
+        config.moe.expert_overlay_participant_residency =
+            std::make_shared<MoEOverlayParticipantResidencyRegistry>(
+                MoEOverlayParticipantResidencyRegistry::Config{
+                    .owner_map = snapshot->owner_map,
+                    .local_participant_ids = {0, 1},
+                    .num_layers = 1,
+                    .num_experts = kNumExperts,
+                    .initial_epoch = snapshot->epoch,
+                });
+        auto model = ModelContext::createForTesting(
+            "test.gguf", nullptr, 1, /*with_weight_manager=*/true);
+        ASSERT_NE(model, nullptr);
+        ASSERT_NE(model->concreteWeightManager(), nullptr);
+        auto &registry = model->concreteWeightManager()->expertGemmRegistry();
+        registerCompleteDomainExpertLayer(
+            registry, "continuation_domain", device, 0);
+        registerCompleteDomainExpertLayer(
+            registry, "remote_domain", DeviceId::cpu(), 0);
+        registerOwnedParticipantExpertLayers(registry, owner_map, 1);
+        TensorArena weights;
+        auto layer = makeLayerWeights(weights);
+        ScopedDevicePublicationStream stream(device);
+        Qwen35MoEGraph builder(model, nullptr, config);
+        for (const int rows : {1, kSeqLen})
+        {
+            SCOPED_TRACE(rows);
+            TensorArena activations;
+            auto buffers = makeActivationBuffers(activations, rows);
+            auto graph = builder.buildFFNGraph(
+                layer, buffers, 0, rows, kBatchSize, device, stream.get());
+            const std::string local =
+                "layer0_moe_expert_ffn_overlay_continuation_local";
+            const std::string fold =
+                "layer0_moe_overlay_continuation_routes_ordered_reduce";
+            ASSERT_NE(graph.getNode(local), nullptr);
+            ASSERT_NE(graph.getNode(fold), nullptr);
+            const auto consumers = stageNamesOfType(
+                graph, ComputeStageType::MOE_OVERLAY_TICKET_CONSUME);
+            ASSERT_EQ(consumers.size(), 1u);
+            EXPECT_TRUE(hasDependency(graph, fold, local))
+                << "CPU ticket readiness does not publish GPU-local route slots";
+            EXPECT_TRUE(hasDependency(graph, fold, consumers.front()))
+                << "GPU-local completion does not publish CPU-returned route slots";
+            EXPECT_TRUE(hasDependency(graph, consumers.front(), local))
+                << "GPU non-local zero fills must precede CPU ticket materialization; "
+                   "joining only at the fold does not order overlapping writers";
+        }
+    }
+
+#ifdef HAVE_CUDA
+    /** @test CUDA decode/prefill folds join both local and CPU route producers. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         RankLocalCanonicalTicketFoldJoinsBothExpertProducersCUDA)
+    {
+        assertRankLocalCanonicalTicketFoldJoinsBothExpertProducers(DeviceId::cuda(0));
+    }
+#endif
+
+#ifdef HAVE_ROCM
+    /** @test ROCm decode/prefill folds join both local and CPU route producers. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         RankLocalCanonicalTicketFoldJoinsBothExpertProducersROCm)
+    {
+        assertRankLocalCanonicalTicketFoldJoinsBothExpertProducers(DeviceId::rocm(0));
+    }
+#endif
+
+    /**
      * @brief A single GPU continuation remains device-owned beside a remote tier.
      *
      * This is the production CUDA/ROCm topology used by the real-weight parity

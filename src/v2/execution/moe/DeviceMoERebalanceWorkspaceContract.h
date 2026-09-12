@@ -127,6 +127,11 @@ namespace llaminar2
 
         /** @return Local collective payload slots after transport-mode expansion. */
         [[nodiscard]] std::size_t collectivePayloadSlotCount() const noexcept;
+
+        /** @return Bounded terminal-history edge capacity derived from model geometry. */
+        [[nodiscard]] std::size_t movementJournalEdgeCapacity() const;
+        /** @return Worst-case paired-wave count fitting the same bounded edge history. */
+        [[nodiscard]] std::size_t movementJournalWaveCapacity() const;
     };
 
     /**
@@ -156,6 +161,8 @@ namespace llaminar2
         static constexpr const char *WS_TRANSFER_PLAN_COUNT = "moe_rebalance_transfer_plan_count";
         static constexpr const char *WS_COMMAND_HEADER = "moe_rebalance_command_header";
         static constexpr const char *WS_CONTROLLER_STATE = "moe_rebalance_controller_state";
+        static constexpr const char *WS_MOVEMENT_WAVES = "moe_rebalance_movement_waves";
+        static constexpr const char *WS_MOVEMENT_EDGES = "moe_rebalance_movement_edges";
         static constexpr const char *WS_PLACEMENT_PLAN_SCRATCH =
             "moe_rebalance_placement_plan_scratch";
         static constexpr const char *WS_LLEP_LAYER_PLANS = "moe_rebalance_llep_layer_plans";

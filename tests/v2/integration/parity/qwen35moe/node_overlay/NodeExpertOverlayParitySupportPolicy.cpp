@@ -7,9 +7,22 @@
  * mathematics, graph execution, or evidence publication ordering.
  */
 #include "NodeExpertOverlayParitySupport.h"
+#include "execution/moe/MoEOptimizationMovementTopology.h"
 
 namespace llaminar2::test::parity::qwen35moe::node_overlay
 {
+
+    /** @brief Build stable demand; prefix-cache eviction is a separate operation. */
+    std::vector<int32_t> stationaryDemandWindowPrompt(
+        std::span<const int> tokens, std::size_t rows)
+    {
+        if (tokens.empty() || rows == 0u)
+            throw std::invalid_argument("Stationary demand requires tokens and positive rows");
+        std::vector<int32_t> result(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+            result[row] = tokens[row % tokens.size()];
+        return result;
+    }
 
     /** Active case has one process-local definition shared by every shard. */
     const ModelParityCase *g_active_model_parity_case = nullptr;
@@ -423,6 +436,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * as one exchange set. The plan must be the capacity-resolved frozen
      * production plan: an automatic-capacity blueprint has no concrete expert
      * membership from which an expressible movement can be inferred.
+     * Cardinality only establishes that an exchange is possible. A swap with
+     * one expert per endpoint can be profitable when measured endpoint service
+     * rates differ; the production admission ledger decides profitability.
      *
      * @param plan Inventory-bound or rank-agnostic ExpertOverlay plan.
      * @return Exact movement-axis contract implied by its participant catalogue.
@@ -431,49 +447,11 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     DynamicMovementAxisContract dynamicMovementAxisContract(
         const MoERoutedExpertPlacementPlan &plan)
     {
-        for (std::size_t tier_index = 0;
-             tier_index < plan.routed_tiers.size();
-             ++tier_index)
-        {
-            const auto &tier = plan.routed_tiers[tier_index];
-            const auto domain = std::find_if(
-                plan.domains.begin(),
-                plan.domains.end(),
-                [&](const RoutedExpertDomain &candidate)
-                { return candidate.name == tier.domain; });
-            if (domain == plan.domains.end())
-            {
-                throw std::invalid_argument(
-                    "Dynamic movement-axis resolution cannot find routed domain '" +
-                    tier.domain + "'");
-            }
-            const std::size_t participant_count =
-                domain->participants.size();
-            if (domain->routed_compute_policy !=
-                    RoutedExpertComputePolicy::Apportioned ||
-                participant_count < 2u)
-            {
-                continue;
-            }
-
-            const bool has_exchange_degree_of_freedom = std::any_of(
-                plan.placements.begin(),
-                plan.placements.end(),
-                [&](const RoutedExpertLayerPlacement &placement)
-                {
-                    return static_cast<std::size_t>(std::count(
-                               placement.routed_expert_tier.begin(),
-                               placement.routed_expert_tier.end(),
-                               static_cast<int>(tier_index))) >
-                           participant_count;
-                });
-            if (has_exchange_degree_of_freedom)
-            {
-                return DynamicMovementAxisContract::
-                    PriorityMigrationAndParticipantBalance;
-            }
-        }
-        return DynamicMovementAxisContract::PriorityMigrationOnly;
+        // This fixture already requires tier migration. Its additional
+        // within-tier proof uses the same model-frozen geometry as serving.
+        return hasParticipantPlacementAxis(availableMoEOptimizationMovementAxes(plan))
+            ? DynamicMovementAxisContract::PriorityMigrationAndParticipantBalance
+            : DynamicMovementAxisContract::PriorityMigrationOnly;
     }
 
     /**
@@ -541,20 +519,14 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
 
         const auto required_rows =
             convergenceBoundaryProtectedRows(purpose);
-        if (!required_rows)
-        {
-            return {
-                .state = ConvergenceBoundaryState::Ready,
-            };
-        }
-        if (!status.demand_window.valid())
+        if (required_rows == 0u || !status.demand_window.valid())
         {
             return {
                 .state =
                     ConvergenceBoundaryState::InvalidAuthorityEvidence,
             };
         }
-        if (status.canBeginExclusiveCohort(*required_rows))
+        if (status.canBeginExclusiveCohort(required_rows))
         {
             return {
                 .state = ConvergenceBoundaryState::Ready,
@@ -565,6 +537,18 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             status.demand_window.remainingRoutedRows();
         if (rows_to_close == 0u)
         {
+            if (status.demand_window.pending_submission_rows != 0u)
+            {
+                return {
+                    .state = ConvergenceBoundaryState::NeedsDemandWindowClosure,
+                    .closure = DemandWindowClosure{
+                        .generation = status.demand_window.generation,
+                        .observed_routed_rows = status.demand_window.collected_routed_rows,
+                        .scope = status.demand_window.scope,
+                        .kind = DemandWindowClosureKind::DeliverPendingProgress,
+                    },
+                };
+            }
             /* A completed bank can be visible just before the worker consumes
              * its wake. It is not safe to admit more demand, but neither is it
              * malformed; ordinary progress must rotate it. */
@@ -580,6 +564,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 .observed_routed_rows =
                     status.demand_window.collected_routed_rows,
                 .routed_rows = rows_to_close,
+                .scope = status.demand_window.scope,
             },
         };
     }
@@ -624,8 +609,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             if (convergence == DynamicResidencyConvergenceState::
                                    AwaitingPhysicalCompletion ||
                 horizon == ConvergenceTrafficHorizon::Open ||
-                !status.quiescentBetweenWaves() ||
-                status.authority != MoEOptimizationAuthority::Host)
+                !status.quiescentBetweenWaves())
             {
                 return {
                     .state = DynamicConvergenceSettlementState::
@@ -656,6 +640,18 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             }
             if (rows_to_close == 0u)
             {
+                if (status.demand_window.pending_submission_rows != 0u)
+                {
+                    return {
+                        .state = DynamicConvergenceSettlementState::NeedsMovementDemandWindowClosure,
+                        .closure = DemandWindowClosure{
+                            .generation = status.demand_window.generation,
+                            .observed_routed_rows = status.demand_window.collected_routed_rows,
+                            .scope = status.demand_window.scope,
+                            .kind = DemandWindowClosureKind::DeliverPendingProgress,
+                        },
+                    };
+                }
                 return {
                     .state = DynamicConvergenceSettlementState::
                         AwaitingMovement,
@@ -669,6 +665,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                     .observed_routed_rows =
                         status.demand_window.collected_routed_rows,
                     .routed_rows = rows_to_close,
+                    .scope = status.demand_window.scope,
                 },
             };
         }

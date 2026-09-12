@@ -9,6 +9,8 @@
  *
  * Without dynamic loading, whichever library loads first would shadow the
  * other's symbols, causing NVIDIA code to call AMD's RCCL or vice versa.
+ * Dependency selection belongs to CMake's RCCL_LIBRARY; runtime loading never
+ * searches for a substitute if that configured installation is unavailable.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -25,7 +27,8 @@ namespace llaminar2
     {
         /**
          * @brief Load RCCL library dynamically with isolated symbols
-         * @param library_path Optional path to librccl.so (nullptr for default search)
+         * @param library_path Explicit diagnostic DSO path, or nullptr for the
+         *        exact RCCL_LIBRARY selected by CMake. No alternate DSO is tried.
          * @return true if loaded successfully
          *
          * The library is loaded with RTLD_NOW | RTLD_LOCAL to:

@@ -9,7 +9,7 @@
  *   4. TQ8 Quantize:   FP32 → TQ8
  *   5. TQ8 Dequantize: TQ8  → FP32
  *   6. TQ8 Roundtrip:  FP32 → TQ8 → FP32
- *   7. KV Cache append + gather (TQ8-K / TQ4-V split precision)
+ *   7. Native KV cache append + explicit gather (AQ8-K / TQ4-V)
  *
  * Each operation is benchmarked with warmup, then timed over many iterations.
  * Reports: ops/sec, throughput (GB/s for data-movement-bound ops), and
@@ -471,7 +471,7 @@ TEST(Perf__TurboQuant, TQ4_vs_TQ8_Dequant_HeadToHead)
 }
 
 // ============================================================================
-// KV Cache: Append + Gather throughput (split TQ8-K / TQ4-V)
+// KV Cache: native FP32-to-AQ8/TQ4 append and explicit gather throughput.
 // ============================================================================
 
 TEST(Perf__TurboQuant, KVCache_SplitTQ_AppendGather_D128)
@@ -487,7 +487,8 @@ TEST(Perf__TurboQuant, KVCache_SplitTQ_AppendGather_D128)
     TurboQuantContext tq_ctx(D, 31, 131);
 
     CPURingKVCacheTQ cache(mpi_ctx, /*n_layers=*/1, /*batch_size=*/1, MAX_SEQ,
-                           N_KV_HEADS, D, DeviceId::cpu());
+                           N_KV_HEADS, D, DeviceId::cpu(),
+                           KVCacheLayoutMode::POSITION_MAJOR, &tq_ctx);
 
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -502,47 +503,38 @@ TEST(Perf__TurboQuant, KVCache_SplitTQ_AppendGather_D128)
         return t;
     };
 
-    auto quantize_k = [&](const FP32Tensor &src)
-    {
-        return TQ8Tensor::quantize_from_fp32(src.data(), src.shape(), D, tq_ctx);
-    };
-    auto quantize_v = [&](const FP32Tensor &src)
-    {
-        return TQ4Tensor::quantize_from_fp32(src.data(), src.shape(), D, tq_ctx);
-    };
-
     auto fp32_prefill_k = make_fp32(N_PREFILL);
     auto fp32_prefill_v = make_fp32(N_PREFILL);
-    auto tq8_prefill_k = quantize_k(*fp32_prefill_k);
-    auto tq4_prefill_v = quantize_v(*fp32_prefill_v);
 
-    std::vector<std::shared_ptr<TQ8Tensor>> decode_k_tokens(N_DECODE_STEPS + WARMUP_STEPS);
-    std::vector<std::shared_ptr<TQ4Tensor>> decode_v_tokens(N_DECODE_STEPS + WARMUP_STEPS);
+    // Preparation stays outside timing; native encoding is the operation being
+    // measured, so prequantizing inputs would hide its actual production cost.
+    std::vector<std::shared_ptr<FP32Tensor>> decode_k_tokens(N_DECODE_STEPS + WARMUP_STEPS);
+    std::vector<std::shared_ptr<FP32Tensor>> decode_v_tokens(N_DECODE_STEPS + WARMUP_STEPS);
     for (int i = 0; i < N_DECODE_STEPS + WARMUP_STEPS; ++i)
     {
-        auto fk = make_fp32(1);
-        auto fv = make_fp32(1);
-        decode_k_tokens[i] = quantize_k(*fk);
-        decode_v_tokens[i] = quantize_v(*fv);
+        decode_k_tokens[i] = make_fp32(1);
+        decode_v_tokens[i] = make_fp32(1);
     }
 
-    auto out_k = std::make_shared<TQ8Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), static_cast<size_t>(KV_DIM)}, D);
+    auto out_k = std::make_shared<AttentionKeyQ8Tensor>(MAX_SEQ, N_KV_HEADS, D,
+        TensorLayout::KV_POS_HEAD_DIM);
     auto out_v = std::make_shared<TQ4Tensor>(
         std::vector<size_t>{static_cast<size_t>(MAX_SEQ), static_cast<size_t>(KV_DIM)}, D);
     std::vector<int> kv_lens;
 
     // Prefill
     auto t0_prefill = std::chrono::high_resolution_clock::now();
-    cache.append_kv(0, 0, tq8_prefill_k.get(), tq4_prefill_v.get(), N_PREFILL);
+    const bool prefilled = cache.append_kv(0, 0, fp32_prefill_k.get(), fp32_prefill_v.get(), N_PREFILL);
     auto t1_prefill = std::chrono::high_resolution_clock::now();
+    ASSERT_TRUE(prefilled);
     double prefill_sec = std::chrono::duration<double>(t1_prefill - t0_prefill).count();
 
     // Warmup decode
     for (int s = 0; s < WARMUP_STEPS; ++s)
     {
-        cache.append_kv(0, 0, decode_k_tokens[s].get(), decode_v_tokens[s].get(), 1);
-        cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
+        ASSERT_TRUE(cache.append_kv(0, 0, decode_k_tokens[s].get(), decode_v_tokens[s].get(), 1));
+        ASSERT_EQ(cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens),
+                  N_PREFILL + s + 1);
     }
 
     // Timed decode
@@ -554,15 +546,26 @@ TEST(Perf__TurboQuant, KVCache_SplitTQ_AppendGather_D128)
         int tok_idx = WARMUP_STEPS + s;
 
         auto ta0 = std::chrono::high_resolution_clock::now();
-        cache.append_kv(0, 0, decode_k_tokens[tok_idx].get(), decode_v_tokens[tok_idx].get(), 1);
+        const bool appended = cache.append_kv(0, 0, decode_k_tokens[tok_idx].get(), decode_v_tokens[tok_idx].get(), 1);
         auto ta1 = std::chrono::high_resolution_clock::now();
+        ASSERT_TRUE(appended);
         total_append_sec += std::chrono::duration<double>(ta1 - ta0).count();
 
         auto tg0 = std::chrono::high_resolution_clock::now();
-        cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
+        const int gathered = cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
         auto tg1 = std::chrono::high_resolution_clock::now();
+        ASSERT_EQ(gathered, N_PREFILL + WARMUP_STEPS + s + 1);
         total_gather_sec += std::chrono::duration<double>(tg1 - tg0).count();
     }
+
+    // Authenticate the final explicit gather outside the measured intervals.
+    // Production attention reads request-local cache views instead of gathering.
+    const int live_rows = cache.get_cached_tokens(0, 0);
+    const auto layout = cache.logicalBlockLayout(0, live_rows);
+    std::vector<uint8_t> expected_k(layout.k_bytes), expected_v(layout.v_bytes);
+    ASSERT_TRUE(cache.exportLogicalBlock({0, 0, 0, live_rows, nullptr}, expected_k.data(), expected_v.data()));
+    EXPECT_EQ(std::memcmp(out_k->raw_data(), expected_k.data(), expected_k.size()), 0);
+    EXPECT_EQ(std::memcmp(out_v->raw_data(), expected_v.data(), expected_v.size()), 0);
 
     double total_decode_sec = total_append_sec + total_gather_sec;
     double avg_kv_len = N_PREFILL + WARMUP_STEPS + N_DECODE_STEPS / 2.0;
@@ -570,13 +573,13 @@ TEST(Perf__TurboQuant, KVCache_SplitTQ_AppendGather_D128)
     double gather_ns = total_gather_sec * 1e9 / N_DECODE_STEPS;
     double step_ns = total_decode_sec * 1e9 / N_DECODE_STEPS;
 
-    double k_bytes_per_row = static_cast<double>(N_KV_HEADS) * sizeof(TQ8Block128);
+    double k_bytes_per_row = static_cast<double>(N_KV_HEADS) * sizeof(AttentionKeyQ8Block<D>);
     double v_bytes_per_row = static_cast<double>(N_KV_HEADS) * sizeof(Block);
-    double gather_bytes = avg_kv_len * (k_bytes_per_row + v_bytes_per_row);
+    double gather_bytes = out_k->anchor_bytes() + avg_kv_len * (k_bytes_per_row + v_bytes_per_row);
     double gather_gb = gather_bytes * N_DECODE_STEPS / 1e9;
     double gather_bw = gather_gb / total_gather_sec;
 
-    std::cout << "\n=== KV Cache Split TQ (TQ8-K / TQ4-V, D=" << D
+    std::cout << "\n=== KV Cache Split TQ (AQ8-K / TQ4-V, D=" << D
               << ", N_KV_HEADS=" << N_KV_HEADS << ") ===" << std::endl;
     std::cout << "  Max seq:       " << MAX_SEQ << std::endl;
     std::cout << "  Prefill:       " << N_PREFILL << " tokens in " << std::fixed << std::setprecision(3)
@@ -588,7 +591,7 @@ TEST(Perf__TurboQuant, KVCache_SplitTQ_AppendGather_D128)
     std::cout << "  Gather:        " << std::fixed << std::setprecision(0) << gather_ns << " ns/step" << std::endl;
     std::cout << "  Total step:    " << std::fixed << std::setprecision(0) << step_ns << " ns/step" << std::endl;
     std::cout << "  Gather B/W:    " << std::fixed << std::setprecision(2) << gather_bw << " GB/s" << std::endl;
-    std::cout << "  K block size:  " << sizeof(TQ8Block128) << " bytes (TQ8)" << std::endl;
+    std::cout << "  K block size:  " << sizeof(AttentionKeyQ8Block<D>) << " bytes (AQ8, plus one request basis)" << std::endl;
     std::cout << "  V block size:  " << sizeof(Block) << " bytes (TQ4)" << std::endl;
     std::cout << "  Row bytes:     " << std::fixed << std::setprecision(0)
               << k_bytes_per_row + v_bytes_per_row << " (K=" << k_bytes_per_row

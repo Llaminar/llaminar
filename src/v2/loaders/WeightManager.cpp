@@ -20,6 +20,7 @@
 #include "MmapRegion.h"
 #include "PreparedWeightRepresentationContract.h"
 #include "PreparedWeightStore.h"
+#include "PreparedOverlaySourceRetirement.h"
 #include "GPUHostLoadPreflight.h"
 #include "GPUVramPreflight.h"
 #include "planning/PhysicalMemoryAuthority.h"
@@ -5185,6 +5186,19 @@ namespace llaminar2
             }
         }
 
+        if (ok && frozen_weights)
+        {
+            // Frozen expert selections bypass cache_, so the legacy host-release
+            // sweep cannot see their owned storage. Finalized participant engines
+            // now own all execution/migration bytes; retire the GPU-only sources
+            // here, before graph/prefix allocation increases setup's host peak.
+            const size_t retired = retirePreparedOverlaySources(
+                *frozen_weights, preparation_plan, expert_gemm_registry_,
+                *weight_metadata_);
+            LOG_DEBUG("[WeightManager] Retired " << retired
+                      << " frozen accelerator expert source bytes after preparation on "
+                      << target_device.to_string());
+        }
         return ok;
     }
 

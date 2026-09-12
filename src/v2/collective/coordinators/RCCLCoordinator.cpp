@@ -2628,7 +2628,8 @@ namespace llaminar2
 
         // Different devices - use RCCL send/recv with synchronization
         return submitAndWait([&]()
-                             { return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx, bytes, /*wait_for_completion=*/true); });
+                             { return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx, bytes, /*wait_for_completion=*/true,
+                                             streams_[src_device_idx], streams_[dst_device_idx]); });
 #else
         (void)dst_ptr;
         (void)dst_device_idx;
@@ -2640,76 +2641,35 @@ namespace llaminar2
 #endif
     }
 
-    bool RCCLCoordinator::copyAsync(void *dst_ptr, int dst_device_idx,
-                                    const void *src_ptr, int src_device_idx,
-                                    size_t bytes)
+    bool RCCLCoordinator::copyOnStreams(
+        void *dst_ptr, int dst_device_idx,
+        const void *src_ptr, int src_device_idx,
+        size_t bytes, void *source_stream, void *destination_stream)
     {
 #ifdef HAVE_RCCL
-        if (!initialized_.load())
+        if (!initialized_.load() || !dst_ptr || !src_ptr || bytes == 0u ||
+            !source_stream || !destination_stream ||
+            dst_device_idx < 0 || dst_device_idx >= num_devices_ ||
+            src_device_idx < 0 || src_device_idx >= num_devices_ ||
+            dst_device_idx == src_device_idx)
         {
-            last_error_ = "RCCLCoordinator not initialized";
+            last_error_ = "RCCLCoordinator::copyOnStreams: invalid cross-device stream binding";
             return false;
         }
-
-        if (bytes == 0)
-        {
-            return true; // No-op for zero bytes
-        }
-
-        if (!dst_ptr || !src_ptr)
-        {
-            last_error_ = "RCCLCoordinator::copyAsync: null buffer pointer";
-            return false;
-        }
-
-        if (dst_device_idx < 0 || dst_device_idx >= num_devices_ ||
-            src_device_idx < 0 || src_device_idx >= num_devices_)
-        {
-            last_error_ = "RCCLCoordinator::copyAsync: device index out of range (src=" +
-                          std::to_string(src_device_idx) + " dst=" + std::to_string(dst_device_idx) +
-                          " num_devices=" + std::to_string(num_devices_) + ")";
-            return false;
-        }
-
-        // Same device - use hipMemcpyAsync on coordinator thread
-        if (src_device_idx == dst_device_idx)
-        {
-            return submitAndWait([&]()
-                                 {
-            hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
-                return false;
-            }
-
-            hipStream_t stream = static_cast<hipStream_t>(streams_[src_device_idx]);
-            err = hipMemcpyAsync(dst_ptr, src_ptr, bytes, hipMemcpyDeviceToDevice, stream);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipMemcpyAsync failed: ") + hipGetErrorString(err);
-                return false;
-            }
-
-            // Record completion event
-            err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[src_device_idx]), stream);
-            if (err != hipSuccess)
-            {
-                last_error_ = std::string("hipEventRecord failed: ") + hipGetErrorString(err);
-                return false;
-            }
-            return true; });
-        }
-
-        // Different devices - use RCCL send/recv without synchronization (async)
-        return submitAndWait([&]()
-                             { return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx, bytes, /*wait_for_completion=*/false); });
+        // A queue round trip serializes communicator use, not GPU completion.
+        // Send and receive remain ordered solely by the supplied device DAG.
+        return submitAndWait([&]() {
+            return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx,
+                          bytes, false, source_stream, destination_stream);
+        });
 #else
         (void)dst_ptr;
         (void)dst_device_idx;
         (void)src_ptr;
         (void)src_device_idx;
         (void)bytes;
+        (void)source_stream;
+        (void)destination_stream;
         last_error_ = "RCCL not available";
         return false;
 #endif
@@ -3120,7 +3080,8 @@ namespace llaminar2
 
     bool RCCLCoordinator::doCopy(void *dst_ptr, int dst_device_idx,
                                  const void *src_ptr, int src_device_idx,
-                                 size_t bytes, bool wait_for_completion)
+                                 size_t bytes, bool wait_for_completion,
+                                 void *source_stream, void *destination_stream)
     {
 #ifdef HAVE_RCCL
         // Start RCCL group for paired send/recv
@@ -3141,7 +3102,7 @@ namespace llaminar2
         }
 
         rccl::ncclComm_t src_comm = static_cast<rccl::ncclComm_t>(comms_[src_device_idx]);
-        hipStream_t src_stream = static_cast<hipStream_t>(streams_[src_device_idx]);
+        hipStream_t src_stream = static_cast<hipStream_t>(source_stream);
 
         // rcclSend: peer rank is the destination device index within the communicator
         r = rccl::ncclSend(src_ptr, bytes, rccl::ncclInt8, dst_device_idx, src_comm, src_stream);
@@ -3162,7 +3123,7 @@ namespace llaminar2
         }
 
         rccl::ncclComm_t dst_comm = static_cast<rccl::ncclComm_t>(comms_[dst_device_idx]);
-        hipStream_t dst_stream = static_cast<hipStream_t>(streams_[dst_device_idx]);
+        hipStream_t dst_stream = static_cast<hipStream_t>(destination_stream);
 
         // rcclRecv: peer rank is the source device index within the communicator
         r = rccl::ncclRecv(dst_ptr, bytes, rccl::ncclInt8, src_device_idx, dst_comm, dst_stream);
@@ -3243,6 +3204,8 @@ namespace llaminar2
         (void)src_device_idx;
         (void)bytes;
         (void)wait_for_completion;
+        (void)source_stream;
+        (void)destination_stream;
         last_error_ = "RCCL not available";
         return false;
 #endif

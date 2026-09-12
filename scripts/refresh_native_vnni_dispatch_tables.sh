@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# @file refresh_native_vnni_dispatch_tables.sh
+# @brief Plan, measure, certify and install NativeVNNI dispatch policies.
+# Backend-specific collectors retain arithmetic and measurement provenance;
+# actual publication requires authenticated evidence. Dry runs only describe
+# those transactions and must not require Git/device discovery or collect data.
 set -euo pipefail
 
 usage() {
@@ -7018,13 +7023,21 @@ authenticate_completed_cpu_decode() {
     "${cpu_decode_policy_json}"
 }
 
+# @brief Drive CPU grouped-verifier collection and arithmetic certification.
+# Dry runs use explicit placeholder provenance, never a purported measurement.
 refresh_cpu() {
   begin_backend_collection_target "CPU grouped verifier"
   require_executable "${cpu_avx2_sweep_bin}"
   require_executable "${cpu_avx512_sweep_bin}"
   local cpu_git_revision cpu_build_id cpu_compiler_id cpu_arch_class
   local cpu_device_name cpu_driver_runtime cpu_serial_policy_hash
-  cpu_git_revision="$(git -C "${repo_root}" rev-parse HEAD)"
+  # A dry run prints a plan and must work from a source archive, just like the
+  # CUDA/ROCm planners. Only a real measurement authenticates Git provenance.
+  if (( dry_run )); then
+    cpu_git_revision="dry-run-git-revision"
+  else
+    cpu_git_revision="$(git -C "${repo_root}" rev-parse HEAD)"
+  fi
   cpu_build_id="$(sha256_file_set \
     "${cpu_avx2_sweep_bin}" "${cpu_avx512_sweep_bin}")"
   cpu_compiler_id="$(${CXX:-c++} --version | first_output_line)"
@@ -7627,7 +7640,11 @@ refresh_cpu_prefill() {
   local cpu_measurement_compiler_id cpu_measurement_arch_class
   local cpu_measurement_device_name cpu_measurement_driver_runtime
   local cpu_measurement_serial_policy_hash
-  cpu_measurement_git_revision="$(git -C "${repo_root}" rev-parse HEAD)"
+  if (( dry_run )); then
+    cpu_measurement_git_revision="dry-run-git-revision"
+  else
+    cpu_measurement_git_revision="$(git -C "${repo_root}" rev-parse HEAD)"
+  fi
   cpu_measurement_build_id="$(sha256_file_set \
     "${cpu_avx2_sweep_bin}" "${cpu_avx512_sweep_bin}")"
   cpu_measurement_compiler_id="$(${CXX:-c++} --version | first_output_line)"

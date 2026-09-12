@@ -1,6 +1,10 @@
 /**
  * @file AttentionComputeStage.cpp
- * @brief Implementation of AttentionComputeStage
+ * @brief Participant-local attention execution and persistent workspace binding.
+ *
+ * The stage owns exact local query/KV geometry and delegates byte accounting
+ * to the canonical attention workspace contract. Request replay updates data
+ * through ordered device state without changing captured storage ownership.
  */
 
 #include "AttentionComputeStage.h"
@@ -33,7 +37,7 @@
 #if defined(HAVE_CUDA)
 #include "../../../kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
 #include "../../../kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
-#include "../../../kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
+#include "../../../kernels/cuda/attention/CUDAFlashAttentionWorkspaceEnvelope.h"
 #include <cuda_runtime_api.h>
 #endif
 
@@ -70,6 +74,8 @@ namespace llaminar2
                 return tensor->native_type() == TensorType::BF16;
             case ActivationPrecision::Q8_1:
                 return tensor->native_type() == TensorType::Q8_1;
+            case ActivationPrecision::AQ8:
+                return tensor->native_type() == TensorType::AQ8;
             case ActivationPrecision::Q16_1:
                 return tensor->native_type() == TensorType::Q16_1;
             case ActivationPrecision::TQ4:
@@ -144,6 +150,20 @@ namespace llaminar2
             const bool value_is_tq =
                 value_precision == ActivationPrecision::TQ4 ||
                 value_precision == ActivationPrecision::TQ8;
+            if (key_precision == ActivationPrecision::AQ8)
+            {
+                if (!value_is_tq)
+                    return value_precision == ActivationPrecision::Q8_1;
+                // The native cache binds rotations before append. A reader may
+                // authenticate that basis, but must not silently replace it.
+                if (!turboquant_context) return false;
+                const auto *expected = &turboquant_context->for_layer(layer);
+                if (auto *tq4 = dynamic_cast<TQ4Tensor *>(value))
+                    return tq4->turboquant_context() == expected;
+                if (auto *tq8 = dynamic_cast<TQ8Tensor *>(value))
+                    return tq8->turboquant_context() == expected;
+                return false;
+            }
             if (key_is_tq != value_is_tq)
             {
                 LOG_ERROR("[AttentionComputeStage] CPU TurboQuant attention requires both K and V to use native TQ storage"
@@ -322,6 +342,11 @@ namespace llaminar2
     // AttentionComputeStage Implementation
     // =============================================================================
 
+    /**
+     * @brief Bind immutable attention geometry and its sole optional KV authority.
+     * @param params Participant-local operands, cache and execution policy.
+     * @throws std::invalid_argument If transformed keys lack a valid GPU cache contract.
+     */
     AttentionComputeStage::AttentionComputeStage(Params params)
         : IComputeStage(params.device_id),
           params_(std::move(params)),
@@ -334,8 +359,7 @@ namespace llaminar2
         const auto &key_cache_policy = params_.execution_policy.key_cache;
         if (key_cache_policy.transformsOnRead())
         {
-            if (!params_.device_id.is_gpu() || !params_.kv_cache ||
-                !params_.read_kv_from_cache)
+            if (!params_.device_id.is_gpu() || !params_.kv_cache)
             {
                 throw std::invalid_argument(
                     "pre-RoPE key-cache encoding requires a cache-backed GPU attention stage");
@@ -590,6 +614,16 @@ namespace llaminar2
         return dynamic_cast<IWorkspaceConsumer *>(kernel);
     }
 
+    /**
+     * @brief Declare scratch for this participant's exact attention geometry.
+     * @param m Generic graph row hint; compact verifier capacity is canonical.
+     * @param n Generic head hint, ignored in favor of the stage's local heads.
+     * @param k Generic width hint, ignored in favor of the stage's head width.
+     * @return Persistent named buffers for this concrete graph family member.
+     *
+     * Serial-family merging, not a maximum against model-level dimensions,
+     * combines sharded and replicated graph members into an allocation BOM.
+     */
     WorkspaceRequirements AttentionComputeStage::getWorkspaceRequirements(int m, int n, int k) const
     {
         auto *self = const_cast<AttentionComputeStage *>(this);
@@ -605,9 +639,11 @@ namespace llaminar2
          * graph.  That same graph is later replayed for an MTP verifier group,
          * however, and split attention indexes its partial-output/M/L buffers
          * by every query row.  Reserve the complete production verifier span
-         * even when the allocator's model-level M hint is one.  Stage-local
-         * head dimensions remain authoritative because TP/MoE graph hints can
-         * describe a smaller shard than the concrete attention stage.
+         * even when the allocator's model-level M hint is one. Stage-local
+         * dimensions are exact: model hints may describe either the global
+         * model (larger than a TP shard) or a smaller shard than a replicated
+         * member. Taking a maximum creates a geometry no graph executes and
+         * disagrees with physical admission's correctly sharded BOM.
          */
         const attention::AttentionWorkspaceCardinality
             workspace_cardinality =
@@ -616,8 +652,10 @@ namespace llaminar2
                     params_.batch_size);
         const int workspace_partial_rows =
             workspace_cardinality.compact_query_rows;
-        const int workspace_heads = std::max(n, params_.n_heads);
-        const int workspace_head_dim = std::max(k, params_.head_dim);
+        (void)n;
+        (void)k;
+        const int workspace_heads = params_.n_heads;
+        const int workspace_head_dim = params_.head_dim;
         const int workspace_kv_capacity =
             params_.kv_cache
                 ? params_.kv_cache->max_seq_len()
@@ -645,17 +683,17 @@ namespace llaminar2
                     cudaGetErrorString(property_status));
             }
 
-            const cuda::fa2_policy::FA2PrefillParallelPlan prefill_plan =
-                cuda::fa2_policy::selectFA2PrefillParallelPlan({
-                    .batch_size = params_.batch_size,
-                    .query_rows = params_.seq_len,
-                    .local_query_heads = params_.n_heads,
-                    .head_dim = params_.head_dim,
-                    .kv_capacity = workspace_kv_capacity,
-                    .sm_count = properties.multiProcessorCount,
-                    .requested_axis =
-                        params_.execution_policy.prefill_parallel_axis,
-                });
+            const cuda::fa2_policy::FA2PrefillParallelGeometry prefill_geometry{
+                .batch_size = params_.batch_size,
+                .query_rows = params_.seq_len,
+                .local_query_heads = params_.n_heads,
+                .head_dim = params_.head_dim,
+                .kv_capacity = workspace_kv_capacity,
+                .sm_count = properties.multiProcessorCount,
+                .requested_axis = params_.execution_policy.prefill_parallel_axis,
+            };
+            const auto prefill_plan =
+                cuda::fa2_policy::selectFA2PrefillParallelPlan(prefill_geometry);
             if (!prefill_plan.valid)
             {
                 throw std::runtime_error(
@@ -663,23 +701,20 @@ namespace llaminar2
                     "capture plan for " + params_.device_id.toString());
             }
 
+            const auto require_capacity = [&reqs](const char *name, std::size_t bytes)
+            {
+                for (auto &buffer : reqs.buffers)
+                {
+                    if (buffer.name == name)
+                    {
+                        buffer.size_bytes = std::max(buffer.size_bytes, bytes);
+                        return;
+                    }
+                }
+                reqs.buffers.push_back({name, bytes, 256, true});
+            };
             if (prefill_plan.usesContextParallelism())
             {
-                const auto require_capacity = [&reqs](
-                                                  const char *name,
-                                                  std::size_t bytes)
-                {
-                    for (auto &buffer : reqs.buffers)
-                    {
-                        if (buffer.name == name)
-                        {
-                            buffer.size_bytes =
-                                std::max(buffer.size_bytes, bytes);
-                            return;
-                        }
-                    }
-                    reqs.buffers.push_back({name, bytes, 256, true});
-                };
                 require_capacity(
                     cuda::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
                     prefill_plan.partial_output_bytes);
@@ -689,6 +724,24 @@ namespace llaminar2
                 require_capacity(
                     cuda::AttentionWorkspaceBuffers::PARTIAL_L,
                     prefill_plan.partial_l_bytes);
+            }
+
+            // The largest bucket can be direct even when an intermediate
+            // bucket needs summaries. Publish the launch-policy envelope once
+            // before any retained executable captures these shared addresses.
+            // This member covers query widths up to its declared bucket, not
+            // up to the KV horizon. Serving prepares the largest bucket first;
+            // serial-family merging covers separately declared participants.
+            const auto family_workspace_plan = cuda::fa2_policy::
+                selectFA2GeometrySelectedWorkspaceEnvelope(prefill_geometry);
+            if (family_workspace_plan.usesContextParallelism())
+            {
+                require_capacity(cuda::AttentionWorkspaceBuffers::PARTIAL_OUTPUT,
+                                 family_workspace_plan.partial_output_bytes);
+                require_capacity(cuda::AttentionWorkspaceBuffers::PARTIAL_M,
+                                 family_workspace_plan.partial_m_bytes);
+                require_capacity(cuda::AttentionWorkspaceBuffers::PARTIAL_L,
+                                 family_workspace_plan.partial_l_bytes);
             }
 
             LOG_TRACE(
@@ -705,7 +758,9 @@ namespace llaminar2
                 << " context_partitions="
                 << prefill_plan.max_context_partitions
                 << " partial_output_bytes="
-                << prefill_plan.partial_output_bytes);
+                << prefill_plan.partial_output_bytes
+                << " family_partial_output_bytes="
+                << family_workspace_plan.partial_output_bytes);
         }
 #endif
 
@@ -781,7 +836,7 @@ namespace llaminar2
                     rocm::fa2_policy::
                         selectROCmFA2GeometrySelectedWorkspaceEnvelope({
                             .batch_size = params_.batch_size,
-                            .query_rows = workspace_kv_capacity,
+                            .query_rows = params_.seq_len,
                             .local_query_heads = params_.n_heads,
                             .head_dim = params_.head_dim,
                             .kv_capacity = workspace_kv_capacity,
@@ -859,21 +914,27 @@ namespace llaminar2
         return reqs;
     }
 
+    /**
+     * @brief Attend to the bound post-append cache, or explicit cacheless operands.
+     * @param ctx Participant execution context; CPU standalone tests may pass null.
+     * @return False on invalid publication, unsupported operands or kernel failure.
+     *
+     * Query width affects work geometry, never source ownership or KV precision.
+     * Native CPU descriptors are host-owned; GPU consumers derive live sequence
+     * bounds on the exact captured stream without a host state mirror.
+     */
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
     {
+        if (params_.kv_cache && params_.layer_idx < 0)
+        {
+            LOG_ERROR("[AttentionComputeStage] Cache-backed attention requires a valid layer binding");
+            return false;
+        }
         const bool gpu_stage = params_.device_id.is_gpu();
         const auto &key_cache_policy = params_.execution_policy.key_cache;
         const bool transform_cached_keys = key_cache_policy.transformsOnRead();
         if (gpu_stage)
             (void)requireGPUStream();
-        if (gpu_stage && params_.kv_cache && !params_.read_kv_from_cache)
-        {
-            LOG_ERROR("[AttentionComputeStage] GPU attention with a KV cache requires the device-owned post-append cache path"
-                      << " layer=" << params_.layer_idx
-                      << " device=" << params_.device_id.toString());
-            return false;
-        }
-
         const bool padded_prefill_replay =
             prefill_replay_params_set_ &&
             prefill_effective_seq_len_ > 0 &&
@@ -937,17 +998,10 @@ namespace llaminar2
         bool cpu_grouped_request_cache = false;
         if (params_.kv_cache && params_.layer_idx >= 0)
         {
-            // Always override K/V from KV cache when:
-            // 1. read_kv_from_cache is set (GPU optimization for type conversion), OR
-            // 2. We're in decode mode (effective_kv_len > seq_len) - the graph may have
-            //    been built during prefill (cached_tokens=0) with K/V wired to activation
-            //    scratch buffers. During decode, those buffers only hold the current token's
-            //    projection. The full KV history lives in the cache (populated by
-            //    KVCacheAppendStage which runs before this stage).
-            // 3. the key-cache policy stores pre-RoPE GPU bytes, which requires
-            //    the captured device transform for both prefill and decode.
-            if (params_.read_kv_from_cache || effective_kv_len > params_.seq_len ||
-                transform_cached_keys)
+            // The preceding append publishes the only K/V authority. Reading
+            // FP32 projections for cold CPU prefill but native cache bytes for
+            // a restored suffix changes the equation solely with request shape.
+            // The same native reader now serves every cache-backed phase.
             {
                 ITensor *cache_k = nullptr;
                 ITensor *cache_v = nullptr;
@@ -1148,13 +1202,9 @@ namespace llaminar2
                      * participates in production execution.
                      */
                     bool cache_read_ok = false;
-                    const ActivationPrecision cache_precision =
-                        params_.kv_cache->k_precision();
+                    const auto read_kind = deviceCacheReadKind();
                     const bool native_floating_ring =
-                        !transform_cached_keys && params_.batch_size == 1 &&
-                        (cache_precision == ActivationPrecision::FP16 ||
-                         cache_precision == ActivationPrecision::BF16 ||
-                         cache_precision == ActivationPrecision::FP32);
+                        read_kind == IKVCache::DeviceReadStorageKind::NativeRing;
                     if (native_floating_ring)
                     {
                         /*
@@ -1609,11 +1659,8 @@ namespace llaminar2
         // (sum of alpha_i * V_i@R) must then be inverse-rotated to recover
         // the correct unrotated attention result.
         //
-        // During PREFILL, effective_K/V are the raw projection outputs (unrotated),
-        // since the cache override is only triggered for decode (kv_len > seq_len).
-        // In this case we must also rotate K/V to match the rotated Q.
-        // During DECODE, effective_K/V come from the cache (already rotated),
-        // so only Q rotation is needed.
+        // Cache-backed K/V were already rotated by append, in every phase.
+        // Only a cacheless invocation must also rotate its explicit K/V inputs.
         // =================================================================
         const auto *kv_rot = params_.kv_rotation;
         const int q_dim = params_.n_heads * params_.head_dim;
@@ -1679,17 +1726,34 @@ namespace llaminar2
             const size_t logical_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
             const size_t k_cols = effective_K ? logical_kv_cols : 0;
             const size_t v_cols = effective_V ? logical_kv_cols : 0;
-            debug_effective_k_tensor_ = effective_K;
-            debug_effective_v_tensor_ = effective_V;
-            debug_effective_k_rows_ = (effective_K && k_rows > 0 && k_cols > 0) ? k_rows : 0;
-            debug_effective_k_cols_ = (effective_K && k_rows > 0 && k_cols > 0) ? k_cols : 0;
-            debug_effective_v_rows_ = (effective_V && v_rows > 0 && v_cols > 0) ? v_rows : 0;
-            debug_effective_v_cols_ = (effective_V && v_rows > 0 && v_cols > 0) ? v_cols : 0;
-
-            // Snapshot callbacks reuse dump info first built before execute()
-            // for coherence. Force post-execute getDumpInfo() to include these
-            // just-resolved tensor-backed diagnostic outputs.
-            invalidateDumpInfoCache();
+            if (gpu_stage)
+            {
+                // Execution must use the exact source admitted before capture.
+                // Do not discover outputs here or resize the immutable manifest.
+                const auto matches = [](const ITensor *prepared, const ITensor *actual) {
+                    return prepared && actual &&
+                        prepared->gpu_data_ptr() == actual->gpu_data_ptr() &&
+                        prepared->native_type() == actual->native_type();
+                };
+                if (!matches(debug_effective_k_tensor_, effective_K) ||
+                    !matches(debug_effective_v_tensor_, effective_V) ||
+                    debug_effective_k_rows_ != k_rows || debug_effective_k_cols_ != k_cols ||
+                    debug_effective_v_rows_ != v_rows || debug_effective_v_cols_ != v_cols)
+                {
+                    LOG_ERROR("[AttentionComputeStage] Effective KV read differs from its prepared snapshot storage");
+                    return false;
+                }
+            }
+            else
+            {
+                debug_effective_k_tensor_ = effective_K;
+                debug_effective_v_tensor_ = effective_V;
+                debug_effective_k_rows_ = k_rows;
+                debug_effective_k_cols_ = k_cols;
+                debug_effective_v_rows_ = v_rows;
+                debug_effective_v_cols_ = v_cols;
+                invalidateDumpInfoCache();
+            }
         }
 
         const bool small_verifier_decode =
@@ -1907,6 +1971,67 @@ namespace llaminar2
         }
     }
 
+    IKVCache::DeviceReadStorageKind AttentionComputeStage::deviceCacheReadKind() const
+    {
+        if (params_.execution_policy.key_cache.transformsOnRead())
+            return IKVCache::DeviceReadStorageKind::ConvertedRequestMajor;
+        const auto precision = params_.kv_cache->k_precision();
+        if (params_.batch_size == 1 &&
+            (precision == ActivationPrecision::FP16 ||
+             precision == ActivationPrecision::BF16 ||
+             precision == ActivationPrecision::FP32))
+            return IKVCache::DeviceReadStorageKind::NativeRing;
+        return IKVCache::DeviceReadStorageKind::NativeRequestMajor;
+    }
+
+    void AttentionComputeStage::prepareEffectiveKVDumpStorage() const
+    {
+        if (!params_.kv_cache)
+        {
+            debug_effective_k_tensor_ = params_.K;
+            debug_effective_v_tensor_ = params_.V;
+            debug_effective_k_rows_ = debug_effective_v_rows_ =
+                static_cast<size_t>(params_.batch_size) * params_.kv_len;
+            debug_effective_k_cols_ = debug_effective_v_cols_ =
+                static_cast<size_t>(params_.n_kv_heads) * params_.head_dim;
+            return;
+        }
+        const auto storage = params_.kv_cache->describeDeviceReadStorage({
+            .layer = params_.layer_idx,
+            .first_sequence = 0,
+            .request_count = params_.batch_size,
+            .kind = deviceCacheReadKind(),
+        });
+        if (!storage || storage->device != params_.device_id ||
+            !storage->key || !storage->value || storage->rows == 0 ||
+            storage->columns != static_cast<size_t>(params_.n_kv_heads) * params_.head_dim)
+            throw std::runtime_error("Attention effective-KV snapshots require complete prepared cache read storage");
+
+        const auto bind_view = [&](std::unique_ptr<ITensor> &view, void *address) {
+            if (view)
+            {
+                if (view->gpu_data_ptr() != address || view->native_type() != storage->type ||
+                    view->shape().size() != 2 ||
+                    view->shape()[0] != storage->rows || view->shape()[1] != storage->columns)
+                    throw std::runtime_error("Attention effective-KV snapshot storage identity changed");
+                return;
+            }
+            // Only immutable host-side tensor metadata is created. The actual
+            // bytes already belong to the cache/workspace and are filled later
+            // by the read operation recorded before the snapshot copy.
+            if (isGraphCaptureActive())
+                throw std::runtime_error("Attention effective-KV snapshot descriptors were not prepared before capture");
+            view = std::make_unique<GpuTensorView>(address, storage->rows,
+                storage->columns, storage->type, storage->device);
+        };
+        bind_view(debug_effective_k_view_, storage->key);
+        bind_view(debug_effective_v_view_, storage->value);
+        debug_effective_k_tensor_ = debug_effective_k_view_.get();
+        debug_effective_v_tensor_ = debug_effective_v_view_.get();
+        debug_effective_k_rows_ = debug_effective_v_rows_ = storage->rows;
+        debug_effective_k_cols_ = debug_effective_v_cols_ = storage->columns;
+    }
+
     StageDumpInfo AttentionComputeStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
@@ -1927,11 +2052,13 @@ namespace llaminar2
         // synchronous observation on one worker can invalidate a peer's HIP or
         // CUDA capture even though both workers are individually well ordered.
         //
-        // execute() publishes the exact cache-owned tensors consumed by
-        // attention into these diagnostic fields.  Their allocation and shape
-        // are graph-stable, so they are the one authority in both preparation
-        // and recording phases.  CPU caches remain host-owned and retain their
-        // ordinary synchronous descriptor path below.
+        // Describe the prepared read destination before any execution. Both
+        // native ring and conversion storage already exist; no materialization
+        // is needed to name them. CPU descriptors remain synchronous below.
+        if (params_.device_id.is_gpu() &&
+            debugEnv().attention.debug_effective_kv_snapshot &&
+            debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
+            prepareEffectiveKVDumpStorage();
         if (debug_effective_k_tensor_ && debug_effective_v_tensor_)
         {
             dump_K = debug_effective_k_tensor_;
@@ -1942,11 +2069,7 @@ namespace llaminar2
                  !params_.device_id.is_gpu())
         {
             const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-            const bool should_read_cache = cached_tokens > 0 &&
-                                           (params_.read_kv_from_cache ||
-                                            cached_tokens > params_.seq_len ||
-                                            params_.execution_policy.key_cache
-                                                .transformsOnRead());
+            const bool should_read_cache = cached_tokens > 0;
 
             if (should_read_cache)
             {
@@ -2019,23 +2142,9 @@ namespace llaminar2
                            ? total_kv_tokens
                            : static_cast<size_t>(params_.seq_len > 0 ? params_.seq_len : 0));
             const size_t expected_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
-            /*
-             * execute() resolves the exact cache-owned view consumed by the
-             * attention kernel.  Keep that pointer for both eager and captured
-             * snapshot publication.  Falling back to dump_K/dump_V after a
-             * captured replay selects sequence zero's raw cache view; labeling
-             * that storage as `request_count * max_kv_len` rows makes every
-             * later request appear zero even though the grouped kernel consumed
-             * the correctly gathered request-major tensor.
-             */
-            /*
-             * GPU effective-K/V diagnostics exist only after execute() resolves
-             * the production cache view. Omitting an unresolved diagnostic from
-             * pre-execution metadata is intentional: the executor requires a
-             * finalized warmup manifest before capture and hard-fails if the
-             * post-execute outputs disappear or change. CPU execution remains
-             * synchronous and may describe its directly selected dump tensors.
-             */
+            // GPU descriptors were bound from the cache-owned read destination
+            // above, including the complete request-major bank. They cannot
+            // appear only after execution or change across request reset.
             const ITensor *effective_k_tensor =
                 debug_effective_k_tensor_
                     ? debug_effective_k_tensor_

@@ -11,8 +11,9 @@
 
 #include <gtest/gtest.h>
 
-#include "kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
+#include "kernels/cuda/attention/CUDAFlashAttentionWorkspaceEnvelope.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -40,6 +41,7 @@ namespace
     using llaminar2::cuda::fa2_policy::selectFA2ContextPartitionSlots;
     using llaminar2::cuda::fa2_policy::selectFA2DeviceDirectPartitionLimit;
     using llaminar2::cuda::fa2_policy::selectFA2PrefillParallelPlan;
+    using llaminar2::cuda::fa2_policy::selectFA2GeometrySelectedWorkspaceEnvelope;
     using llaminar2::cuda::fa2_policy::selectFA2ReducerDimensionWarps;
     using llaminar2::attention::AttentionPrefillParallelAxis;
 
@@ -53,6 +55,96 @@ namespace
         int head_dim;
         int expected_groups_at_m64_on_ga102;
     };
+
+    /** @brief Lock down the 4096-direct / 3072-context production failure. */
+    TEST(CUDAFlashAttentionLaunchPolicy, WorkspaceEnvelopeCoversNonMonotonicPrefill)
+    {
+        FA2PrefillParallelGeometry geometry{
+            .batch_size = 1, .query_rows = 4096, .local_query_heads = 24,
+            .head_dim = 256, .kv_capacity = 4096, .sm_count = 82,
+            .requested_axis = AttentionPrefillParallelAxis::GeometrySelected,
+        };
+        const auto largest = selectFA2PrefillParallelPlan(geometry);
+        ASSERT_TRUE(largest.valid);
+        EXPECT_FALSE(largest.usesContextParallelism());
+        const auto envelope = selectFA2GeometrySelectedWorkspaceEnvelope(geometry);
+        ASSERT_TRUE(envelope.usesContextParallelism());
+        // The last grid with two persistent slots has 109 tiles of 32 rows.
+        EXPECT_EQ(envelope.partial_output_bytes, 3488ULL * 24 * 16 * 256 * sizeof(float));
+        geometry.query_rows = 3072;
+        const auto member = selectFA2PrefillParallelPlan(geometry);
+        ASSERT_TRUE(member.usesContextParallelism());
+        EXPECT_GE(envelope.partial_output_bytes, member.partial_output_bytes);
+    }
+
+    /**
+     * @brief Compare the bounded policy search with an exhaustive M oracle.
+     *
+     * No codebook enters attention summary geometry. Sweep physical batch,
+     * heads (including TP1/2/4/8 of the failing shape), head width and SM count,
+     * every M through each horizon, and contexts beyond measured workloads.
+     */
+    TEST(CUDAFlashAttentionLaunchPolicy, WorkspaceEnvelopeEqualsEveryMemberMaximum)
+    {
+        for (const int batch : {1, 2})
+        for (const int heads : {3, 6, 12, 24, 64})
+        for (const int width : {64, 128, 256})
+        for (const int sms : {20, 82, 132})
+        for (const int context : {256, 512, 4096, 131072})
+        for (const int horizon : {17, 127, 128, 512, 4096})
+        {
+            FA2PrefillParallelGeometry geometry{
+                .batch_size = batch, .query_rows = horizon,
+                .local_query_heads = heads, .head_dim = width,
+                .kv_capacity = context, .sm_count = sms,
+                .requested_axis = AttentionPrefillParallelAxis::GeometrySelected,
+            };
+            const auto envelope = selectFA2GeometrySelectedWorkspaceEnvelope(geometry);
+            std::size_t maximum_output = 0, maximum_m = 0, maximum_l = 0;
+            for (int rows = 1; rows <= horizon; ++rows)
+            {
+                geometry.query_rows = rows;
+                const auto member = selectFA2PrefillParallelPlan(geometry);
+                ASSERT_TRUE(member.valid);
+                maximum_output = std::max(maximum_output, member.partial_output_bytes);
+                maximum_m = std::max(maximum_m, member.partial_m_bytes);
+                maximum_l = std::max(maximum_l, member.partial_l_bytes);
+            }
+            SCOPED_TRACE(::testing::Message() << "B=" << batch << " H=" << heads
+                << " D=" << width << " SM=" << sms << " KV=" << context << " maxM=" << horizon);
+            EXPECT_EQ(envelope.partial_output_bytes, maximum_output);
+            EXPECT_EQ(envelope.partial_m_bytes, maximum_m);
+            EXPECT_EQ(envelope.partial_l_bytes, maximum_l);
+            EXPECT_EQ(envelope.usesContextParallelism(), maximum_output > 0);
+        }
+    }
+
+    /** @brief Context capacity cannot turn envelope search into an O(context) walk. */
+    TEST(CUDAFlashAttentionLaunchPolicy, WorkspaceEnvelopeHandlesFullPositiveContextRange)
+    {
+        FA2PrefillParallelGeometry geometry{
+            .batch_size = 1, .query_rows = 1048576, .local_query_heads = 3,
+            .head_dim = 256, .kv_capacity = std::numeric_limits<int>::max(),
+            .sm_count = 82,
+            .requested_axis = AttentionPrefillParallelAxis::GeometrySelected,
+        };
+        const auto bounded = selectFA2GeometrySelectedWorkspaceEnvelope(geometry);
+        ASSERT_TRUE(bounded.usesContextParallelism());
+        geometry.query_rows = std::numeric_limits<int>::max();
+        const auto full = selectFA2GeometrySelectedWorkspaceEnvelope(geometry);
+        EXPECT_EQ(full.partial_output_bytes, bounded.partial_output_bytes);
+        EXPECT_EQ(full.partial_m_bytes, bounded.partial_m_bytes);
+        EXPECT_EQ(full.partial_l_bytes, bounded.partial_l_bytes);
+        for (const auto axis : {AttentionPrefillParallelAxis::QuerySequence,
+                               AttentionPrefillParallelAxis::KeyValueContext})
+        {
+            geometry.requested_axis = axis;
+            EXPECT_FALSE(selectFA2GeometrySelectedWorkspaceEnvelope(geometry).valid);
+        }
+        geometry.requested_axis = AttentionPrefillParallelAxis::GeometrySelected;
+        geometry.sm_count = 0;
+        EXPECT_FALSE(selectFA2GeometrySelectedWorkspaceEnvelope(geometry).valid);
+    }
 
     TEST(CUDAFlashAttentionLaunchPolicy, CoversQwenDenseAndMoEReleaseEnvelope)
     {

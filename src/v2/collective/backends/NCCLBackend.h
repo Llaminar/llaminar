@@ -391,13 +391,13 @@ namespace llaminar2
                   size_t bytes) override;
 
         /**
-         * @brief Async copy between CUDA devices
-         *
-         * Same semantics as copy() but non-blocking.
+         * @brief Submit an event-acquired copy on both exact endpoint streams.
+         * @copydetails ICollectiveBackend::copyOnStreams
          */
-        bool copyAsync(void *dst_ptr, DeviceId dst_device,
-                       const void *src_ptr, DeviceId src_device,
-                       size_t bytes, void *stream = nullptr) override;
+        bool copyOnStreams(void *dst_ptr, DeviceId dst_device,
+                           const void *src_ptr, DeviceId src_device,
+                           size_t bytes, void *source_stream,
+                           void *destination_stream) override;
 
         /**
          * @brief Check if copy is supported between device pair

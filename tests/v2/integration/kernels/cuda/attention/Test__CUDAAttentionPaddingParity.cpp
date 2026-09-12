@@ -682,7 +682,6 @@ TEST_F(Test__CUDAAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
     params.workspace_mask = workspace_mask.get();
     params.kv_cache = kv_cache.get();
     params.layer_idx = 0;
-    params.read_kv_from_cache = true;
     params.position_offset = real_kv_len - 1;
     params.mpi_ctx = &mpi_ctx_;
 

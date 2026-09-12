@@ -2416,7 +2416,8 @@ namespace llaminar2
 
         // Different devices - use NCCL send/recv with synchronization
         return submitAndWait([&]()
-                             { return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx, bytes, /*wait_for_completion=*/true); });
+                             { return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx, bytes, /*wait_for_completion=*/true,
+                                             streams_[src_device_idx], streams_[dst_device_idx]); });
 #else
         (void)dst_ptr;
         (void)dst_device_idx;
@@ -2428,76 +2429,35 @@ namespace llaminar2
 #endif
     }
 
-    bool NCCLCoordinator::copyAsync(void *dst_ptr, int dst_device_idx,
-                                    const void *src_ptr, int src_device_idx,
-                                    size_t bytes)
+    bool NCCLCoordinator::copyOnStreams(
+        void *dst_ptr, int dst_device_idx,
+        const void *src_ptr, int src_device_idx,
+        size_t bytes, void *source_stream, void *destination_stream)
     {
 #ifdef HAVE_NCCL
-        if (!initialized_.load())
+        if (!initialized_.load() || !dst_ptr || !src_ptr || bytes == 0u ||
+            !source_stream || !destination_stream ||
+            dst_device_idx < 0 || dst_device_idx >= num_devices_ ||
+            src_device_idx < 0 || src_device_idx >= num_devices_ ||
+            dst_device_idx == src_device_idx)
         {
-            last_error_ = "NCCLCoordinator not initialized";
+            last_error_ = "NCCLCoordinator::copyOnStreams: invalid cross-device stream binding";
             return false;
         }
-
-        if (bytes == 0)
-        {
-            return true; // No-op for zero bytes
-        }
-
-        if (!dst_ptr || !src_ptr)
-        {
-            last_error_ = "NCCLCoordinator::copyAsync: null buffer pointer";
-            return false;
-        }
-
-        if (dst_device_idx < 0 || dst_device_idx >= num_devices_ ||
-            src_device_idx < 0 || src_device_idx >= num_devices_)
-        {
-            last_error_ = "NCCLCoordinator::copyAsync: device index out of range (src=" +
-                          std::to_string(src_device_idx) + " dst=" + std::to_string(dst_device_idx) +
-                          " num_devices=" + std::to_string(num_devices_) + ")";
-            return false;
-        }
-
-        // Same device - use cudaMemcpyAsync on coordinator thread
-        if (src_device_idx == dst_device_idx)
-        {
-            return submitAndWait([&]()
-                                 {
-            cudaError_t err = cudaSetDevice(device_ordinals_[src_device_idx]);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
-                return false;
-            }
-
-            cudaStream_t stream = static_cast<cudaStream_t>(streams_[src_device_idx]);
-            err = cudaMemcpyAsync(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice, stream);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaMemcpyAsync failed: ") + cudaGetErrorString(err);
-                return false;
-            }
-
-            // Record completion event
-            err = cudaEventRecord(static_cast<cudaEvent_t>(completion_events_[src_device_idx]), stream);
-            if (err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaEventRecord failed: ") + cudaGetErrorString(err);
-                return false;
-            }
-            return true; });
-        }
-
-        // Different devices - use NCCL send/recv without synchronization (async)
-        return submitAndWait([&]()
-                             { return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx, bytes, /*wait_for_completion=*/false); });
+        // A queue round trip serializes communicator use, not GPU completion.
+        // Send and receive remain ordered solely by the supplied device DAG.
+        return submitAndWait([&]() {
+            return doCopy(dst_ptr, dst_device_idx, src_ptr, src_device_idx,
+                          bytes, false, source_stream, destination_stream);
+        });
 #else
         (void)dst_ptr;
         (void)dst_device_idx;
         (void)src_ptr;
         (void)src_device_idx;
         (void)bytes;
+        (void)source_stream;
+        (void)destination_stream;
         last_error_ = "NCCL not available";
         return false;
 #endif
@@ -2869,7 +2829,8 @@ namespace llaminar2
 
     bool NCCLCoordinator::doCopy(void *dst_ptr, int dst_device_idx,
                                  const void *src_ptr, int src_device_idx,
-                                 size_t bytes, bool wait_for_completion)
+                                 size_t bytes, bool wait_for_completion,
+                                 void *source_stream, void *destination_stream)
     {
 #ifdef HAVE_NCCL
         // Start NCCL group for paired send/recv
@@ -2890,7 +2851,7 @@ namespace llaminar2
         }
 
         nccl::ncclComm_t src_comm = static_cast<nccl::ncclComm_t>(comms_[src_device_idx]);
-        cudaStream_t src_stream = static_cast<cudaStream_t>(streams_[src_device_idx]);
+        cudaStream_t src_stream = static_cast<cudaStream_t>(source_stream);
 
         // ncclSend: peer rank is the destination device index within the communicator
         r = nccl::ncclSend(src_ptr, bytes, nccl::ncclInt8, dst_device_idx, src_comm, src_stream);
@@ -2911,7 +2872,7 @@ namespace llaminar2
         }
 
         nccl::ncclComm_t dst_comm = static_cast<nccl::ncclComm_t>(comms_[dst_device_idx]);
-        cudaStream_t dst_stream = static_cast<cudaStream_t>(streams_[dst_device_idx]);
+        cudaStream_t dst_stream = static_cast<cudaStream_t>(destination_stream);
 
         // ncclRecv: peer rank is the source device index within the communicator
         r = nccl::ncclRecv(dst_ptr, bytes, nccl::ncclInt8, src_device_idx, dst_comm, dst_stream);
@@ -2983,6 +2944,8 @@ namespace llaminar2
         (void)src_device_idx;
         (void)bytes;
         (void)wait_for_completion;
+        (void)source_stream;
+        (void)destination_stream;
         last_error_ = "NCCL not available";
         return false;
 #endif

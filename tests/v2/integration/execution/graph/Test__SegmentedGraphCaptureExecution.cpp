@@ -16,9 +16,12 @@
  *    route ticket without serial child launches or a host stream fence.
  * 5. Small auxiliary graph families certify aggregate native-pool growth over
  *    cold and warm lifetimes without attributing a pool slab to one sibling.
+ * 6. The sealed CPU-service inventory is exported with its GPU parent and only
+ *    successful initial/repeat submissions, on both CUDA and ROCm.
  */
 
 #include <gtest/gtest.h>
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include <memory>
 #include <span>
 #include <vector>
@@ -457,7 +460,12 @@ namespace
                 return false;
             }
 
-            const std::uint64_t residency_epoch = 301u + call_count_;
+            // The device-owned request epoch is part of the captured payload.
+            // Never invent an epoch from the CPU's current placement: a wave
+            // can publish while this retained parent is between layers.
+            const std::uint64_t residency_epoch = dispatch.header->residency_epoch;
+            if (residency_epoch != 301u + call_count_)
+                return false;
             auto publication = return_storage_->arm(residency_epoch);
             if (!publication)
                 return false;
@@ -1564,6 +1572,15 @@ TEST_F(CachedGraphReplayExecutionTest,
     constexpr std::size_t contribution_bytes =
         contribution_elements * sizeof(float);
     const DeviceId device = device_ctx_->deviceId();
+    auto epoch_arena = std::make_shared<DeviceMoEOverlayEpochArena>(
+        DeviceMoEOverlayEpochArena::Config{.device_id = device});
+    DeviceMoEOverlayEpochTicket epoch_fixture{
+        .epoch = 301u, .selector = deviceMoEOverlayEpochSelector(1u, 0u)};
+    auto *epoch_backend = getBackendFor(device);
+    ASSERT_NE(epoch_backend, nullptr);
+    ASSERT_TRUE(epoch_backend->hostToDeviceOnStream(
+        epoch_arena->requestTicket(0u), &epoch_fixture, sizeof(epoch_fixture),
+        device.gpu_ordinal(), gpu_ctx_->defaultStream()));
 
     auto *hidden = createArenaFP32Tensor(
         BufferId::NORMALIZED,
@@ -1646,7 +1663,8 @@ TEST_F(CachedGraphReplayExecutionTest,
             d_model,
             device,
             /*workspace_generation=*/41u,
-            ticket_arena);
+            ticket_arena,
+            epoch_arena->requestTicket(0u));
         auto return_storage = std::make_shared<
             MoEOverlayCanonicalRouteReturnTicketStorage>();
         return_storage->bindFixedCapacity(
@@ -1883,6 +1901,14 @@ TEST_F(CachedGraphReplayExecutionTest,
         DeviceGraphExecutor::GraphInitialSubmissionPolicy::
             CaptureInstantiateAndLaunch));
     expect_transaction(/*call=*/0u, /*base=*/11.0f);
+
+    // Change only request data. Every retained layer must copy the new epoch
+    // rather than retaining the header word produced by the previous replay.
+    epoch_fixture.epoch = 302u;
+    epoch_fixture.selector = deviceMoEOverlayEpochSelector(2u, 1u);
+    ASSERT_TRUE(epoch_backend->hostToDeviceOnStream(
+        epoch_arena->requestTicket(0u), &epoch_fixture, sizeof(epoch_fixture),
+        device.gpu_ordinal(), segment_cache.capture_stream));
 
     fill_dispatch(29.0f);
     ASSERT_TRUE(hidden->ensureOnDevice(
@@ -2121,6 +2147,7 @@ TEST_F(CachedGraphReplayExecutionTest,
             RequireRetainedParentWithConcurrentTicketService);
     const auto production_composer = retained_plan->composer;
     std::size_t composer_calls = 0u;
+    segment_cache.perf_context = "main_decode";
     const DeviceGraphExecutor::RetainedParentCompositionHook composer =
         [&](IGPUGraphCapture &destination,
             const ComputeGraph &source_graph,
@@ -2174,6 +2201,40 @@ TEST_F(CachedGraphReplayExecutionTest,
         }
     };
 
+    // Model-free coverage of the exact records consumed by HTTP certification.
+    // Setup must describe physical ownership without claiming a CPU invocation;
+    // each later record must come from this parent, not logical layer counts.
+    const auto expect_boundary_evidence = [&](double expected_initial,
+                                              double expected_replays)
+    {
+        double nodes = 0.0, initial = 0.0, replays = 0.0;
+        for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+        {
+            if (record.name != "retained_parent_executable_nodes" &&
+                record.name != "retained_parent_transaction_zero_launches" &&
+                record.name != "retained_parent_replays")
+                continue;
+            EXPECT_EQ(record.device, device.toString());
+            ASSERT_TRUE(record.tags.contains("context"));
+            ASSERT_TRUE(record.tags.contains("boundary_authority"));
+            ASSERT_TRUE(record.tags.contains("ticket_service_units"));
+            ASSERT_TRUE(record.tags.contains("child_units"));
+            EXPECT_EQ(record.tags.at("context"), "main_decode");
+            EXPECT_EQ(record.tags.at("boundary_authority"), "concurrent_ticket_service");
+            EXPECT_EQ(record.tags.at("ticket_service_units"), "1");
+            EXPECT_EQ(record.tags.at("child_units"), "3");
+            if (record.name == "retained_parent_executable_nodes")
+                nodes += record.value;
+            else if (record.name == "retained_parent_transaction_zero_launches")
+                initial += record.value;
+            else
+                replays += record.value;
+        }
+        EXPECT_GT(nodes, 0.0);
+        EXPECT_EQ(initial, expected_initial);
+        EXPECT_EQ(replays, expected_replays);
+    };
+
     ASSERT_TRUE(execute(
         DeviceGraphExecutor::GraphInitialSubmissionPolicy::
             MaterializeWithoutLaunch));
@@ -2192,6 +2253,7 @@ TEST_F(CachedGraphReplayExecutionTest,
     EXPECT_EQ(
         segment_cache.retained_composed_parent_replay.child_unit_count,
         3u);
+    expect_boundary_evidence(0.0, 0.0);
 
     graph.reset();
     ASSERT_TRUE(execute(
@@ -2200,6 +2262,7 @@ TEST_F(CachedGraphReplayExecutionTest,
     ASSERT_EQ(first_manual_probe->callCount(), 1u);
     ASSERT_EQ(second_manual_probe->callCount(), 1u);
     expect_payload(1000.0f);
+    expect_boundary_evidence(1.0, 0.0);
     EXPECT_FALSE(first_ticket_storage->payloadReady());
     EXPECT_FALSE(second_ticket_storage->payloadReady());
 
@@ -2211,6 +2274,7 @@ TEST_F(CachedGraphReplayExecutionTest,
     ASSERT_EQ(second_manual_probe->callCount(), 2u);
     EXPECT_EQ(composer_calls, 1u);
     expect_payload(2000.0f);
+    expect_boundary_evidence(1.0, 1.0);
     EXPECT_FALSE(first_ticket_storage->payloadReady());
     EXPECT_FALSE(second_ticket_storage->payloadReady());
 }

@@ -2561,17 +2561,19 @@ namespace llaminar2
 #endif
     }
 
-    bool RCCLBackend::copyAsync(void *dst_ptr, DeviceId dst_device,
+    bool RCCLBackend::copyOnStreams(void *dst_ptr, DeviceId dst_device,
                                 const void *src_ptr, DeviceId src_device,
-                                size_t bytes, void *stream)
+                                size_t bytes, void *source_stream,
+                                void *destination_stream)
     {
 #ifdef HAVE_RCCL
-        (void)stream; // Coordinator manages its own streams
+        if (!source_stream || !destination_stream)
+            return false;
 
         // RCCLBackend only supports ROCm↔ROCm copies
         if (!src_device.is_rocm() || !dst_device.is_rocm())
         {
-            LOG_DEBUG("RCCLBackend::copyAsync: requires ROCm devices, got "
+            LOG_DEBUG("RCCLBackend::copyOnStreams: requires ROCm devices, got "
                       << src_device.toString() << " -> " << dst_device.toString());
             return false;
         }
@@ -2587,16 +2589,16 @@ namespace llaminar2
         // Require coordinator for all copies
         if (!coordinator_)
         {
-            last_error_ = "RCCLBackend::copyAsync: coordinator not initialized";
+            last_error_ = "RCCLBackend::copyOnStreams: coordinator not initialized";
             LOG_ERROR(last_error_);
             return false;
         }
 
         // Delegate to coordinator async copy (enqueues work, returns immediately)
-        // Caller should use coordinator_->getCompletionEvent(dst_idx) to synchronize
-        if (!coordinator_->copyAsync(dst_ptr, dst_idx, src_ptr, src_idx, bytes))
+        // TransferEngine publishes completion on the exact endpoint streams.
+        if (!coordinator_->copyOnStreams(dst_ptr, dst_idx, src_ptr, src_idx, bytes, source_stream, destination_stream))
         {
-            last_error_ = "RCCLBackend::copyAsync: " + coordinator_->lastError();
+            last_error_ = "RCCLBackend::copyOnStreams: " + coordinator_->lastError();
             LOG_ERROR(last_error_);
             return false;
         }
@@ -2607,7 +2609,8 @@ namespace llaminar2
         (void)src_ptr;
         (void)src_device;
         (void)bytes;
-        (void)stream;
+        (void)source_stream;
+        (void)destination_stream;
         return false;
 #endif
     }

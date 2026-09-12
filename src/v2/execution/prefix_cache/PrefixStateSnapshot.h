@@ -1,7 +1,16 @@
+/**
+ * @file PrefixStateSnapshot.h
+ * @brief Owned prefix lookup and persistent-state checkpoint contracts.
+ *
+ * Lookups retain the placement admission span alongside payload leases.
+ * Checkpoints own their exact memory and readiness events so asynchronous
+ * restore cannot outlive its sources or relabel state after expert movement.
+ */
 #pragma once
 
 #include "backends/DeviceId.h"
 #include "execution/prefix_cache/PrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixPlacementEpochSpan.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -78,7 +87,7 @@ namespace llaminar2
         int cached_tokens = 0;
         int block_size = 0;
         uint64_t fingerprint_key = 0;
-        uint64_t placement_epoch = 0;
+        PrefixPlacementEpochSpan placement_epochs;
         bool requires_terminal_hidden = true;
         bool requires_terminal_logits = true;
         bool has_terminal_hidden = false;
@@ -102,6 +111,11 @@ namespace llaminar2
      * position, so it supplies that immutable control-plane fact alongside the
      * sequence being archived.
      *
+     * The append limits describe the admitted transaction, not the retained
+     * graph family's maximum width. Logical rollback preserves resident KV
+     * bytes only while those appends cannot wrap over the archived prefix.
+     * A later transaction must acquire its own checkpoint and append limits.
+     *
      * The fields intentionally have invalid defaults so callers cannot obtain
      * a meaningful checkpoint by default construction.  Concrete runners must
      * reject a request unless @ref valid returns true.
@@ -110,13 +124,17 @@ namespace llaminar2
     {
         int sequence_index = -1;
         int logical_cached_tokens = -1;
+        int maximum_main_append_tokens = -1;
+        int maximum_shifted_append_tokens = -1;
 
         /**
-         * @brief Whether the request names a valid sequence cursor.
+         * @brief Whether the request names a cursor and explicit append bounds.
          */
         bool valid() const
         {
-            return sequence_index >= 0 && logical_cached_tokens >= 0;
+            return sequence_index >= 0 && logical_cached_tokens >= 0 &&
+                   maximum_main_append_tokens >= 0 &&
+                   maximum_shifted_append_tokens >= 0;
         }
     };
 

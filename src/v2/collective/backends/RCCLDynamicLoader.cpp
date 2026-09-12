@@ -4,6 +4,9 @@
  *
  * Uses dlopen with RTLD_LOCAL to load RCCL into an isolated symbol namespace,
  * preventing conflicts with NCCL which exports identical symbol names.
+ * CMake's RCCL_LIBRARY is the sole dependency-selection authority. Missing or
+ * incompatible dependencies fail; the loader never substitutes a distribution
+ * library or guesses a checkout path inside a relocated container.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -99,6 +102,12 @@ namespace llaminar2
         // Public API Implementation
         // =========================================================================
 
+        /**
+         * @brief Resolve the configured RCCL dependency once without substitution.
+         * @param library_path Explicit diagnostic dependency, or null to use
+         *        CMake's selected RCCL_LIBRARY. An invalid path fails as given.
+         * @return True only when the selected DSO and required symbols load.
+         */
         bool load(const char *library_path)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -109,52 +118,35 @@ namespace llaminar2
                 return true;
             }
 
-            // Default library names to try
-            // RCCL is typically built locally, so we prioritize local paths
-            const char *lib_paths[] = {
-                library_path, // User-specified path (may be nullptr)
-                "/usr/local/lib/librccl.so.1",
-                "/usr/local/lib/librccl.so",
-                "/workspaces/llaminar/external/rccl/build/librccl.so.1",
-                "/workspaces/llaminar/external/rccl/build/librccl.so",
-                "librccl.so.1", // Standard versioned name
-                "librccl.so",   // Unversioned
-                "/opt/rocm/lib/librccl.so.1",
-                "/opt/rocm/lib/librccl.so",
-                "/usr/lib/x86_64-linux-gnu/librccl.so.1",
-                nullptr // Sentinel
-            };
+            // A search list can silently select packaged GPU code that differs
+            // from the dependency admitted by the build. In particular, moving
+            // a checkout into /src must not change which RCCL executes.
+            const char *path = library_path;
+#ifdef LLAMINAR_RCCL_LIBRARY_PATH
+            if (!path)
+                path = LLAMINAR_RCCL_LIBRARY_PATH;
+#endif
+            if (!path || !*path)
+            {
+                g_last_error = "No RCCL library configured; set RCCL_LIBRARY when configuring the build";
+                LOG_ERROR("RCCL Dynamic Loader: " << g_last_error);
+                return false;
+            }
 
             // Clear any previous dlerror
             dlerror();
 
-            for (const char *path : lib_paths)
-            {
-                if (!path)
-                    continue;
-
-                LOG_DEBUG("RCCL Dynamic Loader: Trying to load '" << path << "'");
-
-                // RTLD_NOW: Resolve all symbols immediately (fail fast)
-                // RTLD_LOCAL: Don't add symbols to global namespace (avoid NCCL conflicts)
-                g_library_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-                if (g_library_handle)
-                {
-                    LOG_INFO("RCCL Dynamic Loader: Successfully loaded '" << path << "'");
-                    break;
-                }
-                else
-                {
-                    LOG_DEBUG("RCCL Dynamic Loader: Failed to load '" << path << "': " << dlerror());
-                }
-            }
-
+            LOG_DEBUG("RCCL Dynamic Loader: Loading configured dependency '" << path << "'");
+            // Resolve symbols immediately and keep them local so CUDA's NCCL
+            // and ROCm's RCCL can coexist without sharing function addresses.
+            g_library_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
             if (!g_library_handle)
             {
-                g_last_error = "Failed to load RCCL library from any known path";
+                g_last_error = std::string("Failed to load configured RCCL library '") + path + "': " + dlerror();
                 LOG_ERROR("RCCL Dynamic Loader: " << g_last_error);
                 return false;
             }
+            LOG_INFO("RCCL Dynamic Loader: Successfully loaded '" << path << "'");
 
             // Load all required symbols
             bool success = true;

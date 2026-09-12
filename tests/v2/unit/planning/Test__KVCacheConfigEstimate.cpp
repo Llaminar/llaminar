@@ -47,7 +47,7 @@ TEST(Test__KVCacheConfigEstimate, FP16_MatchesEstimator)
     auto cfg = makeConfig(ActivationPrecision::FP16, 24, 4096, 2, 64);
     size_t est_bytes = cfg.estimateBytes();
 
-    size_t expected = KVCacheMemoryEstimator::estimate(
+    size_t expected = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         24, 1, 4096, 2, 64, "fp16", DeviceId::cuda(0));
 
     EXPECT_EQ(est_bytes, expected);
@@ -59,7 +59,7 @@ TEST(Test__KVCacheConfigEstimate, FP32_MatchesEstimator)
     auto cfg = makeConfig(ActivationPrecision::FP32, 24, 4096, 2, 64);
     size_t est_bytes = cfg.estimateBytes();
 
-    size_t expected = KVCacheMemoryEstimator::estimate(
+    size_t expected = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         24, 1, 4096, 2, 64, "fp32", DeviceId::cuda(0));
 
     EXPECT_EQ(est_bytes, expected);
@@ -70,7 +70,7 @@ TEST(Test__KVCacheConfigEstimate, Q8_1_MatchesEstimator)
     auto cfg = makeConfig(ActivationPrecision::Q8_1, 24, 4096, 2, 64);
     size_t est_bytes = cfg.estimateBytes();
 
-    size_t expected = KVCacheMemoryEstimator::estimate(
+    size_t expected = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         24, 1, 4096, 2, 64, "q8_1", DeviceId::cuda(0));
 
     EXPECT_EQ(est_bytes, expected);
@@ -97,7 +97,7 @@ TEST(Test__KVCacheConfigEstimate, EveryConcretePrecisionMapsExactly)
             test_case.precision, 24, 4096, 2, 64, test_case.device);
         EXPECT_EQ(
             cfg.estimateBytes(),
-            KVCacheMemoryEstimator::estimate(
+            KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
                 24, 1, 4096, 2, 64,
                 test_case.token, test_case.device));
     }
@@ -114,7 +114,7 @@ TEST(Test__KVCacheConfigEstimate, Sharded_UsesLocalKVHeads)
 
     EXPECT_EQ(
         cfg_shard.estimateBytes(),
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             24, 1, 4096, 1, 64, "fp16", DeviceId::cuda(0)));
     EXPECT_LT(cfg_shard.estimateBytes(), cfg_full.estimateBytes());
 }

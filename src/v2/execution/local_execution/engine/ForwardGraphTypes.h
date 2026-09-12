@@ -15,6 +15,7 @@
 #include "../../compute_stages/IComputeStage.h"
 #include "../graph/IGraphBuilder.h" // For ForwardOutput
 #include "PrefillGraphCache.h"
+#include "../../mtp/MTPConditionForwardPurpose.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -97,7 +98,49 @@ namespace llaminar2
         ExplicitPrefill, ///< Require prefill mathematical topology.
         ExplicitDecode, ///< Require decode mathematical topology.
         RestoredPrefixMTPDecodeBridge, ///< Decode plus restored-prefix shifted-MTP state bridge.
+        CommittedMTPCondition, ///< Scalar MTP condition owns a serial commit edge.
     };
+
+    /**
+     * @brief Resolve scalar condition commit ownership before graph lookup.
+     * @param purpose Explicit caller-owned transaction purpose.
+     * @return Invocation whose persistent-state topology is part of cache identity.
+     * @throws std::invalid_argument for an unknown purpose.
+     */
+    [[nodiscard]] inline ForwardInvocationKind mtpConditionForwardInvocation(
+        MTPConditionForwardPurpose purpose)
+    {
+        switch (purpose)
+        {
+        case MTPConditionForwardPurpose::SpeculativeContinuation:
+            return ForwardInvocationKind::ExplicitDecode;
+        case MTPConditionForwardPurpose::CommittedSerialToken:
+            return ForwardInvocationKind::CommittedMTPCondition;
+        }
+        throw std::invalid_argument("Unknown MTP condition commit purpose");
+    }
+
+    /**
+     * @brief Identify the complete forward that owns one serial cadence edge.
+     * @param role Mathematical model role.
+     * @param phase Prefill or decode phase.
+     * @param transaction Persistent-state topology captured with the model.
+     * @return true for ordinary decode or an explicitly committed MTP condition.
+     *
+     * A verifier, speculative condition, or restored-prefix suffix must not
+     * charge a serial edge. Their commit belongs to another transaction.
+     */
+    [[nodiscard]] constexpr bool ownsSerialDecodeCommitBoundary(
+        ForwardExecutionRole role,
+        ForwardExecutionPhase phase,
+        ForwardStateTransaction transaction) noexcept
+    {
+        return phase == ForwardExecutionPhase::Decode &&
+               ((role == ForwardExecutionRole::MainInference &&
+                 transaction == ForwardStateTransaction::Ordinary) ||
+                (role == ForwardExecutionRole::MTPCondition &&
+                 transaction == ForwardStateTransaction::CommittedMTPCondition));
+    }
 
     struct ForwardExecutionPhaseRequest
     {
@@ -140,6 +183,7 @@ namespace llaminar2
             return ForwardExecutionPhase::Prefill;
         case ForwardInvocationKind::ExplicitDecode:
         case ForwardInvocationKind::RestoredPrefixMTPDecodeBridge:
+        case ForwardInvocationKind::CommittedMTPCondition:
             return ForwardExecutionPhase::Decode;
         case ForwardInvocationKind::Automatic:
             break;

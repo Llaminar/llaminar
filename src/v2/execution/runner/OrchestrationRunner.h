@@ -275,7 +275,13 @@ namespace llaminar2
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
         /** @return Existing prefix outcome and validated terminal MTP observations. */
         RequestRuntimeSummary requestRuntimeSummary() const override;
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        /**
+         * @brief Observe runtime state without transferring execution authority.
+         * @param capture_policy Exact diagnostic ranges, forwarded unchanged to participants.
+         * @return Immutable combined cache and terminal-state evidence.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override;
         DeviceId primaryDeviceId() const override;
 
         // =====================================================================

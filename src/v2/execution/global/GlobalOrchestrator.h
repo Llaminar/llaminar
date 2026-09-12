@@ -284,8 +284,11 @@ namespace llaminar2
          * A single local stage is returned verbatim. Multiple local stages are
          * folded in stable pipeline order so cache inventories and terminal
          * evidence remain complete without inventing a second state authority.
+         * @param capture_policy Immutable per-cache ranges forwarded to every stage.
+         * @return Combined participant-local runtime evidence.
          */
-        PrefixRuntimeStateSnapshot prefixStateProbeAll() const;
+        PrefixRuntimeStateSnapshot prefixStateProbeAll(
+            const PrefixProbeCapturePolicy &capture_policy) const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
         PrefixStateSnapshot captureLivePrefixCheckpointAll(
             const PrefixCheckpointCaptureRequest &request) const;
@@ -535,8 +538,13 @@ namespace llaminar2
             const PrefixCheckpointCaptureRequest &request) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
-        /** @brief Observe the complete rank-local pipeline prefix state. */
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        /**
+         * @brief Observe the complete rank-local pipeline prefix state.
+         * @param capture_policy Exact diagnostic ranges, forwarded unchanged to participants.
+         * @return Immutable combined cache and terminal-state evidence.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override;
 
         // =================================================================
         // IInferenceRunner — GPU-side Sampling
@@ -551,6 +559,17 @@ namespace llaminar2
          * @return Token ID on all ranks
          */
         int sampleGreedyOnDevice() override;
+
+        /** @return The resolved vocabulary-head leader for request coordination. */
+        std::optional<int> requestAuthorityRank() const override { return tail_rank_; }
+
+        /**
+         * @brief Declare participation in the existing greedy token broadcast.
+         * @param params Admitted sampler policy.
+         * @return True for the collective greedy sampler; CPU stochastic
+         *         sampling remains local to the declared request authority.
+         */
+        bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
 
         /**
          * @brief Full sampling with cross-rank broadcast
@@ -688,7 +707,9 @@ namespace llaminar2
         bool executeTransfer(const RankTransferAction &action);
 
         /**
-         * @brief Find the tail rank (the rank that has the LM head)
+         * @brief Resolve the unique vocabulary-head domain's request leader.
+         * @return Its owner rank, or first participating rank for a TP domain.
+         * @throws std::invalid_argument for missing, duplicate or invalid ownership.
          */
         int findTailRank() const;
 

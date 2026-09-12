@@ -192,6 +192,38 @@ namespace llaminar2
         return total;
     }
 
+    PrefixProbeCapturePolicy PrefixProbeCapturePolicy::forKVContinuationOf(
+        const PrefixRuntimeStateSnapshot &seed) const
+    {
+        if (!seed.initialized)
+            throw std::invalid_argument("KV continuation probe requires an initialized seed");
+        auto policy = *this;
+        policy.kv_continuation_partitions.clear();
+        policy.hash_full_kv_payloads = true;
+        // A partitioned probe owns its ranges. Do not also export the old
+        // global split or overlapping named ranges from diagnostic environment.
+        policy.hash_default_kv_segments = false;
+        policy.requested_kv_segments.clear();
+        policy.trailing_kv_tokens = 0;
+        for (const auto *family : {&seed.kv_caches, &seed.mtp_kv_caches})
+            for (const auto &cache : *family)
+                for (const auto &layer : cache.layers)
+                {
+                    if (layer.cached_tokens < 0 || layer.seq_idx < 0)
+                        throw std::invalid_argument("KV continuation seed has invalid row geometry");
+                    PrefixKVProbePartition partition{
+                        .owner = cache.owner, .device = cache.device,
+                        .global_layer = layer.global_layer, .seq_idx = layer.seq_idx,
+                        .copied_tokens = layer.cached_tokens};
+                    for (const auto &other : policy.kv_continuation_partitions)
+                        if (other.owner == partition.owner && other.device == partition.device &&
+                            other.global_layer == partition.global_layer && other.seq_idx == partition.seq_idx)
+                            throw std::invalid_argument("KV continuation seed has duplicate cache identity");
+                    policy.kv_continuation_partitions.push_back(std::move(partition));
+                }
+        return policy;
+    }
+
     PrefixProbeCapturePolicy PrefixProbeCapturePolicy::fromEnvironment()
     {
         PrefixProbeCapturePolicy policy;
@@ -322,6 +354,7 @@ namespace llaminar2
                 }
                 const bool capture_any_segment =
                     capture_policy.hash_default_kv_segments ||
+                    !capture_policy.kv_continuation_partitions.empty() ||
                     !capture_policy.requested_kv_segments.empty() ||
                     capture_policy.trailing_kv_tokens > 0;
                 if (layer_probe.cached_tokens > 0 && capture_any_segment)
@@ -400,6 +433,38 @@ namespace llaminar2
                                 : nullptr);
                         return segment;
                     };
+
+                    if (!capture_policy.kv_continuation_partitions.empty())
+                    {
+                        const PrefixKVProbePartition *partition = nullptr;
+                        for (const auto &entry : capture_policy.kv_continuation_partitions)
+                            if (entry.owner == probe.owner && entry.device == probe.device &&
+                                entry.global_layer == layer_probe.global_layer && entry.seq_idx == seq)
+                            {
+                                if (partition)
+                                    throw std::invalid_argument("KV continuation probe has ambiguous cache identity");
+                                partition = &entry;
+                            }
+                        if (!partition || partition->copied_tokens < 0 ||
+                            partition->copied_tokens > layer_probe.cached_tokens)
+                            throw std::invalid_argument("KV continuation probe has missing or invalid seed boundary");
+
+                        // The full seed digest owns the copied prefix, including
+                        // zero rows. Capture every remaining row as one disjoint
+                        // suffix; never clamp a sidecar to the main cache split.
+                        layer_probe.leading_segment_tokens = partition->copied_tokens;
+                        if (partition->copied_tokens > 0)
+                            hash_segment(0, partition->copied_tokens,
+                                &layer_probe.leading_segment_hash_available,
+                                &layer_probe.leading_k_payload_bytes, &layer_probe.leading_v_payload_bytes,
+                                &layer_probe.leading_k_payload_hash, &layer_probe.leading_v_payload_hash,
+                                nullptr, nullptr);
+                        if (partition->copied_tokens < layer_probe.cached_tokens)
+                            layer_probe.segments.push_back(capture_named_segment(PrefixKVSegmentProbe{
+                                .name = "recomputed_suffix",
+                                .token_start = partition->copied_tokens,
+                                .token_count = layer_probe.cached_tokens - partition->copied_tokens}));
+                    }
 
                     if (capture_policy.hash_default_kv_segments &&
                         layer_probe.cached_tokens > 1)

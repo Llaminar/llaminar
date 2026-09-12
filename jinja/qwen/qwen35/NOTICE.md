@@ -39,3 +39,11 @@ The `.jinja` file is embedded into the binary at build time by CMake
 (see `src/v2/models/qwen35/CMakeLists-fragment` / the custom command that
 generates `Qwen35ChatTemplate.generated.h`). There is no filesystem
 dependency at runtime.
+
+## Local modifications
+
+An assistant message after the latest user query retains its thinking header
+even when the reasoning content is empty. This preserves the non-thinking
+generation prompt as an exact prefix when continuing that assistant turn.
+Historical assistant turns before a later user query still omit reasoning;
+fresh generation prompts and their thinking controls are unchanged.

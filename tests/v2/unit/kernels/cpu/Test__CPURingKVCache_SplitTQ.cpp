@@ -17,6 +17,15 @@
 #include <numeric>
 #include <random>
 
+/**
+ * @brief These packed-operand tests select their physical K/V types explicitly.
+ *
+ * They prove the generic ring's lossless copy and the TQ tensor primitives, not
+ * the public compressed-cache policy. Runtime Q8/TQ selectors now use anchored
+ * keys; their factory/append/attention/prefix proofs live in the model-free
+ * CPUAttentionCacheSource integration suite. Do not use convenience policy
+ * aliases here: that would silently change the input codec being tested.
+ */
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "kernels/cpu/turboquant/TurboQuantDequantizeSplitTQ.h"
@@ -132,7 +141,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_PositionMajor_AppendAndGather_Round
     constexpr int MAX_SEQ = 8;
     constexpr int N_TOKENS = 3;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, /*n_layers=*/1, /*batch_size=*/1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, /*n_layers=*/1, /*batch_size=*/1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu(),
                            KVCacheLayoutMode::POSITION_MAJOR);
 
@@ -169,7 +178,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_HeadMajor_AppendAndGather_RoundTrip
     constexpr int MAX_SEQ = 8;
     constexpr int N_TOKENS = 4;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu(),
                            KVCacheLayoutMode::HEAD_MAJOR);
 
@@ -517,7 +526,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_RingWrap_PreservesNewestTokens)
 {
     constexpr int MAX_SEQ = 4;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     // Append 6 tokens (overflows a capacity-4 ring → oldest 2 evicted)
@@ -556,7 +565,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_IncrementalAppend_DecodeLike)
 {
     constexpr int MAX_SEQ = 16;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     // Simulate prefill (5 tokens) + 3 decode steps (1 token each)
@@ -608,7 +617,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_MultiLayer_IndependentData)
     constexpr int MAX_SEQ = 8;
     constexpr int N_LAYERS = 3;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, N_LAYERS, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, N_LAYERS, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     // Append different data to each layer
@@ -648,7 +657,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_MultiLayer_IndependentData)
 
 TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_Clear_ResetsAllLayers)
 {
-    CPURingKVCacheTQ cache(mpi_ctx_, 2, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 2, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto k = makeRandomFP32(3, 1400);
     auto v = makeRandomFP32(3, 1500);
@@ -701,7 +710,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_CacheRoundTrip_CosineSimilarity)
     constexpr int MAX_SEQ = 32;
     constexpr int N_TOKENS = 16;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(N_TOKENS, 4100);
@@ -789,7 +798,7 @@ TEST_F(Test__CPURingKVCache_SplitTQ, SplitTQ_OneHot_ThroughCache)
 {
     constexpr int MAX_SEQ = 8;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     // Create one-hot K and V vectors (2 tokens, each head has one-hot at different pos)

@@ -57,8 +57,9 @@ TEST(Qwen122DynamicWaveGeometry,
 /**
  * @brief Matrix expansion selects evidence geometry before fixture setup.
  *
- * This regression prevents the speed witness from leaking its broad transfer
- * wave and timing window into the five MTP movement-only cells. It also proves
+ * This regression separates the speed witness's timing window from the five
+ * MTP movement-only cells. Both use the same allocated transfer lanes rather
+ * than imposing a second, smaller active-cycle cap. It also proves
  * that the fixture receives a complete immutable policy rather than deriving
  * controller settings from the GoogleTest name.
  */
@@ -106,14 +107,15 @@ TEST(Qwen122DynamicWaveGeometry,
         << "The speed witness must still traverse captured 16+1 prefill segments";
     EXPECT_EQ(qwen35MoEConvergenceTimingRequestRoutedRows(), 19u);
     EXPECT_EQ(qwen35MoEConvergenceTimingCohortRoutedRows(), 57u);
-    EXPECT_EQ(qwen35MoEMaximumNumericalParityRoutedRows(), 14u);
-    EXPECT_EQ(qwen35MoEConvergenceProtectedRoutedRows(), 71u);
-    EXPECT_EQ(kQwen35MoEConvergenceHistogramWindowRows, 96);
+    EXPECT_EQ(qwen35MoEMaximumNumericalParityRoutedRows(), 24u);
+    EXPECT_EQ(qwen35MoEConvergenceProtectedRoutedRows(), 81u);
+    EXPECT_EQ(qwen35MoEConvergenceTrainingMaximumRoutedRows(), 36u);
+    EXPECT_EQ(kQwen35MoEConvergenceHistogramWindowRows, 118);
     EXPECT_GT(
         static_cast<std::uint64_t>(
             kQwen35MoEConvergenceHistogramWindowRows),
         qwen35MoEConvergenceProtectedRoutedRows() +
-            qwen35MoEConvergenceTimingRequestRoutedRows())
+            qwen35MoEConvergenceTrainingMaximumRoutedRows())
         << "One admitted request, the matched cohort, and canonical parity must remain in one immutable epoch";
     EXPECT_EQ(
         speedup.dynamic_rebalance.window_size,
@@ -139,9 +141,10 @@ TEST(Qwen122DynamicWaveGeometry,
             static_cast<float>(
                 kQwen35MoEMovementProofInitialWindowRows));
     EXPECT_EQ(movement.dynamic_rebalance.migration_transfer_slots, 49u);
+    EXPECT_FALSE(movement.dynamic_rebalance.migration_cycles_per_wave.has_value());
     EXPECT_EQ(
         movement.dynamic_rebalance.resolvedMigrationCyclesPerWave(),
-        2u);
+        movement.dynamic_rebalance.migration_transfer_slots);
     EXPECT_EQ(
         movement.dynamic_rebalance.device_min_maintenance_period_tokens,
         4096);
@@ -308,7 +311,7 @@ TEST(Qwen122E2ECertification, SelectsInitialTopologySubsetWithoutExpandingParity
             const auto config = cell.makeOrchestrationConfig(cell.model.model_path, 0);
             EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
             EXPECT_TRUE(config.prefix_cache.enabled);
-            auto arguments = modelParityE2EServerArguments(cell);
+            auto arguments = modelParityServerArguments(cell);
             arguments.insert(arguments.begin(), "llaminar2");
             std::vector<char *> argv;
             for (auto &argument : arguments) argv.push_back(argument.data());

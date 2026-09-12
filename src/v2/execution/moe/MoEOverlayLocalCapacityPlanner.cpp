@@ -10,6 +10,7 @@
  */
 
 #include "MoEOverlayLocalCapacityPlanner.h"
+#include "MoEOverlayCPUServiceMeasurement.h"
 
 #include "planning/ActivationBufferSizing.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
@@ -356,6 +357,16 @@ namespace llaminar2
         const auto &rank_plan = *input.rank_plan;
         const auto &overlay_plan = *input.overlay_plan;
         const auto &inventory = *input.rank_inventory;
+        const bool needs_host_demand =
+            overlay_plan.authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
+            rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
+        if (needs_host_demand != input.host_demand_memory.has_value())
+            throw std::invalid_argument(
+                "ExpertOverlay host Dynamic capacity requires exactly its routing-evidence BOM; other authorities must not allocate a host mirror");
+        if (input.host_demand_memory &&
+            (input.host_demand_memory->geometry().num_experts != profile.expert_count ||
+             input.host_demand_memory->geometry().top_k != profile.expert_used_count))
+            throw std::invalid_argument("ExpertOverlay routing-evidence BOM differs from model router geometry");
         if (profile.n_layers <= 0 || profile.expert_count <= 0 ||
             rank_plan.rank < 0 || inventory.rank != rank_plan.rank)
         {
@@ -428,7 +439,7 @@ namespace llaminar2
             }
         }
         std::set<DeviceId> resource_devices = endpoint_devices;
-        if (input.require_host_memory_authority)
+        if (input.require_host_memory_authority || needs_host_demand)
             resource_devices.insert(DeviceId::cpu());
         for (const auto &charge : activation_channel_plan.staging_charges)
         {
@@ -483,6 +494,16 @@ namespace llaminar2
             {
                 config.graph_snapshot_memory =
                     input.graph_snapshot_memory;
+                if (config.graph_snapshot_memory.effective_kv)
+                {
+                    // Segments import into retained forward parents. Charge
+                    // those independent identities, never every segment or
+                    // rank ticket, plus the separately retained sidecars.
+                    const auto &graphs = input.captured_graph_plan.resident_executables;
+                    config.graph_snapshot_memory.effective_kv->retained_arena_count =
+                        graphs.model_graph_identity_count * graphs.model_graph_topology_variant_count +
+                        MTPGraphOwnerPlan(rank_plan.runtime.mtp).sidecarGraphSlots();
+                }
             }
             config.shard_index = shard_index;
             config.total_shards = total_shards;
@@ -705,6 +726,7 @@ namespace llaminar2
 
         MoEOverlayLocalCapacityPlannerResult result;
         result.resident_graph_rows = input.resident_graph_rows;
+        result.host_demand_memory = input.host_demand_memory;
         result.activation_channel_plan =
             std::move(activation_channel_plan);
         result.fixed_memory_plan = MemoryPlanner::plan(profile, configs);
@@ -756,7 +778,23 @@ namespace llaminar2
                           input.captured_graph_plan.resident_executables)
                     : 0u;
             PhysicalMemoryBOMBuilder additions(resource);
+            // Startup probes reuse one serial scratch family on each CPU
+            // resource. Price it before automatic expert capacity fills RAM;
+            // serving and probe workspaces are independent physical owners.
+            const size_t cpu_service_bytes = device.is_cpu() &&
+                endpoint_devices.contains(device) &&
+                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic
+                    ? MoEOverlayCPUServiceMeasurement::allocationBytes({
+                          .d_model = profile.d_model,
+                          .intermediate = profile.expert_feed_forward_length})
+                    : 0u;
             additions
+                .add(PhysicalMemoryOwner::ExecutionWorkspace, cpu_service_bytes)
+                // One host histogram/mailbox family per rank, regardless of
+                // how many CPU or GPU expert endpoints share that process.
+                .add(PhysicalMemoryOwner::ExecutionWorkspace,
+                     device == DeviceId::cpu() && input.host_demand_memory
+                         ? input.host_demand_memory->allocationBytes() : 0u)
                 .add(
                     PhysicalMemoryOwner::NativeGraphExecutable,
                     captured_graph_bytes)

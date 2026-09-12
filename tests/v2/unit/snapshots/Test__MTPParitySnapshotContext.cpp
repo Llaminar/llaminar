@@ -1,6 +1,9 @@
 /**
  * @file Test__MTPParitySnapshotContext.cpp
- * @brief Device-free regressions for MTP parity snapshot context selection.
+ * @brief Device-free regressions for MTP checkpoint and serial-oracle authority.
+ *
+ * These tests keep tolerant HF tensor comparisons separate from exact native
+ * token induction, and reject malformed lifecycle evidence before inference.
  */
 
 #include <gtest/gtest.h>
@@ -162,6 +165,23 @@ namespace llaminar2::test::parity
             std::invalid_argument);
     }
 
+    TEST(Test__MTPParitySnapshotContext, InitialConditionOwnsDepthZeroBranchIdentity)
+    {
+        EXPECT_EQ(mtpParityBranchReferencePrefix(2, 0, {}, 760),
+                  "decode_step2_CONDITION_760_MTP0_");
+        constexpr std::array<int32_t, 2> drafts{13, 17};
+        EXPECT_EQ(mtpParityBranchReferencePrefix(2, 2, drafts, 760),
+                  "decode_step2_CONDITION_760_BRANCH_13_17_MTP2_");
+        EXPECT_NE(mtpParityBranchReferencePrefix(2, 2, drafts, 760),
+                  mtpParityBranchReferencePrefix(2, 2, drafts));
+        EXPECT_THROW((void)mtpParityBranchReferencePrefix(2, 0, {}), std::invalid_argument);
+        EXPECT_THROW((void)mtpParityBranchReferencePrefix(2, 0, {}, -1), std::invalid_argument);
+        constexpr std::array<int32_t, 14> deepest{};
+        EXPECT_NO_THROW((void)mtpParityBranchReferencePrefix(2, 14, deepest, 760));
+        constexpr std::array<int32_t, 15> too_deep{};
+        EXPECT_THROW((void)mtpParityBranchReferencePrefix(2, 15, too_deep, 760), std::invalid_argument);
+    }
+
     TEST(Test__MTPParitySnapshotContext, OperationalAndMalformedKeysFailClosed)
     {
         constexpr std::array<std::string_view, 7> keys = {
@@ -282,18 +302,23 @@ namespace llaminar2::test::parity
     {
         constexpr std::array<int32_t, 5> serial = {
             13, 271, 760, 3841, 13477};
-        constexpr std::array<int32_t, 4> mtp0 = {
-            561, 760, 3841, 13477};
+        constexpr std::array<MTPParityDraftPrediction, 4> mtp0 = {{
+            {561}, {760}, {3841}, {13477}}};
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{0u, 13, 271},
+            MTPParityCertifiedDecodeRow{1u, 271, 760},
+            MTPParityCertifiedDecodeRow{2u, 760, 3841},
+            MTPParityCertifiedDecodeRow{3u, 3841, 13477}};
         const auto selected =
-            firstMTPParityAcceptedDraftReference(serial, mtp0);
+            selectMTPParityCheckpointAcceptedDraftReference(13, serial, rows, mtp0);
         ASSERT_TRUE(selected.has_value());
         EXPECT_EQ(selected->reference_step, 1u);
         EXPECT_EQ(selected->base_token, 271);
         EXPECT_EQ(selected->first_draft_token, 760);
 
-        constexpr std::array<int32_t, 2> rejected = {7, 8};
+        constexpr std::array<MTPParityDraftPrediction, 2> rejected = {{{7}, {8}}};
         EXPECT_FALSE(
-            firstMTPParityAcceptedDraftReference(serial, rejected)
+            selectMTPParityCheckpointAcceptedDraftReference(13, serial, rows, rejected)
                 .has_value());
     }
 
@@ -324,6 +349,171 @@ namespace llaminar2::test::parity
         EXPECT_EQ(
             certification.tokens,
             (std::vector<int32_t>{13, 271, 760, 3841}));
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         AcceptedDraftUsesNativeSuccessorAtHuggingFaceNearTie)
+    {
+        // The 122B reference forces 271 after row zero; native M=1 and the
+        // predictor both choose 561. Row zero is an accepting native edge,
+        // whereas row one's forced input cannot extend the native trajectory.
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{0u, 13, 561},
+            MTPParityCertifiedDecodeRow{1u, 271, 760},
+            MTPParityCertifiedDecodeRow{2u, 760, 3841},
+        };
+        constexpr std::array<int32_t, 3> reference = {13, 271, 760};
+        constexpr std::array<MTPParityDraftPrediction, 3> drafts = {{{561}, {760}, {3841}}};
+        const auto selected = selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, drafts);
+        ASSERT_TRUE(selected.has_value());
+        EXPECT_EQ(selected->reference_step, 0u);
+        EXPECT_EQ(selected->base_token, 13);
+        EXPECT_EQ(selected->first_draft_token, 561);
+
+        const auto short_proof = certifyMTPParitySerialTrajectory(13, rows, 2u);
+        EXPECT_EQ(selectMTPParitySerialOracleSource(short_proof, 2u, true),
+                  MTPParitySerialOracleSource::ComparedDecodeRows);
+        EXPECT_EQ(selectMTPParitySerialOracleSource(short_proof, 2u, false),
+                  MTPParitySerialOracleSource::ProductionRequest);
+        const auto longer_proof = certifyMTPParitySerialTrajectory(13, rows, 4u);
+        EXPECT_FALSE(longer_proof.complete(4u));
+        EXPECT_EQ(selectMTPParitySerialOracleSource(longer_proof, 4u, true),
+                  MTPParitySerialOracleSource::ProductionRequest);
+
+        constexpr std::array<MTPParityDraftPrediction, 3> rejected = {{{7}, {760}, {3841}}};
+        const auto later_checkpoint = selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, rejected);
+        ASSERT_TRUE(later_checkpoint);
+        EXPECT_EQ(later_checkpoint->reference_step, 2u)
+            << "Only a new checkpoint request can use the later matching edge";
+        EXPECT_FALSE(longer_proof.complete(4u))
+            << "Checkpoint selection must not reclassify forced rows as free-running";
+    }
+
+    /** The dual-CUDA near-tie rejects row one but permits a new row-two request. */
+    TEST(Test__MTPParitySnapshotContext, CheckpointRequestDoesNotInheritDivergedNativePrefix)
+    {
+        constexpr std::array<int32_t, 3> prompt = {760, 3841, 13477};
+        constexpr std::array<int32_t, 5> reference = {13, 271, 760, 3841, 13477};
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{0u, 13, 198},
+            MTPParityCertifiedDecodeRow{1u, 271, 760},
+            MTPParityCertifiedDecodeRow{2u, 760, 3841},
+            MTPParityCertifiedDecodeRow{3u, 3841, 13477}};
+        constexpr std::array<MTPParityDraftPrediction, 4> drafts = {{{561}, {760}, {3841}, {13477}}};
+        const auto selected = selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, drafts);
+        ASSERT_TRUE(selected);
+        EXPECT_EQ(selected->reference_step, 2u);
+        EXPECT_EQ(selected->base_token, 760);
+        EXPECT_EQ(selected->first_draft_token, 3841);
+        EXPECT_EQ(mtpParityCheckpointPrompt(prompt, reference, *selected),
+                  (std::vector<int32_t>{760, 3841, 13477, 13, 271}));
+        const auto serial = certifyMTPParitySerialTrajectory(13, rows, 5u);
+        EXPECT_EQ(serial.tokens, (std::vector<int32_t>{13, 198}));
+        EXPECT_FALSE(serial.complete(5u));
+        auto wrong_condition = *selected;
+        wrong_condition.base_token = 198;
+        EXPECT_THROW((void)mtpParityCheckpointPrompt(prompt, reference, wrong_condition),
+                     std::invalid_argument);
+        wrong_condition.reference_step = reference.size();
+        EXPECT_THROW((void)mtpParityCheckpointPrompt(prompt, reference, wrong_condition),
+                     std::invalid_argument);
+        EXPECT_THROW((void)mtpParityCheckpointPrompt({}, reference, *selected), std::invalid_argument);
+
+        // The concrete row-two draft was another near-tie (3841/11316).
+        // Prefer the pack's decisive row-three prediction; do not relax the
+        // runtime requirement that the nominated draft is actually accepted.
+        auto margins = drafts;
+        margins[2].margin = 0.01f;
+        margins[3].margin = 5.95f;
+        const auto strongest = selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, margins);
+        ASSERT_TRUE(strongest);
+        EXPECT_EQ(strongest->reference_step, 3u);
+        EXPECT_EQ(mtpParityCheckpointPrompt(prompt, reference, *strongest),
+                  (std::vector<int32_t>{760, 3841, 13477, 13, 271, 760}));
+    }
+
+    /** Validate the entire pack before a locally accepting edge can be selected. */
+    TEST(Test__MTPParitySnapshotContext, CheckpointSelectionRejectsMalformedRowsAfterEarlyAcceptance)
+    {
+        constexpr std::array<int32_t, 3> reference = {13, 271, 760};
+        constexpr std::array<MTPParityDraftPrediction, 3> drafts = {{{561}, {760}, {3841}}};
+        const std::array rows = {
+            MTPParityCertifiedDecodeRow{0u, 13, 561},
+            MTPParityCertifiedDecodeRow{1u, 271, 760},
+            MTPParityCertifiedDecodeRow{2u, 760, 3841}};
+        for (int defect = 0; defect != 3; ++defect)
+        {
+            auto malformed = rows;
+            if (defect == 0) malformed[2].reference_step = 3u;
+            if (defect == 1) malformed[2].committed_token = 198;
+            if (defect == 2) malformed[2].predicted_successor_token = -1;
+            EXPECT_FALSE(selectMTPParityCheckpointAcceptedDraftReference(
+                13, reference, malformed, drafts));
+        }
+        EXPECT_FALSE(selectMTPParityCheckpointAcceptedDraftReference(-1, reference, rows, drafts));
+        EXPECT_FALSE(selectMTPParityCheckpointAcceptedDraftReference(13, {}, rows, drafts));
+        auto malformed_drafts = drafts;
+        malformed_drafts.back().token = -1;
+        EXPECT_FALSE(selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, malformed_drafts));
+        malformed_drafts = drafts;
+        malformed_drafts.back().margin = std::numeric_limits<float>::quiet_NaN();
+        EXPECT_FALSE(selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, rows, malformed_drafts));
+    }
+
+    /** A reset-row numerical oracle cannot also certify a running epoch clock. */
+    TEST(Test__MTPParitySnapshotContext, MovementOracleRequiresContinuousRequest)
+    {
+        constexpr std::array rows = {
+            MTPParityCertifiedDecodeRow{0u, 13, 271},
+            MTPParityCertifiedDecodeRow{1u, 271, 760}};
+        const auto proof = certifyMTPParitySerialTrajectory(13, rows, 3u);
+        ASSERT_TRUE(proof.complete(3u));
+        EXPECT_EQ(selectMTPParitySerialOracleSource(
+                      proof, 3u, true, MTPParitySerialOracleContinuity::ComparedRows),
+                  MTPParitySerialOracleSource::ComparedDecodeRows);
+        EXPECT_EQ(selectMTPParitySerialOracleSource(
+                      proof, 3u, true, MTPParitySerialOracleContinuity::ContinuousRequest),
+                  MTPParitySerialOracleSource::ProductionRequest);
+        EXPECT_EQ(selectMTPParitySerialOracleSource(
+                      {}, 3u, true, MTPParitySerialOracleContinuity::ContinuousRequest),
+                  MTPParitySerialOracleSource::InvalidEvidence);
+        EXPECT_EQ(selectMTPParitySerialOracleSource(
+                      proof, 3u, true, static_cast<MTPParitySerialOracleContinuity>(99)),
+                  MTPParitySerialOracleSource::InvalidEvidence);
+    }
+
+    TEST(Test__MTPParitySnapshotContext,
+         MalformedSerialEvidenceCannotSelectProductionRequest)
+    {
+        for (const auto failure : {
+                 MTPParitySerialCertificationFailure::InvalidRequestedHorizon,
+                 MTPParitySerialCertificationFailure::InvalidPrefillPrediction,
+                 MTPParitySerialCertificationFailure::NonContiguousDecodeRow,
+                 MTPParitySerialCertificationFailure::InvalidSuccessorPrediction})
+        {
+            const MTPParitySerialTrajectoryCertification malformed{
+                .tokens = {13, 561}, .failure = failure};
+            EXPECT_EQ(selectMTPParitySerialOracleSource(malformed, 2u, true),
+                      MTPParitySerialOracleSource::InvalidEvidence);
+            EXPECT_EQ(selectMTPParitySerialOracleSource(
+                          malformed, 2u, true,
+                          MTPParitySerialOracleContinuity::ContinuousRequest),
+                      MTPParitySerialOracleSource::InvalidEvidence);
+        }
+        EXPECT_EQ(selectMTPParitySerialOracleSource({}, 2u, true),
+                  MTPParitySerialOracleSource::InvalidEvidence);
+        constexpr std::array malformed_rows = {
+            MTPParityCertifiedDecodeRow{1u, 13, 561}};
+        constexpr std::array<MTPParityDraftPrediction, 1> drafts = {{{561}}};
+        constexpr std::array<int32_t, 1> reference = {13};
+        EXPECT_FALSE(selectMTPParityCheckpointAcceptedDraftReference(
+            13, reference, malformed_rows, drafts).has_value());
     }
 
     TEST(Test__MTPParitySnapshotContext,
@@ -386,6 +576,9 @@ namespace llaminar2::test::parity
             EXPECT_EQ(plan.execution_draft_depth, depth);
             EXPECT_EQ(plan.response_token_budget, 2);
             EXPECT_TRUE(plan.device_commit_boundary);
+            EXPECT_FALSE(plan.fitsMaintenanceWindow(1));
+            EXPECT_TRUE(plan.fitsMaintenanceWindow(2));
+            EXPECT_TRUE(plan.fitsMaintenanceWindow(depth + 1));
         }
 
         const auto cpu_plan = makeMTPParityCheckpointTransactionPlan(
@@ -403,6 +596,32 @@ namespace llaminar2::test::parity
                 false,
                 std::numeric_limits<int>::max())
                 .valid());
+    }
+
+    /** Cadence, oracle offset, and adaptive budget must describe one request. */
+    TEST(Test__MTPParitySnapshotContext, AdaptiveWitnessRetiresDeclaredInitialCadence)
+    {
+        for (int depth = 1; depth <= 15; ++depth)
+        {
+            for (int cadence : {1, 2, 16})
+            {
+                const auto plan = makeMTPParityAdaptiveWitnessPlan(depth, cadence);
+                ASSERT_TRUE(plan.valid());
+                EXPECT_EQ(plan.warmup_tokens, cadence);
+                EXPECT_EQ(plan.response_tokens, depth + 2);
+                EXPECT_EQ(plan.serial_oracle_tokens, cadence + depth + 2);
+            }
+            const auto no_device_clock = makeMTPParityAdaptiveWitnessPlan(depth);
+            ASSERT_TRUE(no_device_clock.valid());
+            EXPECT_EQ(no_device_clock.warmup_tokens, 1);
+        }
+        EXPECT_FALSE(makeMTPParityAdaptiveWitnessPlan(0, 2).valid());
+        EXPECT_FALSE(makeMTPParityAdaptiveWitnessPlan(15, 0).valid());
+        EXPECT_FALSE(makeMTPParityAdaptiveWitnessPlan(15, -1).valid());
+        EXPECT_FALSE(makeMTPParityAdaptiveWitnessPlan(
+            15, std::numeric_limits<int>::max()).valid());
+        EXPECT_FALSE(makeMTPParityAdaptiveWitnessPlan(
+            std::numeric_limits<int>::max(), 2).valid());
     }
 
     TEST(Test__MTPParitySnapshotContext, GroupedTokenMismatchReportsFirstEdge)

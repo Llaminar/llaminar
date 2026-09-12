@@ -30,6 +30,7 @@ namespace llaminar2::cpu::native_vnni
         NibbleLUT = 0,          ///< Four-bit payload decoded in the hot loop.
         ExpandedInt8 = 1,       ///< One prepared signed byte per logical weight.
         Q6KNativeDualScale = 2, ///< Native six-bit payload with two FP16 scales.
+        CompactMultiScale = 3, ///< Native payload, two scales, optional two minima.
     };
 
     /**
@@ -47,6 +48,7 @@ namespace llaminar2::cpu::native_vnni
         case CPUNativeVNNIEncoding::NibbleLUT:
         case CPUNativeVNNIEncoding::ExpandedInt8:
         case CPUNativeVNNIEncoding::Q6KNativeDualScale:
+        case CPUNativeVNNIEncoding::CompactMultiScale:
             return true;
         }
         return false;
@@ -65,6 +67,7 @@ namespace llaminar2::cpu::native_vnni
         switch (encoding)
         {
         case CPUNativeVNNIEncoding::NibbleLUT:
+        case CPUNativeVNNIEncoding::CompactMultiScale:
             return 1024;
         case CPUNativeVNNIEncoding::ExpandedInt8:
             return 2048;
@@ -88,6 +91,10 @@ namespace llaminar2::cpu::native_vnni
             return 0;
         if (encoding == CPUNativeVNNIEncoding::Q6KNativeDualScale)
             return 1792;
+        // A fixed padded native payload plus two scale vectors and one optional
+        // effective-minimum vector. Unused bytes are zero, not another ledger.
+        if (encoding == CPUNativeVNNIEncoding::CompactMultiScale)
+            return 1536;
         return data_stride + 256u + (is_asymmetric ? 128u : 0u);
     }
 

@@ -226,9 +226,14 @@ namespace
         return reinterpret_cast<ITensorGemm *>(static_cast<uintptr_t>(0x7000 + id * 0x100));
     }
 
+    /**
+     * @brief Read service policy from the repository-root CTest working directory.
+     * @return Source text, or empty text when the required source is missing.
+     * @details The same relative path works in a checkout and the installed test image.
+     */
     std::string readMoEWeightServiceSource()
     {
-        std::ifstream in("/workspaces/llaminar/src/v2/execution/moe/MoEExpertWeightService.cpp");
+        std::ifstream in("src/v2/execution/moe/MoEExpertWeightService.cpp");
         if (!in)
             return {};
         std::ostringstream ss;

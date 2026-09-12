@@ -64,6 +64,181 @@ inventory, and source-policy gates inspect the shared fixture family.
 
 ## Tagged HTTP / long-context certification
 
+`ModelParityRuntimeExport.h` exports the public runtime arguments for every
+canonical cell, not only E2E tags. `scripts/ci/model_parity_inventory.py` owns
+the shared CTest/GoogleTest discovery join. Its default `all` scope includes
+untagged cells; `--scope e2e` projects only the tagged subset. Saved manifests
+declare that scope, and an E2E-only manifest cannot certify full-matrix
+coverage. Listing/exporting metadata does not load weights or run inference:
+
+```bash
+python3 scripts/ci/model_parity_inventory.py \
+  --build-dir build_v2_integration \
+  --export-manifest parity-results/canonical-cells.json
+```
+
+The runtime record and the E2E profile share one CLI argument projection.
+The profile additionally owns its HTTP workload/context budgets; it does not
+define a second topology. Rebuild the matrix executables after changing the
+typed export and regenerate manifests rather than editing their JSON by hand.
+
+`ModelParityDefinition::generation_workload` owns the fast regression horizon.
+Every generated cell, including MTP off and fixed/adaptive MTP, inherits the
+same per-request budget. The default requests and requires 384 actual committed
+output tokens in one continuous generation, including models without MTP.
+Definitions may increase that horizon; several short requests or early EOS
+below the minimum cannot satisfy it. The export is `runtime.generation`;
+`GenerationWorkload.observe()` validates
+each response before exact token comparison. Token equality is a behavioral
+regression check, not a bound on KL/cosine or a substitute for byte-exact
+grouped-versus-serial arithmetic tests. This workload does not change the
+short checkpoint-rich deep mathematical parity fixtures.
+
+`ModelParityModelDefinition::generation_prompt` owns the exact system, user,
+and fixed assistant-history messages, plus an optional next user turn.
+Its validated value is shared by
+all backends, topologies and MTP policies for that model. Choose suitable
+long-form text during initial baseline acquisition when a model naturally
+finishes another task before the required horizon. Do not change prompts or
+retry seeds automatically when an approved stream regresses. The common
+four-request protocol and minimum output length do not change;
+new message bytes invalidate affected controls through ordinary identity checks.
+`ModelParityModelDefinition::generation_seed` owns the fixed positive uint32
+request seed for every topology, KV format and MTP policy of that model. Initial
+acquisition may deliberately choose it, but changing it invalidates affected
+controls just like changing messages. Zero and values outside the public sampler
+ABI fail definition construction; runners never choose or retry seeds.
+The extension must still preserve the complete cached token prefix. A chat
+template that rewrites the earlier assistant header cannot waive that
+requirement. Diagnose a short restored answer against a cold request
+with the exact same body before attributing it to natural EOS or cache state.
+
+The small Qwen2/Qwen3 definitions explicitly select the fixed passage in
+`LongFormJournalPrompt.h`. A finite English revision task supplies concrete
+remaining text; it is not an expected answer or permission to suppress EOS.
+The larger model families retain their existing prompts. Actual continuous
+output length, stochastic sampling, exact repeats and prefix restoration remain
+live checks; source-text length alone cannot satisfy them.
+The supplied assistant history is a closed message, not a live completion
+prefix. The Qwen2 Q4_0 identity explicitly requests the entire revision in a next user turn;
+Qwen3 keeps the assistant history terminal because its template otherwise
+rewrites the earlier non-thinking assistant header. That distinction is model
+owned, never selected by backend or by observed output. The exact token-prefix
+gate still checks both. All four requests keep the same stochastic sampling
+policy; EOS remains enabled. The Qwen2 Q8_0 identity retains its already-proven
+translation task. Exact real-model definitions own this choice; runners must
+never pick a task from a filename, backend, KV format or observed output.
+
+`ModelParityModelDefinition::prefix_state` declares the main-model restore
+contract explicitly. Attention-only models use `AttentionKV`; hybrid models
+use `HybridRecurrent`, even when MTP is off. Missing declarations fail matrix
+expansion. The generation observer requires the declared state at full and
+partial hits; MTP independently adds shifted sidecar and full-hit hidden-state
+obligations. This contract is part of serial-control identity, not inferred
+from model filenames, response flags or optional profiling.
+
+The in-progress generation runner reuses the mature HTTP harness's local or
+Docker server lifecycle. List its existing serial controls without loading
+weights:
+
+```bash
+python3 scripts/ci/run_model_parity_generation.py \
+  --mode collect-controls --list --output parity-results/generation-controls
+```
+
+For an exact selector discovered above, `--mode collect-controls` acquires
+unapproved MTP-off observations. `--mode compare-controls --controls PATH`
+compares selected cells with those controls. The expander exports each control
+relationship, exact prompt/sampler request and fresh/full/partial probe order;
+the runner does not synthesize an Off configuration from MTP argv. Both modes
+run the full Unit/preflight gate once before admitting their cells, use the
+shared tmpfs cache, and stop at the first failure. Output directories must be
+new; comparison never updates control files. MTP collection without a serial
+control is rejected before HTTP inference.
+
+The outer runner binds each selected cell to the complete current Off record
+from that same canonical inventory. A stable cell name and matching prompt are
+not sufficient when topology or economy defaults changed. Stale controls fail
+before prerequisites, model staging or server launch; the runner never parses
+MTP options out of CLI strings to synthesize a control configuration.
+
+For unchanged local iteration, `--reuse-preflight-report PATH` accepts a passed
+canonical numerical, generation or standalone prerequisite receipt. A direct
+`run_production_parity_preflight(..., artifact_directory=...)` invocation writes
+`prerequisites.json` even when no model run follows. This model-free receipt
+cannot certify a model or image. The same admission
+authority verifies the complete Unit/integration inventory and build identity;
+standalone and generation reports retain the original gate completion time even as later cell
+progress is written. A failed model cell does not require rerunning an unchanged
+successful prerequisite, but a rebuild/reconfiguration invalidates it.
+
+The partial probe extends a complete earlier conversation with fixed assistant
+history. It does not substitute a shorter shared-text lookup for a restorable
+hybrid-state checkpoint. Actual returned prompt IDs must contain the complete
+prior prompt as a strict prefix. Every probe also requests the public terminal
+runtime summary and asserts its actual fresh/full/partial outcome and matched
+token boundary. Matching tokens cannot waive a missing restore, even when
+movement explains cache invalidation. The preserved placement epochs diagnose
+such misses. Graph evidence includes the captured prefill lifecycle as well as
+decode replay; no snapshot or GPU-stage profiler is enabled for these probes.
+HTTP runtime projection uses the typed stochastic-capable MTP verifier policy,
+which also serves greedy requests. Generation uses a positive position-keyed
+seed: seed zero cannot establish serial-sample equivalence. Each speculative
+response must report actual drafting, stochastic verification and accepted
+drafts under the selected depth policy; an MTP CLI flag or token equality alone
+does not satisfy that requirement. Dynamic MTP also requires positive terminal
+depth-policy updates. A fresh request must have no stale restoration state;
+every MTP hit must restore shifted sidecar state, and a full MTP hit must also
+restore terminal hidden state. These checks apply to both live responses and
+persisted observations, independently of token equality.
+
+Every response also carries `runtime_summary.expert_movement`, a versioned
+model-lifetime snapshot of the placement authority's completed journal.
+`generation_movement_ledger.py` checks complete, non-truncated publication,
+closed physical cycles, matching profitable economy records and host admission
+proofs. Later snapshots must retain the earlier immutable history exactly.
+Static and non-applicable cells require empty journals; Dynamic requires
+completed movement over the four-request cohort, not an unnecessary new wave
+on every full cache hit. Device recomposition can put differently labelled
+logical objectives into the same physical cycle: preserve per-command axes
+instead of demanding one label for the whole component. Missing journals in
+older observations are missing evidence, not implicitly empty journals.
+
+The separate `runtime_summary.expert_movement_topology` describes the canonical
+model-frozen plan: required authority and available tier/participant axes.
+It is independent of Static/Dynamic activity and immutable across requests.
+Both public probes and deep parity use `MoEOptimizationMovementTopology` for
+this geometry; neither re-estimates capacity or infers it from observed moves.
+Dynamic must cover every available axis over the cohort, with a combined edge
+counting for both; wrong-authority or impossible-axis journals fail. Static
+still requires empty journals even when its topology could support movement.
+
+These passive checks do not estimate placement or drive runtime decisions.
+The completed movement journal uses wire schema 2. Each economy record names
+its admitting `policy`: `time_ns` retains the existing exact service/transfer/
+interference equation, while `native_load_spread` retains the homogeneous GPU
+policy's routed-work conservation, accepted swap gain, payload-slot floor and
+post-wave spread ceiling. These are different units, not interchangeable cost
+estimates. A native load proof certifies only same-tier participant swaps and
+cannot substitute for a multi-tier time-based proof. Missing policy metadata or
+older journal schemas require fresh observation; no consumer manufactures
+nanosecond estimates from load counts. A valid policy equation alone does not
+prove that its commands completed.
+Estimated weight sizes are not measured transport bytes. After shutdown, the
+shared HTTP harness requires published payload bytes and matching bounded
+transport/owner sequences for host movement, or transaction-qualified completed
+edge/byte evidence for device movement. Calibration cannot supply placement
+proof. Generation then binds every HTTP journal edge to those committed
+identities through `validate_movement_transport_mirrors()`; unrelated waves or
+rank duplicates cannot replace missing movement. Evidence predating these
+contracts needs recollection, not fabricated metadata.
+
+These commands are currently **diagnostic**, not the routine image gate.
+Successful observations still require independent numerical provenance and
+complete per-request prefix/movement-ledger evidence before baseline approval
+and CI cutover. They do not replace the full E2E server suite. The HTTP-only
+probe helper cannot launch a server or certify an image itself.
+
 `ModelParityDefinition::e2e_certifiable` opts exact existing configurations into
 the Release HTTP gate. Each typed selector names activation/KV precision, MTP,
 prefill profile and, for ExpertOverlay, both movement and owner order. Model and
@@ -187,6 +362,14 @@ only with a declared mixed topology, same-rank node-local mapping evidence and
 its exact nonblocking payload contract. CPU expert inputs are an explicit
 collective boundary, not permission to mirror GPU execution state on the host.
 
+Explicit heterogeneous collective segmentation likewise needs physical native
+executables, not a full-graph record with a different name. The HTTP observer
+joins every segment's nonempty capture and launch by rank, device, graph context
+and stage identity. It requires transaction zero for setup-materialized units
+and replay for repeated execution. Missing units, graph-only children, eager
+warmup and homogeneous segmentation remain failures. Setup-only buckets need no
+synthetic inference to produce launch evidence.
+
 The same profile owns `readiness_timeout_seconds` (default 60). Override it in
 an exact certification selector's `.profile` when model loading and graph setup
 need a larger budget; the initial 122B tags use 180 seconds. Discovery exports
@@ -245,8 +428,9 @@ not every Integration/Release target, and never launches a model campaign,
 E2E server, container, or benchmark. Registration and manual invocation are in
 `.githooks/README.md`. Numerical and HTTP certification remain separate gates.
 
-Every aggregate campaign run first builds the CMake-owned `v2_unit_gate` target
-and runs the complete `V2_Unit_*` CTest namespace. It then runs the registered
+Every aggregate campaign run first builds the CMake-owned `v2_unit_gate` and
+`v2_production_parity_preflight_gate` targets in one transaction, then runs the
+complete `V2_Unit_*` CTest namespace. It then runs the registered
 `ProductionParityPreflight` CTest label. Both phases precede the model-download
 fixture and GGUF staging, so a broken device-free invariant, rank lifecycle,
 graph/event contract, or ExpertOverlay epoch cannot consume model-loading time
@@ -268,7 +452,8 @@ member:
 - exercises production infrastructure without loading a real model.
 
 The Integration preflight covers established MPI/rank and orchestration
-lifecycle, CUDA/ROCm explicit-stream event ordering, native graph capture and
+lifecycle, production CPU self-launch and physical-core affinity for serialized
+device selectors, CUDA/ROCm explicit-stream event ordering, native graph capture and
 retained replay,
 prefill graph buckets, heterogeneous captured-ticket dispatch, prepared
 ExpertOverlay weights, and asynchronous overlay epochs. When a campaign defect
@@ -452,6 +637,17 @@ identity validation. Cells that change residency policy, owner placement, or
 another capacity-affecting field construct a fresh authority rather than
 guessing compatibility in the fixture.
 
+Compatible Static 122B MTP cells additionally retain one complete runner with
+an identical physical/graph identity and depth-fifteen capacity. Requested MTP
+depth is a request policy, not a reason to reconstruct that topology. Before
+each cell, `ParityRunnerEvidence` preserves only named construction and Static
+policy contracts when the exact retained runner is still owned. All replay,
+MTP execution, prefix restore, movement, timing and ordered-sequence records
+start fresh. The existing collector remains the only evidence store; retained
+allocations and captures are not republished as new work. A fresh or incompatible
+runner clears every record. This lifetime distinction never replaces the
+per-cell mathematical, fresh-execution, or authoritative movement-ledger gates.
+
 ## Production-path evidence
 
 Production campaigns force declarative graph execution and enable structured
@@ -476,6 +672,15 @@ backend/collective boundary. CPU cells must still use the production graph
 execution path. No campaign falls back to eager execution, deterministic test
 kernels, serial replay, or a different backend.
 
+Rank-local heterogeneous ticket evidence comes from the production marker-
+adjacency validator before retained-parent lowering. Its versioned logical
+contract is distinct from physical compiler-unit counts: many CPU cutpoints
+can become one service program, and extra graph-only GPU children can belong
+to one retained executable. The shared evidence interpreter requires that
+logical proof; independent capture/materialization/replay records still prove
+the optimized implementation executed. Never infer ticket ordering from a
+post-lowering child count or accept lifecycle evidence alone as execution proof.
+
 Each results directory contains `production_path.csv`, recording the typed
 global execution topology, rank-local graph contract, execution path,
 inner-forward versus complete graph
@@ -497,6 +702,21 @@ artifacts:
 - `decode_layers.csv`
 - `decode_stages.csv`
 
+Every production cell also writes `prefix_restore.csv`. For a partial hit,
+the actual immutable cache seed owns exact restored-prefix bytes; the previously
+certified serial continuation owns the uncached suffix and terminal-state
+expectations. These are distinct authorities when expert movement precedes a
+reseed. The CSV records `cached_prefix_moe_movement_epoch` separately from
+serial-oracle and observed epochs. This does not weaken byte identity against
+the seed or the existing placement-aware numerical gates for recomputation.
+Dynamic proof admission must budget the complete request sequence, including
+the mandatory cold reseed after purging decode's archive and the uncached
+suffix. `ProductionParityPrefixRestorePlan` supplies that geometry to both
+execution and admission. A complete hit contributes no routed rows; an
+overlapping training request whose prefix is invalidated can contribute a
+second cold prefill. Use maximum overlap for headroom and minimum guaranteed
+work for a finite training horizon, never interchange the two.
+
 Every typed MTP cell additionally writes `mtp_transactions.csv`; specialized
 long-horizon campaigns may also write `mtp_sidecar_token_trace.csv`. Their
 committed verifier columns (`verifier_identity_transaction_count`,
@@ -505,11 +725,47 @@ the device-owned identity published by the same fused response/state commit
 that advances the generation controller. They must agree with the transaction
 delta and selected depth for every speculative call. The token vector also
 selects a branch-qualified Hugging Face sidecar oracle whenever quantized
-predictor argmax leaves the canonical HF branch; comparing that row with the
-unqualified tensor is invalid. Reusable proposal or verifier-input scratch is
+predictor argmax leaves the canonical HF branch. The actual initial condition
+likewise owns a `_CONDITION_<token>` qualifier when it differs from HF's main
+argmax; comparing embeddings for different token IDs is invalid. These
+additive references retain independent FP32 HF hidden/cache history and never
+replace canonical tensors. Reusable proposal or verifier-input scratch is
 not admissible post-transaction evidence. A terminal absorbing call may retain
 the preceding committed identity while selecting depth zero, because it does
 not claim a new verifier transaction.
+
+The shared fixture additionally requires `mtp_native_verifier_rows.csv`.
+Its same-input native serial versus grouped row-zero comparison accepts only
+nonempty, equal-shaped, finite, byte-identical rows, including signed-zero bits.
+This common gate precedes model-specific diagnostic hooks; neither HF cosine/KL
+tolerances nor matching token IDs can waive it. The canonical artifact auditor
+requires a coherent bank including embedding, final norm and LM head. A failed
+recursive HF bank also retains its complete native/reference NumPy diagnostic
+values under `mtp_failed_bank_depth*/`, with exact checkpoint names in a CSV.
+Those native values must never become inputs to the independent HF oracle.
+
+HF remains the tensor oracle, not the exact native token oracle. A quantized
+near-tie can pass the distribution gate while selecting a different token.
+MTP acceptance checkpoints therefore match HF predictor tensors against
+native M=1 conditions and successors at an authenticated checkpoint. Each
+checkpoint defines a new request: the original prompt plus its preceding HF
+input tokens. It need not lie on the original free-running native trajectory.
+Those input tokens never become an expected native response. The strongest
+matching HF predictor margin nominates the acceptance checkpoint (earliest on
+ties); actual native acceptance remains required. Malformed row identity or
+prediction is a hard failure.
+
+One public captured serial request from the exact complete cached prefix owns
+the expected tokens, restored persistent input state and selected verifier-row
+tensors together. The observer publishes that selected row exactly once; an
+earlier forced row or another request in the same placement epoch cannot replace
+it. Fixed proofs cover their complete admitted response; dynamic proofs use the
+same continuous request for the full maintenance/adaptive witness horizon.
+MTP restores and compares the complete persistent input before executing.
+Captured suffix prefill and serial decode may use different arithmetic geometry:
+equal token IDs and positions alone do not establish identical verifier input.
+Actual positive acceptance, exact serial response, and every HF tensor comparison
+remain mandatory after nomination.
 
 Cross-rank pipeline cells first write rank-local diagnostic fragments, then
 merge them into the same canonical files. The merged result must contain every
@@ -641,13 +897,16 @@ python3 scripts/ci/run_production_parity_campaigns.py \
 
 The report path is generated debris and must not be committed.
 
-To run one exact campaign directly, discover its name first:
+To select one exact campaign, discover its name first and keep the driver-owned
+tmpfs, prerequisite, watchdog, and artifact contracts:
 
 ```bash
 ctest --test-dir build_v2_integration -N -L Campaign
-ctest --test-dir build_v2_integration \
-  -R '^V2_Integration_Parity_Qwen2_SingleDevice_ProductionCampaign_CUDA_ALL_PRECISIONS$' \
-  --output-on-failure
+python3 scripts/ci/run_production_parity_campaigns.py \
+  --build-dir build_v2_integration \
+  --campaign '^V2_Integration_Parity_Qwen2_SingleDevice_ProductionCampaign_CUDA_ALL_PRECISIONS$' \
+  --model-ramdisk-root /mnt/llaminar-production-parity \
+  --persistent-model-cache-dir cache
 ```
 
 ## Adding or extending a matrix
@@ -699,6 +958,49 @@ its selected topology has a complete first-class implementation; no production
 cell substitutes another movement policy for it.
 
 ## Local verification
+
+### Route-conditioned MoE MTP equations
+
+A validated near-cutoff expert substitution has an explicit independent proof:
+the existing full-router/top-k boundary and probability-space KL checks must
+pass, the FFN input must pass HF parity, and both routers' selected weights must
+equal their own normalized probabilities. The reference then evaluates the
+union of selected experts in CPU/FP32 PyTorch on the **HF input**, using only
+those expert slices from the exact GGUF. Native inputs and outputs are not
+generator arguments. The bank must tightly reconstruct the original HF expert
+sum before it can certify the native selected-route sum at the unchanged cell
+cosine gate. Relative L2 additionally cannot exceed the unit-vector distance
+implied by that gate, so a scale error cannot hide behind a good cosine.
+
+`proof_authority=route_conditioned_hf` is distinct from `canonical_hf` in both
+canonical stage CSVs and the detailed MTP breakdown. Original cosine/L2/error
+metrics remain unchanged; `canonical_passed` and the independent proof metrics
+show exactly why a different-route comparison was admitted. Failed original
+values remain available even when the independent equation passes.
+
+The bounded sidecar suffix has its own `route_conditioned_hf_suffix` authority:
+combined routed + gated shared, residual addition, and terminal RMS norm. It
+requires a passing routed equation and the **original** HF comparisons for FC,
+attention output and gated shared output. Every suffix equation must tightly
+reconstruct its original HF checkpoint before comparing native output at the
+unchanged cosine/L2 gates. A failed stage prevents certification of later
+stages. RMS parameters come from the exact GGUF through the canonical
+dequantizer and HF parameter transform, never by fitting native or HF outputs.
+No logits, future recursive input, prefix restore or serial-byte gate is
+replaced. In particular, a conditioned terminal norm cannot silently author
+the next draft's HF hidden state.
+
+`generate_moe_route_conditioned_reference.py` caches unweighted expert banks
+under the authenticated pack's `route_conditioned/` directory. The existing
+reference-generation lease serializes publication; small operand content,
+all GGUF shard file identities, exact expert IDs, and equation schema own cache
+identity. No whole-GGUF checksum or full-model reload is performed. Corrupt
+committed banks fail closed. The codebook-independent slice uses the canonical
+GGUF dequantizer; FP32, FP16, and BF16 follow the same equation as quantized
+experts. Device-free equation/cache/normalization regressions belong to both
+Unit and `ProductionParityPreflight`.
+
+### Commands
 
 Fast, device-free framework checks:
 

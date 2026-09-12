@@ -7,6 +7,8 @@
  * ROCm participants. Both driver families register their process-local mapping
  * only after the group-owner first-touch rendezvous. Exact-stream copies then
  * prove byte visibility in both directions without a device/stream synchronize.
+ * Restoration regressions seed accumulated placement drift, then require every
+ * captured repair wave to respect the same per-layer capacity as optimization.
  */
 
 #include "backends/BackendManager.h"
@@ -4924,6 +4926,155 @@ namespace llaminar2::test
                     << layer << " expert " << expert;
             }
         }
+    }
+
+    /**
+     * @brief Restore accumulated drift without borrowing another layer's slots.
+     * @param authority_backend Backend owning the captured placement author.
+     *
+     * Seven disjoint six-participant cycles in each of two layers model the
+     * result of many earlier bounded Dynamic waves. The prepared owner table
+     * and live runtime are deliberately different at construction. Repair must
+     * use multiple epochs, while independent layers still share each wave.
+     * Synthetic weight descriptors isolate publication from payload kernels;
+     * the real-model campaign separately verifies the physical byte transfers.
+     */
+    void proveBoundedPreparedContextRestore(DeviceType authority_backend)
+    {
+        IBackend *const cuda = getCUDABackend();
+        IBackend *const rocm = getROCmBackend();
+        if (!cuda || !rocm || cuda->deviceCount() < 2 || rocm->deviceCount() < 4)
+        {
+            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
+        }
+        const auto resolved = topology(authority_backend);
+        constexpr std::uint32_t cycles_per_layer = 7u;
+        const auto participants = static_cast<std::uint32_t>(resolved->participants.size());
+        for (const std::uint32_t policy_layer_limit : {0u, 1u, 2u, 4u})
+        {
+            SCOPED_TRACE(policy_layer_limit);
+            // A zero optimization cap cannot disable terminal restoration;
+            // admission still owns one cycle's physical capacity in this mode.
+            const auto layer_limit = std::max(1u, policy_layer_limit);
+            auto prepared = adversarialPolicyInput();
+            prepared.num_experts = participants * cycles_per_layer;
+            prepared.dynamic_maximum_cycles_per_layer = policy_layer_limit;
+            prepared.economy.reset(); // Lifecycle repair has no economy objective.
+            const auto plane = prepared.num_layers * prepared.num_experts;
+            prepared.collected_state.assign(participants * plane, 0u);
+            auto live = prepared;
+            for (const auto &participant : resolved->participants)
+            {
+                auto &metadata = prepared.participants.at(participant.participant_id);
+                metadata.tier_index = participant.tier_idx;
+                metadata.tier_priority = resolved->groupForParticipant(
+                    participant.participant_id)->tier_priority;
+            }
+            live.participants = prepared.participants;
+            for (std::uint32_t layer = 0u; layer < prepared.num_layers; ++layer)
+            {
+                for (std::uint32_t expert = 0u; expert < prepared.num_experts; ++expert)
+                {
+                    const auto initial = expert % participants;
+                    const auto moved = (initial + (layer == 0u ? 1u : participants - 1u)) % participants;
+                    const auto word = moe_rebalance_policy::packCollectedState(
+                        1u, 0u, true, false, true);
+                    prepared.collected_state[initial * plane + layer * prepared.num_experts + expert] = word;
+                    live.collected_state[moved * plane + layer * prepared.num_experts + expert] = word;
+                }
+            }
+            auto fabrics = makeControllerFabricPair(resolved, prepared);
+            const auto bindings = allParticipantBindings(*fabrics.cuda_rank, *fabrics.rocm_rank);
+            const auto transports = allTransportBindings(*fabrics.cuda_rank, *fabrics.rocm_rank);
+            std::vector<std::unique_ptr<MoEOverlayDeviceRuntimePublicationFixture>> fixtures;
+            for (const auto &participant : resolved->participants)
+            {
+                const auto binding = std::find_if(bindings.begin(), bindings.end(),
+                    [&participant](const auto &entry)
+                    { return entry.participant_id == participant.participant_id; });
+                ASSERT_NE(binding, bindings.end());
+                fixtures.push_back(std::make_unique<MoEOverlayDeviceRuntimePublicationFixture>(
+                    participant.device.type == DeviceType::CUDA ? cuda : rocm,
+                    participant, *resolved, live, &binding->controller->admission_epoch,
+                    binding->lifetime));
+            }
+
+            auto owners = initialOwners(live);
+            const auto targets = initialOwners(prepared);
+            const auto waves = (cycles_per_layer + layer_limit - 1u) / layer_limit;
+            RuntimeCandidateApplyEvidence observed;
+            std::vector<std::uint64_t> movement_history;
+            std::string error;
+            for (std::uint32_t wave = 0u; wave <= waves; ++wave)
+            {
+                SCOPED_TRACE(wave);
+                const bool terminal = wave == waves;
+                ASSERT_TRUE(runRuntimeCandidateApply(cuda, rocm, *resolved, bindings,
+                    transports, fixtures, &observed, &error,
+                    {.complete_epoch = true, .expect_no_movement = terminal,
+                     .objective = RuntimeCandidateApplyObjective::PreparedContextRestore})) << error;
+                EXPECT_EQ(observed.command.demand_phase,
+                    static_cast<std::uint32_t>(MoEOverlayDeviceDemandPhase::Invalid));
+                EXPECT_EQ(observed.command.projected_net_benefit_ns, 0);
+                if (wave == 0u) movement_history = observed.economy_last_moved;
+                EXPECT_EQ(observed.economy_last_moved, movement_history);
+                if (terminal)
+                {
+                    EXPECT_TRUE(observed.commands.empty());
+                    EXPECT_EQ(owners, targets);
+                    EXPECT_EQ(observed.controller.current_durable_epoch, prepared.base_epoch + waves);
+                    break;
+                }
+                const auto cycles = std::min(layer_limit, cycles_per_layer - wave * layer_limit);
+                ASSERT_EQ(observed.commands.size(), prepared.num_layers * participants * cycles)
+                    << "One layer must not consume the global wave's shadow capacity";
+                EXPECT_EQ(observed.policy.changed_layers, prepared.num_layers)
+                    << "Independent layers must retain parallel wave admission";
+                std::vector<std::uint32_t> arrivals(participants * prepared.num_layers, 0u);
+                for (const auto &command : observed.commands)
+                {
+                    ASSERT_LT(command.layer, prepared.num_layers);
+                    ASSERT_LT(command.expert, prepared.num_experts);
+                    ASSERT_LT(command.destination_participant, participants);
+                    const auto index = command.layer * prepared.num_experts + command.expert;
+                    EXPECT_EQ(command.source_participant, owners[index]);
+                    EXPECT_EQ(command.destination_participant, targets[index]);
+                    EXPECT_NE(owners[index], targets[index]) << "Repair must make strict progress";
+                    owners[index] = command.destination_participant;
+                    EXPECT_LE(++arrivals[command.destination_participant * prepared.num_layers + command.layer], layer_limit);
+                }
+            }
+            // The terminal zero-command receipt certifies live device tables,
+            // not just the host's independent expected-command reconstruction.
+            for (std::uint32_t layer = 0u; layer < prepared.num_layers; ++layer)
+                for (std::uint32_t expert = 0u; expert < prepared.num_experts; ++expert)
+                {
+                    std::uint32_t owner_count = 0u;
+                    for (std::size_t p = 0u; p < fixtures.size(); ++p)
+                    {
+                        const auto &runtime = observed.runtime_layers.at(p).at(layer);
+                        ASSERT_LT(runtime.active_bank, kDeviceMoEOverlayEpochBankCount);
+                        const auto &descriptor = runtime.banks[runtime.active_bank].experts[expert];
+                        if (!hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::LocalCompute)) continue;
+                        ++owner_count;
+                        EXPECT_EQ(fixtures[p]->participantId(), targets[layer * prepared.num_experts + expert]);
+                        EXPECT_TRUE(descriptor.weightsReady());
+                    }
+                    EXPECT_EQ(owner_count, 1u);
+                }
+        }
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         CUDAAuthoredPreparedRestoreHonorsLayerCapacityAcrossEpochs)
+    {
+        proveBoundedPreparedContextRestore(DeviceType::CUDA);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         ROCmAuthoredPreparedRestoreHonorsLayerCapacityAcrossEpochs)
+    {
+        proveBoundedPreparedContextRestore(DeviceType::ROCm);
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,

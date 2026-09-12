@@ -180,9 +180,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     /**
  * @brief Same-tier movement is required only with a real exchange degree.
  *
- * Two experts on two apportioned participants admit only a permutation and
- * can never reduce makespan. A third resident expert makes a capacity-
- * preserving ownership exchange mathematically capable of improving skew.
+ * Two experts on two apportioned participants already permit an exchange.
+ * Its profitability belongs to measured service economics, not cardinality:
+ * equal residency does not imply equal participant service rates.
  */
     TEST(Qwen35MoEDynamicMovementAxisGeometry,
      UsesCapacityResolvedExpertCardinality)
@@ -205,7 +205,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     }};
     plan.placements = {{
         .layer = 0,
-        .routed_expert_tier = {0, 0},
+        .routed_expert_tier = {0},
     }};
 
     EXPECT_EQ(
@@ -220,13 +220,66 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
 }
 
     /**
+     * @brief A one-expert-per-device swap can reduce unequal-rate makespan.
+     *
+     * This is a device-free arithmetic counterexample, not a performance test.
+     * The same topology opportunity must be recognized for CPU, CUDA and ROCm;
+     * physical hardware, measured profitability and transfer cost remain the
+     * production controller's responsibility.
+     */
+    TEST(Qwen35MoEDynamicMovementAxisGeometry,
+         OneExpertPerParticipantCanBalanceUnequalServiceRates)
+    {
+        constexpr std::uint64_t hot_demand = 9u;
+        constexpr std::uint64_t cold_demand = 2u;
+        constexpr std::uint64_t fast_service = 2u;
+        constexpr std::uint64_t slow_service = 3u;
+        const auto before = std::max(hot_demand * slow_service,
+                                     cold_demand * fast_service);
+        const auto after = std::max(hot_demand * fast_service,
+                                    cold_demand * slow_service);
+        ASSERT_LT(after, before);
+
+        for (const auto &participants :
+             std::vector<std::vector<GlobalDeviceAddress>>{
+                 {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
+                 {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+                 {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}})
+        {
+            MoERoutedExpertPlacementPlan plan;
+            RoutedExpertDomain domain;
+            domain.name = "apportioned";
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+            domain.participants = participants;
+            plan.domains = {domain};
+            plan.routed_tiers = {{.name = "priority", .domain = domain.name, .priority = 7}};
+            plan.placements = {{.layer = 0, .routed_expert_tier = {0, 0}}};
+            EXPECT_EQ(dynamicMovementAxisContract(plan),
+                      DynamicMovementAxisContract::PriorityMigrationAndParticipantBalance);
+
+            // One endpoint cannot exchange ownership with itself, regardless
+            // of expert count or the speed of its backend.
+            plan.domains.front().participants.resize(1u);
+            EXPECT_EQ(dynamicMovementAxisContract(plan),
+                      DynamicMovementAxisContract::PriorityMigrationOnly);
+
+            // Tensor-sharded participants jointly compute each expert rather
+            // than owning independently exchangeable whole experts.
+            plan.domains.front().participants = participants;
+            plan.domains.front().routed_compute_policy =
+                RoutedExpertComputePolicy::TensorSharded;
+            EXPECT_EQ(dynamicMovementAxisContract(plan),
+                      DynamicMovementAxisContract::PriorityMigrationOnly);
+        }
+    }
+
+    /**
  * @brief Measured and cache-distinct convergence traffic have separate identities.
  *
  * The optimizer must observe exactly the finite workload later judged by the
  * convergence A/B. Movement-only cells instead need guaranteed full-prefill
- * evidence, and traffic used only to close a partial demand bank must also lie
- * outside the measured corpus so neither can turn a required prefill into a
- * prefix-cache hit.
+ * evidence. Exact demand-bank closure has no nonce identity: it uses a public
+ * archive purge so the authenticated workload remains stationary.
  */
     TEST(Qwen35MoEDynamicConvergenceLifecycle,
      SeparatesMeasuredAndCacheDistinctTrafficNamespaces)
@@ -242,7 +295,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             request % kConvergenceTimingCorpusRequests);
     }
     for (int request = 0;
-         request < kMovementProofIdentityNamespaceRequests +
+         request < kMaximumDynamicHistogramRequests +
                        kMaximumDynamicPublicationOverlapRequests;
          ++request)
     {
@@ -251,18 +304,6 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 ConvergenceMovementTraffic::MovementProof,
                 request),
             kConvergenceTimingCorpusRequests + request);
-    }
-    for (int request = 0;
-         request < 3 * kConvergenceTimingCorpusRequests;
-         ++request)
-    {
-        EXPECT_GE(
-            convergenceMovementPromptIdentity(
-                ConvergenceMovementTraffic::DemandWindowClosure,
-                request),
-            kConvergenceTimingCorpusRequests +
-                kMovementProofIdentityNamespaceRequests +
-                kMaximumDynamicPublicationOverlapRequests);
     }
 }
 
@@ -324,7 +365,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         traffic.decode_forward_rows,
         kQwen35MoEConvergenceTimingDecodeForwards);
     EXPECT_EQ(traffic.guaranteedRoutedRows(), 19u);
-    EXPECT_EQ(kMaximumDynamicHistogramRequests, 24);
+    EXPECT_EQ(traffic.maximumRoutedRows(), 36u);
+    EXPECT_EQ(kMaximumDynamicHistogramRequests, 28);
     EXPECT_GE(
         static_cast<std::uint64_t>(kMaximumDynamicHistogramRequests) *
             traffic.guaranteedRoutedRows(),
@@ -357,27 +399,150 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
 }
 
     /**
- * @brief Movement-only cells must not inherit the speed witness's bank budget.
+ * @brief Every parity purpose protects its own required prefix proof budget.
  *
  * The canonical matrix assigns exactly one matched A/B witness per Dynamic
- * topology and owner order. Other MTP depths still prove physical movement,
- * but they proceed directly from a quiescent publication boundary to parity;
- * requiring 71 rows of unused headroom would make their ordinary short
- * histogram windows impossible to settle.
+ * topology and owner order. MTP owns its separate serial/prefix evidence
+ * horizon; ordinary decode protects its own smaller seed/restore interval.
  */
     TEST(Qwen35MoEDynamicConvergenceLifecycle,
-     RequiresDemandHeadroomOnlyForObservedSpeedup)
+     RequiresDemandHeadroomForTheDeclaredEvidencePurpose)
     {
     EXPECT_EQ(
         convergenceBoundaryProtectedRows(
-            ConvergenceBoundaryPurpose::MovementProof),
-        std::nullopt);
+            ConvergenceBoundaryPurpose::NumericalParity),
+        qwen35MoEMaximumNumericalParityRoutedRows());
     EXPECT_EQ(
         convergenceBoundaryProtectedRows(
             ConvergenceBoundaryPurpose::ObservedSpeedupCohort),
-        std::optional<std::uint64_t>(
-            convergenceProtectedRoutedRows()));
+        convergenceProtectedRoutedRows());
+    EXPECT_EQ(
+        convergenceBoundaryProtectedRows(
+            ConvergenceBoundaryPurpose::MTPNumericalParity),
+        mtpNumericalParityProtectedRoutedRows());
 }
+
+    /**
+     * @brief A quiescent four-row bank cannot retain an MTP cache/serial proof.
+     *
+     * Successful movement keeps the production observation window short. The
+     * next prompt would rotate it and invalidate a freshly seeded prefix. Use
+     * the existing exact-closure transition until the authority, not a guessed
+     * post-movement cooldown, advertises enough headroom for the entire proof.
+     */
+    TEST(Qwen35MoEDynamicConvergenceLifecycle,
+         ProtectsMTPPrefixAndSerialOracleAfterSuccessfulMovement)
+    {
+        MoEOptimizationStatus status{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = MoEOptimizationActivityState::CollectingDemand,
+            .demand_window = {
+                .generation = 2u,
+                .collected_routed_rows = 1u,
+                .capacity_routed_rows = 4u,
+            },
+            .published_progress_generation = 3u,
+            .reconciled_progress_generation = 3u,
+        };
+        const auto purpose = ConvergenceBoundaryPurpose::MTPNumericalParity;
+        const auto short_bank = classifyConvergenceBoundary(status, purpose);
+        EXPECT_EQ(short_bank.state,
+                  ConvergenceBoundaryState::NeedsDemandWindowClosure);
+        ASSERT_TRUE(short_bank.closure.has_value());
+        EXPECT_EQ(short_bank.closure->routed_rows, 3u);
+        const auto required = mtpNumericalParityProtectedRoutedRows();
+        EXPECT_GT(required, kQwen122MaximumMTPDraftDepth + 1u);
+        status.demand_window.capacity_routed_rows = required + 1u;
+        EXPECT_EQ(classifyConvergenceBoundary(status, purpose).state,
+                  ConvergenceBoundaryState::NeedsDemandWindowClosure)
+            << "Filling the bank exactly can publish another placement";
+        ++status.demand_window.capacity_routed_rows;
+        EXPECT_EQ(classifyConvergenceBoundary(status, purpose).state,
+                  ConvergenceBoundaryState::Ready);
+    }
+
+    /**
+     * @brief MTP-off parity also needs one epoch for its seed/restore pair.
+     *
+     * The nine-row production bank below is idle after successful movement,
+     * but the next authenticated prefill would fill it and invalidate its own
+     * prefix before decode restores it. Quiescence must request exact closure,
+     * not admit a numerical proof solely because speculative decode is off.
+     */
+    TEST(Qwen35MoEDynamicConvergenceLifecycle,
+         ProtectsNonMTPPrefixAfterSuccessfulMovement)
+    {
+        MoEOptimizationStatus status{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = MoEOptimizationActivityState::CollectingDemand,
+            .demand_window = {
+                .generation = 2u,
+                .collected_routed_rows = 1u,
+                .capacity_routed_rows = kQwen35MoEParityTokenIds.size(),
+            },
+            .published_progress_generation = 3u,
+            .reconciled_progress_generation = 3u,
+        };
+        const auto purpose = ConvergenceBoundaryPurpose::NumericalParity;
+        ASSERT_TRUE(status.quiescentBetweenWaves());
+        const auto short_bank = classifyConvergenceBoundary(status, purpose);
+        ASSERT_EQ(short_bank.state,
+                  ConvergenceBoundaryState::NeedsDemandWindowClosure);
+        ASSERT_TRUE(short_bank.closure.has_value());
+        EXPECT_EQ(short_bank.closure->routed_rows, 8u);
+        const auto required = qwen35MoEMaximumNumericalParityRoutedRows();
+        status.demand_window.capacity_routed_rows = required + 1u;
+        EXPECT_EQ(classifyConvergenceBoundary(status, purpose).state,
+                  ConvergenceBoundaryState::NeedsDemandWindowClosure);
+        ++status.demand_window.capacity_routed_rows;
+        EXPECT_EQ(classifyConvergenceBoundary(status, purpose).state,
+                  ConvergenceBoundaryState::Ready);
+    }
+
+    /** @brief Closing a demand bank cannot secretly train a different prompt. */
+    TEST(Qwen35MoEDynamicConvergenceLifecycle,
+         DemandWindowClosureKeepsAuthenticatedTokensStationary)
+    {
+        constexpr std::array<int, 3> tokens = {13, 271, 760};
+        EXPECT_EQ(stationaryDemandWindowPrompt(tokens, 2u),
+                  (std::vector<int32_t>{13, 271}));
+        EXPECT_EQ(stationaryDemandWindowPrompt(tokens, 5u),
+                  (std::vector<int32_t>{13, 271, 760, 13, 271}));
+        EXPECT_EQ(stationaryDemandWindowPrompt(tokens, 5u),
+                  stationaryDemandWindowPrompt(tokens, 5u));
+        EXPECT_THROW(stationaryDemandWindowPrompt({}, 1u), std::invalid_argument);
+        EXPECT_THROW(stationaryDemandWindowPrompt(tokens, 0u), std::invalid_argument);
+    }
+
+    /**
+     * @brief Evidence traffic uses every already-owned parallel transfer lane.
+     *
+     * Both evidence policies inherit the same topology-derived physical slots.
+     * A hidden two-cycle cap would serialize a large model's convergence before
+     * MTP admission, despite paying for the full transfer fabric at setup.
+     */
+    TEST(Qwen35MoEDynamicConvergenceLifecycle,
+         UsesAllocatedTransferConcurrencyForEvery122BTopology)
+    {
+        for (const auto &spec : qwen122OverlayTopologySpecs())
+        {
+            SCOPED_TRACE(spec.test_id);
+            const auto policies = qwen122DynamicRuntimePolicies(spec, 48, 4096);
+            EXPECT_GT(static_cast<std::uint64_t>(policies.economic_movement.max_window_size),
+                      qwen35MoEMTPNumericalParityProtectedRoutedRows());
+            for (const auto *policy : {
+                     &policies.economic_movement,
+                     &policies.economic_movement_and_observed_speedup})
+            {
+                EXPECT_FALSE(policy->migration_cycles_per_wave.has_value());
+                EXPECT_EQ(policy->resolvedMigrationCyclesPerWave(),
+                          policy->migration_transfer_slots);
+                EXPECT_GE(policy->resolvedMigrationCyclesPerWave(), 48u);
+            }
+        }
+    }
 
     /**
  * @brief Settlement protects prefix parity from a post-cohort fifth wave.
@@ -387,7 +552,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
  * parity prefill seeded the prefix cache. The authority correctly published a
  * fifth profitable wave, but that publication invalidated the seed before its
  * required restore. The typed boundary must reject that bank and admit the
- * configured 96-row successor, which also retains the maximum decode tail.
+ * definition-owned successor, including the complete partial-prefix proof.
  */
     TEST(Qwen35MoEDynamicConvergenceLifecycle,
      ProtectsNumericalParityTailFromFifthWave)
@@ -435,6 +600,60 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
 }
 
     /**
+     * @brief An admitted proof must include the mandatory reseed and suffix.
+     *
+     * The earlier 96-row bank appeared safe with 19 overlap + 57 timing + 14
+     * numerical rows. It actually reached its threshold during the omitted
+     * nine-row reseed, allowing invalidation before the partial hit. Admission
+     * must reject that bank, reject exact equality at the wave threshold, and
+     * retain the complete proof even after a movement-invalidated training
+     * request has consumed its maximum possible rows.
+     */
+    TEST(Qwen35MoEDynamicConvergenceLifecycle,
+         PartialPrefixReseedCannotCrossTheNextMovementWindow)
+    {
+        MoEOptimizationStatus status{
+            .authority = MoEOptimizationAuthority::Host,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = MoEOptimizationActivityState::CollectingDemand,
+            .demand_window = {
+                .generation = 5u,
+                .collected_routed_rows = 19u,
+                .capacity_routed_rows = 96u,
+            },
+            .published_progress_generation = 9u,
+            .reconciled_progress_generation = 9u,
+        };
+        const auto classify = [&status] {
+            return classifyConvergenceBoundary(
+                status, ConvergenceBoundaryPurpose::ObservedSpeedupCohort);
+        };
+        EXPECT_EQ(classify().state, ConvergenceBoundaryState::NeedsDemandWindowClosure);
+
+        constexpr ProductionParityPrefixRestorePlan prefix(kQwen35MoEParityTokenIds.size());
+        const std::array<std::uint64_t, 4> proof_rows{
+            qwen35MoEConvergenceTimingCohortRoutedRows(),
+            kQwen35MoEParityTokenIds.size() + kQwen35MoEMaximumParityDecodeForwards,
+            static_cast<std::uint64_t>(prefix.seedTokens()),
+            static_cast<std::uint64_t>(prefix.suffixTokens()),
+        };
+        status.demand_window.collected_routed_rows =
+            convergenceTrainingTrafficPlan().maximumRoutedRows();
+        status.demand_window.capacity_routed_rows =
+            status.demand_window.collected_routed_rows + convergenceProtectedRoutedRows();
+        EXPECT_EQ(classify().state, ConvergenceBoundaryState::NeedsDemandWindowClosure);
+        status.demand_window.capacity_routed_rows = kQwen35MoEConvergenceHistogramWindowRows;
+        ASSERT_EQ(classify().state, ConvergenceBoundaryState::Ready);
+        for (const auto rows : proof_rows)
+        {
+            status.demand_window.collected_routed_rows += rows;
+            EXPECT_LT(status.demand_window.collected_routed_rows,
+                      status.demand_window.capacity_routed_rows);
+        }
+        EXPECT_EQ(status.demand_window.remainingRoutedRows(), 1u);
+    }
+
+    /**
  * @brief A partial timing bank closes exactly before its successor is measured.
  *
  * A movement wave can rotate its successor bank after an inference request is
@@ -446,11 +665,53 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
  * unreconciled, and admit the complete protected interval only after
  * production rotates to an empty successor.
  */
+    /** Device cadence names its closing phase and never waits for an unsent command. */
+    TEST(Qwen35MoEDynamicConvergenceLifecycle,
+         DeviceDemandAdmissionRetainsPhaseAndPendingCommandEdges)
+    {
+        MoEOptimizationStatus status{
+            .authority = MoEOptimizationAuthority::Device,
+            .state = MoEOptimizationLifecycleState::Active,
+            .activity = MoEOptimizationActivityState::CollectingDemand,
+            .demand_window = {
+                .generation = 2u,
+                .collected_routed_rows = 7u,
+                .capacity_routed_rows = 9u,
+                .scope = MoEOptimizationDemandScope::DecodeCadence,
+            },
+        };
+        const auto closure = classifyConvergenceBoundary(
+            status, ConvergenceBoundaryPurpose::NumericalParity);
+        ASSERT_TRUE(closure.closure);
+        EXPECT_EQ(closure.closure->routed_rows, 2u);
+        EXPECT_EQ(closure.closure->scope, MoEOptimizationDemandScope::DecodeCadence);
+        EXPECT_EQ(closure.closure->kind, DemandWindowClosureKind::CompleteWindow);
+        status.demand_window.collected_routed_rows = 9u;
+        EXPECT_EQ(classifyConvergenceBoundary(status,
+            ConvergenceBoundaryPurpose::NumericalParity).state,
+            ConvergenceBoundaryState::AwaitingQuiescence);
+        status.demand_window.pending_submission_rows = 2u;
+        const auto delivery = classifyConvergenceBoundary(
+            status, ConvergenceBoundaryPurpose::NumericalParity);
+        ASSERT_TRUE(delivery.closure);
+        EXPECT_TRUE(delivery.closure->valid());
+        EXPECT_EQ(delivery.closure->kind, DemandWindowClosureKind::DeliverPendingProgress);
+        EXPECT_EQ(delivery.closure->routed_rows, 0u);
+        const auto movement = classifyDynamicConvergenceSettlement(
+            DynamicResidencyConvergenceState::AwaitingPublication, status,
+            ConvergenceBoundaryPurpose::NumericalParity,
+            ConvergenceTrafficHorizon::Exhausted);
+        ASSERT_TRUE(movement.closure);
+        EXPECT_EQ(movement.state,
+            DynamicConvergenceSettlementState::NeedsMovementDemandWindowClosure);
+        EXPECT_EQ(movement.closure->kind, DemandWindowClosureKind::DeliverPendingProgress);
+    }
+
     TEST(Qwen35MoEDynamicConvergenceLifecycle,
      OneOverlapFitsAndUnexpectedOccupancyClosesExactly)
     {
     constexpr std::uint64_t kOverlappingRequestRows =
-        qwen35MoEConvergenceTimingRequestRoutedRows();
+        qwen35MoEConvergenceTrainingMaximumRoutedRows();
     const MoEOptimizationStatus overlap_bank{
         .authority = MoEOptimizationAuthority::Host,
         .state = MoEOptimizationLifecycleState::Active,
@@ -499,10 +760,10 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     EXPECT_EQ(
         classifyConvergenceBoundary(
             partial_bank,
-            ConvergenceBoundaryPurpose::MovementProof)
+            ConvergenceBoundaryPurpose::NumericalParity)
             .state,
         ConvergenceBoundaryState::Ready)
-        << "Movement-only cells need no post-publication timing bank";
+        << "Ordinary parity needs its smaller seed/decode bank, not timing rows";
 
     auto completed_bank = partial_bank;
     completed_bank.activity =
@@ -564,7 +825,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         classifyDynamicConvergenceSettlement(
             DynamicResidencyConvergenceState::AwaitingPublication,
             partial_bank,
-            ConvergenceBoundaryPurpose::MovementProof,
+            ConvergenceBoundaryPurpose::NumericalParity,
             ConvergenceTrafficHorizon::Open);
     EXPECT_EQ(
         open_horizon.state,
@@ -576,7 +837,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         classifyDynamicConvergenceSettlement(
             DynamicResidencyConvergenceState::AwaitingPublication,
             partial_bank,
-            ConvergenceBoundaryPurpose::MovementProof,
+            ConvergenceBoundaryPurpose::NumericalParity,
             ConvergenceTrafficHorizon::Exhausted);
     ASSERT_EQ(
         exhausted_horizon.state,
@@ -596,7 +857,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         classifyDynamicConvergenceSettlement(
             DynamicResidencyConvergenceState::AwaitingPublication,
             unreconciled_bank,
-            ConvergenceBoundaryPurpose::MovementProof,
+            ConvergenceBoundaryPurpose::NumericalParity,
             ConvergenceTrafficHorizon::Exhausted);
     EXPECT_EQ(
         unreconciled.state,
@@ -610,7 +871,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         classifyDynamicConvergenceSettlement(
             DynamicResidencyConvergenceState::AwaitingPublication,
             malformed_bank,
-            ConvergenceBoundaryPurpose::MovementProof,
+            ConvergenceBoundaryPurpose::NumericalParity,
             ConvergenceTrafficHorizon::Exhausted)
             .state,
         DynamicConvergenceSettlementState::InvalidAuthorityEvidence);
@@ -649,7 +910,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         classifyDynamicConvergenceSettlement(
             DynamicResidencyConvergenceState::AwaitingPublication,
             empty_successor,
-            ConvergenceBoundaryPurpose::MovementProof,
+            ConvergenceBoundaryPurpose::NumericalParity,
             ConvergenceTrafficHorizon::Exhausted);
     ASSERT_EQ(
         exhausted.state,
@@ -664,7 +925,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         classifyDynamicConvergenceSettlement(
             DynamicResidencyConvergenceState::AwaitingPublication,
             empty_successor,
-            ConvergenceBoundaryPurpose::MovementProof,
+            ConvergenceBoundaryPurpose::NumericalParity,
             ConvergenceTrafficHorizon::Open);
     EXPECT_EQ(
         open.state,
@@ -704,7 +965,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         classifyDynamicConvergenceSettlement(
             DynamicResidencyConvergenceState::AwaitingPublication,
             full,
-            ConvergenceBoundaryPurpose::MovementProof,
+            ConvergenceBoundaryPurpose::NumericalParity,
             ConvergenceTrafficHorizon::Exhausted);
     EXPECT_EQ(
         full_bank.state,

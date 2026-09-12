@@ -135,6 +135,7 @@ namespace llaminar2
             size_t max_total_entries = 0;      ///< Sum of routed entries across all subpackets.
             int d_model = 0;                   ///< Hidden width of every compact row.
             int top_k = 0;                     ///< Maximum routes represented by one token row.
+            MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
         };
 
         /**
@@ -249,6 +250,7 @@ namespace llaminar2
     private:
         std::vector<int> participant_ids_;
         size_t max_total_rows_ = 0;
+        size_t max_total_return_rows_ = 0; ///< Layout-derived capacity, not a second allocation ledger.
         size_t max_total_entries_ = 0;
         int d_model_ = 0;
         int top_k_ = 0;

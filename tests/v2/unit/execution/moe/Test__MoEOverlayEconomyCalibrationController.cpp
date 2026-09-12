@@ -5,6 +5,8 @@
  * The startup profiler must exercise the production transfer transaction,
  * retain robust physical timings, and abort every staged residency candidate.
  * It must never ask the caller to run synthetic inference or publish a bank.
+ * Service-coverage regressions also keep cold exact-format classes explicit:
+ * preparation must not borrow a price from another format or participant.
  */
 
 #include "execution/moe/MoEOverlayEconomyCalibrationController.h"
@@ -958,9 +960,235 @@ namespace llaminar2::test
         EXPECT_FALSE(catalog.isServiceTelemetryLayer(17));
     }
 
-    TEST(
-        MoEOverlayEconomyCertificationController,
-        FixedMTPTopologyCertifiesWithoutImpossibleDecodeEvidence)
+    /**
+     * @brief Idle singleton-format experts produce bounded, participant-local gaps.
+     *
+     * This reproduces the three-tier model's readiness failure without loading
+     * it: common layers execute, while one participant never routes to the
+     * singleton class. More observations of the common class cannot close it.
+     */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog,
+         ColdSingletonFormatEnumeratesEveryMissingPhaseWithoutBorrowing)
+    {
+        std::vector<MoEOverlayLayerWeightManifest> manifest{
+            layerManifest(0, 256, native_vnni_formats::Q4_K),
+            layerManifest(1, 256, native_vnni_formats::Q5_K),
+            layerManifest(2, 256, native_vnni_formats::Q4_K),
+        };
+        // Match the failure's mixed triplets: Q4_K/Q4_K/Q5_K in common
+        // layers, Q5_K/Q5_K/Q6_K in the otherwise identical singleton.
+        for (auto &layer : manifest)
+        {
+            const auto &down = layer.layer_idx == 1
+                                   ? native_vnni_formats::Q6_K
+                                   : native_vnni_formats::Q5_K;
+            layer.projections[2] = projectionManifest(
+                ExpertTierWeightProjection::Down, 64, 256, down);
+        }
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
+        const auto topology = ExpertHistogramProductionTopology::uniform(
+            3, kAllExpertHistogramProductionSources);
+        std::vector<MoEOverlayParticipantLayerServiceTotals> rows{
+            serviceRow(0, 0, 10), serviceRow(0, 1, 10), serviceRow(0, 2, 10),
+            serviceRow(3, 0, 100), {.participant_id = 3, .layer = 1},
+            serviceRow(3, 2, 100),
+        };
+        const auto before = rows;
+        const auto gaps = catalog.serviceEvidenceGaps(rows, {0, 3}, topology);
+        ASSERT_EQ(gaps.size(), 3u);
+        for (std::size_t phase = 0; phase < gaps.size(); ++phase)
+        {
+            EXPECT_EQ(gaps[phase].participant_id, 3);
+            EXPECT_EQ(gaps[phase].representative_layer, 1);
+            EXPECT_EQ(expertHistogramProductionSourceIndex(gaps[phase].source), phase);
+            EXPECT_EQ(gaps[phase].eligible_layers, (std::vector<int>{1}));
+        }
+        for (std::size_t index = 0; index < rows.size(); ++index)
+        {
+            EXPECT_EQ(rows[index].total_nanoseconds, before[index].total_nanoseconds);
+            EXPECT_EQ(rows[index].activation_count, before[index].activation_count);
+            EXPECT_EQ(rows[index].sample_count, before[index].sample_count);
+        }
+        rows[3] = serviceRow(3, 0, 100'000);
+        EXPECT_EQ(catalog.serviceEvidenceGaps(rows, {0, 3}, topology).size(), 3u);
+        // Only actual evidence of the missing coordinate completes coverage.
+        rows[4] = serviceRow(3, 1, 100);
+        EXPECT_TRUE(catalog.serviceEvidenceGaps(rows, {0, 3}, topology).empty());
+    }
+
+    /** @brief A dormant class can be priced without changing any live counter. */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog,
+         PreparedSamplesCompleteColdClassesWithoutBecomingRuntimeCounters)
+    {
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog({
+            layerManifest(0, 256, native_vnni_formats::Q4_K),
+            layerManifest(1, 256, native_vnni_formats::Q5_K),
+            layerManifest(2, 256, native_vnni_formats::Q4_K),
+        });
+        const auto topology = ExpertHistogramProductionTopology::uniform(
+            3, kAllExpertHistogramProductionSources);
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> live{
+            serviceRow(0, 0, 10), serviceRow(0, 1, 20), serviceRow(0, 2, 30),
+            {.participant_id = 3, .layer = 0}, {.participant_id = 3, .layer = 1},
+            serviceRow(3, 2, 40),
+        };
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> prepared{
+            serviceRow(0, 0, 1000), serviceRow(0, 1, 2000), serviceRow(0, 2, 3000),
+            serviceRow(3, 0, 4000), serviceRow(3, 1, 5000), serviceRow(3, 2, 6000),
+        };
+        const auto combined = catalog.withPreparedServiceEvidence(
+            live, prepared, {0, 3}, topology);
+        EXPECT_TRUE(catalog.serviceEvidenceGaps(combined, {0, 3}, topology).empty());
+        for (std::size_t row = 0; row < combined.size(); ++row)
+        {
+            // Only the wholly unobserved class uses setup evidence. Live
+            // participant 3/layer 2 already owns the common class, so a probe
+            // at its equivalent but idle layer 0 must not skew that price.
+            const auto &expected = row == 4 ? prepared[row] : live[row];
+            EXPECT_EQ(combined[row].total_nanoseconds, expected.total_nanoseconds);
+            EXPECT_EQ(combined[row].activation_count, expected.activation_count);
+            EXPECT_EQ(combined[row].sample_count, expected.sample_count);
+        }
+        EXPECT_EQ(live[4].sample_count, (std::array<std::uint64_t, 3>{}));
+        EXPECT_EQ(catalog.serviceEvidenceGaps(live, {0, 3}, topology).size(), 3u);
+        // A subsequent natural observation takes precedence without adding
+        // setup counts to the device's cumulative producer values.
+        auto later_live = live;
+        later_live[4] = serviceRow(3, 1, 7);
+        const auto later = catalog.withPreparedServiceEvidence(
+            later_live, prepared, {0, 3}, topology);
+        EXPECT_EQ(later[4].total_nanoseconds, later_live[4].total_nanoseconds);
+        EXPECT_EQ(later[4].sample_count, later_live[4].sample_count);
+    }
+
+    /** @brief An empty or corrupt setup price cannot masquerade as coverage. */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog,
+         PreparedEvidenceCannotHideMissingOrMalformedCoordinates)
+    {
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog({
+            layerManifest(0, 256, native_vnni_formats::Q4_K),
+            layerManifest(1, 256, native_vnni_formats::Q5_K),
+        });
+        const auto topology = ExpertHistogramProductionTopology::uniform(
+            2, kAllExpertHistogramProductionSources);
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> live{
+            serviceRow(3, 0, 10), {.participant_id = 3, .layer = 1},
+        };
+        auto probes = live;
+        const auto incomplete = catalog.withPreparedServiceEvidence(live, probes, {3}, topology);
+        EXPECT_EQ(catalog.serviceEvidenceGaps(incomplete, {3}, topology).size(), 3u);
+        probes[1] = serviceRow(3, 1, 20);
+        probes[1].overflowed[0] = true;
+        EXPECT_THROW((void)catalog.withPreparedServiceEvidence(live, probes, {3}, topology),
+                     std::invalid_argument);
+        // Even wholly covered live evidence must validate the unused probe
+        // bank: a phase/owner mismatch is not silently discarded as irrelevant.
+        const std::vector complete{serviceRow(3, 0, 10), serviceRow(3, 1, 10)};
+        probes = complete;
+        probes[0].participant_id = 4;
+        EXPECT_THROW((void)catalog.withPreparedServiceEvidence(complete, probes, {3}, topology),
+                     std::invalid_argument);
+    }
+
+    /** @brief Equivalent layers share prices only within the priced phase mask. */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog,
+         MissingPlanSelectsPricedMembersNotTheTransferRepresentative)
+    {
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog({
+            layerManifest(0, 256, native_vnni_formats::Q4_K),
+            layerManifest(1, 256, native_vnni_formats::Q4_K),
+        });
+        const ExpertHistogramProductionTopology topology(
+            {{true, true, true}, {true, true, true}},
+            {{false, false, false}, {false, true, true}});
+        std::vector<MoEOverlayParticipantLayerServiceTotals> rows{
+            serviceRow(2, 0, 10), {.participant_id = 2, .layer = 1},
+        };
+        const auto gaps = catalog.serviceEvidenceGaps(rows, {2}, topology);
+        ASSERT_EQ(gaps.size(), 2u);
+        EXPECT_EQ(gaps[0].source, ExpertHistogramSource::PrefillChunk);
+        EXPECT_EQ(gaps[1].source, ExpertHistogramSource::GroupedVerifier);
+        for (const auto &gap : gaps)
+        {
+            EXPECT_EQ(gap.representative_layer, 0);
+            EXPECT_EQ(gap.eligible_layers, (std::vector<int>{1}));
+        }
+        EXPECT_TRUE(catalog.serviceEvidenceGaps({}, {}, topology).empty());
+    }
+
+    /** @brief A cold early coordinate must not hide malformed later evidence. */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog,
+         MissingPlanRejectsMalformedEvidenceBeforeReportingGaps)
+    {
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog({
+            layerManifest(0, 256, native_vnni_formats::Q4_K),
+        });
+        const auto topology = ExpertHistogramProductionTopology::uniform(
+            1, kAllExpertHistogramProductionSources);
+        std::vector<MoEOverlayParticipantLayerServiceTotals> rows{
+            {.participant_id = 0, .layer = 0}, serviceRow(3, 0, 10),
+        };
+        EXPECT_THROW((void)catalog.serviceEvidenceGaps(rows, {3, 0}, topology),
+                     std::invalid_argument);
+        EXPECT_THROW((void)catalog.serviceEvidenceGaps(rows, {0, 0}, topology),
+                     std::invalid_argument);
+        EXPECT_THROW((void)catalog.serviceEvidenceGaps(rows, {0}, topology),
+                     std::invalid_argument);
+        EXPECT_THROW((void)catalog.serviceEvidenceGaps(rows, {-1, 3}, topology),
+                     std::invalid_argument);
+        rows[1].layer = 1;
+        EXPECT_THROW((void)catalog.serviceEvidenceGaps(rows, {0, 3}, topology),
+                     std::invalid_argument);
+        rows[1] = serviceRow(3, 0, 10);
+        const auto serial = ExpertHistogramProductionTopology::uniform(
+            1, {true, true, false});
+        EXPECT_THROW((void)catalog.serviceEvidenceGaps(rows, {0, 3}, serial),
+                     std::invalid_argument);
+        rows[1].overflowed[0] = true;
+        EXPECT_THROW((void)catalog.serviceEvidenceGaps(rows, {0, 3}, topology),
+                     std::invalid_argument);
+    }
+
+    /** @brief Every codebook and floating weight type retains a distinct price. */
+    TEST(MoEOverlayEconomyCalibrationLayerCatalog,
+         MissingPlanKeepsAllSourceCodebooksAndFloatingFormatsDistinct)
+    {
+        std::vector<MoEOverlayLayerWeightManifest> manifest;
+        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        {
+            manifest.push_back(layerManifest(
+                static_cast<int>(manifest.size()), 256, *source.metadata));
+        }
+        for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+        {
+            auto layer = layerManifest(
+                static_cast<int>(manifest.size()), 256, native_vnni_formats::Q4_K);
+            for (auto &projection : layer.projections)
+                projection.format = ExpertWeightFormat::floating(type);
+            manifest.push_back(std::move(layer));
+        }
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifest);
+        ASSERT_EQ(catalog.groups().size(), manifest.size());
+        const auto topology = ExpertHistogramProductionTopology::uniform(
+            static_cast<int>(manifest.size()), kAllExpertHistogramProductionSources);
+        std::vector<MoEOverlayParticipantLayerServiceTotals> rows;
+        for (std::size_t layer = 0; layer < manifest.size(); ++layer)
+            rows.push_back({.participant_id = 7, .layer = static_cast<int>(layer)});
+        for (std::size_t layer = 0; layer < manifest.size(); ++layer)
+        {
+            const auto gaps = catalog.serviceEvidenceGaps(rows, {7}, topology);
+            ASSERT_EQ(gaps.size(), (manifest.size() - layer) * 3u);
+            EXPECT_EQ(gaps.front().representative_layer, static_cast<int>(layer));
+            rows[layer] = serviceRow(7, static_cast<int>(layer), 100);
+        }
+        EXPECT_TRUE(catalog.serviceEvidenceGaps(rows, {7}, topology).empty());
+    }
+
+    /** @brief Independent measurement producers feeding the same certificate. */
+    enum class ServiceEvidenceOrigin { NaturalTraffic, PreparedKernels };
+
+    /** @brief Both evidence origins retain one certification/rebase state machine. */
+    static void verifyCertification(ServiceEvidenceOrigin origin)
     {
         const auto initial = snapshot();
         DecodeExpertHistogramConfig histogram_config;
@@ -1052,6 +1280,23 @@ namespace llaminar2::test
                 .initial_epoch = authority->snapshot()->epoch,
                 .collect_economy_service_measurements = true,
             });
+        std::vector<MoEOverlayParticipantLayerServiceTotals> prepared;
+        if (origin == ServiceEvidenceOrigin::PreparedKernels)
+        {
+            for (int participant = 0; participant < 2; ++participant)
+            {
+                auto row = serviceRow(participant, 0, participant == 0 ? 10 : 100);
+                row.total_nanoseconds[0] = 0;
+                row.activation_count[0] = 0;
+                row.sample_count[0] = 0;
+                prepared.push_back(row);
+            }
+            // Device snapshots remain the sole cumulative writer for the GPU
+            // endpoint even when startup measurements complete its prices.
+            std::string error;
+            ASSERT_TRUE(registry->importDeviceServiceMeasurements(
+                0, {{.participant_id = 0, .layer = 0}}, &error)) << error;
+        }
         MoEOverlayEconomyCertificationController certification({
             .calibration = profile,
             .registry = registry,
@@ -1075,6 +1320,7 @@ namespace llaminar2::test
                     /*retained_layer_count=*/1,
                     /*main_inference_layer_count=*/1,
                     ExpertHistogramServingRegime::PositiveDepthMTP),
+            .prepared_service_measurements = std::move(prepared),
             .perf_device = "certification-readiness-test",
         });
 
@@ -1107,6 +1353,7 @@ namespace llaminar2::test
 
         for (int participant = 0; participant < 2; ++participant)
         {
+            if (origin == ServiceEvidenceOrigin::PreparedKernels) continue;
             const auto endpoint = registry->endpoint(participant);
             ASSERT_NE(endpoint, nullptr);
             for (const auto source : {
@@ -1148,5 +1395,30 @@ namespace llaminar2::test
         EXPECT_EQ(certification.stats().routing_evidence_rebases, 1u);
         EXPECT_EQ(certification.stats().certifications_installed, 1u);
         EXPECT_EQ(factory.observations->bank_preparations, 0u);
+        EXPECT_EQ(authority->snapshot()->epoch, initial->epoch);
+        if (origin == ServiceEvidenceOrigin::PreparedKernels)
+        {
+            std::vector<MoEOverlayParticipantLayerServiceTotals> live;
+            ASSERT_TRUE(registry->trySnapshotServiceMeasurements(&live));
+            ASSERT_EQ(live.size(), 2u);
+            for (const auto &row : live)
+            {
+                EXPECT_EQ(row.total_nanoseconds, (std::array<std::uint64_t, 3>{}));
+                EXPECT_EQ(row.activation_count, (std::array<std::uint64_t, 3>{}));
+                EXPECT_EQ(row.sample_count, (std::array<std::uint64_t, 3>{}));
+            }
+        }
+    }
+
+    TEST(MoEOverlayEconomyCertificationController,
+         FixedMTPTopologyCertifiesWithoutImpossibleDecodeEvidence)
+    {
+        verifyCertification(ServiceEvidenceOrigin::NaturalTraffic);
+    }
+
+    TEST(MoEOverlayEconomyCertificationController,
+         PreparedEvidenceCertifiesWithoutRoutingOrChangingDeviceCounters)
+    {
+        verifyCertification(ServiceEvidenceOrigin::PreparedKernels);
     }
 } // namespace llaminar2::test

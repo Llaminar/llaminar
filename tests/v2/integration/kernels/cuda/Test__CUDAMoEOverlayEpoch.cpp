@@ -13,6 +13,7 @@
 #include "execution/moe/MoEOverlayEpochLeaseLifecycle.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/NativeMoEMovementArchive.h"
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
 
@@ -110,7 +111,7 @@ namespace llaminar2::test
                       cudaSuccess);
             ASSERT_EQ(cudaMalloc(
                           reinterpret_cast<void **>(&device_plan_entry_),
-                          sizeof(*device_plan_entry_)),
+                          2u * sizeof(*device_plan_entry_)),
                       cudaSuccess);
             ASSERT_EQ(cudaMalloc(
                           reinterpret_cast<void **>(&device_command_header_),
@@ -146,6 +147,10 @@ namespace llaminar2::test
                       cudaSuccess);
 
             DeviceMoEOverlayEpochControl initial_control{};
+            ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_movement_waves_),
+                                  20u * sizeof(*device_movement_waves_)), cudaSuccess);
+            ASSERT_EQ(cudaMalloc(reinterpret_cast<void **>(&device_movement_edges_),
+                                  40u * sizeof(*device_movement_edges_)), cudaSuccess);
             MoEOverlayDeviceEpochProtocol::initialize(
                 initial_control, /*initial_epoch=*/1u);
             const std::array<std::uint64_t, 2> epochs{2u, 1u};
@@ -287,6 +292,10 @@ namespace llaminar2::test
                 (void)cudaFree(device_command_header_);
             if (device_plan_entry_)
                 (void)cudaFree(device_plan_entry_);
+            if (device_movement_waves_)
+                (void)cudaFree(device_movement_waves_);
+            if (device_movement_edges_)
+                (void)cudaFree(device_movement_edges_);
             if (device_transfer_slot_)
                 (void)cudaFree(device_transfer_slot_);
             if (device_runtime_family_)
@@ -323,6 +332,13 @@ namespace llaminar2::test
             return {.stream = maintenance_stream_, .workspace = nullptr};
         }
 
+        /** @return Persistent append storage owned until captured graphs retire. */
+        DeviceMoERebalanceMovementJournalView journalView() const noexcept
+        {
+            return {&device_controller_->movement_journal, device_movement_waves_,
+                    device_movement_edges_, 20u, 40u};
+        }
+
         cudaStream_t inference_stream_ = nullptr;
         cudaStream_t maintenance_stream_ = nullptr;
         cudaEvent_t inference_event_ = nullptr;
@@ -339,6 +355,8 @@ namespace llaminar2::test
         DeviceMoERebalanceApplyStatus *device_apply_status_ = nullptr;
         DeviceMoERebalanceGraphControllerState *device_controller_ = nullptr;
         DeviceMoERebalancePlanEntry *device_plan_entry_ = nullptr;
+        DeviceMoERebalanceMovementWave *device_movement_waves_ = nullptr;
+        DeviceMoERebalanceMovementEdge *device_movement_edges_ = nullptr;
         DeviceMoERebalanceCommandBufferHeader *device_command_header_ = nullptr;
         DeviceMoEExpertDirectoryEntry *device_transfer_slot_ = nullptr;
         DeviceMoEPlacementBank *device_placement_banks_ = nullptr;
@@ -1256,8 +1274,18 @@ namespace llaminar2::test
         EXPECT_EQ(apply_status.changed_layers, 1u);
         EXPECT_EQ(controller.last_error_code, 0u);
         EXPECT_EQ(controller.decode_apply_hits, 1u);
+        // Preparing the peer bank has not committed placement. The exact
+        // commands must survive until the finalizer publishes the selector.
         EXPECT_EQ(controller.waves[0].state, static_cast<std::uint32_t>(
-            DeviceMoERebalanceWaveLifecycle::Applied));
+            DeviceMoERebalanceWaveLifecycle::PreparedForPublication));
+        ASSERT_EQ(cudaMemcpyAsync(
+                      &command_header, device_command_header_,
+                      sizeof(command_header), cudaMemcpyDeviceToHost,
+                      maintenance_stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(maintenance_stream_), cudaSuccess);
+        EXPECT_EQ(command_header.epoch, 1u);
+        EXPECT_EQ(command_header.command_count, 1u);
 
         /* Apply prepares only the reserved bank. Publication is a separate
          * all-layer transaction, so active placement must remain at epoch one. */
@@ -1267,6 +1295,26 @@ namespace llaminar2::test
         EXPECT_EQ(runtime.banks[1].epoch, 2u);
         EXPECT_EQ(runtime.banks[1].experts[0].owner_participant, 1);
         EXPECT_EQ(runtime.banks[1].resident_participant_mask[0], 0b10u);
+        ASSERT_TRUE(moe_rebalance_publication::preparedWaveMatches(
+            &controller, &command_header, 1u, &apply_status));
+        ASSERT_TRUE(kernel_->finalizeMoEOverlayRebalancePublication(
+            maintenanceLaunch(), device_runtime_, 1u, 1u, device_control_,
+            &device_epochs_[0], &device_statuses_[2], device_apply_status_,
+            device_controller_, device_command_header_, 1u,
+            device_plan_entry_, 2u, 4096u, journalView()));
+        ASSERT_EQ(cudaMemcpyAsync(&controller, device_controller_, sizeof(controller),
+                                   cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(&command_header, device_command_header_, sizeof(command_header),
+                                   cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(&reservation_status, &device_statuses_[2], sizeof(reservation_status),
+                                   cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(maintenance_stream_), cudaSuccess);
+        ASSERT_TRUE(reservation_status.succeeded());
+        EXPECT_EQ(reservation_status.typedOperation(), DeviceMoEOverlayEpochOperation::PublishCandidate);
+        EXPECT_EQ(controller.waves[0].state,
+                  static_cast<std::uint32_t>(DeviceMoERebalanceWaveLifecycle::Applied));
+        EXPECT_EQ(command_header.epoch, 0u);
+        EXPECT_EQ(command_header.command_count, 0u);
     }
 
     TEST_F(CUDAMoEOverlayEpochTest,
@@ -1278,6 +1326,28 @@ namespace llaminar2::test
                                  std::int32_t published_owner,
                                  bool prepare_changed_layer)
         {
+            // This fixture supplies the same immutable apply identity as the
+            // real apply kernel. Finalization must reject unrelated headers.
+            DeviceMoERebalanceGraphControllerState controller{};
+            controller.participant_count = 2u;
+            auto &wave = controller.waves[0];
+            wave.epoch = static_cast<std::uint32_t>(candidate_epoch);
+            wave.state = static_cast<std::uint32_t>(
+                DeviceMoERebalanceWaveLifecycle::PreparedForPublication);
+            wave.command_count = 1u;
+            wave.planned_layer_count = 2u;
+            wave.applied_layer_count = 2u;
+            DeviceMoERebalanceCommandBufferHeader header{};
+            header.participant_count = 2u;
+            header.epoch = wave.epoch;
+            header.command_count = header.command_capacity = 1u;
+            apply_status.transaction_wave_index = 0u;
+            apply_status.transaction_epoch = wave.epoch;
+            apply_status.transaction_command_count = 1u;
+            ASSERT_EQ(cudaMemcpyAsync(device_controller_, &controller, sizeof(controller),
+                                       cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(device_command_header_, &header, sizeof(header),
+                                       cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
             const std::uint32_t candidate_bank = 1u - published_bank;
             std::array<DeviceMoELayerRuntime, 2> family{};
             for (std::size_t layer = 0; layer < family.size(); ++layer)
@@ -1340,7 +1410,8 @@ namespace llaminar2::test
             maintenanceLaunch(), device_runtime_family_,
             /*layer_count=*/2u, /*expert_count=*/1u,
             device_control_, &device_epochs_[0], &device_statuses_[2],
-            device_apply_status_));
+            device_apply_status_, device_controller_, device_command_header_, 1u,
+            device_plan_entry_, 2u, 4096u, journalView()));
         ASSERT_EQ(cudaStreamEndCapture(maintenance_stream_, &graph_), cudaSuccess);
         ASSERT_NE(graph_, nullptr);
         ASSERT_EQ(cudaGraphInstantiate(
@@ -1439,6 +1510,34 @@ namespace llaminar2::test
             published_owner = static_cast<std::int32_t>(epoch & 1u);
         }
 
+        // A stale apply receipt must not publish or recycle the prepared wave.
+        // This uses the same retained graph, so the identity is device data,
+        // not a host choice of another execution path.
+        upload_family(22u, published_bank, published_owner, true);
+        ++apply_status.transaction_epoch;
+        ASSERT_EQ(cudaMemcpyAsync(device_apply_status_, &apply_status, sizeof(apply_status),
+                                   cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaGraphLaunch(graph_exec_, maintenance_stream_), cudaSuccess);
+        DeviceMoERebalanceGraphControllerState rejected_controller{};
+        DeviceMoERebalanceCommandBufferHeader retained_header{};
+        ASSERT_EQ(cudaMemcpyAsync(&rejected_controller, device_controller_, sizeof(rejected_controller),
+                                   cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(&retained_header, device_command_header_, sizeof(retained_header),
+                                   cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(&control, device_control_, sizeof(control),
+                                   cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(&publication_status, &device_statuses_[2], sizeof(publication_status),
+                                   cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(maintenance_stream_), cudaSuccess);
+        EXPECT_EQ(publication_status.code,
+                  static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::InvalidControl));
+        EXPECT_EQ(control.published_selector, deviceMoEOverlayEpochSelector(21u, published_bank));
+        EXPECT_EQ(retained_header.epoch, 22u);
+        EXPECT_EQ(retained_header.command_count, 1u);
+        EXPECT_NE(rejected_controller.last_error_code, 0u);
+        EXPECT_EQ(rejected_controller.waves[0].state, static_cast<std::uint32_t>(
+            DeviceMoERebalanceWaveLifecycle::Error));
+
         DeviceMoELayerRuntime sidecar{};
         sidecar.active_bank = 1u - published_bank;
         sidecar.active_epoch = 1u;
@@ -1480,4 +1579,185 @@ namespace llaminar2::test
         ASSERT_EQ(cudaStreamSynchronize(inference_stream_), cudaSuccess);
         EXPECT_EQ(routed_participant, published_owner);
     }
+/**
+     * @brief Captured native commits retain exact paired receipts across reuse.
+     *
+     * This is a publication-protocol test: apply and copy records are explicit
+     * inputs. The transfer-parity suites independently prove the actual payload
+     * copy. No PerfStats data participates in the publication or assertions.
+     */
+    TEST_F(CUDAMoEOverlayEpochTest, NativeMovementJournalCapturedPublicationAndReset)
+    {
+        NativeMoEMovementArchive archive({.workspace_generation = 1, .layers = 2, .experts = 2,
+            .wave_capacity = 20, .edge_capacity = 40,
+            .participants = {{DeviceId::cuda(0), 0, 0}, {DeviceId::cuda(1), 0, 0}}});
+        DeviceMoERebalanceGraphControllerState controller{};
+        controller.participant_count = 2u;
+        // Build one retained graph before supplying any wave. Its pointers and
+        // capacity never change through successful, exhausted and invalid cases.
+        ASSERT_EQ(cudaMemcpyAsync(device_controller_, &controller, sizeof(controller),
+                                 cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(maintenance_stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamBeginCapture(maintenance_stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+        ASSERT_TRUE(kernel_->reserveMoEOverlayEpochCandidate(
+            maintenanceLaunch(), device_control_, &device_epochs_[0], &device_statuses_[2]));
+        ASSERT_TRUE(kernel_->finalizeMoEOverlayRebalancePublication(
+            maintenanceLaunch(), device_runtime_family_, 2u, 2u, device_control_,
+            &device_epochs_[0], &device_statuses_[2], device_apply_status_,
+            device_controller_, device_command_header_, 1u,
+            device_plan_entry_, 2u, 4096u, journalView()));
+        ASSERT_EQ(cudaStreamEndCapture(maintenance_stream_, &graph_), cudaSuccess);
+        ASSERT_EQ(cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0), cudaSuccess);
+
+        std::array<DeviceMoERebalanceMovementWave, 20> waves{};
+        std::array<DeviceMoERebalanceMovementEdge, 40> edges{};
+        DeviceMoEOverlayEpochControl control{};
+        for (std::uint32_t replay = 0u; replay < 27u; ++replay)
+        {
+            SCOPED_TRACE(replay);
+            const bool invalid = replay >= 22u;
+            const std::uint32_t epoch = invalid ? 24u : replay + 2u;
+            const auto bank = static_cast<std::uint32_t>((epoch - 2u) & 1u);
+            if (replay == 21u)
+            {
+                // A new request clears only its small journal prefix. Retained
+                // payload storage and model-lifetime selector epochs survive.
+                controller.movement_journal = {};
+            }
+            controller.last_error_code = 0u;
+            auto &wave = controller.waves[0];
+            wave = {};
+            wave.epoch = epoch;
+            wave.state = static_cast<std::uint32_t>(
+                DeviceMoERebalanceWaveLifecycle::PreparedForPublication);
+            wave.planned_layer_count = wave.applied_layer_count = 2u;
+            wave.command_count = wave.copied_arrivals = 2u;
+            wave.copied_payload_bytes = 6144u;
+            DeviceMoERebalanceCommandBufferHeader header{};
+            header.participant_count = 2u;
+            header.epoch = epoch;
+            header.command_count = header.command_capacity = 2u;
+            header.movement_decision.kind =
+                DeviceMoERebalanceMovementDecisionKind::NativeOwnershipSpread;
+            header.movement_decision.load = {
+                .accepted_spread_improvement = 40, .pre_wave_spread = 100,
+                .post_wave_spread = 60, .pre_wave_total = 200, .post_wave_total = 200,
+                .pre_participant_spread = 0, .post_participant_spread = 20,
+                .pre_participant_total = 200, .post_participant_total = 200,
+                .requested_payload_slots = 1, .minimum_improvement_per_slot = 40,
+                .maximum_post_spread_per_mille = 300, .ownership_swap_accepts = 1};
+            std::array<DeviceMoERebalancePlanEntry, 2> plans{};
+            for (std::uint32_t i = 0; i < 2u; ++i)
+            {
+                plans[i].op = static_cast<std::uint32_t>(DeviceMoERebalancePlanOp::OwnershipTransfer);
+                plans[i].expert = i;
+                plans[i].source_participant = i;
+                plans[i].destination_participant = 1u - i;
+                plans[i].activation_count = i == 0u ? 100u : 20u;
+            }
+            if (replay == 22u) wave.copied_payload_bytes = 0u;
+            if (replay == 23u) ++header.movement_decision.load.post_wave_total;
+            if (replay == 24u) plans[1].destination_participant = 1u;
+            if (replay == 25u) header.movement_decision.kind =
+                static_cast<DeviceMoERebalanceMovementDecisionKind>(UINT32_MAX);
+            if (replay == 26u) plans[0].source_participant = 2u;
+
+            DeviceMoERebalanceApplyStatus applied{};
+            applied.changed_layers = 1u;
+            applied.transaction_wave_index = 0u;
+            applied.transaction_epoch = epoch;
+            applied.transaction_command_count = 2u;
+            std::array<DeviceMoELayerRuntime, 2> family{};
+            for (auto &runtime : family)
+            {
+                runtime.active_bank = bank;
+                runtime.active_epoch = epoch - 1u;
+                runtime.expert_count = 2u;
+                runtime.participant_count = 2u;
+                auto &source = runtime.banks[bank];
+                source.epoch = epoch - 1u;
+                source.expert_count = 2u;
+                source.experts[0].owner_participant = 0;
+                source.experts[1].owner_participant = 1;
+            }
+            // Only one layer changed. The finalizer must clone the other layer
+            // before publishing this same complete model-family generation.
+            auto &candidate = family[0].banks[1u - bank];
+            candidate = family[0].banks[bank];
+            candidate.epoch = epoch;
+            candidate.experts[0].owner_participant = 1;
+            candidate.experts[1].owner_participant = 0;
+
+            ASSERT_EQ(cudaMemcpyAsync(device_runtime_family_, family.data(), sizeof(family),
+                                     cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(device_controller_, &controller, sizeof(controller),
+                                     cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(device_command_header_, &header, sizeof(header),
+                                     cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(device_apply_status_, &applied, sizeof(applied),
+                                     cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(device_plan_entry_, plans.data(), sizeof(plans),
+                                     cudaMemcpyHostToDevice, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaGraphLaunch(graph_exec_, maintenance_stream_), cudaSuccess);
+            DeviceMoEOverlayEpochStatus publication{};
+            ASSERT_EQ(cudaMemcpyAsync(&controller, device_controller_, sizeof(controller),
+                                     cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(&header, device_command_header_, sizeof(header),
+                                     cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(&control, device_control_, sizeof(control),
+                                     cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(&publication, &device_statuses_[2], sizeof(publication),
+                                     cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(waves.data(), device_movement_waves_, sizeof(waves),
+                                     cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(edges.data(), device_movement_edges_, sizeof(edges),
+                                     cudaMemcpyDeviceToHost, maintenance_stream_), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(maintenance_stream_), cudaSuccess);
+            const auto &history = controller.movement_journal;
+            // Feed actual captured publisher bytes through the production
+            // terminal archive, with profiling neither consulted nor required.
+            ASSERT_NO_THROW(archive.observe(replay >= 21u ? 2u : 1u, 1u, history,
+                std::span(waves).first(history.committed_waves),
+                std::span(edges).first(history.committed_edges)));
+            EXPECT_EQ(archive.ledger().edges.size(), 2u * std::min(replay + 1u, 20u));
+            EXPECT_EQ(archive.totals().physical_bytes,
+                6144u * (replay >= 21u ? 21u : std::min(replay + 1u, 20u)));
+            EXPECT_EQ(archive.ledger().complete(), replay < 20u);
+            if (invalid)
+            {
+                EXPECT_FALSE(publication.succeeded());
+                EXPECT_NE(controller.last_error_code, 0u);
+                EXPECT_EQ(control.published_selector, deviceMoEOverlayEpochSelector(23u, 0u));
+                EXPECT_EQ(history.committed_waves, 1u);
+                EXPECT_EQ(history.last_candidate_epoch, 23u);
+                EXPECT_EQ(header.command_count, 2u); // Failed commands are retained.
+                continue;
+            }
+            ASSERT_TRUE(publication.succeeded());
+            EXPECT_EQ(control.published_selector, deviceMoEOverlayEpochSelector(epoch, 1u - bank));
+            EXPECT_EQ(header.command_count, 0u);
+            EXPECT_EQ(header.movement_decision.kind, DeviceMoERebalanceMovementDecisionKind::None);
+            EXPECT_EQ(history.last_candidate_epoch, epoch);
+            EXPECT_EQ(history.committed_waves, replay == 21u ? 1u : std::min(replay + 1u, 20u));
+            EXPECT_EQ(history.committed_edges, history.committed_waves * 2u);
+            EXPECT_EQ(history.discarded_waves, replay == 20u ? 1u : 0u);
+            EXPECT_EQ(history.discarded_edges, replay == 20u ? 2u : 0u);
+            for (std::uint32_t i = 0; i < history.committed_waves; ++i)
+            {
+                EXPECT_EQ(waves[i].candidate_epoch, replay == 21u ? 23u : i + 2u);
+                EXPECT_EQ(waves[i].first_edge, 2u * i);
+                EXPECT_EQ(waves[i].edge_count, 2u);
+                EXPECT_EQ(waves[i].physical_payload_bytes, 6144u);
+                EXPECT_TRUE(waves[i].proof.valid());
+                EXPECT_EQ(edges[2u * i].source_participant, 0u);
+                EXPECT_EQ(edges[2u * i + 1u].source_participant, 1u);
+                EXPECT_EQ(edges[2u * i].destination_participant, 1u);
+                EXPECT_EQ(edges[2u * i + 1u].destination_participant, 0u);
+                EXPECT_EQ(edges[2u * i].activation_count, 100u);
+                EXPECT_EQ(edges[2u * i + 1u].activation_count, 20u);
+                EXPECT_EQ(edges[2u * i].estimated_weight_bytes, 4096u);
+            }
+        }
+    }
+
 } // namespace llaminar2::test

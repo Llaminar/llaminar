@@ -145,7 +145,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kBatchMagic = 0x42454f4dU; // "MOEB" in little-endian memory.
-        constexpr uint32_t kBatchVersion = 2u;
+        constexpr uint32_t kBatchVersion = 3u; // Return records authenticate arithmetic/row identity.
         constexpr uint8_t kDispatchEnvelopeKind = 1u;
         constexpr uint8_t kReturnEnvelopeKind = 2u;
 
@@ -438,6 +438,7 @@ namespace llaminar2
                 return false;
             }
             if (rows.target_participant < 0 || rows.d_model != d_model ||
+                !isValidMoEOverlayReturnLayout(rows.layout) ||
                 !rows.row_ids_host || !rows.output_rows_fp32)
             {
                 if (error)
@@ -691,6 +692,8 @@ namespace llaminar2
         Config config)
         : participant_ids_(std::move(config.participant_ids)),
           max_total_rows_(config.max_total_rows),
+          max_total_return_rows_(config.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes
+                                     ? config.max_total_entries : config.max_total_rows),
           max_total_entries_(config.max_total_entries),
           d_model_(config.d_model),
           top_k_(config.top_k)
@@ -698,7 +701,7 @@ namespace llaminar2
         std::sort(participant_ids_.begin(), participant_ids_.end());
         if (participant_ids_.empty() || max_total_rows_ == 0 ||
             max_total_entries_ == 0 || d_model_ <= 0 || top_k_ <= 0 ||
-            participant_ids_.front() < 0)
+            participant_ids_.front() < 0 || !isValidMoEOverlayReturnLayout(config.return_layout))
         {
             throw std::invalid_argument(
                 "MoE rank-batch workspace requires participants and positive geometry");
@@ -748,8 +751,11 @@ namespace llaminar2
                 kReturnSubrecordCapacityAllowance,
                 "return subrecord metadata"),
             "return metadata");
-        return_capacity = checkedAdd(return_capacity, row_id_bytes, "return row ids");
-        return_capacity = checkedAdd(return_capacity, hidden_bytes, "return rows");
+        return_capacity = checkedAdd(return_capacity,
+            checkedMultiply(max_total_return_rows_, sizeof(int32_t), "return row ids"), "return row ids");
+        return_capacity = checkedAdd(return_capacity,
+            checkedMultiply(checkedMultiply(max_total_return_rows_, static_cast<size_t>(d_model_), "return elements"),
+                            sizeof(float), "return rows"), "return rows");
 
         const size_t wire_capacity = std::max(dispatch_capacity, return_capacity);
         if (wire_capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -1069,7 +1075,7 @@ namespace llaminar2
                     *error = "return batch contains a null participant view";
                 return false;
             }
-            if (rows[index]->live_row_count > max_total_rows_ - total_rows)
+            if (rows[index]->live_row_count > max_total_return_rows_ - total_rows)
             {
                 if (error)
                     *error = "return batch exceeds fixed aggregate row capacity";
@@ -1101,6 +1107,7 @@ namespace llaminar2
                 !writer.append(packet.source_participant) ||
                 !writer.append(packet.target_participant) ||
                 !writer.append(packet.d_model) ||
+                !writer.append(packet.layout) ||
                 !writer.append(row_count) ||
                 !writer.appendBytes(
                     packet.row_ids_host,
@@ -1170,11 +1177,13 @@ namespace llaminar2
                 int32_t target_participant = -1;
                 int32_t d_model = 0;
                 uint64_t row_count_wire = 0;
+                MoEOverlayReturnLayout layout{};
                 if (!reader.read(&participant_id) ||
                     !reader.read(&residency_epoch) ||
                     !reader.read(&source_participant) ||
                     !reader.read(&target_participant) ||
                     !reader.read(&d_model) ||
+                    !reader.read(&layout) ||
                     !reader.read(&row_count_wire))
                 {
                     if (error)
@@ -1192,11 +1201,12 @@ namespace llaminar2
                 if (!destination || participant_id != participant_ids_[index] ||
                     source_participant != participant_id ||
                     target_participant < 0 || d_model != d_model_ ||
+                    !isValidMoEOverlayReturnLayout(layout) ||
                     row_count > destination->row_capacity ||
                     !destination->row_ids_host ||
                     !destination->output_rows_fp32 ||
                     (row_count != 0 && residency_epoch == 0) ||
-                    row_count > max_total_rows_ - aggregate_rows)
+                    row_count > max_total_return_rows_ - aggregate_rows)
                 {
                     if (error)
                         *error = "return batch subrecord violates graph-bound topology or capacity";
@@ -1222,6 +1232,7 @@ namespace llaminar2
                     destination->target_participant = target_participant;
                     destination->d_model = d_model;
                     destination->live_row_count = row_count;
+                    destination->layout = layout;
                 }
                 else if (!reader.skip(row_bytes) || !reader.skip(output_bytes))
                 {

@@ -1,6 +1,13 @@
 /**
  * @file MoEOverlayInferenceTransactionService.cpp
  * @brief Fixed-slot MPI control transport and remote transaction execution.
+ *
+ * An outer command owns one or more bounded execution sequences. Each sequence
+ * pins its placement epoch and admits symmetric graph groups, whose follower
+ * slots retire only after the exact sparse-return boundary. Observability uses
+ * those existing protocol identities; it never owns execution progress. In
+ * particular, chunked prefill and ticketed generation may retire many sequences
+ * under one command without being duplicate transactions.
  */
 
 #include "MoEOverlayInferenceTransactionService.h"
@@ -2362,7 +2369,10 @@ namespace llaminar2
         /* Slot retirement follows the continuation graph's exact sparse-return
          * fence. Reaching this edge proves both the local captured submissions
          * and every authenticated follower transaction completed; earlier arm
-         * or terminal-submission states are deliberately insufficient. */
+         * or terminal-submission states are deliberately insufficient. The
+         * sequence ID already authenticates each graph binding. Include it so
+         * distinct prefill chunks or MTP rounds under one command cannot merge
+         * into a single PerfStats counter; no observer-owned cursor is needed. */
         PerfStatsCollector::addCounter(
             "forward_graph",
             "segmented_replay_segments",
@@ -2371,6 +2381,7 @@ namespace llaminar2
             "continuation_rank",
             {{"authority", "typed_overlay_transaction_plan"},
              {"command", std::to_string(active_command_.command_id)},
+             {"sequence", std::to_string(execution_sequence_.sequence_id)},
              {"draft_depth", std::to_string(retired_draft_depth)},
              {"graph_groups", std::to_string(retired_count)},
              {"plan_segments",
@@ -2385,6 +2396,7 @@ namespace llaminar2
             "continuation_rank",
             {{"action", "retire"},
              {"command", std::to_string(active_command_.command_id)},
+             {"sequence", std::to_string(execution_sequence_.sequence_id)},
              {"draft_depth", std::to_string(retired_draft_depth)},
              {"transactions", std::to_string(retired_count)}});
         resetGraphSequenceLocked();

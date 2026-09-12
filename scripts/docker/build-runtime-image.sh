@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Build the Llaminar release runtime container from the repo Dockerfile.
+# @file build-runtime-image.sh
+# @brief Build the Llaminar release runtime container from the repo Dockerfile.
 #
 # This is the local/CI entry point for packaging a Release `llaminar2` binary
 # into the slim runtime image. The Dockerfile still owns the actual dependency
 # install and binary copy; this script keeps the docker build invocation shared.
+# Dry-run command planning requires neither a Docker client nor a daemon. Full
+# production certification/publication is owned by run_production_pipeline.py.
 set -euo pipefail
 
 usage() {
@@ -123,7 +126,9 @@ append_split_labels() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 
-default_rccl_only_funcs='AllReduce RING/TREE LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Reduce RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|ReduceScatter RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|AllGather RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Broadcast RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|SendRecv RING SIMPLE Sum i8'
+# Shared with direct Docker builds. MIN/MAX must not disappear from packaged
+# runtimes merely because ordinary model allreduces most often use SUM.
+default_rccl_only_funcs="$(<"${repo_root}/scripts/docker/rccl-functions.txt")"
 
 tags=()
 labels=()
@@ -430,9 +435,6 @@ case "${verify_mode}" in
         ;;
 esac
 
-command -v docker >/dev/null 2>&1 || die "docker CLI is not available"
-docker buildx version >/dev/null 2>&1 || die "docker buildx is not available"
-
 cmd=(
     docker buildx build
     --file "${repo_root}/Dockerfile"
@@ -463,9 +465,9 @@ fi
 if [[ -n "${rocm_runtime_gpu_targets}" ]]; then
     cmd+=(--build-arg "ROCM_RUNTIME_GPU_TARGETS=${rocm_runtime_gpu_targets}")
 fi
-if [[ -n "${rccl_only_funcs}" ]]; then
-    cmd+=(--build-arg "RCCL_ONLY_FUNCS=${rccl_only_funcs}")
-fi
+# Passing an explicit empty value preserves --full-rccl-funcs now that the
+# Dockerfile's default also selects the canonical inference support set.
+cmd+=(--build-arg "RCCL_ONLY_FUNCS=${rccl_only_funcs}")
 if [[ -n "${platform}" ]]; then
     cmd+=(--platform "${platform}")
 fi
@@ -509,6 +511,11 @@ printf '\n'
 if [[ "${dry_run}" == "true" ]]; then
     exit 0
 fi
+
+# A dry run validates and prints the build contract without requiring an
+# installed Docker client or daemon. Execution alone needs those dependencies.
+command -v docker >/dev/null 2>&1 || die "docker CLI is not available"
+docker buildx version >/dev/null 2>&1 || die "docker buildx is not available"
 
 "${cmd[@]}"
 

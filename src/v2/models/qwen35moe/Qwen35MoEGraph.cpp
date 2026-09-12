@@ -3606,7 +3606,8 @@ namespace llaminar2
     std::shared_ptr<MoEOverlayCollectiveWorkspace>
     Qwen35MoEGraph::overlayProtocolWorkspaceForParticipant(
         DeviceId graph_device,
-        int participant)
+        int participant,
+        MoEOverlayReturnLayout return_layout)
     {
         if (!graph_device.is_valid() || participant < 0 ||
             config_.d_model <= 0 || config_.moe.top_k <= 0)
@@ -3626,7 +3627,8 @@ namespace llaminar2
         const size_t planned_entries = planned_rows * top_k;
         const std::string key =
             graph_device.to_string() + "#overlay_protocol_p" +
-            std::to_string(participant);
+            std::to_string(participant) + "#return" +
+            std::to_string(static_cast<uint32_t>(return_layout));
         const auto existing =
             moe_serial_overlay_protocol_workspaces_.find(key);
         if (existing != moe_serial_overlay_protocol_workspaces_.end())
@@ -3654,6 +3656,7 @@ namespace llaminar2
                 .device = DeviceId::cpu(),
                 .reuse_policy = MoEOverlayCollectiveWorkspace::
                     StorageReusePolicy::SerialGraphFamily,
+                .return_layout = return_layout,
             });
         moe_serial_overlay_protocol_workspaces_.emplace(key, workspace);
         return workspace;
@@ -3860,6 +3863,9 @@ namespace llaminar2
                     .max_total_entries = max_total_entries,
                     .d_model = config_.d_model,
                     .top_k = config_.moe.top_k,
+                    .return_layout = source_descriptor->device.is_cpu()
+                        ? MoEOverlayReturnLayout::CanonicalExpertRoutes
+                        : MoEOverlayReturnLayout::ParticipantTokenPartials,
                 });
         auto transport = createMoEOverlayRankBatchTransport(
             MoEOverlayRankBatchTransportConfig{
@@ -4317,58 +4323,30 @@ namespace llaminar2
             !table || !config_.moe.decode_histogram)
             return;
 
+        // Overlay demand has exactly one producer: CPU routing or the
+        // declared heterogeneous ticket boundary. A second drain of accepted
+        // GPU marginals would duplicate rows and discard their batch identity.
+        // Native all-GPU controllers retain their evidence on device.
+        if (config_.moe.expert_overlay_residency_authority)
+            return;
+
         auto *histogram = config_.moe.decode_histogram;
         const std::string sync_key =
             key + "@" + std::to_string(reinterpret_cast<std::uintptr_t>(histogram));
         if (!moe_runtime_histogram_sync_keys_.insert(sync_key).second)
             return;
-
-        const bool overlay_histogram =
-            config_.moe.expert_overlay_residency_authority != nullptr;
-        if (overlay_histogram)
-        {
-            /* The heterogeneous ticket boundary already publishes exact
-             * ordinary decode/prefill routes into the shared host histogram.
-             * GPU state is authoritative only for accepted grouped-verifier
-             * rows, whose acceptance remains device-owned. Selecting that one
-             * phase prevents duplicate demand while preserving MTP rigor. */
-            table->enableAsyncDecodeHistogramDrain(
-                RuntimeExpertHistogramSourceMask{false, false, true});
-            histogram->registerRuntimeHistogramDrain(
-                [table, histogram]()
-                {
-                    return table->progressAsyncDecodeHistogramDrain(
-                        *histogram);
-                });
-            histogram->registerRuntimeHistogramAdmission(
-                [table](RuntimeExpertHistogramAdmission admission)
-                {
-                    return table->publishAsyncDecodeHistogramAdmission(
-                        admission);
-                });
-        }
-        else
-        {
-            histogram->registerRuntimeHistogramSync(
-                [table, histogram]()
-                {
-                    void *stream = table->decodeHistogramProducerStream();
-                    if (!stream)
-                        throw std::runtime_error(
-                            "[Qwen35MoEGraph] runtime histogram sync requested before a decode producer stream was recorded");
-                    return table->syncDecodeHistogramToHost(*histogram, stream);
-                });
-        }
+        histogram->registerRuntimeHistogramSync(
+            [table, histogram]()
+            {
+                void *stream = table->decodeHistogramProducerStream();
+                if (!stream)
+                    throw std::runtime_error(
+                        "[Qwen35MoEGraph] runtime histogram sync requested before a decode producer stream was recorded");
+                return table->syncDecodeHistogramToHost(*histogram, stream);
+            });
         PerfStatsCollector::addCounter(
-            "moe_rebalance",
-            "runtime_histogram_sync_registrations",
-            1.0,
-            "graph",
-            "",
-            {{"key", key},
-             {"protocol", overlay_histogram
-                              ? "async_double_buffered"
-                              : "synchronous_legacy"}});
+            "moe_rebalance", "runtime_histogram_sync_registrations",
+            1.0, "graph", "", {{"key", key}, {"protocol", "synchronous_legacy"}});
     }
 
     // =========================================================================
@@ -4511,6 +4489,14 @@ namespace llaminar2
                 : (total_tokens == 1
                        ? MoEOverlayServicePhaseHint::Decode
                        : MoEOverlayServicePhaseHint::Prefill);
+        // Demand and measured service prices describe the same graph phase.
+        // In particular, predictor M=1 is MTP work, not ordinary decode.
+        const ExpertHistogramSource routed_histogram_source =
+            routed_service_phase == MoEOverlayServicePhaseHint::GroupedVerifier
+                ? ExpertHistogramSource::GroupedVerifier
+                : routed_service_phase == MoEOverlayServicePhaseHint::Prefill
+                    ? ExpertHistogramSource::PrefillChunk
+                    : ExpertHistogramSource::DecodeToken;
         if (layer_idx == 0 && mirroredLayerDiagnosticsEnabled())
         {
             LOG_INFO(
@@ -4899,6 +4885,12 @@ namespace llaminar2
                        : config_.moe.routed_prefill_assignment_policy);
         if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
             hot_replica_cap = std::max(0, env.moe_rebalance.max_replicas);
+        hot_replica_cap = std::min(hot_replica_cap, config_.moe.num_experts);
+        // The replica request is only an upper bound. Consume the immutable
+        // physical-admission grant, including after retained-runner reuse;
+        // graph construction must not reserve the original larger directory.
+        if (overlay_plan && overlay_plan->replica_cache_capacity)
+            hot_replica_cap = overlay_plan->replica_cache_capacity->resolve(hot_replica_cap);
         const bool dynamic_overlay_residency =
             use_expert_overlay &&
             config_.moe.routed_expert_plan &&
@@ -6899,13 +6891,13 @@ namespace llaminar2
             route_params.norm_topk_prob = config_.moe.norm_topk_prob;
             route_params.layer_idx = layer_idx;
             route_params.decode_histogram =
-                mtp_sidecar_context ||
-                        device_side_graph_rebalance_candidate ||
-                        !collect_runtime_histogram
+                !device.is_cpu() || device_side_graph_rebalance_candidate ||
+                        config_.moe.rebalance_config.mode == MoERebalanceRuntimeMode::Off
                     ? nullptr
                     : config_.moe.decode_histogram;
+            route_params.host_routing_source = routed_histogram_source;
             route_params.host_logical_row_count =
-                device.is_cpu() && !mtp_sidecar_context
+                device.is_cpu()
                     ? total_tokens
                     : 0;
             route_params.moe_runtime_table = moe_runtime_table;
@@ -8708,7 +8700,17 @@ namespace llaminar2
                             config_.d_model,
                             device,
                             /*workspace_generation=*/1,
-                            mappedOverlayTicketArenaForDevice(device));
+                            mappedOverlayTicketArenaForDevice(device),
+                            moe_runtime_table
+                                ? moe_runtime_table->hostLayerState(layer_idx).overlay_epoch_ticket
+                                : nullptr);
+                        if (config_.moe.expert_overlay_residency_authority &&
+                            dispatch_ticket_storage->epochAuthority() !=
+                                MoEOverlayDispatchEpochAuthority::CapturedRequest)
+                        {
+                            throw std::logic_error(
+                                "GPU ExpertOverlay dispatch requires the captured request's placement epoch");
+                        }
                         dispatch_output_lifetime->ticket_lifetime =
                             dispatch_ticket_storage;
 
@@ -8796,22 +8798,16 @@ namespace llaminar2
                     dispatch_params.cpu_current_batch_llep_state =
                         cpu_llep_state;
                     if (dispatch_ticket_storage &&
-                        config_.moe.decode_histogram &&
-                        !mtp_sidecar_context &&
-                        !grouped_main_verifier_layer)
+                        config_.moe.decode_histogram)
                     {
-                    /*
-                     * The manual ticket boundary already owns the exact host
-                     * route prefix. Publish ordinary prefill/decode demand
-                     * there; grouped verification must wait for accepted-state
-                     * publication and is deliberately excluded here.
-                     */
+                        // This declared heterogeneous boundary already owns
+                        // exact routes and live row geometry. One ticket is
+                        // one executed batch, including rejected MTP work;
+                        // acceptance never changes these service-cost facts.
                         dispatch_params.routing_evidence_publication =
                             MoEExpertDispatchStage::RoutingEvidencePublication{
                                 .histogram = config_.moe.decode_histogram,
-                                .source = ordinary_prefill_graph
-                                              ? ExpertHistogramSource::PrefillChunk
-                                              : ExpertHistogramSource::DecodeToken,
+                                .source = routed_histogram_source,
                             };
                     }
                     dispatch_params.output_lifetime = dispatch_output_lifetime;
@@ -9293,6 +9289,13 @@ namespace llaminar2
                             ? final_rank_local_overlay_participant
                             : final_overlay_participant;
 
+                const auto *continuation_descriptor = owner_map_lifetime->participantForId(
+                    continuation_root_participant);
+                if (!continuation_descriptor)
+                    throw std::logic_error("Host sparse return has no continuation participant identity");
+                const auto host_return_layout = continuation_descriptor->device.is_cpu()
+                    ? MoEOverlayReturnLayout::CanonicalExpertRoutes
+                    : MoEOverlayReturnLayout::ParticipantTokenPartials;
                 std::vector<std::shared_ptr<MoEOverlayCollectiveWorkspace>> participant_workspaces(
                     static_cast<size_t>(participant_count));
                 for (int participant = 0;
@@ -9301,7 +9304,7 @@ namespace llaminar2
                 {
                     participant_workspaces[static_cast<size_t>(participant)] =
                         overlayProtocolWorkspaceForParticipant(
-                            device, participant);
+                            device, participant, host_return_layout);
                 }
 
                 std::shared_ptr<IMoEOverlaySparseCollectiveContext>
@@ -9452,6 +9455,7 @@ namespace llaminar2
                     local_params.device_id = target_device;
                     local_params.input_rows_lifetime = inbound;
                     local_params.output_rows_lifetime = outbound;
+                    local_params.return_layout = host_return_layout;
                     local_params.workspace_lifetime =
                         participant_workspaces[static_cast<size_t>(
                             target_participant)];
@@ -9807,6 +9811,7 @@ namespace llaminar2
                                 local_participants;
                             follower_return.outbound_rows =
                                 std::move(outbound_rows);
+                            follower_return.return_layout = host_return_layout;
                             follower_return.seq_len = total_tokens;
                             follower_return.d_model = config_.d_model;
 
@@ -10152,12 +10157,15 @@ namespace llaminar2
                                 std::move(return_inbound);
                             batch_return.ticket_storage =
                                 dispatch_ticket_storage;
+                            batch_return.return_layout = host_return_layout;
                             if (!dispatch_ticket_storage)
                             {
-                                batch_return.dense_output = moe_output;
+                                batch_return.dense_output = host_return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes
+                                    ? canonical_route_contributions : moe_output;
                                 batch_return.dense_output_buffer_id =
                                     buffers.idFor(
-                                        BufferId::MOE_COMBINED_OUTPUT);
+                                        host_return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes
+                                            ? BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS : BufferId::MOE_COMBINED_OUTPUT);
                             }
                             batch_return.seq_len = total_tokens;
                             batch_return.d_model = config_.d_model;
@@ -10470,6 +10478,7 @@ namespace llaminar2
                             local_params.device_id = target_device;
                             local_params.input_rows_lifetime = target_dispatch_inbound;
                             local_params.output_rows_lifetime = local_output_lifetime;
+                            local_params.return_layout = host_return_layout;
                             local_params.workspace_lifetime =
                                 participant_workspaces[static_cast<size_t>(
                                     target_participant)];
@@ -10825,6 +10834,7 @@ namespace llaminar2
                             return_params.target_participant = continuation_root_participant;
                             return_params.outbound_rows_lifetime = outbound_lifetime;
                             return_params.inbound_rows_lifetime = inbound_lifetime;
+                            return_params.return_layout = host_return_layout;
                             if (canonical_route_ticket_storage)
                             {
                                 return_params.inbound_consumer_role =
@@ -10843,10 +10853,12 @@ namespace llaminar2
                             if (!dispatch_ticket_storage &&
                                 !canonical_route_ticket_storage)
                             {
-                                return_params.dense_output = moe_output;
+                                return_params.dense_output = host_return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes
+                                    ? canonical_route_contributions : moe_output;
                                 return_params.dense_output_buffer_id =
                                     buffers.idFor(
-                                        BufferId::MOE_COMBINED_OUTPUT);
+                                        host_return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes
+                                            ? BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS : BufferId::MOE_COMBINED_OUTPUT);
                             }
                             return_params.seq_len = total_tokens;
                             return_params.d_model = config_.d_model;
@@ -11048,6 +11060,21 @@ namespace llaminar2
                             device);
                         graph.addDependency(
                             consume_name, ingress_dependency);
+                        /*
+                         * Local GPU canonical publication writes every route
+                         * slot, including zeroes for CPU-owned experts. CPU
+                         * computation overlaps that work, but ingress replaces
+                         * those zeroes and must therefore follow the local
+                         * writer. A later reducer joining both branches cannot
+                         * repair a write/write race in their shared route bank.
+                         * This is a graph edge, not a host/stream wait; the CPU
+                         * service and GPU expert compute remain independent.
+                         */
+                        if (!captured_local_expert_terminal.empty())
+                        {
+                            graph.addDependency(
+                                consume_name, captured_local_expert_terminal);
+                        }
                         graph.setGraphCaptureWaveContract(
                             consume_name,
                             GraphCaptureWaveContract{
@@ -11553,6 +11580,34 @@ namespace llaminar2
                     }
                     return merge_name;
                 };
+
+                if (host_return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes &&
+                    sparse_graph_contract.ownsDispatchAuthority())
+                {
+                    if (!device.is_cpu() || !canonical_route_contributions || last_return_reduce.empty())
+                        throw std::logic_error("Canonical host return has no complete root-owned publication bank");
+                    // Reuse the LocalTP packed protocol and its coverage proof.
+                    // Only this final node applies weights, in original router
+                    // order, after every tier/participant has returned raw rows.
+                    MoECanonicalRouteReduceStage::Params reduce;
+                    reduce.device_id = device;
+                    reduce.canonical_route_contributions = canonical_route_contributions;
+                    reduce.routing_weights = routing_weights;
+                    reduce.output = moe_output;
+                    reduce.seq_len = total_tokens;
+                    reduce.top_k = config_.moe.top_k;
+                    reduce.d_model = config_.d_model;
+                    reduce.canonical_route_arithmetic = MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA;
+                    reduce.canonical_route_layout = MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows;
+                    reduce.reduction_role = MoECanonicalRouteReductionRole::RootOwner;
+                    reduce.canonical_route_contributions_buffer_id = buffers.idFor(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+                    reduce.routing_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
+                    reduce.output_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                    const std::string fold_name = prefix + "moe_host_routes_ordered_reduce";
+                    graph.addNode(fold_name, ComputeStageFactory::createMoECanonicalRouteReduce(reduce), device);
+                    graph.addDependency(fold_name, last_return_reduce);
+                    last_return_reduce = fold_name;
+                }
 
                 const bool distributed_dense_continuation =
                     distributed_overlay &&
@@ -12122,6 +12177,23 @@ namespace llaminar2
                     graph.addDependency(
                         ordered_reduce_name,
                         ordered_reduce_dependency);
+
+                    /*
+                     * A CPU ticket publishes only its own original route
+                     * slots. Its readiness is not a completion edge for the
+                     * concurrently executing continuation-local experts.
+                     * Preserve both producers in the DAG, as LocalTP does:
+                     * capture compilation may schedule independent units in
+                     * parallel and must not rely on insertion order or the
+                     * CPU branch normally taking longer than the GPU branch.
+                     */
+                    if (ordered_reduce_dependency !=
+                        captured_local_expert_terminal)
+                    {
+                        graph.addDependency(
+                            ordered_reduce_name,
+                            captured_local_expert_terminal);
+                    }
 
                     captured_overlay_routed_unit_terminal =
                         ordered_reduce_name;

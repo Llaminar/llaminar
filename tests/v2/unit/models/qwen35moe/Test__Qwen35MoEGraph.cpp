@@ -1,6 +1,11 @@
 /**
  * @file Test__Qwen35MoEGraph.cpp
  * @brief Regression tests for Qwen3.5 MoE graph construction.
+ *
+ * Build real declarative graphs with device-free model fixtures and inspect
+ * typed stage policies, ownership, data bindings, and dependency edges. Sparse
+ * CPU publication must gather raw routes, apply one ordered root fold, and only
+ * then broadcast; a participant-local partial sum cannot replace that contract.
  */
 
 #include <gtest/gtest.h>
@@ -1269,9 +1274,36 @@ TEST(Test__Qwen35MoEGraph,
         EXPECT_EQ(
             publication_stage->params().output,
             buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT)));
+        const auto *fold_node = graph.getNode("layer0_moe_host_routes_ordered_reduce");
+        const auto *return_consumer = publication_node;
+        if (rank == 0)
+        {
+            ASSERT_NE(fold_node, nullptr);
+            const auto *fold = dynamic_cast<const MoECanonicalRouteReduceStage *>(fold_node->stage.get());
+            ASSERT_NE(fold, nullptr);
+            EXPECT_TRUE(hasDependency(graph, kPublication, fold_node->name));
+            EXPECT_EQ(fold->params().canonical_route_arithmetic,
+                      MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA);
+            EXPECT_EQ(fold->params().canonical_route_layout,
+                      MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows);
+            EXPECT_EQ(fold->params().reduction_role, MoECanonicalRouteReductionRole::RootOwner);
+            EXPECT_EQ(fold->params().canonical_route_contributions,
+                      buffers.get(buffers.idFor(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS)));
+            EXPECT_EQ(fold->params().routing_weights,
+                      buffers.get(buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS)));
+            EXPECT_EQ(fold->params().output, publication_stage->params().output);
+            EXPECT_TRUE(contractReads(fold->bufferContract(), BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
+            EXPECT_TRUE(contractReads(fold->bufferContract(), BufferId::MOE_EXPERT_WEIGHTS));
+            EXPECT_TRUE(contractWrites(fold->bufferContract(), BufferId::MOE_COMBINED_OUTPUT));
+            return_consumer = fold_node;
+        }
+        else
+        {
+            EXPECT_EQ(fold_node, nullptr) << "Only the dispatch authority may fold routed rows";
+        }
         EXPECT_TRUE(std::any_of(
-            publication_node->dependencies.begin(),
-            publication_node->dependencies.end(),
+            return_consumer->dependencies.begin(),
+            return_consumer->dependencies.end(),
             [&](const std::string &dependency)
             {
                 const auto *return_node = graph.getNode(dependency);
@@ -1281,6 +1313,25 @@ TEST(Test__Qwen35MoEGraph,
                         dynamic_cast<const MoERankBatchReturnReduceStage *>(
                             return_node->stage.get()) != nullptr);
             })) << "rank=" << rank;
+        // Check the emitted stages, rather than matching a particular source
+        // spelling. Scalar and rank-batched returns must publish the same bank
+        // with a coherent BufferId and never add directly into the final row.
+        for (const auto &name : graph.getExecutionOrder())
+        {
+            const auto *node = graph.getNode(name);
+            const auto *scalar = dynamic_cast<const MoESparseReturnReduceStage *>(node->stage.get());
+            const auto *batch = dynamic_cast<const MoERankBatchReturnReduceStage *>(node->stage.get());
+            if (!scalar && !batch) continue;
+            const auto layout = scalar ? scalar->params().return_layout : batch->params().return_layout;
+            EXPECT_EQ(layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
+            if (rank != 0) continue;
+            const auto destination = scalar ? scalar->params().dense_output : batch->params().dense_output;
+            const auto destination_id = scalar ? scalar->params().dense_output_buffer_id : batch->params().dense_output_buffer_id;
+            ASSERT_EQ(destination_id, buffers.idFor(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
+            EXPECT_EQ(destination, buffers.get(*destination_id));
+            EXPECT_TRUE(contractWrites(node->stage->bufferContract(), *destination_id));
+            EXPECT_FALSE(contractWrites(node->stage->bufferContract(), BufferId::MOE_COMBINED_OUTPUT));
+        }
         EXPECT_TRUE(hasDependency(
             graph,
             "layer0_shared_expert_allreduce",
@@ -3917,7 +3968,7 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithPost
            "when the phase-split cache stores complete KV rows";
     EXPECT_EQ(attention->getParams().gqa_n_rep,
               config.n_heads / config.n_kv_heads);
-    EXPECT_TRUE(attention->getParams().read_kv_from_cache);
+    EXPECT_NE(attention->getParams().kv_cache, nullptr);
     EXPECT_FALSE(
         attention->getParams().execution_policy.key_cache.transformsOnRead());
     EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_kv_append"));
@@ -3993,7 +4044,7 @@ TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedPos
     EXPECT_EQ(attention->getParams().head_start, 0)
         << "a replicated full-Q graph owns global head zero on every "
            "participant, irrespective of that participant's primary TP shard";
-    EXPECT_TRUE(attention->getParams().read_kv_from_cache);
+    EXPECT_NE(attention->getParams().kv_cache, nullptr);
     EXPECT_FALSE(
         attention->getParams().execution_policy.key_cache.transformsOnRead());
 }

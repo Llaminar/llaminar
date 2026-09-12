@@ -1172,6 +1172,41 @@ namespace llaminar2
         owner_ = nullptr;
     }
 
+    size_t CPUGroupedMoESerialWorkspace::plannedAllocationBytes(const Config &config)
+    {
+        if (config.row_capacity == 0 || config.d_model <= 0 ||
+            config.expert_intermediate <= 0 || config.num_experts <= 0 ||
+            config.routing_top_k <= 0 || config.routing_top_k > config.num_experts)
+            throw std::invalid_argument("CPU grouped-MoE workspace requires positive geometry");
+        const auto multiply = [](size_t a, size_t b)
+        {
+            if (a && b > std::numeric_limits<size_t>::max() / a)
+                throw std::overflow_error("CPU grouped-MoE workspace byte product overflow");
+            return a * b;
+        };
+        const auto add = [](size_t a, size_t b)
+        {
+            if (b > std::numeric_limits<size_t>::max() - a)
+                throw std::overflow_error("CPU grouped-MoE workspace byte sum overflow");
+            return a + b;
+        };
+        const size_t rows = config.row_capacity;
+        const size_t routes = multiply(rows, static_cast<size_t>(config.routing_top_k));
+        if (routes > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::overflow_error("CPU grouped-MoE workspace route capacity exceeds int");
+        const size_t hidden = static_cast<size_t>(config.d_model);
+        const size_t intermediate = static_cast<size_t>(config.expert_intermediate);
+        const size_t hidden_blocks = (hidden + Q8_1Block::BLOCK_SIZE - 1u) / Q8_1Block::BLOCK_SIZE;
+        const size_t intermediate_blocks = (intermediate + Q8_1Block::BLOCK_SIZE - 1u) / Q8_1Block::BLOCK_SIZE;
+        // Batch input plus gate/up/out and the independent floating route output.
+        const size_t fp32_elements = add(multiply(rows, hidden),
+            multiply(routes, add(multiply(2u, hidden), multiply(2u, intermediate))));
+        // Transported router/SwiGLU rows and the kernel's own router publication.
+        const size_t q8_blocks = add(multiply(routes, add(hidden_blocks, intermediate_blocks)),
+                                    multiply(rows, hidden_blocks));
+        return add(multiply(fp32_elements, sizeof(float)), multiply(q8_blocks, sizeof(Q8_1Block)));
+    }
+
     CPUGroupedMoESerialWorkspace::CPUGroupedMoESerialWorkspace(Config config)
         : row_capacity_(config.row_capacity),
           d_model_(config.d_model),
@@ -1182,6 +1217,8 @@ namespace llaminar2
                           ? "cpu_grouped_moe_serial_workspace"
                           : std::move(config.debug_name))
     {
+        // The allocation owner and preflight consume this same payload contract.
+        const size_t planned_bytes = plannedAllocationBytes(config);
         if (row_capacity_ == 0 || d_model_ <= 0 ||
             expert_intermediate_ <= 0 || num_experts_ <= 0 ||
             routing_top_k_ <= 0 || routing_top_k_ > num_experts_)
@@ -1299,6 +1336,9 @@ namespace llaminar2
             allocation_bytes_,
             kernel_router_publication_bytes,
             "kernel router publication bytes");
+
+        if (allocation_bytes_ != planned_bytes)
+            throw std::logic_error("CPU grouped-MoE workspace allocation disagrees with its BOM");
 
         PerfStatsCollector::addCounter(
             "memory",

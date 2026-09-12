@@ -1356,6 +1356,10 @@ namespace llaminar2::moe_rebalance_policy
         if (post_policy_load_spread > UINT64_MAX / 1000ULL)
             return false;
         const uint64_t lhs = post_policy_load_spread * 1000ULL;
+        // A mathematical RHS larger than uint64 cannot reject a representable
+        // LHS. Do not wrap it into a small threshold on a long demand horizon.
+        if (post_policy_load_total > UINT64_MAX / max_post_load_spread_per_mille)
+            return true;
         const uint64_t rhs =
             post_policy_load_total *
             static_cast<uint64_t>(max_post_load_spread_per_mille);

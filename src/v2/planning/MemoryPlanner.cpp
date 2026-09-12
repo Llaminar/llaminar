@@ -493,6 +493,50 @@ MemoryPlan MemoryPlanner::plan(
          */
         const int main_layer_count =
             std::max(0, profile.n_layers - profile.mtp_layer_count);
+        if (cfg.device.is_gpu() && cfg.graph_snapshot_memory.effective_kv &&
+            cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
+        {
+            const auto &diagnostic = *cfg.graph_snapshot_memory.effective_kv;
+            if (!cfg.graph_snapshot_memory.valid() || diagnostic.retained_arena_count == 0 ||
+                cfg.batch_size <= 0 || max_seq <= 0 || profile.head_dim <= 0 ||
+                (diagnostic.layer && (*diagnostic.layer < 0 || *diagnostic.layer >= profile.n_layers)))
+                throw std::invalid_argument("Effective-KV snapshot admission requires complete layer, request, context and retained-arena geometry");
+
+            std::size_t per_arena_bytes = 0;
+            for (int layer = 0; layer < profile.n_layers; ++layer)
+            {
+                const bool sidecar = layer >= main_layer_count;
+                const bool resident = sidecar ? cfg.mtp_enabled :
+                    (layer >= cfg.first_layer && layer <= last_layer);
+                if (!resident || (diagnostic.layer && layer != *diagnostic.layer) ||
+                    !PersistentStateMemoryEstimator::isFullAttentionLayer(profile, layer))
+                    continue;
+                const int heads = sidecar ? mtp_local_kv_heads : local_kv_heads;
+                if (heads <= 0)
+                    throw std::invalid_argument("Effective-KV snapshot admission requires positive local KV heads");
+
+                // Each output slot holds raw native bytes. FP32 is the maximum
+                // supported effective-read element size (native or converted),
+                // so the explicit envelope covers every codec without guessing
+                // the model's attention read policy. No conversion is performed.
+                const auto elements = checkedMultiply(
+                    checkedMultiply(static_cast<std::size_t>(cfg.batch_size), max_seq,
+                                    "effective-KV request/context rows"),
+                    checkedMultiply(static_cast<std::size_t>(heads), profile.head_dim,
+                                    "effective-KV local head width"),
+                    "effective-KV bank elements");
+                const auto payload = checkedMultiply(elements, 2u * sizeof(float),
+                                                     "effective-K/V bank bytes");
+                const auto metadata = checkedMultiply(static_cast<std::size_t>(cfg.batch_size),
+                    2u * sizeof(std::int32_t), "effective-KV device count/head snapshots");
+                per_arena_bytes = checkedAdd(per_arena_bytes, checkedAdd(payload, metadata,
+                    "effective-KV layer snapshot"), "effective-KV layer inventory");
+            }
+            graph_snapshot_bytes = checkedAdd(graph_snapshot_bytes,
+                checkedMultiply(per_arena_bytes, diagnostic.retained_arena_count,
+                                "retained effective-KV snapshot arenas"),
+                "reference and effective-KV snapshots");
+        }
         const bool owns_terminal_main_layer =
             main_layer_count > 0 &&
             cfg.first_layer <= main_layer_count - 1 &&
@@ -754,6 +798,7 @@ MemoryPlan MemoryPlanner::plan(
                     std::max(1, cfg.prefix_cache.block_size);
                 const auto logical_block =
                     KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                        persistent_state.main_kv_family,
                         prefix_block_tokens,
                         local_kv_heads,
                         profile.head_dim,
@@ -765,6 +810,7 @@ MemoryPlan MemoryPlanner::plan(
                     "prefix logical K/V layer");
                 const auto shifted_logical_block =
                     KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                        KVCacheFamily::AttentionOnly,
                         prefix_block_tokens,
                         mtp_local_kv_heads,
                         profile.head_dim,

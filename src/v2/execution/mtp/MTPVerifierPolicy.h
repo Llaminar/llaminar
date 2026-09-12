@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bit>
+#include <algorithm>
 
 /**
  * @file MTPVerifierPolicy.h
@@ -15,6 +16,44 @@
 
 namespace llaminar2
 {
+
+    /** @brief Owner that clips speculative work at a response boundary. */
+    enum class MTPCommitBudgetAuthority
+    {
+        Host,
+        Device,
+    };
+
+    /**
+     * @brief Resolve executed drafts once, before checkpoint admission.
+     *
+     * A device controller retains the complete selected transaction when any
+     * speculative response work remains; its commit budget clips publication,
+     * not graph width. A zero-draft response boundary executes only the existing
+     * captured condition advance. The same value must size rollback protection
+     * and drive the subsequent sidecar/verifier execution.
+     *
+     * @param capacity Draft width selected for this transaction/capture.
+     * @param response_budget Positive output limit, or zero for unbounded.
+     * @param leading_output_cost Zero for an already-emitted condition, else one.
+     * @param authority Owner of accepted-state/output clipping.
+     * @return Executed draft width, or -1 for invalid admission geometry.
+     */
+    [[nodiscard]] constexpr int mtpTransactionDraftCount(
+        int capacity, int response_budget, int leading_output_cost,
+        MTPCommitBudgetAuthority authority) noexcept
+    {
+        if (capacity < 0 || response_budget < 0 ||
+            leading_output_cost < 0 || leading_output_cost > 1)
+            return -1;
+        if (response_budget == 0)
+            return capacity;
+        const int remaining = std::max(0, response_budget - leading_output_cost);
+        if (remaining == 0)
+            return 0;
+        return authority == MTPCommitBudgetAuthority::Device
+                   ? capacity : std::min(capacity, remaining);
+    }
 
     /**
      * @brief Immutable policy for mapping logical verifier rows to graph width.

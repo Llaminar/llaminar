@@ -15,6 +15,7 @@
 #include "kernels/HybridKVCacheConfig.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "utils/MPIContext.h"
@@ -161,7 +162,8 @@ namespace llaminar2::test
         auto cache = KernelFactory::createCPUKVCache(config);
 
         ASSERT_NE(cache, nullptr);
-        EXPECT_EQ(cache->precision(), ActivationPrecision::Q8_1);
+        EXPECT_EQ(cache->k_precision(), ActivationPrecision::AQ8);
+        EXPECT_EQ(cache->v_precision(), ActivationPrecision::Q8_1);
         EXPECT_EQ(cache->num_layers(), 24);
         EXPECT_EQ(cache->max_seq_len(), 2048);
         EXPECT_EQ(cache->n_kv_heads(), 2);
@@ -392,6 +394,7 @@ namespace llaminar2::test
     TEST_F(Test__KernelFactory_KVCache,
            CanonicalAuthorityClaimsAllSupportedCPUStorageFormats)
     {
+        TurboQuantContext context(64, 42);
         const std::array precisions{
             ActivationPrecision::FP32,
             ActivationPrecision::BF16,
@@ -414,6 +417,7 @@ namespace llaminar2::test
             config.n_kv_heads = 2;
             config.head_dim = 64;
             config.mpi_ctx = &getTestMPIContext();
+            config.turboquant_ctx = &context;
             const size_t expected_bytes = config.estimateBytes();
             ASSERT_GT(expected_bytes, 0u);
 
@@ -479,7 +483,7 @@ namespace llaminar2::test
 
         EXPECT_EQ(
             config.estimateBytes(),
-            KVCacheMemoryEstimator::estimate(
+            KVCacheMemoryEstimator::estimate(KVCacheFamily::Hybrid,
                 /*n_layers=*/1,
                 config.batch_size,
                 config.max_seq_len,

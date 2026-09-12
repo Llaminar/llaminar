@@ -16,10 +16,14 @@
  * expected grouped verifier kernel counters.  That makes this suite a regression
  * net for the CUDA, ROCm, and CPU verifier-forward paths without forcing every
  * iteration through the heavier PyTorch snapshot matrix.
+ * The canonical-generation boundary case also carries the first real stochastic
+ * CPU drift back into this row-level oracle, independently of sampler draws.
  */
 
 #include "Qwen36MoEParityTestBase.h"
+#include "../ModelParityGenerationWorkload.h"
 
+#include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 #include "execution/mtp/MTPVerifierPolicy.h"
@@ -661,6 +665,166 @@ LLAMINAR_QWEN36_VERIFIER_OPERATION_TESTS(ROCm, ROCm)
 
 #undef LLAMINAR_QWEN36_VERIFIER_OPERATION_TESTS
 
+/**
+ * @brief Locate CPU canonical-generation drift through production transactions.
+ *
+ * Independent serial and MTP orchestration runners own physical admission and
+ * complete request setup. At each speculative boundary row zero depends only
+ * on the already-agreed condition token, so it can be compared with the serial
+ * checkpoint even when the speculative proposal is rejected. This short
+ * reduction does not replace the campaign's 384-token request certificate.
+ */
+TEST(Qwen36MTPForwardVerifierOperationEquivalence, MoECPU_M2_CanonicalGenerationBoundary)
+{
+    using llaminar2::test::parity::ModelParityGenerationWorkload;
+    ScopedEnvironmentValues operation_diagnostics({
+        {"LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC", "1"},
+        {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+    });
+    auto test_case = moeBenchmarkPromptCase(VerifierBackend::CPU);
+    test_case.reference_input_source = MoEReferenceInputSource::ModelTokenizer;
+    test_case.chat_messages = {
+        {"system", std::string(ModelParityGenerationWorkload::systemPrompt())},
+        {"user", std::string(ModelParityGenerationWorkload::userPrompt())},
+    };
+    test_case.exact_prompt_tokens = 214;
+    test_case.max_seq_len = 4096;
+    test_case.kv_cache_precision = "fp16";
+    std::string model_path;
+    std::vector<int32_t> prompt, unused_reference_tokens;
+    loadMoEReferenceInputs(test_case, &model_path, &prompt, &unused_reference_tokens);
+    if (moeReferenceInputsStoppedCurrentTest())
+        return;
+
+    constexpr int kDiagnosticOutputs = 64;
+    SamplingParams sampling;
+    sampling.seed = 4242;
+    sampling.temperature = 0.7f;
+    sampling.top_k = 40;
+    sampling.top_p = 0.9f;
+    auto factory = createOrchestrationRunnerFactory();
+    auto config = makeMoEPrefixRestoreConfig(
+        test_case, model_path, true, static_cast<int>(prompt.size()), false);
+    config.mtp.graph_capacity_draft_tokens = 15;
+    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+    const auto snapshot_keys = qwen36MoEGroupedVerifierDiagnosticSnapshotKeys();
+    auto serial = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(serial, nullptr);
+    ASSERT_TRUE(serial->initialize()) << serial->lastError();
+    // Match HTTP's per-field merge: explicit stochastic knobs do not disable
+    // model-recommended repetition penalties. Omitting these would diagnose a
+    // different request and miss double application outside the model graph.
+    const auto defaults = serial->getRecommendedSamplingParams();
+    sampling.presence_penalty = defaults.presence_penalty;
+    sampling.frequency_penalty = defaults.frequency_penalty;
+    sampling.dry_multiplier = defaults.dry_multiplier;
+    sampling.dry_base = defaults.dry_base;
+    sampling.dry_allowed_length = defaults.dry_allowed_length;
+    sampling.dry_penalty_last_n = defaults.dry_penalty_last_n;
+    sampling.dry_sequence_breakers = defaults.dry_sequence_breakers;
+    serial->setSamplingParams(sampling);
+    serial->setSnapshotCaptureFilter(snapshot_keys);
+    serial->enableSnapshotCapture();
+    ASSERT_TRUE(serial->prefill(prompt)) << serial->lastError();
+    std::vector<int32_t> serial_tokens;
+    std::vector<std::map<std::string, std::vector<float>>> serial_snapshots;
+    for (int output = 0; output < kDiagnosticOutputs; ++output)
+    {
+        serial->clearSnapshots();
+        serial->setDecodeStepTokenBudget(1);
+        const auto step = serial->decodeStep();
+        ASSERT_TRUE(step.error.empty()) << step.error;
+        ASSERT_EQ(step.tokens.size(), 1u);
+        serial_tokens.push_back(step.tokens.front());
+        serial_snapshots.push_back(captureMoERunnerSnapshots(*serial));
+    }
+    serial->disableSnapshotCapture();
+    serial->shutdown();
+    serial.reset();
+
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+    auto mtp = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(mtp, nullptr);
+    ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+    mtp->setSamplingParams(sampling);
+    mtp->setSnapshotCaptureFilter(snapshot_keys);
+    mtp->enableSnapshotCapture();
+    ASSERT_TRUE(mtp->prefill(prompt)) << mtp->lastError();
+    const auto results = moeDiagnosticResultsDir();
+    std::ofstream csv(results / "canonical_generation_transactions_vs_serial.csv");
+    ASSERT_TRUE(csv.is_open());
+    writeMoESnapshotCsvHeader(csv);
+    std::size_t emitted = 0;
+    while (emitted + 2 < serial_tokens.size())
+    {
+        // A rejected correction is already response-visible but remains a
+        // pending condition. The model-owned position, not response length,
+        // identifies row zero of the next verifier transaction.
+        const auto before = mtp->prefixStateProbe(PrefixProbeCapturePolicy{});
+        const int serial_output = before.mtp_next_condition_position -
+                                  static_cast<int>(prompt.size()) + 1;
+        ASSERT_GT(serial_output, 0);
+        ASSERT_LT(serial_output, static_cast<int>(serial_snapshots.size()));
+        mtp->clearSnapshots();
+        mtp->setDecodeStepTokenBudget(kDiagnosticOutputs - static_cast<int>(emitted));
+        const auto step = mtp->decodeStep();
+        ASSERT_TRUE(step.error.empty()) << step.error;
+        ASSERT_FALSE(step.tokens.empty());
+        ASSERT_EQ(step.tokens.front(), serial_tokens[emitted]);
+        const auto grouped = captureMoERunnerSnapshots(*mtp);
+        ASSERT_FALSE(grouped.empty());
+        std::vector<MoESnapshotCompareRow> rows;
+        const int output_count = serial_output + 1;
+        appendMoEAllPositionVerifierRows(
+            grouped, serial_snapshots[serial_output], 0, output_count, csv, &rows);
+        csv.flush();
+        const auto *bad = firstMoEDiagnosticByteDivergence(
+            rows, "all_position_row0_vs_serial_prefix" + std::to_string(output_count), false);
+        if (bad)
+        {
+            // Preserve the entire first bad layer, including its inputs and
+            // routing outputs, so a model-free kernel regression can use it.
+            const auto separator = bad->key.find('_');
+            const auto prefix = bad->key.starts_with("layer") && separator != std::string::npos
+                ? bad->key.substr(0, separator + 1) : bad->key;
+            std::ofstream raw(results / "canonical_generation_first_drift.csv");
+            ASSERT_TRUE(raw.is_open());
+            raw << "runner,key,index,value,hex_bits\n";
+            const auto write_values = [&](const char *label, const auto &snapshots)
+            {
+                for (const auto &[key, values] : snapshots)
+                {
+                    if (!key.starts_with(prefix))
+                        continue;
+                    for (std::size_t i = 0; i < values.size(); ++i)
+                    {
+                        uint32_t bits;
+                        std::memcpy(&bits, &values[i], sizeof(bits));
+                        raw << label << ',' << key << ',' << i << ','
+                            << std::setprecision(9) << values[i] << ','
+                            << std::hex << bits << std::dec << '\n';
+                    }
+                }
+            };
+            write_values("serial", serial_snapshots[serial_output]);
+            write_values("grouped", grouped);
+            ADD_FAILURE() << "first verifier drift at completion index " << serial_output
+                          << ": " << describeMoEDiagnosticRow(*bad);
+            break;
+        }
+        ASSERT_LE(emitted + step.tokens.size(), serial_tokens.size());
+        for (std::size_t i = 0; i < step.tokens.size(); ++i)
+            ASSERT_EQ(step.tokens[i], serial_tokens[emitted + i])
+                << "sample drift at completion index " << emitted + i;
+        emitted += step.tokens.size();
+    }
+    mtp->disableSnapshotCapture();
+    mtp->shutdown();
+    PerfStatsCollector::reset();
+}
+
 TEST(
     Qwen36MTPForwardVerifierOperationEquivalence,
     MoECUDA_M2_FirstProductionTransactionAfterBenchmarkPrompt)
@@ -703,10 +867,15 @@ TEST(
     runMoEResidentSidecarInputEquivalenceCase(VerifierBackend::ROCm);
 }
 
+/** @brief Install standalone-test runtime services before constructing runners. */
 int main(int argc, char **argv)
 {
     int provided = MPI_THREAD_SINGLE;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    // The application normally installs this allocation backend during runtime
+    // initialization. Direct orchestration tests must establish the same domain
+    // before a CPU graph asks its physical authority to materialize workspaces.
+    initCPUBackend(-1);
     ::testing::InitGoogleTest(&argc, argv);
     const int result = RUN_ALL_TESTS();
 

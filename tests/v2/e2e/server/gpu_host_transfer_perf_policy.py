@@ -8,6 +8,8 @@ movement and explicitly declared heterogeneous activation collectives are
 data-plane boundaries, not execution-state mirrors. The shared activation
 channel additionally requires same-rank node-local mapped-region evidence;
 a CPU expert participant necessarily receives the activations it computes.
+Likewise a CPU pipeline tail owns host logits: observing that CPU-owned value
+is not a GPU download merely because an earlier pipeline stage runs on a GPU.
 ROCm additionally permits one
 strictly authenticated scheduler ticket per hosted transaction: 52 bytes for
 dynamic MTP and 60 bytes for homogeneous device-side MoE rebalancing. HIP
@@ -258,6 +260,16 @@ def validate_gpu_host_transfer_policy(
         if name in _UNATTRIBUTED_TRANSFER_AGGREGATES:
             continue
         if not _is_semantic_host_transfer(name):
+            continue
+        device = str(record.get("device", "")).lower()
+        if (name == "host_logits_access" and record.get("domain") == "sampling"
+                and "cpu" in device_kinds
+                and (device == "cpu" or (device.startswith("cpu:") and device[4:].isdigit()))
+                and (record.get("tags") or {}).get("source") in {
+                    "rank_orchestrator_logits", "device_graph_logits"}):
+            # The emitting runtime owner, not the cell's broad backend label,
+            # determines whether this is a D2H boundary. Missing/GPU ownership
+            # remains forbidden, even in a topology containing a CPU tier.
             continue
         if name in _FINAL_RESPONSE_OPERATIONS:
             final_response.add(name)

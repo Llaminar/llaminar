@@ -19,6 +19,7 @@
 #pragma once
 
 #include "../qwen35/Qwen35ParityTestBase.h"
+#include "../MoERouteConditionedReference.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 
 #include <algorithm>
@@ -49,6 +50,27 @@ namespace llaminar2::test::parity::qwen35moe
     {
     protected:
         using Base = Qwen35ConfigDrivenParityTest<Derived>;
+
+        /**
+         * @brief Evaluate Qwen MoE SwiGLU experts independently on the named HF input.
+         * @param prefix Authenticated canonical or branch-qualified checkpoint.
+         * @param expert_ids Union of validated native and HF selected IDs.
+         * @param rows Number of reference input rows.
+         * @param hidden Reference hidden width.
+         * @return CPU FP32 expert bank and HF RMS parameters, independent of backend/format.
+         */
+        MoEIndependentReference independentMoEMTPExpertReference(
+            const std::string &prefix, const std::vector<int> &expert_ids,
+            size_t rows, size_t hidden) override
+        {
+            return loadMoERouteConditionedReference({
+                .model = Base::config_.model_path,
+                .snapshot_directory = Base::config_.snapshot_dir,
+                .artifacts = Base::ensureResultsDir(),
+                .checkpoint_prefix = prefix,
+                .gguf_block = Base::parityLayerCount(),
+            }, expert_ids, rows, hidden);
+        }
 
         /** @return true because every multi-device MoE uses ExpertOverlay. */
         bool requiresUniversalMoEAuthority() const override
@@ -405,12 +427,19 @@ namespace llaminar2::test::parity::qwen35moe
          * bounded sidecar replay rather than a second complete 35B model load.
          * The caller owns node-wide serialization and validates every resulting
          * NPY before comparison.
+         * @param reference_step Main-model position in the authenticated pack.
+         * @param condition_tokens Inputs consumed by recursive MTP1..N rows.
+         * @param condition_token_override Actual MTP0 input when noncanonical.
+         * @return True after the additive FP32 branch is durably generated.
          */
         bool regeneratePyTorchMTPBranchSnapshots(
             int reference_step,
-            const std::vector<int32_t> &condition_tokens) override
+            const std::vector<int32_t> &condition_tokens,
+            std::optional<int32_t> condition_token_override) override
         {
-            if (reference_step < 0 || condition_tokens.empty() ||
+            if (reference_step < 0 ||
+                (condition_tokens.empty() && !condition_token_override) ||
+                (condition_token_override && *condition_token_override < 0) ||
                 condition_tokens.size() >= 15u ||
                 std::any_of(
                     condition_tokens.begin(),
@@ -433,14 +462,19 @@ namespace llaminar2::test::parity::qwen35moe
                     << request_path);
                 return false;
             }
-            request << "{\"" << reference_step << "\": [";
+            request << "{\"" << reference_step << "\": {\"condition_token\": ";
+            if (condition_token_override)
+                request << *condition_token_override;
+            else
+                request << "null";
+            request << ", \"draft_tokens\": [";
             for (size_t index = 0; index < condition_tokens.size(); ++index)
             {
                 if (index != 0u)
                     request << ", ";
                 request << condition_tokens[index];
             }
-            request << "]}\n";
+            request << "]}}\n";
             request.flush();
             if (!request.good())
             {

@@ -5,7 +5,8 @@
  * Dynamic residency must not consume a histogram until both prepared-expert
  * service cost and real transfer cost are measured. This controller joins the
  * bounded startup transfer profile with service telemetry accumulated by
- * ordinary requests, expands only exact manifest-equivalent layer
+ * ordinary requests and independent prepared-kernel measurements for unobserved
+ * classes. It expands only exact manifest-equivalent layer
  * representatives, composes the complete immutable profiles, and installs
  * them into the residency authority. Every operation is maintenance-owned and
  * non-blocking with respect to inference.
@@ -96,6 +97,13 @@ namespace llaminar2
             MoEOverlayMigrationEconomyPolicy economy_policy;
             /** Graph reachability and economy-priced subset for every layer. */
             ExpertHistogramProductionTopology production_topology;
+            /**
+             * Independent bounded setup measurements over exact prepared experts.
+             * Empty while no setup bank is supplied. These are immutable profile
+             * inputs, never imported into device/CPU cumulative service counters.
+             */
+            std::vector<MoEOverlayParticipantLayerServiceTotals>
+                prepared_service_measurements;
             /** Optional all-rank service and attempt evidence lane. */
             std::shared_ptr<IMoEOverlayEconomyEvidenceExchange>
                 evidence_exchange;

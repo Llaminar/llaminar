@@ -1,11 +1,12 @@
 /**
  * @file Test__AttentionComputeStage.cpp
- * @brief Unit tests for AttentionComputeStage compute stage
+ * @brief AttentionComputeStage unit contracts and device-workspace integration proofs.
  * @author David Sanftenberg
  *
  * Tests the new AttentionComputeStage which uses KernelFactory for
- * type-safe attention kernel dispatch. This is part of Phase 9 of
- * the multi-device architecture refactoring.
+ * type-safe attention kernel dispatch. CPU contracts run in Unit; the CUDA and
+ * ROCm workspace cases use physical-device properties and are separately
+ * registered in ProductionParityPreflight. No model weights are needed.
  */
 
 #include <gtest/gtest.h>
@@ -24,6 +25,8 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/utils/DebugEnv.h"
 #include "v2/utils/MPIContext.h"
+#include "kernels/attention/AttentionWorkspaceContract.h"
+#include <omp.h>
 
 #ifdef HAVE_CUDA
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
@@ -104,6 +107,84 @@ namespace
     };
 
     /**
+     * @brief Cover every prefill bucket from one physical-device family BOM.
+     * @param device Backend whose immutable physical properties are queried.
+     * @param mpi_ctx Test-owned tensor allocation context.
+     *
+     * These are pre-binding descriptor queries, not kernel execution. Each
+     * maximum-sized CPU operand supplies the real dtype and tensor capacity;
+     * each stage declares the active rows it would capture. No large device
+     * allocation or model is required to catch intermediate-M scratch peaks.
+     */
+    void expectPrefillWorkspaceFamilyCoverage(DeviceId device, MPIContext &mpi_ctx)
+    {
+        TensorFactory factory(mpi_ctx);
+        std::vector<std::unique_ptr<ITensor>> queries;
+        queries.push_back(factory.createFP32({4096, 24 * 256}, DeviceId::cpu()));
+        queries.push_back(factory.createFP16({4096, 24 * 256}));
+        queries.push_back(factory.createBF16({4096, 24 * 256}));
+        AttentionComputeStage::Params params;
+        params.batch_size = 1;
+        params.seq_len = 4096;
+        params.kv_len = 4096;
+        params.n_heads = 24;
+        params.n_kv_heads = 4;
+        params.head_dim = 256;
+        params.device_id = device;
+        params.mpi_ctx = &mpi_ctx;
+        params.execution_policy.prefill_parallel_axis =
+            attention::AttentionPrefillParallelAxis::GeometrySelected;
+
+        // These kernel dtypes share the workspace ABI even though production
+        // model activation admission currently permits FP32 only.
+        for (const auto &query : queries)
+        {
+            params.Q = query.get();
+            for (const int context : {4096, 16384})
+            {
+                params.kv_len = context;
+                size_t smallest_partial_bytes = 0;
+                for (const int limit : {32, 512, 2048, 4096})
+                {
+                    SCOPED_TRACE(::testing::Message() << device.toString()
+                        << " type=" << query->dtype_name()
+                        << " context=" << context << " admitted_M=" << limit);
+                    params.seq_len = limit;
+                    AttentionComputeStage largest(params);
+                    const auto family = largest.getWorkspaceRequirements(1, 24, 256);
+                    const auto *partials = family.find("attn_partial_output");
+                    ASSERT_NE(partials, nullptr);
+                    if (limit == 32)
+                        smallest_partial_bytes = partials->size_bytes;
+                    if (limit == 4096)
+                    {
+                        // Identical KV capacity does not imply identical query
+                        // capacity. A tiny admitted bucket must not reserve
+                        // summaries for unadmitted, much wider query grids.
+                        EXPECT_LT(smallest_partial_bytes, partials->size_bytes);
+                    }
+                    for (const int rows : {1, 16, 17, 32, 64, 128, 256, 512,
+                                           1024, 1536, 2048, 3072, 4096})
+                    {
+                        if (rows > limit)
+                            continue;
+                        SCOPED_TRACE(::testing::Message() << " M=" << rows);
+                        params.seq_len = rows;
+                        AttentionComputeStage member(params);
+                        const auto required = member.getWorkspaceRequirements(1, 24, 256);
+                        for (const auto &buffer : required.buffers)
+                        {
+                            const auto *published = family.find(buffer.name);
+                            ASSERT_NE(published, nullptr) << buffer.name;
+                            EXPECT_GE(published->size_bytes, buffer.size_bytes) << buffer.name;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * @brief Minimal KV cache stub for attention metadata contract tests.
      *
      * The lightweight fake keeps host-coherence and diagnostic regressions in
@@ -119,6 +200,19 @@ namespace
         int canonical_device_ring_head = 0;
         ActivationPrecision k_precision_value = ActivationPrecision::FP16;
         ActivationPrecision v_precision_value = ActivationPrecision::FP16;
+        std::optional<DeviceReadStorage> prepared_read_storage;
+
+        /**
+         * @brief Return opaque prepared addresses without reading any payload.
+         * @param request Immutable query geometry; the fixture supplies one bank.
+         * @return Declared descriptor, or no storage until the test prepares it.
+         */
+        std::optional<DeviceReadStorage> describeDeviceReadStorage(
+            const DeviceReadStorageRequest &request) const override
+        {
+            (void)request;
+            return prepared_read_storage;
+        }
 
         ActivationPrecision k_precision() const override { return k_precision_value; }
         ActivationPrecision v_precision() const override { return v_precision_value; }
@@ -250,7 +344,7 @@ namespace
      *
      * The policy replaces three independently mutable stage fields. These
      * constructor checks make it impossible for a manually assembled CPU stage,
-     * cacheless GPU stage, or projection-reading GPU stage to claim that a later
+     * cacheless GPU stage to claim that a later
      * operation will transform K.
      */
     TEST_F(Test__AttentionComputeStage, PreRotaryKeyCachePolicyRequiresCacheBackedGPUReader)
@@ -264,7 +358,6 @@ namespace
             .partial_rotary_factor = 1.0f,
         };
         params.kv_cache = &cache;
-        params.read_kv_from_cache = true;
 
         params.device_id = DeviceId::cpu();
         EXPECT_THROW(
@@ -278,12 +371,8 @@ namespace
             std::invalid_argument);
 
         params.kv_cache = &cache;
-        params.read_kv_from_cache = false;
-        EXPECT_THROW(
-            { AttentionComputeStage stage(params); },
-            std::invalid_argument);
+        EXPECT_NO_THROW({ AttentionComputeStage stage(params); });
 
-        params.read_kv_from_cache = true;
         params.execution_policy.key_cache.partial_rotary_factor = 0.0f;
         EXPECT_THROW(
             { AttentionComputeStage stage(params); },
@@ -339,8 +428,8 @@ namespace
      * GPU work: the thread-local capture guard and counting cache fake prove
      * that capture-time metadata neither observes host state nor substitutes
      * the declarative projection tensor for an unresolved production cache
-     * view. GPU execution state remains device-owned outside capture as well;
-     * only a CPU stage may enter the host-visible cache descriptor path.
+     * view. Complete immutable descriptors must be prepared before capture;
+     * missing storage and address changes fail without consulting host state.
      */
     TEST_F(Test__AttentionComputeStage, GPUDumpInfoNeverQueriesHostKVState)
     {
@@ -365,7 +454,6 @@ namespace
         auto output = factory.createFP32({seq_len, q_cols}, device_id_);
 
         AttentionComputeStage::Params params;
-        params.device_id = DeviceId::cuda(0);
         params.Q = Q.get();
         params.K = K.get();
         params.V = V.get();
@@ -378,29 +466,54 @@ namespace
         params.head_dim = head_dim;
         params.kv_cache = &kv_cache;
         params.layer_idx = 0;
-        params.read_kv_from_cache = true;
-        AttentionComputeStage stage(params);
-
+        // These host words are opaque identity sentinels, never GPU payloads.
+        // Wrapping them as metadata must not allocate, copy or access a device.
+        uint16_t opaque_key = 0;
+        uint16_t opaque_value = 0;
+        uint16_t changed_key = 0;
+        for (DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
         {
-            GraphCaptureGuard capture;
-            const StageDumpInfo captured_info = stage.buildDumpInfoImpl();
-            EXPECT_FALSE(captured_info.inputs.empty());
-            const auto effective_k = std::find_if(
-                captured_info.outputs.begin(),
-                captured_info.outputs.end(),
-                [](const StageDumpInfo::OutputBuffer &candidate)
-                {
-                    return candidate.name && std::string(candidate.name) == "effective_k";
-                });
-            EXPECT_EQ(effective_k, captured_info.outputs.end())
-                << "Unexecuted GPU attention must not label its FP32 projection buffer as the effective cache view";
-        }
-        EXPECT_EQ(kv_cache.cached_token_queries, 0)
-            << "graph recording must not cross to host KV sequence state";
+            SCOPED_TRACE(device.toString());
+            params.device_id = device;
+            kv_cache.prepared_read_storage.reset();
+            AttentionComputeStage stage(params);
+            EXPECT_THROW(stage.buildDumpInfoImpl(), std::runtime_error)
+                << "A missing read descriptor must not silently omit outputs";
+            kv_cache.prepared_read_storage = IKVCache::DeviceReadStorage{
+                &opaque_key, &opaque_value, physical_kv_rows, kv_cols,
+                TensorType::FP16, device};
+            {
+                GraphCaptureGuard capture;
+                EXPECT_THROW(stage.buildDumpInfoImpl(), std::runtime_error)
+                    << "Descriptor construction must precede graph recording";
+            }
 
-        (void)stage.buildDumpInfoImpl();
-        EXPECT_EQ(kv_cache.cached_token_queries, 0)
-            << "GPU diagnostics must not query host KV sequence state outside capture either";
+            const auto prepared = stage.buildDumpInfoImpl();
+            ASSERT_EQ(prepared.outputs.size(), 5u);
+            {
+                GraphCaptureGuard capture;
+                const StageDumpInfo captured = stage.buildDumpInfoImpl();
+                ASSERT_EQ(captured.outputs.size(), prepared.outputs.size());
+                const auto &effective_k = captured.outputs[1];
+                const auto &effective_v = captured.outputs[2];
+                EXPECT_STREQ(effective_k.name, "effective_k");
+                EXPECT_STREQ(effective_v.name, "effective_v");
+                EXPECT_STREQ(effective_k.dtype, "FP16");
+                EXPECT_EQ(effective_k.rows, physical_kv_rows);
+                EXPECT_EQ(effective_k.cols, kv_cols);
+                ASSERT_NE(effective_k.tensor, nullptr);
+                ASSERT_NE(effective_v.tensor, nullptr);
+                EXPECT_NE(effective_k.tensor, K.get());
+                EXPECT_NE(effective_v.tensor, V.get());
+                EXPECT_EQ(effective_k.tensor->gpu_data_ptr(), &opaque_key);
+                EXPECT_EQ(effective_v.tensor->gpu_data_ptr(), &opaque_value);
+            }
+            kv_cache.prepared_read_storage->key = &changed_key;
+            EXPECT_THROW(stage.buildDumpInfoImpl(), std::runtime_error)
+                << "An admitted pointer must not silently follow new storage";
+            EXPECT_EQ(kv_cache.cached_token_queries, 0)
+                << "Neither preparation nor recording may query host KV state";
+        }
     }
 
     /**
@@ -779,17 +892,90 @@ namespace
         EXPECT_EQ(stage->type(), ComputeStageType::ATTENTION);
     }
 
+    /**
+     * @brief Local attention geometry must win over smaller and larger hints.
+     *
+     * A two-rank Qwen2 graph executes seven of fourteen Q heads per rank.
+     * Taking max(global hint, local heads) inflated its runtime scratch beyond
+     * the correctly admitted local BOM. Sweep TP degrees and worker counts:
+     * CPU split cardinality depends on both, including non-divisible teams.
+     * No kernel is launched and no GPU or model is required.
+     */
+    TEST_F(Test__AttentionComputeStage, CPUWorkspaceUsesExactParticipantGeometry)
+    {
+        /** Restore caller OpenMP policy even when an assertion exits early. */
+        struct ThreadPolicyScope
+        {
+            int original = omp_get_max_threads();
+            /** Restore the process test thread's inherited worker budget. */
+            ~ThreadPolicyScope() { omp_set_num_threads(original); }
+        } thread_policy;
+        TensorFactory factory(mpi_ctx_);
+        constexpr int global_heads = 14;
+        constexpr int head_dim = 64;
+        for (const int workers : {1, 3, 7, 28, 56})
+        {
+            omp_set_num_threads(workers);
+            for (int tp = 1; tp <= 8; ++tp)
+            {
+                const int local_heads = (global_heads + tp - 1) / tp;
+                auto Q = factory.createFP32(
+                    {1u, static_cast<size_t>(local_heads * head_dim)}, device_id_);
+                AttentionComputeStage::Params params;
+                params.device_id = device_id_;
+                params.Q = Q.get();
+                params.n_heads = local_heads;
+                params.n_kv_heads = 1;
+                params.head_dim = head_dim;
+                params.batch_size = 1;
+                AttentionComputeStage stage(params);
+                const auto expected = attention_workspace::cpuParallelRequirements({
+                    .compact_query_rows = attention::kMaxGroupedVerifierAttentionRows,
+                    .local_query_heads = local_heads,
+                    .head_dim = head_dim,
+                    .worker_count = workers,
+                });
+                for (const int rows : {1, 9, 16, 512})
+                {
+                    for (const int hinted_heads : {0, local_heads / 2, global_heads})
+                    {
+                        SCOPED_TRACE(::testing::Message()
+                                     << "workers=" << workers << " tp=" << tp
+                                     << " rows=" << rows << " hinted_heads=" << hinted_heads);
+                        const auto actual = stage.getWorkspaceRequirements(
+                            rows, hinted_heads, head_dim);
+                        ASSERT_EQ(actual.buffers.size(), expected.buffers.size());
+                        for (const auto &buffer : expected.buffers)
+                        {
+                            const auto *found = actual.find(buffer.name);
+                            ASSERT_NE(found, nullptr);
+                            EXPECT_EQ(found->size_bytes, buffer.size_bytes);
+                        }
+                        EXPECT_EQ(actual.total_bytes_with_alignment(),
+                                  expected.total_bytes_with_alignment());
+                    }
+                }
+                // Generic tensor-width hints are not attention head dimensions.
+                EXPECT_EQ(stage.getWorkspaceRequirements(1, global_heads, global_heads * head_dim)
+                              .total_bytes_with_alignment(),
+                          expected.total_bytes_with_alignment());
+            }
+        }
+    }
+
 #ifdef HAVE_ROCM
     TEST_F(Test__AttentionComputeStage, ROCmWorkspaceRequirementsCoverStageShapeAndGroupedVerifierRows)
     {
+        expectPrefillWorkspaceFamilyCoverage(DeviceId::rocm(0), mpi_ctx_);
         TensorFactory factory(mpi_ctx_);
 
         /*
          * Regressions for Qwen3.5 MoE long-context MTP: graph-level hints can
          * describe eight heads while this stage executes sixteen, and the same
          * one-request graph later executes up to four verifier rows.  Split
-         * decode scratch must cover both maxima.  This test only asks for pure
-         * workspace descriptors; it never initializes or executes a GPU.
+         * decode scratch must cover both maxima. The production descriptor
+         * planner queries physical-device properties, so this is a model-free
+         * Integration proof even though it does not launch attention kernels.
          */
         constexpr int seq_len = 1;
         constexpr int kv_len = 513;
@@ -862,12 +1048,24 @@ namespace
         EXPECT_GT(partial_output->size_bytes, old_underallocated_partial_output)
             << "Attention workspace must cover both the stage's real head count "
                "and the maximum grouped verifier row span";
+
+        // An unrelated global-model hint must not enlarge this local member.
+        const auto oversized_hint = stage.getWorkspaceRequirements(
+            seq_len, stage_heads * 8, head_dim * 8);
+        ASSERT_EQ(oversized_hint.buffers.size(), reqs.buffers.size());
+        for (const auto &buffer : reqs.buffers)
+        {
+            const auto *found = oversized_hint.find(buffer.name);
+            ASSERT_NE(found, nullptr);
+            EXPECT_EQ(found->size_bytes, buffer.size_bytes);
+        }
     }
 #endif
 
 #ifdef HAVE_CUDA
     TEST_F(Test__AttentionComputeStage, CUDAWorkspaceRequirementsCoverStageShapeAndGroupedVerifierRows)
     {
+        expectPrefillWorkspaceFamilyCoverage(DeviceId::cuda(0), mpi_ctx_);
         TensorFactory factory(mpi_ctx_);
 
         /*
@@ -939,6 +1137,17 @@ namespace
         EXPECT_GE(partial_output->size_bytes, expected_partial_output);
         EXPECT_GE(partial_m->size_bytes, expected_partial_meta);
         EXPECT_GE(partial_l->size_bytes, expected_partial_meta);
+
+        // Mirror the local-geometry ownership proof on the CUDA backend.
+        const auto oversized_hint = stage.getWorkspaceRequirements(
+            seq_len, stage_heads * 8, head_dim * 8);
+        ASSERT_EQ(oversized_hint.buffers.size(), reqs.buffers.size());
+        for (const auto &buffer : reqs.buffers)
+        {
+            const auto *found = oversized_hint.find(buffer.name);
+            ASSERT_NE(found, nullptr);
+            EXPECT_EQ(found->size_bytes, buffer.size_bytes);
+        }
     }
 #endif
 

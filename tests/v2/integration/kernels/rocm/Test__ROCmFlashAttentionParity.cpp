@@ -3407,7 +3407,6 @@ void Test__ROCmFlashAttentionParity::runAttentionStageFP16CacheQwen36RoPEOnReadR
     params.auto_detect_mode = true;
     params.kv_cache = kv_cache.get();
     params.layer_idx = 0;
-    params.read_kv_from_cache = true;
     params.execution_policy.key_cache = {
         .encoding = attention::AttentionKeyCacheEncoding::
             PreRotaryDeviceTransform,
@@ -3723,7 +3722,6 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     attn_params.auto_detect_mode = true;
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
-    attn_params.read_kv_from_cache = true;
     attn_params.execution_policy.key_cache = {
         .encoding = attention::AttentionKeyCacheEncoding::
             PreRotaryDeviceTransform,
@@ -5319,7 +5317,6 @@ void Test__ROCmFlashAttentionParity::runCapturedRequestBatchCacheParity(
         params.auto_detect_mode = true;
         params.kv_cache = cache.get();
         params.layer_idx = 0;
-        params.read_kv_from_cache = true;
         params.turboquant_ctx = rotation.get();
         params.execution_policy.key_cache = {
             .encoding = attention::AttentionKeyCacheEncoding::PreRotaryDeviceTransform,

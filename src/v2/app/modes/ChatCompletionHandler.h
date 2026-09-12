@@ -7,6 +7,11 @@
  *
  * Supports both non-streaming and SSE streaming responses with
  * reasoning_content extraction for thinking models.
+ * Non-streaming callers may request exact prompt/completion token IDs. These
+ * are observations of ordinary committed runner output, not model snapshots
+ * or a separate inference path, and remain independent of text framing.
+ * Optional runtime JSON also projects the placement owner's completed,
+ * model-lifetime movement ledger without polling or joining maintenance.
  */
 
 #pragma once
@@ -49,6 +54,21 @@ namespace llaminar2
         bool dry_sequence_breakers{false};
     };
 
+    /** @brief Optional response representation; never changes sampling or execution. */
+    enum class CompletionTokenOutput
+    {
+        TextOnly,       ///< Standard HTTP response with no token-vector storage.
+        TextAndIds,     ///< Non-streaming terminal response includes exact token IDs.
+    };
+
+    /** @brief Optional completed-request observations; never a live-state probe. */
+    enum class CompletionRuntimeOutput
+    {
+        Omit,    ///< Standard response; no runtime-summary JSON.
+        Include, ///< Non-streaming response includes terminal summary and passive lifetime movement evidence.
+    };
+
+    /** @brief Validated immutable request policy consumed by the serving handler. */
     struct ChatCompletionRequest
     {
         std::vector<ChatMessage> messages;
@@ -58,6 +78,10 @@ namespace llaminar2
         SamplingParams sampling;
         SamplingOverrides sampling_set;  ///< Per-field "user specified" flags
         bool stream{false};         ///< If true, use SSE streaming response
+        CompletionTokenOutput token_output{CompletionTokenOutput::TextOnly};
+                                   ///< Requested terminal representation, independent of model state.
+        CompletionRuntimeOutput runtime_output{CompletionRuntimeOutput::Omit};
+                                   ///< Optional immutable outcome, independent of logging/PerfStats.
         bool enable_thinking{true}; ///< If true, enable thinking mode for thinking models
         std::string model;          ///< Model identifier from request (optional)
 

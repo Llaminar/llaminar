@@ -6,10 +6,10 @@
  * This file implements the CPURoPEKernelT template specializations for
  * FP32, BF16, FP16, Q8_1, and Q16_1 precision types.
  *
- * Q16_1 supports variable block sizes (32, 64, 128, 192) via templated dispatch.
+ * Q16_1 supports variable block sizes (32, 64, 128) via templated dispatch.
  *
- * Implementation mirrors CPURoPEKernelT - uses existing primitives with n_past
- * and handles position_ids at the kernel level.
+ * Explicit position IDs and implicit (offset + row) positions share the same
+ * absolute-angle primitives. No path materializes a depth-limited position array.
  */
 
 #include "CPURoPEKernelT.h"
@@ -125,7 +125,8 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         int device_idx,
-        int rotary_dim)
+        int rotary_dim,
+        int pos_offset)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -151,7 +152,7 @@ namespace llaminar2
 
         // Check for contiguous positions to enable optimized block processing
         bool contiguous = true;
-        int start_pos = 0;
+        int start_pos = pos_offset;
 
         if (position_ids)
         {
@@ -199,7 +200,7 @@ namespace llaminar2
         // Fall back to per-token processing for non-contiguous positions
         for (int tok = 0; tok < seq_len; ++tok)
         {
-            int position = position_ids ? position_ids[tok] : tok;
+            int position = position_ids ? position_ids[tok] : pos_offset + tok;
 
             // Skip RoPE for padding tokens (position_id = -1)
             if (position < 0)
@@ -248,7 +249,8 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         int device_idx,
-        int rotary_dim)
+        int rotary_dim,
+        int pos_offset)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -274,7 +276,7 @@ namespace llaminar2
 
         // Check for contiguous positions to enable optimized block processing
         bool contiguous = true;
-        int start_pos = 0;
+        int start_pos = pos_offset;
 
         if (position_ids)
         {
@@ -307,7 +309,7 @@ namespace llaminar2
         // Fall back to per-token processing for non-contiguous positions
         for (int tok = 0; tok < seq_len; ++tok)
         {
-            int position = position_ids ? position_ids[tok] : tok;
+            int position = position_ids ? position_ids[tok] : pos_offset + tok;
 
             // Skip RoPE for padding tokens (position_id = -1)
             if (position < 0)
@@ -344,7 +346,8 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         int device_idx,
-        int rotary_dim)
+        int rotary_dim,
+        int pos_offset)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -370,7 +373,7 @@ namespace llaminar2
 
         // Check for contiguous positions to enable optimized block processing
         bool contiguous = true;
-        int start_pos = 0;
+        int start_pos = pos_offset;
 
         if (position_ids)
         {
@@ -403,7 +406,7 @@ namespace llaminar2
         // Fall back to per-token processing for non-contiguous positions
         for (int tok = 0; tok < seq_len; ++tok)
         {
-            int position = position_ids ? position_ids[tok] : tok;
+            int position = position_ids ? position_ids[tok] : pos_offset + tok;
 
             // Skip RoPE for padding tokens (position_id = -1)
             if (position < 0)
@@ -440,7 +443,8 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         int device_idx,
-        int rotary_dim)
+        int rotary_dim,
+        int pos_offset)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -466,7 +470,7 @@ namespace llaminar2
             n_heads, n_kv_heads,
             head_dim,
             rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr);
+            (seq_len == 1) ? &tls_state_ : nullptr, pos_offset);
 
         return true;
     }
@@ -511,7 +515,6 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
-        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::FP32)
         {
@@ -534,7 +537,7 @@ namespace llaminar2
         return apply_typed(
             q_fp32->mutable_data(),
             k_fp32 ? k_fp32->mutable_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim, pos_offset);
     }
 
     bool CPURoPEKernelT<ActivationPrecision::FP32>::apply_verifier_rows_decode_equivalent(
@@ -624,7 +627,6 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
-        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::BF16)
         {
@@ -647,7 +649,7 @@ namespace llaminar2
         return apply_typed(
             q_bf16->mutable_typed_data(),
             k_bf16 ? k_bf16->mutable_typed_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim, pos_offset);
     }
 
     bool CPURoPEKernelT<ActivationPrecision::BF16>::apply_verifier_rows_decode_equivalent(
@@ -725,7 +727,6 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
-        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::FP16)
         {
@@ -748,7 +749,7 @@ namespace llaminar2
         return apply_typed(
             q_fp16->mutable_typed_data(),
             k_fp16 ? k_fp16->mutable_typed_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim, pos_offset);
     }
 
     bool CPURoPEKernelT<ActivationPrecision::FP16>::apply_verifier_rows_decode_equivalent(
@@ -829,7 +830,6 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
-        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::Q8_1)
         {
@@ -852,7 +852,7 @@ namespace llaminar2
         return apply_typed(
             q_q8->mutable_typed_data(),
             k_q8 ? k_q8->mutable_typed_data() : nullptr,
-            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+            position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim, pos_offset);
     }
 
     bool CPURoPEKernelT<ActivationPrecision::Q8_1>::apply_verifier_rows_decode_equivalent(
@@ -1310,7 +1310,8 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         int device_idx,
-        int rotary_dim)
+        int rotary_dim,
+        int pos_offset)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -1336,7 +1337,7 @@ namespace llaminar2
             n_heads, n_kv_heads,
             head_dim,
             rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr);
+            (seq_len == 1) ? &tls_state_ : nullptr, pos_offset);
 
         return true;
     }
@@ -1353,7 +1354,8 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         int device_idx,
-        int rotary_dim)
+        int rotary_dim,
+        int pos_offset)
     {
         (void)device_idx; // Unused for CPU kernel
 
@@ -1381,18 +1383,18 @@ namespace llaminar2
             n_heads, n_kv_heads,
             head_dim,
             rope_theta,
-            (seq_len == 1) ? &tls_state_ : nullptr);
+            (seq_len == 1) ? &tls_state_ : nullptr, pos_offset);
 
         return true;
     }
 
     // Explicit template instantiations for all block sizes
     template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block>(
-        Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, int, int);
+        Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, int, int, int);
     template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block_64>(
-        Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, int, int);
+        Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, int, int, int);
     template bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_typed_block<Q16_1Block_128>(
-        Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, int, int);
+        Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, int, int, int);
 
     // --- Q16_1 apply_q16_1() ---
     bool CPURoPEKernelT<ActivationPrecision::Q16_1>::apply_q16_1(
@@ -1424,7 +1426,6 @@ namespace llaminar2
     {
         KERNEL_PROFILE_SCOPE(KernelType::ROPE);
         (void)mpi_ctx;
-        (void)pos_offset; // CPU kernel doesn't need this optimization
 
         if (!Q || Q->native_type() != TensorType::Q16_1)
         {
@@ -1462,19 +1463,19 @@ namespace llaminar2
             return apply_typed_block<Q16_1Block>(
                 static_cast<Q16_1Block *>(q_raw),
                 static_cast<Q16_1Block *>(k_raw),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim, pos_offset);
 
         case Q16BlockSize::BLOCK_64:
             return apply_typed_block<Q16_1Block_64>(
                 static_cast<Q16_1Block_64 *>(q_raw),
                 static_cast<Q16_1Block_64 *>(k_raw),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim, pos_offset);
 
         case Q16BlockSize::BLOCK_128:
             return apply_typed_block<Q16_1Block_128>(
                 static_cast<Q16_1Block_128 *>(q_raw),
                 static_cast<Q16_1Block_128 *>(k_raw),
-                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim);
+                position_ids, seq_len, n_heads, n_kv_heads, head_dim, rope_theta, device_idx, rotary_dim, pos_offset);
 
         default:
             LOG_ERROR("CPURoPEKernelT<Q16_1>::apply_tensor: Unknown block size");
@@ -1514,15 +1515,8 @@ namespace llaminar2
             return false;
         }
 
-        std::array<int, 4> contiguous_positions{};
-        const int *effective_positions = position_ids;
-        if (!effective_positions)
-        {
-            for (int row = 0; row < verifier_rows; ++row)
-                contiguous_positions[static_cast<size_t>(row)] = pos_offset + row;
-            effective_positions = contiguous_positions.data();
-        }
-
+        // Carry the scalar offset into the primitive. Runtime depth never needs
+        // a stack array, allocation, or serial-row replay to express positions.
         void *q_raw = q_q16->raw_mutable_data();
         void *k_raw = k_q16 ? k_q16->raw_mutable_data() : nullptr;
         bool success = false;
@@ -1532,25 +1526,25 @@ namespace llaminar2
             success = apply_typed_block<Q16_1Block>(
                 static_cast<Q16_1Block *>(q_raw),
                 static_cast<Q16_1Block *>(k_raw),
-                effective_positions, verifier_rows,
+                position_ids, verifier_rows,
                 n_heads, n_kv_heads, head_dim,
-                rope_theta, device_idx, rotary_dim);
+                rope_theta, device_idx, rotary_dim, pos_offset);
             break;
         case Q16BlockSize::BLOCK_64:
             success = apply_typed_block<Q16_1Block_64>(
                 static_cast<Q16_1Block_64 *>(q_raw),
                 static_cast<Q16_1Block_64 *>(k_raw),
-                effective_positions, verifier_rows,
+                position_ids, verifier_rows,
                 n_heads, n_kv_heads, head_dim,
-                rope_theta, device_idx, rotary_dim);
+                rope_theta, device_idx, rotary_dim, pos_offset);
             break;
         case Q16BlockSize::BLOCK_128:
             success = apply_typed_block<Q16_1Block_128>(
                 static_cast<Q16_1Block_128 *>(q_raw),
                 static_cast<Q16_1Block_128 *>(k_raw),
-                effective_positions, verifier_rows,
+                position_ids, verifier_rows,
                 n_heads, n_kv_heads, head_dim,
-                rope_theta, device_idx, rotary_dim);
+                rope_theta, device_idx, rotary_dim, pos_offset);
             break;
         default:
             LOG_ERROR("CPURoPEKernelT<Q16_1> grouped verifier encountered an unknown block size");

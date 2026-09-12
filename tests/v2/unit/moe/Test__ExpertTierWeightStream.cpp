@@ -1,6 +1,10 @@
 /**
  * @file Test__ExpertTierWeightStream.cpp
  * @brief Device-free proof of the heterogeneous expert-weight stream ABI.
+ *
+ * Exercise source provenance, bounded receive/publication state and exact
+ * layout transformations independently of backend launchers. Native grid
+ * scales/minima must survive conversion, not merely a lossy round trip.
  */
 
 #include "execution/moe/ExpertTierWeightStream.h"
@@ -106,6 +110,45 @@ namespace llaminar2
                 }
             }
             return projection;
+        }
+
+        TEST(ExpertTierWeightStream, SingleScaleNativeGridsExpandWithoutRequantization)
+        {
+            for (const uint8_t codebook : {11, 12, 15, 16})
+            {
+                SCOPED_TRACE(static_cast<int>(codebook));
+                const auto *format = native_vnni_formats::forSourceIdentity(codebook, true);
+                ASSERT_NE(format, nullptr);
+                auto original = makeProjection(codebook, format->payload_bytes,
+                                               format->is_asymmetric, true);
+                // Metadata identity includes signed zero and tiny scales:
+                // no absmax threshold may silently zero out a native block.
+                const std::array<uint16_t, 6> scale_bits{0, 0x8000, 1, 0x03ff, 0x0400, 0x8400};
+                for (size_t index = 0; index < original.scales.size(); ++index)
+                    original.scales[index] = scale_bits[index % scale_bits.size()];
+                cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
+                std::string error;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(original, cpu, &error)) << error;
+                HostGpuExpertPackedProjection expanded;
+                ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, expanded, &error)) << error;
+                EXPECT_EQ(expanded.source_codebook_id, codebook);
+                EXPECT_EQ(expanded.scales, original.scales);
+                EXPECT_EQ(expanded.mins, original.mins);
+                ASSERT_EQ(expanded.payload_bytes_per_block, 32);
+                for (size_t index = 0; index < original.scales.size(); ++index)
+                {
+                    std::array<int8_t, 32> values{};
+                    cpu::native_vnni::decode_native_block(codebook,
+                        original.payload.data() + index * format->payload_bytes, values.data());
+                    EXPECT_EQ(std::memcmp(values.data(), expanded.payload.data() + index * 32,
+                                          values.size()), 0);
+                }
+                cpu::native_vnni::CPUNativeVNNIPackedWeights returned;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(expanded, returned, &error)) << error;
+                ASSERT_EQ(returned.native_interleaved.size(), cpu.native_interleaved.size());
+                EXPECT_EQ(std::memcmp(returned.native_interleaved.data(),
+                    cpu.native_interleaved.data(), cpu.native_interleaved.size()), 0);
+            }
         }
 
         /** @brief Device-free GEMM exporting a caller-owned GPU descriptor. */
@@ -396,6 +439,30 @@ namespace llaminar2
                     canonicalDeviceVnniCodebookId(
                         entry.metadata->codebook_id))
                     << entry.quant_type;
+            }
+        }
+
+        TEST(ExpertTierWeightStream, MultiScaleSourcesRejectLegacyLossyExpandedLayouts)
+        {
+            for (const auto &entry : native_vnni_formats::kAllSourceFormats)
+            {
+                const auto id = entry.metadata->codebook_id;
+                if (id != 8 && !hasCompactMultiScaleVnniPayload(id))
+                    continue;
+                SCOPED_TRACE(std::string(entry.quant_type));
+                auto layout = makeGpuToCpuExpertTierWeightStreamManifest(
+                    *entry.metadata, 70, 256, 101, 3, 7,
+                    ExpertTierWeightProjection::Gate, 4).deviceLayout();
+                ASSERT_TRUE(layout.valid());
+                layout.cpu_encoding = cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8;
+                layout.cpu_data_stride = cpu::native_vnni::preparedDataStride(layout.cpu_encoding);
+                layout.cpu_block_stride = cpu::native_vnni::preparedInterleavedBlockStride(layout.cpu_encoding, true);
+                layout.gpu_codebook_id = kNativeVnniExpandedInt8MinCodebook;
+                layout.gpu_payload_bytes_per_block = 32;
+                layout.gpu_has_emins = 0;
+                EXPECT_FALSE(layout.valid());
+                layout.direction = ExpertTierWeightConversionDirection::CpuToGpu;
+                EXPECT_FALSE(layout.valid());
             }
         }
 
@@ -828,7 +895,7 @@ namespace llaminar2
             EXPECT_TRUE(canonical.gpu_packed.has_emins);
 
             MoEOverlayPreparedWeightSource normalized;
-            ASSERT_TRUE(resolveMoEOverlayPreparedWeightSource(
+            ASSERT_FALSE(resolveMoEOverlayPreparedWeightSource(
                 std::make_shared<ExportingGpuGemm>(
                     make_descriptor(kNativeVnniExpandedInt8MinCodebook),
                     q2_source),
@@ -836,9 +903,8 @@ namespace llaminar2
                 normalized,
                 &error))
                 << error;
-            EXPECT_EQ(normalized.gpu_packed.payload_bytes_per_block, 32u);
-            EXPECT_TRUE(normalized.gpu_packed.is_asymmetric);
-            EXPECT_FALSE(normalized.gpu_packed.has_emins);
+            // A one-scale INT8 descriptor cannot preserve Q2_K's independent
+            // scales and minima, even if its backing allocation is large enough.
 
             MoEOverlayPreparedWeightSource rejected;
             EXPECT_FALSE(resolveMoEOverlayPreparedWeightSource(

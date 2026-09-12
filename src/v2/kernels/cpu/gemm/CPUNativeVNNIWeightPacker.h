@@ -79,6 +79,8 @@ namespace llaminar2::cpu::native_vnni
             return CPUNativeVNNIEncoding::NibbleLUT;
         if (codebook_id == 8)
             return CPUNativeVNNIEncoding::Q6KNativeDualScale;
+        if (hasCompactMultiScaleVnniPayload(codebook_id))
+            return CPUNativeVNNIEncoding::CompactMultiScale;
         return CPUNativeVNNIEncoding::ExpandedInt8;
     }
 
@@ -246,6 +248,12 @@ namespace llaminar2::cpu::native_vnni
             return encoding == CPUNativeVNNIEncoding::Q6KNativeDualScale;
         }
 
+        /** @brief Whether native payload and all multi-scale metadata are retained. */
+        [[nodiscard]] bool usesCompactMultiScale() const noexcept
+        {
+            return encoding == CPUNativeVNNIEncoding::CompactMultiScale;
+        }
+
         /**
          * @brief Return whether each prepared block carries weight compensation.
          *
@@ -257,7 +265,7 @@ namespace llaminar2::cpu::native_vnni
          */
         [[nodiscard]] bool usesInlineCompensation() const noexcept
         {
-            return !usesQ6KNativeDualScale();
+            return !usesQ6KNativeDualScale() && !usesCompactMultiScale();
         }
 
         /**
@@ -346,6 +354,20 @@ namespace llaminar2::cpu::native_vnni
                 usesInlineCompensation() ? 256u : 128u;
             return reinterpret_cast<const uint16_t *>(
                 interleavedBase() + block_offset + data_stride + metadata_offset);
+        }
+
+        /**
+         * @brief Access the packed pair of Q2_K effective minima per output column.
+         * @param c Output chunk of 64 columns.
+         * @param kb Logical K block.
+         * @return Sixty-four packed FP16 pairs; zero for other compact formats.
+         */
+        inline const uint32_t *chunkEffectiveMins(int c, int kb) const
+        {
+            if (!usesCompactMultiScale())
+                throw std::logic_error("Effective minima require compact multi-scale weights");
+            const size_t offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            return reinterpret_cast<const uint32_t *>(interleavedBase() + offset + data_stride + 256);
         }
 
         /// Payload pointer for N-chunk c, K-block kb (contiguous 64 × payload_bytes)
@@ -477,11 +499,11 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &meta,
         uint8_t *workspace)
     {
-        if (meta.usesQ6KNativeDualScale())
+        if (meta.usesQ6KNativeDualScale() || meta.usesCompactMultiScale())
         {
             throw std::invalid_argument(
-                "Deferred native-block repacking does not own the Q6_K "
-                "superblock context required by the native dual-scale layout");
+                "Deferred native-block repacking does not own the source "
+                "superblock context required by native multi-scale layouts");
         }
         const int N = meta.N;
         const int bpr = meta.blocks_per_row;
@@ -747,11 +769,11 @@ namespace llaminar2::cpu::native_vnni
      *
      * This pass owns one `(64 output columns, up to eight K blocks)` tile per
      * OpenMP iteration.  A tile reads every source block once and writes every
-     * byte of its disjoint final destination.  Group bytes, compensation,
-     * FP16 scales, and optional FP16 minima retain exactly the same arithmetic
-     * and byte order as the former two-pass implementation.  Eight-block tiles
-     * preserve the format-specific superblock decoder, so K-quant and IQuant
-     * codebooks do not regress to eight redundant header decodes.
+     * byte of its disjoint final destination. Single-scale native payloads
+     * retain their exact integer grids and FP16 scale/minimum metadata; they
+     * must not pass through the lossy Q8 normalization helpers. Other formats
+     * use the source's complete superblock decoder. Both paths write the same
+     * interleaved execution layout without matrix-sized temporary arrays.
      *
      * @param unpackable Source-codebook decode authority.
      * @param out Fully initialized Expanded-INT8 layout metadata and final
@@ -818,7 +840,42 @@ namespace llaminar2::cpu::native_vnni
                     {
                         const int source_row =
                             row_start + chunk * kColumnsPerChunk + column;
-                        if (use_superblock &&
+                        if (is_payload_decodable(out.codebook_id))
+                        {
+                            // Read the same native block contract as GPU
+                            // preparation. IQuant grids already fit signed
+                            // bytes; an absmax/Q8 pass would change the weights.
+                            // One bounded stack tile keeps preparation streaming
+                            // without a matrix-sized separated shadow.
+                            alignas(64) uint8_t native_payload[kBlocksPerTile * 32]{};
+                            uint16_t native_scales[kBlocksPerTile]{};
+                            uint16_t native_mins[kBlocksPerTile]{};
+                            VnniPackContext context{
+                                .raw_bytes = nullptr,
+                                .N = 1,
+                                .K = out.K,
+                                .blocks_per_row = blocks_per_row,
+                                .payload_bytes = out.payload_bytes,
+                                .payload_array = native_payload,
+                                .scales_array = native_scales,
+                                .mins_array = native_mins,
+                                .emins_array = nullptr,
+                                .destination_block_origin = first_kb,
+                                .destination_block_count = block_count,
+                            };
+                            for (int local_kb = 0; local_kb < block_count; ++local_kb)
+                            {
+                                unpackable.packVnniBlock(
+                                    context, source_row, 0, first_kb + local_kb);
+                                decode_native_block(
+                                    out.codebook_id,
+                                    native_payload + local_kb * out.payload_bytes,
+                                    decoded + local_kb * kValuesPerBlock);
+                                scales[local_kb] = fp16_to_fp32(native_scales[local_kb]);
+                                mins[local_kb] = fp16_to_fp32(native_mins[local_kb]);
+                            }
+                        }
+                        else if (use_superblock &&
                             block_count == kBlocksPerTile)
                         {
                             // One call decodes the source header and all eight
@@ -1011,18 +1068,7 @@ namespace llaminar2::cpu::native_vnni
         out.encoding = preparedEncodingForCodebook(
             fmt->codebook_id, use_rotated_path);
 
-        switch (out.encoding)
-        {
-        case CPUNativeVNNIEncoding::NibbleLUT:
-            out.data_stride = 1024;
-            break;
-        case CPUNativeVNNIEncoding::ExpandedInt8:
-            out.data_stride = 2048;
-            break;
-        case CPUNativeVNNIEncoding::Q6KNativeDualScale:
-            out.data_stride = 1536;
-            break;
-        }
+        out.data_stride = preparedDataStride(out.encoding);
         out.interleaved_block_stride = preparedInterleavedBlockStride(
             out.encoding, out.is_asymmetric);
 
@@ -1034,6 +1080,45 @@ namespace llaminar2::cpu::native_vnni
         std::vector<uint16_t> temp_mins;
 
         bool use_superblock = (unpackable->superblock_size() == 256);
+
+        if (out.usesCompactMultiScale())
+        {
+            // Each worker owns complete final units. Native preparation writes a
+            // bounded one-block stack window, then only the storage order changes.
+            // No dequantize/requantize edge may discard a scale or delta sign.
+            out.native_interleaved = placement.allocate<uint8_t>(
+                static_cast<size_t>(N_chunks) * blocks_per_row * out.interleaved_block_stride);
+#pragma omp parallel for collapse(2) schedule(static)
+            for (int chunk = 0; chunk < N_chunks; ++chunk)
+            {
+                for (int kb = 0; kb < blocks_per_row; ++kb)
+                {
+                    uint8_t *const unit = out.native_interleaved.data() +
+                        (static_cast<size_t>(chunk) * blocks_per_row + kb) * out.interleaved_block_stride;
+                    std::memset(unit, 0, out.interleaved_block_stride);
+                    for (int column = 0; column < std::min(64, N - chunk * 64); ++column)
+                    {
+                        uint8_t payload[16]{};
+                        uint16_t primary = 0, secondary = 0;
+                        uint32_t emins = 0;
+                        const VnniPackContext context{
+                            .raw_bytes = nullptr, .N = 1, .K = K,
+                            .blocks_per_row = blocks_per_row, .payload_bytes = out.payload_bytes,
+                            .payload_array = payload, .scales_array = &primary,
+                            .mins_array = &secondary, .emins_array = &emins,
+                            .destination_block_origin = kb, .destination_block_count = 1,
+                        };
+                        unpackable->packVnniBlock(context, row_start + chunk * 64 + column, 0, kb);
+                        for (int byte = 0; byte < out.payload_bytes; ++byte)
+                            unit[(byte / 4) * 256 + column * 4 + byte % 4] = payload[byte];
+                        std::memcpy(unit + out.data_stride + column * 2, &primary, 2);
+                        std::memcpy(unit + out.data_stride + 128 + column * 2, &secondary, 2);
+                        std::memcpy(unit + out.data_stride + 256 + column * 4, &emins, 4);
+                    }
+                }
+            }
+            return true;
+        }
 
         if (use_rotated_path)
         {

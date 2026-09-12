@@ -123,6 +123,19 @@ namespace llaminar2
             has_emins = false;
             switch (cpu.encoding)
             {
+            case CPUEncoding::CompactMultiScale:
+            {
+                const auto *format = native_vnni_formats::forSourceIdentity(
+                    cpu.codebook_id, cpu.is_superblock);
+                if (!format || !hasCompactMultiScaleVnniPayload(cpu.codebook_id) ||
+                    cpu.payload_bytes != format->payload_bytes || !cpu.is_asymmetric)
+                    return reject(error, "Compact multi-scale CPU stream metadata is invalid");
+                codebook = cpu.codebook_id;
+                payload_bytes = static_cast<uint8_t>(format->payload_bytes);
+                is_asymmetric = true;
+                has_emins = format->has_emins;
+                return true;
+            }
             case CPUEncoding::NibbleLUT:
                 if (!isNibbleCodebook(cpu.codebook_id) ||
                     cpu.payload_bytes != 16)
@@ -148,6 +161,11 @@ namespace llaminar2
                 is_asymmetric = true;
                 return true;
             case CPUEncoding::ExpandedInt8:
+                // A single scale/minimum cannot express these source families.
+                // Reject stale expanded layouts before they can be promoted.
+                if (cpu.codebook_id == 8 ||
+                    hasCompactMultiScaleVnniPayload(cpu.codebook_id))
+                    return reject(error, "Multi-scale CPU sources require their lossless native encoding");
                 // Promotion from CPU retains already-decoded signed values.
                 codebook = cpu.is_asymmetric
                                ? kNativeVnniExpandedInt8MinCodebook
@@ -329,6 +347,11 @@ namespace llaminar2
                 cpu.payload_bytes = 24;
                 cpu.is_asymmetric = true;
                 cpu.is_superblock = true;
+            }
+            else if (hasCompactMultiScaleVnniPayload(gpu.codebook_id))
+            {
+                cpu.encoding = CPUEncoding::CompactMultiScale;
+                cpu.payload_bytes = gpu.payload_bytes_per_block;
             }
             else
             {
@@ -729,15 +752,13 @@ namespace llaminar2
         if (exact_source_representation)
             return true;
 
-        // A CPU promotion may only produce the two explicit normalized INT8
-        // destinations; it may never pretend to reconstruct a compact source.
-        const bool normalized_symmetric =
-            codebook_id == 19 && payload_bytes_per_block == 32 &&
-            !is_asymmetric && !has_emins;
-        const bool normalized_asymmetric =
-            codebook_id == kNativeVnniExpandedInt8MinCodebook &&
-            payload_bytes_per_block == 32 && is_asymmetric && !has_emins;
-        if (normalized_symmetric || normalized_asymmetric)
+        // The same canonical contract sizes recyclable slots and validates
+        // arrivals. In particular, multi-scale sources never normalize to one
+        // scale/minimum: accepting that stale representation would lose math.
+        const auto migrated = migrationStableDeviceVnniFormat(*source_format);
+        if (codebook_id == migrated.codebook_id &&
+            payload_bytes_per_block == migrated.payload_bytes_per_block &&
+            is_asymmetric == migrated.is_asymmetric && has_emins == migrated.has_emins)
             return true;
         return reject(error, "Host GPU endpoint format is inconsistent with source provenance");
     }
@@ -1007,6 +1028,8 @@ namespace llaminar2
         output.scales.resize(block_count);
         if (gpu_asym)
             output.mins.resize(block_count);
+        if (gpu_emins)
+            output.emins.resize(block_count);
 
         // Visit in GPU block-major order so `linear` matches production kernels.
         for (int kb = 0; kb < cpu.blocks_per_row; ++kb)
@@ -1018,6 +1041,20 @@ namespace llaminar2
                 uint8_t *destination =
                     output.payload.data() + linear * payload_bytes;
                 const size_t unit = cpuUnitOffset(cpu, n, kb);
+
+                if (cpu.usesCompactMultiScale())
+                {
+                    // This is a reversible transpose of the original payload,
+                    // not an expanded or requantized migration representation.
+                    for (int byte = 0; byte < payload_bytes; ++byte)
+                        destination[byte] = cpu.native_interleaved[
+                            interleavedValueOffset(cpu, n, kb, byte)];
+                    output.scales[linear] = cpu.chunkScales(n / 64, kb)[n % 64];
+                    output.mins[linear] = cpu.chunkMins(n / 64, kb)[n % 64];
+                    if (gpu_emins)
+                        output.emins[linear] = cpu.chunkEffectiveMins(n / 64, kb)[n % 64];
+                    continue;
+                }
 
                 if (cpu.encoding == CPUEncoding::NibbleLUT)
                 {
@@ -1147,7 +1184,8 @@ namespace llaminar2
         // Region and codebook validation prevents out-of-bounds source reads.
         if (!gpu.valid(error))
             return false;
-        if (!isNibbleCodebook(gpu.codebook_id) && gpu.codebook_id != 8 &&
+        if (!cpu::native_vnni::is_payload_decodable(gpu.codebook_id) &&
+            !hasCompactMultiScaleVnniPayload(gpu.codebook_id) && gpu.codebook_id != 8 &&
             gpu.codebook_id != 19 &&
             gpu.codebook_id != kNativeVnniExpandedInt8MinCodebook)
         {
@@ -1178,6 +1216,20 @@ namespace llaminar2
                     linear * gpu.payload_bytes_per_block;
                 const size_t unit = cpuUnitOffset(output, n, kb);
                 const int local_column = n % 64;
+
+                if (output.usesCompactMultiScale())
+                {
+                    // Reserved payload/metadata bytes remain deterministic zero.
+                    for (int byte = 0; byte < output.payload_bytes; ++byte)
+                        output.native_interleaved[
+                            interleavedValueOffset(output, n, kb, byte)] = source[byte];
+                    uint8_t *const metadata = output.native_interleaved.data() + unit + output.data_stride;
+                    std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
+                    std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
+                    if (gpu.has_emins)
+                        std::memcpy(metadata + 256 + local_column * 4, &gpu.emins[linear], 4);
+                    continue;
+                }
 
                 if (output.encoding == CPUEncoding::NibbleLUT)
                 {
@@ -1222,14 +1274,21 @@ namespace llaminar2
 
                 if (output.encoding == CPUEncoding::ExpandedInt8)
                 {
-                    // Scatter signed values and derive the same correction inline.
+                    // Native single-scale grids expand exactly to signed
+                    // bytes. Their scale/minimum remain untouched, just like
+                    // an already-expanded projection returning from CPU.
+                    int8_t decoded[32];
+                    if (cpu::native_vnni::is_payload_decodable(gpu.codebook_id))
+                        cpu::native_vnni::decode_native_block(gpu.codebook_id, source, decoded);
+                    else
+                        std::memcpy(decoded, source, sizeof(decoded));
                     int32_t sum = 0;
                     for (int value = 0; value < 32; ++value)
                     {
                         output.native_interleaved[
                             interleavedValueOffset(output, n, kb, value)] =
-                            source[value];
-                        sum += static_cast<int8_t>(source[value]);
+                            static_cast<uint8_t>(decoded[value]);
+                        sum += decoded[value];
                     }
                     const int16_t compensation = static_cast<int16_t>(sum);
                     std::memcpy(

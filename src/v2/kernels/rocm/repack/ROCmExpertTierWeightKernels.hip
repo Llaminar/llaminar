@@ -38,6 +38,71 @@ namespace llaminar2
         __device__ __constant__ std::uint64_t kTierIQ2XXSGridROCm[256];
         __device__ __constant__ std::uint64_t kTierIQ1SGridROCm[2048];
 
+        __device__ __forceinline__ void initializeCpuUnitROCm(std::uint8_t *, std::uint32_t);
+
+        /**
+         * @brief Lossless native-payload transpose for all compact multi-scale formats.
+         * @tparam ToCpu True for demotion, false for promotion.
+         * @param source Immutable separated GPU source (demotion only).
+         * @param destination Mutable separated GPU destination (promotion only).
+         * @param cpu_source Complete received CPU units (promotion only).
+         * @param cpu_destination Complete outgoing CPU units (demotion only).
+         * @param layout Validated immutable format and stride contract.
+         * @param first_unit Absolute unit origin of this bounded transfer chunk.
+         *
+         * One CTA owns a unit; each lane owns one output column. Padding and
+         * unused metadata are zeroed before valid lanes publish. No floating
+         * arithmetic, lookup, allocation or synchronization with inference is
+         * required: scale/minimum bits and IQ1_M delta signs move unchanged.
+         */
+        template <bool ToCpu>
+        __global__ void compactMultiScaleUnitsROCm(
+            ExpertTierGpuConstProjectionView source,
+            ExpertTierGpuMutableProjectionView destination,
+            const std::uint8_t *cpu_source,
+            std::uint8_t *cpu_destination,
+            ExpertTierWeightDeviceLayout layout,
+            std::uint32_t first_unit)
+        {
+            const unsigned unit_index = first_unit + blockIdx.x;
+            const int column = static_cast<int>(threadIdx.x);
+            const int n = static_cast<int>(unit_index / layout.blocks_per_row) * 64 + column;
+            const int kb = static_cast<int>(unit_index % layout.blocks_per_row);
+            const size_t offset = static_cast<size_t>(blockIdx.x) * layout.cpu_block_stride;
+            if constexpr (ToCpu)
+            {
+                initializeCpuUnitROCm(cpu_destination + offset, layout.cpu_block_stride);
+                __syncthreads();
+            }
+            if (n >= layout.N)
+                return;
+            const size_t linear = static_cast<size_t>(kb) * layout.N + n;
+            const int payload_bytes = layout.gpu_payload_bytes_per_block;
+            for (int byte = 0; byte < payload_bytes; ++byte)
+            {
+                const size_t cpu_offset = offset + (byte / 4) * 256 + column * 4 + byte % 4;
+                if constexpr (ToCpu)
+                    cpu_destination[cpu_offset] = source.payload[linear * payload_bytes + byte];
+                else
+                    destination.payload[linear * payload_bytes + byte] = cpu_source[cpu_offset];
+            }
+            const size_t metadata = offset + layout.cpu_data_stride;
+            if constexpr (ToCpu)
+            {
+                reinterpret_cast<uint16_t *>(cpu_destination + metadata)[column] = source.scales[linear];
+                reinterpret_cast<uint16_t *>(cpu_destination + metadata + 128)[column] = source.mins[linear];
+                if (layout.gpu_has_emins)
+                    reinterpret_cast<uint32_t *>(cpu_destination + metadata + 256)[column] = source.emins[linear];
+            }
+            else
+            {
+                destination.scales[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata)[column];
+                destination.mins[linear] = reinterpret_cast<const uint16_t *>(cpu_source + metadata + 128)[column];
+                if (layout.gpu_has_emins)
+                    destination.emins[linear] = reinterpret_cast<const uint32_t *>(cpu_source + metadata + 256)[column];
+            }
+        }
+
         /**
          * @brief Compile-time properties of one accelerator source codebook.
          * @tparam Codebook NativeVNNI codebook identifier stored in the stream
@@ -504,160 +569,8 @@ namespace llaminar2
         }
 
         /**
-         * @brief Convert serialized FP16 metadata bits to FP32.
-         * @param bits Exact bits published by the production GPU packer.
-         * @return FP32 value used during CPU-format preparation.
-         */
-        __device__ __forceinline__ float tierHalfToFloatROCm(
-            std::uint16_t bits)
-        {
-            return __half2float(__ushort_as_half(bits));
-        }
-
-        /**
-         * @brief Round final preparation metadata to IEEE FP16 storage.
-         * @param value FP32 scale or affine minimum.
-         * @return Round-to-nearest-even FP16 bits.
-         */
-        __device__ __forceinline__ std::uint16_t tierFloatToHalfROCm(
-            float value)
-        {
-            return __half_as_ushort(__float2half_rn(value));
-        }
-
-        /**
-         * @brief Divide two preparation values with ordinary IEEE FP32 rules.
-         * @param numerator Dividend.
-         * @param denominator Non-zero divisor.
-         * @return One correctly rounded FP32 quotient.
-         *
-         * The ROCm target is compiled without unsafe/fast math. Keeping the
-         * division in this named boundary prevents an accidental reciprocal
-         * approximation from being introduced when the transcode is tuned.
-         */
-        __device__ __forceinline__ float tierDivideROCm(
-            float numerator,
-            float denominator)
-        {
-            return numerator / denominator;
-        }
-
-        /**
-         * @brief Reconstruct one represented FP32 source value.
-         * @tparam Codebook Actual accelerator source codebook.
-         * @param value_index Logical value from zero through 31.
-         * @param quantized Integer produced by production-format decode.
-         * @param payload Compact block bytes, used by IQ1_M delta signs.
-         * @param primary Low-half or whole-block scale.
-         * @param secondary High-half scale or additive IQ1_S minimum.
-         * @param effective_mins Packed low/high Q2_K minima.
-         * @return Source value with explicit multiply/add rounding boundaries.
-         */
-        template <std::uint8_t Codebook>
-        __device__ __forceinline__ float tierSourceValueROCm(
-            int value_index,
-            int quantized,
-            const std::uint8_t *payload,
-            float primary,
-            float secondary,
-            std::uint32_t effective_mins)
-        {
-            const float q = static_cast<float>(quantized);
-            if constexpr (Codebook == 9 || Codebook == 13 || Codebook == 14)
-            {
-                const float scale = value_index < 16 ? primary : secondary;
-                return __fmul_rn(q, scale);
-            }
-            else if constexpr (Codebook == 10)
-            {
-                const float scale = value_index < 16 ? primary : secondary;
-                const std::uint16_t minimum_bits =
-                    value_index < 16
-                        ? static_cast<std::uint16_t>(effective_mins)
-                        : static_cast<std::uint16_t>(effective_mins >> 16);
-                return __fadd_rn(
-                    __fmul_rn(q, scale),
-                    tierHalfToFloatROCm(minimum_bits));
-            }
-            else if constexpr (Codebook == 16)
-            {
-                return __fadd_rn(__fmul_rn(q, primary), secondary);
-            }
-            else if constexpr (Codebook == 17)
-            {
-                const float scale = value_index < 16 ? primary : secondary;
-                const int subgroup = value_index / 8;
-                const std::uint8_t high = payload[4 + subgroup / 2];
-                const int delta_bit = (subgroup & 1) == 0 ? 3 : 7;
-                constexpr float kDelta = 0.125f;
-                const float delta = (high & (1u << delta_bit)) != 0
-                                        ? -kDelta
-                                        : kDelta;
-                return __fmul_rn(__fadd_rn(q, delta), scale);
-            }
-            else
-            {
-                return __fmul_rn(q, primary);
-            }
-        }
-
-        /**
-         * @brief Clamp one affine preparation result to a signed byte.
-         * @param value Rounded integer candidate.
-         * @return Value saturated to [-128, 127].
-         */
-        __device__ __forceinline__ std::int8_t clampTierPreparedInt8ROCm(
-            int value)
-        {
-            value = value < -128 ? -128 : value;
-            value = value > 127 ? 127 : value;
-            return static_cast<std::int8_t>(value);
-        }
-
-        /**
-         * @brief Build the canonical Q16 multiplier for an IQ2 grid half.
-         * @param factor Published source scale for this sixteen-value half.
-         * @param inverse_scale Reciprocal of the destination Q8 scale.
-         * @return Positive Q16 multiplier rounded before integer application.
-         *
-         * The CPU AVX-512 representation rounds this multiplier once and then
-         * truncates integer products. Naming that boundary keeps ROCm demotion
-         * byte-identical without replacing the parallel preparation kernel.
-         */
-        __device__ __forceinline__ std::int32_t tierIQ2Q16RatioROCm(
-            float factor,
-            float inverse_scale)
-        {
-            const float scaled = __fmul_rn(
-                __fmul_rn(factor, inverse_scale), 65536.0f);
-            return static_cast<std::int32_t>(__fadd_rn(scaled, 0.5f));
-        }
-
-        /**
-         * @brief Apply one canonical Q16 IQ2 transcode while retaining sign.
-         * @param signed_grid_value Signed integer decoded from an IQ2 grid.
-         * @param ratio Positive Q16 multiplier for the value's source half.
-         * @return Signed Q8 payload byte in an integer container.
-         *
-         * Sign application follows the unsigned multiply/shift so this is the
-         * scalar-lane equivalent of AVX-512 `mullo`, `srli`, then masked negate.
-         */
-        __device__ __forceinline__ int applyTierIQ2Q16RatioROCm(
-            int signed_grid_value,
-            std::int32_t ratio)
-        {
-            const std::uint32_t magnitude = static_cast<std::uint32_t>(
-                signed_grid_value < 0 ? -signed_grid_value : signed_grid_value);
-            const std::uint32_t prepared =
-                (magnitude * static_cast<std::uint32_t>(ratio)) >> 16;
-            return signed_grid_value < 0
-                       ? -static_cast<int>(prepared)
-                       : static_cast<int>(prepared);
-        }
-
-        /**
-         * @brief Decode and transcode one source-format block per logical row.
-         * @tparam Codebook One of 6, 7, 9 through 17, or raw-INT8 19.
+         * @brief Losslessly expand one single-scale block per logical row.
+         * @tparam Codebook One of 6, 7, 11, 12, 15, 16, 19, or normalized 23.
          * @param payload Production-packed source payload array.
          * @param scales Source primary/low-half FP16 scale array.
          * @param mins Optional source secondary-scale/minimum array.
@@ -669,8 +582,8 @@ namespace llaminar2
          * @param cpu_chunk Preallocated device staging output.
          *
          * Every thread owns one logical column. Q5 and Q8 blocks transpose
-         * their exact integer domain, Q3_K/Q2_K reproduce the CPU packer's
-         * two-half affine union, and IQ blocks normalize to CPU Q8 bytes. All
+         * their exact integer domain. Single-scale IQuant grids preserve their
+         * original scale/minimum bits without floating-point conversion. All
          * metadata is published only after the final byte domain is known.
          */
         template <std::uint8_t Codebook>
@@ -711,225 +624,16 @@ namespace llaminar2
             std::int32_t decoded_groups[8]{};
             decodeTierSourceGroupsROCm<Codebook>(source, decoded_groups);
 
-            const float primary = tierHalfToFloatROCm(scales[linear]);
-            const float secondary =
-                mins == nullptr ? 0.0f : tierHalfToFloatROCm(mins[linear]);
-            const std::uint32_t effective_mins =
-                emins == nullptr ? 0u : emins[linear];
-            float output_scale = primary;
-            float output_minimum = secondary;
-
-            if constexpr (Codebook == 9 || Codebook == 10)
+            static_assert(Codebook == 6 || Codebook == 7 || Codebook == 11 ||
+                          Codebook == 12 || Codebook == 15 || Codebook == 16 ||
+                          Codebook == 19 || Codebook == kNativeVnniExpandedInt8MinCodebook);
+            // These single-scale formats retain their exact integer domain.
+            // Multi-scale sources use the native transposition kernel instead.
+            for (int value = 0; value < 32; ++value)
             {
-                // The CPU representation has one affine domain, while these
-                // sources have independent low/high domains. Use theoretical
-                // extrema so output metadata is independent of payload values.
-                float minimum0 = 0.0f;
-                float maximum0 = 0.0f;
-                float minimum1 = 0.0f;
-                float maximum1 = 0.0f;
-                if constexpr (Codebook == 9)
-                {
-                    minimum0 = primary >= 0.0f
-                                   ? __fmul_rn(primary, -4.0f)
-                                   : __fmul_rn(primary, 3.0f);
-                    maximum0 = primary >= 0.0f
-                                   ? __fmul_rn(primary, 3.0f)
-                                   : __fmul_rn(primary, -4.0f);
-                    minimum1 = secondary >= 0.0f
-                                   ? __fmul_rn(secondary, -4.0f)
-                                   : __fmul_rn(secondary, 3.0f);
-                    maximum1 = secondary >= 0.0f
-                                   ? __fmul_rn(secondary, 3.0f)
-                                   : __fmul_rn(secondary, -4.0f);
-                }
-                else
-                {
-                    minimum0 = tierHalfToFloatROCm(
-                        static_cast<std::uint16_t>(effective_mins));
-                    minimum1 = tierHalfToFloatROCm(
-                        static_cast<std::uint16_t>(effective_mins >> 16));
-                    maximum0 = __fadd_rn(
-                        __fmul_rn(primary, 3.0f), minimum0);
-                    maximum1 = __fadd_rn(
-                        __fmul_rn(secondary, 3.0f), minimum1);
-                }
-                const float global_minimum = fminf(minimum0, minimum1);
-                const float global_maximum = fmaxf(maximum0, maximum1);
-                const float range =
-                    __fadd_rn(global_maximum, -global_minimum);
-                if (range < 1.0e-5f)
-                {
-                    output_scale = 0.0f;
-                    output_minimum = global_minimum;
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        unit[interleavedValueOffsetROCm(
-                            local_column, value)] = 0x80u;
-                    }
-                }
-                else
-                {
-                    output_scale = tierDivideROCm(range, 255.0f);
-                    output_minimum = __fadd_rn(
-                        global_minimum,
-                        __fmul_rn(128.0f, output_scale));
-                    const float inverse_scale =
-                        tierDivideROCm(1.0f, output_scale);
-                    const float bias =
-                        __fmul_rn(-output_minimum, inverse_scale);
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        const float actual = tierSourceValueROCm<Codebook>(
-                            value,
-                            decodedTierGroupValueROCm(decoded_groups, value),
-                            source,
-                            primary,
-                            secondary,
-                            effective_mins);
-                        const int quantized = __float2int_rn(__fadd_rn(
-                            __fmul_rn(actual, inverse_scale), bias));
-                        unit[interleavedValueOffsetROCm(
-                            local_column, value)] =
-                            static_cast<std::uint8_t>(
-                                clampTierPreparedInt8ROCm(quantized));
-                    }
-                }
-            }
-            else if constexpr (Codebook == 13 || Codebook == 15)
-            {
-                // IQ2_S and IQ2_XXS share the CPU AVX-512 Q16 contract:
-                // round the two half-block ratios, truncate integer products,
-                // and only then apply signs. Each work item still owns one
-                // column, so the exactness fix introduces no serial lane.
-                int maximum_grid_low = 0;
-                int maximum_grid_high = 0;
-                for (int value = 0; value < 32; ++value)
-                {
-                    const int signed_grid =
-                        decodedTierGroupValueROCm(decoded_groups, value);
-                    const int magnitude =
-                        signed_grid < 0 ? -signed_grid : signed_grid;
-                    if (value < 16)
-                        maximum_grid_low =
-                            magnitude > maximum_grid_low
-                                ? magnitude
-                                : maximum_grid_low;
-                    else
-                        maximum_grid_high =
-                            magnitude > maximum_grid_high
-                                ? magnitude
-                                : maximum_grid_high;
-                }
-
-                const float factor_low = primary;
-                const float factor_high =
-                    Codebook == 13 ? secondary : primary;
-                const float maximum_low = __fmul_rn(
-                    factor_low, static_cast<float>(maximum_grid_low));
-                const float maximum_high = __fmul_rn(
-                    factor_high, static_cast<float>(maximum_grid_high));
-                const float maximum_absolute =
-                    fmaxf(maximum_low, maximum_high);
-                output_minimum = 0.0f;
-                if (maximum_absolute < 1.0e-6f)
-                {
-                    output_scale = 0.0f;
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        unit[interleavedValueOffsetROCm(
-                            local_column, value)] = 0u;
-                    }
-                }
-                else
-                {
-                    output_scale = fminf(
-                        tierDivideROCm(maximum_absolute, 127.0f),
-                        65504.0f);
-                    const float inverse_scale =
-                        tierDivideROCm(1.0f, output_scale);
-                    const std::int32_t ratio_low =
-                        tierIQ2Q16RatioROCm(factor_low, inverse_scale);
-                    const std::int32_t ratio_high =
-                        tierIQ2Q16RatioROCm(factor_high, inverse_scale);
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        const int quantized = applyTierIQ2Q16RatioROCm(
-                            decodedTierGroupValueROCm(decoded_groups, value),
-                            value < 16 ? ratio_low : ratio_high);
-                        unit[interleavedValueOffsetROCm(
-                            local_column, value)] =
-                            static_cast<std::uint8_t>(
-                                static_cast<std::int8_t>(quantized));
-                    }
-                }
-            }
-            else if constexpr (
-                Codebook == 11 || Codebook == 12 || Codebook == 14 ||
-                Codebook == 16 || Codebook == 17)
-            {
-                // IQ formats become normalized Q8_0 CPU blocks. Derive absmax
-                // from represented values, then quantize with one shared scale.
-                float maximum_absolute = 0.0f;
-                for (int value = 0; value < 32; ++value)
-                {
-                    const float actual = tierSourceValueROCm<Codebook>(
-                        value,
-                        decodedTierGroupValueROCm(decoded_groups, value),
-                        source,
-                        primary,
-                        secondary,
-                        effective_mins);
-                    maximum_absolute =
-                        fmaxf(maximum_absolute, fabsf(actual));
-                }
-                output_minimum = 0.0f;
-                if (maximum_absolute < 1.0e-6f)
-                {
-                    output_scale = 0.0f;
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        unit[interleavedValueOffsetROCm(
-                            local_column, value)] = 0u;
-                    }
-                }
-                else
-                {
-                    output_scale = fminf(
-                        tierDivideROCm(maximum_absolute, 127.0f),
-                        65504.0f);
-                    const float inverse_scale =
-                        tierDivideROCm(1.0f, output_scale);
-                    for (int value = 0; value < 32; ++value)
-                    {
-                        const float actual = tierSourceValueROCm<Codebook>(
-                            value,
-                            decodedTierGroupValueROCm(decoded_groups, value),
-                            source,
-                            primary,
-                            secondary,
-                            effective_mins);
-                        int quantized = __float2int_rn(
-                            __fmul_rn(actual, inverse_scale));
-                        quantized = quantized < -127 ? -127 : quantized;
-                        quantized = quantized > 127 ? 127 : quantized;
-                        unit[interleavedValueOffsetROCm(
-                            local_column, value)] =
-                            static_cast<std::uint8_t>(
-                                static_cast<std::int8_t>(quantized));
-                    }
-                }
-            }
-            else
-            {
-                // Q5 and raw Q8 already use the CPU integer domain.
-                for (int value = 0; value < 32; ++value)
-                {
-                    unit[interleavedValueOffsetROCm(local_column, value)] =
-                        static_cast<std::uint8_t>(static_cast<std::int8_t>(
-                            decodedTierGroupValueROCm(
-                                decoded_groups, value)));
-                }
+                unit[interleavedValueOffsetROCm(local_column, value)] =
+                    static_cast<std::uint8_t>(static_cast<std::int8_t>(
+                        decodedTierGroupValueROCm(decoded_groups, value)));
             }
 
             // CPU kernels shift activations to unsigned before VNNI. Store the
@@ -943,16 +647,14 @@ namespace llaminar2
             reinterpret_cast<std::int16_t *>(unit + 2048u)[local_column] =
                 static_cast<std::int16_t>(compensation);
             reinterpret_cast<std::uint16_t *>(unit + 2176u)[local_column] =
-                tierFloatToHalfROCm(output_scale);
+                scales[linear];
             if constexpr (
-                Codebook == 7 || Codebook == 9 || Codebook == 10 ||
-                Codebook == 13 || Codebook == 14 || Codebook == 16 ||
-                Codebook == 17 ||
+                Codebook == 7 || Codebook == 16 ||
                 Codebook == kNativeVnniExpandedInt8MinCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(
                     unit + 2304u)[local_column] =
-                    tierFloatToHalfROCm(output_minimum);
+                    mins[linear];
             }
         }
 
@@ -1274,6 +976,12 @@ namespace llaminar2
         const dim3 grid(unit_count);
         const dim3 block(kColumnsPerUnit);
         auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+        if (layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+        {
+            compactMultiScaleUnitsROCm<true><<<grid, block, 0, hip_stream>>>(
+                source, {}, nullptr, device_cpu_chunk, layout, first_unit);
+            return hipPeekAtLastError() == hipSuccess;
+        }
         if (layout.cpu_encoding ==
             cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
         {
@@ -1319,32 +1027,17 @@ namespace llaminar2
             case 7:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(7);
                 break;
-            case 9:
-                LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(9);
-                break;
-            case 10:
-                LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(10);
-                break;
             case 11:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(11);
                 break;
             case 12:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(12);
                 break;
-            case 13:
-                LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(13);
-                break;
-            case 14:
-                LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(14);
-                break;
             case 15:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(15);
                 break;
             case 16:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(16);
-                break;
-            case 17:
-                LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(17);
                 break;
             case 19:
                 LLAMINAR_LAUNCH_ROCM_TIER_SOURCE(19);
@@ -1396,6 +1089,13 @@ namespace llaminar2
         const dim3 grid(unit_count);
         const dim3 block(kColumnsPerUnit);
         auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+        if (layout.cpu_encoding ==
+            cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale)
+        {
+            compactMultiScaleUnitsROCm<false><<<grid, block, 0, hip_stream>>>(
+                {}, destination, device_cpu_chunk, nullptr, layout, first_unit);
+            return hipPeekAtLastError() == hipSuccess;
+        }
         if (layout.cpu_encoding ==
             cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)
         {

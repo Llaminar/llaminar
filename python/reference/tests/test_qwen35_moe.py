@@ -30,6 +30,7 @@ from python.reference.qwen35_moe import (
     Qwen35MoEReferenceModel,
     materialize_route_contributions,
     mtp_sidecar_replay_depth,
+    mtp_branch_qualifier,
     production_router_distribution,
 )
 from python.reference.generate_qwen35_moe_pipeline_snapshots import (
@@ -182,7 +183,7 @@ def test_sidecar_capacity_promotion_preserves_authenticated_metadata(tmp_path):
 def test_additive_mtp_branch_replays_only_committed_prefix_and_requested_depth():
     """Branch generation does not recompute the combinatorial canonical pack."""
 
-    overrides = {2: [101, 202, 303, 404]}
+    overrides = normalize_mtp_branch_override_batches({"2": [101, 202, 303, 404]})[0]
     assert mtp_sidecar_replay_depth(0, 15, overrides) == 1
     assert mtp_sidecar_replay_depth(1, 15, overrides) == 1
     assert mtp_sidecar_replay_depth(2, 15, overrides) == 5
@@ -194,14 +195,51 @@ def test_mtp_branch_override_campaign_batches_preserve_independent_trajectories(
     """Many observed branches share one HF model without merging trajectories."""
 
     assert normalize_mtp_branch_override_batches({"3": [11, 22]}) == [
-        {3: [11, 22]}
+        {3: {"condition_token": None, "draft_tokens": [11, 22]}}
     ]
     assert normalize_mtp_branch_override_batches(
         [{"1": [7]}, {"1": [8, 9]}, {"3": [10, 11, 12]}]
-    ) == [{1: [7]}, {1: [8, 9]}, {3: [10, 11, 12]}]
+    ) == [
+        {1: {"condition_token": None, "draft_tokens": [7]}},
+        {1: {"condition_token": None, "draft_tokens": [8, 9]}},
+        {3: {"condition_token": None, "draft_tokens": [10, 11, 12]}},
+    ]
 
     with pytest.raises(ValueError, match="flat token array"):
         normalize_mtp_branch_override_batches({"2": [[1, 2], [3, 4]]})
+
+
+def test_mtp_initial_condition_branches_preserve_canonical_depth_zero():
+    """An actual MTP0 input is identity, not permission to change HF tensors."""
+    batches = normalize_mtp_branch_override_batches({
+        "2": {"condition_token": 760, "draft_tokens": []},
+        "3": {"condition_token": 3841, "draft_tokens": [13, 17]},
+    })
+    assert len(batches) == 2  # No altered cache may leak across branches.
+    first = batches[0][2]
+    assert mtp_sidecar_replay_depth(1, 15, batches[0]) == 1
+    assert mtp_sidecar_replay_depth(2, 15, batches[0]) == 1
+    assert mtp_branch_qualifier(first, []) == "_CONDITION_760"
+    assert mtp_branch_qualifier(first, [13, 17]) == "_CONDITION_760_BRANCH_13_17"
+    assert mtp_branch_qualifier(None, []) == ""
+    canonical_condition = {"condition_token": None, "draft_tokens": [13, 17]}
+    assert mtp_branch_qualifier(canonical_condition, []) == ""
+    assert mtp_branch_qualifier(canonical_condition, [13]) == "_BRANCH_13"
+
+
+@pytest.mark.parametrize("branch", [
+    {"condition_token": -1, "draft_tokens": []},
+    {"condition_token": 1.5, "draft_tokens": []},
+    {"condition_token": True, "draft_tokens": []},
+    {"condition_token": None, "draft_tokens": []},
+    {"condition_token": 1, "draft_tokens": [-1]},
+    {"condition_token": 1, "draft_tokens": [3] * 15},
+    {"condition_token": 1, "draft_tokens": [], "hidden": [0.0]},
+])
+def test_mtp_branch_inputs_reject_invalid_or_hidden_state_overrides(branch):
+    """Only discrete nonnegative token inputs may condition an HF branch."""
+    with pytest.raises(ValueError):
+        normalize_mtp_branch_override_batches({"2": branch})
 
 
 def test_streaming_loader_filters_before_read_and_dequantize(monkeypatch):

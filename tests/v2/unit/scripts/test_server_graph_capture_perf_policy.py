@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import json
+import copy
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import shlex
@@ -29,6 +30,7 @@ REPO_ROOT = SERVER_E2E_DIR.parents[3]
 sys.path.insert(0, str(SERVER_E2E_DIR))
 
 from graph_capture_perf_policy import (  # noqa: E402
+    DecodeGraphRequirement,
     _incomplete_graph_contexts,
     _missing_prefill_phases,
     device_kinds_for_cell,
@@ -86,6 +88,27 @@ def counter(
     return record
 
 
+def host_movement_records() -> list[dict]:
+    """One published wave with bounded, independently authored ordering proof."""
+    scope = {"rank": 0, "device": "priority0/priority1", "phase": "maintenance"}
+    tags = {"purpose": "placement_change"}
+    sequence = {"kind": "ordered_sequence", "count": 1, "sequence_word_count": 2,
+                "sequence_digest_lo": 123, "sequence_digest_hi": 456}
+    return [counter("expert_migration_edges", domain="moe_overlay_residency", value=2) | scope,
+            counter("placement_published_payload_bytes", domain="moe_overlay_residency",
+                    value=4096, tags=tags) | scope,
+            *[counter(name, domain="moe_overlay_residency", tags=tags) | scope | sequence
+              for name in ("placement_transport_publications", "placement_owner_publications")]]
+
+
+def device_overlay_movement_records() -> list[dict]:
+    """One completed all-GPU wave; unrelated rank/transaction rows cannot join."""
+    scope = {"rank": 0, "device": "priority0/priority1", "phase": "maintenance"}
+    tags = {"transaction": "3", "candidate_epoch": "4", "policy_owner": "device"}
+    return [counter(name, domain="moe_overlay_controller", tags=tags) | scope
+            for name in ("dynamic_movement_transactions", "dynamic_migration_edges", "dynamic_physical_bytes")]
+
+
 def device_generation_ticket_tags() -> dict[str, str]:
     """Build the reviewed cross-language immutable-ticket ABI tags."""
 
@@ -132,6 +155,21 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     if mpi_crash:
                         self.assertIn("child process crashed (exit code: 17)", result.stdout)
 
+    def test_server_disposal_cannot_restore_a_discarded_model(self) -> None:
+        """The HTTP surface exports no reusable model contract at shutdown."""
+        for name in ("prepared_context_restore_movement_waves", "prepared_context_restore_certifications"):
+            for device in ("cuda:0", "rocm:0"):
+                with self.subTest(name=name, device=device):
+                    record = counter(name, domain="moe_overlay_controller") | {"device": device}
+                    self.assertIn("without a retained model", validate_runtime_feature_policy(
+                        [record], "", MovementEvidence.NOT_APPLICABLE) or "")
+                    self.assertIsNone(validate_runtime_feature_policy(
+                        [record | {"value": 0}], "", MovementEvidence.NOT_APPLICABLE))
+        host = counter("prepared_context_restoration_edges", domain="moe_overlay_residency")
+        self.assertIn("without a retained model", validate_runtime_feature_policy(
+            [host], "", MovementEvidence.NOT_APPLICABLE) or "")
+        self.assertIsNone(validate_runtime_feature_policy([host | {"value": 0}], "", MovementEvidence.NOT_APPLICABLE))
+
     def test_runtime_features_require_execution_not_lookup_or_domain_presence(self) -> None:
         """A cache hit or arbitrary MTP counter is not a completed feature."""
         records = [counter("harvest_inserts", domain="prefix_cache"),
@@ -153,11 +191,11 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                   counter("populate_restores", domain="prefix_cache", tags={"includes_mtp_state": "true"}),
                   counter("accepted_tokens", domain="mtp"),
                   counter("depth_policy_windows", domain="mtp")]
-        host = [counter("draft_steps", domain="mtp"),
-                counter("expert_migration_edges", domain="moe_overlay_residency")]
+        host = [counter("draft_steps", domain="mtp"), *host_movement_records()]
         native = [counter("device_generation_terminal_attempted_draft_tokens", domain="mtp"),
-                  counter("device_rebalance_wave_applied_arrivals_total", domain="moe_rebalance"),
-                  counter("device_rebalance_transfer_useful_payload_bytes", domain="moe_rebalance")]
+                  counter("device_rebalance_request_copied_payload_lower_bound", domain="moe_rebalance"),
+                  counter("device_rebalance_request_applied_payload_lower_bound", domain="moe_rebalance"),
+                  counter("device_rebalance_request_useful_payload_bytes_lower_bound", domain="moe_rebalance")]
         for backend, completed in (("cpu", host), ("cuda", native), ("rocm", native)):
             with self.subTest(backend=backend):
                 records = [record | {"device": backend + ":0"} for record in common + completed]
@@ -169,13 +207,89 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         records = [counter("draft_steps", domain="mtp"), counter("accepted_tokens", domain="mtp")]
         self.assertIn("depth-controller", validate_runtime_feature_policy(records, "--mtp --mtp-depth-policy dynamic", MovementEvidence.NOT_APPLICABLE) or "")
 
+    def test_host_movement_needs_published_bytes_and_matching_bounded_sequences(self) -> None:
+        """Committed edges, calibration copies and mismatched publications fail."""
+        records = host_movement_records()
+        self.assertIsNone(validate_runtime_feature_policy(records, "", MovementEvidence.REQUIRED))
+        for omitted in range(len(records)):
+            with self.subTest(omitted=omitted):
+                self.assertIsNotNone(validate_runtime_feature_policy(
+                    records[:omitted] + records[omitted + 1:], "", MovementEvidence.REQUIRED))
+        for field, value in (("rank", 1), ("device", "different-tier"), ("phase", "prefill"),
+                             ("count", 2), ("sequence_word_count", 4),
+                             ("sequence_digest_lo", 999), ("sequence_digest_hi", 999),
+                             ("kind", "counter"), ("tags", {"purpose": "economy_calibration"})):
+            with self.subTest(field=field):
+                broken = [*records[:-1], records[-1] | {field: value}]
+                self.assertIsNotNone(validate_runtime_feature_policy(broken, "", MovementEvidence.REQUIRED))
+        for purpose in ("economy_calibration", "prepared_context_restoration", None):
+            broken = [records[0], *[r | {"tags": {"purpose": purpose}} for r in records[1:]]]
+            self.assertIsNotNone(validate_runtime_feature_policy(broken, "", MovementEvidence.REQUIRED))
+        for value in (0, -1, True, float("nan"), float("inf"), "invalid"):
+            broken = [records[0], records[1] | {"value": value}, *records[2:]]
+            self.assertIsNotNone(validate_runtime_feature_policy(broken, "", MovementEvidence.REQUIRED))
+
+    def test_static_rejects_completed_placement_payload_without_an_owner_commit(self) -> None:
+        """Actual copies are forbidden even if publication later aborts."""
+        for name in ("placement_transfer_operations_completed", "placement_transfer_payload_bytes_completed",
+                     "placement_published_payload_bytes"):
+            with self.subTest(name=name):
+                record = counter(name, domain="moe_overlay_residency", tags={"purpose": "placement_change"})
+                self.assertIn("static", validate_runtime_feature_policy([record], "", MovementEvidence.FORBIDDEN) or "")
+                # A topology probe is distinct from a placement transaction.
+                record["tags"] = {"purpose": "economy_calibration"}
+                self.assertIsNone(validate_runtime_feature_policy([record], "", MovementEvidence.FORBIDDEN))
+
+    def test_host_publications_keep_noop_ranks_explicit_and_do_not_add_rank_mirrors(self) -> None:
+        """No-op rank payloads may be zero, never missing, malformed or unmatched."""
+        records = host_movement_records()
+        follower = [r | {"rank": 1} for r in records]
+        follower[1] = follower[1] | {"value": 0}
+        self.assertIsNone(validate_runtime_feature_policy(records + follower, "", MovementEvidence.REQUIRED))
+        for invalid in (None, True, -1, float("nan")):
+            changed = [follower[0], follower[1] | {"value": invalid}, *follower[2:]]
+            self.assertIsNotNone(validate_runtime_feature_policy(records + changed, "", MovementEvidence.REQUIRED))
+        self.assertIsNotNone(validate_runtime_feature_policy(records + [follower[0], *follower[2:]], "", MovementEvidence.REQUIRED))
+        self.assertIsNotNone(validate_runtime_feature_policy(records + [records[-1]], "", MovementEvidence.REQUIRED))
+
+    def test_runtime_features_native_movement_survives_empty_final_wave(self) -> None:
+        """Terminal scratch reuse must not erase a qualified physical commit."""
+        names = ("device_rebalance_request_copied_payload_lower_bound",
+                 "device_rebalance_request_applied_payload_lower_bound",
+                 "device_rebalance_request_useful_payload_bytes_lower_bound")
+        for backend in ("CUDA", "ROCm"):
+            records = [counter(name, domain="moe_rebalance", device=f"{backend}:0",
+                               value=value, tags={"launch_count": "384"}) |
+                       {"rank": 0, "phase": "decode"}
+                       for name, value in zip(names, (2, 1, 3277312))]
+            scratch = counter("device_rebalance_transfer_useful_payload_bytes",
+                              domain="moe_rebalance", value=0)
+            with self.subTest(backend=backend):
+                self.assertIsNone(validate_runtime_feature_policy(records + [scratch], "",
+                                  MovementEvidence.REQUIRED))
+                self.assertIn("static", validate_runtime_feature_policy(records, "",
+                              MovementEvidence.FORBIDDEN) or "")
+                for omitted in range(3):
+                    partial = records[:omitted] + records[omitted + 1:]
+                    self.assertIn("committed physical", validate_runtime_feature_policy(
+                        partial, "", MovementEvidence.REQUIRED) or "")
+                # Pairing a copy from one participant/request with another's
+                # apply can fabricate a transaction that never completed.
+                for field, value in (("device", f"{backend}:1"), ("rank", 1),
+                                     ("phase", "prefill"),
+                                     ("tags", {"launch_count": "768"})):
+                    mismatched = [records[0] | {field: value}, *records[1:]]
+                    self.assertIn("committed physical", validate_runtime_feature_policy(
+                        mismatched, "", MovementEvidence.REQUIRED) or "")
+                for invalid in (0, -1, float("nan"), float("inf"), "invalid"):
+                    incomplete = [records[0] | {"value": invalid}, *records[1:]]
+                    self.assertIn("committed physical", validate_runtime_feature_policy(
+                        incomplete, "", MovementEvidence.REQUIRED) or "")
+
     def test_runtime_features_certify_device_overlay_commits_symmetrically(self) -> None:
         """The sole overlay authority emits a completed transaction/edge/byte trio."""
-        names = ("dynamic_movement_transactions", "dynamic_migration_edges",
-                 "dynamic_physical_bytes")
         for backend in ("cuda", "rocm"):
-            records = [counter(name, domain="moe_overlay_controller") |
-                       {"device": backend + ":0"} for name in names]
+            records = [record | {"device": backend + ":0"} for record in device_overlay_movement_records()]
             with self.subTest(backend=backend):
                 self.assertIsNone(validate_runtime_feature_policy(records, "",
                     MovementEvidence.REQUIRED))
@@ -185,6 +299,19 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     partial = records[:omitted] + records[omitted + 1:]
                     self.assertIn("committed physical", validate_runtime_feature_policy(
                         partial, "", MovementEvidence.REQUIRED) or "")
+
+    def test_device_overlay_completion_cannot_join_unrelated_transactions_or_ranks(self) -> None:
+        """Global positive totals cannot fabricate one completed transaction."""
+        records = device_overlay_movement_records()
+        for field, value in (("rank", 1), ("device", "another-domain"), ("phase", "prefill")):
+            with self.subTest(field=field):
+                self.assertIsNotNone(validate_runtime_feature_policy(
+                    [records[0] | {field: value}, *records[1:]], "", MovementEvidence.REQUIRED))
+        for field, value in (("transaction", "4"), ("candidate_epoch", "5"), ("policy_owner", "host")):
+            with self.subTest(field=field):
+                self.assertIsNotNone(validate_runtime_feature_policy(
+                    [records[0] | {"tags": records[0]["tags"] | {field: value}}, *records[1:]],
+                    "", MovementEvidence.REQUIRED))
 
     def test_runtime_features_reject_device_overlay_proposals(self) -> None:
         """Submitted commands and prepared arrivals cannot certify a commit."""
@@ -1415,6 +1542,17 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         )
         self.assertIn("new_intermediate_state_d2h", result.error or "")
 
+    def test_gpu_host_transfer_policy_distinguishes_cpu_tail_logits(self) -> None:
+        """CPU-owned logits are legal; a CPU tier cannot authorize GPU logits downloads."""
+        for gpu in ("cuda", "rocm"):
+            for device in ("CPU", "CPU:0", "CPU:1", "CUDA:0", "ROCm:0", "", "CPU:invalid"):
+                with self.subTest(gpu=gpu, device=device):
+                    row = counter("host_logits_access", domain="sampling", device=device,
+                                  tags={"source": "rank_orchestrator_logits"})
+                    result = validate_gpu_host_transfer_policy([row], device_kinds=frozenset({gpu, "cpu"}))
+                    self.assertEqual(result.error is None, device in {"CPU", "CPU:0", "CPU:1"})
+                    self.assertIsNotNone(validate_gpu_host_transfer_policy([row], device_kinds=frozenset({gpu})).error)
+
     def test_gpu_host_transfer_policy_accepts_explicit_cache_tier_movement(
         self,
     ) -> None:
@@ -1497,7 +1635,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
     def test_canonical_overlay_export_names_movement_policy_explicitly(self) -> None:
         """Actual round-trip tests, not shell-table patterns, prove the axes."""
         root = Path(__file__).resolve().parents[4]
-        source = (root / "tests/v2/integration/parity/ModelParityE2EExport.h").read_text()
+        source = (root / "tests/v2/integration/parity/ModelParityRuntimeExport.h").read_text()
         self.assertIn('add("--moe-residency-maintenance", moeRebalanceRuntimeModeToString(config.moe_rebalance.mode))', source)
         self.assertIn("cell.expert_overlay->owner_order", source)
         self.assertIn("cell.expert_overlay->movement", source)
@@ -1623,10 +1761,13 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         """The runner transports typed arguments and pins the full helper."""
         root = Path(__file__).resolve().parents[4]
         driver = (root / "scripts/ci/run_model_parity_e2e.py").read_text()
-        self.assertIn("parity.discover_campaigns(", driver)
+        inventory = (root / "scripts/ci/model_parity_inventory.py").read_text()
+        self.assertIn("discover_inventory(args, InventoryScope.E2E)", driver)
+        self.assertIn("parity.discover_campaigns(", inventory)
         self.assertIn('record["e2e"]["server_args"]', driver)
         self.assertIn('"LLAMINAR_E2E_LONG_CONTEXT_TIER": "full"', driver)
         self.assertNotIn("itertools.product", driver)
+        self.assertNotIn("itertools.product", inventory)
         self.assertNotIn("Qwen3.6-", driver)
 
     def test_stochastic_probe_requires_device_resident_outcome_evidence(
@@ -1890,6 +2031,33 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             rows.append(counter("decode_graph_phase", device=device,
                                 tags={"context": "condition_batch", "phase": "replay"}))
             self.assertEqual(_incomplete_graph_contexts(rows), ())
+
+    def test_materialized_only_family_passes_full_policy_only_with_matching_launch(self) -> None:
+        """Exercise the public validator, not only its inner lifecycle helper."""
+        for device in ("cuda:0", "rocm:0"):
+            rows = [counter("full_graph_plan_graphs", tags={"type": "capturable"}),
+                    dict(counter("full_graph_capture_executable_nodes", value=1175, device=device,
+                            tags={"context": "main_decode", "source": "full_graph_capture",
+                                  "type": "materialized_unlaunched_executable"}), count=1),
+                    counter("decode_graph_phase", device=device,
+                            tags={"context": "main_decode", "phase": "capture"}),
+                    counter("decode_capture_policy", value=1532, device=device,
+                            tags={"context": "main_decode"}),
+                    counter("decode_graph_phase", value=1532, device=device,
+                            tags={"context": "main_decode", "phase": "replay"})]
+            self.assertIsNone(validate_graph_capture_policy(rows, device, "").error)
+            self.assertIn("missing launch", validate_graph_capture_policy(rows[:-1], device, "").error)
+            for field, bad in (("context", "unrelated"), ("type", "captured_child_template"),
+                               ("source", "segmented_graph_capture")):
+                changed = copy.deepcopy(rows)
+                changed[1]["tags"][field] = bad
+                self.assertIsNotNone(validate_graph_capture_policy(changed, device, "").error)
+            changed = copy.deepcopy(rows)
+            changed[1]["value"] = 0
+            self.assertIsNotNone(validate_graph_capture_policy(changed, device, "").error)
+            changed = copy.deepcopy(rows)
+            changed[1]["domain"] = "unrelated"
+            self.assertIsNotNone(validate_graph_capture_policy(changed, device, "").error)
 
     def test_native_materialization_count_cannot_mask_another_owner_or_launch(self) -> None:
         """Rank/context identity and exact counts prevent over-crediting setup."""
@@ -2240,6 +2408,382 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ),
         )
         self.assertIn("runtime-proven collective", result.error or "")
+
+    @staticmethod
+    def pipeline_boundary_records(device: str = "cuda:0") -> list[dict]:
+        """One captured GPU child plus one CPU child in a frozen rank-local PP plan."""
+        geometry = {"total_segments": "2", "native_segments": "1", "host_segments": "1",
+                    "heterogeneous_segmented": "true", "scope": "pipeline_coordinator",
+                    "boundary_authority": "rank_pipeline_graph_plan"}
+        rows = [counter("segmented_plan_segments", value=2, device="pipeline_coordinator", tags=geometry),
+                counter("segmented_graph_capture_segments", device="pipeline_coordinator", tags=geometry)]
+        for row in rows:
+            row["phase"] = "setup"
+        for phase in ("prefill", "decode"):
+            rows.append(dict(counter("segmented_replay_segments", value=2, device="pipeline_coordinator",
+                                     tags={"segments_per_transaction": "2", "transactions": "1",
+                                           "heterogeneous_segmented": "true",
+                                           "boundary_authority": "rank_pipeline_graph_plan"}), phase=phase))
+        rows += [counter("full_graph_plan_graphs", device=device, tags={"type": "capturable"}),
+                 counter("full_graph_capture_executable_nodes", value=17, device=device,
+                         tags={"context": "main_decode", "source": "full_graph_capture", "type": "captured_executable"}),
+                 counter("decode_graph_phase", device=device, tags={"context": "main_decode", "phase": "capture"}),
+                 counter("decode_graph_phase", device=device, tags={"context": "main_decode", "phase": "replay"})]
+        return [dict(row, rank=0) for row in rows]
+
+    def test_pipeline_boundary_preserves_full_native_child_proof(self) -> None:
+        """PP coordination is not an in-child collective on either GPU vendor."""
+        for device in ("cuda:0", "rocm:0"):
+            rows = self.pipeline_boundary_records(device)
+            result = validate_graph_capture_policy(rows, "pp", f"{device} cpu:0")
+            self.assertIsNone(result.error)
+            self.assertTrue(result.has_pipeline_boundary_evidence)
+            self.assertFalse(result.has_collective_evidence)
+            without_executable = [r for r in rows if r["name"] != "full_graph_capture_executable_nodes"]
+            self.assertIsNotNone(validate_graph_capture_policy(without_executable, "pp", f"{device} cpu:0").error)
+            self.assertIsNotNone(validate_graph_capture_policy(rows, "pp", f"{device}").error)
+
+    def test_pipeline_boundary_rejects_incomplete_or_cross_rank_evidence(self) -> None:
+        """A policy tag or a neighboring rank cannot certify missing PP work."""
+        mutations = (
+            lambda r: r.pop(0),
+            lambda r: r.pop(1),
+            lambda r: r.pop(2),
+            lambda r: r.pop(3),
+            lambda r: r[1].update(rank=1),
+            lambda r: r[1].update(value=2),
+            lambda r: r[3].update(value=1),
+            lambda r: r[3]["tags"].update(segments_per_transaction="3"),
+            lambda r: r[0]["tags"].update(total_segments="wrong"),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                rows = copy.deepcopy(self.pipeline_boundary_records())
+                mutate(rows)
+                # Even a nested TP child's valid collective cannot hide an
+                # incomplete outer pipeline lifecycle.
+                rows.append(counter("decode_capture_policy", tags={"has_collectives": "true"}))
+                self.assertIsNotNone(validate_graph_capture_policy(rows, "pp", "cuda:0 cpu:0").error)
+
+    @classmethod
+    def overlay_boundary_records(cls, device: str = "cuda:0", rank: int = 0,
+                                 native: int = 1, host: int = 1,
+                                 generation_phase: str = "decode") -> list[dict]:
+        """Reduce a real sparse-overlay server artifact without fabricating TP.
+
+        The coordinator emits one frozen rank plan and one retirement per
+        sequence; many sequences may share one command. GPU parents separately
+        prove physical capture and launches.
+        Exercise CPU/GPU and mixed-vendor GPU boundaries using the same schema.
+        """
+        total = native + host
+        identity = {"authority": "typed_overlay_transaction_plan",
+                    "scope": "cross_rank_expert_overlay"}
+        geometry = identity | {"continuation_rank": str(rank), "graph_family_generation": "1",
+                               "follower_segments": str(total - 1), "native_segments": str(native),
+                               "eager_host_segments": str(host), "native_participants": str(native)}
+        rows = [dict(counter("segmented_plan_segments", value=total, device="continuation_rank",
+                             tags=dict(geometry)), rank=rank, phase="setup"),
+                dict(counter("segmented_graph_capture_segments", value=native, device="continuation_rank",
+                             tags=dict(geometry)), rank=rank, phase="setup")]
+        for command, phase in enumerate(("prefill", generation_phase), 1):
+            groups = 3 if phase == "mtp" else 1
+            rows.append(dict(counter("segmented_replay_segments", value=total * groups,
+                device="continuation_rank", tags=identity | {
+                    "command": str(command), "sequence": str(command),
+                    "draft_depth": "2" if phase == "mtp" else "0",
+                    "graph_groups": str(groups), "plan_segments": str(total),
+                    "terminal": "sparse_return_retired"}), rank=rank, phase=phase))
+        for offset in range(native):
+            participant = device if offset == 0 else ("rocm:0" if device == "cuda:0" else "cuda:0")
+            child = cls.retained_parent_records(participant, rank + offset)
+            for row in child:
+                row["tags"]["has_collectives"] = "false"
+            rows.extend(child)
+        return copy.deepcopy(rows)
+
+    def test_overlay_boundary_accepts_retired_sparse_transactions_without_child_tp(self) -> None:
+        """Both vendors, shifted continuation ranks, and two/three tiers work."""
+        for device in ("cuda:0", "rocm:0"):
+            for rank in (0, 1):
+                for native, host in ((1, 1), (2, 0), (2, 1)):
+                    for phase in ("decode", "mtp"):
+                        with self.subTest(device=device, rank=rank, native=native, host=host, phase=phase):
+                            rows = self.overlay_boundary_records(device, rank, native, host, phase)
+                            flags = f"{device} " + ("cpu:0" if host else "cuda:0 rocm:0")
+                            result = validate_graph_capture_policy(
+                                rows, "tp", flags, decode_requirement=DecodeGraphRequirement.REPLAY)
+                            self.assertIsNone(result.error)
+                            self.assertTrue(result.has_overlay_boundary_evidence)
+                            self.assertFalse(result.has_collective_evidence)
+                            self.assertFalse(result.has_pipeline_boundary_evidence)
+
+    def test_overlay_boundary_rejects_missing_malformed_and_foreign_evidence(self) -> None:
+        """Plan, physical preparation and retirement cannot borrow other owners."""
+        mutations = (
+            lambda r: r.pop(0), lambda r: r.pop(1), lambda r: r.pop(2), lambda r: r.pop(3),
+            lambda r: r[1].update(rank=9), lambda r: r[3].update(rank=9),
+            lambda r: r[0]["tags"].update(continuation_rank="9"),
+            lambda r: r[1]["tags"].update(graph_family_generation="2"),
+            lambda r: r[0]["tags"].update(graph_family_generation="0"),
+            lambda r: r[0]["tags"].update(native_participants="0"),
+            lambda r: r[0]["tags"].update(eager_host_segments="-1"),
+            lambda r: r[0]["tags"].update(follower_segments="invalid"),
+            lambda r: r[0].update(count=2), lambda r: r[1].update(value=0),
+            lambda r: r[3].update(value=1), lambda r: r[3].update(value=float("nan")),
+            lambda r: r[3]["tags"].update(terminal="submitted"),
+            lambda r: r[3]["tags"].update(plan_segments="3"),
+            lambda r: r[3]["tags"].update(command="0"),
+            lambda r: r[3]["tags"].update(sequence="1"),
+            lambda r: r[3]["tags"].update(sequence="0"),
+            lambda r: r[3]["tags"].pop("sequence"),
+            lambda r: r[3].update(count=2, value=4),
+            lambda r: r[3]["tags"].update(graph_groups="0"),
+            lambda r: r[3]["tags"].update(draft_depth="2"),
+            lambda r: r[3]["tags"].update(scope="unrelated"),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                rows = self.overlay_boundary_records()
+                mutate(rows)
+                # A child's TP counter must not hide a broken outer boundary.
+                rows.append(counter("decode_capture_policy", tags={"has_collectives": "true"}))
+                self.assertIn("Incomplete ExpertOverlay", validate_graph_capture_policy(
+                    rows, "tp", "cuda:0 cpu:0").error or "")
+
+    def test_overlay_boundary_distinguishes_many_sequences_in_one_command(self) -> None:
+        """Four-row prefill and ticketed MTP retire sequences, not commands.
+
+        The failing server artifact coalesced 54 prefill returns because its
+        counter omitted the already authoritative sequence ID. Require that ID
+        for every return; accepting a multiplied count would hide duplicates.
+        """
+        for device in ("cuda:0", "rocm:0"):
+            for phase in ("prefill", "decode", "mtp"):
+                with self.subTest(device=device, phase=phase):
+                    rows = self.overlay_boundary_records(
+                        device, generation_phase="mtp" if phase == "mtp" else "decode")
+                    original = rows[2 if phase == "prefill" else 3]
+                    for sequence in range(3, 56):
+                        additional = copy.deepcopy(original)
+                        additional["tags"]["sequence"] = str(sequence)
+                        rows.append(additional)
+                    flags = f"{device} cpu:0"
+                    self.assertIsNone(validate_graph_capture_policy(rows, "tp", flags).error)
+                    # Distinct commands cannot recycle a sequence either.
+                    duplicate = copy.deepcopy(rows[-1])
+                    duplicate["tags"]["command"] = "99"
+                    rows.append(duplicate)
+                    self.assertIn("Incomplete ExpertOverlay", validate_graph_capture_policy(
+                        rows, "tp", flags).error or "")
+
+    def test_overlay_boundary_keeps_native_executable_and_topology_obligations(self) -> None:
+        """A retired command cannot certify missing GPU execution or eager work."""
+        for device in ("cuda:0", "rocm:0"):
+            rows = self.overlay_boundary_records(device)
+            self.assertIn("homogeneous", validate_graph_capture_policy(rows, device, "").error or "")
+            for missing in ("retained_parent_executable_nodes", "retained_parent_transaction_zero_launches",
+                            "retained_parent_replays"):
+                with self.subTest(device=device, missing=missing):
+                    incomplete = [row for row in rows if row["name"] != missing]
+                    self.assertIn("lifecycle", validate_graph_capture_policy(
+                        incomplete, "tp", f"{device} cpu:0").error or "")
+            rows.append(dict(counter("decode_graph_phase", device=device,
+                tags={"context": "main_verifier", "phase": "warmup"}), rank=0))
+            self.assertIn("eager warmup", validate_graph_capture_policy(
+                rows, "tp", f"{device} cpu:0").error or "")
+
+    @classmethod
+    def local_ticket_boundary_records(cls, device: str = "cuda:0", rank: int = 0) -> list[dict]:
+        """A rank-local CPU service retires alongside one captured GPU parent.
+
+        Physical lowering combines many logical CPU cutpoints into one service
+        program. Do not require a fake cross-rank coordinator or TP collective.
+        The executor publishes the same sealed geometry on nodes and successful
+        initial/repeat submissions, after joining the CPU service worker.
+        """
+        rows = cls.retained_parent_records(device, rank)
+        for row in rows:
+            row["tags"]["context"] = "main_decode"
+            if row["name"] == "decode_capture_policy":
+                row["tags"]["has_collectives"] = "false"
+            if row["name"] in {"retained_parent_executable_nodes",
+                               "retained_parent_transaction_zero_launches", "retained_parent_replays"}:
+                row["tags"].update(boundary_authority="concurrent_ticket_service", ticket_service_units="1")
+                row["count"] = 3 if row["name"] == "retained_parent_replays" else 1
+        return rows
+
+    def test_rank_local_overlay_boundary_uses_completed_ticket_service(self) -> None:
+        """CUDA/CPU and ROCm/CPU need no cross-rank transaction coordinator."""
+        for device in ("cuda:0", "rocm:0"):
+            for rank in (0, 1):
+                with self.subTest(device=device, rank=rank):
+                    result = validate_graph_capture_policy(self.local_ticket_boundary_records(device, rank),
+                        "tp", f"{device} cpu:0", decode_requirement=DecodeGraphRequirement.REPLAY)
+                    self.assertIsNone(result.error)
+                    self.assertTrue(result.has_overlay_boundary_evidence)
+                    self.assertFalse(result.has_collective_evidence)
+                    self.assertFalse(result.has_pipeline_boundary_evidence)
+
+    def test_rank_local_overlay_boundary_rejects_missing_or_borrowed_retirement(self) -> None:
+        """Neither a flag, a sibling, nor unrelated TP can certify this boundary."""
+        mutations = (
+            lambda r: r.pop(2), lambda r: r.pop(4), lambda r: r.pop(5),
+            lambda r: r[2].update(rank=9), lambda r: r[4].update(device="rocm:7"),
+            lambda r: r[5]["tags"].update(context="unrelated_helper"),
+            lambda r: r[4]["tags"].update(child_units="48"),
+            lambda r: r[4]["tags"].update(ticket_service_units="2"),
+            lambda r: r[2]["tags"].update(ticket_service_units="0"),
+            lambda r: r[4]["tags"].pop("boundary_authority"),
+            lambda r: r[4].update(count=2), lambda r: r[4].update(value=0),
+            lambda r: r[4].update(value=float("nan")),
+            lambda r: r[2].update(domain="unrelated"),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                rows = self.local_ticket_boundary_records()
+                mutate(rows)
+                rows.append(counter("decode_capture_policy", tags={"has_collectives": "true"}))
+                self.assertIsNotNone(validate_graph_capture_policy(rows, "tp", "cuda:0 cpu:0").error)
+
+    def test_rank_local_ticket_boundary_never_permits_homogeneous_segmentation(self) -> None:
+        """Even valid CPU-service records cannot change the requested topology."""
+        for device in ("cuda:0", "rocm:0"):
+            self.assertIn("homogeneous", validate_graph_capture_policy(
+                self.local_ticket_boundary_records(device), device, "").error or "")
+
+    def test_decode_replay_gate_uses_native_family_and_not_prefill_or_sidecar(self) -> None:
+        """One graph policy owns replay validation for every executable family."""
+        for device in ("cuda:0", "rocm:0"):
+            for family in ("full", "retained", "segmented"):
+                with self.subTest(device=device, family=family):
+                    if family == "retained":
+                        rows = self.overlay_boundary_records(device)
+                    elif family == "segmented":
+                        rows = self.segmented_executable_records(device)
+                    else:
+                        rows = self.pipeline_boundary_records(device)
+                    self.assertIsNone(validate_graph_capture_policy(
+                        rows, "tp", f"{device} cpu:0", decode_requirement=DecodeGraphRequirement.REPLAY).error)
+                    for context in ("prefill_bucket", "mtp_decode_sidecar"):
+                        unrelated = copy.deepcopy(rows)
+                        for row in unrelated:
+                            if "context" in row["tags"]:
+                                row["tags"]["context"] = context
+                        self.assertIn("no context-matched decode", validate_graph_capture_policy(
+                            unrelated, "tp", f"{device} cpu:0",
+                            decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
+
+    def test_unused_retained_family_does_not_satisfy_required_decode_replay(self) -> None:
+        """An instantiated but unlaunched setup family cannot certify inference."""
+        rows = [row for row in self.overlay_boundary_records()
+                if row["name"] not in {"decode_capture_policy", "retained_parent_replays",
+                                       "retained_parent_transaction_zero_launches"}]
+        self.assertIsNone(validate_graph_capture_policy(rows, "tp", "cuda:0 cpu:0").error)
+        self.assertIn("expected context-matched decode", validate_graph_capture_policy(
+            rows, "tp", "cuda:0 cpu:0", decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
+
+    def test_short_probe_still_requires_decode_capture_not_only_a_plan(self) -> None:
+        """Consolidation preserves the shell's unconditional GPU capture gate."""
+        rows = [counter("full_graph_plan_graphs", tags={"type": "capturable"}),
+                counter("full_graph_capture_executable_nodes", value=17,
+                        tags={"context": "main_decode", "source": "full_graph_capture",
+                              "type": "captured_executable"})]
+        self.assertIn("no context-matched decode", validate_graph_capture_policy(
+            rows, "cuda:0", "", decode_requirement=DecodeGraphRequirement.CAPTURE).error or "")
+        rows.append(counter("decode_graph_phase", tags={"context": "main_decode", "phase": "capture"}))
+        self.assertIsNone(validate_graph_capture_policy(
+            rows, "cuda:0", "", decode_requirement=DecodeGraphRequirement.CAPTURE).error)
+        self.assertIn("expected context-matched decode", validate_graph_capture_policy(
+            rows, "cuda:0", "", decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
+
+    @staticmethod
+    def segmented_executable_records(device: str, rank: int = 1,
+                                     context: str = "main_decode") -> list[dict]:
+        """Reduce the real mixed-vendor TP artifact to two captured segments.
+
+        Setup instantiates both units without executing arithmetic. Transaction
+        zero and subsequent inference submit those same native executables.
+        One segment cannot provide another segment's physical-node evidence.
+        """
+        rows = [counter("decode_capture_policy", value=3, device=device, tags={
+                    "context": context, "has_collectives": "true",
+                    "replay_plan_policy": "allow_heterogeneous_boundary_segmentation"}),
+                counter("decode_graph_phase", device=device,
+                        tags={"context": context, "phase": "capture"}),
+                counter("decode_graph_phase", value=3, device=device,
+                        tags={"context": context, "phase": "replay"}),
+                counter("materialized_graph_transaction_zero_launches", device=device,
+                        tags={"context": context, "segments": "3"})]
+        for first, last in (("embedding", "router"), ("ffn", "output")):
+            tags = {"context": context, "first_stage": first,
+                    "last_stage": last, "stage_count": "2"}
+            rows += [counter("segmented_graph_capture_executable_nodes", value=8,
+                             device=device, tags=tags | {
+                                 "source": "segmented_graph_capture",
+                                 "type": "materialized_unlaunched_executable"}),
+                     counter("segmented_replay_segments", value=3, device=device,
+                             tags=tags | {"type": "capturable"})]
+        return [dict(row, rank=rank) for row in rows]
+
+    def test_heterogeneous_segments_require_matching_physical_executables(self) -> None:
+        """Both vendors and decode/prefill contexts obey the same native proof."""
+        for device in ("cuda:0", "rocm:0"):
+            for rank in (0, 1):
+                for context in ("main_decode", "prefill_bucket"):
+                    with self.subTest(device=device, rank=rank, context=context):
+                        rows = self.segmented_executable_records(device, rank, context)
+                        result = validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0")
+                        self.assertIsNone(result.error)
+                        self.assertTrue(result.has_segmented_execution)
+                        self.assertFalse(result.has_nonempty_full_graph_executable)
+
+    def test_heterogeneous_segment_lifecycle_rejects_incomplete_or_wrong_owner(self) -> None:
+        """A complete neighboring unit cannot hide a missing capture or launch."""
+        for device in ("cuda:0", "rocm:0"):
+            for missing in ("segmented_graph_capture_executable_nodes",
+                            "segmented_replay_segments",
+                            "materialized_graph_transaction_zero_launches"):
+                with self.subTest(device=device, missing=missing):
+                    rows = self.segmented_executable_records(device)
+                    rows.remove(next(row for row in rows if row["name"] == missing))
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error)
+            for field, value in (("rank", 0), ("device", "rocm:7"),
+                                 ("context", "unrelated_helper"), ("source", "full_graph_capture"),
+                                 ("first_stage", "different"), ("last_stage", "different"),
+                                 ("stage_count", "3"), ("stage_count", "bad"),
+                                 ("type", "captured_child_template"), ("value", 0),
+                                 ("value", float("nan")), ("value", float("inf"))):
+                with self.subTest(device=device, field=field, value=value):
+                    rows = self.segmented_executable_records(device)
+                    node = next(row for row in rows if row["name"] == "segmented_graph_capture_executable_nodes")
+                    (node if field in {"rank", "device", "value"} else node["tags"])[field] = value
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error)
+
+    def test_unused_segmented_family_needs_no_synthetic_launch(self) -> None:
+        """Setup counts are physical units/shapes, never inference invocations."""
+        rows = [row for row in self.segmented_executable_records("cuda:0")
+                if row["name"] not in {"decode_capture_policy", "segmented_replay_segments",
+                                       "materialized_graph_transaction_zero_launches"}
+                and row["tags"].get("phase") != "replay"]
+        rows.append(counter("decode_collective_graph_capture_policy",
+                            tags={"has_collectives": "true"}))
+        self.assertIsNone(validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error)
+
+    def test_each_segment_replays_after_repeated_execution(self) -> None:
+        """Repeated context submissions cannot borrow one neighbor's launches."""
+        rows = self.segmented_executable_records("rocm:0")
+        next(row for row in rows if row["name"] == "segmented_replay_segments")["value"] = 1
+        self.assertIn("missing replay", validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error or "")
+
+    def test_segment_proof_cannot_hide_eager_or_homogeneous_execution(self) -> None:
+        """Physical segments are not permission to change the topology policy."""
+        for device in ("cuda:0", "rocm:0"):
+            rows = self.segmented_executable_records(device)
+            self.assertIn("homogeneous", validate_graph_capture_policy(rows, device, "").error or "")
+            rows.append(dict(counter("decode_graph_phase", device=device,
+                tags={"context": "main_decode", "phase": "warmup"}), rank=1))
+            self.assertIn("eager warmup", validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error or "")
 
     @staticmethod
     def retained_parent_records(device: str, rank: int = 1) -> list[dict]:

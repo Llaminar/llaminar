@@ -12,6 +12,8 @@
 #include "execution/moe/MoEOverlayDistributedResidencyProtocol.h"
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "execution/moe/MoEOverlayRemoteProjectionProtocol.h"
+#include "execution/moe/MoEOverlayWireIO.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <gtest/gtest.h>
 
@@ -26,6 +28,36 @@ namespace llaminar2::test
 {
     namespace
     {
+        /** @return A rank-local ledger for bounded transaction evidence, not model weights. */
+        ExpertHistogramTransactionConfig demandAdmission()
+        {
+            PhysicalMemoryBOMBuilder bom({.world_rank = 0, .device = DeviceId::cpu(),
+                .total_bytes = 1u << 20, .admission_available_bytes = 1u << 20});
+            bom.add(PhysicalMemoryOwner::ExecutionWorkspace, 1u << 20);
+            PhysicalMemoryPlanBuilder plan;
+            plan.add(bom.build());
+            return {{16, 4, 2}, std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0)};
+        }
+
+        /** @return A frozen sample from real histogram ingress with two independent decode batches. */
+        DecodeExpertHistogramWindow demandWindow(const ExpertHistogramTransactionConfig &admission,
+                                                std::array<int, 4> routes)
+        {
+            DecodeExpertHistogramConfig config;
+            config.num_layers = 1;
+            config.num_experts = 4;
+            config.top_k = 2;
+            config.window_size = 4;
+            config.sockets = {DeviceId::cpu(), DeviceId(DeviceType::CPU, 1)};
+            config.ownership = MoELayeredExpertOwnership::uniform(1, 2, {0, 0, 1, 1});
+            config.transaction_demand = admission;
+            DecodeExpertHistogram histogram(config);
+            const float weights[]{0.5f, 0.5f};
+            histogram.record(0, routes.data(), weights, 2);
+            histogram.record(0, routes.data() + 2, weights, 2);
+            return histogram.freezeAndRotateWindow();
+        }
         /** @brief Build one whole-expert execution domain on any world rank. */
         RoutedExpertDomain domain(
             std::string name,
@@ -813,6 +845,179 @@ namespace llaminar2::test
         EXPECT_NE(error.find("geometry"), std::string::npos);
     }
 
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, TransactionCooccurrenceBelongsToWindowIdentity)
+    {
+        auto admission = demandAdmission();
+        const auto grouped = demandWindow(admission, {0, 1, 2, 3});
+        const auto mixed = demandWindow(admission, {0, 3, 1, 2});
+        ASSERT_EQ(grouped.expert_counts, mixed.expert_counts);
+        ASSERT_EQ(grouped.source_expert_counts, mixed.source_expert_counts);
+        ASSERT_EQ(grouped.generation, mixed.generation);
+        EXPECT_NE(fingerprintDecodeExpertHistogramWindow(grouped), fingerprintDecodeExpertHistogramWindow(mixed));
+        auto missing = grouped;
+        missing.transaction_demand.reset();
+        EXPECT_NE(fingerprintDecodeExpertHistogramWindow(grouped), fingerprintDecodeExpertHistogramWindow(missing));
+    }
+
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, TransactionWireRoundTripOwnsCompactAuthenticatedPayload)
+    {
+        auto source_admission = demandAdmission();
+        auto receiver = demandAdmission();
+        const auto source = demandWindow(source_admission, {0, 1, 2, 3});
+        std::vector<uint8_t> packet(moeOverlayDistributedHistogramWireBytes(source));
+        EXPECT_LT(packet.size(), moeOverlayDistributedHistogramWireBytes(1, 4, &receiver.capacity));
+        std::string error;
+        ASSERT_TRUE(encodeMoEOverlayDistributedHistogramWindow(source, packet, &error)) << error;
+        DecodeExpertHistogramWindow decoded;
+        ASSERT_TRUE(decodeMoEOverlayDistributedHistogramWindow(packet, 1, 4, &decoded, &error, &receiver)) << error;
+        ASSERT_TRUE(decoded.valid());
+        EXPECT_EQ(fingerprintDecodeExpertHistogramWindow(source), fingerprintDecodeExpertHistogramWindow(decoded));
+        ASSERT_EQ(decoded.transaction_demand->layerTransactions(0).size(), 2u);
+        EXPECT_EQ(decoded.transaction_demand->routes(0, 1).expert_ids[0], 2);
+        EXPECT_EQ(decoded.transaction_demand->topK(), 2u);
+        EXPECT_EQ(decoded.transaction_demand->tokenBoundaryLayer(), 0);
+        const auto bytes = decoded.transaction_demand->allocationBytes();
+        EXPECT_EQ(receiver.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                  PhysicalMemoryMaterializationKind::NewAllocation), bytes);
+        std::fill(packet.begin(), packet.end(), 0xff); // Reusing MPI's inbox cannot mutate a live proposal.
+        EXPECT_EQ(decoded.transaction_demand->routes(0, 0).expert_ids[0], 0);
+        decoded = {};
+        EXPECT_EQ(receiver.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                  PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
+
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, TransactionWireRejectsSameMarginalRouteTamperAndMissingEvidence)
+    {
+        auto admission = demandAdmission();
+        const auto source = demandWindow(admission, {0, 1, 2, 3});
+        std::vector<uint8_t> packet(moeOverlayDistributedHistogramWireBytes(source));
+        std::string error;
+        ASSERT_TRUE(encodeMoEOverlayDistributedHistogramWindow(source, packet, &error));
+        // Swap complete int32 IDs across the two batches. Marginals remain exact,
+        // but the alternate co-occurrence has the opposite movement payoff.
+        for (size_t byte = 0; byte < 4; ++byte)
+            std::swap(packet[packet.size() - 12 + byte], packet[packet.size() - 4 + byte]);
+        DecodeExpertHistogramWindow decoded;
+        EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(packet, 1, 4, &decoded, &error, &admission));
+        EXPECT_FALSE(decoded.valid());
+        EXPECT_NE(error.find("authentication"), std::string::npos);
+        ASSERT_TRUE(encodeMoEOverlayDistributedHistogramWindow(source, packet, &error));
+        EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(packet, 1, 4, &decoded, &error));
+        auto missing = source;
+        missing.transaction_demand.reset();
+        packet.resize(moeOverlayDistributedHistogramWireBytes(missing));
+        ASSERT_TRUE(encodeMoEOverlayDistributedHistogramWindow(missing, packet, &error));
+        EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(packet, 1, 4, &decoded, &error, &admission));
+        EXPECT_NE(error.find("missing"), std::string::npos);
+    }
+
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, TransactionWireRejectsEveryTruncationAndUnadmittedShape)
+    {
+        auto admission = demandAdmission();
+        const auto source = demandWindow(admission, {0, 1, 2, 3});
+        std::vector<uint8_t> packet(moeOverlayDistributedHistogramWireBytes(source));
+        std::string error;
+        ASSERT_TRUE(encodeMoEOverlayDistributedHistogramWindow(source, packet, &error));
+        DecodeExpertHistogramWindow decoded;
+        for (size_t bytes = 0; bytes < packet.size(); ++bytes)
+        {
+            EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(std::span(packet).first(bytes),
+                         1, 4, &decoded, &error, &admission)) << bytes;
+            EXPECT_FALSE(decoded.valid());
+        }
+        auto too_small = admission;
+        too_small.capacity = {1, 1, 2};
+        EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(packet, 1, 4, &decoded, &error, &too_small));
+        auto unowned = admission;
+        unowned.memory.reset();
+        EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(packet, 1, 4, &decoded, &error, &unowned));
+        // A hostile declared length must be checked by subtraction, not overflow.
+        std::fill_n(packet.begin() + 64, 8, uint8_t{0xff});
+        EXPECT_FALSE(decodeMoEOverlayDistributedHistogramWindow(packet, 1, 4, &decoded, &error, &admission));
+    }
+
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, TransactionProposalRetainsBatchAndPlanAuthentication)
+    {
+        auto admission = demandAdmission();
+        auto receiver = demandAdmission();
+        auto window = std::make_shared<const DecodeExpertHistogramWindow>(demandWindow(admission, {0, 1, 2, 3}));
+        MoEOverlayDistributedResidencyProposal proposal{
+            .plan = {.expected_epoch = 1, .num_layers = 1, .num_experts = 4,
+                .histogram_window = window,
+                .entries = std::vector<MoEOverlayAuthoritativeResidencyEntry>(4,
+                    {.candidate_tier_idx = 0, .candidate_owner_participant = 0})},
+            .execution_fingerprint = {.low = 1, .high = 2},
+            .policy_fingerprint = {.low = 3, .high = 4},
+        };
+        std::vector<uint8_t> packet(moeOverlayDistributedResidencyProposalWireBytes(proposal));
+        EXPECT_LT(packet.size(), moeOverlayDistributedResidencyProposalWireBytes(1, 4, &receiver.capacity));
+        std::string error;
+        ASSERT_TRUE(encodeMoEOverlayDistributedResidencyProposal(proposal, packet, &error)) << error;
+        MoEOverlayDistributedResidencyProposal decoded;
+        ASSERT_TRUE(decodeMoEOverlayDistributedResidencyProposal(packet, 1, 4, &decoded, &error, &receiver)) << error;
+        ASSERT_NE(decoded.plan.histogram_window->transaction_demand, nullptr);
+        EXPECT_EQ(fingerprintDecodeExpertHistogramWindow(*decoded.plan.histogram_window),
+                  fingerprintDecodeExpertHistogramWindow(*window));
+        EXPECT_EQ(decoded.plan.entries.back().candidate_owner_participant, 0);
+        auto alternative = proposal;
+        alternative.plan.histogram_window = std::make_shared<const DecodeExpertHistogramWindow>(
+            demandWindow(admission, {0, 3, 1, 2}));
+        std::vector<uint8_t> alternative_packet(packet.size());
+        ASSERT_TRUE(encodeMoEOverlayDistributedResidencyProposal(alternative, alternative_packet, &error));
+        // This replacement is internally authenticated with identical counts.
+        // The containing plan must still reject its different batch identity.
+        const auto header = MoEOverlayDistributedResidencyProposalHeader::kWireBytes;
+        const auto payload = moeOverlayDistributedHistogramWireBytes(*window);
+        std::copy_n(alternative_packet.begin() + header, payload, packet.begin() + header);
+        EXPECT_FALSE(decodeMoEOverlayDistributedResidencyProposal(packet, 1, 4, &decoded, &error, &receiver));
+        EXPECT_FALSE(decoded.valid());
+        EXPECT_NE(error.find("plan authentication"), std::string::npos);
+        EXPECT_EQ(receiver.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                  PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
+
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, TransactionPayloadRejectsMalformedDescriptorsBeforePublication)
+    {
+        auto admission = demandAdmission();
+        auto receiver = demandAdmission();
+        const auto source = demandWindow(admission, {0, 1, 2, 3});
+        std::vector<uint8_t> packet(source.transaction_demand->wireBytes());
+        source.transaction_demand->encodeWire(packet);
+        auto envelope = source;
+        envelope.transaction_demand.reset();
+        // Descriptor zero starts after the 8-byte model and 16-byte layer headers.
+        for (uint32_t malformed : {0u, 5u, std::numeric_limits<uint32_t>::max()})
+        {
+            auto corrupted = packet;
+            size_t offset = 24;
+            moe_overlay_wire::writeLittleEndian(corrupted, offset, malformed);
+            EXPECT_THROW((void)DecodeExpertTransactionWindow::decodeWire(receiver, envelope, corrupted),
+                         std::invalid_argument);
+            EXPECT_EQ(receiver.memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                      PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        }
+        // Every descriptor still fits; the second batch nevertheless begins
+        // after this smaller receiver's sample would already have closed.
+        auto smaller = receiver;
+        smaller.capacity = {1, 4, 2};
+        EXPECT_THROW((void)DecodeExpertTransactionWindow::decodeWire(smaller, envelope, packet),
+                     std::invalid_argument);
+    }
+
+    TEST(Test__MoEOverlayDistributedResidencyProtocol, ScalarCodecRejectsOutOfBoundsWithoutAdvancingCursor)
+    {
+        std::array<uint8_t, 4> bytes{};
+        size_t offset = 0;
+        moe_overlay_wire::writeLittleEndian(bytes, offset, int32_t{-2});
+        EXPECT_EQ(bytes, (std::array<uint8_t, 4>{0xfe, 0xff, 0xff, 0xff}));
+        EXPECT_THROW((void)moe_overlay_wire::readLittleEndian<uint32_t>(bytes, offset), std::out_of_range);
+        EXPECT_EQ(offset, 4u);
+        EXPECT_THROW(moe_overlay_wire::writeLittleEndian(bytes, offset, uint8_t{1}), std::out_of_range);
+        EXPECT_EQ(offset, 4u);
+        offset = 0;
+        EXPECT_EQ(moe_overlay_wire::readLittleEndian<int32_t>(bytes, offset), -2);
+    }
+
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
         IndependentRankTransactionsHaveIdenticalCompleteFingerprint)
@@ -875,6 +1080,8 @@ namespace llaminar2::test
             .migration_profile_identity = "movement-profile-a",
             .smoothed_through_generation =
                 measured.histogram_generation,
+            .forecast_fingerprint = fingerprintDecodeExpertHistogramWindow(
+                *measured.histogram_window),
             .historical_window_weight = 3,
             .current_window_weight = 1,
             .payoff_horizon_tokens = 8,
@@ -908,6 +1115,17 @@ namespace llaminar2::test
         EXPECT_NE(
             fingerprintMoEOverlayResidencyTransaction(different_profile),
             measured_fingerprint);
+
+        auto different_forecast = measured;
+        different_forecast.economy.forecast_fingerprint ^= 0x8000000000000000ULL;
+        ASSERT_TRUE(different_forecast.valid());
+        EXPECT_NE(fingerprintMoEOverlayResidencyTransaction(different_forecast),
+                  measured_fingerprint);
+        EXPECT_EQ(fingerprintMoEOverlayResidencyExecutionPlan(different_forecast),
+                  fingerprintMoEOverlayResidencyExecutionPlan(measured));
+        auto missing_forecast = measured;
+        missing_forecast.economy.forecast_fingerprint = 0;
+        EXPECT_FALSE(missing_forecast.valid());
 
         auto different_policy = measured;
         different_policy.economy.payoff_horizon_tokens = 9;

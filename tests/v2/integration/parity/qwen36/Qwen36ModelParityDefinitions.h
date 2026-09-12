@@ -57,6 +57,7 @@ namespace llaminar2::test::parity::qwen36
                 kModelParityRequiredMaximumMTPDepth,
             .mtp_checkpoint_surface =
                 qwen36DenseMTPCheckpointSurface(),
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
     }
 
@@ -82,6 +83,7 @@ namespace llaminar2::test::parity::qwen36
             .kv_heads = 2,
             .maximum_mtp_draft_depth =
                 kModelParityRequiredMaximumMTPDepth,
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
     }
 
@@ -236,12 +238,16 @@ namespace llaminar2::test::parity::qwen36
          */
         config.dynamic_imbalance_threshold_per_mille = 1000;
         /*
-         * The first one-token boundary still forces physical movement.  Once
-         * that epoch retires, leave one complete maximum-width MTP verifier
+         * The first boundary must admit the checkpoint's two-token response
+         * without splitting it across reusable transaction snapshot banks.
+         * It still forces physical movement within the short decode trace.
+         * Once that epoch retires, leave one complete maximum-width MTP verifier
          * transaction between maintenance boundaries.  Otherwise a cadence
          * of one marks every adaptive-depth observation budget-limited and the
          * two independent device controllers can never both make progress.
          */
+        config.device_initial_maintenance_period_tokens =
+            makeMTPParityCheckpointTransactionPlan(true, 1).response_token_budget;
         config.device_min_maintenance_period_tokens =
             kModelParityRequiredMaximumMTPDepth + 1;
         config.release_raw_expert_weights = false;

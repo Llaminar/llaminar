@@ -31,9 +31,18 @@ Llaminar supports the following model architectures initially:
 
 ## Benchmarks
 
-Latest benchmarks can be found here: 
+For homogeneous multi-GPU MoE, `--moe-hot-expert-cache` is a replica-cache
+upper bound. Physical admission fits the largest positive cache alongside
+the complete model and graph allocations; it never disables Dynamic movement
+to fit. The resolved capacity is reported during setup.
 
-https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/e126900d/benchmark_results.csv
+Production benchmarks use the canonical model-parity cells tagged for E2E
+certification. The [production CI guide](docs/production-ci.md) describes the
+local/hosted pipeline, independent AVX512/AVX2 image certificates, and checked-in
+[high-water marks](benchmarks/production/high_water.json). Official successful
+runs commit their compact result JSON under `benchmarks/production/results/`.
+Both full E2E server suites pass before either image's benchmarks run; ISA-specific
+high-water marks and certificates are never reused across the two images.
 
 ## Quickstart
 
@@ -103,10 +112,12 @@ case "$LLAMINAR_CPU_ISA" in
   *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
 esac
 
-export LLAMINAR_CPU_IMAGE="ghcr.io/llaminar/llaminar:develop-cpu-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_CUDA_IMAGE="ghcr.io/llaminar/llaminar:develop-cuda13.0-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_ROCM_IMAGE="ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:develop-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+# Use the immutable tag emitted by a successful production CI/release run.
+export LLAMINAR_IMAGE_TAG="replace-with-certified-tag"
+export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
+export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
+export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
 # docker run pulls these public GHCR images automatically when needed.
 export AMD_KFD_GID="$(stat -c '%g' /dev/kfd 2>/dev/null || true)"
 export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'renderD*' 2>/dev/null | head -n1)" 2>/dev/null || true)"
@@ -179,6 +190,35 @@ exact Quickstart header as a full server case.
 ```bash
 docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 "$LLAMINAR_FULL_IMAGE" serve --host 0.0.0.0 --port 8080 --tp-devices cuda:0,rocm:0 --backend host "${MOE_PREFIX_FLAGS[@]}" -m "$MODEL_MOE"
 ```
+
+#### Exact completion token IDs
+
+Non-streaming `/v1/chat/completions` requests may set `"return_token_ids": true`.
+The response then includes `token_ids.prompt` (the actual templated input) and
+`token_ids.completion` (ordered committed output, including stop tokens and any
+forced thinking continuation). Counts agree with `usage`; displayed text may
+omit tokens used for framing or termination. This option does not change
+sampling, MTP, graph execution, or prefix-cache behavior, and performs no extra
+model-state download. Streaming requests with this option return HTTP 400.
+Without it, the response format and token-storage cost are unchanged.
+
+The independent `"return_runtime_summary": true` option includes a versioned
+`runtime_summary` with the completed request's prefix-cache outcome and MTP
+statistics. This is the runner's existing terminal observation, not a live-state
+probe or a reconstruction from PerfStats. It remains available when profiling
+and INFO logging are disabled. Streaming requests with this option return HTTP
+400; ordinary responses omit it.
+Within `prefix_cache`, `hit` denotes a full hit and `partial_hit` denotes a
+partial restore; these flags are mutually exclusive, not an aggregate hit flag.
+The optional `expert_movement` member contains the placement owner's completed
+edge, economy and host-admission records. Its explicit `model_lifetime` scope
+is cumulative: successive responses overlap and must not be summed as separate
+request totals. Logical `movement_axis` and physical `direction` are independent;
+unknown MPI ranks are `null`, and estimated weight bytes remain labeled as
+estimates. This export reads the existing immutable ledger once before request
+cleanup, without advancing or waiting for maintenance. Ordinary responses and
+INFO logging do not copy this journal. Truncated or malformed owner evidence
+fails the requested export rather than being presented as zero movement.
 
 ## Llaminar Architecture
 
@@ -404,7 +444,7 @@ After reboot, confirm the AMD device nodes exist:
 ls -l /dev/kfd /dev/dri/render*
 ```
 
-5. Pull the public GHCR runtime images:
+5. Pull the independently certified runtime image for this host's ISA:
 
 ```bash
 export LLAMINAR_CPU_ISA=AVX512  # or AVX2
@@ -414,21 +454,21 @@ case "$LLAMINAR_CPU_ISA" in
   *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
 esac
 
-export LLAMINAR_CPU_IMAGE="ghcr.io/llaminar/llaminar:develop-cpu-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_CUDA_IMAGE="ghcr.io/llaminar/llaminar:develop-cuda13.0-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_ROCM_IMAGE="ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:develop-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+# Use the immutable tag emitted by a successful production CI/release run.
+export LLAMINAR_IMAGE_TAG="replace-with-certified-tag"
+export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
+export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
+export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
 
-docker pull "$LLAMINAR_CPU_IMAGE"
-docker pull "$LLAMINAR_CUDA_IMAGE"
-docker pull "$LLAMINAR_ROCM_IMAGE"
 docker pull "$LLAMINAR_FULL_IMAGE"
 ```
 
-Docker also pulls these public images automatically on first `docker run`. Use
-the CPU, CUDA, or ROCm image when the target machine only needs one backend; use
-the full image for mixed CUDA+ROCm runs. The unsuffixed aliases are AVX512
-builds; append `-avx2` for the AVX2 builds.
+Docker also pulls the image automatically on first `docker run`. Official
+certification ships full CPU/CUDA/ROCm images for both ISAs; the example backend
+variables name that same artifact. Backend selection remains a runtime CLI
+choice. Unsuffixed tags are AVX512; append `-avx2` for independently certified
+AVX2 images. Local backend-subset builds below do not carry these certificates.
 
 To build images locally instead of pulling GHCR, use the release image build
 script:
@@ -519,7 +559,7 @@ export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
 export MODEL_TP_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 ```
 
-Use the public GHCR develop release aliases:
+Use the immutable tag from a successful production CI/release run:
 
 ```bash
 export LLAMINAR_CPU_ISA=AVX512  # or AVX2
@@ -529,10 +569,12 @@ case "$LLAMINAR_CPU_ISA" in
   *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
 esac
 
-export LLAMINAR_CPU_IMAGE="ghcr.io/llaminar/llaminar:develop-cpu-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_CUDA_IMAGE="ghcr.io/llaminar/llaminar:develop-cuda13.0-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_ROCM_IMAGE="ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:develop-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+# Use the immutable tag emitted by a successful production CI/release run.
+export LLAMINAR_IMAGE_TAG="replace-with-certified-tag"
+export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
+export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
+export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
 ```
 
 For local builds, override these variables with tags such as `llaminar:cpu`,

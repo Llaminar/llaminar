@@ -12,6 +12,8 @@
 #include <gmock/gmock.h>
 
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/MoEMovementLedgerJson.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "mocks/MockOrchestrationRunner.h"
 #include "mocks/MockTokenizer.h"
 #include "utils/Logger.h"
@@ -34,9 +36,11 @@ using ::testing::Throw;
 // Test fixture
 // =============================================================================
 
+/** @brief Device-free HTTP fixture that forbids live probes and unsolicited ledger copies. */
 class Test__ChatCompletionHandler : public ::testing::Test
 {
 protected:
+    /** @brief Install inert dependencies and strict default observation boundaries. */
     void SetUp() override
     {
         runner_ = std::make_unique<MockOrchestrationRunner>();
@@ -47,11 +51,13 @@ protected:
         EXPECT_CALL(*runner_, maybeApplyMoERebalance(_))
             .Times(AnyNumber())
             .WillRepeatedly(Return(true));
-        EXPECT_CALL(*runner_, prefixStateProbe())
+        EXPECT_CALL(*runner_, prefixStateProbe(testing::_))
             .Times(0);
         EXPECT_CALL(*runner_, requestRuntimeSummary())
             .Times(AnyNumber())
             .WillRepeatedly(Return(RequestRuntimeSummary{}));
+        // INFO logging and ordinary replies must never copy the lifetime ledger.
+        EXPECT_CALL(*runner_, moeOptimizationMovementLedger()).Times(0);
         previous_log_level_ = Logger::getInstance().getLogLevel();
         Logger::getInstance().setLogLevel(LogLevel::INFO);
 
@@ -590,6 +596,8 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseFormat_OpenAICompatibl
     EXPECT_EQ(response.http_status, 200);
 
     auto body = json::parse(response.json_body);
+    EXPECT_FALSE(body.contains("token_ids"));
+    EXPECT_FALSE(body.contains("runtime_summary"));
     EXPECT_EQ(body["object"], "chat.completion");
     EXPECT_EQ(body["choices"][0]["message"]["role"], "assistant");
     EXPECT_EQ(body["choices"][0]["message"]["content"], "hello world");
@@ -597,6 +605,507 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseFormat_OpenAICompatibl
     EXPECT_EQ(body["usage"]["prompt_tokens"], 3);
     EXPECT_EQ(body["usage"]["completion_tokens"], 3); // 100, 200, 0(stop)
     EXPECT_EQ(body["usage"]["total_tokens"], 6);
+}
+
+/** Optional token IDs are terminal output, never a new inference mode. */
+TEST_F(Test__ChatCompletionHandler, TokenIds_RequestPolicyIsExplicitAndNonStreaming)
+{
+    ChatCompletionResponse error;
+    auto request = ChatCompletionHandler::parseRequest(minimalRequest(), error);
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->token_output, CompletionTokenOutput::TextOnly);
+    request = ChatCompletionHandler::parseRequest(minimalRequest({{"return_token_ids", true}}), error);
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->token_output, CompletionTokenOutput::TextAndIds);
+    for (const json &invalid : {json(nullptr), json(1), json("true"), json::array()})
+    {
+        auto body = json::parse(minimalRequest());
+        body["return_token_ids"] = invalid;
+        EXPECT_FALSE(ChatCompletionHandler::parseRequest(body.dump(), error));
+        EXPECT_EQ(error.http_status, 400);
+    }
+    EXPECT_FALSE(ChatCompletionHandler::parseRequest(
+        minimalRequest({{"return_token_ids", true}, {"stream", true}}), error));
+    EXPECT_EQ(error.http_status, 400);
+    EXPECT_TRUE(ChatCompletionHandler::parseRequest(
+        minimalRequest({{"return_token_ids", false}, {"stream", true}}), error));
+}
+
+/** A typed streaming caller cannot silently drop the requested representation. */
+TEST_F(Test__ChatCompletionHandler, TokenIds_StreamingRejectionPrecedesInference)
+{
+    EXPECT_CALL(*runner_, clearCache()).Times(0);
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+    EXPECT_CALL(*runner_, decodeStep()).Times(0);
+    ChatCompletionRequest request;
+    request.token_output = CompletionTokenOutput::TextAndIds;
+    request.stream = true;
+    auto response = makeHandler()->handleStreamingRequest(request, [](const std::string &) {
+        ADD_FAILURE() << "unsupported response must not emit chunks";
+        return true;
+    });
+    EXPECT_FALSE(response.ok);
+    EXPECT_EQ(response.http_status, 400);
+}
+
+/** The optional completed summary has explicit admission, not truthy JSON flags. */
+TEST_F(Test__ChatCompletionHandler, RuntimeSummary_ParsesTypedNonStreamingPolicy)
+{
+    ChatCompletionResponse error;
+    auto request = ChatCompletionHandler::parseRequest(minimalRequest(), error);
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->runtime_output, CompletionRuntimeOutput::Omit);
+    request = ChatCompletionHandler::parseRequest(minimalRequest({{"return_runtime_summary", true}}), error);
+    ASSERT_TRUE(request);
+    EXPECT_EQ(request->runtime_output, CompletionRuntimeOutput::Include);
+    for (const json &invalid : {json(nullptr), json(1), json("true"), json::array()})
+    {
+        auto body = json::parse(minimalRequest());
+        body["return_runtime_summary"] = invalid;
+        EXPECT_FALSE(ChatCompletionHandler::parseRequest(
+            body.dump(), error));
+        EXPECT_EQ(error.http_status, 400);
+    }
+    EXPECT_FALSE(ChatCompletionHandler::parseRequest(
+        minimalRequest({{"return_runtime_summary", true}, {"stream", true}}), error));
+    EXPECT_EQ(error.http_status, 400);
+    EXPECT_TRUE(ChatCompletionHandler::parseRequest(
+        minimalRequest({{"return_runtime_summary", false}, {"stream", true}}), error));
+}
+
+/** A typed streaming caller cannot silently discard requested terminal evidence. */
+TEST_F(Test__ChatCompletionHandler, RuntimeSummary_RejectsStreamingBeforeInference)
+{
+    EXPECT_CALL(*runner_, clearCache()).Times(0);
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+    EXPECT_CALL(*runner_, decodeStep()).Times(0);
+    EXPECT_CALL(*runner_, requestRuntimeSummary()).Times(0);
+    ChatCompletionRequest request;
+    request.runtime_output = CompletionRuntimeOutput::Include;
+    EXPECT_EQ(makeHandler()->handleStreamingRequest(request,
+        [](const std::string &) { return true; }).http_status, 400);
+}
+
+/** JSON and logs share one terminal observation even when INFO is disabled. */
+TEST_F(Test__ChatCompletionHandler, RuntimeSummary_ProjectsOutcomeWithoutLiveProbe)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{7, 8}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return("A"));
+    EXPECT_CALL(*runner_, decodeStep()).Times(2).WillRepeatedly(Return(makeToken(10)));
+    EXPECT_CALL(*runner_, prefixStateProbe(_)).Times(0);
+    RequestRuntimeSummary outcome;
+    outcome.prefix_request.enabled = true;
+    outcome.prefix_request.hit = false; // Full-hit and partial-hit outcomes are exclusive.
+    outcome.prefix_request.partial_hit = true;
+    outcome.prefix_request.requested_tokens = 2;
+    outcome.prefix_request.matched_tokens = 1;
+    outcome.prefix_request.hybrid_state_restored = true;
+    outcome.prefix_request.storage_tier = "ram";
+    outcome.prefix_request.admission_placement_epochs = PrefixPlacementEpochSpan::covering(17, 19);
+    outcome.prefix_request.completion_movement_epoch = 23;
+    outcome.mtp_request.enabled = true;
+    outcome.mtp_request.draft_steps = 27;
+    outcome.mtp_request.adaptive_depth_enabled = true;
+    outcome.mtp_request.max_depth = 15;
+    outcome.mtp_verifier_runs = 9;
+    EXPECT_CALL(*runner_, requestRuntimeSummary()).Times(2).WillRepeatedly(Return(outcome));
+    EXPECT_CALL(*runner_, moeOptimizationMovementLedger())
+        .Times(2).WillRepeatedly(Return(MoEOptimizationMovementLedger{}));
+    ChatCompletionRequest request;
+    request.messages = {{"user", "story"}};
+    request.max_tokens = 1;
+    request.enable_thinking = false;
+    request.runtime_output = CompletionRuntimeOutput::Include;
+    for (const auto level : {LogLevel::INFO, LogLevel::WARN})
+    {
+        Logger::getInstance().setLogLevel(level);
+        const auto response = makeHandler()->handleRequest(request);
+        ASSERT_TRUE(response.ok);
+        const auto body = json::parse(response.json_body);
+        EXPECT_FALSE(body.contains("token_ids")); // Independent extension.
+        const auto &summary = body.at("runtime_summary");
+        EXPECT_EQ(summary.at("schema"), 1);
+        const auto &prefix = summary.at("prefix_cache");
+        EXPECT_EQ(prefix.at("partial_hit"), true);
+        EXPECT_EQ(prefix.at("hit"), false);
+        EXPECT_EQ(prefix.at("matched_tokens"), 1);
+        EXPECT_EQ(prefix.at("hybrid_state_restored"), true);
+        EXPECT_EQ(prefix.at("storage_tier"), "ram");
+        EXPECT_EQ(prefix.at("admission_epoch_earliest"), 17);
+        EXPECT_EQ(prefix.at("admission_epoch_latest"), 19);
+        EXPECT_EQ(prefix.at("completion_movement_epoch"), 23);
+        EXPECT_EQ(summary.at("mtp").at("draft_steps"), 27);
+        EXPECT_EQ(summary.at("mtp").at("verifier_runs"), 9);
+        EXPECT_EQ(summary.at("mtp").at("max_depth"), 15);
+        EXPECT_EQ(summary.at("expert_movement").at("scope"), "model_lifetime");
+        EXPECT_TRUE(summary.at("expert_movement").at("edges").empty());
+    }
+}
+
+namespace
+{
+    /**
+     * @brief Build a complete two-edge cycle without creating any device state.
+     * @param authority Host or device owner whose evidence is being projected.
+     * @return Valid publication, economy and (for Host) admission records.
+     */
+    MoEOptimizationMovementLedger completedMovementFixture(MoEOptimizationAuthority authority)
+    {
+        MoEOptimizationMovementEdge promotion{
+            .authority = authority, .transaction = 2, .candidate_epoch = 2,
+            .layer = 31, .expert = 75, .cycle_index = 0, .cycle_size = 2,
+            .direction = MoEOptimizationMovementDirection::Promotion,
+            .axis = MoEOptimizationMovementAxis::Combined,
+            .source_participant = 4, .destination_participant = 1,
+            .source_priority = 17, .destination_priority = -20,
+            .source_device = authority == MoEOptimizationAuthority::Host
+                ? DeviceId::cpu() : DeviceId::cuda(1),
+            .destination_device = DeviceId::rocm(3),
+            .source_world_rank = 7, .destination_world_rank = 99,
+            .source_world_rank_known = true, .destination_world_rank_known = false,
+            .estimated_weight_bytes = (std::uint64_t{1} << 55) + 3,
+            .activation_count = 123, .blocking_inference = false,
+        };
+        auto demotion = promotion;
+        demotion.expert = 108;
+        demotion.direction = MoEOptimizationMovementDirection::Demotion;
+        std::swap(demotion.source_participant, demotion.destination_participant);
+        std::swap(demotion.source_priority, demotion.destination_priority);
+        std::swap(demotion.source_device, demotion.destination_device);
+        std::swap(demotion.source_world_rank, demotion.destination_world_rank);
+        std::swap(demotion.source_world_rank_known, demotion.destination_world_rank_known);
+        MoEOptimizationMovementLedger ledger;
+        ledger.edges = {promotion, demotion};
+        ledger.economy.push_back({
+            .authority = authority, .transaction = 2, .candidate_epoch = 2,
+            .command_count = 2, .cycle_count = 1,
+            .proof = MoEOptimizationTimeEconomy{
+            .projected_service_gain_ns = 1000,
+            .projected_transfer_and_repack_ns = 100,
+            .projected_inference_interference_ns = 10,
+            .projected_net_benefit_ns = 890,
+            },
+        });
+        if (authority == MoEOptimizationAuthority::Host)
+            ledger.host_admissions.push_back({
+                .authority = authority, .transaction = 2, .candidate_epoch = 2,
+                .maximum_concurrent_cycles = 3,
+                .candidate_cycles = 3, .policy_eligible_cycles = 2,
+                .policy_eligible_axes = {.tier_residency = 1, .combined = 1},
+                .admitted_candidate_cycles = 1, .admitted_candidate_axes = {.combined = 1},
+                .admitted_physical_cycles = 1, .admitted_physical_axes = {.combined = 1},
+                .individual_policy_rejected_cycles = 1, .dependent_payoff_rejected_cycles = 1,
+                .dependent_cohort_candidates = 2, .dependent_cohort_payoff_rejections = 1,
+                .policy_bounded = true,
+            });
+        return ledger;
+    }
+}
+
+/** Device-free projection retains exact identities, integer widths and every proof family. */
+TEST(Test__MoEMovementLedgerJson, ProjectsHostAndDeviceEvidenceWithoutRecounting)
+{
+    for (const auto authority : {MoEOptimizationAuthority::Host, MoEOptimizationAuthority::Device})
+    {
+        const auto ledger = completedMovementFixture(authority);
+        const auto wire = json::parse(moeMovementLedgerJson(ledger).dump());
+        EXPECT_EQ(wire.at("schema"), 2);
+        EXPECT_EQ(wire.at("scope"), "model_lifetime");
+        EXPECT_EQ(wire.at("complete"), true);
+        ASSERT_EQ(wire.at("edges").size(), 2u);
+        const auto &edge = wire.at("edges").at(0);
+        EXPECT_EQ(edge.at("authority"), authority == MoEOptimizationAuthority::Host ? "host" : "device");
+        EXPECT_EQ(edge.at("transaction"), 2);
+        EXPECT_EQ(edge.at("candidate_epoch"), 2);
+        EXPECT_EQ(edge.at("layer"), 31);
+        EXPECT_EQ(edge.at("expert"), 75);
+        EXPECT_EQ(edge.at("cycle_index"), 0);
+        EXPECT_EQ(edge.at("cycle_size"), 2);
+        EXPECT_EQ(edge.at("source_participant"), 4);
+        EXPECT_EQ(edge.at("destination_participant"), 1);
+        EXPECT_EQ(edge.at("source_priority"), 17);
+        EXPECT_EQ(edge.at("destination_priority"), -20);
+        EXPECT_EQ(edge.at("source_device"), ledger.edges[0].source_device.toString());
+        EXPECT_EQ(edge.at("destination_device"), DeviceId::rocm(3).toString());
+        EXPECT_EQ(edge.at("source_world_rank"), 7);
+        EXPECT_TRUE(edge.at("destination_world_rank").is_null());
+        EXPECT_TRUE(edge.at("estimated_weight_bytes").is_number_unsigned());
+        EXPECT_EQ(edge.at("estimated_weight_bytes").get<std::uint64_t>(), ledger.edges[0].estimated_weight_bytes);
+        EXPECT_EQ(edge.at("activation_count"), 123);
+        EXPECT_EQ(edge.at("blocking_inference"), false);
+        EXPECT_EQ(edge.at("movement_axis"), "combined");
+        EXPECT_EQ(edge.at("direction"), "promotion");
+        EXPECT_EQ(wire.at("edges").at(1).at("direction"), "demotion");
+        EXPECT_EQ(wire.at("edges").at(1).at("expert"), 108);
+        ASSERT_EQ(wire.at("economy").size(), 1u);
+        EXPECT_EQ(wire.at("economy").at(0).at("policy"), "time_ns");
+        EXPECT_EQ(wire.at("economy").at(0).at("projected_net_benefit_ns"), 890);
+        EXPECT_EQ(wire.at("economy").at(0).at("command_count"), 2);
+        if (authority == MoEOptimizationAuthority::Device)
+            EXPECT_TRUE(wire.at("host_admissions").empty());
+        else
+        {
+            ASSERT_EQ(wire.at("host_admissions").size(), 1u);
+            const auto &admission = wire.at("host_admissions").at(0);
+            EXPECT_EQ(admission.at("cycle_capacity_kind"), "bounded");
+            EXPECT_EQ(admission.at("maximum_concurrent_cycles"), 3);
+            EXPECT_EQ(admission.at("policy_eligible_axes").at("tier_residency"), 1);
+            EXPECT_EQ(admission.at("admitted_physical_axes").at("combined"), 1);
+            EXPECT_EQ(admission.at("dependent_cohort_candidates"), 2);
+            EXPECT_EQ(admission.at("policy_bounded"), true);
+            auto unbounded = ledger;
+            unbounded.host_admissions[0].cycle_capacity_kind = MoEOptimizationCycleCapacityKind::Unbounded;
+            unbounded.host_admissions[0].maximum_concurrent_cycles = 0;
+            const auto alternative = moeMovementLedgerJson(unbounded);
+            EXPECT_EQ(alternative.at("host_admissions").at(0).at("cycle_capacity_kind"), "unbounded");
+            EXPECT_EQ(alternative.at("host_admissions").at(0).at("maximum_concurrent_cycles"), 0);
+        }
+    }
+}
+
+/** Native policy proofs preserve dimensionless thresholds and exact load counts. */
+TEST(Test__MoEMovementLedgerJson, NativePolicyRetainsLoadUnitsWithoutNanosecondEstimates)
+{
+    auto ledger = completedMovementFixture(MoEOptimizationAuthority::Device);
+    const DeviceMoERebalanceLoadSpreadProof load{
+        .accepted_spread_improvement = 40, .pre_wave_spread = 100, .post_wave_spread = 60,
+        .pre_wave_total = 200, .post_wave_total = 200,
+        .pre_participant_spread = 0, .post_participant_spread = 20,
+        .pre_participant_total = 200, .post_participant_total = 200,
+        .requested_payload_slots = 1, .minimum_improvement_per_slot = 40,
+        .maximum_post_spread_per_mille = 300, .ownership_swap_accepts = 1};
+    ledger.economy[0].proof = load;
+    const auto wire = moeMovementLedgerJson(ledger).at("economy").at(0);
+    EXPECT_EQ(wire.at("policy"), "native_load_spread");
+    EXPECT_EQ(wire.at("pre_wave_spread"), 100);
+    EXPECT_EQ(wire.at("post_wave_spread"), 60);
+    EXPECT_EQ(wire.at("minimum_improvement_per_slot"), 40);
+    EXPECT_EQ(wire.at("maximum_post_spread_per_mille"), 300);
+    EXPECT_EQ(wire.at("ownership_swap_accepts"), 1);
+    EXPECT_FALSE(wire.contains("projected_service_gain_ns"));
+    EXPECT_FALSE(wire.contains("projected_transfer_and_repack_ns"));
+    EXPECT_FALSE(wire.contains("projected_inference_interference_ns"));
+    EXPECT_FALSE(wire.contains("projected_net_benefit_ns"));
+    ledger.economy[0].authority = MoEOptimizationAuthority::Host;
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+    ledger.economy[0].authority = MoEOptimizationAuthority::Device;
+    ledger.economy[0].command_count += 1;
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+}
+
+/** Static/non-overlay execution supplies a complete empty lifetime observation. */
+TEST(Test__MoEMovementLedgerJson, EmptyLedgerIsExplicitAndDoesNotInventAnAuthority)
+{
+    const auto wire = moeMovementLedgerJson({});
+    EXPECT_EQ(wire.at("complete"), true);
+    EXPECT_TRUE(wire.at("edges").empty());
+    EXPECT_TRUE(wire.at("economy").empty());
+    EXPECT_TRUE(wire.at("host_admissions").empty());
+    EXPECT_FALSE(wire.contains("authority"));
+}
+
+/** Geometry is independent of journal activity, and rejects impossible owner/axis combinations. */
+TEST(Test__MoEMovementLedgerJson, FrozenTopologyPreservesEveryAuthorityAndAxis)
+{
+    EXPECT_EQ(moeMovementTopologyJson({})["authority"], "none");
+    for (const auto authority : {MoEOptimizationAuthority::Host, MoEOptimizationAuthority::Device})
+        for (const auto axes : {MoEOptimizationMovementAxes::None, MoEOptimizationMovementAxes::TierResidency,
+                               MoEOptimizationMovementAxes::ParticipantPlacement, MoEOptimizationMovementAxes::Both})
+        {
+            const auto wire = moeMovementTopologyJson({.authority = authority, .axes = axes});
+            EXPECT_EQ(wire["schema"], 1);
+            EXPECT_EQ(wire["scope"], "model_lifetime");
+            EXPECT_EQ(wire["authority"], authority == MoEOptimizationAuthority::Host ? "host" : "device");
+            EXPECT_EQ(wire["available_axes"].size(),
+                      int(hasTierResidencyAxis(axes)) + int(hasParticipantPlacementAxis(axes)));
+        }
+    for (const auto invalid : {
+             MoEOptimizationMovementTopology{.axes = MoEOptimizationMovementAxes::Both},
+             MoEOptimizationMovementTopology{.authority = static_cast<MoEOptimizationAuthority>(99)},
+             MoEOptimizationMovementTopology{.authority = MoEOptimizationAuthority::Device,
+                                            .axes = static_cast<MoEOptimizationMovementAxes>(99)}})
+        EXPECT_THROW(moeMovementTopologyJson(invalid), std::invalid_argument);
+}
+
+/** Logical objectives cannot be collapsed into physical promotion/demotion direction. */
+TEST(Test__MoEMovementLedgerJson, PreservesEveryAxisAndSamePriorityDirection)
+{
+    auto ledger = completedMovementFixture(MoEOptimizationAuthority::Device);
+    auto &edge = ledger.edges[0];
+    edge.direction = MoEOptimizationMovementDirection::SamePriority;
+    edge.destination_priority = edge.source_priority;
+    for (const auto &[axis, name] : {
+            std::pair{MoEOptimizationMovementAxis::TierResidency, "tier_residency"},
+            std::pair{MoEOptimizationMovementAxis::ParticipantPlacement, "participant_placement"},
+            std::pair{MoEOptimizationMovementAxis::Combined, "combined"}})
+    {
+        edge.axis = axis;
+        const auto wire = moeMovementLedgerJson(ledger);
+        EXPECT_EQ(wire.at("edges").at(0).at("movement_axis"), name);
+        EXPECT_EQ(wire.at("edges").at(0).at("direction"), "same_priority");
+    }
+}
+
+/** Lost, malformed or contradictory evidence must never become a successful observation. */
+TEST(Test__MoEMovementLedgerJson, RejectsTruncationAndMalformedOwnerRecords)
+{
+    const auto valid = completedMovementFixture(MoEOptimizationAuthority::Host);
+    for (auto field : {&MoEOptimizationMovementLedger::discarded_edges,
+                       &MoEOptimizationMovementLedger::discarded_economy_records,
+                       &MoEOptimizationMovementLedger::discarded_host_admission_records})
+    {
+        auto ledger = valid;
+        ledger.*field = 1;
+        EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+    }
+    auto ledger = valid;
+    ledger.edges.push_back({});
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+    ledger = valid;
+    ledger.edges[0].axis = static_cast<MoEOptimizationMovementAxis>(255);
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+    ledger = valid;
+    ledger.edges[0].direction = static_cast<MoEOptimizationMovementDirection>(255);
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+    ledger = valid;
+    ledger.edges[0].authority = static_cast<MoEOptimizationAuthority>(255);
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+    ledger = valid;
+    std::get<MoEOptimizationTimeEconomy>(ledger.economy[0].proof).projected_net_benefit_ns += 1;
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+    ledger = valid;
+    ledger.host_admissions[0].candidate_cycles += 1;
+    EXPECT_THROW(moeMovementLedgerJson(ledger), std::invalid_argument);
+}
+
+/** Opt-in HTTP observes once, after generation and before the cleanup reset. */
+TEST_F(Test__ChatCompletionHandler, RuntimeSummary_MovementIsTerminalPassiveAndBeforeCleanup)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{7, 8}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return("A"));
+    EXPECT_CALL(*runner_, moeOptimizationStatus()).Times(0);
+    const auto ledger = completedMovementFixture(MoEOptimizationAuthority::Host);
+    OrchestrationConfig resolved_config;
+    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+    plan->enabled = true;
+    plan->domains = {{.name = "cpu", .participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}},
+                     {.name = "gpu", .participants = {GlobalDeviceAddress::rocm(0)}}};
+    plan->routed_tiers = {{.name = "a", .domain = "cpu", .priority = 9},
+                          {.name = "b", .domain = "gpu", .priority = -3}};
+    plan->placements = {{.layer = 0, .routed_expert_tier = {0, 0, 1}}};
+    plan->authority_execution = resolveMoEOverlayAuthorityExecutionKind(*plan);
+    resolved_config.moe_routed_expert_plan = plan;
+    ON_CALL(*runner_, config()).WillByDefault(testing::ReturnRef(resolved_config));
+    int completed_steps = 0;
+    bool observed = false;
+    // A grouped result followed by a terminal row catches both per-step and
+    // per-token ledger reads: neither is a completed-request observation.
+    EXPECT_CALL(*runner_, decodeStep()).Times(2).WillRepeatedly(Invoke([&] {
+        ++completed_steps;
+        return completed_steps == 1 ? makeTokens({10, 10}) : makeToken(10);
+    }));
+    EXPECT_CALL(*runner_, moeOptimizationMovementLedger()).Times(1).WillOnce(Invoke([&] {
+        EXPECT_EQ(completed_steps, 2);
+        observed = true;
+        return ledger;
+    }));
+    EXPECT_CALL(*runner_, clearCache()).Times(2).WillRepeatedly(Invoke([&] {
+        if (completed_steps != 0)
+            EXPECT_TRUE(observed);
+    }));
+    ChatCompletionRequest request;
+    request.messages = {{"user", "story"}};
+    request.max_tokens = 3;
+    request.enable_thinking = false;
+    request.runtime_output = CompletionRuntimeOutput::Include;
+    const auto response = makeHandler()->handleRequest(request);
+    ASSERT_TRUE(response.ok);
+    EXPECT_EQ(json::parse(response.json_body).at("usage").at("completion_tokens"), 3);
+    EXPECT_EQ(json::parse(response.json_body).at("runtime_summary").at("expert_movement"),
+              moeMovementLedgerJson(ledger));
+    EXPECT_EQ(json::parse(response.json_body)["runtime_summary"]["expert_movement_topology"],
+              moeMovementTopologyJson({.authority = MoEOptimizationAuthority::Host, .axes = MoEOptimizationMovementAxes::Both}));
+}
+
+/** A requested but truncated movement proof is an HTTP failure, not an empty Static claim. */
+TEST_F(Test__ChatCompletionHandler, RuntimeSummary_RejectsIncompleteMovementEvidence)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{7, 8}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return("A"));
+    EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(10)));
+    MoEOptimizationMovementLedger ledger;
+    ledger.discarded_edges = 1;
+    EXPECT_CALL(*runner_, moeOptimizationMovementLedger()).Times(1).WillOnce(Return(ledger));
+    ChatCompletionRequest request;
+    request.messages = {{"user", "story"}};
+    request.max_tokens = 1;
+    request.enable_thinking = false;
+    request.runtime_output = CompletionRuntimeOutput::Include;
+    const auto response = makeHandler()->handleRequest(request);
+    EXPECT_FALSE(response.ok);
+    EXPECT_EQ(response.http_status, 500);
+    EXPECT_NE(response.json_body.find("movement ledger"), std::string::npos);
+}
+
+/** Preserve grouped order, hidden EOS, actual prompt IDs, and per-request reset. */
+TEST_F(Test__ChatCompletionHandler, TokenIds_ObserveCommittedOutputWithoutRetokenizingOrProbing)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{7, 8}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_)).WillByDefault(Return("same text"));
+    EXPECT_CALL(*tokenizer_, encode(_, _, _)).Times(0);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeTokens({10, 11, 0}, true)))
+        .WillOnce(Return(makeToken(42, true)));
+    auto handler = makeHandler();
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "observe")};
+    request.max_tokens = 8;
+    request.enable_thinking = false;
+    request.token_output = CompletionTokenOutput::TextAndIds;
+    for (const auto expected : {std::vector<int>{10, 11, 0}, std::vector<int>{42}})
+    {
+        const auto response = handler->handleRequest(request);
+        ASSERT_TRUE(response.ok);
+        const auto body = json::parse(response.json_body);
+        EXPECT_EQ(body.at("token_ids").at("prompt"), (std::vector<int>{7, 8}));
+        EXPECT_EQ(body.at("token_ids").at("completion"), expected);
+        EXPECT_EQ(body.at("usage").at("completion_tokens"), expected.size());
+        EXPECT_EQ(body.at("choices")[0].at("finish_reason"), "stop");
+    }
+}
+
+/** Do not report tokens that the existing bounded HTTP response did not consume. */
+TEST_F(Test__ChatCompletionHandler, TokenIds_RespectResponseBudgetAndEmptyTerminalResult)
+{
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_)).WillByDefault(Return("text"));
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeTokens({10, 11, 12})))
+        .WillOnce(Return(makeTokens({}, true)));
+    auto handler = makeHandler();
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "observe")};
+    request.max_tokens = 2;
+    request.enable_thinking = false;
+    request.token_output = CompletionTokenOutput::TextAndIds;
+    for (const auto expected : {std::vector<int>{10, 11}, std::vector<int>{}})
+    {
+        const auto response = handler->handleRequest(request);
+        ASSERT_TRUE(response.ok);
+        const auto body = json::parse(response.json_body);
+        EXPECT_EQ(body.at("token_ids").at("completion"), expected);
+        EXPECT_EQ(body.at("usage").at("completion_tokens"), expected.size());
+    }
 }
 
 TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsumesMultiTokenDecodeStep)
@@ -647,7 +1156,7 @@ TEST_F(Test__ChatCompletionHandler, RuntimeSummaryNeverProbesLiveInferenceState)
         .Times(4).WillRepeatedly(Return(makeToken(10)));
     // A real probe reads ring metadata and can wait for unrelated maintenance.
     // Both HTTP modes must use completed request observations instead.
-    EXPECT_CALL(*runner_, prefixStateProbe()).Times(0);
+    EXPECT_CALL(*runner_, prefixStateProbe(testing::_)).Times(0);
     EXPECT_CALL(*runner_, requestRuntimeSummary())
         .Times(2).WillRepeatedly(Return(RequestRuntimeSummary{}));
     ChatCompletionRequest request;
@@ -3015,12 +3524,18 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_InjectsStopSequ
     request.max_tokens = 20;
     request.enable_thinking = true;
     request.thinking_budget_tokens = 2; // Exhaust after 2 thinking tokens
+    request.token_output = CompletionTokenOutput::TextAndIds;
 
     auto response = handler->handleRequest(request);
     EXPECT_TRUE(response.ok);
 
     auto body = json::parse(response.json_body);
     auto content = body["choices"][0]["message"]["content"].get<std::string>();
+
+    // Forced thinking suffixes are real committed positions, not text-only
+    // framing. A token regression trace must retain them and terminal EOS.
+    EXPECT_EQ(body.at("token_ids").at("completion"),
+              (std::vector<int>{10, 11, 90, 91, 92, 0}));
 
     // Generated text should contain the injected stop tokens
     EXPECT_NE(content.find("stop"), std::string::npos)

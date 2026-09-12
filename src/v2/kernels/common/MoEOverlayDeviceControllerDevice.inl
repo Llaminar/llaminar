@@ -2955,6 +2955,8 @@ namespace llaminar2::moe_overlay_controller_device
      * Restoration is a lifecycle objective, not an economy decision. It neither
      * consumes demand history nor applies payoff/hysteresis gates, and its moves
      * are excluded from optimization evidence by the host physical follower.
+     * It still obeys the admitted per-layer cycle budget: accumulated drift
+     * from many optimization waves cannot fit into one layer's shadow bank.
      */
     __device__ __forceinline__ void authorPreparedContextRestore(
         const MoEOverlayDeviceControllerActionLaunch &launch,
@@ -2999,6 +3001,13 @@ namespace llaminar2::moe_overlay_controller_device
             loadPeerPublished(&binding.layout->maximum_cycles_per_wave);
         const std::uint64_t expected_owner_words =
             static_cast<std::uint64_t>(layer_count) * expert_count;
+        // Capacity admission materializes at least one cycle per layer even
+        // when a zero policy cap disables optimization. Repair is mandatory,
+        // but must use that same budget rather than the global wave width.
+        const std::uint32_t configured_layer_cycles = loadPeerPublished(
+            &binding.layout->dynamic_maximum_cycles_per_layer);
+        const std::uint32_t maximum_cycles_per_layer =
+            configured_layer_cycles == 0u ? 1u : configured_layer_cycles;
         if (participant_count == 0u ||
             participant_count >
                 kMoEOverlayDeviceControllerFabricMaxParticipants ||
@@ -3146,7 +3155,9 @@ namespace llaminar2::moe_overlay_controller_device
             }
 
             bool changed_layer = false;
-            while (result.accepted_cycles < maximum_cycles)
+            std::uint32_t layer_cycles = 0u;
+            while (result.accepted_cycles < maximum_cycles &&
+                   layer_cycles < maximum_cycles_per_layer)
             {
                 const std::uint32_t cycle_length = findDynamicCycle(
                     scratch,
@@ -3227,6 +3238,7 @@ namespace llaminar2::moe_overlay_controller_device
                         scratch.desired_owner[expert];
                 }
                 ++result.accepted_cycles;
+                ++layer_cycles;
                 changed_layer = true;
             }
             if (changed_layer)

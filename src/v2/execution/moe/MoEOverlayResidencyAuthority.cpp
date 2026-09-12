@@ -8,11 +8,19 @@
  * inference can reference it. Candidate construction also preserves physical
  * owners for experts that remain in a tier, so bounded waves never invent
  * unrelated participant-to-participant transfers.
+ * Placement forecasts remain private predictions. Published transactions keep
+ * their immutable observed routing window, including real batch boundaries;
+ * smoothing cannot rewrite those observations or their movement metadata.
+ * Jointly admitted seed cohorts and ordinary candidates share the same
+ * fairness and capacity classification. Fairness is not a dependency edge;
+ * only the exact candidate/cohort economy gate can authorize coupled work.
  */
 
 #include "MoEOverlayResidencyAuthority.h"
 
 #include "MoEOverlayEconomyCalibrationPlanner.h"
+#include "MoEOverlayDistributedResidencyProtocol.h"
+#include "MoEOverlayTransactionCost.h"
 
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -25,6 +33,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -142,6 +151,57 @@ namespace llaminar2
             }
         };
 
+        /**
+         * @brief One fairness reservation, satisfied only by admitted work.
+         *
+         * This is not a tier dependency. The candidate/cohort economy checks
+         * prove dependencies before admission. A rejected tier candidate does
+         * not forbid an independent participant improvement, and a seeded
+         * dependency cohort can already satisfy the same participant lane.
+         */
+        class ParticipantLaneReservation
+        {
+        public:
+            /** Result of observing one economically and physically admitted cycle. */
+            enum class Transition { Unchanged, Fulfilled };
+
+            /** @brief Construct an unneeded reservation for a single-axis wave. */
+            constexpr ParticipantLaneReservation() noexcept = default;
+
+            /** @return An outstanding one-lane reservation for a two-axis wave. */
+            static constexpr ParticipantLaneReservation required() noexcept
+            {
+                ParticipantLaneReservation result;
+                result.state_ = State::Pending;
+                return result;
+            }
+
+            /**
+             * @brief Observe actual admission, including a pre-admitted cohort.
+             * @param axis Logical objectives of one admitted candidate cycle.
+             * @return Fulfilled exactly once, when participant work is admitted.
+             */
+            constexpr Transition recordAdmission(MoEOptimizationMovementAxis axis) noexcept
+            {
+                if (state_ != State::Pending || !advancesParticipantPlacement(axis))
+                    return Transition::Unchanged;
+                state_ = State::Fulfilled;
+                return Transition::Fulfilled;
+            }
+
+            /** @return Whether this wave requested independent-axis fairness. */
+            constexpr bool active() const noexcept { return state_ != State::Unneeded; }
+            /** @return Whether admitted work already satisfies the reservation. */
+            constexpr bool fulfilled() const noexcept { return state_ == State::Fulfilled; }
+            /** @return Zero or one reserved participant candidate, never a cycle total. */
+            constexpr std::size_t reservedCandidates() const noexcept { return fulfilled() ? 1u : 0u; }
+
+        private:
+            /** Only admission may advance Pending to Fulfilled. */
+            enum class State { Unneeded, Pending, Fulfilled };
+            State state_ = State::Unneeded;
+        };
+
         using CapacityKey = std::pair<int, int>;
 
         std::map<CapacityKey, int> tierCapacities(
@@ -237,6 +297,8 @@ namespace llaminar2
                 policy.minimum_improvement_per_mille);
         }
 
+        class ObservedTransactionServiceObjective;
+
         /**
          * @brief Select a paired owner swap using certified endpoint service.
          *
@@ -259,8 +321,7 @@ namespace llaminar2
             const MoELayeredExpertOwnership &complete_ownership,
             int layer_idx,
             uint64_t routed_window_activations,
-            const ValidatedDecodeExpertHistogramWindowView &window,
-            const MoERoutedTierServiceProfile &service_profile,
+            ObservedTransactionServiceObjective &service_objective,
             const MoEOverlayParticipantRebalancePolicy &policy);
 
         /**
@@ -278,7 +339,7 @@ namespace llaminar2
             const ValidatedDecodeExpertHistogramWindowView &window,
             const MoEOverlayParticipantRebalancePolicy &policy,
             std::optional<std::reference_wrapper<
-                const MoERoutedTierServiceProfile>> service_objective)
+                ObservedTransactionServiceObjective>> service_objective)
         {
             ParticipantRebalancePlan result{
                 .ownership = base_owner_map.layeredOwnership(
@@ -429,7 +490,6 @@ namespace llaminar2
                                   result.ownership,
                                   placement.layer,
                                   routed_window_activations,
-                                  window,
                                   service_objective->get(),
                                   policy)
                             : bestRawOverlayParticipantSwap(
@@ -560,6 +620,205 @@ namespace llaminar2
             return lhs * rhs;
         }
 
+
+        /**
+         * @brief One proposal's borrowed observations and reusable service scratch.
+         *
+         * Candidate ranking may smooth counts, but service is priced only against
+         * immutable real invocations. This adapter borrows the authority's already
+         * certified participant/layer table; it does not create a second profile.
+         * It is exclusive to the proposal lock, not inference or a device controller.
+         */
+        class ObservedTransactionServiceObjective
+        {
+        public:
+            /** @brief Phase-pure critical paths and selected-tier imbalance evidence. */
+            struct Score
+            {
+                std::array<moe_overlay_economy::ServiceCostPair,
+                           kExpertHistogramProductionSourceCount> by_phase{};
+                std::array<WideCost, kExpertHistogramProductionSourceCount>
+                    minimum_before_by_phase{};
+            };
+
+            /**
+             * @brief Borrow one authenticated observation and the certified table.
+             * @param observed Real routing sample retained by the proposal.
+             * @param topology Reachable and economy-priced phases.
+             * @param rows Participant-major, layer-minor certified price pointers.
+             * @param participants Complete physical participant count.
+             *
+             * Scratch is constructed once per proposal, not per candidate or batch.
+             * A counts-only window is rejected if and when service is requested;
+             * forecast maintenance alone does not pretend to quote execution cost.
+             */
+            ObservedTransactionServiceObjective(
+                ValidatedDecodeExpertHistogramWindowView observed,
+                const ExpertHistogramProductionTopology &topology,
+                std::span<const MoERoutedParticipantLayerPhaseServiceCost *const> rows,
+                std::size_t participants)
+                : observed_(observed), topology_(topology), rows_(rows),
+                  prices_(participants), scratch_(participants)
+            {
+                if (participants == 0 ||
+                    participants > std::numeric_limits<std::uint32_t>::max() ||
+                    topology.layerCount() != static_cast<std::size_t>(observed.numLayers()) ||
+                    rows.size() != participants * topology.layerCount())
+                    throw std::logic_error(
+                        "ExpertOverlay observed service objective has invalid certified geometry");
+            }
+
+            /** @return Authenticated expert geometry, never inferred from a candidate. */
+            int numExperts() const noexcept { return observed_.numExperts(); }
+
+            /**
+             * @brief Price complete before/after maps at the observed invocation boundaries.
+             * @param layer Exact routed layer.
+             * @param before Published or provisional complete owner map for this layer.
+             * @param after Candidate complete owner map for this layer.
+             * @param selected Empty means the complete topology; otherwise price only
+             *        the named tier's critical path for the intentionally broader search.
+             * @return Sum of per-invocation maxima, separately for each recurring phase.
+             * @throws On missing observations, invalid owners, unpriced work or overflow.
+             *
+             * Selecting a tier does not regroup transactions. Its imbalance floor is
+             * likewise the sum of per-invocation minima, not a minimum of window totals.
+             */
+            Score score(int layer, std::span<const std::int32_t> before,
+                        std::span<const std::int32_t> after,
+                        std::span<const int> selected = {})
+            {
+                if (before.size() != static_cast<std::size_t>(numExperts()) ||
+                    after.size() != before.size())
+                    throw std::logic_error("ExpertOverlay observed service owner geometry mismatch");
+                for (std::size_t index = 0; index < before.size(); ++index)
+                {
+                    if (before[index] < 0 || after[index] < 0 ||
+                        static_cast<std::size_t>(before[index]) >= scratch_.size() ||
+                        static_cast<std::size_t>(after[index]) >= scratch_.size())
+                        throw std::logic_error("ExpertOverlay observed service owner is invalid");
+                }
+                for (std::size_t index = 0; index < selected.size(); ++index)
+                {
+                    if (selected[index] < 0 ||
+                        static_cast<std::size_t>(selected[index]) >= scratch_.size() ||
+                        std::find(selected.begin(), selected.begin() + index,
+                                  selected[index]) != selected.begin() + index)
+                        throw std::logic_error("ExpertOverlay observed service tier is invalid");
+                }
+
+                const auto &demand = observed_.transactionDemand();
+                const auto batches = demand.layerTransactions(layer);
+                Score result;
+                for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
+                {
+                    for (std::size_t participant = 0; participant < prices_.size(); ++participant)
+                        prices_[participant] = rows_[
+                            participant * topology_.layerCount() + static_cast<std::size_t>(layer)]
+                            ->nanoseconds_per_activation[phase];
+                    for (std::size_t batch = 0; batch < batches.size(); ++batch)
+                    {
+                        if (batches[batch].phase != kProductionHistogramSources[phase])
+                            continue;
+                        if (!topology_.reachable(layer, phase))
+                            throw std::logic_error(
+                                "ExpertOverlay observed service found demand in an unreachable phase");
+                        // Rare retained catch-up/tail execution can be reachable
+                        // without belonging to the declared recurring payoff model.
+                        if (!topology_.requiresServiceEvidence(layer, phase))
+                            continue;
+                        auto transaction = moe_overlay_economy::scoreTransaction(
+                            demand.routes(layer, batch),
+                            {before.data(), after.data(), prices_.data(),
+                             static_cast<std::uint32_t>(numExperts()),
+                             static_cast<std::uint32_t>(prices_.size())},
+                            scratch_.data(), static_cast<std::uint32_t>(scratch_.size()));
+                        requireComplete(transaction.status);
+                        std::uint64_t minimum = std::numeric_limits<std::uint64_t>::max();
+                        if (selected.empty())
+                        {
+                            for (const auto &work : scratch_)
+                                minimum = std::min(minimum, work.before_ns);
+                        }
+                        else
+                        {
+                            transaction.cost = {};
+                            for (const int participant : selected)
+                            {
+                                const auto &work = scratch_[static_cast<std::size_t>(participant)];
+                                transaction.cost.before_ns =
+                                    std::max(transaction.cost.before_ns, work.before_ns);
+                                transaction.cost.after_ns =
+                                    std::max(transaction.cost.after_ns, work.after_ns);
+                                minimum = std::min(minimum, work.before_ns);
+                            }
+                        }
+                        requireComplete(moe_overlay_economy::appendTransaction(
+                            result.by_phase[phase], transaction));
+                        checkedAddWide(&result.minimum_before_by_phase[phase], minimum,
+                                       "observed transaction imbalance floor");
+                    }
+                }
+                return result;
+            }
+
+        private:
+            /** @brief A partial or saturated cost is never eligible for publication. */
+            static void requireComplete(moe_overlay_economy::TransactionCostStatus status)
+            {
+                using Status = moe_overlay_economy::TransactionCostStatus;
+                if (status == Status::Complete) return;
+                if (status == Status::Overflow)
+                    throw std::overflow_error("ExpertOverlay observed transaction service overflows");
+                throw std::logic_error(
+                    "ExpertOverlay observed transaction service failed: status=" +
+                    std::to_string(static_cast<std::uint32_t>(status)));
+            }
+
+            ValidatedDecodeExpertHistogramWindowView observed_;
+            const ExpertHistogramProductionTopology &topology_;
+            std::span<const MoERoutedParticipantLayerPhaseServiceCost *const> rows_;
+            std::vector<std::uint64_t> prices_;
+            std::vector<moe_overlay_economy::ServiceCostPair> scratch_;
+        };
+
+        /**
+         * @brief Project migration sets onto one published layer and price their delta.
+         *
+         * Both bounded candidate selection and final admission use this projection.
+         * Each set is relative to the same immutable source map; combining axes must
+         * not apply a move twice or price one expert as if two owners executed it.
+         */
+        ObservedTransactionServiceObjective::Score scoreObservedMigrationSet(
+            ObservedTransactionServiceObjective &objective,
+            const MoEOverlayResidencyTransaction &transaction,
+            int layer, std::span<const std::size_t> before_indices,
+            std::span<const std::size_t> after_indices)
+        {
+            std::vector<std::int32_t> before(objective.numExperts(), -1);
+            for (const auto &owner : transaction.previous->owner_map.owners())
+                if (owner.layer_idx == layer)
+                    before.at(static_cast<std::size_t>(owner.expert_id)) = owner.owner_participant;
+            auto after = before;
+            const auto apply = [&](std::span<const std::size_t> indices,
+                                   std::vector<std::int32_t> &owners)
+            {
+                for (const auto index : indices)
+                {
+                    const auto &move = transaction.migrations.at(index);
+                    if (move.layer_idx != layer) continue;
+                    auto &owner = owners.at(static_cast<std::size_t>(move.expert_id));
+                    if (owner != move.source.owner_participant)
+                        throw std::logic_error(
+                            "ExpertOverlay economy migration source disagrees with published ownership");
+                    owner = move.destination.owner_participant;
+                }
+            };
+            apply(before_indices, before);
+            apply(after_indices, after);
+            return objective.score(layer, before, after);
+        }
+
         moe_rebalance_policy::OwnershipSwapChoice
         bestServiceAwareOverlayParticipantSwap(
             const std::vector<uint64_t> &participant_load,
@@ -570,8 +829,7 @@ namespace llaminar2
             const MoELayeredExpertOwnership &complete_ownership,
             int layer_idx,
             uint64_t routed_window_activations,
-            const ValidatedDecodeExpertHistogramWindowView &window,
-            const MoERoutedTierServiceProfile &service_profile,
+            ObservedTransactionServiceObjective &service_objective,
             const MoEOverlayParticipantRebalancePolicy &policy)
         {
             moe_rebalance_policy::OwnershipSwapChoice choice{};
@@ -586,158 +844,26 @@ namespace llaminar2
             {
                 return choice;
             }
-            if (!service_profile.production_topology.valid() ||
-                layer_idx < 0 ||
-                layer_idx >= window.numLayers() ||
-                static_cast<std::size_t>(layer_idx) >=
-                    service_profile.production_topology.layerCount())
-            {
-                throw std::logic_error(
-                    "ExpertOverlay service-aware participant planner received invalid phase geometry");
-            }
-
-            /*
-             * Economy construction has already certified one row for every
-             * global participant/layer coordinate. Rebuild the layer-local
-             * pointer table here because proposal generation intentionally
-             * receives immutable public profile evidence, not the authority's
-             * mutable economy-state implementation detail.
-             */
-            std::vector<
-                const MoERoutedParticipantLayerPhaseServiceCost *>
-                service_rows;
-            for (const auto &row : service_profile.participant_costs)
-            {
-                if (row.layer == layer_idx)
-                    service_rows.push_back(&row);
-            }
-            std::sort(
-                service_rows.begin(),
-                service_rows.end(),
-                [](const auto *lhs, const auto *rhs)
-                { return lhs->participant_id < rhs->participant_id; });
-            for (std::size_t participant = 0;
-                 participant < service_rows.size();
-                 ++participant)
-            {
-                if (service_rows[participant]->participant_id !=
-                    static_cast<int>(participant))
-                {
-                    throw std::logic_error(
-                        "ExpertOverlay service-aware participant planner requires contiguous certified participant ids");
-                }
-            }
-            if (service_rows.size() < 2u)
-            {
-                throw std::logic_error(
-                    "ExpertOverlay service-aware participant planner requires at least two certified endpoints");
-            }
-            for (const int participant_id : tier_participant_ids)
-            {
-                if (participant_id < 0 ||
-                    participant_id >=
-                        static_cast<int>(service_rows.size()))
-                {
-                    throw std::logic_error(
-                        "ExpertOverlay tier participant is absent from certified service evidence");
-                }
-            }
-
-            using PhaseWork = std::array<
-                std::vector<WideCost>,
-                kExpertHistogramProductionSourceCount>;
-            PhaseWork before_work;
-            for (auto &phase_work : before_work)
-                phase_work.assign(service_rows.size(), WideCost{0});
-
-            const auto &topology = service_profile.production_topology;
-            for (int expert_id = 0;
-                 expert_id < window.numExperts();
-                 ++expert_id)
-            {
-                const int owner = complete_ownership.owner(
-                    layer_idx, expert_id);
-                if (owner < 0 ||
-                    owner >= static_cast<int>(service_rows.size()))
-                {
-                    throw std::logic_error(
-                        "ExpertOverlay service-aware participant planner found an owner outside certified evidence");
-                }
-                for (std::size_t phase = 0;
-                     phase < kProductionHistogramSources.size();
-                     ++phase)
-                {
-                    const uint64_t demand = window.activationCount(
-                        kProductionHistogramSources[phase],
-                        layer_idx,
-                        expert_id);
-                    if (!topology.reachable(layer_idx, phase))
-                    {
-                        if (demand != 0u)
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay service-aware participant planner observed demand in an unreachable phase");
-                        }
-                        continue;
-                    }
-                    if (!topology.requiresServiceEvidence(layer_idx, phase))
-                        continue;
-                    checkedAddWide(
-                        &before_work[phase][static_cast<std::size_t>(owner)],
-                        checkedMultiplyWide(
-                            demand,
-                            service_rows[static_cast<std::size_t>(owner)]
-                                ->nanoseconds_per_activation[phase],
-                            "service-aware participant work"),
-                        "service-aware participant work");
-                }
-            }
-
-            std::array<WideCost, kExpertHistogramProductionSourceCount>
-                before_makespan{};
+            std::vector<std::int32_t> before_owners(service_objective.numExperts());
+            for (int expert = 0; expert < service_objective.numExperts(); ++expert)
+                before_owners[static_cast<std::size_t>(expert)] =
+                    complete_ownership.owner(layer_idx, expert);
+            auto after_owners = before_owners;
+            const auto baseline = service_objective.score(
+                layer_idx, before_owners, before_owners, tier_participant_ids);
             WideCost before_total = 0;
             bool imbalance_threshold_met = false;
-            for (std::size_t phase = 0;
-                 phase < kProductionHistogramSources.size();
-                 ++phase)
+            for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
             {
-                if (!topology.requiresServiceEvidence(layer_idx, phase))
-                    continue;
-                for (const int participant_id : tier_participant_ids)
-                {
-                    before_makespan[phase] = std::max(
-                        before_makespan[phase],
-                        before_work[phase][static_cast<std::size_t>(
-                            participant_id)]);
-                }
-                checkedAddWide(
-                    &before_total,
-                    before_makespan[phase],
-                    "service-aware phase makespan");
-
-                WideCost tier_min = ~WideCost{0};
-                WideCost tier_max = 0;
-                for (const int participant_id : tier_participant_ids)
-                {
-                    const WideCost work = before_work[phase][
-                        static_cast<std::size_t>(participant_id)];
-                    tier_min = std::min(tier_min, work);
-                    tier_max = std::max(tier_max, work);
-                }
-                if (tier_max == 0)
-                    continue;
-                if (tier_min == 0 ||
-                    checkedMultiplyWide(
-                        tier_max,
-                        1000u,
-                        "service-aware imbalance numerator") >=
-                        checkedMultiplyWide(
-                            tier_min,
-                            policy.imbalance_threshold_per_mille,
-                            "service-aware imbalance denominator"))
-                {
+                const WideCost tier_max = baseline.by_phase[phase].before_ns;
+                const WideCost tier_min = baseline.minimum_before_by_phase[phase];
+                checkedAddWide(&before_total, tier_max, "observed participant service");
+                if (tier_max != 0 &&
+                    (tier_min == 0 ||
+                     checkedMultiplyWide(tier_max, 1000u, "observed imbalance numerator") >=
+                     checkedMultiplyWide(tier_min, policy.imbalance_threshold_per_mille,
+                                         "observed imbalance denominator")))
                     imbalance_threshold_met = true;
-                }
             }
             if (!imbalance_threshold_met || before_total == 0)
                 return choice;
@@ -770,98 +896,22 @@ namespace llaminar2
                     if (first_local_owner == second_local_owner)
                         continue;
 
-                    const int first_participant = tier_participant_ids[
-                        static_cast<std::size_t>(first_local_owner)];
-                    const int second_participant = tier_participant_ids[
-                        static_cast<std::size_t>(second_local_owner)];
+                    // Keep forecast counts for deterministic candidate ordering and
+                    // raw-load bookkeeping, but never use them as parallel work.
+                    const auto first_expert = static_cast<std::size_t>(tier_expert_ids[first]);
+                    const auto second_expert = static_cast<std::size_t>(tier_expert_ids[second]);
+                    std::swap(after_owners.at(first_expert), after_owners.at(second_expert));
+                    const auto measured = service_objective.score(
+                        layer_idx, before_owners, after_owners, tier_participant_ids);
+                    std::swap(after_owners.at(first_expert), after_owners.at(second_expert));
                     WideCost after_total = 0;
                     bool phase_regressed = false;
-                    for (std::size_t phase = 0;
-                         phase < kProductionHistogramSources.size();
-                         ++phase)
+                    for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
                     {
-                        if (!topology.requiresServiceEvidence(
-                                layer_idx, phase))
-                        {
-                            continue;
-                        }
-                        const uint64_t first_demand = window.activationCount(
-                            kProductionHistogramSources[phase],
-                            layer_idx,
-                            tier_expert_ids[first]);
-                        const uint64_t second_demand = window.activationCount(
-                            kProductionHistogramSources[phase],
-                            layer_idx,
-                            tier_expert_ids[second]);
-                        const auto first_cost =
-                            service_rows[static_cast<std::size_t>(
-                                first_participant)]
-                                ->nanoseconds_per_activation[phase];
-                        const auto second_cost =
-                            service_rows[static_cast<std::size_t>(
-                                second_participant)]
-                                ->nanoseconds_per_activation[phase];
-                        const WideCost first_old = checkedMultiplyWide(
-                            first_demand,
-                            first_cost,
-                            "service-aware outgoing participant work");
-                        const WideCost second_old = checkedMultiplyWide(
-                            second_demand,
-                            second_cost,
-                            "service-aware outgoing participant work");
-                        auto first_after = before_work[phase][
-                            static_cast<std::size_t>(first_participant)];
-                        auto second_after = before_work[phase][
-                            static_cast<std::size_t>(second_participant)];
-                        if (first_after < first_old ||
-                            second_after < second_old)
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay service-aware candidate work underflowed its owner total");
-                        }
-                        first_after -= first_old;
-                        second_after -= second_old;
-                        checkedAddWide(
-                            &first_after,
-                            checkedMultiplyWide(
-                                second_demand,
-                                first_cost,
-                                "service-aware incoming participant work"),
-                            "service-aware swapped participant work");
-                        checkedAddWide(
-                            &second_after,
-                            checkedMultiplyWide(
-                                first_demand,
-                                second_cost,
-                                "service-aware incoming participant work"),
-                            "service-aware swapped participant work");
-
-                        WideCost after_makespan = 0;
-                        for (const int participant_id : tier_participant_ids)
-                        {
-                            const auto participant =
-                                static_cast<std::size_t>(participant_id);
-                            WideCost work = before_work[phase][participant];
-                            if (participant_id == first_participant)
-                            {
-                                work = first_after;
-                            }
-                            else if (participant_id == second_participant)
-                            {
-                                work = second_after;
-                            }
-                            after_makespan = std::max(
-                                after_makespan, work);
-                        }
-                        if (after_makespan > before_makespan[phase])
-                        {
-                            phase_regressed = true;
-                            break;
-                        }
-                        checkedAddWide(
-                            &after_total,
-                            after_makespan,
-                            "service-aware candidate phase makespan");
+                        const auto &cost = measured.by_phase[phase];
+                        phase_regressed |= cost.after_ns > cost.before_ns;
+                        checkedAddWide(&after_total, cost.after_ns,
+                                       "observed candidate participant service");
                     }
                     if (phase_regressed || after_total >= before_total)
                         continue;
@@ -1003,19 +1053,104 @@ namespace llaminar2
             return static_cast<uint64_t>(smoothed);
         }
 
-        /** @brief Compare immutable histogram value identity, never pointers. */
-        bool sameHistogramWindow(
-            const DecodeExpertHistogramWindow &lhs,
-            const DecodeExpertHistogramWindow &rhs) noexcept
+        /**
+         * @brief Private placement prediction paired with its last observed input.
+         *
+         * Only candidate ranking borrows the rounded counts. The actual input
+         * remains immutable and is the sole source of executable activity and
+         * transaction geometry. Keeping both in one value makes advancing the
+         * prediction atomic even if validation, allocation or arithmetic fails.
+         */
+        class PlacementDemandForecast final
         {
-            return lhs.generation == rhs.generation &&
-                   lhs.token_count == rhs.token_count &&
-                   lhs.source_token_counts == rhs.source_token_counts &&
-                   lhs.num_layers == rhs.num_layers &&
-                   lhs.num_experts == rhs.num_experts &&
-                   lhs.expert_counts == rhs.expert_counts &&
-                   lhs.source_expert_counts == rhs.source_expert_counts;
-        }
+        public:
+            /**
+             * @brief Seed a prediction without claiming observed transactions.
+             * @param observed Complete immutable input retained for generation identity.
+             * @throws std::invalid_argument If the input is absent or malformed.
+             */
+            explicit PlacementDemandForecast(
+                std::shared_ptr<const DecodeExpertHistogramWindow> observed)
+                : observed_(std::move(observed))
+            {
+                if (!observed_ || !observed_->valid())
+                    throw std::invalid_argument("ExpertOverlay forecast requires valid observed demand");
+                counts_ = *observed_;
+                // Rounded marginals describe no particular collection of
+                // batches. Never attach the observed trace to that prediction.
+                counts_.transaction_demand.reset();
+            }
+
+            /**
+             * @brief Advance once per observed generation, with strong exception safety.
+             * @param observed New complete input, or an identical retransmission.
+             * @param policy Validated deterministic history/current weights.
+             * @throws std::invalid_argument On stale, changed or malformed input.
+             * @throws std::overflow_error If rounded phase sums exceed their ABI.
+             */
+            void observe(std::shared_ptr<const DecodeExpertHistogramWindow> observed,
+                         const MoEOverlayMigrationEconomyPolicy &policy)
+            {
+                if (!observed || !observed->valid() || !policy.valid() ||
+                    observed->num_layers != counts_.num_layers ||
+                    observed->num_experts != counts_.num_experts ||
+                    observed->generation < observed_->generation)
+                    throw std::invalid_argument("ExpertOverlay forecast received invalid or regressing demand");
+                if (observed->generation == observed_->generation)
+                {
+                    // The canonical wire identity includes batch boundaries
+                    // and co-occurrence. Equal marginals alone are not equal
+                    // evidence, nor is a separately owned identical copy new.
+                    if (fingerprintDecodeExpertHistogramWindow(*observed) !=
+                        fingerprintDecodeExpertHistogramWindow(*observed_))
+                        throw std::invalid_argument(
+                            "ExpertOverlay migration economy received different evidence for one histogram generation");
+                    return;
+                }
+
+                PlacementDemandForecast next(std::move(observed));
+                WideCost token_sum = 0;
+                for (std::size_t phase = 0; phase < kExpertHistogramProductionSourceCount; ++phase)
+                {
+                    next.counts_.source_token_counts[phase] = smoothCount(
+                        counts_.source_token_counts[phase], next.counts_.source_token_counts[phase], policy);
+                    token_sum += next.counts_.source_token_counts[phase];
+                }
+                // Round each primitive once, then derive its redundant total.
+                // Rounding the aggregate independently can disagree by a row.
+                next.counts_.token_count = checkedCostToU64(token_sum, "forecast token total");
+                for (std::size_t index = 0; index < counts_.source_expert_counts.size(); ++index)
+                    next.counts_.source_expert_counts[index] = smoothCount(
+                        counts_.source_expert_counts[index], next.counts_.source_expert_counts[index], policy);
+                const std::size_t entries = counts_.expert_counts.size();
+                for (std::size_t entry = 0; entry < entries; ++entry)
+                {
+                    WideCost phase_sum = 0;
+                    for (std::size_t phase = 0; phase < kExpertHistogramProductionSourceCount; ++phase)
+                        phase_sum += next.counts_.source_expert_counts[phase * entries + entry];
+                    next.counts_.expert_counts[entry] = checkedCostToU64(phase_sum, "forecast expert total");
+                }
+                if (!next.counts_.valid())
+                    throw std::logic_error("ExpertOverlay forecast produced invalid candidate counts");
+                *this = std::move(next);
+            }
+
+            /** @return Borrowed prediction for candidate ranking, never publication. */
+            [[nodiscard]] const DecodeExpertHistogramWindow &candidateCounts() const noexcept
+            {
+                return counts_;
+            }
+
+            /** @return Canonical count identity for the root's private policy audit. */
+            [[nodiscard]] uint64_t fingerprint() const
+            {
+                return fingerprintDecodeExpertHistogramWindow(counts_);
+            }
+
+        private:
+            std::shared_ptr<const DecodeExpertHistogramWindow> observed_;
+            DecodeExpertHistogramWindow counts_;
+        };
     } // namespace
 
     bool MoEOverlayMigrationEconomyPolicy::valid() const noexcept
@@ -1035,6 +1170,7 @@ namespace llaminar2
             return service_profile_identity.empty() &&
                    migration_profile_identity.empty() &&
                    smoothed_through_generation == 0 &&
+                   forecast_fingerprint == 0 &&
                    historical_window_weight == 0 &&
                    current_window_weight == 0 &&
                    payoff_horizon_tokens == 0 &&
@@ -1050,6 +1186,7 @@ namespace llaminar2
 
         if (service_profile_identity.empty() ||
             migration_profile_identity.empty() ||
+            forecast_fingerprint == 0 ||
             current_window_weight == 0 || payoff_horizon_tokens == 0 ||
             static_cast<uint64_t>(historical_window_weight) +
                     static_cast<uint64_t>(current_window_weight) >
@@ -1535,37 +1672,12 @@ namespace llaminar2
         int tier_count = 0;
         int participant_count = 0;
         ExpertHistogramProductionTopology production_topology;
-        std::vector<const MoERoutedTierLayerPhaseServiceCost *>
-            service_cost_rows;
         std::vector<const MoERoutedParticipantLayerPhaseServiceCost *>
             participant_service_cost_rows;
         std::vector<const MoEOverlayParticipantLayerMigrationCost *>
             migration_cost_rows;
-        std::optional<DecodeExpertHistogramWindow> last_input_window;
-        std::optional<DecodeExpertHistogramWindow> smoothed_window;
+        std::optional<PlacementDemandForecast> forecast;
         std::vector<uint64_t> last_moved_generation;
-
-        /** @brief Return one prevalidated tier/layer service row. */
-        const MoERoutedTierLayerPhaseServiceCost &serviceCost(
-            int tier,
-            int layer) const
-        {
-            return *service_cost_rows.at(
-                static_cast<std::size_t>(tier) *
-                    static_cast<std::size_t>(num_layers) +
-                static_cast<std::size_t>(layer));
-        }
-
-        /** @brief Return one prevalidated participant/layer service row. */
-        const MoERoutedParticipantLayerPhaseServiceCost &participantServiceCost(
-            int participant,
-            int layer) const
-        {
-            return *participant_service_cost_rows.at(
-                static_cast<std::size_t>(participant) *
-                    static_cast<std::size_t>(num_layers) +
-                static_cast<std::size_t>(layer));
-        }
 
         /** @brief Return one prevalidated directed endpoint/layer cost row. */
         const MoEOverlayParticipantLayerMigrationCost &migrationCost(
@@ -1709,7 +1821,9 @@ namespace llaminar2
             static_cast<std::size_t>(state->tier_count),
             static_cast<std::size_t>(state->num_layers),
             "service-profile tier/layer geometry");
-        state->service_cost_rows.assign(service_rows, nullptr);
+        // Tier prices still certify placement ranking. Only participant prices
+        // are retained for service scoring; there is no second live tier scorer.
+        std::vector<bool> service_rows_seen(service_rows, false);
         for (const auto &row : service_profile.costs)
         {
             if (row.tier_index < 0 ||
@@ -1723,18 +1837,18 @@ namespace llaminar2
                 static_cast<std::size_t>(row.tier_index) *
                     static_cast<std::size_t>(state->num_layers) +
                 static_cast<std::size_t>(row.layer);
-            if (state->service_cost_rows[offset])
+            if (service_rows_seen[offset])
             {
                 throw std::invalid_argument(
                     "ExpertOverlay service profile repeats a tier/layer row");
             }
-            state->service_cost_rows[offset] = &row;
+            service_rows_seen[offset] = true;
         }
-        if (state->service_cost_rows.size() != service_profile.costs.size() ||
+        if (service_rows_seen.size() != service_profile.costs.size() ||
             std::any_of(
-                state->service_cost_rows.begin(),
-                state->service_cost_rows.end(),
-                [](const auto *row) { return row == nullptr; }))
+                service_rows_seen.begin(),
+                service_rows_seen.end(),
+                [](bool seen) { return !seen; }))
         {
             throw std::invalid_argument(
                 "ExpertOverlay service profile is not total for live residency geometry");
@@ -3153,114 +3267,28 @@ namespace llaminar2
             }
             auto &state = *economy_state_;
             const auto &policy = *config_.migration_economy_policy;
-            if (state.last_input_window)
-            {
-                if (transaction.histogram_generation <
-                    state.last_input_window->generation)
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay migration economy received a regressing histogram generation");
-                }
-                if (transaction.histogram_generation ==
-                    state.last_input_window->generation)
-                {
-                    if (!sameHistogramWindow(
-                            *transaction.histogram_window,
-                            *state.last_input_window))
-                    {
-                        throw std::invalid_argument(
-                            "ExpertOverlay migration economy received different evidence for one histogram generation");
-                    }
-                }
-                else
-                {
-                    DecodeExpertHistogramWindow smoothed =
-                        *transaction.histogram_window;
-                    smoothed.token_count = smoothCount(
-                        state.smoothed_window->token_count,
-                        transaction.histogram_window->token_count,
-                        policy);
-                    for (std::size_t source = 0;
-                         source < kExpertHistogramProductionSourceCount;
-                         ++source)
-                    {
-                        smoothed.source_token_counts[source] = smoothCount(
-                            state.smoothed_window->source_token_counts[source],
-                            transaction.histogram_window
-                                ->source_token_counts[source],
-                            policy);
-                    }
-                    for (std::size_t index = 0;
-                         index < smoothed.source_expert_counts.size();
-                         ++index)
-                    {
-                        smoothed.source_expert_counts[index] = smoothCount(
-                            state.smoothed_window
-                                ->source_expert_counts[index],
-                            transaction.histogram_window
-                                ->source_expert_counts[index],
-                            policy);
-                    }
-                    const std::size_t entries =
-                        static_cast<std::size_t>(smoothed.num_layers) *
-                        static_cast<std::size_t>(smoothed.num_experts);
-                    for (std::size_t entry = 0; entry < entries; ++entry)
-                    {
-                        unsigned __int128 total = 0;
-                        for (std::size_t source = 0;
-                             source < kExpertHistogramProductionSourceCount;
-                             ++source)
-                        {
-                            total += smoothed.source_expert_counts[
-                                source * entries + entry];
-                        }
-                        if (total > std::numeric_limits<uint64_t>::max())
-                        {
-                            throw std::overflow_error(
-                                "ExpertOverlay smoothed aggregate histogram exceeds uint64");
-                        }
-                        smoothed.expert_counts[entry] =
-                            static_cast<uint64_t>(total);
-                    }
-                    if (!smoothed.valid())
-                    {
-                        throw std::logic_error(
-                            "ExpertOverlay deterministic smoothing produced an invalid histogram window");
-                    }
-                    state.smoothed_window = std::move(smoothed);
-                    state.last_input_window =
-                        *transaction.histogram_window;
-                }
-            }
+            if (state.forecast)
+                state.forecast->observe(transaction.histogram_window, policy);
             else
-            {
-                state.last_input_window = *transaction.histogram_window;
-                state.smoothed_window = *transaction.histogram_window;
-            }
-            planning_window = &*state.smoothed_window;
+                state.forecast.emplace(transaction.histogram_window);
+            planning_window = &state.forecast->candidateCounts();
         }
 
         /*
-         * Materialize the exact evidence which will travel with the transaction.
-         * After generation one, the economy policy's deterministic smoothing
-         * window differs from the raw RCU bank. Publishing the raw bank while
-         * retaining migration counts derived from the smoothed window creates
-         * two authorities for one activation count and makes peers reject the
-         * otherwise authenticated proposal. The raw input has already been
-         * retained in `last_input_window`; only the effective planning evidence
-         * belongs to the executable transaction.
+         * Forecasts rank candidates; observations authenticate execution.
+         * Keep the original window and derive migration activity from it, so
+         * peers need neither a forecast copy nor a second routing payload.
+         * Authenticate each borrowed view once outside the candidate loops.
          */
-        if (planning_window != transaction.histogram_window.get())
-        {
-            transaction.histogram_window =
-                std::make_shared<const DecodeExpertHistogramWindow>(
-                    *planning_window);
-        }
-        planning_window = transaction.histogram_window.get();
-
-        /* Authenticate the redundant aggregate/phase representation once, then
-         * give every planner and economy hot loop the typed constant-time view. */
         const auto planning_evidence = planning_window->validatedView();
+        const auto observed_evidence = transaction.histogram_window->validatedView();
+
+        std::optional<ObservedTransactionServiceObjective> observed_service;
+        if (economy_state_)
+            observed_service.emplace(
+                observed_evidence, economy_state_->production_topology,
+                economy_state_->participant_service_cost_rows,
+                static_cast<std::size_t>(economy_state_->participant_count));
 
         MoERoutedExpertPlacementPlannerOptions options;
         options.decode_histogram_window = planning_window;
@@ -3296,7 +3324,7 @@ namespace llaminar2
             result.migrations = buildMigrations(
                 *previous,
                 *result.candidate,
-                &planning_evidence,
+                &observed_evidence,
                 planned.memory.routed_expert_bytes_per_expert,
                 movement_objectives);
             result.migration_cycles = buildMigrationCycles(
@@ -3464,7 +3492,7 @@ namespace llaminar2
 
                 if (!config_.migration_economy_policy)
                     return score;
-                if (!economy_state_ || planning_evidence.tokenCount() == 0)
+                if (!economy_state_ || observed_evidence.tokenCount() == 0)
                 {
                     throw std::logic_error(
                         "ExpertOverlay bounded tier selection requires complete non-zero economy evidence");
@@ -3472,119 +3500,19 @@ namespace llaminar2
 
                 const auto &state = *economy_state_;
                 const auto &policy = *config_.migration_economy_policy;
-                const std::size_t participant_count =
-                    previous->owner_map.participants().size();
+                const auto observed_cost = scoreObservedMigrationSet(
+                    *observed_service, tier_target_transaction, cycle.layer_idx,
+                    {}, cycle.migration_indices);
                 WideCost service_gain_one_window = 0;
                 bool phase_safe = true;
-                for (std::size_t phase = 0;
-                     phase < kProductionHistogramSources.size();
-                     ++phase)
+                for (const auto &phase : observed_cost.by_phase)
                 {
-                    std::vector<WideCost> before_work(
-                        participant_count, 0);
-                    std::vector<WideCost> after_work(
-                        participant_count, 0);
-                    for (const auto &owner : previous->owner_map.owners())
-                    {
-                        if (owner.layer_idx != cycle.layer_idx)
-                            continue;
-                        int after_participant = owner.owner_participant;
-                        for (const std::size_t migration_index :
-                             cycle.migration_indices)
-                        {
-                            const auto &migration =
-                                tier_target_transaction.migrations.at(
-                                    migration_index);
-                            if (migration.layer_idx == owner.layer_idx &&
-                                migration.expert_id == owner.expert_id)
-                            {
-                                if (migration.source.owner_participant !=
-                                    owner.owner_participant)
-                                {
-                                    throw std::logic_error(
-                                        "ExpertOverlay bounded tier candidate source disagrees with the published owner map");
-                                }
-                                after_participant =
-                                    migration.destination.owner_participant;
-                                break;
-                            }
-                        }
-                        if (owner.owner_participant < 0 ||
-                            after_participant < 0 ||
-                            owner.owner_participant >=
-                                static_cast<int>(participant_count) ||
-                            after_participant >=
-                                static_cast<int>(participant_count))
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay bounded tier candidate references an invalid participant");
-                        }
-
-                        const uint64_t demand =
-                            planning_evidence.activationCount(
-                                kProductionHistogramSources[phase],
-                                owner.layer_idx,
-                                owner.expert_id);
-                        if (!state.production_topology.reachable(
-                                owner.layer_idx, phase))
-                        {
-                            if (demand != 0)
-                            {
-                                throw std::logic_error(
-                                    "ExpertOverlay bounded tier candidate observed demand in a disabled phase");
-                            }
-                            continue;
-                        }
-                        if (!state.production_topology
-                                 .requiresServiceEvidence(
-                                     owner.layer_idx, phase))
-                        {
-                            /* Rare retained catch-up/tail demand is legal but
-                             * is deliberately outside steady-state movement
-                             * economics for a positive-depth MTP regime. */
-                            continue;
-                        }
-                        const auto &before_cost =
-                            state.participantServiceCost(
-                                owner.owner_participant,
-                                owner.layer_idx);
-                        const auto &after_cost =
-                            state.participantServiceCost(
-                                after_participant,
-                                owner.layer_idx);
-                        checkedAddWide(
-                            &before_work[static_cast<std::size_t>(
-                                owner.owner_participant)],
-                            checkedMultiplyWide(
-                                demand,
-                                before_cost
-                                    .nanoseconds_per_activation[phase],
-                                "bounded tier participant service cost"),
-                            "bounded tier participant work");
-                        checkedAddWide(
-                            &after_work[static_cast<std::size_t>(
-                                after_participant)],
-                            checkedMultiplyWide(
-                                demand,
-                                after_cost
-                                    .nanoseconds_per_activation[phase],
-                                "bounded tier candidate service cost"),
-                            "bounded tier candidate work");
-                    }
-
-                    const WideCost before = *std::max_element(
-                        before_work.begin(), before_work.end());
-                    const WideCost after = *std::max_element(
-                        after_work.begin(), after_work.end());
-                    if (after > before)
-                    {
+                    if (phase.after_ns > phase.before_ns)
                         phase_safe = false;
-                        continue;
-                    }
-                    checkedAddWide(
-                        &service_gain_one_window,
-                        before - after,
-                        "bounded tier critical-path gain");
+                    else
+                        checkedAddWide(&service_gain_one_window,
+                                       phase.before_ns - phase.after_ns,
+                                       "observed bounded tier service gain");
                 }
 
                 WideCost transfer = 0;
@@ -3658,7 +3586,7 @@ namespace llaminar2
                     service_gain_one_window,
                     policy.payoff_horizon_tokens,
                     "bounded tier projected service gain") /
-                    planning_evidence.tokenCount();
+                    observed_evidence.tokenCount();
                 WideCost measured_cost = transfer;
                 checkedAddWide(
                     &measured_cost,
@@ -3834,11 +3762,11 @@ namespace llaminar2
             participant_search_policy.maximum_swaps_per_layer = 1u;
         }
         const std::optional<std::reference_wrapper<
-            const MoERoutedTierServiceProfile>> participant_service_objective =
-            economy_state_
+            ObservedTransactionServiceObjective>> participant_service_objective =
+            observed_service
                 ? std::optional<std::reference_wrapper<
-                      const MoERoutedTierServiceProfile>>{
-                      std::cref(*config_.phase_service_profile)}
+                      ObservedTransactionServiceObjective>>{
+                      std::ref(*observed_service)}
                 : std::nullopt;
         const auto participant_plan = planOverlayParticipantRebalance(
             *participant_base_candidate->placement_plan,
@@ -3986,6 +3914,32 @@ namespace llaminar2
                                config_.shadow_slots_per_endpoint_layer;
                 });
         };
+        /**
+         * @brief Sum of observed transaction critical paths, separated by phase.
+         *
+         * These modeled costs use certified prices and actual route co-occurrence,
+         * not a maximum of aggregate histogram work. Retain rejected costs too
+         * so a phase regression cannot masquerade as a zero-benefit estimate.
+         */
+        struct ParticipantMakespanScore
+        {
+            std::array<WideCost, kExpertHistogramProductionSourceCount>
+                service_before_by_phase_ns{};
+            std::array<WideCost, kExpertHistogramProductionSourceCount>
+                service_after_by_phase_ns{};
+        };
+
+        /** @brief The exact payoff branch, independent of residency eligibility. */
+        enum class CyclePayoffDisposition
+        {
+            NotPriced,
+            PhaseRegression,
+            NoProjectedGain,
+            InsufficientPayoff,
+            Accepted,
+        };
+
+        /** @brief One candidate's physical cost and authoritative payoff result. */
         struct CycleEconomyScore
         {
             uint64_t projected_service_gain_ns = 0;
@@ -3993,11 +3947,34 @@ namespace llaminar2
             uint64_t inference_interference_ns = 0;
             uint64_t projected_net_benefit_ns = 0;
             bool residency_eligible = true;
-            bool payoff_eligible = true;
+            CyclePayoffDisposition payoff = CyclePayoffDisposition::NotPriced;
+            ParticipantMakespanScore service;
 
+            /** @return Whether the payoff branch permits this candidate. */
+            [[nodiscard]] bool payoffEligible() const noexcept
+            {
+                return payoff == CyclePayoffDisposition::NotPriced ||
+                       payoff == CyclePayoffDisposition::Accepted;
+            }
+
+            /** @return Conjunction of independent residency and payoff policy. */
             [[nodiscard]] bool eligible() const noexcept
             {
-                return residency_eligible && payoff_eligible;
+                return residency_eligible && payoffEligible();
+            }
+
+            /** @return Stable diagnostic name, without another decision flag. */
+            [[nodiscard]] const char *payoffName() const
+            {
+                switch (payoff)
+                {
+                case CyclePayoffDisposition::NotPriced: return "not_priced";
+                case CyclePayoffDisposition::PhaseRegression: return "phase_regression";
+                case CyclePayoffDisposition::NoProjectedGain: return "no_projected_gain";
+                case CyclePayoffDisposition::InsufficientPayoff: return "insufficient_payoff";
+                case CyclePayoffDisposition::Accepted: return "accepted";
+                }
+                throw std::logic_error("Invalid ExpertOverlay cycle payoff disposition");
             }
         };
 
@@ -4016,15 +3993,6 @@ namespace llaminar2
         };
         std::optional<SingleCycleArbitrationSummary>
             single_cycle_arbitration_summary;
-
-        /** Exact before/after routed-service critical path for one window. */
-        struct ParticipantMakespanScore
-        {
-            std::array<WideCost, kExpertHistogramProductionSourceCount>
-                service_before_by_phase_ns{};
-            std::array<WideCost, kExpertHistogramProductionSourceCount>
-                service_after_by_phase_ns{};
-        };
 
         /** Reject phase cross-subsidy before considering aggregate payoff. */
         const auto phases_do_not_regress = [&]
@@ -4079,9 +4047,6 @@ namespace llaminar2
             if (after_migration_indices.empty())
                 return score;
 
-            const auto &state = *economy_state_;
-            const std::size_t participant_count =
-                candidate.previous->owner_map.participants().size();
             std::vector<int> affected_layers;
             affected_layers.reserve(
                 before_migration_indices.size() +
@@ -4104,112 +4069,17 @@ namespace llaminar2
 
             for (const int layer_idx : affected_layers)
             {
-                for (std::size_t phase = 0;
-                     phase < kProductionHistogramSources.size();
-                     ++phase)
+                const auto observed_cost = scoreObservedMigrationSet(
+                    *observed_service, candidate, layer_idx,
+                    before_migration_indices, after_migration_indices);
+                for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
                 {
-                    std::vector<WideCost> before_work(
-                        participant_count, 0);
-                    std::vector<WideCost> after_work(
-                        participant_count, 0);
-                    for (const auto &owner :
-                         candidate.previous->owner_map.owners())
-                    {
-                        if (owner.layer_idx != layer_idx)
-                            continue;
-                        const auto owner_after = [&]
-                            (const std::vector<std::size_t> &indices)
-                        {
-                            for (const std::size_t migration_index : indices)
-                            {
-                                const auto &migration =
-                                    candidate.migrations.at(migration_index);
-                                if (migration.layer_idx == owner.layer_idx &&
-                                    migration.expert_id == owner.expert_id)
-                                {
-                                    if (migration.source.owner_participant !=
-                                        owner.owner_participant)
-                                    {
-                                        throw std::logic_error(
-                                            "ExpertOverlay economy migration source disagrees with the published owner map");
-                                    }
-                                    return migration.destination
-                                        .owner_participant;
-                                }
-                            }
-                            return owner.owner_participant;
-                        };
-                        const int before_participant = owner_after(
-                            before_migration_indices);
-                        const int after_participant = owner_after(
-                            after_migration_indices);
-                        if (before_participant < 0 ||
-                            after_participant < 0 ||
-                            before_participant >=
-                                static_cast<int>(participant_count) ||
-                            after_participant >=
-                                static_cast<int>(participant_count))
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay participant economy references an invalid owner");
-                        }
-
-                        const uint64_t demand =
-                            planning_evidence.activationCount(
-                                kProductionHistogramSources[phase],
-                                layer_idx,
-                                owner.expert_id);
-                        if (!state.production_topology.reachable(
-                                layer_idx, phase))
-                        {
-                            if (demand != 0)
-                            {
-                                throw std::logic_error(
-                                    "ExpertOverlay participant economy observed routed demand in a runtime-disabled inference phase");
-                            }
-                            continue;
-                        }
-                        if (!state.production_topology
-                                 .requiresServiceEvidence(
-                                     layer_idx, phase))
-                        {
-                            continue;
-                        }
-                        const auto &before_cost =
-                            state.participantServiceCost(
-                                before_participant, layer_idx);
-                        const auto &after_cost =
-                            state.participantServiceCost(
-                                after_participant, layer_idx);
-                        checkedAddWide(
-                            &before_work[static_cast<std::size_t>(
-                                before_participant)],
-                            checkedMultiplyWide(
-                                demand,
-                                before_cost
-                                    .nanoseconds_per_activation[phase],
-                                "participant critical-path service cost"),
-                            "participant critical-path work");
-                        checkedAddWide(
-                            &after_work[static_cast<std::size_t>(
-                                after_participant)],
-                            checkedMultiplyWide(
-                                demand,
-                                after_cost
-                                    .nanoseconds_per_activation[phase],
-                                "candidate participant critical-path service cost"),
-                            "candidate participant critical-path work");
-                    }
-                    checkedAddWide(
-                        &score.service_before_by_phase_ns[phase],
-                        *std::max_element(
-                            before_work.begin(), before_work.end()),
-                        "window participant critical path before movement");
-                    checkedAddWide(
-                        &score.service_after_by_phase_ns[phase],
-                        *std::max_element(
-                            after_work.begin(), after_work.end()),
-                        "window participant critical path after movement");
+                    checkedAddWide(&score.service_before_by_phase_ns[phase],
+                                   observed_cost.by_phase[phase].before_ns,
+                                   "observed service before movement");
+                    checkedAddWide(&score.service_after_by_phase_ns[phase],
+                                   observed_cost.by_phase[phase].after_ns,
+                                   "observed service after movement");
                 }
             }
             return score;
@@ -4353,14 +4223,15 @@ namespace llaminar2
                 candidate_migration_indices.end(),
                 cycle.migration_indices.begin(),
                 cycle.migration_indices.end());
-            const auto makespan = score_participant_makespan(
+            score.service = score_participant_makespan(
                 candidate,
                 baseline_migration_indices,
                 candidate_migration_indices);
+            const auto &makespan = score.service;
 
             if (!phases_do_not_regress(makespan))
             {
-                score.payoff_eligible = false;
+                score.payoff = CyclePayoffDisposition::PhaseRegression;
                 return score;
             }
             const WideCost service_before_ns =
@@ -4375,7 +4246,7 @@ namespace llaminar2
                 service_before_ns > service_after_ns
                     ? service_before_ns - service_after_ns
                     : 0;
-            if (planning_evidence.tokenCount() == 0)
+            if (observed_evidence.tokenCount() == 0)
             {
                 throw std::logic_error(
                     "ExpertOverlay cannot score migration economy from a zero-token histogram window");
@@ -4390,7 +4261,7 @@ namespace llaminar2
              * benefit can never make a migration eligible.
              */
             const WideCost projected_gain =
-                projected_gain_numerator / planning_evidence.tokenCount();
+                projected_gain_numerator / observed_evidence.tokenCount();
             score.projected_service_gain_ns = checkedCostToU64(
                 projected_gain,
                 "projected service gain");
@@ -4405,9 +4276,10 @@ namespace llaminar2
                     projected_gain - measured_cost,
                     "projected net benefit");
             }
-            score.payoff_eligible =
-                score.projected_net_benefit_ns >
-                policy.minimum_net_benefit_ns;
+            score.payoff = score.projected_net_benefit_ns > policy.minimum_net_benefit_ns
+                ? CyclePayoffDisposition::Accepted
+                : (projected_gain == 0 ? CyclePayoffDisposition::NoProjectedGain
+                                       : CyclePayoffDisposition::InsufficientPayoff);
             return score;
         };
 
@@ -4437,8 +4309,9 @@ namespace llaminar2
                 all_migration_indices.begin(),
                 all_migration_indices.end(),
                 std::size_t{0});
-            const auto makespan = score_participant_makespan(
+            score.service = score_participant_makespan(
                 candidate, {}, all_migration_indices);
+            const auto &makespan = score.service;
 
             for (const auto &cycle : candidate.migration_cycles)
             {
@@ -4456,14 +4329,14 @@ namespace llaminar2
                     "transaction inference interference");
             }
 
-            if (planning_evidence.tokenCount() == 0)
+            if (observed_evidence.tokenCount() == 0)
             {
                 throw std::logic_error(
                     "ExpertOverlay cannot score transaction economy from a zero-token histogram window");
             }
             if (!phases_do_not_regress(makespan))
             {
-                score.payoff_eligible = false;
+                score.payoff = CyclePayoffDisposition::PhaseRegression;
                 return score;
             }
             const WideCost service_before_ns =
@@ -4483,7 +4356,7 @@ namespace llaminar2
                     service_gain_one_window,
                     policy.payoff_horizon_tokens,
                     "transaction token-horizon service gain") /
-                planning_evidence.tokenCount();
+                observed_evidence.tokenCount();
             WideCost measured_cost = transfer;
             checkedAddWide(
                 &measured_cost,
@@ -4505,9 +4378,10 @@ namespace llaminar2
                     projected_service_gain - measured_cost,
                     "transaction net benefit");
             }
-            score.payoff_eligible =
-                score.projected_net_benefit_ns >
-                policy.minimum_net_benefit_ns;
+            score.payoff = score.projected_net_benefit_ns > policy.minimum_net_benefit_ns
+                ? CyclePayoffDisposition::Accepted
+                : (projected_service_gain == 0 ? CyclePayoffDisposition::NoProjectedGain
+                                               : CyclePayoffDisposition::InsufficientPayoff);
             return score;
         };
 
@@ -4783,6 +4657,7 @@ namespace llaminar2
                 config_.migration_cost_profile->identity;
             economy_evidence.smoothed_through_generation =
                 transaction.histogram_generation;
+            economy_evidence.forecast_fingerprint = economy_state_->forecast->fingerprint();
             economy_evidence.historical_window_weight =
                 policy.historical_window_weight;
             economy_evidence.current_window_weight =
@@ -4806,8 +4681,31 @@ namespace llaminar2
                 economy_evidence.residency_rejected_cycles +=
                     score.residency_eligible ? 0u : 1u;
                 economy_evidence.payoff_rejected_cycles +=
-                    score.payoff_eligible ? 0u : 1u;
-                if (!score.payoff_eligible)
+                    score.payoffEligible() ? 0u : 1u;
+                // Mirror the already computed decision. Observability cannot
+                // select a candidate or cause any device/route materialization.
+                if (PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+                {
+                    for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
+                    {
+                        const PerfStatsCollector::Tags cycle_tags{
+                            {"histogram_generation", std::to_string(full_transaction.histogram_generation)},
+                            {"cycle_index", std::to_string(cycle_index)},
+                            {"source", phase == 0 ? "decode" : (phase == 1 ? "prefill" : "grouped_verifier")},
+                            {"payoff_disposition", score.payoffName()},
+                            {"migration_count", std::to_string(cycle.migration_indices.size())},
+                            {"service_profile", config_.phase_service_profile->identity},
+                            {"migration_profile", config_.migration_cost_profile->identity},
+                        };
+                        PerfStatsCollector::addCounter("moe_overlay_residency", "economy_cycle_service_before_ns",
+                            static_cast<double>(score.service.service_before_by_phase_ns[phase]),
+                            "maintenance", config_.perf_device, cycle_tags);
+                        PerfStatsCollector::addCounter("moe_overlay_residency", "economy_cycle_service_after_ns",
+                            static_cast<double>(score.service.service_after_by_phase_ns[phase]),
+                            "maintenance", config_.perf_device, cycle_tags);
+                    }
+                }
+                if (!score.payoffEligible())
                 {
                     /*
                      * Preserve one internally consistent rejected cycle, not
@@ -4901,6 +4799,12 @@ namespace llaminar2
                  candidate.economy.migration_profile_identity},
                 {"histogram_generation",
                  std::to_string(candidate.histogram_generation)},
+                {"observed_window_tokens",
+                 std::to_string(candidate.histogram_window->token_count)},
+                {"forecast_window_tokens",
+                 std::to_string(planning_window->token_count)},
+                {"forecast_fingerprint",
+                 std::to_string(candidate.economy.forecast_fingerprint)},
             };
             const auto add = [&](const char *name, uint64_t value)
             {
@@ -4928,6 +4832,7 @@ namespace llaminar2
             if (closest_rejected_payoff)
             {
                 auto rejected_tags = tags;
+                rejected_tags.emplace("payoff_disposition", closest_rejected_payoff->score.payoffName());
                 rejected_tags.emplace(
                     "cycle_index",
                     std::to_string(
@@ -4938,7 +4843,7 @@ namespace llaminar2
                         closest_rejected_payoff->migration_count));
                 rejected_tags.emplace(
                     "histogram_window_tokens",
-                    std::to_string(planning_window->token_count));
+                    std::to_string(candidate.histogram_window->token_count));
                 rejected_tags.emplace(
                     "payoff_horizon_tokens",
                     std::to_string(
@@ -5261,15 +5166,6 @@ namespace llaminar2
             }
         }
 
-        /** Typed progress through the bounded wave's one-lane fairness rule. */
-        enum class IndependentAxisReservationPhase
-        {
-            Disabled,
-            AwaitingTier,
-            AwaitingParticipant,
-            Complete,
-        };
-
         /*
          * Dynamic has two independent placement objectives: improve tier
          * residency and reduce participant makespan inside each apportioned
@@ -5284,10 +5180,7 @@ namespace llaminar2
          * the search past a participant candidate that conflicts with the exact
          * per-layer shadow-slot BOM.
          */
-        bool independent_axis_reservation_active = false;
-        std::size_t independent_axis_reserved_participant_candidates = 0u;
-        IndependentAxisReservationPhase axis_reservation_phase =
-            IndependentAxisReservationPhase::Disabled;
+        ParticipantLaneReservation participant_reservation;
         const std::vector<std::size_t> economic_cycle_order = cycle_order;
         if (config_.max_concurrent_cycles >= 2u &&
             cycle_order.size() >= 2u)
@@ -5312,7 +5205,7 @@ namespace llaminar2
                 });
             if (tier_axis_available && participant_axis_available)
             {
-                independent_axis_reservation_active = true;
+                participant_reservation = ParticipantLaneReservation::required();
                 const auto first_tier_it = std::find_if(
                     cycle_order.begin(),
                     cycle_order.end(),
@@ -5328,13 +5221,6 @@ namespace llaminar2
                         "ExpertOverlay two-axis scheduler lost its tier candidate");
                 }
                 const std::size_t first_cycle = *first_tier_it;
-                const auto first_axis = migrationCycleAxis(
-                    full_transaction,
-                    full_transaction.migration_cycles[first_cycle]);
-                axis_reservation_phase =
-                    first_axis == MoEOptimizationMovementAxis::Combined
-                        ? IndependentAxisReservationPhase::Complete
-                        : IndependentAxisReservationPhase::AwaitingTier;
                 std::vector<std::size_t> axis_balanced_order;
                 axis_balanced_order.reserve(cycle_order.size());
                 axis_balanced_order.push_back(first_cycle);
@@ -5344,18 +5230,15 @@ namespace llaminar2
                  * one is admitted. The admission loop below then restores the
                  * untouched tail to `economic_cycle_order`.
                  */
-                if (first_axis != MoEOptimizationMovementAxis::Combined)
+                for (const std::size_t cycle_index : cycle_order)
                 {
-                    for (const std::size_t cycle_index : cycle_order)
-                    {
-                        if (cycle_index == first_cycle)
-                            continue;
-                        const auto axis = migrationCycleAxis(
-                            full_transaction,
-                            full_transaction.migration_cycles[cycle_index]);
-                        if (advancesParticipantPlacement(axis))
-                            axis_balanced_order.push_back(cycle_index);
-                    }
+                    if (cycle_index == first_cycle)
+                        continue;
+                    const auto axis = migrationCycleAxis(
+                        full_transaction,
+                        full_transaction.migration_cycles[cycle_index]);
+                    if (advancesParticipantPlacement(axis))
+                        axis_balanced_order.push_back(cycle_index);
                 }
                 for (const std::size_t cycle_index : cycle_order)
                 {
@@ -5651,10 +5534,10 @@ namespace llaminar2
                      std::to_string(
                          dependent_cohort_payoff_rejections)},
                     {"independent_axis_reservation_active",
-                     independent_axis_reservation_active ? "true" : "false"},
+                     participant_reservation.active() ? "true" : "false"},
                     {"independent_axis_reserved_participant_candidates",
                      std::to_string(
-                         independent_axis_reserved_participant_candidates)},
+                         participant_reservation.reservedCandidates())},
                     {"capacity_bounded",
                      effective_capacity_bounded ? "true" : "false"},
                     {"policy_bounded",
@@ -5704,7 +5587,30 @@ namespace llaminar2
             bounded_economy_score = dependent_cycle_cohort->economy;
             selected_participant_objective_entries =
                 dependent_cycle_cohort->participant_entries;
+            // Seeded work has already passed joint economy and capacity gates.
+            // Observe it before skipping its indices in the ordinary loop.
+            for (const auto cycle_index : selected_cycles)
+                participant_reservation.recordAdmission(migrationCycleAxis(
+                    full_transaction, full_transaction.migration_cycles[cycle_index]));
+            if (participant_reservation.fulfilled())
+                cycle_order = economic_cycle_order;
         }
+
+        /**
+         * Classify the untouched tail when the physical wave is full.
+         * Seeded indices can occur later in either ordering, but they remain
+         * admitted; both capacity exits must use this same exclusion rule.
+         */
+        const auto rejectUnadmittedTailForCapacity = [&](std::size_t begin)
+        {
+            for (std::size_t remaining = begin; remaining < cycle_order.size(); ++remaining)
+            {
+                const auto cycle_index = cycle_order[remaining];
+                if (std::find(selected_cycles.begin(), selected_cycles.end(), cycle_index) ==
+                    selected_cycles.end())
+                    capacity_rejected_cycle_indices.insert(cycle_index);
+            }
+        };
         for (std::size_t order_position = 0u;
              order_position < cycle_order.size();
              ++order_position)
@@ -5721,18 +5627,7 @@ namespace llaminar2
                 bounded->migration_cycles.size() >=
                     config_.max_concurrent_cycles)
             {
-                for (std::size_t remaining = order_position;
-                     remaining < cycle_order.size(); ++remaining)
-                {
-                    const std::size_t omitted = cycle_order[remaining];
-                    if (std::find(
-                            selected_cycles.begin(),
-                            selected_cycles.end(),
-                            omitted) == selected_cycles.end())
-                    {
-                        capacity_rejected_cycle_indices.insert(omitted);
-                    }
-                }
+                rejectUnadmittedTailForCapacity(order_position);
                 break;
             }
             const std::uint32_t cycle_participant_entries =
@@ -5782,7 +5677,7 @@ namespace llaminar2
                     policy.minimum_net_benefit_ns,
                     "bounded transaction marginal payoff threshold");
                 if (!trial_economy_score->residency_eligible ||
-                    !trial_economy_score->payoff_eligible ||
+                    !trial_economy_score->payoffEligible() ||
                     trial_economy_score->projected_net_benefit_ns <=
                         required_net_benefit)
                 {
@@ -5808,25 +5703,9 @@ namespace llaminar2
             const auto admitted_axis = migrationCycleAxis(
                 full_transaction,
                 full_transaction.migration_cycles[cycle_index]);
-            if (axis_reservation_phase ==
-                IndependentAxisReservationPhase::AwaitingTier)
+            if (participant_reservation.recordAdmission(admitted_axis) ==
+                ParticipantLaneReservation::Transition::Fulfilled)
             {
-                if (!advancesTierResidency(admitted_axis))
-                {
-                    throw std::logic_error(
-                        "ExpertOverlay independent-axis reservation admitted a non-tier cycle before its tier prerequisite");
-                }
-                axis_reservation_phase =
-                    IndependentAxisReservationPhase::AwaitingParticipant;
-            }
-            else if (axis_reservation_phase ==
-                         IndependentAxisReservationPhase::AwaitingParticipant &&
-                     advancesParticipantPlacement(admitted_axis))
-            {
-                axis_reservation_phase =
-                    IndependentAxisReservationPhase::Complete;
-                independent_axis_reserved_participant_candidates = 1u;
-
                 /*
                  * The fairness reservation has fulfilled its complete contract.
                  * Keep the already attempted prefix stable for rejection
@@ -5873,13 +5752,7 @@ namespace llaminar2
                  * identities separately from marginal-payoff rejections so
                  * capacity telemetry never mislabels an economical decision.
                  */
-                for (std::size_t remaining = order_position + 1u;
-                     remaining < cycle_order.size();
-                     ++remaining)
-                {
-                    capacity_rejected_cycle_indices.insert(
-                        cycle_order[remaining]);
-                }
+                rejectUnadmittedTailForCapacity(order_position + 1u);
                 break;
             }
         }
@@ -7774,6 +7647,7 @@ namespace llaminar2
                         transaction.migrations.size()),
                     .cycle_count = static_cast<std::uint64_t>(
                         transaction.migration_cycles.size()),
+                    .proof = MoEOptimizationTimeEconomy{
                     .projected_service_gain_ns =
                         transaction.economy.projected_service_gain_ns,
                     .projected_transfer_and_repack_ns =
@@ -7784,6 +7658,7 @@ namespace llaminar2
                             .projected_inference_interference_ns,
                     .projected_net_benefit_ns =
                         transaction.economy.projected_net_benefit_ns,
+                    },
                 };
                 if (!committed_economy->valid())
                 {
@@ -8043,6 +7918,21 @@ namespace llaminar2
         }
         else
         {
+            if (PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+            {
+                /* The transport folds the same immutable identity only after
+                 * publishing the fully prepared runtime bank. This independent
+                 * owner witness follows ledger publication, so diagnostics can
+                 * match their complete ordering without per-epoch telemetry keys.
+                 * Neither witness participates in the runtime commit decision. */
+                PerfStatsCollector::recordOrderedSequenceStep(
+                    "moe_overlay_residency",
+                    "placement_owner_publications",
+                    {transaction.candidate->epoch,
+                     static_cast<std::uint64_t>(transaction.migrations.size())},
+                    "maintenance", config_.perf_device,
+                    {{"purpose", "placement_change"}});
+            }
             committed_waves_.fetch_add(1, std::memory_order_relaxed);
             committed_migrations_.fetch_add(
                 transaction.migrations.size(),

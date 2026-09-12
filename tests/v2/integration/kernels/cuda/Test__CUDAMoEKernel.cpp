@@ -1,3 +1,11 @@
+/**
+ * @file Test__CUDAMoEKernel.cpp
+ * @brief Device-backed routing, grouped arithmetic and expert publication proofs.
+ *
+ * Exercises production kernels with explicit streams and adversarial transfer
+ * slot lifetimes. Terminal movement evidence must distinguish copied payloads
+ * from resident-only assignments and survive an empty final apply poll.
+ */
 #include <gtest/gtest.h>
 
 #ifdef HAVE_CUDA
@@ -9298,6 +9306,20 @@ TEST_F(Test__CUDAMoEKernel,
     EXPECT_EQ(status.post_policy_load_max, 79u);
     EXPECT_EQ(status.accepted_load_spread_improvement_total, 42u);
     EXPECT_EQ(status.accepted_load_spread_improvement_max, 42u);
+    EXPECT_EQ(command_header.movement_decision.kind,
+              llaminar2::DeviceMoERebalanceMovementDecisionKind::NativeOwnershipSpread);
+    const auto &sealed_proof = command_header.movement_decision.load;
+    EXPECT_TRUE(sealed_proof.valid());
+    EXPECT_EQ(sealed_proof.accepted_spread_improvement, 42u);
+    EXPECT_EQ(sealed_proof.pre_wave_spread, 90u);
+    EXPECT_EQ(sealed_proof.post_wave_spread, 48u);
+    EXPECT_EQ(sealed_proof.pre_wave_total, 110u);
+    EXPECT_EQ(sealed_proof.post_wave_total, 110u);
+    EXPECT_EQ(sealed_proof.requested_payload_slots, 1u);
+    EXPECT_EQ(sealed_proof.minimum_improvement_per_slot, 30u);
+    EXPECT_EQ(sealed_proof.ownership_swap_accepts, 1u);
+    EXPECT_EQ(plan[0].activation_count, 30u);
+    EXPECT_EQ(plan[1].activation_count, 9u);
     EXPECT_EQ(status.payload_bucket_requested_slots, 1u)
         << "The reciprocal ownership pair is one concurrent source-lane slot, not two edges.";
     EXPECT_EQ(status.payload_bucket_slots, 1u);
@@ -11118,6 +11140,14 @@ TEST_F(Test__CUDAMoEKernel, ApplyReadyDeviceRebalanceWaveClearsAppliedCommandHea
     EXPECT_EQ(apply_status.plan_entries_seen, 0u);
     EXPECT_EQ(apply_status.applied_arrivals, 0u);
     EXPECT_EQ(apply_status.changed_layers, 0u);
+
+    // The final empty poll preserves the completed wave, but that wave only
+    // reassigned existing bytes. Nonzero configured slot capacity is not proof
+    // that a physical expert payload crossed a device boundary.
+    ASSERT_EQ(cudaMemcpy(&result_state, d_controller_state, sizeof(result_state),
+                         cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(llaminar2::deviceMoERebalanceRequestMovementEvidence(
+                  result_state.waves, 0, 1024).useful_payload_bytes_lower_bound, 0u);
 
     cudaFree(d_plan_entries);
     cudaFree(d_command_headers);
@@ -14777,6 +14807,11 @@ TEST_F(Test__CUDAMoEKernel,
                 command_buffer_count);
 
         occupants = transaction.next_occupants;
+        // This fixture supplies copy-complete payload leases. The real apply
+        // kernel must turn only the matching wave into terminal evidence.
+        const auto movement = deviceMoERebalanceRequestMovementEvidence(
+            {&controller.waves[wave_index], 1}, 0, 1024);
+        ASSERT_EQ(movement.completed_payload_lower_bound, transaction.command_count);
         ASSERT_TRUE(model::validateSnapshot(
             runtime,
             occupants,
@@ -14843,6 +14878,11 @@ TEST_F(Test__CUDAMoEKernel,
             ASSERT_EQ(
                 controller.decode_apply_hits,
                 hits_before);
+            EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(
+                          {&controller.waves[wave_index], 1}, 0, 1024)
+                          .useful_payload_bytes_lower_bound,
+                      movement.useful_payload_bytes_lower_bound)
+                << "an empty final apply must not erase completed payload evidence";
         }
     }
 
@@ -26534,6 +26574,20 @@ TEST_F(
         "CUDA",
         llaminar2::DeviceId::cuda(0),
         stream_);
+#endif
+}
+
+/** @brief Prove all-codebook copy bytes and the exact transient epoch lease. */
+TEST_F(Test__CUDAMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactBytes)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+        "CUDA", llaminar2::DeviceId::cuda(0), stream_,
+        llaminar2::test::NativeExpertTransferProofScope::CopyPublication);
 #endif
 }
 

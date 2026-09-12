@@ -9,6 +9,7 @@
 #pragma once
 
 #include "NodeExpertOverlayParitySupport.h"
+#include "../../ParityPrefillSnapshotEvidence.h"
 
 namespace llaminar2::test::parity::qwen35moe::node_overlay
 {
@@ -95,6 +96,9 @@ protected:
      * @return True only for one complete exact-identity retained runner.
      */
     bool hasCompatibleQwen122OverlayRunner(std::string *error) const;
+
+    /** @return Retained setup proof only for the exact still-owned runner. */
+    ParityRunnerEvidenceLifetime productionParityRunnerEvidenceLifetime() const override;
 
     /**
      * @brief Transfer an exact yielded runner into this fixture.
@@ -327,19 +331,17 @@ protected:
         ReferenceEconomyPromptRole role) const;
 
     /**
-     * @brief Build the exact cache-distinct prefill that closes a demand bank.
+     * @brief Build the exact stationary prefill that closes a demand bank.
      *
      * The authority supplies the remaining logical routed-row count. This
-     * helper changes only the prefix-cache identity and repeats authenticated
-     * model tokens for the requested causal length, so closure remains ordinary
-     * production inference rather than synthetic histogram mutation.
+     * helper repeats authenticated model tokens without injecting a new leading
+     * token. The caller purges reusable prefix state through the production API
+     * so these same causal rows execute rather than being served from cache.
      *
-     * @param request_index Stable identity in the closure traffic namespace.
      * @param routed_rows Exact positive active-bank headroom to consume.
      * @return One valid model prompt with exactly @p routed_rows rows.
      */
     std::vector<int32_t> makeDemandWindowClosurePrompt(
-        int request_index,
         std::uint64_t routed_rows) const;
 
     /** @return Median of a non-empty timing corpus without changing it. */
@@ -613,7 +615,8 @@ protected:
      * assertion consequently proves the whole lifecycle rather than inventing
      * a test-only reset edge: all schedules succeed, every captured row is
      * accounted for, both roles retain identical ordered digests, and the one
-     * snapshot-bearing parity request independently proves `[4,4,1]`. Mandatory
+     * request-scoped parity evidence independently proves `[4,4,1]`. Training
+     * and prefix seeding may also publish valid snapshot aggregations. Mandatory
      * prefix restore then contributes exactly one serial suffix-decode record.
      */
     void assertSegmentedPrefillEvidence() const;
@@ -625,8 +628,11 @@ protected:
      * `PREFILL_CHUNK_0_layer0_...` for diagnosis and rewrites the bare semantic
      * key to the ordered aggregate. This check prevents a short final chunk
      * from passing merely because a comparison used the shorter tensor length.
+     * @param before Immutable counters immediately before the parity request;
+     *               its delta excludes earlier training and later prefix seeds.
      */
-    void assertSegmentedPrefillCheckpointCoverage();
+    void assertSegmentedPrefillCheckpointCoverage(
+        const ParityPrefillSnapshotEvidence &before);
 
     bool collectivelyCheckHardwareAndModel() const;
 
@@ -1188,27 +1194,15 @@ protected:
         const std::vector<LayerStats> &layers) override;
 
     /**
-     * @brief Retain one serial main-model row under its exact placement epoch.
+     * @brief Retain exactly one same-prefix serial verifier oracle for this cell.
+     * @param boundary The checkpoint published by the generic captured request.
      *
-     * A later live-oracle extension may revisit the same logical row after an
-     * ExpertOverlay epoch change. In that case the newer row replaces the old
-     * diagnostic so grouped row zero is never compared with a stale physical
-     * placement. Re-observing the same epoch must carry the same token identity.
+     * Duplicate publication is fatal. Another request in the same placement
+     * epoch is not interchangeable with this request's hidden/KV input state.
      */
     void retainMTPSerialVerifierDiagnostic(
         const ProductionParityMTPSerialOracleBoundary &boundary);
 
-    /**
-     * @brief Reuse the compared captured M=1 row before placement maintenance.
-     *
-     * GPU fixed-depth cells need no serial replay: ordinary parity already
-     * executed and compared the exact row selected for grouped verification.
-     * Dynamic-depth and CPU cells can require a longer oracle than the compact
-     * checkpoint corpus, so their explicit live-oracle callback remains the
-     * authority.
-     */
-    void observeProductionParityDecodeBoundary(
-        const ProductionParityDecodeBoundary &boundary) override;
 
     /**
      * @brief Observe the primary sidecar bank under its exact live namespace.

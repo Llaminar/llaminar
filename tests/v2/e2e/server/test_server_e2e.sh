@@ -8,6 +8,11 @@
 # Default selection comes from ModelParityDefinition::e2e_certifiable through
 # scripts/ci/run_model_parity_e2e.py. This file owns HTTP checks and server
 # lifecycle, not a second model/topology/feature matrix.
+# Canonical generation probes reuse this same lifecycle via an explicit
+# --generation-configuration file. They are not full HTTP/E2E certification;
+# their ordered requests and serial-control identity come from the typed matrix.
+# GPU capture/replay certification belongs to graph_capture_perf_policy.py;
+# the shell does not reinterpret retained parents as legacy full-graph counters.
 #
 # Each backend test:
 #   Every MPI rank exports its own evidence; after shutdown the harness requires
@@ -206,6 +211,8 @@ STARTED_SERVER_HANDLE=""
 OVERRIDE_MODEL=""
 OVERRIDE_BACKENDS=""
 SERVER_ARGS_FILE=""
+GENERATION_CONFIG_FILE=""
+GENERATION_CONTROL_FILE=""
 declare -a CANONICAL_SERVER_ARGS=()
 
 show_usage() {
@@ -221,6 +228,10 @@ Container options:
   --docker-network                    auto|host|bridge|container:<id> (default: auto)
   --docker-gpus                       auto|all|none|<docker --gpus value> (default: auto)
   --docker-arg                        Additional docker run argument; repeatable
+
+Canonical generation diagnostics (not the full E2E suite):
+  --generation-configuration          Typed exported cell, with canonical requests
+  --generation-control               Completed serial observations; required for MTP
 
 Environment:
   LLAMINAR_E2E_CONTAINER_IMAGE        Docker image to run instead of the local binary
@@ -260,10 +271,22 @@ while [[ $# -gt 0 ]]; do
         --backends) OVERRIDE_BACKENDS="$2"; shift 2 ;;
         --suite)    SUITES+=("$2");         shift 2 ;;
         --server-args-file) SERVER_ARGS_FILE="$2"; shift 2 ;;
+        --generation-configuration) GENERATION_CONFIG_FILE="$2"; shift 2 ;;
+        --generation-control) GENERATION_CONTROL_FILE="$2"; shift 2 ;;
         --port)     BASE_PORT="$2";         shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [[ -n "$GENERATION_CONFIG_FILE" ]]; then
+    if [[ -z "$SERVER_ARGS_FILE" || ${#SUITES[@]} -ne 1 || "${SUITES[0]}" == *e2e-certification* ]]; then
+        echo "Generation diagnostics require one canonical argv suite and cannot claim E2E certification" >&2
+        exit 1
+    fi
+elif [[ -n "$GENERATION_CONTROL_FILE" ]]; then
+    echo "A generation control requires its canonical configuration" >&2
+    exit 1
+fi
 
 # Preserve argv boundaries, including paths with spaces and domain semicolons.
 # Validate synchronously before mapfile; process-substitution errors alone do
@@ -810,8 +833,11 @@ start_server_process() {
         --name "$container_name"
         --network "$network_mode"
         --ulimit core=-1
-        -v "${model_dir}:${model_dir}:ro"
-        -v "${log_dir_abs}:${log_dir_abs}"
+        # Resolve the daemon's mount namespace: a private devcontainer tmpfs
+        # is not the host's identically named directory. Preserve the same
+        # destination so canonical server arguments remain unchanged.
+        --mount "type=bind,src=$(python3 "${REPO_ROOT}/scripts/ci/docker_paths.py" "$model_dir"),dst=${model_dir},readonly"
+        --mount "type=bind,src=$(python3 "${REPO_ROOT}/scripts/ci/docker_paths.py" "$log_dir_abs"),dst=${log_dir_abs}"
     )
     if [[ -n "$DOCKER_IPC" && "${DOCKER_IPC,,}" != "none" ]]; then
         docker_args+=(--ipc "$DOCKER_IPC")
@@ -831,7 +857,13 @@ start_server_process() {
     fi
     local nvidia_mode="none"
     local needs_nvidia="0"
-    if docker_args_need_cuda "${args_ref[@]}"; then
+    # Image linkage and request placement are different contracts. A full
+    # shared-core image needs the real NVIDIA loader even for CPU/ROCm cells;
+    # supplying that driver must not rewrite the typed inference topology.
+    local image_needs_nvidia
+    image_needs_nvidia="$(python3 "${REPO_ROOT}/scripts/ci/docker_paths.py" \
+        --cuda-driver-required "$CONTAINER_IMAGE")"
+    if docker_args_need_cuda "${args_ref[@]}" || [[ "$image_needs_nvidia" == yes ]]; then
         needs_nvidia="1"
     fi
 
@@ -1942,16 +1974,16 @@ validate_perf_stats() {
     fi
 
     local validation
-    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" <<'PY'
+    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" "$GENERATION_CONFIG_FILE" "$LOG_DIR/generation/observations.json" "$REPO_ROOT/scripts/ci" <<'PY'
 import json
 from pathlib import Path
 import shlex
 import sys
 
-path, backend, extra_flags, long_context_run, suite_options, policy_module_dir = sys.argv[1:7]
+path, backend, extra_flags, long_context_run, suite_options, policy_module_dir, generation_config, generation_observations, generation_module_dir = sys.argv[1:10]
 sys.path.insert(0, policy_module_dir)
 
-from graph_capture_perf_policy import validate_graph_capture_policy
+from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
 from flash_attention_perf_policy import (
     validate_cpu_flash_attention_execution_policy,
     validate_flash_attention_plan_policy,
@@ -1978,7 +2010,7 @@ suite_option_set = {
 }
 expect_prefill_phase = (
     is_gpu
-    and long_context_run == "true"
+    and (long_context_run == "true" or "generation-regression" in suite_option_set)
     and "no-prefill-graph-buckets" not in suite_option_set
 )
 require_prefill_capture = (
@@ -2023,6 +2055,8 @@ if is_gpu:
         backend,
         extra_flags,
         require_prefill_lifecycle=expect_prefill_phase,
+        decode_requirement=(DecodeGraphRequirement.REPLAY if expect_decode_replay
+                            else DecodeGraphRequirement.CAPTURE),
     )
     if graph_capture_validation.error:
         print(f"FAIL: {graph_capture_validation.error}")
@@ -2170,18 +2204,11 @@ if expect_shared_moe_route_scratch:
         print(f"FAIL: {route_scratch_error}")
         sys.exit(0)
 
-decode_graph_captured = (
-    has_record("decode_graph_phase", "forward_graph", {"phase": "capture"})
-)
-decode_graph_replayed = (
-    has_record("decode_graph_phase", "forward_graph", {"phase": "replay"})
-)
-
 if is_mtp and not has_record(domain="mtp"):
     print("FAIL: MTP case emitted no mtp-domain counters")
     sys.exit(0)
 
-if "e2e-certification" in suite_option_set:
+if suite_option_set.intersection({"e2e-certification", "generation-regression"}):
     import os
     try:
         required_movement = MovementEvidence(os.environ["LLAMINAR_E2E_MOVEMENT_EVIDENCE"])
@@ -2192,17 +2219,22 @@ if "e2e-certification" in suite_option_set:
     if runtime_feature_error:
         print(f"FAIL: {runtime_feature_error}")
         sys.exit(0)
-
-if is_gpu:
-    if not decode_graph_captured:
-        print("FAIL: GPU case emitted no decode graph capture counter")
-        sys.exit(0)
-    # Short arithmetic probes may finish immediately after warmup/capture,
-    # especially on ROCm.  Require replay only for cases that deliberately
-    # create enough decode work or explicitly ask for a replay proof.
-    if expect_decode_replay and not decode_graph_replayed:
-        print("FAIL: GPU case expected decode graph replay but emitted no replay counter")
-        sys.exit(0)
+    if "generation-regression" in suite_option_set:
+        # Physical publication checks above remain independent of the HTTP
+        # authority journal. Bind their exact expert identities here only after
+        # shutdown has published every rank's complete diagnostic artifact.
+        sys.path.insert(0, generation_module_dir)
+        from generation_regression_http import observation_traces
+        from generation_movement_ledger import validate_movement_transport_mirrors
+        try:
+            configuration = json.loads(Path(generation_config).read_text())
+            observations = json.loads(Path(generation_observations).read_text())
+            observation_traces(configuration, observations)
+            final_journal = observations["requests"][-1]["response"]["runtime_summary"]["expert_movement"]
+            validate_movement_transport_mirrors(final_journal, records)
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+            print(f"FAIL: generation transport/journal evidence: {error}")
+            sys.exit(0)
 
 if require_prefill_capture:
     if not has_record("prefill_graph_phase", "forward_graph", {"capture_phase": "capture"}):
@@ -3490,6 +3522,23 @@ run_backend_tests() {
         fail "[${tag}] GET /health unexpected: ${health_response}"
     fi
 
+    if [[ -n "$GENERATION_CONFIG_FILE" ]]; then
+        # Only the workload changes. Startup, Docker/MPI ownership, graceful
+        # teardown, memory, graph and feature validation remain shared below.
+        local -a generation_args=(
+            --configuration "$GENERATION_CONFIG_FILE"
+            --base-url "$(server_base_url "$port")"
+            --output "$LOG_DIR/generation"
+        )
+        if [[ -n "$GENERATION_CONTROL_FILE" ]]; then
+            generation_args+=(--control "$GENERATION_CONTROL_FILE")
+        fi
+        if python3 "$REPO_ROOT/scripts/ci/generation_regression_http.py" "${generation_args[@]}"; then
+            pass "[${tag}] Canonical generation token probes"
+        else
+            fail "[${tag}] Canonical generation token probes (see generation/observations.json)"
+        fi
+    else
     # The stochastic probe is an HTTP production-path check, so it must run
     # only after the server has crossed its explicit health publication
     # boundary. Keeping it here also makes its first request the cache producer
@@ -3598,6 +3647,7 @@ print(d.get('error', {}).get('type', ''))
     if [ "$long_context_run" = "true" ]; then
         run_long_context_checks "$tag" "$port" "$thinking_model"
     fi
+    fi # Ordinary HTTP/E2E workload; generation has its own typed requests.
 
     # ─── Test 10: Memory and server log hygiene ───────────────────────
     check_memory_usage "$tag" "$backend" "$model" "$server_handle" "$gpu_before_mb" "$extra_flags"

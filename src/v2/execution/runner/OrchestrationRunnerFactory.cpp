@@ -11,7 +11,7 @@
 
 #include "IOrchestrationRunnerFactory.h"
 #include "OrchestrationRunner.h"
-#include "NamedDomainGlobalRunner.h"
+#include "../global/NamedDomainGraphBuilder.h"
 #include "../../config/OrchestrationConfigParser.h"
 #include "../../config/ParallelismTreeParser.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
@@ -25,7 +25,7 @@ namespace llaminar2
     RunnerModelAuthorityScope resolveRunnerModelAuthorityScope(
         const OrchestrationConfig &config)
     {
-        if (config.topology_tree || NamedDomainGlobalRunner::shouldUse(config))
+        if (config.topology_tree || requiresNamedDomainGlobalGraph(config))
             return RunnerModelAuthorityScope::MultiRankSet;
         return RunnerModelAuthorityScope::RankLocal;
     }
@@ -273,21 +273,8 @@ namespace llaminar2
                 // But we need model context first, so fall through to standard path
             }
 
-            // ================================================================
-            // Phase 5: Named-domain global pipeline runner
-            // ================================================================
-            // When the config has named domains with PP stages that span
-            // multiple MPI ranks, use NamedDomainGlobalRunner.  This supports
-            // scope=node_local, scope=global, and AUTO domains whose device
-            // list spans multiple hostnames.
-            if (NamedDomainGlobalRunner::shouldUse(config))
-            {
-                LOG_DEBUG("Named-domain global PP configuration detected — using NamedDomainGlobalRunner");
-                auto runner_plan_builder = createExecutionPlanBuilder();
-                return std::make_unique<NamedDomainGlobalRunner>(
-                    std::move(config),
-                    std::move(runner_plan_builder));
-            }
+            // Named domains share the ordinary initialization/admission owner.
+            // Their explicit global graph is lowered at its build-graph phase.
 
             // Global orchestration detection (legacy path — simple --pp-degree mode)
             {

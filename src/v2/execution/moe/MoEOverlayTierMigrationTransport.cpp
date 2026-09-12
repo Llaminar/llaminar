@@ -603,6 +603,28 @@ namespace llaminar2
                 if (progress == MoEOverlayResidencyWaveProgress::Ready)
                 {
                     phase_ = Phase::Published;
+                    if (identity_.recordsOptimizationTransferEvidence() &&
+                        PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+                    {
+                        /* Corroborate the owner's publication with an independently
+                         * completed bank/transfer edge. Epochs are sequence words,
+                         * never tags: the diagnostic storage stays bounded over a
+                         * long model lifetime. Calibration and teardown restoration
+                         * must not contribute optimization evidence. */
+                        PerfStatsCollector::recordOrderedSequenceStep(
+                            "moe_overlay_residency",
+                            "placement_transport_publications",
+                            {identity_.candidate_epoch,
+                             static_cast<std::uint64_t>(identity_.migration_count)},
+                            "maintenance", perf_device_,
+                            {{"purpose", "placement_change"}});
+                        PerfStatsCollector::addCounter(
+                            "moe_overlay_residency",
+                            "placement_published_payload_bytes",
+                            static_cast<double>(completed_projection_payload_bytes_),
+                            "maintenance", perf_device_,
+                            {{"purpose", "placement_change"}});
+                    }
                     PerfStatsCollector::addCounter(
                         "moe_overlay_residency",
                         "runtime_banks_published",

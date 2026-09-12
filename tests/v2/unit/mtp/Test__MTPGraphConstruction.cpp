@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <fstream>
 #include <initializer_list>
 #include <memory>
@@ -6729,6 +6730,57 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     PerfStatsCollector::reset();
 }
 
+/**
+ * @brief Logical checkpoints admit exact appends without risking ring overwrite.
+ *
+ * The tiny production CPU runner exercises the shared participant admission at
+ * the final physical KV slot. Main and shifted limits are checked independently;
+ * restoring and replaying that slot must preserve the same native logits.
+ */
+TEST(Test__MTPGraphConstruction, LivePrefixCheckpointAdmitsOnlyDeclaredAppendSpan)
+{
+    DeviceManager::instance().initialize(-1, false);
+    TinyQwen35MTPForwardFixture fixture;
+    auto builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(builder, fixture.mpi);
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        1, fixture.config.max_seq_len, DeviceId::cpu()));
+    orchestrator.setFrozenWeightSet(makeTinyQwen35MTPFrozenWeightSet(fixture));
+    PreparedWeightStore prepared;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), prepared);
+    builder->setPreparedWeightStore(&prepared);
+    const std::vector<int> prompt(fixture.config.max_seq_len - 1, 1);
+    ASSERT_NE(orchestrator.forward(prompt.data(), prompt.size(), 1), nullptr);
+    PrefixCheckpointCaptureRequest request{
+        .sequence_index = 0,
+        .logical_cached_tokens = static_cast<int>(prompt.size()),
+        .maximum_main_append_tokens = 1,
+        .maximum_shifted_append_tokens = 1};
+    auto invalid = request;
+    invalid.maximum_main_append_tokens = 2;
+    EXPECT_FALSE(orchestrator.captureLivePrefixCheckpoint(invalid).valid);
+    invalid = request;
+    invalid.maximum_shifted_append_tokens = fixture.config.max_seq_len;
+    EXPECT_FALSE(orchestrator.captureLivePrefixCheckpoint(invalid).valid);
+    invalid = request;
+    invalid.maximum_main_append_tokens = std::numeric_limits<int>::max();
+    EXPECT_FALSE(orchestrator.captureLivePrefixCheckpoint(invalid).valid);
+    invalid.maximum_main_append_tokens = -1;
+    EXPECT_FALSE(orchestrator.captureLivePrefixCheckpoint(invalid).valid);
+
+    const auto checkpoint = orchestrator.captureLivePrefixCheckpoint(request);
+    ASSERT_TRUE(checkpoint.valid);
+    ASSERT_TRUE(checkpoint.logical_checkpoint);
+    const int token = 4;
+    const auto *first = orchestrator.forward(&token, 1, 1);
+    ASSERT_NE(first, nullptr);
+    const std::vector<float> logits(first, first + fixture.config.vocab_size);
+    ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
+    const auto *replay = orchestrator.forward(&token, 1, 1);
+    ASSERT_NE(replay, nullptr);
+    EXPECT_EQ(std::memcmp(logits.data(), replay, logits.size() * sizeof(float)), 0);
+}
+
 TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogicalTruncate)
 {
     DeviceManager::instance().initialize(-1, false);
@@ -6760,7 +6812,9 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
             PrefixCheckpointCaptureRequest{
                 .sequence_index = 0,
                 .logical_cached_tokens =
-                    static_cast<int>(prefix_tokens.size())});
+                    static_cast<int>(prefix_tokens.size()),
+                .maximum_main_append_tokens = 2,
+                .maximum_shifted_append_tokens = 0});
     ASSERT_TRUE(checkpoint.valid);
     EXPECT_TRUE(checkpoint.logical_checkpoint);
     ASSERT_EQ(checkpoint.blocks.size(), 1u);
@@ -6837,7 +6891,7 @@ TEST(Test__MTPGraphConstruction,
         kMTPConcurrentLiveCheckpointSets *
         static_cast<size_t>(fixture.config.d_model) * sizeof(float);
     const size_t expected_kv_bytes =
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             /*main plus shifted full-attention layers=*/2,
             /*batch_size=*/1,
             fixture.config.max_seq_len,
@@ -6953,7 +7007,9 @@ TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossR
         orchestrator.captureLivePrefixCheckpoint(
             PrefixCheckpointCaptureRequest{
                 .sequence_index = 0,
-                .logical_cached_tokens = 1});
+                .logical_cached_tokens = 1,
+                .maximum_main_append_tokens = 0,
+                .maximum_shifted_append_tokens = 0});
     ASSERT_TRUE(checkpoint.valid);
     ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
     EXPECT_GT(orchestrator.forwardReplayLiveStateEpoch(), epoch_after_decode);

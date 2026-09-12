@@ -102,8 +102,8 @@ namespace llaminar2
     struct MoEOverlayDistributedHistogramHeader
     {
         static constexpr std::uint32_t kMagic = 0x484F4F4Du; // "MOOH"
-        static constexpr std::uint32_t kABIVersion = 2u;
-        static constexpr std::size_t kWireBytes = 64u;
+        static constexpr std::uint32_t kABIVersion = 3u;
+        static constexpr std::size_t kWireBytes = 72u;
 
         std::uint32_t magic = kMagic;
         std::uint32_t abi_version = kABIVersion;
@@ -118,6 +118,8 @@ namespace llaminar2
         std::uint64_t expert_count_entries = 0;
         std::uint64_t source_expert_count_entries = 0;
         std::uint64_t counts_fingerprint = 0;
+        /** Compact observed batches following the counts; zero for count-only diagnostics. */
+        std::uint64_t transaction_bytes = 0;
 
         /** @return Whether geometry, count, and digest form a valid envelope. */
         [[nodiscard]] bool valid() const noexcept;
@@ -131,16 +133,21 @@ namespace llaminar2
         MoEOverlayDistributedHistogramHeader::kWireBytes);
 
     /**
-     * @brief Return exact fixed-packet bytes for one model histogram geometry.
+     * @brief Return maximum receive bytes for model-owned histogram/demand geometry.
      * @throws std::invalid_argument For non-positive geometry.
      * @throws std::overflow_error When flattened counts exceed size_t.
      */
     [[nodiscard]] std::size_t moeOverlayDistributedHistogramWireBytes(
         int num_layers,
-        int num_experts);
+        int num_experts,
+        const moe_overlay_economy::TransactionDemandCapacity *transactions = nullptr);
+
+    /** @return Exact send bytes for one observed sample, excluding unused capacity. */
+    [[nodiscard]] std::size_t moeOverlayDistributedHistogramWireBytes(
+        const DecodeExpertHistogramWindow &window);
 
     /**
-     * @brief Stable digest of generation, geometry, and every expert count.
+     * @brief Stable digest of generation, counts, phases, routes and batch boundaries.
      * @param window Valid immutable routing-evidence generation.
      * @return Non-zero endian-independent digest.
      * @throws std::invalid_argument For an invalid window.
@@ -161,12 +168,13 @@ namespace llaminar2
         std::string *error = nullptr);
 
     /**
-     * @brief Decode and authenticate one fixed histogram packet.
+     * @brief Decode and authenticate one compact, capacity-bounded histogram packet.
      * @param packet Complete little-endian packet from the coordinator.
      * @param expected_layers Model-owned layer geometry.
      * @param expected_experts Model-owned expert geometry.
      * @param window Receives the authenticated generation and counts.
      * @param error Optional malformed-packet diagnostic.
+     * @param transactions Local capacity and PMA; when supplied, complete batches are mandatory.
      * @return True only for exact size, geometry, and digest agreement.
      *
      * Callers may pre-size aggregate and source count vectors to reuse
@@ -177,7 +185,8 @@ namespace llaminar2
         int expected_layers,
         int expected_experts,
         DecodeExpertHistogramWindow *window,
-        std::string *error = nullptr);
+        std::string *error = nullptr,
+        const ExpertHistogramTransactionConfig *transactions = nullptr);
 
     /**
      * @brief Root-authored plan plus separate execution and policy identities.
@@ -201,7 +210,7 @@ namespace llaminar2
     struct MoEOverlayDistributedResidencyProposalHeader
     {
         static constexpr std::uint32_t kMagic = 0x504F4F4Du; // "MOOP"
-        static constexpr std::uint32_t kABIVersion = 1u;
+        static constexpr std::uint32_t kABIVersion = 2u;
         static constexpr std::size_t kWireBytes = 96u;
 
         std::uint32_t magic = kMagic;
@@ -244,7 +253,12 @@ namespace llaminar2
     [[nodiscard]] std::size_t
     moeOverlayDistributedResidencyProposalWireBytes(
         int num_layers,
-        int num_experts);
+        int num_experts,
+        const moe_overlay_economy::TransactionDemandCapacity *transactions = nullptr);
+
+    /** @return Compact actual proposal bytes within its preadmitted receive capacity. */
+    [[nodiscard]] std::size_t moeOverlayDistributedResidencyProposalWireBytes(
+        const MoEOverlayDistributedResidencyProposal &proposal);
 
     /**
      * @brief Encode one canonical proposal into exact little-endian storage.
@@ -265,6 +279,7 @@ namespace llaminar2
      * @param expected_experts Model-owned expert geometry.
      * @param proposal Receives the canonical plan and identities.
      * @param error Optional malformed-packet diagnostic.
+     * @param transactions Local capacity/PMA requiring observed transaction evidence.
      * @return True only after complete size, geometry, and digest validation.
      */
     bool decodeMoEOverlayDistributedResidencyProposal(
@@ -272,7 +287,8 @@ namespace llaminar2
         int expected_layers,
         int expected_experts,
         MoEOverlayDistributedResidencyProposal *proposal,
-        std::string *error = nullptr);
+        std::string *error = nullptr,
+        const ExpertHistogramTransactionConfig *transactions = nullptr);
 
     /** @brief Fixed-layout identity shared by every rank in one migration wave. */
     struct MoEOverlayDistributedResidencyWaveIdentity

@@ -1,12 +1,17 @@
 /**
  * @file KVCacheAppendStage.cpp
- * @brief Implementation of KVCacheAppendStage
+ * @brief Publish projection rows through the cache's native conversion authority.
+ *
+ * Anchored compressed caches own basis initialization and fused K/V encoding on
+ * every backend. The stage passes original projections and live row geometry;
+ * it must not quantize keys before the request-relative basis is applied.
  */
 
 #include "KVCacheAppendStage.h"
 #include "../ComputeStageUtils.h"
 #include "../../local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/Assertions.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../utils/Logger.h"
@@ -347,6 +352,113 @@ namespace llaminar2
         const int batch_size = params_.batch_size;
         const int seq_len = params_.seq_len;
 
+        /*
+         * Q16 publication is one operation for serial, grouped and request-
+         * batched rows. Each physical block owns its range; no model-wide scale
+         * or value clipping may silently discard the precision of this cache.
+         * Attention bounds its transient query codes to make integer reductions
+         * safe for full-range native keys on every CPU ISA.
+         */
+        if (cache_k_precision == ActivationPrecision::Q16_1 &&
+            cache_v_precision == ActivationPrecision::Q16_1)
+        {
+            if (!params_.device_id.is_cpu())
+                LLAMINAR_UNREACHABLE("Native Q16 append requires the CPU cache implementation");
+            const size_t kv_dim = params_.K->cols();
+            const auto block_size = optimal_q16_block_size(params_.head_dim);
+            const size_t block_elements = q16_block_size_elements(block_size);
+            const int requests = batch_size > 1 && seq_len > 0 ? batch_size : 1;
+            const int rows = requests > 1 ? seq_len : total_tokens;
+            if (!(params_.head_dim > 0 && kv_dim > 0 &&
+                           kv_dim % block_elements == 0 &&
+                           params_.V->cols() == kv_dim &&
+                           rows > 0 && rows * requests == total_tokens &&
+                           params_.K->rows() >= size_t(total_tokens) &&
+                           params_.V->rows() >= size_t(total_tokens)))
+                LLAMINAR_UNREACHABLE("Invalid Q16 cache publication geometry");
+
+            /**
+             * Prepare one request operand; owned storage survives until append
+             * completes. Native inputs are already in the cache basis, so they
+             * must not be rotated or quantized a second time. FP32 scratch is
+             * reused between K and V only after encoding the previous operand.
+             */
+            const auto prepare = [&](const ITensor &input, int first_row,
+                                     std::unique_ptr<Q16_1Tensor> &owned)
+                -> const Q16_1Tensor *
+            {
+                if (const auto *native = dynamic_cast<const Q16_1Tensor *>(&input))
+                {
+                    if (native->q16_block_size() != block_size)
+                        LLAMINAR_UNREACHABLE("Q16 source and cache physical block sizes differ");
+                    if (first_row == 0)
+                        return native;
+                    // A request slice preserves native scale/code bytes. This
+                    // avoids dequantize/requantize rounding and rotating twice.
+                    owned = std::make_unique<Q16_1Tensor>(
+                        std::vector<size_t>{size_t(rows), kv_dim}, block_size);
+                    const size_t row_bytes = native->blocks_per_row() *
+                                             q16_block_size_bytes(block_size);
+                    std::memcpy(owned->raw_mutable_data(),
+                                static_cast<const uint8_t *>(native->raw_data()) +
+                                    size_t(first_row) * row_bytes,
+                                size_t(rows) * row_bytes);
+                    return owned.get();
+                }
+
+                const float *data = input.fp32_data();
+                if (!data)
+                    LLAMINAR_UNREACHABLE("Q16 source has no CPU FP32 projection data");
+                data += size_t(first_row) * kv_dim;
+                if (params_.kv_rotation)
+                {
+                    const size_t elements = size_t(rows) * kv_dim;
+                    kv_rotation_scratch_.resize(elements);
+                    std::memcpy(kv_rotation_scratch_.data(), data, elements * sizeof(float));
+                    params_.kv_rotation->rotate_rows_inplace(
+                        kv_rotation_scratch_.data(), rows, static_cast<int>(kv_dim));
+                    data = kv_rotation_scratch_.data();
+                }
+                owned = std::make_unique<Q16_1Tensor>(
+                    std::vector<size_t>{size_t(rows), kv_dim}, block_size);
+                if (!owned->copyFrom_fp32(data))
+                    LLAMINAR_UNREACHABLE("Q16 native block encoding failed");
+                return owned.get();
+            };
+
+            for (int request = 0; request < requests; ++request)
+            {
+                const auto start = std::chrono::high_resolution_clock::now();
+                const int first_row = request * rows;
+                std::unique_ptr<Q16_1Tensor> key_owned, value_owned;
+                const auto *key = prepare(*params_.K, first_row, key_owned);
+                const auto *value = prepare(*params_.V, first_row, value_owned);
+
+                // Optional decomposed-stage output describes these exact native
+                // values, not the original projection before cache encoding.
+                if (params_.V_dequant_out)
+                {
+                    auto *output = dynamic_cast<FP32Tensor *>(params_.V_dequant_out);
+                    if (!(output && output->cols() == kv_dim &&
+                          output->rows() >= size_t(total_tokens)))
+                        LLAMINAR_UNREACHABLE("Q16 V_dequant_out requires the declared FP32 row geometry");
+                    for (int row = 0; row < rows; ++row)
+                        value->to_fp32_row(
+                            row, output->mutable_data() + size_t(first_row + row) * kv_dim);
+                }
+
+                const auto elapsed = std::chrono::high_resolution_clock::now() - start;
+                KVCacheProfiler::record(
+                    KVCacheOpType::CONVERT_TO_Q16_1,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+                    rows, estimateTensorAppendBytes(key, rows) +
+                              estimateTensorAppendBytes(value, rows));
+                if (!append_to_cache(params_.seq_idx + request, key, value, rows))
+                    return false;
+            }
+            return true;
+        }
+
         // If batch_size > 1 and seq_len > 0, do per-sequence append
         // K/V layout: [batch_size * seq_len, kv_dim] - contiguous per-sequence
         if (batch_size > 1 && seq_len > 0)
@@ -628,28 +740,27 @@ namespace llaminar2
         const bool has_gpu_inputs = (params_.K->gpu_data_ptr() != nullptr && params_.V->gpu_data_ptr() != nullptr);
 
         /*
-         * CUDA and ROCm compressed caches own one fused FP32-to-physical
+         * CPU, CUDA and ROCm compressed caches own one fused FP32-to-physical
          * append launch: AQ8 for K and Q8_1/TQ4/TQ8 for V. Keeping that
          * conversion behind the cache boundary preserves capture, avoids host
          * scratch, and lets Q8_1 operate without an unrelated TQ context.
          */
-        const bool gpu_asymmetric_compressed_cache =
-            params_.device_id.is_gpu() &&
+        const bool native_asymmetric_compressed_cache =
             cache_k_precision == ActivationPrecision::AQ8 &&
             (cache_v_precision == ActivationPrecision::Q8_1 ||
              cache_v_precision == ActivationPrecision::TQ4 ||
              cache_v_precision == ActivationPrecision::TQ8);
-        if (gpu_asymmetric_compressed_cache)
+        if (native_asymmetric_compressed_cache)
         {
             const bool value_uses_turboquant =
                 cache_v_precision == ActivationPrecision::TQ4 ||
                 cache_v_precision == ActivationPrecision::TQ8;
             if (value_uses_turboquant && !params_.turboquant_ctx)
             {
-                LOG_ERROR("[KVCacheAppendStage] AQ8/TQ GPU cache requires turboquant_ctx for value rotation");
+                LOG_ERROR("[KVCacheAppendStage] AQ8/TQ cache requires turboquant_ctx for value rotation");
                 return false;
             }
-            if (!has_gpu_inputs)
+            if (params_.device_id.is_gpu() && !has_gpu_inputs)
             {
                 LOG_ERROR("[KVCacheAppendStage] AQ8/compressed GPU cache requires device-resident K/V inputs");
                 return false;
@@ -670,7 +781,7 @@ namespace llaminar2
                 conv_ns, static_cast<uint64_t>(total_tokens), 0);
             if (!success)
             {
-                LOG_ERROR("[KVCacheAppendStage] fused AQ8/compressed GPU append failed for K="
+                LOG_ERROR("[KVCacheAppendStage] fused AQ8/compressed append failed for K="
                           << activationPrecisionToString(cache_k_precision)
                           << " V="
                           << activationPrecisionToString(cache_v_precision));
@@ -949,310 +1060,6 @@ namespace llaminar2
             return true;
         }
 
-        // =================================================================
-        // Q16_1 cache path with VNNI-safe fixed-scale quantization
-        // =================================================================
-        // For Q16_1 cache, we MUST use fixed-scale quantization with VNNI-safe
-        // clipping to prevent INT32 overflow during VNNI dot-product accumulation.
-        //
-        // See: VNNISafetyConstants.h for MAX_SAFE_INT16 limits per head_dim
-        // See: PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
-        // =================================================================
-
-        const bool cache_is_q16_1 =
-            cache_k_precision == ActivationPrecision::Q16_1 &&
-            cache_v_precision == ActivationPrecision::Q16_1;
-
-        if (cache_is_q16_1)
-        {
-            const auto conv_start = std::chrono::high_resolution_clock::now();
-
-            const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
-            const float kv_cache_scale_k = params_.kv_cache_scale_k;
-            const float kv_cache_scale_v = params_.kv_cache_scale_v;
-            const int head_dim = params_.head_dim;
-
-            // -----------------------------------------------------------------
-            // KV rotation helper: reduces activation kurtosis before Q16_1
-            // quantization. Copies const FP32 data → scratch, rotates in-place,
-            // returns pointer to rotated data. No-op when kv_rotation is null.
-            // For mutable buffers (e.g. v_fp32_temp), use rotate_mutable instead.
-            // -----------------------------------------------------------------
-            const auto *kv_rot = params_.kv_rotation;
-
-            // Copy const FP32 → scratch → rotate → return scratch pointer
-            auto rotate_const = [&](const float *src, size_t n_elements) -> const float *
-            {
-                if (!kv_rot)
-                    return src;
-                const size_t needed = n_elements;
-                if (kv_rotation_scratch_.size() < needed)
-                    kv_rotation_scratch_.resize(needed);
-                std::memcpy(kv_rotation_scratch_.data(), src, n_elements * sizeof(float));
-                kv_rot->rotate_rows_inplace(kv_rotation_scratch_.data(),
-                                            static_cast<int>(n_elements / kv_dim),
-                                            static_cast<int>(kv_dim));
-                return kv_rotation_scratch_.data();
-            };
-
-            // Rotate mutable FP32 buffer in-place
-            auto rotate_mutable = [&](float *data, int n_rows)
-            {
-                if (!kv_rot)
-                    return;
-                kv_rot->rotate_rows_inplace(data, n_rows, static_cast<int>(kv_dim));
-            };
-
-            // VNNI-safe clipping limit: floor(sqrt(INT32_MAX / (head_dim/16)))
-            // Prevents INT32 overflow during VPDPWSSD accumulation.
-            const int16_t max_safe_int16 = (head_dim <= 64) ? 23170 : (head_dim <= 96) ? 18918
-                                                                  : (head_dim <= 128)  ? 16383
-                                                                  : (head_dim <= 192)  ? 13377
-                                                                                       : 11585;
-
-            LOG_DEBUG("[KVCacheAppendStage] Q16_1 cache with VNNI-safe fixed-scale quantization"
-                      << " (scale_k=" << kv_cache_scale_k
-                      << ", scale_v=" << kv_cache_scale_v
-                      << ", head_dim=" << head_dim
-                      << ", max_safe_int16=" << max_safe_int16
-                      << ", tokens=" << total_tokens << ")");
-
-            // Determine input types
-            bool k_is_q16_1 = (params_.K->native_type() == TensorType::Q16_1);
-            bool k_is_fp32 = (params_.K->native_type() == TensorType::FP32);
-            bool v_is_q8_1 = (params_.V->native_type() == TensorType::Q8_1);
-            bool v_is_fp32 = (params_.V->native_type() == TensorType::FP32);
-
-            // -----------------------------------------------------------------
-            // Handle K tensor conversion/passthrough
-            // -----------------------------------------------------------------
-            std::unique_ptr<Q16_1Tensor> k_q16_owned;
-            const TensorBase *k_for_cache = nullptr;
-
-            if (k_is_q16_1)
-            {
-                // K is already Q16_1 - pass through directly
-                // Assumption: K was quantized with the same fixed scale (e.g., from RoPE stage)
-                // Cast ITensor* to TensorBase* (const)
-                k_for_cache = dynamic_cast<const TensorBase *>(params_.K);
-                if (!k_for_cache)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] K tensor is Q16_1 but not a TensorBase (GPU?)");
-                    return false;
-                }
-                LOG_TRACE("[KVCacheAppendStage] K is already Q16_1, passing through");
-            }
-            else if (k_is_fp32)
-            {
-                // K is FP32 - quantize to Q16_1 with fixed scale and VNNI clipping
-                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
-                k_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
-                    optimal_q16_block_size(head_dim));
-
-                const float *k_fp32 = params_.K->fp32_data();
-                if (!k_fp32)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for K tensor");
-                    return false;
-                    ;
-                }
-
-                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
-                k_fp32 = rotate_const(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
-
-                // Use fixed-scale quantization with VNNI-safe clipping
-                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale_k, head_dim))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale K quantization failed");
-                    return false;
-                }
-
-                k_for_cache = k_q16_owned.get();
-                LOG_TRACE("[KVCacheAppendStage] Quantized K from FP32 to Q16_1 with fixed scale");
-            }
-            else
-            {
-                // K is some other format (Q8_1, etc.) - dequant to FP32 first
-                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
-                k_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
-                    optimal_q16_block_size(head_dim));
-
-                const float *k_fp32 = params_.K->fp32_data();
-                if (!k_fp32)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Cannot dequantize K to FP32");
-                    return false;
-                }
-
-                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
-                k_fp32 = rotate_const(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
-
-                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale_k, head_dim))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale K quantization failed");
-                    return false;
-                }
-
-                k_for_cache = k_q16_owned.get();
-                LOG_TRACE("[KVCacheAppendStage] Converted K from " << params_.K->dtype_name()
-                                                                   << " to Q16_1 via FP32 with fixed scale");
-            }
-
-            // -----------------------------------------------------------------
-            // Handle V tensor conversion
-            // -----------------------------------------------------------------
-            std::unique_ptr<Q16_1Tensor> v_q16_owned;
-            const TensorBase *v_for_cache = nullptr;
-
-            if (v_is_fp32)
-            {
-                // V is FP32 - quantize to Q16_1 with fixed scale and VNNI clipping
-                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
-                v_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
-                    optimal_q16_block_size(head_dim));
-
-                const float *v_fp32 = params_.V->fp32_data();
-                if (!v_fp32)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Cannot get FP32 data for V tensor");
-                    return false;
-                }
-
-                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
-                v_fp32 = rotate_const(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
-
-                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale_v, head_dim))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
-                    return false;
-                }
-
-                v_for_cache = v_q16_owned.get();
-                LOG_TRACE("[KVCacheAppendStage] Quantized V from FP32 to Q16_1 with fixed scale");
-            }
-            else if (v_is_q8_1)
-            {
-                // V is Q8_1 - dequant to FP32, then requant to Q16_1 with fixed scale
-                // NOTE: This is different from the old path which did direct int8→int16 scaling!
-                // The old path (×256) was NOT VNNI-safe because it produced values close to ±32767.
-                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
-                v_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
-                    optimal_q16_block_size(head_dim));
-
-                const auto *v_q8 = dynamic_cast<const Q8_1Tensor *>(params_.V);
-                if (!v_q8)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to cast V to Q8_1Tensor");
-                    return false;
-                }
-
-                // Allocate temporary FP32 buffer for dequantization
-                std::vector<float> v_fp32_temp(total_tokens * kv_dim);
-
-                // Dequantize Q8_1 → FP32 (row by row for small token counts, batch for large)
-                constexpr int SMALL_TOKEN_THRESHOLD = 32;
-                if (total_tokens <= SMALL_TOKEN_THRESHOLD)
-                {
-                    for (int t = 0; t < total_tokens; ++t)
-                    {
-                        v_q8->to_fp32_row(t, v_fp32_temp.data() + t * kv_dim);
-                    }
-                }
-                else
-                {
-                    // Use fp32_data() for larger token counts
-                    const float *v_fp32 = v_q8->fp32_data();
-                    if (!v_fp32)
-                    {
-                        LOG_ERROR("[KVCacheAppendStage] Cannot dequantize V from Q8_1");
-                        return false;
-                    }
-                    std::memcpy(v_fp32_temp.data(), v_fp32, total_tokens * kv_dim * sizeof(float));
-                }
-
-                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
-                rotate_mutable(v_fp32_temp.data(), total_tokens);
-
-                // Requantize with fixed scale and VNNI-safe clipping
-                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32_temp.data(), kv_cache_scale_v, head_dim))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
-                    return false;
-                }
-
-                v_for_cache = v_q16_owned.get();
-                LOG_TRACE("[KVCacheAppendStage] Converted V from Q8_1 to Q16_1 via FP32 with fixed scale"
-                          << " (VNNI-safe, max_int16=" << max_safe_int16 << ")");
-            }
-            else
-            {
-                // V is some other format - try to dequant via fp32_data()
-                // NOTE: Must use same block_size as KV cache (optimal_q16_block_size(head_dim))
-                v_q16_owned = std::make_unique<Q16_1Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(total_tokens), kv_dim},
-                    optimal_q16_block_size(head_dim));
-
-                const float *v_fp32 = params_.V->fp32_data();
-                if (!v_fp32)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Cannot convert V (" << params_.V->dtype_name()
-                                                                        << ") to Q16_1");
-                    return false;
-                }
-
-                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
-                v_fp32 = rotate_const(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
-
-                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale_v, head_dim))
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
-                    return false;
-                }
-
-                v_for_cache = v_q16_owned.get();
-                LOG_TRACE("[KVCacheAppendStage] Converted V from " << params_.V->dtype_name()
-                                                                   << " to Q16_1 via FP32 with fixed scale");
-            }
-
-            // Also populate V_dequant_out if requested (for decomposed attention path)
-            if (params_.V_dequant_out && v_q16_owned)
-            {
-                auto *v_dequant_q16 = dynamic_cast<Q16_1Tensor *>(params_.V_dequant_out);
-                if (v_dequant_q16 && v_dequant_q16->mutable_typed_data())
-                {
-                    constexpr size_t block_size = Q16_1Block::BLOCK_SIZE;
-                    const size_t blocks_per_row = (kv_dim + block_size - 1) / block_size;
-                    std::memcpy(v_dequant_q16->mutable_typed_data(),
-                                v_q16_owned->typed_data(),
-                                total_tokens * blocks_per_row * sizeof(Q16_1Block));
-                    LOG_DEBUG("[KVCacheAppendStage] Populated V_dequant_out with VNNI-safe Q16_1 values");
-                }
-            }
-
-            const auto conv_end = std::chrono::high_resolution_clock::now();
-            const uint64_t conv_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
-            const uint64_t conv_bytes = static_cast<uint64_t>(
-                estimateTensorAppendBytes(k_for_cache, total_tokens) +
-                estimateTensorAppendBytes(v_for_cache, total_tokens));
-            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_Q16_1, conv_ns, static_cast<uint64_t>(total_tokens), conv_bytes);
-
-            bool success = append_to_cache(
-                params_.seq_idx,
-                k_for_cache, v_for_cache, total_tokens);
-
-            if (!success)
-            {
-                LOG_ERROR("[KVCacheAppendStage] append failed (Q16_1 cache)");
-                return false;
-            }
-
-            return true;
-        }
 
         // =================================================================
         // TQ4 cache path with TurboQuant rotation-based quantization

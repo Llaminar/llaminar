@@ -629,8 +629,11 @@ GEMM got faster. When the kernel is at the register ceiling, only **register-neu
 
 ## Step 6: Record the result
 
-- Update the relevant baseline (e.g. `.githooks/benchmark_baseline.json`) only with
-  human-approved numbers.
+- Production high-water marks live in `benchmarks/production/high_water.json`.
+  Only the official successful production pipeline commits those marks, after
+  both ISA images pass parity, the full E2E suites, and benchmarks. Use
+  `scripts/ci/run_model_parity_benchmarks.py --diagnostic` for one-off experiments;
+  these reports cannot certify images or advance marks. See `docs/production-ci.md`.
 - Note rejected experiments and *why* (regression cause) so they aren't retried blindly.
 - Do **not** create ad-hoc markdown reports unless asked; use `changelog/` (ISO-date prefix)
   for durable write-ups.

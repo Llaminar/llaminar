@@ -29,19 +29,6 @@ namespace llaminar2
     };
 
     /**
-     * @brief Basis construction used when the first AQ8 key rows are appended.
-     *
-     * Ordinary prefill averages its retained rows to minimize residual error.
-     * Decode-equivalent grouped publication uses the first retained row because
-     * serial decode establishes its immutable basis from that same row.
-     */
-    enum class AttentionKeyAnchorPolicy : uint8_t
-    {
-        MeanRetained,
-        FirstRetained,
-    };
-
-    /**
      * @brief Convert a public quantized-cache selector into a physical policy.
      *
      * The selector names the value-storage budget; AQ8 is the invariant key

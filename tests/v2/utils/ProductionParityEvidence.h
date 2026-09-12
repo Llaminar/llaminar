@@ -4,8 +4,9 @@
  *
  * Numerical parity is meaningful only when the production implementation that
  * a campaign claims to certify actually ran.  This helper interprets the
- * request-local MTP controller records without coupling fast unit tests to the
- * large model-parity fixture. CUDA certifies one native conditional parent.
+ * retained construction contracts and request-local MTP/replay records without
+ * coupling fast unit tests to the large model-parity fixture. CUDA certifies
+ * one native conditional parent.
  * ROCm, whose HIP graph API has no conditional nodes, certifies a narrow
  * authenticated scheduler ticket and the retained captured transaction family
  * selected by that ticket. Both policies leave mutable generation state under
@@ -18,6 +19,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <charconv>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -1142,6 +1144,179 @@ namespace llaminar2::test::parity
             evidence.policy = ProductionDeviceGenerationPolicy::Unclassified;
             evidence.certification_detail = "unclassified_policy_evidence";
         }
+        return evidence;
+    }
+
+    /**
+     * @brief Find a positive counter in the exact forward-graph family.
+     * @param records Retained setup contracts plus fresh cell measurements.
+     * @param name Exact producer-owned record name, not a prefix.
+     * @return True when the declared family has a positive counter.
+     */
+    inline bool parityForwardGraphHasCounter(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &name)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&name](const PerfStatRecord &record)
+            {
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "forward_graph" &&
+                       record.name == name &&
+                       record.value > 0.0;
+            });
+    }
+
+    /**
+     * @brief Find a native decode capture or replay phase record.
+     * @param records Cell evidence; a runtime replay must be fresh.
+     * @param capture_phase Exact value of the producer's phase tag.
+     * @return True only for a positive decode-phase counter with that tag.
+     */
+    inline bool parityForwardGraphHasDecodePhase(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &capture_phase)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&capture_phase](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != "forward_graph" ||
+                    record.name != "decode_graph_phase" ||
+                    record.phase != "decode" ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find("phase");
+                return it != record.tags.end() &&
+                       it->second == capture_phase;
+            });
+    }
+
+    /**
+     * @brief Find one exact forward-graph counter in its execution phase.
+     * @param records Structured cell evidence.
+     * @param name Exact producer-owned counter family.
+     * @param phase Exact execution phase, distinguishing prefill from decode.
+     * @return True when both identities match a positive counter.
+     */
+    inline bool parityForwardGraphHasCounterPhase(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &name,
+        const std::string &phase)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&name, &phase](const PerfStatRecord &record)
+            {
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "forward_graph" &&
+                       record.name == name && record.phase == phase &&
+                       record.value > 0.0;
+            });
+    }
+
+    /**
+     * @brief Interpret the complete graph certificate without loading a model.
+     * @param records Authenticated retained construction plus fresh cell work.
+     * @param graph_execution Whether the declarative production runner ran.
+     * @param execution_topology Typed inventory classification.
+     * @param graph_contract Role-specific execution obligation for this rank.
+     * @param model_context_reused Whether the production runner reused weights.
+     * @param elapsed_seconds Cell wall time, independent of path certification.
+     * @param target_seconds Shared campaign economy target, not a kill deadline.
+     * @return Canonical CSV evidence consumed by the graph certification gate.
+     *
+     * A retained parent's transaction-zero launch proves its captured decode
+     * topology, never replay in the new cell. Keeping these fields independent
+     * prevents a construction-only record from certifying an idle request.
+     */
+    inline ProductionParityEvidence collectProductionParityEvidence(
+        const std::vector<PerfStatRecord> &records,
+        bool graph_execution,
+        ProductionParityExecutionTopology execution_topology,
+        ProductionParityGraphContract graph_contract,
+        bool model_context_reused,
+        double elapsed_seconds,
+        double target_seconds)
+    {
+        ProductionParityEvidence evidence;
+        evidence.graph_execution = graph_execution;
+        evidence.execution_topology = execution_topology;
+        evidence.graph_contract = graph_contract;
+        evidence.forward_full_graph_capture = parityForwardGraphHasCounter(
+            records, "full_graph_capture_executable_nodes");
+        evidence.forward_full_graph_replay = parityForwardGraphHasCounter(
+            records, "full_graph_replay_calls");
+        const ProductionDeviceGenerationEvidence generation_evidence =
+            collectProductionDeviceGenerationEvidence(records);
+        evidence.device_generation_controller =
+            generation_evidence.controller_observed;
+        evidence.generation_execution_policy = generation_evidence.policy;
+        evidence.native_generation_parent =
+            generation_evidence.hasNativeParent();
+        evidence.hosted_ticket_boundary_certified =
+            generation_evidence.hosted_ticket_boundary_certified;
+        evidence.generation_loop_certified =
+            generation_evidence.hasCertifiedGenerationLoop();
+        evidence.generation_certification_detail =
+            generation_evidence.certification_detail;
+        // A captured forward nested inside a host-scheduled MTP transaction is
+        // useful but is not one complete production generation graph. Preserve
+        // the inner-forward fields for diagnosis and make the established
+        // full-graph fields describe the complete request as their name claims.
+        const bool complete_generation_parent =
+            !evidence.device_generation_controller ||
+            evidence.native_generation_parent;
+        evidence.full_graph_capture =
+            evidence.forward_full_graph_capture && complete_generation_parent;
+        evidence.full_graph_replay =
+            evidence.forward_full_graph_replay && complete_generation_parent;
+        evidence.segmented_plan = parityForwardGraphHasCounter(
+            records, "segmented_plan_segments");
+        const bool retained_parent_capture =
+            parityForwardGraphHasCounter(
+                records, "retained_parent_transaction_zero_launches") ||
+            parityForwardGraphHasCounter(
+                records, "retained_parent_transaction_captures");
+        const bool retained_parent_replay =
+            parityForwardGraphHasCounter(records, "retained_parent_replays") ||
+            parityForwardGraphHasCounter(
+                records, "retained_parent_transaction_replays");
+        evidence.decode_graph_capture =
+            parityForwardGraphHasDecodePhase(records, "capture") ||
+            parityForwardGraphHasCounterPhase(
+                records,
+                "retained_parent_transaction_captures",
+                "decode") ||
+            parityForwardGraphHasCounterPhase(
+                records,
+                "retained_parent_transaction_zero_launches",
+                "decode");
+        evidence.decode_graph_replay =
+            parityForwardGraphHasDecodePhase(records, "replay") ||
+            productionParityHasRetainedParentDecodeReplay(records);
+        evidence.segmented_capture =
+            evidence.segmented_plan &&
+            (parityForwardGraphHasCounter(
+                 records, "segmented_graph_capture_executable_nodes") ||
+             parityForwardGraphHasCounter(
+                 records, "segmented_graph_capture_segments") ||
+             retained_parent_capture);
+        evidence.segmented_replay =
+            evidence.segmented_plan &&
+            (parityForwardGraphHasCounter(
+                 records, "segmented_replay_segments") ||
+             retained_parent_replay);
+        evidence.model_context_reused = model_context_reused;
+        evidence.elapsed_seconds = elapsed_seconds;
+        evidence.target_seconds = target_seconds;
         return evidence;
     }
 } // namespace llaminar2::test::parity

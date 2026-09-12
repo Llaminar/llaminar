@@ -4,8 +4,9 @@
  *
  * These stages are the graph-facing counterpart of the typed rank-batch
  * transport. One dispatch boundary packs every logical participant owned by a
- * remote rank, and one return boundary receives and accumulates those results
- * in ascending participant-id order. Node-local pairs bind the stages directly
+ * remote rank, and one return boundary receives those results in authenticated
+ * participant order. Canonical returns gather raw routes for the final ordered
+ * fold instead of defining arithmetic by participant grouping. Node-local pairs bind the stages directly
  * to shared rows; inter-node pairs retain the explicit MPI wire workspace. The
  * participant-local expert stages remain ordinary per-device graph nodes, so
  * their exact device streams and prepared-weight ownership stay explicit.
@@ -211,8 +212,9 @@ namespace llaminar2
      * @brief Send or receive one complete remote-rank sparse return batch.
      *
      * Remote-target instances publish all completed participant rows in one
-     * batch. Continuation-source instances consume those rows and add them to
-     * the dense/ticket output strictly in canonical participant order.
+     * batch. Continuation-source instances consume the declared return layout:
+     * canonical rows enter the packed final-fold bank, while token partials
+     * enter the explicitly bound dense/ticket accumulator.
      */
     class MoERankBatchReturnReduceStage final : public IComputeStage
     {
@@ -233,6 +235,8 @@ namespace llaminar2
             std::vector<std::shared_ptr<MoEOverlayReturnRows>> inbound_rows;
 
             TensorBase *dense_output = nullptr;
+            /** Packed canonical bank versus participant token sums; fixed at graph build. */
+            MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
             std::optional<BufferId> dense_output_buffer_id;
             std::shared_ptr<MoEOverlayDispatchTicketStorage> ticket_storage;
             int seq_len = 0;

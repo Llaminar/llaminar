@@ -1,9 +1,16 @@
 /**
  * @file MoESparseReturnReduceStage.cpp
  * @brief Implementation of graph-native sparse MoE return/reduce payload stage.
+ *
+ * The graph-bound return layout distinguishes dense token accumulation from
+ * raw canonical-route gathering. A canonical boundary performs no weighted
+ * sum: the final ordered reducer authenticates complete router-slot coverage
+ * before the continuation broadcast. Transport completion and residency lease
+ * retirement retain their existing explicit graph edges.
  */
 
 #include "MoESparseReturnReduceStage.h"
+#include "../../moe/MoEOverlayCanonicalHostReturn.h"
 
 #include "../../../collective/ITPContext.h"
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
@@ -85,6 +92,11 @@ namespace llaminar2
             params_.outbound_rows = params_.outbound_rows_lifetime.get();
         if (!params_.inbound_rows && params_.inbound_rows_lifetime)
             params_.inbound_rows = params_.inbound_rows_lifetime.get();
+        if (!isValidMoEOverlayReturnLayout(params_.return_layout) ||
+            (params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes &&
+             (params_.ticket_storage || params_.canonical_route_ticket_storage ||
+              params_.broadcast_after_scatter || params_.publish_ticket_completion)))
+            throw std::invalid_argument("Canonical host gathering cannot own a dense ticket or broadcast before the final ordered fold");
     }
 
     /**
@@ -287,6 +299,19 @@ namespace llaminar2
                 return false;
             }
         }
+        else if (!skips_dense_scatter &&
+                 params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes)
+        {
+            if (!params_.dense_output ||
+                params_.dense_output->native_type() != TensorType::FP32 ||
+                params_.broadcast_after_scatter || params_.publish_ticket_completion ||
+                canonical_moe_route_record::recordCapacity(
+                    params_.dense_output->numel(), params_.d_model) == 0)
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Canonical gather requires a packed bank and a separate final ordered reducer");
+                return false;
+            }
+        }
         else if (!skips_dense_scatter && !validateDenseOutput(
                      params_.dense_output,
                      params_.seq_len,
@@ -320,6 +345,11 @@ namespace llaminar2
 
         if (!validateReturnRows(*params_.inbound_rows, params_.d_model))
             return false;
+        if (!skips_dense_scatter && params_.inbound_rows->layout != params_.return_layout)
+        {
+            LOG_ERROR("[MoESparseReturnReduceStage] Return arithmetic differs from the graph-bound consumer contract");
+            return false;
+        }
 
         /*
          * MPI ranks enter every return key, but only the rank that owns the
@@ -367,7 +397,22 @@ namespace llaminar2
                                        ? 0u
                                        : static_cast<size_t>(params_.seq_len) *
                                              static_cast<size_t>(params_.d_model);
-        if (!skips_dense_scatter && params_.clear_output_before_scatter)
+        const bool canonical_gather = !skips_dense_scatter &&
+            params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes;
+        if (canonical_gather)
+        {
+            if (!gatherMoEOverlayCanonicalHostReturn(
+                    *params_.inbound_rows,
+                    {dense, params_.dense_output->numel()},
+                    params_.clear_output_before_scatter
+                        ? MoEOverlayCanonicalGatherBoundary::Begin
+                        : MoEOverlayCanonicalGatherBoundary::Append))
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Canonical return exceeds or violates the graph-owned packed bank");
+                return false;
+            }
+        }
+        else if (!skips_dense_scatter && params_.clear_output_before_scatter)
             std::fill_n(dense, dense_count, 0.0f);
 
         std::chrono::steady_clock::time_point t_scatter_start;
@@ -376,6 +421,7 @@ namespace llaminar2
 
         for (size_t compact_row = 0;
              !skips_dense_scatter &&
+             !canonical_gather &&
              compact_row < params_.inbound_rows->live_row_count;
              ++compact_row)
         {

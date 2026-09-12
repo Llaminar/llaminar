@@ -26,6 +26,7 @@
 #include "../prefix_cache/PrefixCacheStateProbe.h"
 #include "../InferenceReadiness.h"
 #include "../moe/MoEOptimizationStatus.h"
+#include "../moe/MoEOptimizationMovementTopology.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../planning/GraphSnapshotMemoryCapacity.h"
@@ -713,6 +714,21 @@ namespace llaminar2
             return {};
         }
 
+        /**
+         * @brief Describe immutable movement geometry from the admitted model plan.
+         * @return Expected authority and expressible axes, even in Static mode.
+         * @throws std::invalid_argument if overlay setup has not frozen its plan.
+         *
+         * This non-virtual projection reuses canonical configuration, not live
+         * device placement or PerfStats. It performs no device I/O, maintenance,
+         * allocation admission or synchronization and belongs only in opt-in
+         * diagnostics, outside the inference loop.
+         */
+        [[nodiscard]] MoEOptimizationMovementTopology moeOptimizationMovementTopology() const
+        {
+            return describeMoEOptimizationMovementTopology(config().moe_routed_expert_plan.get());
+        }
+
         // =====================================================================
         // Configuration
         // =====================================================================
@@ -841,8 +857,11 @@ namespace llaminar2
          *
          * May observe device state and synchronize. Ordinary serving summaries
          * must use requestRuntimeSummary instead, regardless of logging level.
+         * @param capture_policy Immutable diagnostic payload and per-cache range plan.
+         * @return Read-only evidence; empty when this interface has no live runner.
          */
-        virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
+        virtual PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const { return {}; }
 
         /**
          * @brief Get the primary compute device backing this orchestration runner.

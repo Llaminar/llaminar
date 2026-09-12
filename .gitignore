@@ -63,12 +63,15 @@ Testing/
 pytorch_attention*/
 pytorch_incremental*/
 pytorch_qwen*/
+# Generated model packs include fine-tunes and future families, not just Qwen.
+/pytorch*_snapshots/
 **/pytorch_layer_captures/**/*
 **/pytorch_snapshots*/**/*
 **/test_pytorch*/**/*
 *.npy
 *.npz
 *.out
+/parity-results/
 *benchmark_result*/
 !benchmark_results/
 benchmark_results/*

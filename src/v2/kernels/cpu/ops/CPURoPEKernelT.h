@@ -125,6 +125,8 @@ namespace llaminar2
          * @param head_dim Head dimension
          * @param rope_theta RoPE base frequency (e.g., 10000.0f)
          * @param device_idx Device index (-1 for CPU)
+         * @param rotary_dim Rotated width, zero for the full head.
+         * @param pos_offset First position when position_ids is nullptr.
          * @return true on success
          */
         bool apply_typed(
@@ -137,7 +139,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             int device_idx = -1,
-            int rotary_dim = 0);
+            int rotary_dim = 0,
+            int pos_offset = 0);
     };
 
     // =========================================================================
@@ -174,7 +177,21 @@ namespace llaminar2
                 .withScalar("rope_theta", "RoPE frequency base");
         }
 
-        // Internal typed implementation
+        /**
+         * @brief Rotate native Q/K using explicit or implicit absolute positions.
+         * @param Q Writable query storage for all rows and heads.
+         * @param K Writable key storage, or nullptr when keys are absent.
+         * @param position_ids Per-row absolute IDs; nullptr uses pos_offset + row.
+         * @param seq_len Number of rows.
+         * @param n_heads Query heads per row.
+         * @param n_kv_heads Key heads per row.
+         * @param head_dim Elements per head, aligned to the native block format.
+         * @param rope_theta Positive RoPE frequency base.
+         * @param device_idx CPU device selector.
+         * @param rotary_dim Rotated width; zero means the full head.
+         * @param pos_offset First absolute position when position_ids is null.
+         * @return True on successful native rotation.
+         */
         bool apply_typed(
             float *Q,
             float *K,
@@ -185,7 +202,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             int device_idx = -1,
-            int rotary_dim = 0);
+            int rotary_dim = 0,
+            int pos_offset = 0);
 
         // Legacy FP32 apply - no longer part of ITensorRoPE interface
         bool apply(
@@ -267,7 +285,21 @@ namespace llaminar2
                 .withScalar("rope_theta", "RoPE frequency base");
         }
 
-        // Internal typed implementation
+        /**
+         * @brief Rotate native Q/K using explicit or implicit absolute positions.
+         * @param Q Writable query storage for all rows and heads.
+         * @param K Writable key storage, or nullptr when keys are absent.
+         * @param position_ids Per-row absolute IDs; nullptr uses pos_offset + row.
+         * @param seq_len Number of rows.
+         * @param n_heads Query heads per row.
+         * @param n_kv_heads Key heads per row.
+         * @param head_dim Elements per head, aligned to the native block format.
+         * @param rope_theta Positive RoPE frequency base.
+         * @param device_idx CPU device selector.
+         * @param rotary_dim Rotated width; zero means the full head.
+         * @param pos_offset First absolute position when position_ids is null.
+         * @return True on successful native rotation.
+         */
         bool apply_typed(
             uint16_t *Q,
             uint16_t *K,
@@ -278,7 +310,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             int device_idx = -1,
-            int rotary_dim = 0);
+            int rotary_dim = 0,
+            int pos_offset = 0);
 
         // Legacy BF16 apply_bf16 - no longer part of ITensorRoPE interface
         bool apply_bf16(
@@ -357,7 +390,21 @@ namespace llaminar2
                 .withScalar("rope_theta", "RoPE frequency base");
         }
 
-        // Internal typed implementation
+        /**
+         * @brief Rotate native Q/K using explicit or implicit absolute positions.
+         * @param Q Writable query storage for all rows and heads.
+         * @param K Writable key storage, or nullptr when keys are absent.
+         * @param position_ids Per-row absolute IDs; nullptr uses pos_offset + row.
+         * @param seq_len Number of rows.
+         * @param n_heads Query heads per row.
+         * @param n_kv_heads Key heads per row.
+         * @param head_dim Elements per head, aligned to the native block format.
+         * @param rope_theta Positive RoPE frequency base.
+         * @param device_idx CPU device selector.
+         * @param rotary_dim Rotated width; zero means the full head.
+         * @param pos_offset First absolute position when position_ids is null.
+         * @return True on successful native rotation.
+         */
         bool apply_typed(
             uint16_t *Q,
             uint16_t *K,
@@ -368,7 +415,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             int device_idx = -1,
-            int rotary_dim = 0);
+            int rotary_dim = 0,
+            int pos_offset = 0);
 
         // Legacy FP16 apply_fp16 - no longer part of ITensorRoPE interface
         bool apply_fp16(
@@ -457,7 +505,21 @@ namespace llaminar2
                 .withScalar("rope_theta", "RoPE frequency base");
         }
 
-        // Internal typed implementation
+        /**
+         * @brief Rotate native Q/K using explicit or implicit absolute positions.
+         * @param Q Writable query storage for all rows and heads.
+         * @param K Writable key storage, or nullptr when keys are absent.
+         * @param position_ids Per-row absolute IDs; nullptr uses pos_offset + row.
+         * @param seq_len Number of rows.
+         * @param n_heads Query heads per row.
+         * @param n_kv_heads Key heads per row.
+         * @param head_dim Elements per head, aligned to the native block format.
+         * @param rope_theta Positive RoPE frequency base.
+         * @param device_idx CPU device selector.
+         * @param rotary_dim Rotated width; zero means the full head.
+         * @param pos_offset First absolute position when position_ids is null.
+         * @return True on successful native rotation.
+         */
         bool apply_typed(
             Q8_1Block *Q,
             Q8_1Block *K,
@@ -468,7 +530,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             int device_idx = -1,
-            int rotary_dim = 0);
+            int rotary_dim = 0,
+            int pos_offset = 0);
 
         // Legacy Q8_1 apply_q8_1 - no longer part of ITensorRoPE interface
         bool apply_q8_1(
@@ -646,7 +709,21 @@ namespace llaminar2
                 .withScalar("rope_theta", "RoPE frequency base");
         }
 
-        // Internal typed implementation (32-element blocks for backward compatibility)
+        /**
+         * @brief Rotate native Q/K using explicit or implicit absolute positions.
+         * @param Q Writable query storage for all rows and heads.
+         * @param K Writable key storage, or nullptr when keys are absent.
+         * @param position_ids Per-row absolute IDs; nullptr uses pos_offset + row.
+         * @param seq_len Number of rows.
+         * @param n_heads Query heads per row.
+         * @param n_kv_heads Key heads per row.
+         * @param head_dim Elements per head, aligned to the native block format.
+         * @param rope_theta Positive RoPE frequency base.
+         * @param device_idx CPU device selector.
+         * @param rotary_dim Rotated width; zero means the full head.
+         * @param pos_offset First absolute position when position_ids is null.
+         * @return True on successful native rotation.
+         */
         bool apply_typed(
             Q16_1Block *Q,
             Q16_1Block *K,
@@ -657,7 +734,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             int device_idx = -1,
-            int rotary_dim = 0);
+            int rotary_dim = 0,
+            int pos_offset = 0);
 
         /**
          * @brief Templated apply for variable Q16 block sizes
@@ -666,6 +744,18 @@ namespace llaminar2
          * Supports: Q16_1Block (32), Q16_1Block_64, Q16_1Block_128
          *
          * @tparam BlockType Q16 block type
+         * @param Q Writable query blocks.
+         * @param K Writable key blocks, or nullptr.
+         * @param position_ids Explicit absolute IDs, or nullptr for contiguous positions.
+         * @param seq_len Number of rows, without a fixed depth limit.
+         * @param n_heads Query heads per row.
+         * @param n_kv_heads Key heads per row.
+         * @param head_dim Elements per head, divisible by the block size.
+         * @param rope_theta Positive frequency base.
+         * @param device_idx CPU device selector.
+         * @param rotary_dim Rotated width (native Q16 requires full-head rotation).
+         * @param pos_offset First position when position_ids is nullptr.
+         * @return True on success; false on invalid native storage geometry.
          */
         template <typename BlockType>
         bool apply_typed_block(
@@ -678,7 +768,8 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             int device_idx = -1,
-            int rotary_dim = 0);
+            int rotary_dim = 0,
+            int pos_offset = 0);
 
         // Legacy Q16_1 apply_q16_1 - no longer part of ITensorRoPE interface
         bool apply_q16_1(

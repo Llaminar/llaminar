@@ -459,6 +459,25 @@ namespace
     // Correctness test: Q4_0 small matrix
     // =========================================================================
 
+    TEST_F(CPUNativeVNNIGemvTest, CompactMultiScaleAVX2DotExhaustiveSignedByteDomain)
+    {
+        using Ops = multi_scale::SIMD<8>;
+        // Exhaust the proven maddubs domain, including activation -128 and
+        // same-sign maximal pairs that expose INT16 saturation or sign bugs.
+        for (int weight = -127; weight <= 127; ++weight)
+        {
+            const auto w = std::bit_cast<Ops::I>(_mm256_set1_epi8(static_cast<char>(weight)));
+            for (int activation = -128; activation <= 127; ++activation)
+            {
+                const auto a = std::bit_cast<Ops::I>(_mm256_set1_epi8(static_cast<char>(activation)));
+                const auto result = Ops::dot(Ops::I{} + 37, w, a);
+                for (int lane = 0; lane < 8; ++lane)
+                    ASSERT_EQ(result[lane], 37 + 4 * weight * activation)
+                        << "weight=" << weight << " activation=" << activation << " lane=" << lane;
+            }
+        }
+    }
+
     TEST_F(CPUNativeVNNIGemvTest, Q4_0_SmallMatrix)
     {
         const int N = 128;
@@ -1013,7 +1032,7 @@ namespace
     {
         constexpr int N = 64;
         constexpr int K = 512;
-        constexpr std::array<int, 4> runtime_rows = {2, 3, 15, 65};
+        constexpr std::array<int, 5> runtime_rows = {1, 2, 3, 15, 65};
         constexpr auto policy =
             CPUProjectionNumericalPolicy::GPUAlignedExpert;
 
@@ -1082,6 +1101,7 @@ namespace
                     static_cast<size_t>(M) * static_cast<size_t>(N),
                     0.0f);
                 std::vector<float> serial(grouped.size(), 0.0f);
+                std::vector<float> serial_fp32_input(grouped.size(), 0.0f);
                 CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc
                     descriptor{
                         .kernel = &kernel,
@@ -1106,7 +1126,17 @@ namespace
                             static_cast<size_t>(row) * blocks_per_row,
                         serial.data() + static_cast<size_t>(row) * N,
                         ISAPath::AUTO);
+                    // The ordinary entrypoint must publish the same Q8 bytes
+                    // as grouped execution. Prequantized-only comparisons
+                    // missed its accidental use of BackendNative rounding.
+                    gemv_native_vnni(
+                        packed,
+                        input.data() + static_cast<size_t>(row) * K,
+                        serial_fp32_input.data() + static_cast<size_t>(row) * N);
                 }
+                expectBitwiseEqualFloatRows(
+                    std::string(format.label) + " serial FP32-input policy",
+                    serial_fp32_input.data(), serial.data(), serial.size(), N);
                 ASSERT_TRUE(std::any_of(
                     serial.begin(),
                     serial.end(),

@@ -6,6 +6,8 @@
  * defined in CUDAFlashAttentionKernels.cu. Decode uses a capacity-stable KV
  * split envelope and the same ordered scalar/grouped reduction in every
  * determinism mode; determinism does not serialize a whole attention head.
+ * Native FP16, BF16 and FP32 cache storage shares that grouped decode contract.
+ * Native prefill converts only on-chip WMMA operands, never the stored cache.
  *
  * @author David Sanftenberg
  */
@@ -55,6 +57,8 @@ extern "C"
         int device_idx,
         int head_start,
         int gqa_n_rep);
+    /** @brief Identical launch contract with native BF16 cache storage. */
+    decltype(cudaFlashAttn_prefill_fa2_fp16kv) cudaFlashAttn_prefill_fa2_bf16kv;
 
     /**
      * @brief Launch a deterministic K/V-context transaction with FP32 K/V.
@@ -91,6 +95,8 @@ extern "C"
         int reducer_dimension_warps,
         void *capture_conditional,
         void *stream, int device_idx, int head_start, int gqa_n_rep);
+    /** @brief Identical launch contract with native BF16 cache storage. */
+    decltype(cudaFlashAttn_prefill_fa2_fp16kv_context_parallel) cudaFlashAttn_prefill_fa2_bf16kv_context_parallel;
 
     // Flash Decoding for single-token decode with split-K parallelism
     int cudaFlashAttn_decode_fp32(
@@ -117,16 +123,19 @@ extern "C"
         int device_idx,
         int head_start,
         int gqa_n_rep);
+    /** @brief Identical launch contract with native BF16 cache storage. */
+    decltype(cudaFlashAttn_decode_fp16kv) cudaFlashAttn_decode_bf16kv;
 
     /**
-     * @brief Launch all compact verifier rows through one FP16-KV decode grid.
+     * @brief Launch all compact verifier rows through one native-KV decode grid.
      *
      * Unlike an ordinary decode batch, every verifier row reads the same cache
      * allocation but has its own device-resident logical KV length. The kernel
      * preserves the exact split sizing and reduction order of independent M=1
      * decode while amortizing launch overhead across runtime M=2..16.
      */
-    int cudaFlashAttn_decode_fp16kv_grouped_verifier_rows(
+    int cudaFlashAttn_decode_nativekv_grouped_verifier_rows(
+        llaminar2::TensorType cache_type,
         const float *Q, const void *K_cache_fp16, const void *V_cache_fp16, float *O,
         float *O_partial, float *m_partial, float *l_partial,
         int verifier_rows, int max_kv_len,
@@ -139,9 +148,10 @@ extern "C"
         int gqa_n_rep);
 
     /**
-     * @brief Launch independent request banks through one row-local FP16 decode.
+     * @brief Launch independent request banks through one row-local native decode.
      */
-    int cudaFlashAttn_decode_fp16kv_grouped_request_rows(
+    int cudaFlashAttn_decode_nativekv_grouped_request_rows(
+        llaminar2::TensorType cache_type,
         const float *Q, const void *K_cache_fp16, const void *V_cache_fp16, float *O,
         float *O_partial, float *m_partial, float *l_partial,
         int request_count, int query_rows, int max_kv_len,
@@ -857,9 +867,11 @@ namespace llaminar2
                 dynamic_attn_device_valid_ &&
                 dynamic_attn_query_rows_ == seq_len &&
                 dynamic_attn_param_rows_ >= seq_len;
-            const bool use_small_fp16kv_decode =
-                K->native_type() == TensorType::FP16 &&
-                V->native_type() == TensorType::FP16 &&
+            const bool use_small_nativekv_decode =
+                (K->native_type() == TensorType::FP16 ||
+                 K->native_type() == TensorType::BF16 ||
+                 K->native_type() == TensorType::FP32) &&
+                V->native_type() == K->native_type() &&
                 batch_size == 1 &&
                 causal &&
                 seq_len > 1 &&
@@ -867,7 +879,7 @@ namespace llaminar2
                 kv_len > seq_len &&
                 row_local_decode_params_ready;
             const int expected_query_rows =
-                use_small_fp16kv_decode ? seq_len : 1;
+                use_small_nativekv_decode ? seq_len : 1;
 
             // Wire the device-owned parameter block for graph-capture replay.
             // Resident cache execution derives it from the live device count;
@@ -951,19 +963,21 @@ namespace llaminar2
                 d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
             }
 
-            // === Mixed-precision KV handling (FP16→direct or Q8_1→fused/FP32) ===
-            // For FP16 KV: both prefill (seq_len > 1) and decode (seq_len == 1)
-            // use direct FP16 kernel variants, eliminating FP16→FP32 conversion.
+            // === Native floating-point KV handling or fused/decoded Q8_1 ===
+            // Floating-point caches retain their physical dtype. FP16/BF16
+            // use native loads in prefill and decode; grouped FP32 shares that
+            // same ordered decode family rather than a separate row replay.
             // For Q8_1 KV decode: fused inline dequant kernel (no workspace),
             // For Q8_1 KV prefill: dequant to FP32 workspace (no Q8_1 prefill kernel).
-            bool use_fp16kv_direct = false;
+            bool use_nativekv_direct = false;
             bool use_q8kv_direct = false;
-            const void *K_fp16_ptr = nullptr;
-            const void *V_fp16_ptr = nullptr;
+            const void *K_native_ptr = nullptr;
+            const void *V_native_ptr = nullptr;
             const void *K_q8_ptr = nullptr;
             const void *V_q8_ptr = nullptr;
 
-            if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
+            if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32 ||
+                use_small_nativekv_decode)
             {
                 if (K->native_type() != V->native_type())
                 {
@@ -972,14 +986,15 @@ namespace llaminar2
                     return false;
                 }
 
-                if (K->native_type() == TensorType::FP16)
+                if (K->native_type() == TensorType::FP16 ||
+                    K->native_type() == TensorType::BF16 || use_small_nativekv_decode)
                 {
-                    // FAST PATH: FP16 KV → pass FP16 pointers directly to kernel
-                    // Works for both prefill (FA2 FP16KV) and decode (flash_decoding_fp16kv)
-                    use_fp16kv_direct = true;
-                    K_fp16_ptr = K->gpu_data_ptr();
-                    V_fp16_ptr = V->gpu_data_ptr();
-                    LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] FP16 KV direct path (no conversion)");
+                    // Native floating-point storage uses the same tiled/split
+                    // arithmetic without materializing a converted cache.
+                    use_nativekv_direct = true;
+                    K_native_ptr = K->gpu_data_ptr();
+                    V_native_ptr = V->gpu_data_ptr();
+                    LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Native floating-point KV direct path (no conversion)");
                 }
                 else if (K->native_type() == TensorType::Q8_1 && seq_len == 1)
                 {
@@ -1014,39 +1029,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (K->native_type() == TensorType::FP16)
-                    {
-                        int k_ret, v_ret;
-                        if (d_attn_params)
-                        {
-                            constexpr int MAX_KV_LEN = 4096;
-                            k_ret = cudaFlashAttn_convert_fp16_to_fp32_dynamic(
-                                K->gpu_data_ptr(), d_k_tmp,
-                                static_cast<int>(logical_cols), MAX_KV_LEN,
-                                d_attn_params, stream_);
-                            v_ret = cudaFlashAttn_convert_fp16_to_fp32_dynamic(
-                                V->gpu_data_ptr(), d_v_tmp,
-                                static_cast<int>(logical_cols), MAX_KV_LEN,
-                                d_attn_params, stream_);
-                        }
-                        else
-                        {
-                            k_ret = cudaFlashAttn_convert_fp16_to_fp32(
-                                K->gpu_data_ptr(), d_k_tmp,
-                                static_cast<int>(logical_elements), stream_);
-                            v_ret = cudaFlashAttn_convert_fp16_to_fp32(
-                                V->gpu_data_ptr(), d_v_tmp,
-                                static_cast<int>(logical_elements), stream_);
-                        }
-                        if (k_ret != 0 || v_ret != 0)
-                        {
-                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] GPU FP16→FP32 conversion failed"
-                                      << " k_ret=" << k_ret << " v_ret=" << v_ret
-                                      << " dynamic=" << (d_attn_params != nullptr));
-                            return false;
-                        }
-                    }
-                    else if (K->native_type() == TensorType::Q8_1)
+                    if (K->native_type() == TensorType::Q8_1)
                     {
                         int k_ret, v_ret;
                         if (d_attn_params)
@@ -1158,10 +1141,10 @@ namespace llaminar2
                     std::move(pending_prefill_conditional_);
             }
 
-            // Dispatch: FP16 KV direct path (prefill and decode) or standard apply_typed
-            if (use_fp16kv_direct)
+            // Dispatch: Native floating-point KV direct path (prefill and decode) or standard apply_typed
+            if (use_nativekv_direct)
             {
-                // FP16 KV direct: skip FP32 conversion, pass FP16 pointers to kernel
+                // Native floating-point KV direct: preserve the cache's own pointer and dtype
                 if (cudaFlashAttn_setDevice(dev) != 0)
                 {
                     LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to set device " << dev);
@@ -1170,7 +1153,7 @@ namespace llaminar2
 
                 if (seq_len == 1)
                 {
-                    // DECODE: Flash Decoding with FP16 KV — no conversion needed
+                    // DECODE: native 16-bit KV loads expand only in registers
                     const int launch_kv_capacity =
                         dynamic_attn_kv_stride_ > 0 ? dynamic_attn_kv_stride_ : kv_len;
                     const int num_splits = computeDecodeSplitEnvelopeForDevice(
@@ -1180,15 +1163,17 @@ namespace llaminar2
 
                     if (!allocateWorkspace(n_heads, head_dim, num_splits))
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace binding failed for FP16KV decode");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace binding failed for native-KV decode");
                         return false;
                     }
 
                     int result;
                     {
                         CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
-                        result = cudaFlashAttn_decode_fp16kv(
-                            Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
+                        result = (K->native_type() == TensorType::BF16
+                                      ? cudaFlashAttn_decode_bf16kv
+                                      : cudaFlashAttn_decode_fp16kv)(
+                            Q_ptr, K_native_ptr, V_native_ptr, output_ptr,
                             static_cast<float *>(partial_output_buf_),
                             static_cast<float *>(partial_m_buf_),
                             static_cast<float *>(partial_l_buf_),
@@ -1199,15 +1184,15 @@ namespace llaminar2
                     }
                     if (result != 0)
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Flash Decoding FP16KV failed");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Flash Decoding native-KV failed");
                         return false;
                     }
                     return true;
                 }
 
-                if (use_small_fp16kv_decode)
+                if (use_small_nativekv_decode)
                 {
-                    LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode path"
+                    LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] Small-M native-KV decode path"
                               << " rows=" << seq_len
                               << " kv_len=" << kv_len
                               << " n_heads=" << n_heads
@@ -1216,13 +1201,13 @@ namespace llaminar2
                               << " device_params=" << (d_attn_params != nullptr));
                     if (!stream_)
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode requires an explicit non-null CUDA stream");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M native-KV decode requires an explicit non-null CUDA stream");
                         return false;
                     }
 
                     if (!workspace_)
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode requires a bound workspace");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M native-KV decode requires a bound workspace");
                         return false;
                     }
 
@@ -1232,7 +1217,7 @@ namespace llaminar2
 
                     if (!O_partial || !m_partial || !l_partial)
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace buffers missing for small-M FP16KV decode");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace buffers missing for small-M native-KV decode");
                         return false;
                     }
 
@@ -1256,10 +1241,11 @@ namespace llaminar2
                         CUDA_KERNEL_PROFILE_SCOPE_STREAM(
                             CUDAKernelType::FLASH_ATTN_DECODE,
                             stream_);
-                        result = cudaFlashAttn_decode_fp16kv_grouped_verifier_rows(
+                        result = cudaFlashAttn_decode_nativekv_grouped_verifier_rows(
+                            K->native_type(),
                             Q_ptr,
-                            K_fp16_ptr,
-                            V_fp16_ptr,
+                            K_native_ptr,
+                            V_native_ptr,
                             output_ptr,
                             O_partial,
                             m_partial,
@@ -1278,7 +1264,7 @@ namespace llaminar2
                     }
                     if (result != 0)
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Grouped small-M FP16KV decode failed"
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Grouped small-M native-KV decode failed"
                                   << " rows=" << seq_len
                                   << " max_kv_len=" << kv_len
                                   << " max_num_splits=" << max_num_splits);
@@ -1288,7 +1274,7 @@ namespace llaminar2
                 }
 
                 // PREFILL: one capture-stable query or context transaction.
-                LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV prefill path"
+                LOG_TRACE("[CUDAFlashAttentionKernelT<FP32>] FA2 native-KV prefill path"
                           << " parallel_axis="
                           << (prefill_plan.usesContextParallelism()
                                   ? "key_value_context"
@@ -1311,7 +1297,7 @@ namespace llaminar2
                     {
                         if (!stream_ || !workspace_ || !d_attn_params)
                         {
-                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel FP16KV prefill requires an exact stream, bound workspace, and device-owned attention params");
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel native-KV prefill requires an exact stream, bound workspace, and device-owned attention params");
                             return false;
                         }
 
@@ -1337,7 +1323,7 @@ namespace llaminar2
                                 prefill_plan.partial_l_bytes;
                         if (!capacity_valid)
                         {
-                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel FP16KV workspace does not match the captured plan"
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Context-parallel native-KV workspace does not match the captured plan"
                                       << " required_output="
                                       << prefill_plan.partial_output_bytes
                                       << " required_scalar="
@@ -1346,10 +1332,12 @@ namespace llaminar2
                         }
 
                         result =
-                            cudaFlashAttn_prefill_fa2_fp16kv_context_parallel(
+                            (K->native_type() == TensorType::BF16
+                                 ? cudaFlashAttn_prefill_fa2_bf16kv_context_parallel
+                                 : cudaFlashAttn_prefill_fa2_fp16kv_context_parallel)(
                                 Q_ptr,
-                                K_fp16_ptr,
-                                V_fp16_ptr,
+                                K_native_ptr,
+                                V_native_ptr,
                                 output_ptr,
                                 O_partial,
                                 m_partial,
@@ -1378,8 +1366,10 @@ namespace llaminar2
                     }
                     else
                     {
-                        result = cudaFlashAttn_prefill_fa2_fp16kv(
-                            Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
+                        result = (K->native_type() == TensorType::BF16
+                                      ? cudaFlashAttn_prefill_fa2_bf16kv
+                                      : cudaFlashAttn_prefill_fa2_fp16kv)(
+                            Q_ptr, K_native_ptr, V_native_ptr, output_ptr,
                             batch_size, seq_len, kv_len,
                             n_heads, n_kv_heads, head_dim,
                             causal, window_size, 0,
@@ -1390,7 +1380,7 @@ namespace llaminar2
                 }
                 if (result != 0)
                 {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV prefill transaction failed"
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] FA2 native-KV prefill transaction failed"
                               << " parallel_axis="
                               << (prefill_plan.usesContextParallelism()
                                       ? "key_value_context"
@@ -1406,7 +1396,7 @@ namespace llaminar2
                     head_dim,
                     launch_kv_capacity,
                     dev,
-                    "fp16");
+                    K->native_type() == TensorType::BF16 ? "bf16" : "fp16");
                 return true;
             }
 
@@ -1638,10 +1628,13 @@ namespace llaminar2
                                                            << " O=" << output->dtype_name());
                 return false;
             }
-            if (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16)
+            if ((K->native_type() != TensorType::FP16 &&
+                 K->native_type() != TensorType::BF16 &&
+                 K->native_type() != TensorType::FP32) ||
+                V->native_type() != K->native_type())
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
-                          "currently proven only for FP16 KV, got K=" << K->dtype_name()
+                          "requires native FP16/BF16/FP32 KV, got K=" << K->dtype_name()
                                                                       << " V=" << V->dtype_name());
                 return false;
             }
@@ -1732,11 +1725,13 @@ namespace llaminar2
             }
             if (Q->native_type() != TensorType::FP32 ||
                 output->native_type() != TensorType::FP32 ||
-                K->native_type() != TensorType::FP16 ||
-                V->native_type() != TensorType::FP16)
+                (K->native_type() != TensorType::FP16 &&
+                 K->native_type() != TensorType::BF16 &&
+                 K->native_type() != TensorType::FP32) ||
+                V->native_type() != K->native_type())
             {
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_device_request_batch_decode_equivalent] "
-                          "requires FP32 Q/output and FP16 fixed-stride K/V"
+                          "requires FP32 Q/output and matching native floating-point fixed-stride K/V"
                           << " Q=" << Q->dtype_name()
                           << " K=" << K->dtype_name()
                           << " V=" << V->dtype_name()
@@ -1853,7 +1848,8 @@ namespace llaminar2
                 CUDA_KERNEL_PROFILE_SCOPE_STREAM(
                     CUDAKernelType::FLASH_ATTN_DECODE,
                     stream_);
-                result = cudaFlashAttn_decode_fp16kv_grouped_request_rows(
+                result = cudaFlashAttn_decode_nativekv_grouped_request_rows(
+                            K->native_type(),
                     Q_ptr,
                     K_ptr,
                     V_ptr,

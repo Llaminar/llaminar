@@ -3678,12 +3678,11 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_NullPositionIds_NoCachePopulated)
 }
 
 /**
- * @brief Prove first-use GPU MTP forwards use the same device handoff as replay.
+ * @brief Prove deferred GPU forwards retain their public result event.
  *
- * A cache miss is still an asynchronous GPU producer. The verifier sampler or
- * main-decode sampler must inherit its explicit stream directly; synchronizing
- * logits merely because no graph executable existed yet reintroduces a host
- * coherence boundary on the first speculative step.
+ * Private sampler handoffs and public tensor publication are complementary.
+ * TransferEngine must observe the produced tensor even when an MTP consumer
+ * also borrows its stream; recording the event is not a host synchronization.
  */
 TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceConsumer)
 {
@@ -3707,7 +3706,8 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceCons
         ForwardOutput output{};
         ASSERT_TRUE(engine.execute(input, output, host));
 
-        EXPECT_EQ(host.sync_logits_calls, 0);
+        EXPECT_EQ(host.sync_logits_calls, 1)
+            << "Deferred verifier consumption must not suppress tensor publication.";
         EXPECT_EQ(host.pending_all_position_verifier_stream_calls, 1);
         EXPECT_NE(host.pending_all_position_verifier_stream, nullptr);
         EXPECT_EQ(
@@ -3730,7 +3730,8 @@ TEST_F(Test__ForwardExecutionEngine, CacheMiss_GPUDecodeDefersLogitsToDeviceCons
         ForwardOutput output{};
         ASSERT_TRUE(engine.execute(input, output, host));
 
-        EXPECT_EQ(host.sync_logits_calls, 0);
+        EXPECT_EQ(host.sync_logits_calls, 1)
+            << "Deferred main consumption must not suppress PP tensor publication.";
         EXPECT_EQ(host.pending_main_decode_stream_calls, 1);
         EXPECT_NE(host.pending_main_decode_stream, nullptr);
         EXPECT_EQ(

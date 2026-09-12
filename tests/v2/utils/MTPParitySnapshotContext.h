@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <span>
@@ -148,15 +149,20 @@ namespace llaminar2::test::parity
      * @param reference_depth Recursive MTP row being compared.
      * @param condition_tokens Exact preceding device/host-owned draft tokens;
      *        its size must equal @p reference_depth.
+     * @param condition_token_override Actual initial condition, when different
+     *        from the canonical HF main-model argmax. Owns depth-zero identity.
      * @return Prefix ending in `_MTPD_`, ready for a stage suffix.
      * @throws std::invalid_argument for an invalid step/depth/token identity.
      */
     [[nodiscard]] inline std::string mtpParityBranchReferencePrefix(
         int reference_step,
         int reference_depth,
-        std::span<const int32_t> condition_tokens)
+        std::span<const int32_t> condition_tokens,
+        std::optional<int32_t> condition_token_override = std::nullopt)
     {
-        if (reference_step < 0 || reference_depth <= 0 ||
+        if (reference_step < 0 || reference_depth < 0 || reference_depth >= 15 ||
+            (reference_depth == 0 && !condition_token_override) ||
+            (condition_token_override && *condition_token_override < 0) ||
             condition_tokens.size() !=
                 static_cast<size_t>(reference_depth))
         {
@@ -165,7 +171,11 @@ namespace llaminar2::test::parity
         }
 
         std::string prefix =
-            "decode_step" + std::to_string(reference_step) + "_BRANCH";
+            "decode_step" + std::to_string(reference_step);
+        if (condition_token_override)
+            prefix += "_CONDITION_" + std::to_string(*condition_token_override);
+        if (!condition_tokens.empty())
+            prefix += "_BRANCH";
         for (const int32_t token : condition_tokens)
         {
             if (token < 0)
@@ -309,10 +319,10 @@ namespace llaminar2::test::parity
     /**
      * @brief Reference row whose first speculative token is serially correct.
      *
-     * The row is selected from immutable Hugging Face evidence before the
-     * production request starts.  It lets one response-bounded transaction prove
-     * both its retained checkpoint bank and a visible accepted draft without
-     * launching a second inference lifecycle.
+     * The HF predictor tensor and already-compared native target rows select
+     * this identity before the speculative request starts. One response-bounded
+     * transaction then proves its retained checkpoint bank and a visible
+     * accepted draft, without substituting HF target tokens for native decode.
      */
     struct MTPParityAcceptedDraftReference
     {
@@ -340,6 +350,13 @@ namespace llaminar2::test::parity
         size_t reference_step = 0; ///< Contiguous row identity, beginning at zero.
         int32_t committed_token = -1; ///< Token actually forwarded by this row.
         int32_t predicted_successor_token = -1; ///< Production argmax after it.
+    };
+
+    /** @brief Independent HF draft nomination and its top-two logit margin. */
+    struct MTPParityDraftPrediction
+    {
+        int32_t token = -1; ///< Predictor argmax, never the native response oracle.
+        float margin = 0.0f; ///< Confidence ordering only; not a numerical gate.
     };
 
     /** @brief Why ordinary decode could not certify a requested serial horizon. */
@@ -407,8 +424,10 @@ namespace llaminar2::test::parity
      * that exact token, then its argmax becomes serial output one, and so on.
      * This induction is byte-token exact; Hugging Face remains the independent
      * tensor oracle but is not substituted for Llaminar's serial trajectory.
-     * A missing row is distinguishable from a broken edge so callers may run
-     * an explicitly longer oracle only when the compared corpus is too short.
+     * A forced token can legitimately differ from the native argmax while its
+     * tensor comparison passes. That ends the reusable prefix, not numerical
+     * parity: a longer native oracle must execute its own production request.
+     * Malformed row identities and missing predictions remain invalid evidence.
      *
      * @param prefill_predicted_token Production argmax after prompt prefill.
      * @param rows Ordered authenticated production decode rows.
@@ -479,6 +498,58 @@ namespace llaminar2::test::parity
         return result;
     }
 
+    /** @brief Authority used to obtain a complete native serial token oracle. */
+    enum class MTPParitySerialOracleSource
+    {
+        ComparedDecodeRows, ///< Every required edge and placement is proven.
+        ProductionRequest, ///< Run native decode beyond available forced rows.
+        InvalidEvidence, ///< Malformed evidence must never select another path.
+    };
+
+    /** Whether token induction alone covers the requested production evidence. */
+    enum class MTPParitySerialOracleContinuity
+    {
+        ComparedRows, ///< Independently restored rows may prove the token chain.
+        ContinuousRequest, ///< Maintenance must advance across consecutive rows.
+    };
+
+    /**
+     * @brief Separate unavailable reuse from malformed checkpoint evidence.
+     * @param certification Exact induction over already-compared decode rows.
+     * @param output_count Required native response horizon.
+     * @param current_placement Whether the rows share the verifier's placement.
+     * @param continuity Whether the proof also owes a continuous serving request.
+     * @return One explicit oracle authority, or a fatal evidence disposition.
+     */
+    [[nodiscard]] inline MTPParitySerialOracleSource selectMTPParitySerialOracleSource(
+        const MTPParitySerialTrajectoryCertification &certification,
+        size_t output_count,
+        bool current_placement,
+        MTPParitySerialOracleContinuity continuity =
+            MTPParitySerialOracleContinuity::ComparedRows) noexcept
+    {
+        if (continuity != MTPParitySerialOracleContinuity::ComparedRows &&
+            continuity != MTPParitySerialOracleContinuity::ContinuousRequest)
+            return MTPParitySerialOracleSource::InvalidEvidence;
+        switch (certification.failure)
+        {
+        case MTPParitySerialCertificationFailure::None:
+            if (!certification.complete(output_count))
+                return MTPParitySerialOracleSource::InvalidEvidence;
+            return current_placement &&
+                           continuity == MTPParitySerialOracleContinuity::ComparedRows
+                       ? MTPParitySerialOracleSource::ComparedDecodeRows
+                       : MTPParitySerialOracleSource::ProductionRequest;
+        case MTPParitySerialCertificationFailure::MissingDecodeRow:
+        case MTPParitySerialCertificationFailure::DiscontinuousTokenEdge:
+            // A reference-forced suffix is not a native autoregressive oracle.
+            // Never substitute HF tokens for the independently executed suffix.
+            return MTPParitySerialOracleSource::ProductionRequest;
+        default:
+            return MTPParitySerialOracleSource::InvalidEvidence;
+        }
+    }
+
     /**
      * @brief Execution and response geometry for one parity checkpoint transaction.
      *
@@ -487,7 +558,9 @@ namespace llaminar2::test::parity
      * device controller deliberately retains the complete selected depth-N
      * graph geometry and clips only publication at the commit boundary. That
      * is the smallest production request which executes one grouped verifier
-     * transaction and cannot advance into a second transaction.
+     * transaction when the first draft is accepted and the maintenance window
+     * admits both rows. A smaller maintenance window can split this response
+     * into multiple transactions; the caller must validate that admission.
      *
      * CPU generation has no resident controller to own that separation, so its
      * public budget remains the complete condition-plus-drafts width.
@@ -503,6 +576,12 @@ namespace llaminar2::test::parity
         {
             return execution_draft_depth > 0 && response_token_budget > 1 &&
                    (!device_commit_boundary || response_token_budget == 2);
+        }
+
+        /** @return Whether a declared maintenance window preserves this bank. */
+        [[nodiscard]] constexpr bool fitsMaintenanceWindow(int rows) const noexcept
+        {
+            return valid() && rows >= response_token_budget;
         }
     };
 
@@ -533,32 +612,96 @@ namespace llaminar2::test::parity
     }
 
     /**
-     * @brief Find the earliest reference row with one provably accepted draft.
+     * @brief Nominate an accepting edge for an authenticated checkpoint prompt.
      *
-     * @param serial_tokens Ordered reference decode tokens.
-     * @param first_draft_tokens MTP0 argmax at each aligned decode step.
-     * @return The first row where MTP0 predicts the following serial token.
+     * A checkpoint is a new request with the original prompt followed by its
+     * authenticated reference inputs. It need not lie on the original prompt's
+     * free-running native trajectory. At that checkpoint, however, the native
+     * condition must match the predictor's input and its native successor must
+     * match the HF draft. This only nominates the request: captured serial and
+     * grouped execution from identical restored state must still prove actual
+     * token equivalence and acceptance. Never reuse these forced rows as a
+     * free-running suffix merely because a later local edge matches again.
+     *
+     * @param prefill_prediction Native prediction after the original prompt.
+     * @param reference_tokens Authenticated HF inputs at each decode step.
+     * @param rows Captured M=1 rows, with their actual inputs and predictions.
+     * @param first_drafts HF MTP0 argmax and top-two margin at each decode step.
+     * @return Strongest matching candidate (earliest on ties), or nullopt.
      */
-    [[nodiscard]] constexpr std::optional<MTPParityAcceptedDraftReference>
-    firstMTPParityAcceptedDraftReference(
-        std::span<const int32_t> serial_tokens,
-        std::span<const int32_t> first_draft_tokens) noexcept
+    [[nodiscard]] inline std::optional<MTPParityAcceptedDraftReference>
+    selectMTPParityCheckpointAcceptedDraftReference(
+        int32_t prefill_prediction,
+        std::span<const int32_t> reference_tokens,
+        std::span<const MTPParityCertifiedDecodeRow> rows,
+        std::span<const MTPParityDraftPrediction> first_drafts)
     {
-        if (serial_tokens.size() < 2u || first_draft_tokens.empty())
+        if (prefill_prediction < 0 || rows.empty() ||
+            rows.size() > reference_tokens.size() ||
+            first_drafts.empty() || first_drafts.size() > rows.size())
             return std::nullopt;
-        const size_t candidate_count = std::min(
-            first_draft_tokens.size(), serial_tokens.size() - 1u);
-        for (size_t step = 0u; step < candidate_count; ++step)
+        // Validate every supplied row before selecting even the first edge.
+        // An earlier near-tie must not conceal malformed later evidence.
+        for (size_t step = 0u; step < rows.size(); ++step)
         {
-            if (first_draft_tokens[step] != serial_tokens[step + 1u])
-                continue;
-            return MTPParityAcceptedDraftReference{
-                .reference_step = step,
-                .base_token = serial_tokens[step],
-                .first_draft_token = serial_tokens[step + 1u],
-            };
+            const auto &row = rows[step];
+            if (row.reference_step != step || row.committed_token < 0 ||
+                row.committed_token != reference_tokens[step] ||
+                row.predicted_successor_token < 0)
+                return std::nullopt;
         }
-        return std::nullopt;
+        if (std::any_of(first_drafts.begin(), first_drafts.end(),
+                        [](const auto &draft) {
+                            return draft.token < 0 || !std::isfinite(draft.margin) || draft.margin < 0.0f;
+                        }))
+            return std::nullopt;
+        std::optional<MTPParityAcceptedDraftReference> selected;
+        float selected_margin = -1.0f;
+        for (size_t step = 0u; step < first_drafts.size(); ++step)
+        {
+            const int32_t condition = step == 0u
+                ? prefill_prediction : rows[step - 1u].predicted_successor_token;
+            if (condition == rows[step].committed_token &&
+                first_drafts[step].token == rows[step].predicted_successor_token &&
+                first_drafts[step].margin > selected_margin)
+            {
+                // The acceptance witness should not deliberately choose a
+                // near-tie when this same authenticated pack has a clearer
+                // prediction. Actual native acceptance remains mandatory.
+                selected_margin = first_drafts[step].margin;
+                selected = MTPParityAcceptedDraftReference{
+                    .reference_step = step,
+                    .base_token = condition,
+                    .first_draft_token = rows[step].predicted_successor_token,
+                };
+            }
+        }
+        return selected;
+    }
+
+    /**
+     * @brief Build the exact request whose HF checkpoint nominated acceptance.
+     * @param prompt Original authenticated prompt tokens.
+     * @param reference_tokens Authenticated decode inputs, not a native oracle.
+     * @param checkpoint Selected local edge, including its condition identity.
+     * @return Prompt extended only by inputs preceding the condition token.
+     * @throws std::invalid_argument if the checkpoint does not bind this pack.
+     */
+    [[nodiscard]] inline std::vector<int32_t> mtpParityCheckpointPrompt(
+        std::span<const int32_t> prompt,
+        std::span<const int32_t> reference_tokens,
+        const MTPParityAcceptedDraftReference &checkpoint)
+    {
+        if (prompt.empty() || checkpoint.reference_step >= reference_tokens.size() ||
+            checkpoint.base_token != reference_tokens[checkpoint.reference_step] ||
+            std::any_of(prompt.begin(), prompt.end(), [](int32_t token) { return token < 0; }) ||
+            std::any_of(reference_tokens.begin(), reference_tokens.end(),
+                        [](int32_t token) { return token < 0; }))
+            throw std::invalid_argument("MTP checkpoint prompt has invalid authenticated token identity");
+        std::vector<int32_t> result(prompt.begin(), prompt.end());
+        result.insert(result.end(), reference_tokens.begin(),
+                      reference_tokens.begin() + static_cast<std::ptrdiff_t>(checkpoint.reference_step));
+        return result;
     }
 
     /**
@@ -679,6 +822,49 @@ namespace llaminar2::test::parity
                        draft_depth <= std::numeric_limits<int>::max() - 2
                    ? draft_depth + 2
                    : 0;
+    }
+
+    /**
+     * @brief Immutable request geometry for the independent adaptive witness.
+     *
+     * Warmup uses ordinary one-token production calls, then the full-width
+     * speculative call begins after the initial maintenance interval. The
+     * serial oracle covers both phases so changing cadence cannot silently
+     * shift the expected token suffix.
+     */
+    struct MTPParityAdaptiveWitnessPlan
+    {
+        int warmup_tokens = 0; ///< Serial calls before adaptive evidence starts.
+        int response_tokens = 0; ///< Full-width speculative response allowance.
+        int serial_oracle_tokens = 0; ///< Complete independently checked horizon.
+
+        /** @return Whether the two phases exactly cover the oracle horizon. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return warmup_tokens > 0 && response_tokens > 2 &&
+                   serial_oracle_tokens > response_tokens &&
+                   serial_oracle_tokens - response_tokens == warmup_tokens;
+        }
+    };
+
+    /**
+     * @brief Derive adaptive proof geometry from the actual maintenance policy.
+     * @param depth Positive selected draft depth.
+     * @param initial_device_maintenance_rows Initial native GPU cadence, or no
+     *        value for a runner without that device-owned maintenance clock.
+     * @return One consistent plan; invalid input yields an invalid zero plan.
+     */
+    [[nodiscard]] constexpr MTPParityAdaptiveWitnessPlan
+    makeMTPParityAdaptiveWitnessPlan(
+        int depth,
+        std::optional<int> initial_device_maintenance_rows = std::nullopt) noexcept
+    {
+        const int response = mtpParityFullWidthPolicyWitnessBudget(depth);
+        const int warmup = initial_device_maintenance_rows.value_or(1);
+        if (response <= 0 || warmup <= 0 ||
+            warmup > std::numeric_limits<int>::max() - response)
+            return {};
+        return {warmup, response, warmup + response};
     }
 
     /**

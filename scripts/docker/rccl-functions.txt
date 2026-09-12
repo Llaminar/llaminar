@@ -1,0 +1,1 @@
+AllReduce RING/TREE LL/LL128/SIMPLE Sum/MinMax i8/i32/f16/f32/bf16|Reduce RING LL/LL128/SIMPLE Sum/MinMax i8/i32/f16/f32/bf16|ReduceScatter RING/PAT LL/LL128/SIMPLE Sum/MinMax i8/i32/f16/f32/bf16|AllGather RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Broadcast RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|SendRecv RING SIMPLE Sum i8

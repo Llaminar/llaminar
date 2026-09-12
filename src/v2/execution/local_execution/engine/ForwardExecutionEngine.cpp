@@ -1782,7 +1782,10 @@ namespace llaminar2
             (!input.mtp_main_terminal_hidden->executableForRequestCount(
                  input.batch_size) ||
              input.shifted_mtp_prefill.has_value() ||
-             input.state_transaction != ForwardStateTransaction::Ordinary ||
+             (input.state_transaction != ForwardStateTransaction::Ordinary &&
+              !(input.state_transaction == ForwardStateTransaction::CommittedMTPCondition &&
+                input.execution_role == ForwardExecutionRole::MTPCondition &&
+                input.batch_size == 1 && input.seq_len == 1)) ||
              input.execution_phase != ForwardExecutionPhase::Decode ||
              (input.execution_role != ForwardExecutionRole::MainInference &&
               input.execution_role != ForwardExecutionRole::MTPCondition)))
@@ -3397,6 +3400,19 @@ namespace llaminar2
                       << " applied_stream=" << forward_cache.applied_stream);
         }
 
+        if (forward_cache.pp_needs_copy && forward_cache.pp_working_buffer &&
+            stream_device.is_gpu())
+        {
+            // Retained replay deliberately skips the full stage-input walk.
+            // The PP ingress is nevertheless a newly published external value
+            // on every call. Acquire this one frontier on the exact replay
+            // stream; residency and cached pointer identity do not imply that
+            // an asynchronous transfer has finished writing the bytes.
+            TransferEngine::requireDeviceInput(
+                forward_cache.pp_working_buffer, stream_device,
+                dynamic_param_stream);
+        }
+
         // Discovery is topology-owned and shared by setup capture and every
         // request execution. Only the small resulting list is walked per launch.
         if (!forward_cache.dynamic_param_stages_cached)
@@ -3559,9 +3575,7 @@ namespace llaminar2
         // Prefill uses its separate bucketed graph-cache state machine below.
         bool used_graph_replay = false;
         void *prefill_producer_stream = nullptr;
-        bool requested_deferred_all_position_sync = false;
         bool requested_deferred_main_decode_sync = false;
-        bool executed_deferred_all_position_sync = false;
         bool executed_deferred_main_decode_sync = false;
 
         auto exec_t0 = std::chrono::high_resolution_clock::now();
@@ -3807,13 +3821,9 @@ namespace llaminar2
                 // timeline transaction; its consumer owns completion.
                 capture_policy.defer_final_sync = true;
             }
-            requested_deferred_all_position_sync =
-                wants_all_position_sync_defer;
             requested_deferred_main_decode_sync =
                 wants_main_decode_sync_defer ||
                 wants_captured_collective_sync_defer;
-            executed_deferred_all_position_sync =
-                wants_all_position_sync_defer && capture_policy.defer_final_sync;
             executed_deferred_main_decode_sync =
                 requested_deferred_main_decode_sync && capture_policy.defer_final_sync;
 
@@ -3993,11 +4003,6 @@ namespace llaminar2
             forward_cache.phase3_active = false;
         }
 
-        const bool all_position_verifier_sync_deferred =
-            success &&
-            used_graph_replay &&
-            executed_deferred_all_position_sync &&
-            forward_cache.segment_cache.capture_stream != nullptr;
         const bool main_decode_sync_deferred =
             success &&
             used_graph_replay &&
@@ -4057,29 +4062,15 @@ namespace llaminar2
             }
         }
 
-        // Publish logits at the forward ownership boundary. Device consumers
-        // inherit the producer stream; host consumers wait only on the exact
-        // tensor or replay completion event.
+        // Every successful graph publishes its tensor, even when completion is
+        // deferred to a device consumer. A sampler's private stream handoff does
+        // not publish a PP hidden tensor to TransferEngine on another stream.
         if (success)
         {
-            if (!all_position_verifier_sync_deferred &&
-                !main_decode_sync_deferred)
+            if (!host.publishForwardResultAtBoundary(output, ctx))
             {
-                /*
-                 * The cached graph's ForwardOutput is immutable graph metadata:
-                 * it names the exact local-shard, gathered, or replicated logits
-                 * tensor selected when the graph was built. Publish that tensor
-                 * after every warmup/capture/replay launch. A device consumer can
-                 * instead inherit the producer stream through the deferred path
-                 * above, so neither route needs a host or stream synchronization.
-                 */
-                if (!host.publishForwardResultAtBoundary(
-                        output,
-                        ctx))
-                {
-                    LOG_ERROR("[ForwardExecutionEngine] Failed to publish cached forward result at the device boundary");
-                    return false;
-                }
+                LOG_ERROR("[ForwardExecutionEngine] Failed to publish cached forward result at the device boundary");
+                return false;
             }
 
             const std::string stage_context =
@@ -6083,8 +6074,6 @@ namespace llaminar2
         }
 
         DeviceId producer_device = effective_input.device;
-        bool deferred_all_position_verifier_sync = false;
-        bool deferred_main_decode_sync = false;
         if (success)
         {
             /*
@@ -6125,9 +6114,6 @@ namespace llaminar2
             {
                 const bool all_position_verifier =
                     host.computeAllPositionLogitsEnabled();
-                const bool defer_all_position_verifier =
-                    all_position_verifier &&
-                    host.shouldDeferAllPositionVerifierFinalSync();
                 const bool defer_main_decode =
                     !all_position_verifier &&
                     host.shouldDeferMainDecodeFinalSync();
@@ -6145,24 +6131,18 @@ namespace llaminar2
                     host.setPendingAllPositionVerifierStream(
                         execution_stream_used);
                 }
-                if (defer_all_position_verifier)
-                {
-                    deferred_all_position_verifier_sync = true;
-                }
                 if (defer_main_decode)
                 {
                     host.setPendingMainDecodeStream(execution_stream_used);
-                    deferred_main_decode_sync = true;
                 }
             }
         }
 
         /*
-         * Host materialization remains the default public forward boundary.
-         * MTP decode is different: its immediate consumer is a GPU sampler or
-         * verifier-publication stage. Cache misses publish the exact producer
-         * stream through the same typed handoff used by cached replay, so the
-         * first execution cannot silently fall back to a host stream drain.
+         * A result's public tensor event and a sampler's private stream handoff
+         * serve different consumers. Publish both on cache misses just as on
+         * replay. Publication records an event; it does not materialize logits
+         * on the host or wait for device completion.
          */
         if (success)
         {
@@ -6186,20 +6166,13 @@ namespace llaminar2
                 }
             }
 
-            const bool device_consumer_owns_logits =
-                deferred_all_position_verifier_sync ||
-                deferred_main_decode_sync;
-            IDeviceContext *sync_ctx =
+            IDeviceContext *publication_ctx =
                 host.getDeviceContext(producer_device);
-            if (sync_ctx && !device_consumer_owns_logits)
+            if (!publication_ctx || !host.publishForwardResultAtBoundary(
+                    output, publication_ctx))
             {
-                if (!host.publishForwardResultAtBoundary(
-                        output,
-                        sync_ctx))
-                {
-                    LOG_ERROR("[ForwardExecutionEngine] Failed to publish cache-miss forward result at the device boundary");
-                    return false;
-                }
+                LOG_ERROR("[ForwardExecutionEngine] Failed to publish cache-miss forward result at the device boundary");
+                return false;
             }
 
             const std::string stage_context =

@@ -276,7 +276,7 @@ commit the updated source gitlink. Never restore the old in-source corpus root.
 The active engine is `src/v2/`. Its production execution stack is:
 
 ```text
-OrchestrationRunner / NamedDomainGlobalRunner
+OrchestrationRunner
   -> GlobalOrchestrator       cross-rank named-domain PP/global TP
   -> RankOrchestrator         rank-local TP or local PP
   -> DeviceGraphOrchestrator  one participant/device
@@ -310,6 +310,11 @@ configuring. The runtime deliberately loads its distinct SONAME, not the
 distribution NCCL package, because retained parent recording requires the
 corrected stream-membership lifecycle. Do not substitute a system library to
 make dependency discovery pass.
+
+RCCL runtime loading uses the exact `RCCL_LIBRARY` selected by CMake, without a
+second runtime search. Select the compatible library explicitly when configuring
+a local build. Container builders and Release images install the same source-
+built RCCL at the same stable path; moving a checkout must not change the DSO.
 
 ```bash
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
@@ -444,7 +449,17 @@ The registered pre-commit hook builds only `v2_unit_gate` and
 `ProductionParityPreflight` label on every branch. It runs no model campaigns,
 E2E, broader integration selections, or benchmarks. Register the tracked hooks
 with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
-Those heavier certifications remain separate manual/CI workflows.
+The full shippable-image gate is `scripts/ci/run_production_pipeline.py`:
+independent AVX512 and AVX2 full CPU/CUDA/ROCm Docker builds, each running the
+canonical Unit/preflight/model-parity driver and all E2E-tagged cells. Both full
+E2E server suites must pass before either ISA's benchmarks run. Only complete
+per-image evidence may attach a certificate; official publication requires
+both images. Explicit one-off diagnostic benchmarks cannot certify images.
+Official CI commits both compact ISA result JSONs and one combined upward-only
+high-water proposal; local
+runs never commit or publish implicitly. See `docs/production-ci.md`. Do not
+add a second benchmark topology/model list or reintroduce this pipeline into
+pre-commit.
 
 Naming conventions:
 
@@ -479,9 +494,12 @@ For model parity, use `.agents/model-parity-testing/SKILL.md`, then read
 production campaigns. The aggregate campaign system replaces the historical
 hand-picked PyTorch parity baseline: it keeps reference generation, live-path
 execution, every checkpoint comparison, CSV evidence, and the shared economy
-target in one registered matrix. Each non-list run first builds and runs the
-complete CMake-owned `V2_Unit_*` suite, then executes the model-free
-`ProductionParityPreflight` integration label. Device-free regressions join the
+target in one registered matrix. Before model admission, a build must pass the
+complete CMake-owned `V2_Unit_*` suite and the model-free
+`ProductionParityPreflight` integration label. Unchanged local diagnostic runs
+reuse their canonical receipt across cells; refresh it after a build or test
+inventory change, not for every cell. The driver validates receipt freshness
+and completeness. Device-free regressions join the
 Unit phase automatically; add a focused Integration regression to preflight
 when a parity defect establishes a reusable backend lifecycle, graph,
 stream/event, collective, or movement invariant. Local reports and result

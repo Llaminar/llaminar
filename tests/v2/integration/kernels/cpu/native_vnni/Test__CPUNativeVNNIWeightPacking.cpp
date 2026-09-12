@@ -6,7 +6,11 @@
  * production packer therefore parallelizes direct source-codebook decoding into
  * its permanent VNNI byte stream.  These tests independently reconstruct that
  * stream from the public IINT8Unpackable contract and require exact equality for
- * every Expanded-INT8 codebook.  The complete 21-format catalog additionally
+ * every Expanded-INT8 codebook. Single-scale integer grids use the native
+ * prepared payload and exact FP16 metadata, not the older lossy INT8 export.
+ * Multi-scale sources retain every native payload/metadata bit and are checked
+ * against independently addressed whole-row GPU preparation. The complete
+ * 21-format catalog additionally
  * proves that every physical encoding is deterministic across OpenMP team sizes.
  *
  * The geometry deliberately combines a nonzero tensor-parallel row slice, a
@@ -26,6 +30,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -155,9 +161,100 @@ namespace llaminar2::cpu::native_vnni::test
         }
 
         /**
+         * @brief Independent scalar decode of one exact single-scale IQ grid.
+         *
+         * The source's native preparation contract is also consumed by the GPU.
+         * Read it with whole-row addressing (not the packer's bounded tile),
+         * then expand one value at a time without calling decode_native_block.
+         * This checks both the optimized decoder and its windowed destination
+         * addressing, while leaving the source's FP16 scale/minimum untouched.
+         *
+         * @param source Quantized source implementation.
+         * @param packed Destination geometry and source codebook identity.
+         * @param source_row Original source row, including the TP slice offset.
+         * @param kb Logical 32-value block within that row.
+         * @param values Output signed grid values, before scale or minimum.
+         * @param scale Output original FP16 scale bits.
+         * @param minimum Output original FP16 minimum bits.
+         * @return Whether this source belongs to the lossless single-scale grid family.
+         */
+        bool decodeSingleScaleGridOracle(
+            const IINT8Unpackable &source,
+            const CPUNativeVNNIPackedWeights &packed,
+            int source_row,
+            int kb,
+            std::array<int8_t, 32> &values,
+            uint16_t &scale,
+            uint16_t &minimum)
+        {
+            const uint8_t codebook = packed.codebook_id;
+            if (codebook != 11 && codebook != 12 &&
+                codebook != 15 && codebook != 16)
+                return false;
+
+            // Full-row storage deliberately has no destination origin override.
+            // Only one block is populated, at its absolute source K index.
+            std::vector<uint8_t> payload(packed.blocks_per_row * packed.payload_bytes);
+            std::vector<uint16_t> scales(packed.blocks_per_row);
+            std::vector<uint16_t> minima(packed.blocks_per_row);
+            const VnniPackContext context{
+                .raw_bytes = nullptr,
+                .N = 1,
+                .K = packed.K,
+                .blocks_per_row = packed.blocks_per_row,
+                .payload_bytes = packed.payload_bytes,
+                .payload_array = payload.data(),
+                .scales_array = scales.data(),
+                .mins_array = minima.data(),
+                .emins_array = nullptr,
+            };
+            source.packVnniBlock(context, source_row, 0, kb);
+            const uint8_t *const block = payload.data() + kb * packed.payload_bytes;
+            scale = scales[kb];
+            minimum = minima[kb];
+
+            for (int element = 0; element < 32; ++element)
+            {
+                if (codebook == 11 || codebook == 12)
+                {
+                    const int grid_index = block[element / 4] |
+                        (codebook == 11
+                             ? ((block[8] >> (element / 4)) & 1) * 256
+                             : 0);
+                    const uint32_t grid = codebook == 11
+                        ? iq3s_grid[grid_index] : iq3xxs_grid[grid_index];
+                    const int magnitude = (grid >> (8 * (element % 4))) & 255;
+                    const int sign_byte = (codebook == 11 ? 9 : 8) + element / 8;
+                    values[element] = static_cast<int8_t>(
+                        (block[sign_byte] & (1 << (element % 8)))
+                            ? -magnitude : magnitude);
+                }
+                else if (codebook == 15)
+                {
+                    const uint64_t grid = iq2xxs_grid[block[element / 8]];
+                    const int magnitude = (grid >> (8 * (element % 8))) & 255;
+                    values[element] = static_cast<int8_t>(
+                        (block[4 + element / 8] & (1 << (element % 8)))
+                            ? -magnitude : magnitude);
+                }
+                else
+                {
+                    const unsigned high = block[4] | (unsigned(block[5]) << 8);
+                    const unsigned grid_index = block[element / 8] |
+                        (((high >> (3 * (element / 8))) & 7) << 8);
+                    const uint8_t bits = static_cast<uint8_t>(
+                        iq1s_grid[grid_index] >> (8 * (element % 8)));
+                    values[element] = std::bit_cast<int8_t>(bits);
+                }
+            }
+            return true;
+        }
+
+        /**
          * @brief Reconstruct final Expanded-INT8 bytes without using the packer.
          *
-         * Each source block is decoded through the scalar public interface.
+         * Each source block is decoded through the scalar public interface,
+         * except exact IQ grids whose native integer/metadata contract is used.
          * This intentionally avoids both the optimized superblock decoder and
          * `packExpandedInt8Direct`, so the test does not share the implementation
          * whose byte layout it certifies.
@@ -211,9 +308,20 @@ namespace llaminar2::cpu::native_vnni::test
                     {
                         const size_t source_row = static_cast<size_t>(
                             row_start + chunk * 64 + column);
-                        int8_t values[32]{};
-                        unpackable->unpack_block_to_int8(
-                            source_row, static_cast<size_t>(kb), values);
+                        std::array<int8_t, 32> values{};
+                        uint16_t scale = 0;
+                        uint16_t minimum = 0;
+                        if (!decodeSingleScaleGridOracle(
+                                *unpackable, packed, static_cast<int>(source_row),
+                                kb, values, scale, minimum))
+                        {
+                            unpackable->unpack_block_to_int8(
+                                source_row, static_cast<size_t>(kb), values.data());
+                            scale = fp32_to_fp16(unpackable->get_block_scale(
+                                source_row, static_cast<size_t>(kb)));
+                            minimum = fp32_to_fp16(unpackable->get_block_min(
+                                source_row, static_cast<size_t>(kb)));
+                        }
 
                         for (int group = 0; group < 8; ++group)
                         {
@@ -221,7 +329,7 @@ namespace llaminar2::cpu::native_vnni::test
                             const int lane = column % 16;
                             std::memcpy(
                                 block + group * 256 + zmm * 64 + lane * 4,
-                                values + group * 4,
+                                values.data() + group * 4,
                                 4);
                         }
 
@@ -229,15 +337,9 @@ namespace llaminar2::cpu::native_vnni::test
                         for (int value = 0; value < 32; ++value)
                             sum += values[value];
                         compensation[column] = static_cast<int16_t>(sum);
-                        scales[column] = fp32_to_fp16(
-                            unpackable->get_block_scale(
-                                source_row, static_cast<size_t>(kb)));
+                        scales[column] = scale;
                         if (mins != nullptr)
-                        {
-                            mins[column] = fp32_to_fp16(
-                                unpackable->get_block_min(
-                                    source_row, static_cast<size_t>(kb)));
-                        }
+                            mins[column] = minimum;
                     }
                 }
             }
@@ -273,6 +375,7 @@ namespace llaminar2::cpu::native_vnni::test
 
         ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
         size_t expanded_formats = 0;
+        size_t compact_formats = 0;
 
         for (const NativeVnniSourceFormat &format :
              native_vnni_formats::kAllSourceFormats)
@@ -311,6 +414,44 @@ namespace llaminar2::cpu::native_vnni::test
                 std::string(format.quant_type) +
                     " differs between one and four workers");
 
+            if (serial.usesCompactMultiScale())
+            {
+                ++compact_formats;
+                const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(source.get());
+                ASSERT_NE(unpackable, nullptr);
+                const int blocks = serial.blocks_per_row;
+                const int bytes = format.metadata->payload_bytes;
+                std::vector<uint8_t> oracle(serial.native_interleaved.size(), 0);
+                std::vector<uint8_t> payload(blocks * bytes);
+                std::vector<uint16_t> scales(blocks), secondary(blocks);
+                std::vector<uint32_t> minima(blocks);
+                // The oracle packs whole source rows. It does not reuse the
+                // production CPU packer's one-block destination window.
+                const VnniPackContext context{
+                    .raw_bytes = nullptr, .N = 1, .K = kK,
+                    .blocks_per_row = blocks, .payload_bytes = bytes,
+                    .payload_array = payload.data(), .scales_array = scales.data(),
+                    .mins_array = secondary.data(), .emins_array = minima.data(),
+                };
+                for (int column = 0; column < serial.N; ++column)
+                {
+                    for (int kb = 0; kb < blocks; ++kb)
+                        unpackable->packVnniBlock(context, column + kRowStart, 0, kb);
+                    for (int kb = 0; kb < blocks; ++kb)
+                    {
+                        auto *unit = oracle.data() + ((column / 64) * blocks + kb) * 1536;
+                        const int local = column % 64;
+                        for (int byte = 0; byte < bytes; ++byte)
+                            unit[(byte / 4) * 256 + local * 4 + byte % 4] = payload[kb * bytes + byte];
+                        std::memcpy(unit + 1024 + local * 2, &scales[kb], 2);
+                        std::memcpy(unit + 1152 + local * 2, &secondary[kb], 2);
+                        if (format.metadata->has_emins)
+                            std::memcpy(unit + 1280 + local * 4, &minima[kb], 4);
+                    }
+                }
+                EXPECT_EQ(std::memcmp(serial.native_interleaved.data(), oracle.data(), oracle.size()), 0)
+                    << "native payload/metadata or padded columns differ from whole-row preparation";
+            }
             if (!serial.usesExpandedInt8())
                 continue;
             ++expanded_formats;
@@ -327,10 +468,12 @@ namespace llaminar2::cpu::native_vnni::test
                 << " direct packing differs from the scalar block oracle";
         }
 
-        // Six source formats use native nibble/Q6 encodings today.  This count
+        // Eleven source formats retain native nibble/Q6/multi-scale payloads.
+        // This count
         // makes a future encoding-policy change update the independent oracle
         // deliberately rather than silently shrinking its coverage.
-        EXPECT_EQ(expanded_formats, 15u);
+        EXPECT_EQ(expanded_formats, 10u);
+        EXPECT_EQ(compact_formats, 5u);
     }
     namespace
     {

@@ -4818,15 +4818,14 @@ namespace llaminar2
                     ? request_sequence_lengths_device
                     : nullptr;
             /*
-             * GPU attention has one production source: the post-append,
-             * device-owned KV cache. This is true for prefill, continuation
+             * Cache-backed attention has one source: the post-append native
+             * KV cache, on CPU and GPU. This is true for prefill, continuation
              * prefill, serial decode, and grouped verifier rows. Selecting the
              * transient projection buffer for one phase changes both precision
              * and RoPE timing, breaking batch invariance. Backends missing a
              * native or converted grouped cache view fail at that contract
              * boundary; there is no projection-buffer fallback.
              */
-            attn_params.read_kv_from_cache = kv_cache && device.is_gpu();
             attn_params.position_offset = position_ids ? position_ids[0] : 0;
             attn_params.mpi_ctx = mpi_ctx_.get();
             attn_params.q_buffer_id = buffers.idFor(BufferId::Q_PROJ);

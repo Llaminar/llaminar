@@ -1,6 +1,11 @@
 /**
  * @file RoPEPrimitives.cpp
- * @brief Vectorized RoPE implementation (ported from V1)
+ * @brief Native CPU rotary embeddings with absolute-position angle ownership.
+ *
+ * Prefill, prefix-restored suffixes and grouped/ordinary decode use the same
+ * position-times-frequency equation. Angle caches memoize that pure function;
+ * they never advance a history-dependent recurrence. Native SIMD rotations and
+ * quantized storage remain unchanged, so chunking cannot change arithmetic.
  * @author David Sanftenberg
  */
 
@@ -339,93 +344,119 @@ namespace llaminar2::primitives
     }
 
     /**
-     * @brief Apply RoPE to tensor with angle recurrence (prefill optimization)
+     * @brief Fill position-owned angles once, shared by all heads in each row.
+     * @param inv_freq Immutable inverse frequencies for the rotary geometry.
+     * @param first_position Absolute position of row zero, never a recurrence seed.
+     * @param rows Number of contiguous angle rows in the caller's storage.
+     * @param cos_table Caller-owned cosine plane, rows times frequency count.
+     * @param sin_table Matching caller-owned sine plane.
      *
-     * Uses pre-computed sin/cos tables generated via recurrence to avoid
-     * expensive trigonometric calls in the hot loop.
+     * The multiplication rounds to FP32 before libm evaluates either function.
+     * Every row is independent: restarting a prefill or rolling back MTP cannot
+     * change its value. Trigonometry is outside the per-head rotation loop.
      */
-    static void apply_rope_to_tensor_recurrence(
-        float *tensor,
-        int seq_len, int num_heads, int head_dim,
-        int n_past,
-        const std::vector<float> &inv_freq)
+    static void fill_absolute_rope_angles(
+        const std::vector<float> &inv_freq, int first_position, int rows,
+        float *cos_table, float *sin_table)
     {
-        const int half_dim = head_dim / 2;
-
-        // 1. Pre-compute sin/cos tables for the whole sequence using recurrence
-        // This avoids computing sin/cos for every head and every token repeatedly
-        std::vector<float> cos_table(seq_len * half_dim);
-        std::vector<float> sin_table(seq_len * half_dim);
-
-        // Compute deltas (rotation per position step)
-        std::vector<float> cos_delta(half_dim);
-        std::vector<float> sin_delta(half_dim);
-        for (int i = 0; i < half_dim; ++i)
+        const auto compute_row = [&](int row)
         {
-            cos_delta[i] = std::cos(inv_freq[i]);
-            sin_delta[i] = std::sin(inv_freq[i]);
-        }
-
-        // Initialize first position (n_past)
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float ang = n_past * inv_freq[i];
-            cos_table[i] = std::cos(ang);
-            sin_table[i] = std::sin(ang);
-        }
-
-        // Recurrence for t > 0
-        // This is serial but extremely fast (vectorizable by compiler)
-        for (int t = 1; t < seq_len; ++t)
-        {
-            int prev_offset = (t - 1) * half_dim;
-            int curr_offset = t * half_dim;
-
-            for (int i = 0; i < half_dim; ++i)
+            for (size_t index = 0; index < inv_freq.size(); ++index)
             {
-                float c = cos_table[prev_offset + i];
-                float s = sin_table[prev_offset + i];
-                float cd = cos_delta[i];
-                float sd = sin_delta[i];
-
-                cos_table[curr_offset + i] = c * cd - s * sd;
-                sin_table[curr_offset + i] = s * cd + c * sd;
-            }
-        }
-
-        // 2. Apply rotation in parallel using cached tables
-        auto do_rope_work = [&]()
-        {
-#pragma omp for collapse(2) schedule(static)
-            for (int t = 0; t < seq_len; ++t)
-            {
-                for (int h = 0; h < num_heads; ++h)
-                {
-                    float *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                    const float *cos_ptr = cos_table.data() + t * half_dim;
-                    const float *sin_ptr = sin_table.data() + t * half_dim;
-
-#if defined(__AVX512F__)
-                    apply_rope_to_head_cached_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
-#elif defined(__AVX2__)
-                    apply_rope_to_head_cached_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
-#else
-                    // Fallback scalar implementation
-                    for (int i = 0; i < half_dim; ++i)
-                    {
-                        float x_first = head_ptr[i];
-                        float x_second = head_ptr[i + half_dim];
-                        float cos_val = cos_ptr[i];
-                        float sin_val = sin_ptr[i];
-
-                        head_ptr[i] = x_first * cos_val - x_second * sin_val;
-                        head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
-                    }
-#endif
-                }
+                const float angle = static_cast<float>(first_position + row) * inv_freq[index];
+                const size_t offset = static_cast<size_t>(row) * inv_freq.size() + index;
+                cos_table[offset] = std::cos(angle);
+                sin_table[offset] = std::sin(angle);
             }
         };
-        OMP_WORKSHARE_REGION(do_rope_work);
+        auto compute = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int row = 0; row < rows; ++row)
+                compute_row(row);
+        };
+        // A new team shares this caller's storage. In an existing outer team,
+        // each caller owns a PRIVATE table: every caller must fill its complete
+        // copy before the differently partitioned head workshare consumes it.
+        if (rows > 1 && !omp_in_parallel())
+        {
+            OMP_WORKSHARE_REGION(compute);
+        }
+        else
+        {
+            for (int row = 0; row < rows; ++row) compute_row(row);
+        }
+    }
+
+    /**
+     * @brief Share angle preparation and one head workshare across Q and K.
+     * @param q Native query rows, modified in place.
+     * @param k Optional native key rows, modified in place.
+     * @param rows Number of live contiguous positions.
+     * @param q_heads Query heads in each row.
+     * @param k_heads Key heads in each row; ignored when k is null.
+     * @param head_dim Complete physical head width.
+     * @param first_position Absolute start of the input rows.
+     * @param inv_freq Immutable inverse frequencies for these heads.
+     * @param rotate Native single-head SIMD operation, preserving storage bytes.
+     *
+     * Q and K have identical angle geometry even under GQA. Preparing separate
+     * planes doubled trigonometry, allocation and team-launch costs. Each worker
+     * still owns disjoint output heads, and no head reduction order changes.
+     */
+    template <typename Native, typename Rotate>
+    static void apply_rope_pair_positions(
+        Native *q, Native *k, int rows, int q_heads, int k_heads, int head_dim,
+        int first_position, const std::vector<float> &inv_freq, Rotate rotate)
+    {
+        const int half_dim = head_dim / 2;
+        const int heads = q_heads + (k ? k_heads : 0);
+        std::vector<float> cos_table(static_cast<size_t>(rows) * half_dim);
+        std::vector<float> sin_table(cos_table.size());
+        fill_absolute_rope_angles(inv_freq, first_position, rows, cos_table.data(), sin_table.data());
+        auto work = [&]()
+        {
+#pragma omp for collapse(2) schedule(static)
+            for (int row = 0; row < rows; ++row)
+                for (int head = 0; head < heads; ++head)
+                {
+                    Native *data = head < q_heads
+                        ? q + (static_cast<size_t>(row) * q_heads + head) * head_dim
+                        : k + (static_cast<size_t>(row) * k_heads + head - q_heads) * head_dim;
+                    rotate(data, cos_table.data() + row * half_dim, sin_table.data() + row * half_dim);
+                }
+        };
+        OMP_WORKSHARE_REGION(work);
+    }
+
+    /** @brief Rotate FP32 heads using shared absolute-position angle rows. */
+    static void apply_rope_to_tensor_positions(
+        float *q, float *k,
+        int seq_len, int q_heads, int k_heads, int head_dim,
+        int n_past, const std::vector<float> &inv_freq)
+    {
+        const auto rotate = [head_dim](float *head_ptr, const float *cos_ptr, const float *sin_ptr)
+        {
+            const int half_dim = head_dim / 2;
+#if defined(__AVX512F__)
+            apply_rope_to_head_cached_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX2__)
+            apply_rope_to_head_cached_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+#else
+            // Scalar builds preserve the same fixed rotation arithmetic.
+            for (int i = 0; i < half_dim; ++i)
+            {
+                float x_first = head_ptr[i];
+                float x_second = head_ptr[i + half_dim];
+                float cos_val = cos_ptr[i];
+                float sin_val = sin_ptr[i];
+
+                head_ptr[i] = x_first * cos_val - x_second * sin_val;
+                head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
+            }
+#endif
+        };
+        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
     }
 
     void update_rope_cache(
@@ -444,43 +475,13 @@ namespace llaminar2::primitives
         const auto &inv_freq = get_inv_freq_cached(head_dim, freq_base);
         const int half_dim = head_dim / 2;
 
-        // Initialize or reset if position jumped
-        if (state.last_pos == -1 || target_pos < state.last_pos)
+        // Memoization only: forward jumps and backwards restores obey the same
+        // equation. No cached execution history is needed for correctness.
+        if (state.last_pos != target_pos)
         {
             state.cos_curr.resize(half_dim);
             state.sin_curr.resize(half_dim);
-            state.cos_delta.resize(half_dim);
-            state.sin_delta.resize(half_dim);
-
-            for (int i = 0; i < half_dim; ++i)
-            {
-                const float delta = inv_freq[i];
-                state.cos_delta[i] = std::cos(delta);
-                state.sin_delta[i] = std::sin(delta);
-
-                const float ang = target_pos * inv_freq[i];
-                state.cos_curr[i] = std::cos(ang);
-                state.sin_curr[i] = std::sin(ang);
-            }
-            state.last_pos = target_pos;
-        }
-        // Advance via complex recurrence
-        else if (target_pos > state.last_pos)
-        {
-            int steps = target_pos - state.last_pos;
-            for (int step = 0; step < steps; ++step)
-            {
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float c = state.cos_curr[i];
-                    float s = state.sin_curr[i];
-                    float cd = state.cos_delta[i];
-                    float sd = state.sin_delta[i];
-
-                    state.cos_curr[i] = c * cd - s * sd;
-                    state.sin_curr[i] = s * cd + c * sd;
-                }
-            }
+            fill_absolute_rope_angles(inv_freq, target_pos, 1, state.cos_curr.data(), state.sin_curr.data());
             state.last_pos = target_pos;
         }
     }
@@ -554,12 +555,8 @@ namespace llaminar2::primitives
         }
         else
         {
-            // Prefill or no persistent state: use angle recurrence
-            apply_rope_to_tensor_recurrence(q, seq_len, q_heads, head_dim, n_past, inv_freq);
-            if (k)
-            {
-                apply_rope_to_tensor_recurrence(k, seq_len, k_heads, head_dim, n_past, inv_freq);
-            }
+            // Prefill uses the same position-owned angles as ordinary decode.
+            apply_rope_to_tensor_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq);
         }
     }
 
@@ -667,40 +664,11 @@ namespace llaminar2::primitives
         const auto &inv_freq = get_inv_freq_cached(rotary_dim, freq_base);
         const int half_rotary = rotary_dim / 2;
 
-        // Pre-compute sin/cos tables using angle recurrence
+        // Partial rotation shares the same absolute-position angle authority.
         std::vector<float> cos_table(seq_len * half_rotary);
         std::vector<float> sin_table(seq_len * half_rotary);
 
-        // Compute deltas (rotation per position step)
-        std::vector<float> cos_delta(half_rotary);
-        std::vector<float> sin_delta(half_rotary);
-        for (int i = 0; i < half_rotary; ++i)
-        {
-            cos_delta[i] = std::cos(inv_freq[i]);
-            sin_delta[i] = std::sin(inv_freq[i]);
-        }
-
-        // Initialize first position (n_past)
-        for (int i = 0; i < half_rotary; ++i)
-        {
-            float ang = n_past * inv_freq[i];
-            cos_table[i] = std::cos(ang);
-            sin_table[i] = std::sin(ang);
-        }
-
-        // Recurrence for t > 0
-        for (int t = 1; t < seq_len; ++t)
-        {
-            int prev = (t - 1) * half_rotary;
-            int curr = t * half_rotary;
-            for (int i = 0; i < half_rotary; ++i)
-            {
-                float c = cos_table[prev + i], s = sin_table[prev + i];
-                float cd = cos_delta[i], sd = sin_delta[i];
-                cos_table[curr + i] = c * cd - s * sd;
-                sin_table[curr + i] = s * cd + c * sd;
-            }
-        }
+        fill_absolute_rope_angles(inv_freq, n_past, seq_len, cos_table.data(), sin_table.data());
 
         // Apply rotation (head_dim for stride, rotary_dim for loop)
         auto do_partial_rope = [&]()
@@ -742,8 +710,8 @@ namespace llaminar2::primitives
         /**
          * @brief Reusable native angle storage for a tiny verifier row group.
          *
-         * MTP uses at most four rows, but allocating several vectors per layer
-         * still pollutes the CPU hot path. Thread-local storage keeps ownership
+         * Allocating several vectors per layer pollutes the CPU hot path at
+         * every supported verifier depth. Thread-local storage keeps ownership
          * compatible with the executor's nested OpenMP model while retaining
          * capacity across every layer and decode iteration.
          */
@@ -762,10 +730,9 @@ namespace llaminar2::primitives
         /**
          * @brief Materialize exactly the angle values produced by serial decode.
          *
-         * Full RoPE advances the caller's persistent recurrence once per valid
-         * row, including non-contiguous jumps. Partial RoPE has no persistent
-         * decode state and computes each absolute-position angle directly, just
-         * like the production M=1 partial primitive. The resulting table can be
+         * Full and partial RoPE compute each absolute-position angle directly,
+         * including non-contiguous jumps. The full-head owner may memoize a row
+         * but never contributes numerical history. The resulting table can be
          * consumed by one grouped row/head workshare without changing math.
          */
         VerifierAngleRows &prepare_verifier_angle_rows(
@@ -1247,89 +1214,37 @@ namespace llaminar2::primitives
         apply_rope_to_head_bf16_scalar(head_ptr, position, inv_freq, head_dim, processed);
     }
 
-    static void apply_rope_to_tensor_bf16_recurrence(
-        uint16_t *tensor,
-        int seq_len, int num_heads, int head_dim,
-        int n_past,
-        const std::vector<float> &inv_freq)
+    /** @brief Rotate BF16 heads using shared absolute-position angle rows. */
+    static void apply_rope_to_tensor_bf16_positions(
+        uint16_t *q, uint16_t *k,
+        int seq_len, int q_heads, int k_heads, int head_dim,
+        int n_past, const std::vector<float> &inv_freq)
     {
-        const int half_dim = head_dim / 2;
-
-        // 1. Pre-compute sin/cos tables for the whole sequence using recurrence
-        std::vector<float> cos_table(seq_len * half_dim);
-        std::vector<float> sin_table(seq_len * half_dim);
-
-        // Compute deltas
-        std::vector<float> cos_delta(half_dim);
-        std::vector<float> sin_delta(half_dim);
-        for (int i = 0; i < half_dim; ++i)
+        const auto rotate = [head_dim](uint16_t *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
-            cos_delta[i] = std::cos(inv_freq[i]);
-            sin_delta[i] = std::sin(inv_freq[i]);
-        }
-
-        // Initialize first position
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float ang = n_past * inv_freq[i];
-            cos_table[i] = std::cos(ang);
-            sin_table[i] = std::sin(ang);
-        }
-
-        // Recurrence
-        for (int t = 1; t < seq_len; ++t)
-        {
-            int prev_offset = (t - 1) * half_dim;
-            int curr_offset = t * half_dim;
-
+            const int half_dim = head_dim / 2;
+#if defined(__AVX512F__)
+            apply_rope_to_head_cached_bf16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX2__)
+            apply_rope_to_head_cached_bf16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+#else
+            // Scalar builds preserve the same fixed rotation arithmetic.
             for (int i = 0; i < half_dim; ++i)
             {
-                float c = cos_table[prev_offset + i];
-                float s = sin_table[prev_offset + i];
-                float cd = cos_delta[i];
-                float sd = sin_delta[i];
+                float x_first = simd::bf16_to_fp32(head_ptr[i]);
+                float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
+                float cos_val = cos_ptr[i];
+                float sin_val = sin_ptr[i];
 
-                cos_table[curr_offset + i] = c * cd - s * sd;
-                sin_table[curr_offset + i] = s * cd + c * sd;
+                float n1 = x_first * cos_val - x_second * sin_val;
+                float n2 = x_first * sin_val + x_second * cos_val;
+
+                head_ptr[i] = simd::fp32_to_bf16(n1);
+                head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
             }
-        }
-
-        // 2. Apply rotation in parallel using cached tables
-        auto do_rope_bf16_work = [&]()
-        {
-#pragma omp for collapse(2) schedule(static)
-            for (int t = 0; t < seq_len; ++t)
-            {
-                for (int h = 0; h < num_heads; ++h)
-                {
-                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                    const float *cos_ptr = cos_table.data() + t * half_dim;
-                    const float *sin_ptr = sin_table.data() + t * half_dim;
-
-#if defined(__AVX512F__)
-                    apply_rope_to_head_cached_bf16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
-#elif defined(__AVX2__)
-                    apply_rope_to_head_cached_bf16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
-#else
-                    // Fallback scalar implementation
-                    for (int i = 0; i < half_dim; ++i)
-                    {
-                        float x_first = simd::bf16_to_fp32(head_ptr[i]);
-                        float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
-                        float cos_val = cos_ptr[i];
-                        float sin_val = sin_ptr[i];
-
-                        float n1 = x_first * cos_val - x_second * sin_val;
-                        float n2 = x_first * sin_val + x_second * cos_val;
-
-                        head_ptr[i] = simd::fp32_to_bf16(n1);
-                        head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
-                    }
 #endif
-                }
-            }
         };
-        OMP_WORKSHARE_REGION(do_rope_bf16_work);
+        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
     }
 
     static void apply_rope_bf16_from_cache(
@@ -1426,7 +1341,7 @@ namespace llaminar2::primitives
             return;
         }
 
-        // Use direct computation for short sequences to avoid recurrence overhead
+        // Short sequences avoid allocating a shared table.
         if (seq_len < 32)
         {
             apply_rope_to_tensor_bf16_direct(q_bf16, seq_len, q_heads, head_dim, n_past, inv_freq);
@@ -1434,9 +1349,8 @@ namespace llaminar2::primitives
         }
         else
         {
-            // Use recurrence optimization for longer sequences
-            apply_rope_to_tensor_bf16_recurrence(q_bf16, seq_len, q_heads, head_dim, n_past, inv_freq);
-            apply_rope_to_tensor_bf16_recurrence(k_bf16, seq_len, k_heads, head_dim, n_past, inv_freq);
+            // Share each absolute-position angle across the head workshare.
+            apply_rope_to_tensor_bf16_positions(q_bf16, k_bf16, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq);
         }
     }
 
@@ -1843,89 +1757,37 @@ namespace llaminar2::primitives
         apply_rope_to_head_fp16_scalar(head_ptr, position, inv_freq, head_dim, processed);
     }
 
-    static void apply_rope_to_tensor_fp16_recurrence(
-        uint16_t *tensor,
-        int seq_len, int num_heads, int head_dim,
-        int n_past,
-        const std::vector<float> &inv_freq)
+    /** @brief Rotate FP16 heads using shared absolute-position angle rows. */
+    static void apply_rope_to_tensor_fp16_positions(
+        uint16_t *q, uint16_t *k,
+        int seq_len, int q_heads, int k_heads, int head_dim,
+        int n_past, const std::vector<float> &inv_freq)
     {
-        const int half_dim = head_dim / 2;
-
-        // 1. Pre-compute sin/cos tables for the whole sequence using recurrence
-        std::vector<float> cos_table(seq_len * half_dim);
-        std::vector<float> sin_table(seq_len * half_dim);
-
-        // Compute deltas
-        std::vector<float> cos_delta(half_dim);
-        std::vector<float> sin_delta(half_dim);
-        for (int i = 0; i < half_dim; ++i)
+        const auto rotate = [head_dim](uint16_t *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
-            cos_delta[i] = std::cos(inv_freq[i]);
-            sin_delta[i] = std::sin(inv_freq[i]);
-        }
-
-        // Initialize first position
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float ang = n_past * inv_freq[i];
-            cos_table[i] = std::cos(ang);
-            sin_table[i] = std::sin(ang);
-        }
-
-        // Recurrence
-        for (int t = 1; t < seq_len; ++t)
-        {
-            int prev_offset = (t - 1) * half_dim;
-            int curr_offset = t * half_dim;
-
+            const int half_dim = head_dim / 2;
+#if defined(__AVX512F__)
+            apply_rope_to_head_cached_fp16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX2__)
+            apply_rope_to_head_cached_fp16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
+#else
+            // Scalar builds preserve the same fixed rotation arithmetic.
             for (int i = 0; i < half_dim; ++i)
             {
-                float c = cos_table[prev_offset + i];
-                float s = sin_table[prev_offset + i];
-                float cd = cos_delta[i];
-                float sd = sin_delta[i];
+                float x_first = simd::fp16_to_fp32(head_ptr[i]);
+                float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
+                float cos_val = cos_ptr[i];
+                float sin_val = sin_ptr[i];
 
-                cos_table[curr_offset + i] = c * cd - s * sd;
-                sin_table[curr_offset + i] = s * cd + c * sd;
+                float n1 = x_first * cos_val - x_second * sin_val;
+                float n2 = x_first * sin_val + x_second * cos_val;
+
+                head_ptr[i] = simd::fp32_to_fp16(n1);
+                head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
             }
-        }
-
-        // 2. Apply rotation in parallel using cached tables
-        auto do_rope_fp16_work = [&]()
-        {
-#pragma omp for collapse(2) schedule(static)
-            for (int t = 0; t < seq_len; ++t)
-            {
-                for (int h = 0; h < num_heads; ++h)
-                {
-                    uint16_t *head_ptr = tensor + (t * num_heads + h) * head_dim;
-                    const float *cos_ptr = cos_table.data() + t * half_dim;
-                    const float *sin_ptr = sin_table.data() + t * half_dim;
-
-#if defined(__AVX512F__)
-                    apply_rope_to_head_cached_fp16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
-#elif defined(__AVX2__)
-                    apply_rope_to_head_cached_fp16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
-#else
-                    // Fallback scalar implementation
-                    for (int i = 0; i < half_dim; ++i)
-                    {
-                        float x_first = simd::fp16_to_fp32(head_ptr[i]);
-                        float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
-                        float cos_val = cos_ptr[i];
-                        float sin_val = sin_ptr[i];
-
-                        float n1 = x_first * cos_val - x_second * sin_val;
-                        float n2 = x_first * sin_val + x_second * cos_val;
-
-                        head_ptr[i] = simd::fp32_to_fp16(n1);
-                        head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
-                    }
 #endif
-                }
-            }
         };
-        OMP_WORKSHARE_REGION(do_rope_fp16_work);
+        apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
     }
 
     static void apply_rope_fp16_from_cache(
@@ -2022,7 +1884,7 @@ namespace llaminar2::primitives
             return;
         }
 
-        // Use direct computation for short sequences to avoid recurrence overhead
+        // Short sequences avoid allocating a shared table.
         if (seq_len < 32)
         {
             apply_rope_to_tensor_fp16_direct(q_fp16, seq_len, q_heads, head_dim, n_past, inv_freq);
@@ -2030,9 +1892,8 @@ namespace llaminar2::primitives
         }
         else
         {
-            // Use recurrence optimization for longer sequences
-            apply_rope_to_tensor_fp16_recurrence(q_fp16, seq_len, q_heads, head_dim, n_past, inv_freq);
-            apply_rope_to_tensor_fp16_recurrence(k_fp16, seq_len, k_heads, head_dim, n_past, inv_freq);
+            // Share each absolute-position angle across the head workshare.
+            apply_rope_to_tensor_fp16_positions(q_fp16, k_fp16, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq);
         }
     }
 
@@ -2726,7 +2587,8 @@ namespace llaminar2::primitives
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        RoPEPersistentState *persistent_state)
+        RoPEPersistentState *persistent_state,
+        int pos_offset)
     {
         if (head_dim % 32 != 0)
         {
@@ -2759,10 +2621,10 @@ namespace llaminar2::primitives
         // Optimization for single-token decode with persistent state
         if (seq_len == 1 && persistent_state)
         {
-            int pos = position_ids ? position_ids[0] : 0;
+            int pos = position_ids ? position_ids[0] : pos_offset;
             if (pos >= 0)
             {
-                // Update persistent state (uses recurrence)
+                // Memoize this absolute position, independent of earlier calls.
                 update_rope_cache(head_dim, rope_theta, pos, *persistent_state);
 
                 // Convert cached floats to Q15 integers
@@ -2778,105 +2640,33 @@ namespace llaminar2::primitives
         }
         else
         {
-            // Check for contiguous positions
-            bool contiguous = true;
-            int start_pos = 0;
-            if (position_ids)
+            // Native Q15 angles derive from absolute positions just like FP32.
+            // Contiguity never selects another numerical scheme.
+            const auto compute_row = [&](int row)
             {
-                start_pos = position_ids[0];
-                if (seq_len > 1)
+                const int position = position_ids ? position_ids[row] : pos_offset + row;
+                for (int index = 0; index < half_dim; ++index)
                 {
-                    for (int i = 1; i < seq_len; ++i)
-                    {
-                        if (position_ids[i] != start_pos + i)
-                        {
-                            contiguous = false;
-                            break;
-                        }
-                    }
+                    const float angle = static_cast<float>(position) * inv_freq[index];
+                    const size_t offset = static_cast<size_t>(row) * half_dim + index;
+                    cos_table[offset] = static_cast<int16_t>(std::cos(angle) * 32767.0f);
+                    sin_table[offset] = static_cast<int16_t>(std::sin(angle) * 32767.0f);
                 }
+            };
+            auto compute_angles = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int row = 0; row < seq_len; ++row) compute_row(row);
+            };
+            // The retained Q15 table is thread-local, so an outer team must
+            // populate each private table rather than split one across owners.
+            if (seq_len > 1 && !omp_in_parallel())
+            {
+                OMP_WORKSHARE_REGION(compute_angles);
             }
             else
             {
-                start_pos = 0;
-            }
-
-            // Generate tables
-            if (contiguous && seq_len > 1)
-            {
-                // Use recurrence for sequential positions
-                std::vector<float> cos_delta(half_dim);
-                std::vector<float> sin_delta(half_dim);
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    cos_delta[i] = std::cos(inv_freq[i]);
-                    sin_delta[i] = std::sin(inv_freq[i]);
-                }
-
-                // Init first row
-                std::vector<float> curr_cos(half_dim);
-                std::vector<float> curr_sin(half_dim);
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float ang = start_pos * inv_freq[i];
-                    curr_cos[i] = std::cos(ang);
-                    curr_sin[i] = std::sin(ang);
-
-                    cos_table[i] = (int16_t)(curr_cos[i] * 32767.0f);
-                    sin_table[i] = (int16_t)(curr_sin[i] * 32767.0f);
-                }
-
-                // Recurrence
-                for (int t = 1; t < seq_len; ++t)
-                {
-                    int offset = t * half_dim;
-                    for (int i = 0; i < half_dim; ++i)
-                    {
-                        float c = curr_cos[i];
-                        float s = curr_sin[i];
-                        float cd = cos_delta[i];
-                        float sd = sin_delta[i];
-
-                        float nc = c * cd - s * sd;
-                        float ns = s * cd + c * sd;
-
-                        curr_cos[i] = nc;
-                        curr_sin[i] = ns;
-
-                        cos_table[offset + i] = (int16_t)(nc * 32767.0f);
-                        sin_table[offset + i] = (int16_t)(ns * 32767.0f);
-                    }
-                }
-            }
-            else
-            {
-                // Parallel compute for non-contiguous or single token (without persistent state)
-                auto do_cos_sin_compute = [&]()
-                {
-#pragma omp for
-                    for (int t = 0; t < seq_len; ++t)
-                    {
-                        int pos = position_ids ? position_ids[t] : t;
-                        int offset = t * half_dim;
-                        for (int i = 0; i < half_dim; ++i)
-                        {
-                            float ang = pos * inv_freq[i];
-                            float c = std::cos(ang);
-                            float s = std::sin(ang);
-
-                            cos_table[offset + i] = (int16_t)(c * 32767.0f);
-                            sin_table[offset + i] = (int16_t)(s * 32767.0f);
-                        }
-                    }
-                };
-                if (seq_len > 1)
-                {
-                    OMP_WORKSHARE_REGION(do_cos_sin_compute);
-                }
-                else
-                {
-                    do_cos_sin_compute();
-                }
+                for (int row = 0; row < seq_len; ++row) compute_row(row);
             }
         }
 
@@ -5059,7 +4849,8 @@ namespace llaminar2::primitives
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        RoPEPersistentState *persistent_state)
+        RoPEPersistentState *persistent_state,
+        int pos_offset)
     {
         constexpr int BLOCK_SIZE = static_cast<int>(BlockType::BLOCK_SIZE);
 
@@ -5089,7 +4880,7 @@ namespace llaminar2::primitives
 
         for (int t = 0; t < seq_len; ++t)
         {
-            int pos = position_ids ? position_ids[t] : t;
+            int pos = position_ids ? position_ids[t] : pos_offset + t;
             if (pos < 0)
                 continue;
 
@@ -5111,7 +4902,7 @@ namespace llaminar2::primitives
             {
                 for (int h = 0; h < n_heads; ++h)
                 {
-                    int pos = position_ids ? position_ids[t] : t;
+                    int pos = position_ids ? position_ids[t] : pos_offset + t;
                     if (pos < 0)
                         continue;
 
@@ -5130,7 +4921,7 @@ namespace llaminar2::primitives
                 {
                     for (int h = 0; h < n_kv_heads; ++h)
                     {
-                        int pos = position_ids ? position_ids[t] : t;
+                        int pos = position_ids ? position_ids[t] : pos_offset + t;
                         if (pos < 0)
                             continue;
 
@@ -5147,9 +4938,9 @@ namespace llaminar2::primitives
     }
 
     // Explicit template instantiations for high-level wrapper
-    template void apply_rope_q16_integer<Q16_1Block>(Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, RoPEPersistentState *);
-    template void apply_rope_q16_integer<Q16_1Block_64>(Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, RoPEPersistentState *);
-    template void apply_rope_q16_integer<Q16_1Block_128>(Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, RoPEPersistentState *);
+    template void apply_rope_q16_integer<Q16_1Block>(Q16_1Block *, Q16_1Block *, const int *, int, int, int, int, float, RoPEPersistentState *, int);
+    template void apply_rope_q16_integer<Q16_1Block_64>(Q16_1Block_64 *, Q16_1Block_64 *, const int *, int, int, int, int, float, RoPEPersistentState *, int);
+    template void apply_rope_q16_integer<Q16_1Block_128>(Q16_1Block_128 *, Q16_1Block_128 *, const int *, int, int, int, int, float, RoPEPersistentState *, int);
 
     /**
      * @brief Runtime dispatch for Q16 RoPE based on Q16BlockSize enum

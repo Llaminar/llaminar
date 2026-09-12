@@ -1,6 +1,11 @@
 /**
  * @file MoEOverlaySparseCollective.h
  * @brief Compact sparse payload transport for graph-native MoE overlay collectives.
+ *
+ * Graph-owned packet views retain exact residency epochs, live counts and
+ * arithmetic layouts across rank-local, shared-memory and MPI transports.
+ * A canonical return is a collection of raw expert rows, never a partial sum;
+ * only the final continuation reducer may apply original router ordering.
  */
 
 #pragma once
@@ -8,6 +13,7 @@
 #include "backends/DeviceId.h"
 #include "DecodeExpertHistogram.h"
 #include "MoEOverlayActivationPayloadLayout.h"
+#include "MoEOverlayReturnLayout.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -26,9 +32,18 @@ namespace llaminar2
     class IBackend;
     class IDeviceContext;
     class IMPIContext;
+    class TensorBase;
     class MappedHostTransferRegion;
     class MappedHostTransferArena;
     struct MoEOverlayCanonicalRouteTicketControl;
+    struct DeviceMoEOverlayEpochTicket;
+
+    /** @brief Sole owner of the placement epoch in a dispatch publication. */
+    enum class MoEOverlayDispatchEpochAuthority : uint8_t
+    {
+        HostAdmission, ///< CPU/host-scheduled transaction admits an immutable snapshot.
+        CapturedRequest, ///< GPU request ticket selected the epoch before any layer ran.
+    };
 
     /**
      * @brief Fixed ABI header for one captured heterogeneous MoE dispatch.
@@ -37,9 +52,9 @@ namespace llaminar2
      * identity established when the model graph is built.  Live publication
      * fields are @ref logical_row_count, the exact @ref residency_epoch used by
      * that replay, and @ref return_logical_row_count.  The current segmented
-     * producer copies the logical count first and the host admission boundary
-     * fills the epoch before any sparse packet is emitted.  The device-local
-     * continuation path copies both values from its captured epoch ticket.
+     * producer copies the logical count and, for device-admitted execution,
+     * the epoch from its captured request ticket. Only an explicitly host-
+     * admitted transaction fills the epoch at the host admission boundary.
      * Consumers may inspect the record only after the producer's exact event;
      * they never infer an epoch by consulting a newer global publication.
      */
@@ -134,6 +149,17 @@ namespace llaminar2
 
         /**
          * @brief Bind the ticket's complete fixed-capacity capture identity.
+         * @param layer_idx Model layer owning this publication.
+         * @param bucket_rows Captured physical row capacity.
+         * @param top_k Maximum routed experts per row.
+         * @param d_model Width of each activation row.
+         * @param source_device Exact CPU or GPU publisher.
+         * @param workspace_generation Positive immutable workspace identity.
+         * @param mapped_arena Model-owned mapped storage for a GPU publisher.
+         * @param captured_request_epoch Borrowed GPU request ticket owned by
+         *        the model's runtime table. When present, its address is frozen
+         *        and its live epoch is published before the ticket release edge;
+         *        it must outlive every graph using this storage.
          * @throws std::invalid_argument for invalid geometry.
          * @throws std::logic_error when an existing ticket is rebound.
          * @throws std::runtime_error when mapped arena allocation fails.
@@ -145,7 +171,16 @@ namespace llaminar2
             int d_model,
             DeviceId source_device,
             uint64_t workspace_generation,
-            std::shared_ptr<MappedHostTransferArena> mapped_arena = nullptr);
+            std::shared_ptr<MappedHostTransferArena> mapped_arena = nullptr,
+            const DeviceMoEOverlayEpochTicket *captured_request_epoch = nullptr);
+
+        /** @return Immutable epoch authority selected with this capture identity. */
+        [[nodiscard]] MoEOverlayDispatchEpochAuthority epochAuthority() const noexcept
+        {
+            return captured_request_epoch_
+                ? MoEOverlayDispatchEpochAuthority::CapturedRequest
+                : MoEOverlayDispatchEpochAuthority::HostAdmission;
+        }
 
         bool isBound() const noexcept { return allocation_ != nullptr; }
         const DeviceId &sourceDevice() const noexcept { return source_device_; }
@@ -216,6 +251,8 @@ namespace llaminar2
         bool hasCapturedPublicationContract() const noexcept;
 
     private:
+        /** Borrowed from the model-owned runtime table; it outlives every captured replay. */
+        const DeviceMoEOverlayEpochTicket *captured_request_epoch_ = nullptr;
         void release() noexcept;
 
         void *allocation_ = nullptr;
@@ -614,6 +651,14 @@ namespace llaminar2
         }
     };
 
+    /**
+     * @brief Borrowed live return payload with an explicit arithmetic contract.
+     *
+     * Canonical expert routes preserve the router's original slot through
+     * movement and transport. They must be gathered, then weighted/reduced in
+     * router order; summing participant partials changes FP32 parenthesization
+     * whenever an expert changes owner. Capacity is storage, never wire length.
+     */
     struct MoEOverlayReturnRows
     {
         MoEOverlayCollectiveKey key;
@@ -622,6 +667,7 @@ namespace llaminar2
         int32_t source_participant = -1;
         int32_t target_participant = -1;
         int32_t d_model = 0;
+        MoEOverlayReturnLayout layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
         size_t live_row_count = 0;
         size_t row_capacity = 0;
 
@@ -711,6 +757,7 @@ namespace llaminar2
             DeviceId device = DeviceId::invalid(); ///< Host/device placement identity.
             StorageReusePolicy reuse_policy =
                 StorageReusePolicy::DistinctLayerTier; ///< Array aliasing contract.
+            MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
         };
 
         /** @brief Construct a growable workspace for isolated fixtures and builders. */
@@ -781,7 +828,8 @@ namespace llaminar2
         struct ReturnStorage
         {
             std::vector<int32_t> row_ids_host;
-            std::vector<float> output_rows_fp32;
+            /** Bulk payload uses the canonical tensor/physical-memory authority. */
+            std::shared_ptr<TensorBase> output_rows_fp32;
         };
 
         struct LayerTierBuffers
@@ -804,6 +852,7 @@ namespace llaminar2
         StorageReusePolicy reuse_policy_ =
             StorageReusePolicy::DistinctLayerTier;
         bool fixed_capacity_ = false;
+        MoEOverlayReturnLayout return_layout_ = MoEOverlayReturnLayout::ParticipantTokenPartials;
         uint64_t generation_id_ = 0;
         uint64_t step_id_ = 0;
         std::map<std::pair<int, int>, LayerTierBuffers> buffers_by_layer_tier_;

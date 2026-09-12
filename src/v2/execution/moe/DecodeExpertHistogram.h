@@ -1,17 +1,20 @@
 /**
  * @file DecodeExpertHistogram.h
- * @brief Per-layer decode expert utilization tracker with sliding window
+ * @brief Per-layer routing demand with one RCU generation and physical owner.
  *
  * Tracks expert activation patterns during MoE decode for socket-aware
  * dynamic rebalancing. Designed for zero allocation on the hot path
- * after initialization.
+ * after initialization. Transaction-enabled banks retain complete route batches
+ * together with their marginals; only retired banks may be copied or reset.
  */
 
 #pragma once
 
 #include "../../backends/DeviceId.h"
+#include "ExpertHistogramSource.h"
 #include "MoELayeredExpertOwnership.h"
 #include "MoEOptimizationStatus.h"
+#include "MoEOverlayTransactionDemand.h"
 #include "RuntimeExpertHistogramDrain.h"
 #include <array>
 #include <atomic>
@@ -19,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -29,7 +33,23 @@ namespace llaminar2
 {
 
     class ValidatedDecodeExpertHistogramWindowView;
+    class PhysicalMemoryAuthority;
+    class DecodeExpertTransactionWindow;
 
+    /**
+     * @brief Admitted transaction payload, required by transaction-cost consumers.
+     *
+     * Counter-only diagnostic consumers do not request this storage. A consumer
+     * claiming transaction economics must require it explicitly; absent evidence
+     * is never permission to substitute marginal-window cost estimates.
+     */
+    struct ExpertHistogramTransactionConfig
+    {
+        moe_overlay_economy::TransactionDemandCapacity capacity;
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+    };
+
+    /** @brief Immutable histogram geometry, ownership and optional demand payload. */
     struct DecodeExpertHistogramConfig
     {
         int num_layers = 0;
@@ -43,27 +63,9 @@ namespace llaminar2
         /// Complete per-layer expert ownership used by load diagnostics.
         /// Updated atomically at accepted Dynamic publication boundaries.
         MoELayeredExpertOwnership ownership;
+        /** Complete transaction banks; their maximum row target bounds adaptation. */
+        std::optional<ExpertHistogramTransactionConfig> transaction_demand;
     };
-
-    /**
-     * @brief Semantic inference phase that produced routed-expert demand.
-     *
-     * The three production values are retained independently because one
-     * expert activation has a different service cost in serial decode,
-     * bucketed prefill, and grouped MTP verification. `SyntheticTest` is an
-     * ingestion-only alias for decode demand; it lets device-free fixtures use
-     * the historical merge API without creating a fourth production phase.
-     */
-    enum class ExpertHistogramSource
-    {
-        DecodeToken,
-        PrefillChunk,
-        GroupedVerifier,
-        SyntheticTest,
-    };
-
-    /// Number of separately retained production inference phases.
-    inline constexpr std::size_t kExpertHistogramProductionSourceCount = 3;
 
     /** @brief Typed availability mask in decode/prefill/MTP-routed order. */
     using ExpertHistogramProductionSourceMask =
@@ -92,24 +94,6 @@ namespace llaminar2
         /** Runtime policy may select either serial decode or positive-depth MTP. */
         AdaptiveSerialOrMTP,
     };
-
-    /** @return Dense retained-phase index, or the source-count sentinel. */
-    [[nodiscard]] constexpr std::size_t expertHistogramProductionSourceIndex(
-        ExpertHistogramSource source) noexcept
-    {
-        switch (source)
-        {
-        case ExpertHistogramSource::DecodeToken:
-            return 0;
-        case ExpertHistogramSource::PrefillChunk:
-            return 1;
-        case ExpertHistogramSource::GroupedVerifier:
-            return 2;
-        case ExpertHistogramSource::SyntheticTest:
-            break;
-        }
-        return kExpertHistogramProductionSourceCount;
-    }
 
     /** @return Whether at least one typed production source is reachable. */
     [[nodiscard]] constexpr bool validExpertHistogramProductionSourceMask(
@@ -412,6 +396,8 @@ namespace llaminar2
          * sum; validation rejects a divergent distributed or restored window.
          */
         std::vector<uint64_t> source_expert_counts;
+        /** Observed batches authenticated against these exact counts/generation. */
+        std::shared_ptr<const DecodeExpertTransactionWindow> transaction_demand;
 
         /** @brief Read one frozen layer/expert count, rejecting invalid geometry. */
         [[nodiscard]] uint64_t activationCount(
@@ -457,6 +443,79 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable, PMA-owned batches independent of recycled mutable banks.
+     *
+     * Copies of a frozen histogram share this evidence without copying payload.
+     * The last reader releases the physical claim after its arrays are destroyed.
+     * A derived/rounded forecast is not interchangeable with observed evidence.
+     */
+    class DecodeExpertTransactionWindow final
+    {
+    public:
+        /** @brief Retire payload before releasing its physical allocation claim. */
+        ~DecodeExpertTransactionWindow();
+        DecodeExpertTransactionWindow(const DecodeExpertTransactionWindow &) = delete;
+        DecodeExpertTransactionWindow &operator=(const DecodeExpertTransactionWindow &) = delete;
+
+        /** @return Read-only batch descriptors for a checked layer coordinate. */
+        [[nodiscard]] std::span<const moe_overlay_economy::TransactionDemandRecord>
+        layerTransactions(int layer) const;
+        /** @return One complete compact batch; rejects invalid layer/batch indices. */
+        [[nodiscard]] moe_overlay_economy::TransactionRoutes routes(
+            int layer, std::size_t transaction) const;
+        /** @return Exact retained payload bytes carried by the physical ledger. */
+        [[nodiscard]] std::size_t allocationBytes() const noexcept;
+        /** @return Whether mutable window fields still name this observed sample. */
+        [[nodiscard]] bool matches(const DecodeExpertHistogramWindow &window) const noexcept;
+        /**
+         * @brief Typed worst-case snapshot BOM, not a physical admission decision.
+         * @throws std::invalid_argument or std::overflow_error for invalid geometry.
+         */
+        [[nodiscard]] static std::size_t maximumAllocationBytes(
+            moe_overlay_economy::TransactionDemandCapacity capacity,
+            int num_layers, int num_experts);
+        /** @return Model routing width, including for a completely empty sample. */
+        [[nodiscard]] std::uint32_t topK() const noexcept;
+        /** @return The routed layer that advances this sample's logical token count. */
+        [[nodiscard]] int tokenBoundaryLayer() const noexcept;
+        /** @return Compact wire bytes for this sample; unused capacity is not sent. */
+        [[nodiscard]] std::size_t wireBytes() const;
+        /** @return Maximum packet payload used for setup-owned receive admission. */
+        [[nodiscard]] static std::size_t maximumWireBytes(
+            moe_overlay_economy::TransactionDemandCapacity capacity,
+            int num_layers, int num_experts);
+        /** @brief Encode complete batches into exact-size caller-owned packet storage. */
+        void encodeWire(std::span<std::uint8_t> destination) const;
+        /**
+         * @brief Decode a bounded packet and publish only fully authenticated evidence.
+         * @param config Local physical admission and model-owned routing capacity.
+         * @param window Exact observed phase counts and generation supplied by the envelope.
+         * @param packet Compact transaction payload, without capacity padding.
+         * @return An immutable physical owner independent of receive-buffer reuse.
+         * @throws On malformed geometry, missing admission, or conflicting route/count evidence.
+         */
+        [[nodiscard]] static std::shared_ptr<const DecodeExpertTransactionWindow> decodeWire(
+            const ExpertHistogramTransactionConfig &config,
+            const DecodeExpertHistogramWindow &window,
+            std::span<const std::uint8_t> packet);
+
+    private:
+        friend class DecodeExpertHistogram;
+        /**
+         * @brief Authenticate and copy retired batches before their bank is reused.
+         * @throws On incomplete evidence, mismatched counts or denied PMA admission.
+         */
+        DecodeExpertTransactionWindow(
+            const ExpertHistogramTransactionConfig &config,
+            std::span<const moe_overlay_economy::TransactionDemandBank> layers,
+            const DecodeExpertHistogramWindow &window, int token_boundary_layer);
+        struct Data;
+        /** @brief Seal a decoder-owned payload after its common authentication step. */
+        explicit DecodeExpertTransactionWindow(std::unique_ptr<Data> data);
+        std::unique_ptr<Data> data_;
+    };
+
+    /**
      * @brief Borrowed, already-authenticated read view of one frozen window.
      *
      * Construction is private and available only through
@@ -479,6 +538,15 @@ namespace llaminar2
 
         /** @return Immutable routed-token count. */
         [[nodiscard]] std::uint64_t tokenCount() const noexcept;
+
+        /**
+         * @return Authenticated invocation boundaries and their actual routed rows.
+         * @throws std::logic_error if this is a counts-only prediction/window.
+         *
+         * Service economics requires co-occurrence, which marginal counts cannot
+         * reconstruct. The immutable window must outlive this borrowed reference.
+         */
+        [[nodiscard]] const DecodeExpertTransactionWindow &transactionDemand() const;
 
         /**
          * @brief Read one aggregate layer/expert count in constant time.
@@ -508,11 +576,13 @@ namespace llaminar2
         const DecodeExpertHistogramWindow *window_;
     };
 
+    /** @brief Production routing ingress and sole mutable histogram-bank lifecycle. */
     class DecodeExpertHistogram
     {
     public:
         static constexpr int MAX_TOP_K = 16;
 
+        /** @brief Validate geometry and materialize two admitted, stable banks. */
         explicit DecodeExpertHistogram(DecodeExpertHistogramConfig config);
 
         // ── Hot path (allocation-free) ────────────────────
@@ -757,6 +827,9 @@ namespace llaminar2
         /** Live adaptive capacity; `config_` remains immutable setup identity. */
         std::atomic<int> active_window_size_;
 
+        struct LayerTransactionData;
+
+        /** @brief Participant-local counts and optional exclusively published batches. */
         struct LayerData
         {
             /// Aggregate atomic counters for lock-free hot path [num_experts].
@@ -770,12 +843,18 @@ namespace llaminar2
             mutable std::mutex weight_mutex;
             std::vector<float> weighted_sums;                         // [num_experts]
             std::vector<std::array<uint64_t, MAX_TOP_K>> slot_counts; // [num_experts][MAX_TOP_K]
+            std::unique_ptr<LayerTransactionData> transaction_demand;
 
-            explicit LayerData(int num_experts);
+            /** @brief Materialize stable counters and any admitted transaction arrays. */
+            LayerData(int num_experts, const std::optional<ExpertHistogramTransactionConfig> &transactions);
+            /** @brief Destroy payload before its PMA claim. */
+            ~LayerData();
+            /** @brief Move only during setup, never during publication/capture. */
             LayerData(LayerData &&other) noexcept;
             LayerData &operator=(LayerData &&) = delete;
             LayerData(const LayerData &) = delete;
             LayerData &operator=(const LayerData &) = delete;
+            /** @brief Reset a retired generation; no writer/reader may retain a pin. */
             void reset();
         };
 
@@ -790,7 +869,9 @@ namespace llaminar2
             std::atomic<uint64_t> active_users{0};
             uint64_t generation = 0;
 
-            HistogramBank(int num_layers, int num_experts);
+            /** @brief Build every layer before this bank becomes publishable. */
+            explicit HistogramBank(const DecodeExpertHistogramConfig &config);
+            /** @brief Recycle data only after the parent RCU retirement edge. */
             void reset();
         };
 

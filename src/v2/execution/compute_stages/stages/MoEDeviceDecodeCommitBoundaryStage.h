@@ -4,7 +4,8 @@
  *
  * HIP does not provide CUDA-style conditional graph nodes.  Homogeneous ROCm
  * ExpertOverlay therefore lets the host observe a compact authenticated ticket
- * only at conservatively scheduled boundaries.  Ordinary serial decode still
+ * only at conservatively scheduled boundaries. Ordinary decode and explicitly
+ * committed scalar MTP conditions both own new serial rows. Serial decode still
  * owns its cadence value on device: this stage appends the publish/acknowledge
  * pair to the complete main decode graph so a non-due token never requires a
  * second graph launch, event fence, host callback, or host mirror.
@@ -30,7 +31,7 @@ namespace llaminar2
     class DeviceWorkspaceManager;
 
     /**
-     * @brief Publish one completed serial decode round inside the main HIP graph.
+     * @brief Publish one serial round inside ordinary or committed-MTP HIP graphs.
      *
      * The first backend kernel advances the device-resident cadence exactly
      * once unless grouped MTP already published the same edge.  The second

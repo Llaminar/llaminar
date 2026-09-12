@@ -4,12 +4,14 @@
  *
  * The root stage performs deterministic descriptor filtering into stable
  * participant workspaces before one direct MPI send.  The return stage decodes
- * one envelope and accumulates participants in the same ascending-id order used
- * by the previous scalar protocol, preserving its floating-point addition
- * order while removing repeated network transactions.
+ * one envelope under its graph-bound arithmetic contract. Canonical CPU
+ * returns gather raw expert records, leaving all arithmetic to the existing
+ * final router-order reducer. Transport completion/participant order must not
+ * choose FP32 parenthesization after experts change owner.
  */
 
 #include "MoERankBatchSparseStages.h"
+#include "../../moe/MoEOverlayCanonicalHostReturn.h"
 
 #include "../../../collective/ITPContext.h"
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
@@ -769,6 +771,15 @@ namespace llaminar2
 
     bool MoERankBatchReturnReduceStage::scatterReceivedRows()
     {
+        const bool canonical_gather =
+            params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes;
+        if (!isValidMoEOverlayReturnLayout(params_.return_layout) ||
+            (canonical_gather && (params_.ticket_storage || params_.broadcast_after_scatter ||
+                                  params_.publish_ticket_completion)))
+        {
+            LOG_ERROR("[MoERankBatchReturnReduceStage] Canonical gathering requires its own final ordered reducer");
+            return false;
+        }
         MoEOverlayDispatchTicket *ticket = nullptr;
         if (params_.ticket_storage)
         {
@@ -791,9 +802,11 @@ namespace llaminar2
                 return false;
             }
             const auto &shape = params_.dense_output->shape();
-            if (shape.size() != 2 ||
+            if ((!canonical_gather && (shape.size() != 2 ||
                 shape[0] < static_cast<size_t>(params_.seq_len) ||
-                shape[1] != static_cast<size_t>(params_.d_model))
+                shape[1] != static_cast<size_t>(params_.d_model))) ||
+                (canonical_gather && canonical_moe_route_record::recordCapacity(
+                    params_.dense_output->numel(), params_.d_model) == 0))
             {
                 LOG_ERROR("[MoERankBatchReturnReduceStage] Dense continuation output geometry is invalid");
                 return false;
@@ -804,7 +817,7 @@ namespace llaminar2
             ticket ? ticket->header->logical_row_count : params_.seq_len;
         float *dense = ticket ? ticket->return_rows_fp32
                               : params_.dense_output->mutable_data();
-        if (params_.clear_output_before_scatter)
+        if (params_.clear_output_before_scatter && !canonical_gather)
         {
             std::fill_n(
                 dense,
@@ -824,7 +837,8 @@ namespace llaminar2
         /*
          * `inbound_views_` is constructed from the transport's ascending
          * participant list.  Never consume in device completion order: this
-         * loop is the numerical-order contract retained by rank batching.
+         * loop is transport order only for canonical rows: the final reducer
+         * reconstructs router order independently of participant placement.
          */
         for (size_t participant_index = 0;
              participant_index < inbound_views_.size();
@@ -836,6 +850,7 @@ namespace llaminar2
             if (rows.source_participant != expected_participant ||
                 rows.target_participant != params_.continuation_participant ||
                 rows.d_model != params_.d_model ||
+                rows.layout != params_.return_layout ||
                 rows.live_row_count > rows.row_capacity ||
                 !rows.row_ids_host || !rows.output_rows_fp32 ||
                 (rows.live_row_count != 0 && rows.residency_epoch == 0) ||
@@ -846,6 +861,19 @@ namespace llaminar2
                 return false;
             }
 
+            if (canonical_gather)
+            {
+                if (!gatherMoEOverlayCanonicalHostReturn(
+                        rows, {dense, params_.dense_output->numel()},
+                        params_.clear_output_before_scatter && participant_index == 0
+                            ? MoEOverlayCanonicalGatherBoundary::Begin
+                            : MoEOverlayCanonicalGatherBoundary::Append))
+                {
+                    LOG_ERROR("[MoERankBatchReturnReduceStage] Invalid canonical return publication");
+                    return false;
+                }
+                continue;
+            }
             for (size_t compact_row = 0;
                  compact_row < rows.live_row_count;
                  ++compact_row)

@@ -3,6 +3,11 @@
  * @brief Unit tests for ChatTemplate class
  * @author David Sanftenberg
  * @date 2025
+ *
+ * Exercise the actual embedded templates without models or devices. Prefix
+ * tests distinguish an in-progress assistant continuation from older history:
+ * rendering the former must retain its generation header byte-for-byte so a
+ * previously captured recurrent-state checkpoint remains reusable.
  */
 
 #include <gtest/gtest.h>
@@ -675,6 +680,37 @@ TEST(Test__ChatTemplate, Qwen35CommunityTemplateHonorsNonThinkingControls)
     EXPECT_NE(marker_overrides_true.find("<think>\n\n</think>\n\n"), std::string::npos)
         << "<|think_off|> should override API thinking=true for deterministic E2E prompts: "
         << marker_overrides_true;
+}
+
+/** Preserve the complete non-thinking seed when extending the active assistant. */
+TEST(Test__ChatTemplate, Qwen35AssistantContinuationPreservesNonThinkingPrefix)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+    std::vector<ChatMessage> messages = {{"system", "Continue the story."}, {"user", "A map was found."}};
+    const auto seed = tmpl->apply(messages, true, false);
+    ASSERT_TRUE(seed.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    messages.push_back({"assistant", "The keeper unfolded the map."});
+    const auto continuation = tmpl->apply(messages, true, false);
+    EXPECT_TRUE(continuation.starts_with(seed + "The keeper unfolded the map."))
+        << "An empty reasoning block is still part of the encoded prompt: " << continuation;
+
+    // A later user query deliberately ends that active turn. Its historical
+    // reasoning stripping policy remains unchanged; this is a distinct prompt.
+    messages.push_back({"user", "Where did the map lead?"});
+    const auto later_query = tmpl->apply(messages, true, false);
+    EXPECT_NE(later_query.find("<|im_start|>assistant\nThe keeper unfolded the map.<|im_end|>"), std::string::npos);
+}
+
+/** Preserve actual reasoning for an active assistant, never invent reasoning text. */
+TEST(Test__ChatTemplate, Qwen35AssistantContinuationKeepsExistingReasoning)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    std::vector<ChatMessage> messages = {{"user", "A map was found."}};
+    const auto seed = tmpl->apply(messages, true, true);
+    messages.push_back({"assistant", "<think>\nCheck the compass.\n</think>\n\nThe keeper turned north."});
+    EXPECT_TRUE(tmpl->apply(messages, true, true).starts_with(
+        seed + "Check the compass.\n</think>\n\nThe keeper turned north."));
 }
 
 // ============================================================================

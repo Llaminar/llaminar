@@ -11,6 +11,7 @@
 #pragma once
 
 #include "../ModelParityDefinition.h"
+#include "../LongFormJournalPrompt.h"
 
 #include <utility>
 
@@ -19,7 +20,14 @@ namespace llaminar2::test::parity::qwen3
     /** Distribution threshold for production compressed-KV/reference parity. */
     inline constexpr float kQwen3CompressedKVKLThreshold = 0.15f;
 
-    /** @return Canonical Qwen3-0.6B Q8_0 model/reference identity. */
+    /**
+     * @return Canonical Qwen3-0.6B Q8_0 model/reference identity.
+     *
+     * Keep the generation assistant history terminal: another user turn makes
+     * this model's template remove its earlier non-thinking assistant header,
+     * changing the seed token prefix. The observer proves the actual complete
+     * prefix and output horizon independently of this source-owned prompt.
+     */
     inline ModelParityModelDefinition qwen3Q80ParityModel()
     {
         return ModelParityModelDefinition{
@@ -36,6 +44,8 @@ namespace llaminar2::test::parity::qwen3
             .transformer_layers = 28,
             .attention_heads = 16,
             .kv_heads = 8,
+            .prefix_state = ModelParityPrefixState::AttentionKV,
+            .generation_prompt = longFormRevisionGenerationPrompt(),
         };
     }
 

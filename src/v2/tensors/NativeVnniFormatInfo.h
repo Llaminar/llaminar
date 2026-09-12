@@ -35,6 +35,22 @@ namespace llaminar2
     inline constexpr std::uint8_t kNativeVnniExpandedInt8MinCodebook = 23;
 
     /**
+     * @brief Identify compact payloads whose two native scales must survive CPU preparation.
+     * @param codebook Canonical execution codebook, independent of source aliases.
+     * @return Whether the common compact multi-scale CPU representation applies.
+     *
+     * Q6_K has its own already-lossless bitplane representation. The remaining
+     * dual-scale formats retain their original payload, including IQ1_M signs;
+     * Q2_K additionally retains the packed pair of effective minima.
+     */
+    [[nodiscard]] inline constexpr bool hasCompactMultiScaleVnniPayload(
+        uint8_t codebook) noexcept
+    {
+        return codebook == 9 || codebook == 10 || codebook == 13 ||
+               codebook == 14 || codebook == 17;
+    }
+
+    /**
      * @brief Metadata descriptor for a native-VNNI quantization format
      *
      * Each native-VNNI format (≤6-bit) has fixed metadata that determines:
@@ -280,8 +296,9 @@ namespace llaminar2
     /**
      * @brief GPU execution representation that survives a CPU-tier round trip.
      *
-     * CPU NativeVNNI preserves nibble codebooks and the native Q6_K dual-scale
-     * encoding. Every other source is expanded to one signed byte per value;
+     * CPU NativeVNNI preserves nibble and multi-scale native payloads, including
+     * Q6_K bitplanes, Q2_K effective minima, and IQ1_M signed deltas. Single-scale
+     * sources expand to one signed byte per value without changing quantization;
      * asymmetric sources retain a separate FP16 minimum. Source provenance is
      * deliberately not part of this structure because the prepared engine
      * carries it independently for arithmetic-policy selection.
@@ -329,13 +346,14 @@ namespace llaminar2
                 .has_emins = false,
             };
         }
-        if (source.codebook_id == 8)
+        if (source.codebook_id == 8 ||
+            hasCompactMultiScaleVnniPayload(source.codebook_id))
         {
             return {
-                .codebook_id = 8,
-                .payload_bytes_per_block = 24,
+                .codebook_id = source.codebook_id,
+                .payload_bytes_per_block = static_cast<uint8_t>(source.payload_bytes),
                 .is_asymmetric = true,
-                .has_emins = false,
+                .has_emins = source.has_emins,
             };
         }
         return {
@@ -393,7 +411,9 @@ namespace llaminar2
         if (execution_codebook == 19)
             return !source.is_asymmetric;
         return execution_codebook == kNativeVnniExpandedInt8MinCodebook &&
-               source.is_asymmetric;
+               source.is_asymmetric &&
+               !hasCompactMultiScaleVnniPayload(source.codebook_id) &&
+               source.codebook_id != 8;
     }
 
     /**

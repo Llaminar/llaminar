@@ -98,23 +98,10 @@ resolve_driver_lib_dir() {
 }
 
 daemon_nvidia_device_nodes() {
-    docker run --rm \
-        --entrypoint /bin/sh \
-        -v /dev:/host-dev:ro \
-        "$probe_image" \
-        -lc '
-set -eu
-for path in \
-    /host-dev/nvidiactl \
-    /host-dev/nvidia-uvm \
-    /host-dev/nvidia-uvm-tools \
-    /host-dev/nvidia-modeset; do
-    [ -e "$path" ] && printf "/dev%s\n" "${path#/host-dev}"
-done
-for path in /host-dev/nvidia[0-9]* /host-dev/nvidia-caps/*; do
-    [ -e "$path" ] && printf "/dev%s\n" "${path#/host-dev}"
-done
-' 2>/dev/null | sort -u
+    # Device metadata must survive a short-lived container's attach race.
+    # The shared Python helper reads a completed artifact and owns cleanup.
+    python3 "$(dirname "${BASH_SOURCE[0]}")/docker_paths.py" \
+        --nvidia-device-nodes "$probe_image"
 }
 
 if docker_supports_nvidia_runtime; then
@@ -123,7 +110,13 @@ if docker_supports_nvidia_runtime; then
 fi
 
 driver_lib_dir="$(resolve_driver_lib_dir || true)"
-mapfile -t device_nodes < <(daemon_nvidia_device_nodes || true)
+# Process substitution hides a failed probe's exit status. Keep an empty
+# inventory distinct from an unsuccessful metadata transaction.
+device_inventory="$(daemon_nvidia_device_nodes)" || die "NVIDIA device metadata probe failed"
+device_nodes=()
+if [[ -n "$device_inventory" ]]; then
+    mapfile -t device_nodes <<< "$device_inventory"
+fi
 
 if [[ -z "$driver_lib_dir" || "${#device_nodes[@]}" -eq 0 ]]; then
     if [[ "$required" == "1" ]]; then

@@ -1,10 +1,15 @@
 /**
  * @file Test__DecodeExpertHistogram.cpp
- * @brief Unit tests for DecodeExpertHistogram
+ * @brief Device-free proofs of routing demand, bank retirement and physical ownership.
+ *
+ * Transaction tests exercise the actual histogram ingress and RCU rotation, not
+ * a parallel recorder. Counts and complete batches must survive as one immutable
+ * sample while inference continues into the next preallocated generation.
  */
 
 #include <gtest/gtest.h>
 #include "execution/moe/DecodeExpertHistogram.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -53,6 +58,304 @@ static DecodeExpertHistogramConfig makeConfig(
     cfg.ownership = makeOwnership(num_layers, num_sockets, owners);
 
     return cfg;
+}
+
+/** @return A CPU physical ledger admitting exactly the requested test payload. */
+static std::shared_ptr<PhysicalMemoryAuthority> transactionMemory(size_t bytes)
+{
+    PhysicalMemoryBOMBuilder bom({.world_rank = 0, .device = DeviceId::cpu(),
+                                  .total_bytes = bytes, .admission_available_bytes = bytes});
+    bom.add(PhysicalMemoryOwner::ExecutionWorkspace, bytes);
+    PhysicalMemoryPlanBuilder plan;
+    plan.add(bom.build());
+    return std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
+}
+
+/** @return Current physical payload claims, including still-retained snapshots. */
+static size_t transactionClaims(const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+{
+    return memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                                PhysicalMemoryMaterializationKind::NewAllocation);
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionSampleClosesCountsAtWholeBatchBoundary)
+{
+    auto cfg = makeConfig(1, 4, 2, 3);
+    const moe_overlay_economy::TransactionDemandCapacity capacity{3, 4, 2};
+    auto memory = transactionMemory(8192);
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{capacity, memory};
+    DecodeExpertHistogram hist(cfg);
+    const int rows[]{0, 1, 2, 3, 0, 3, 1, 2, -1, -1};
+    std::array<uint64_t, 4> scratch{};
+    const RoutedExpertHistogramMerge batch{.source = ExpertHistogramSource::PrefillChunk,
+        .layer_idx = 0, .real_token_count = 4, .bucket_token_count = 5,
+        .top_k = 2, .route_stride = 2, .count_window_tokens = true};
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(rows, batch, scratch));
+    const auto closed = hist.mergeRoutedExpertRows(rows, batch, scratch);
+    ASSERT_TRUE(closed);
+    EXPECT_EQ(closed.activations_merged, 0u);
+    EXPECT_EQ(closed.tokens_counted, 0u);
+    auto window = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(window.valid());
+    ASSERT_NE(window.transaction_demand, nullptr);
+    EXPECT_EQ(&window.validatedView().transactionDemand(), window.transaction_demand.get());
+    EXPECT_EQ(window.token_count, 4u);
+    EXPECT_EQ(window.expert_counts, (std::vector<uint64_t>{2, 2, 2, 2}));
+    const auto transactions = window.transaction_demand->layerTransactions(0);
+    ASSERT_EQ(transactions.size(), 1u);
+    EXPECT_EQ(transactions[0].phase, ExpertHistogramSource::PrefillChunk);
+    EXPECT_EQ(transactions[0].logical_rows, 4u);
+    const auto retained = window.transaction_demand->routes(0, 0);
+    EXPECT_EQ(retained.logical_rows, 4u);
+    EXPECT_EQ(retained.capacity_slots, 8u);
+    EXPECT_TRUE(std::equal(rows, rows + 8, retained.expert_ids));
+    // A rounded forecast cannot masquerade as this observed transaction sample.
+    ++window.expert_counts[0];
+    ++window.source_expert_counts[4];
+    EXPECT_FALSE(window.valid());
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionSnapshotsOutliveBankReuseAndHistogram)
+{
+    auto memory = transactionMemory(8192);
+    DecodeExpertHistogramWindow retained;
+    {
+        auto cfg = makeConfig(1, 4, 2, 2);
+        const moe_overlay_economy::TransactionDemandCapacity capacity{2, 2, 2};
+        cfg.transaction_demand = ExpertHistogramTransactionConfig{capacity, memory};
+        DecodeExpertHistogram hist(cfg);
+        const auto banks = 2 * capacity.allocationBytes();
+        EXPECT_EQ(transactionClaims(memory), banks);
+        std::array<uint64_t, 4> scratch{};
+        int ids[]{0, 1};
+        const RoutedExpertHistogramMerge row{.source = ExpertHistogramSource::DecodeToken,
+            .layer_idx = 0, .real_token_count = 1, .bucket_token_count = 1,
+            .top_k = 2, .route_stride = 2, .count_window_tokens = true};
+        ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, row, scratch));
+        retained = hist.freezeAndRotateWindow();
+        ASSERT_NE(retained.transaction_demand, nullptr);
+        EXPECT_EQ(transactionClaims(memory), banks + retained.transaction_demand->allocationBytes());
+        ids[0] = 2;
+        ids[1] = 3;
+        for (int epoch = 0; epoch < 20; ++epoch)
+        {
+            ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, row, scratch));
+            auto next = hist.freezeAndRotateWindow();
+            EXPECT_TRUE(next.valid());
+            EXPECT_EQ(next.transaction_demand->routes(0, 0).expert_ids[0], 2);
+            EXPECT_EQ(retained.transaction_demand->routes(0, 0).expert_ids[0], 0);
+            EXPECT_TRUE(retained.valid());
+        }
+    }
+    EXPECT_EQ(transactionClaims(memory), retained.transaction_demand->allocationBytes());
+    EXPECT_TRUE(retained.valid());
+    retained = {};
+    EXPECT_EQ(transactionClaims(memory), 0u);
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionAdmissionRejectsPartialAndUnownedEvidence)
+{
+    auto cfg = makeConfig(1, 4, 2, 2);
+    const moe_overlay_economy::TransactionDemandCapacity capacity{2, 4, 2};
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{capacity, nullptr};
+    EXPECT_THROW(DecodeExpertHistogram{cfg}, std::invalid_argument);
+    auto insufficient = transactionMemory(capacity.allocationBytes());
+    cfg.transaction_demand->memory = insufficient;
+    EXPECT_THROW(DecodeExpertHistogram{cfg}, std::logic_error);
+    EXPECT_EQ(transactionClaims(insufficient), 0u);
+    cfg.transaction_demand->memory = transactionMemory(8192);
+    DecodeExpertHistogram hist(cfg);
+    EXPECT_THROW(hist.setWindowSize(3), std::invalid_argument);
+    EXPECT_EQ(hist.windowSize(), 2);
+    const uint64_t counts[]{1, 1, 0, 0};
+    EXPECT_THROW(hist.mergeLayerCounts(0, counts, 4, true), std::logic_error);
+    EXPECT_THROW(hist.recordTokenBoundary(0), std::logic_error);
+    int ids[]{0, 1, 2, -1};
+    std::array<uint64_t, 4> scratch{};
+    const RoutedExpertHistogramMerge batch{.source = ExpertHistogramSource::PrefillChunk,
+        .layer_idx = 0, .real_token_count = 2, .bucket_token_count = 2,
+        .top_k = 2, .route_stride = 2, .count_window_tokens = true};
+    EXPECT_FALSE(hist.mergeRoutedExpertRows(ids, batch, scratch));
+    const auto frozen = hist.freezeAndRotateWindow();
+    EXPECT_TRUE(frozen.valid());
+    EXPECT_EQ(frozen.token_count, 0u);
+    EXPECT_TRUE(frozen.transaction_demand->layerTransactions(0).empty());
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionPhaseAndAdaptiveBudgetUseCanonicalParentState)
+{
+    auto cfg = makeConfig(2, 4, 2, 1);
+    cfg.token_boundary_layer_idx = 0; // Retained auxiliary layers need not advance main-model tokens.
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{{4, 4, 2}, transactionMemory(8192)};
+    DecodeExpertHistogram hist(cfg);
+    const int ids[]{0, 1, 2, 3};
+    const float weights[]{0.5f, 0.5f};
+    hist.record(0, ids, weights, 2);
+    hist.record(0, ids, weights, 2); // Parent target is one: neither representation grows.
+    hist.setWindowSize(4);
+    std::array<uint64_t, 4> scratch{};
+    const RoutedExpertHistogramMerge grouped{.source = ExpertHistogramSource::GroupedVerifier,
+        .layer_idx = 0, .real_token_count = 2, .bucket_token_count = 2,
+        .top_k = 2, .route_stride = 2, .count_window_tokens = true};
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, grouped, scratch));
+    auto auxiliary = grouped;
+    auxiliary.layer_idx = 1;
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, auxiliary, scratch));
+    auto prefill = grouped;
+    prefill.real_token_count = 1;
+    prefill.source = ExpertHistogramSource::PrefillChunk;
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, prefill, scratch));
+    const auto frozen = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(frozen.valid());
+    EXPECT_EQ(frozen.token_count, 4u);
+    EXPECT_EQ(frozen.source_token_counts, (std::array<uint64_t, 3>{1, 1, 2}));
+    const auto batches = frozen.transaction_demand->layerTransactions(0);
+    ASSERT_EQ(batches.size(), 3u);
+    EXPECT_EQ(batches[0].phase, ExpertHistogramSource::DecodeToken);
+    EXPECT_EQ(batches[1].phase, ExpertHistogramSource::GroupedVerifier);
+    EXPECT_EQ(batches[1].logical_rows, 2u);
+    EXPECT_EQ(batches[2].phase, ExpertHistogramSource::PrefillChunk);
+    EXPECT_EQ(frozen.transaction_demand->layerTransactions(1).size(), 1u);
+    EXPECT_THROW((void)frozen.transaction_demand->routes(-1, 0), std::out_of_range);
+    EXPECT_THROW((void)frozen.transaction_demand->routes(0, 3), std::out_of_range);
+    EXPECT_THROW((void)frozen.transaction_demand->layerTransactions(2), std::out_of_range);
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionQuarantineUsesExistingAdmissionAndRotation)
+{
+    auto cfg = makeConfig(1, 4, 2, 4);
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{{4, 2, 2}, transactionMemory(8192)};
+    DecodeExpertHistogram hist(cfg);
+    int ids[]{0, 1};
+    std::array<uint64_t, 4> scratch{};
+    const RoutedExpertHistogramMerge row{.source = ExpertHistogramSource::DecodeToken,
+        .layer_idx = 0, .real_token_count = 1, .bucket_token_count = 1,
+        .top_k = 2, .route_stride = 2, .count_window_tokens = true};
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, row, scratch));
+    hist.beginOptimizationDemandRebase();
+    auto ignored = hist.mergeRoutedExpertRows(ids, row, scratch);
+    ASSERT_TRUE(ignored);
+    EXPECT_EQ(ignored.activations_merged, 0u);
+    const auto calibration = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(calibration.valid());
+    EXPECT_EQ(calibration.token_count, 1u);
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, row, scratch));
+    hist.activateOptimizationDemand();
+    ids[0] = 2;
+    ids[1] = 3;
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, row, scratch));
+    const auto optimization = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(optimization.valid());
+    EXPECT_EQ(optimization.token_count, 1u);
+    EXPECT_EQ(optimization.expert_counts, (std::vector<uint64_t>{0, 0, 1, 1}));
+    EXPECT_EQ(optimization.transaction_demand->routes(0, 0).expert_ids[0], 2);
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionConcurrentRotationRetainsEveryAdmittedBatch)
+{
+    auto cfg = makeConfig(1, 4, 2, 512);
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{{512, 2, 2}, transactionMemory(1u << 20)};
+    DecodeExpertHistogram hist(cfg);
+    std::atomic<bool> done{false};
+    uint64_t admitted = 0;
+    std::thread producer([&] {
+        const int ids[]{0, 1};
+        std::array<uint64_t, 4> scratch{};
+        const RoutedExpertHistogramMerge row{.source = ExpertHistogramSource::DecodeToken,
+            .layer_idx = 0, .real_token_count = 1, .bucket_token_count = 1,
+            .top_k = 2, .route_stride = 2, .count_window_tokens = true};
+        for (int token = 0; token < 4096; ++token)
+        {
+            auto result = hist.mergeRoutedExpertRows(ids, row, scratch);
+            EXPECT_TRUE(result);
+            admitted += result.tokens_counted;
+            if (token % 32 == 0) std::this_thread::yield();
+        }
+        done.store(true, std::memory_order_release);
+    });
+    uint64_t observed = 0;
+    do
+    {
+        const auto frozen = hist.freezeAndRotateWindow();
+        EXPECT_TRUE(frozen.valid());
+        EXPECT_EQ(frozen.transaction_demand->layerTransactions(0).size(), frozen.token_count);
+        observed += frozen.token_count;
+    } while (!done.load(std::memory_order_acquire));
+    producer.join();
+    const auto tail = hist.freezeAndRotateWindow();
+    EXPECT_TRUE(tail.valid());
+    observed += tail.token_count;
+    EXPECT_GT(admitted, 0u);
+    EXPECT_EQ(observed, admitted);
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionBOMCoversExactWorstCaseWithoutReserve)
+{
+    using namespace moe_overlay_economy;
+    const TransactionDemandCapacity capacity{3, 4, 2};
+    const auto snapshot_bytes = DecodeExpertTransactionWindow::maximumAllocationBytes(capacity, 1, 4);
+    const auto bank_bytes = 2 * capacity.allocationBytes();
+    auto memory = transactionMemory(bank_bytes + snapshot_bytes);
+    auto cfg = makeConfig(1, 4, 2, 3);
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{capacity, memory};
+    DecodeExpertHistogram hist(cfg);
+    int ids[]{0, 1, 2, 3, 0, 2, 1, 3};
+    float weights[]{0.5f, 0.5f};
+    hist.record(0, ids, weights, 2);
+    hist.record(0, ids, weights, 2);
+    std::array<uint64_t, 4> scratch{};
+    const RoutedExpertHistogramMerge batch{.source = ExpertHistogramSource::PrefillChunk,
+        .layer_idx = 0, .real_token_count = 4, .bucket_token_count = 4,
+        .top_k = 2, .route_stride = 2, .count_window_tokens = true};
+    ASSERT_TRUE(hist.mergeRoutedExpertRows(ids, batch, scratch));
+    EXPECT_EQ(transactionClaims(memory), bank_bytes);
+    const auto frozen = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(frozen.valid());
+    EXPECT_EQ(frozen.token_count, 6u);
+    EXPECT_EQ(frozen.transaction_demand->allocationBytes(), snapshot_bytes);
+    EXPECT_EQ(transactionClaims(memory), bank_bytes + snapshot_bytes);
+    EXPECT_THROW((void)DecodeExpertTransactionWindow::maximumAllocationBytes({}, 1, 4), std::invalid_argument);
+    EXPECT_THROW((void)DecodeExpertTransactionWindow::maximumAllocationBytes(capacity, 0, 4), std::invalid_argument);
+}
+
+TEST(Test__DecodeExpertHistogram, TransactionIngressPreservesOppositePayoffsWithIdenticalMarginals)
+{
+    using namespace moe_overlay_economy;
+    auto cfg = makeConfig(1, 4, 2, 2);
+    cfg.transaction_demand = ExpertHistogramTransactionConfig{{2, 1, 2}, transactionMemory(8192)};
+    DecodeExpertHistogram hist(cfg);
+    const float weights[]{0.5f, 0.5f};
+    const int grouped_routes[]{0, 1, 2, 3};
+    const int mixed_routes[]{0, 3, 1, 2};
+    hist.record(0, grouped_routes, weights, 2);
+    hist.record(0, grouped_routes + 2, weights, 2);
+    const auto grouped = hist.freezeAndRotateWindow();
+    hist.record(0, mixed_routes, weights, 2);
+    hist.record(0, mixed_routes + 2, weights, 2);
+    const auto mixed = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(grouped.valid());
+    ASSERT_TRUE(mixed.valid());
+    EXPECT_EQ(grouped.source_expert_counts, mixed.source_expert_counts);
+    const int32_t before[]{0, 0, 1, 1};
+    const int32_t after[]{1, 0, 0, 1};
+    const uint64_t prices[]{1, 3};
+    const TransactionPlacementCosts placement{before, after, prices, 4, 2};
+    const auto score = [&](const DecodeExpertHistogramWindow &window) {
+        ServiceCostPair sum;
+        std::array<ServiceCostPair, 2> scratch{};
+        for (size_t batch = 0; batch < window.transaction_demand->layerTransactions(0).size(); ++batch)
+        {
+            const auto cost = scoreTransaction(window.transaction_demand->routes(0, batch),
+                                               placement, scratch.data(), scratch.size());
+            EXPECT_EQ(appendTransaction(sum, cost), TransactionCostStatus::Complete);
+        }
+        return sum;
+    };
+    EXPECT_EQ(score(grouped).before_ns, 8u);
+    EXPECT_EQ(score(grouped).after_ns, 6u);
+    EXPECT_EQ(score(mixed).before_ns, 6u);
+    EXPECT_EQ(score(mixed).after_ns, 8u);
 }
 
 // ── Tests ─────────────────────────────────────────────
@@ -1099,6 +1402,8 @@ TEST(Test__DecodeExpertHistogram,
     EXPECT_EQ(view.numExperts(), 4);
     EXPECT_EQ(view.generation(), frozen.generation);
     EXPECT_EQ(view.tokenCount(), frozen.token_count);
+    EXPECT_THROW((void)view.transactionDemand(), std::logic_error)
+        << "Counts-only windows may rank placement, but cannot price concurrent service";
     EXPECT_EQ(view.activationCount(1, 1), 1u);
     EXPECT_EQ(
         view.activationCount(

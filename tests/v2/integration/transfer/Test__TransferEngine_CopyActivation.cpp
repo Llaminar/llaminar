@@ -16,12 +16,21 @@
  */
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cmath>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "v2/tensors/TensorClasses.h"
 #include "v2/backends/DeviceId.h"
 #include "v2/backends/BackendManager.h"
+#include "v2/backends/GPUDeviceContextPool.h"
+#include "v2/backends/IGPUGraphCapture.h"
+#include "v2/backends/IWorkerGPUContext.h"
+#include "v2/execution/local_execution/graph/GraphCaptureGuard.h"
 #include "v2/collective/BackendRouter.h"
 #include "v2/transfer/TransferEngine.h"
 #include "v2/transfer/TransferMethod.h"
@@ -40,6 +49,9 @@ using namespace llaminar2;
 class Test__TransferEngine_CopyActivation : public ::testing::Test
 {
 protected:
+    /** @brief Distinguish tensor-to-tensor copies from PP ownership handoffs. */
+    enum class ActivationOperation { Copy, Handoff };
+    /** @brief Discover real devices and create explicit producer streams. */
     void SetUp() override
     {
 #ifdef HAVE_CUDA
@@ -82,6 +94,13 @@ protected:
         }
     }
 
+    /** @brief Retire communicator owners before process-local registries exit. */
+    void TearDown() override
+    {
+        GlobalBackendRouter::shutdown();
+    }
+
+    /** @return Exact producer stream owned by this fixture for the device. */
     void *streamFor(DeviceId device) const
     {
         if (device.type == DeviceType::CUDA && cuda_stream_)
@@ -158,6 +177,94 @@ protected:
         return true;
     }
 
+    /**
+     * @brief Prove that an activation copy consumes its published generation.
+     *
+     * A mapped timeline holds the producer before its final write. The copy
+     * must import that producer event; waiting for an unrelated copy stream
+     * alone can finish successfully while copying the previous generation.
+     * All allocations and initial uploads precede the gate so an allocator
+     * synchronization cannot accidentally make the test pass.
+     *
+     * @param source_device Device holding the blocked activation producer.
+     * @param destination_device Device receiving the activation.
+     * @param operation Copy to another tensor or hand off this tensor's owner.
+     */
+    void provePendingProducerCopy(DeviceId source_device, DeviceId destination_device,
+                                  ActivationOperation operation = ActivationOperation::Copy)
+    {
+        auto *backend = getBackendFor(source_device);
+        ASSERT_NE(backend, nullptr);
+        auto &transfers = TransferEngine::instance();
+        const DeviceId devices[] = {source_device};
+        auto control = transfers.allocateMappedHostRegion(64u, devices);
+        auto *signal = static_cast<std::uint64_t *>(control->mutableHostData());
+        std::atomic_ref<std::uint64_t>(*signal).store(0u, std::memory_order_release);
+        auto src = makePatternTensor();
+        auto dst = makePoisonTensor();
+        // PP handoff storage and any collective communicator must exist before
+        // holding the producer. Lazy setup otherwise hides a missing event.
+        TransferEngine::allocateDeviceStorage(src.get(), destination_device);
+        llaminar2::test::ScopedGPUStream destination_stream(destination_device);
+        ASSERT_TRUE(makeGpuResident(src.get(), source_device));
+        ASSERT_TRUE(dst->ensureOnDevice(destination_device, destination_stream.get()));
+        ASSERT_TRUE(src->ensureOnHost());
+        ASSERT_TRUE(dst->ensureOnHost());
+        const auto bytes = src->numel() * sizeof(float);
+        void *producer = streamFor(source_device);
+        // Host verification above changes authority. Re-publish the resident
+        // source so warmup actually exercises the intended GPU transport.
+        TransferEngine::publishDeviceWrite(src.get(), source_device, producer);
+        const auto warm = transfers.copyActivation(src.get(), dst.get(), destination_device, bytes);
+        ASSERT_TRUE(warm.success) << warm.error;
+
+        auto &context = GPUDeviceContextPool::instance().getContext(source_device);
+        std::unique_ptr<IGPUGraphCapture> graph;
+        context.submitAndWait([&] {
+            graph = context.createGraphCapture(producer);
+            if (!graph) throw std::runtime_error("Missing captured producer");
+            ScopedBackendGraphCapture capture(context, *graph, "activation producer proof");
+            if (!capture.begin() || !backend->streamWaitTimelineSignal64(
+                    producer, control->deviceAlias(source_device), 1u, source_device.ordinal) ||
+                !backend->memset(src->gpu_data_ptr(), 0x3f, bytes,
+                                  source_device.ordinal, producer))
+                throw std::runtime_error("Cannot capture the activation producer");
+            capture.finish();
+            if (!graph->instantiate()) throw std::runtime_error("Cannot instantiate producer");
+        });
+
+        // Release is test-owned and bounded even if an assertion or a copy
+        // throws. The normal path releases only AFTER submission returned,
+        // proving nonblocking progress without an inference-speed threshold.
+        std::jthread release([signal](std::stop_token stop) {
+            std::mutex mutex;
+            std::unique_lock lock(mutex);
+            std::condition_variable_any wake;
+            wake.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; });
+            std::atomic_ref<std::uint64_t>(*signal).store(1u, std::memory_order_release);
+        });
+        context.submitAndWait([&] {
+            if (!graph->launch()) throw std::runtime_error("Cannot launch captured producer");
+        });
+        TransferEngine::publishDeviceWrite(src.get(), source_device, producer);
+        const auto result = operation == ActivationOperation::Copy
+            ? transfers.copyActivation(src.get(), dst.get(), destination_device, bytes)
+            : transfers.transferActivation(src.get(), destination_device, bytes);
+        ASSERT_TRUE(result.success) << result.error;
+        EXPECT_EQ(std::atomic_ref<std::uint64_t>(*signal).load(std::memory_order_acquire), 0u)
+            << "Transfer blocked waiting for the held producer";
+        release.request_stop();
+        release.join();
+        auto *received = operation == ActivationOperation::Copy ? dst.get() : src.get();
+        ASSERT_TRUE(received->ensureOnHost());
+        const auto *actual = reinterpret_cast<const unsigned char *>(received->data());
+        for (std::size_t byte = 0u; byte < bytes; ++byte)
+        {
+            ASSERT_EQ(actual[byte], 0x3f)
+                << "Copied stale activation before its producer event at byte " << byte;
+        }
+    }
+
     bool cuda_available_ = false;
     bool rocm_available_ = false;
     bool multi_cuda_ = false;
@@ -170,6 +277,36 @@ protected:
     std::unique_ptr<llaminar2::test::ScopedGPUStream> cuda_stream_;
     std::unique_ptr<llaminar2::test::ScopedGPUStream> rocm_stream_;
 };
+
+/** @brief CUDA copies must join a producer on a different explicit stream. */
+TEST_F(Test__TransferEngine_CopyActivation, PendingProducer_CUDA)
+{
+    if (!cuda_available_) GTEST_SKIP() << "Need CUDA";
+    provePendingProducerCopy(cuda_device_, cuda_device_);
+}
+
+/** @brief ROCm obeys the same generation/event contract as CUDA. */
+TEST_F(Test__TransferEngine_CopyActivation, PendingProducer_ROCm)
+{
+    if (!rocm_available_) GTEST_SKIP() << "Need ROCm";
+    provePendingProducerCopy(rocm_device_, rocm_device_);
+}
+
+/** @brief Both CUDA tensor copy and PP handoff import the cross-device producer. */
+TEST_F(Test__TransferEngine_CopyActivation, PendingProducer_CUDA_Peer)
+{
+    if (!multi_cuda_) GTEST_SKIP() << "Need two CUDA devices";
+    for (auto operation : {ActivationOperation::Copy, ActivationOperation::Handoff})
+        provePendingProducerCopy(cuda_device_, cuda_device_1_, operation);
+}
+
+/** @brief Both ROCm tensor copy and PP handoff import the cross-device producer. */
+TEST_F(Test__TransferEngine_CopyActivation, PendingProducer_ROCm_Peer)
+{
+    if (!multi_rocm_) GTEST_SKIP() << "Need two ROCm devices";
+    for (auto operation : {ActivationOperation::Copy, ActivationOperation::Handoff})
+        provePendingProducerCopy(rocm_device_, rocm_device_1_, operation);
+}
 
 // =============================================================================
 // Host source → GPU (direct H2D)

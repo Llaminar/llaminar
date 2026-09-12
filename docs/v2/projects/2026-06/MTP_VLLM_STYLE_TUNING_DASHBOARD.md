@@ -8,6 +8,342 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+2026-09-12 lossless-grid follow-on: IQ3_S, IQ3_XXS, IQ2_XXS and IQ1_S now
+preserve native grids/scales through CPU preparation and CUDA/ROCm movement.
+Both backend/ISA sweeps reduce the failing format set from nine to five;
+all four CPU sparse endpoint/ticket tests pass. Rebuilt Unit gate is
+648/648 green (74.32 s), and 64 Release repack/streaming economy rows pass
+with zero CUDA/ROCm spills. Full production preflight completes in 583.62 s:
+149/154 pass; its stale CPU packing oracle is then corrected and passes on
+focused rerun, leaving 150/154 individually green. The four remaining
+backend/ISA registrations fail only dual-scale Q2_K/Q3_K/IQ2_S/IQ2_XS/IQ1_M.
+A clean, uncontended Release rerun also passes all 64 economy rows. These
+multi-scale formats and the separate 122B HTTP drift
+remain unresolved. No model/image certificate advances. See the
+[repair and remaining representation contract](../2026-09/generation-qwen122-overlay-control-coverage.md#lossless-single-scale-grid-repair-2026-09-12).
+
+2026-09-12 focused follow-on: corrected three empty floating-CPU preflight
+filters and made all CTest/GTest registrations fail on zero executed tests.
+Removed the obsolete sole-disabled attention registration; all remaining 648
+Unit tests pass before the subsequent kernel fix. A real CPU sparse endpoint
+feeding captured CUDA/ROCm tickets exposed an M=1 quantization-policy omission;
+the all-format fix and both native/forced-AVX2 endpoint sweeps pass. Release
+rebuild succeeds; all 648 rebuilt Unit tests pass in 74.49 seconds. Extending
+the transfer arithmetic proof to original resident GPU descriptors then
+exposes lossy CPU INT8 normalization in nine Q2/Q3/IQ formats on both vendors.
+Those new regressions are red in preflight and need lossless representation
+work, not threshold changes. Q8_0 is not among them, and the current 122B HTTP
+Dynamic repeatability failure remains unresolved: nine of the original 36
+controls green, one red, 26 unseen. See the
+[focused evidence and arithmetic map](../2026-09/generation-qwen122-overlay-control-coverage.md).
+
+122B acquisition (2026-09-11): all eight CUDA1/CPU2 and CUDA2/CPU2 MTP-off
+controls pass on their first attempt (Static/Dynamic, Ordinal/Random), with
+32 complete 384-token HTTP responses and exact cross-policy/placement streams
+within each topology. Dynamic commits both tier and participant movement;
+Static remains movement-free. The existing 797-test receipt and four-shard
+tmpfs cache were reused unchanged. CUDA1/CPU1 Static/Ordinal then passes tokens
+and teardown but exposes missing rank-local ticket-boundary evidence in the
+HTTP graph observer. The sealed parent/service inventory now feeds that proof;
+126 evidence-policy unit tests and both GPU cached-graph preflight suites pass.
+The refreshed 649 Unit / 148 preflight gate passes, and the exact HTTP retry
+passes all eight checks in 202.094 s with unchanged tokens. The 27 untouched
+controls resumed with that receipt, then stopped on CUDA1/CPU1 Dynamic/Ordinal:
+the fresh 384-token stream matches Static, but the full-prefix repeat drifts
+at index 291 and at index 198 in an unchanged reproduction. Graph, memory and
+teardown checks pass. Nine original unseen 122B controls are individually
+green; 26 remain unadmitted. Focused CUDA/ROCm lowering regressions prove a
+missing local-expert producer edge at the single-GPU canonical fold. The fix
+and all 649 Unit / 150 preflight checks pass, but the unchanged HTTP retry
+still drifts at index 216: that dependency defect is not the resolved root
+cause. An uncertified no-prefix probe also drifts (index 309), excluding
+restore as a necessary trigger. A four-request repeat probe drifts on requests
+2/3, then returns to the original 384-token stream on request 4 (admitted at
+epoch 8). Transient movement/publication is the next focus; these ad-hoc probes
+did not certify graceful teardown or export normal terminal PerfStats.
+These remain unapproved
+controls, not MTP/HF or Docker certificates. See the
+[122B control coverage record](../2026-09/generation-qwen122-overlay-control-coverage.md).
+
+Dense 27B follow-on (2026-09-11): four new CPU controls pass their four
+384-token HTTP requests. The first CUDA LocalPP control exposed a non-monotonic
+attention workspace peak at an intermediate captured prefill bucket. A shared
+CUDA policy envelope now feeds stage binding and metadata admission; both GPU
+backends bound it to admitted query rows rather than the full KV horizon.
+Five focused registrations and the full 649 Unit / 148 preflight gate pass.
+The failed CUDA cell is green on exact retry (96.892 s); the two unseen
+CUDA/ROCm and dual-ROCm pipeline controls pass (131.015 / 132.462 s), reusing
+the same receipt. All seven dense controls are individually green, with 28
+successful 384-token requests. The remaining 36 unseen controls are all 122B
+overlays; prior failures and MTP comparisons remain. No token corpus or image
+is certified. The current receipt is `dense27b-workspace-prerequisites-02`.
+See the [dense coverage and lifecycle audit](../2026-09/generation-dense27b-control-coverage.md).
+
+Ornith acquisition (2026-09-11): all twelve unseen CPU2/CUDA2/ROCm2 overlay
+MTP-off controls and the unseen single-ROCm control pass first try. All 52
+requests reach 384 tokens; policy/placement variants have identical streams
+within each overlay topology while retaining movement/no-movement checks.
+No implementation change or repeated prerequisite run was needed. The shared
+797-test receipt remains valid; 43 MTP-off controls remain unseen. These are
+unapproved controls, not model/image certificates. See the
+[Ornith coverage record](../2026-09/generation-ornith15-control-coverage.md).
+
+Native GPU evidence follow-on (2026-09-11): fixed a final-empty-wave false
+negative and excluded resident-only assignments from physical movement proof.
+CUDA/ROCm lifecycle entries pass 20 repetitions each; the full 649 Unit +
+148 preflight gate passes. The exact CUDA2 Dynamic/Ordinal control and six
+paused unseen controls pass; all eight Qwen3.6-35B homogeneous two-GPU
+MTP-off controls are individually green. There are now 56 unseen controls.
+No baseline or Docker certificate is approved. See the
+[native movement lifecycle audit](../2026-09/native-gpu-movement-generation-evidence.md).
+
+Host-overlay follow-on (2026-09-11): executed routing work is separated from
+MTP acceptance, removing the CPU accepted-histogram graph walks. Explicit phase
+tags and retained PMA-bound invocation storage are installed; seven focused
+registrations pass 20 repetitions (53.80 s), followed by all 649 Unit and
+146 preflight tests (609.268 s). Release and matrices rebuilt; the preserved
+HTTP control passes in 85.688 s with four 384-token requests and 125 completed
+expert moves (previously zero). All six resumed unseen controls also pass,
+including both device-owned CUDA/ROCm Dynamic placements. Four further unseen
+Qwen3.6 MoE CPU NodeTP controls pass, with 520/510 Dynamic moves but no speedup
+over Static. These ten new greens leave 64 unattempted MTP-off controls. This is an
+unapproved MTP-off control, not an MTP or model/image certificate. See the
+[producer lifecycle audit](../2026-09/generation-rocm-cpu-random-economy.md#live-host-producer-and-mtp-workacceptance-separation).
+
+Latest GPU follow-on (2026-09-11): compressed-cache cold/partial restore drift
+was reproduced on CUDA and traced to chunk-mean AQ8 bases on both GPU backends.
+CUDA and ROCm now use the first input key in every phase; the redundant policy
+enum is removed and legacy disk fingerprints are invalidated. Both Release
+request pairs match all 384 tokens, and the full 647 Unit + 135 preflight gate
+passes. The canonical CUDA Q4_0/Q8-KV four-request generation cell is green in
+17.022 s. Its HF prefill Top-5 is still 4/5 (KL 0.00317625 passes), so numerical
+certification remains red. The next unseen CUDA Q4_0/TQ generation cell stops
+naturally at 76 tokens on its initial cold request and remains unproven at the
+required 384-token horizon. Follow-up: the cache regression passes 20 unprofiled
+runs on each GPU backend; seven of eight further unseen generation controls
+pass in 14.6–43.8 s. ROCm Q8_0/Q8-KV ends naturally at 182 tokens. All six
+affected GPU HF cells have now run: four pass, CUDA Q4_0/Q8-KV remains Top-5
+red, and ROCm Q4_0/TQ is red on KL 0.007492 versus 0.005 and Top-5 4/5.
+Each has eight validated CSVs; prerequisites were reused throughout. Native
+339-tensor banks now attribute both GPU failures: norms/projections closely
+match their quantized same-input equations, and independently reconstructed
+attention has mean relative-L2 residual 8.91e-7 (CUDA) / 3.59e-6 (ROCm).
+The actual cells select post-RoPE keys; the older pre-RoPE sensitivity diagnostic
+is not their live-path explanation. Final-head isolation places drift upstream,
+strongly supporting accumulated quantization error; both gates remain red.
+The optional effective-K/V cold-capture manifest fix is now installed: the
+cache describes prepared storage before capture, and reset preserves immutable
+stage descriptors. The CUDA native BF16 and FP32/BF16 request-batch gaps
+are now closed with typed native kernels, without conversion workspaces.
+Both graph integration binaries pass 60/60 tests; the 43-case snapshot/native
+math subset passes 20 repetitions on each backend. All 99 native CUDA
+specializations have zero stack/local memory, with focused NCU evidence.
+Integration and Release rebuilds pass. The refreshed shared gate passes
+647 Unit + 135 preflight CTests (584.434 s). Its exact ROCm Q4_0/TQ effective-K/V
+diagnostic first stopped before numerical comparison: full-context snapshot
+banks were absent from the reference-only memory declaration. That accounting
+fix is now installed and both builds pass. Fresh 647 Unit / 135 preflight tests
+pass (77.20 / 504.89 s); a driver interruption required receipt recovery from
+complete CTest evidence. The exact model diagnostic now reaches all eight CSVs
+in 9.206 s, retaining the same KL/Top-5 red. Actual effective-cache snapshots
+give a stronger independent attention residual: mean relative L2 4.30e-7,
+worst 3.42e-6 across 24 layers. No thresholds were waived. Subsequent unchanged
+cells reuse this shared gate; resumed coverage prioritizes unseen controls.
+Two more unseen Qwen3 controls ran: ROCm/FP32-KV passes all four 384-token
+requests in 41.851 s; CUDA/Q8_1-KV finishes its partial request at 372 tokens
+and fails the minimum in 16.370 s. An independent cold request matches all
+372 tokens exactly, excluding restore-induced drift in this reproduction.
+The next unseen Qwen3 CUDA/ROCm FP16-KV controls end their partial requests at
+301/260 tokens; independent cold servers match every token exactly, ruling out
+restore-induced drift in those reproductions but not satisfying the 384 minimum.
+No thresholds or precisions changed. See the
+[GPU prefix-basis audit](../2026-09/production-ci-gpu-aq8-prefix-basis.md).
+
+Latest follow-on (2026-09-11): CPU RoPE's history-dependent angles and ignored
+implicit offsets are fixed; Q16 no longer has a four-row position buffer.
+Release cold/partial generation matches 384/384 tokens. All 28 functional
+RoPE tests pass 20 repetitions on actual AVX2 and AVX512 Release builds. The
+RoPE full gate passes 647 Unit + 133 preflight tests. Q16 block-local encoding
+and complete-reduction range safety are now installed: three focused checks
+pass 20 repetitions on both Release ISAs. Q16 HF KL improves to 0.00246115
+against 0.006, but prefill Top-5 remains 4/5, like the separate Q8 cell.
+The all-layer audit explains 169 linears, 24 attention operations and 97
+residual-linked norm/RoPE operations; accumulated approximation remains at the
+Top-5 boundary. A reproduced fused-GEMM dump-width defect is fixed and passes
+20 focused repeats. A second diagnostic admission defect (async work after the
+dump budget was exhausted) is also fixed; all 25 dump tests pass 20 repetitions.
+Final 647 Unit + 133 preflight checks pass (589.649 s including build). The
+5.201 s post-fix cell reuses the receipt, proves 24 complete gate dumps and 48
+byte-identical projection outputs without dump errors, but remains Top-5 red.
+No threshold was relaxed; no aggregate, corpus or image certificate is claimed.
+See the [position-identity audit](../2026-09/production-ci-cpu-rope-position-identity.md).
+
+Current slice: CPU Q8/TQ caches now use native anchored keys, with one
+first-token basis across cold prefill, grouped verification and prefix restore.
+All-format native runtime/storage checks pass (14 tests), including 20 complete
+repetitions and the AVX2 runtime route. Fresh **647 Unit / 132 production
+preflight** tests pass (572.852 s). The original outlier regression improves
+from cosine 0.915217 to 0.999970. Qwen2 CPU/Q8_1 HF KL falls from 0.613263 to
+0.00138603; all five decode tokens and prefix checks pass. That cell is still
+red solely on prefill Top-5 (4/5), now narrowed to a 0.001010 fifth/sixth gap.
+Independent terminal Q8-operand arithmetic reproduces native logits to
+relative L2 2.21e-7; upstream approximation and the gate boundary remain under
+investigation. No tolerance has been waived. Release runtime economy and the
+continuous-generation recheck remain before claiming this CPU slice certified.
+Historical generation coverage is 34 individual cells; CPU evidence
+must be refreshed after this arithmetic-source change. Docker certificates and
+routine-generation CI cutover remain incomplete.
+
+Earlier generation follow-up: **33 individually green cells**. The thirty
+Qwen3.6/Qwen3.8 pilots are joined by focused Qwen2 CPU/CUDA/ROCm controls,
+each with four 384-token requests, exact repeats, real prefix restores,
+production graph evidence and clean shutdown (34.278/13.562/29.412 s).
+Cold/restored comparisons ruled out cache corruption for the short journal
+answers. The model now declares a field-guide workload; the unsuccessful
+follow-up-turn prototype is removed. No EOS, precision or mathematical gate
+changes. All 79 script-policy tests, C++ contracts and 510-cell discovery pass;
+only the 30 Qwen2 request bodies change. The refreshed shared prerequisite
+gate and canonical Qwen2 family run are in progress. These focused results
+are not corpus or image certificates. See the
+[workload audit](../2026-09/generation-qwen2-continuous-workload.md).
+
+September 10: **509/510 historical individual numerical greens**, no unseen
+cells; Qwen2 CPU Q16 Top-5 remains red. Ornith ROCm dynamic depth now passes
+with an independently authenticated HF-only conditional suffix, preserving
+original scores and unchanged gates (26.894s, ten CSVs, 614 byte-exact rows).
+The new Release generation pilot is **12/12 green** (Qwen3.6 MoE, CUDA/ROCm,
+Off/1/2/3/15/dynamic), four continuous 384-token requests each with exact seeded
+Off-control tokens and real fresh/full/partial prefix outcomes. No approved
+token corpus or certified Docker image yet. Common native byte-assertion
+hardening passes 647 Unit / 128 preflight and all twelve Qwen3.6 single-device
+numerical policies. Ornith's 614 native verifier rows are exact; its remaining
+HF route discontinuity is handled by the installed bounded suffix proof.
+Its adversarial C++/Python preflight suites pass twenty repetitions each;
+fresh full 647 Unit / 128 preflight gates also pass.
+The complete shared single-device family passes 24/24 (Qwen3.6 CPU/CUDA/ROCm
+and Ornith ROCm), with 232 canonical CSVs and 12,280 finite byte-exact verifier
+rows. Dense/multi-participant live proof and the full image gate remain pending.
+Follow-up closes representative dense/multi-rank proof: Qwen3.8 CPU/CUDA/ROCm
+passes 18/18, and 122B CUDA1/CPU2 MPI2 Static/Dynamic ordinal passes 12/12.
+The symmetric 122B ROCm1/CPU2 twelve-cell slice also passes. Combined fresh
+common-gate coverage is 66 distinct cells, 638 canonical CSVs
+and 34,980 byte-exact checkpoint rows. Other overlay topologies and the full
+image gate remain pending; historical mathematical coverage is still 509/510.
+Generation admission hardening passes 74 policy tests and a fresh 647-test
+Unit gate. The new CPU control's NUMA/bootstrap failure is fixed and its
+preflight regression passes twenty repeats; fresh 647 Unit / 129 preflight
+also pass. CPU Off passes all four 384-token requests (118.892s), but the first
+depth-1 comparison exposes a seeded RNG mismatch: ordinary CPU decode advanced
+a call-count RNG while MTP keyed draws by output position. Identical-logit
+regressions reproduce eighteen wrong ordinary/batched draws. The shared
+position-keyed fix passes the runner suite, twenty focused preflight repeats,
+and fresh 647 Unit / 130 preflight gates. The regenerated unapproved CPU control
+passes (120.586s), but the exact depth-1 retry now diverges at token 54 instead
+of token 2. The residual is double application of CPU stochastic history
+penalties, reproduced at the same token despite 22,784 exact model checkpoint
+rows. The single-owner fix passes its model-free regression, twenty focused
+preflight repeats, and the short model probe (26,344 exact rows). Fresh complete
+647 Unit / 130 preflight gates pass; corrected Off (119.881s) and depth 1
+(133.171s) pass all four 384-token requests with exact serial equality and real
+prefix restores. The four remaining unseen CPU policies pass on that build:
+depth 2 (134.204s), depth 3 (144.147s), depth 15 (340.522s), and dynamic
+(175.802s). All six CPU modes are green; the Qwen3.6 CPU/CUDA/ROCm generation
+pilot now has 18 distinct individual greens. Every CPU cell still misses the
+60-second economy target. The broader generation matrix and both image
+certificates remain pending. See the
+[sampling audit](../2026-09/production-ci-cpu-seeded-sampling.md).
+See [verifier audit](../2026-09/production-ci-mtp-verifier-evidence-audit.md).
+
+Earlier entries below describe prior checkpoints, not current queue totals.
+
+Local unseen-first parity is at **429/510**. The last build passed 645 Unit and
+128 production preflight registrations. Six-GPU 122B Dynamic/Ordinal MTP off
+and fixed depths 1/2/3/15 pass after bounded prepared-context restoration.
+Dynamic depth now also passes in 402.843s with all nine CSVs, depth-15 serial
+and acceptance witnesses, prefix restore, and clean retirement. Checkpoint
+admission uses explicit transaction append bounds instead of retained graph
+width; three focused tests pass twenty repeats each, and fresh full gates pass.
+Static/Random MTP-off passes in 42.820s; unseen-first pass 17 continues.
+No kernel, format, cache size, or numerical gate changes. Docker and the known
+Qwen2 Q16 Top-5 red remain pending. See the
+[append-admission audit](../2026-09/production-ci-mtp-checkpoint-append-admission.md).
+
+September 9 proof 22 built/discovered both ISA images and passed AVX512's
+645 Unit / 120 preflight gates before 122B CUDA2/CPU2 Static depth-1 checkpoint
+admission failed. The single-request oracle fix passes that exact cell and the
+complete six-policy CUDA2/CPU2 Static sequence (116.47s, 53 CSVs). Qwen36 two-CUDA
+Static also passes all six (108.47s, 53 CSVs). Full Unit passes 645/645 (76.23s);
+53 pipeline-policy tests also pass after closing a fine-tune metadata ignore gap.
+ROCm2/CPU2 off/depth 1/depth 2 pass, but depth 3 fails recursive MoE tensor parity
+at reference row three, both in sequence and alone. Tokens and draft acceptance
+remain exact. The snapshot scale/publication audit is open; no gate relaxation,
+new full pipeline, E2E/benchmark certificate, or published image is claimed.
+See the [oracle audit](../2026-09/production-ci-mtp-oracle-authority.md).
+
+September 9 Docker proof 21 built the AVX512 builder and Release runtime, but
+failed before discovery: Docker attach returned empty successful device-probe
+output. The completed-artifact fix passes 20 real checks per backend and the
+exact original discovery step (13 canonical E2E cells). No numerical model cell
+ran in proof 21. Full dual-ISA certification requires new source-frozen proof
+22; neither image is certified. See the
+[metadata authority audit](../2026-09/production-ci-device-metadata.md).
+
+September 9 proof 20 completed seventeen campaigns after 645/645 Unit and
+118/118 preflight, then stopped on Qwen36 IQ3_S two-ROCm Dynamic/Ordinal D1.
+The exact failure reproduces alone: initial maintenance cadence splits the
+checkpoint response. Correcting test admission restores all nine numerical/
+prefix/path CSVs but exposes missing movement. A continuous budget-one trace
+proves the MTP condition graph never advanced HIP's maintenance clock. Explicit
+serial-versus-speculative condition ownership now passes that exact ROCm cell
+(48.626s, nine CSVs), twenty-repeat focused gates, and 645/645 Unit (73.23s).
+Bounded replica-cache admission now passes all-codebook/backend Units and
+admits 21/25 CUDA replicas; ROCm depth 1/15 pass at the canonical 25-slot grant.
+CUDA Static and Dynamic expose a separate same-prefix oracle mismatch before
+MTP starts. The same-prefix fix passes six focused CUDA/ROCm cells (54 CSVs),
+including deep/adaptive cases. Fresh prerequisites pass 645/645 Unit (74.42s)
+and 120/120 preflight (469.25s). Both four-cell process-level teardown/re-entry
+sequences pass (ROCm 190.311s, CUDA 126.699s, 72 more CSVs). The slice is ready
+for source-frozen dual-ISA Docker proof 21; neither ISA image is certified. See the
+[commit lifecycle audit](../2026-09/production-ci-mtp-maintenance-checkpoint.md).
+
+September 9 follow-up: Docker proof 19 passed fourteen complete campaigns and
+all six Static/Ordinal 122B cells, then failed Dynamic/MTP-off prefix restore.
+The missing headroom branch is removed. Seven targeted runs now pass with
+60 fresh CSVs, including three-cell CUDA and ROCm reuse/transition sequences.
+The finished slice passes 645/645 Unit (72.80s), 118/118 production preflight
+(453.87s), and twenty repetitions of focused lifecycle regressions. Docker
+proof 20 is the next full dual-ISA run; neither image is certified or published.
+See the [MTP-off prefix admission audit](../2026-09/production-ci-non-mtp-prefix-boundary.md).
+
+September 9: short-sequence testing fixed retained setup-evidence loss and
+snapshot capture sizing from the first shallow request instead of retained
+capacity. Both full Static sequences pass (24 cells, 212 validated CSVs): CUDA
+154.20 seconds, ROCm 151.85 seconds. The rebuilt Unit gate passes 645/645 (73.76
+seconds), and focused snapshot regressions pass twenty repeats per backend.
+The full production-preflight gate passes 118/118 (454.65 seconds); Docker proof
+19 is the next source-frozen attempt for both ISAs. See the
+[retained-runner audit](../2026-09/production-ci-retained-runner-evidence.md).
+
+Container certification follow-up: the native-token oracle correction passes
+seven isolated 122B CUDA1/CPU2 and ROCm1/CPU2 Static MTP cells (63 required
+CSVs). The next Dynamic depth-1 cell exposed premature prefix/serial-proof
+admission after movement. Both CUDA and ROCm focused cells now pass with
+stationary settlement and the allocated parallel transfer fabric (153.318 /
+202.259 seconds, nine CSVs each). This is not an end-to-end speedup claim.
+The first Dynamic depth-15 follow-up exposed a bounded-cycle admission defect
+before MTP verification. Its device-free multi-wave reproduction is fixed;
+the authority and preflight gates pass 20 repetitions each. The exact CUDA
+depth-15 retry passes in 176.951 seconds with nine required CSVs and clean
+retirement, after 644/644 Unit tests passed. CUDA dynamic-depth, ROCm depth 15
+and ROCm dynamic-depth also pass (203.743 / 211.162 / 215.225 seconds; 27 more
+CSVs). CUDA Random depth 15 and ROCm Random dynamic-depth pass as well
+(203.705 / 193.205 seconds): six deep checks, 54 required CSVs in total.
+The complete production-preflight gate passes 118/118 in 456.21 seconds;
+the prerequisites for the next source-frozen container run are green. See the
+[oracle audit](../2026-09/production-ci-mtp-oracle-authority.md) and
+[cycle admission audit](../2026-09/production-ci-overlay-cycle-admission.md).
+Whole production/image certification remains incomplete.
+
 September 8 hardware-defaults follow-on is verified: RTX3090 automatically
 retains 0.30 and MI50 selects 0.45, based on complete continuation membership,
 with explicit request overrides preserved. Fresh clean Release decode is

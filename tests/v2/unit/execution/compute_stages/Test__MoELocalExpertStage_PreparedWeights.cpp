@@ -663,6 +663,77 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     }
 }
 
+/** @brief Host packets retain raw rows and original CSR identities after filtering. */
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUCanonicalHostPacketPreservesRawRowsAndFilteredOriginalSlots)
+{
+    constexpr int width = 8;
+    constexpr int experts = 4;
+    MoEOverlayCollectiveWorkspace workspace({
+        .max_rows = 1, .max_entries = 4, .d_model = width, .top_k = 4,
+        .device = DeviceId::cpu(),
+        .return_layout = MoEOverlayReturnLayout::CanonicalExpertRoutes,
+    });
+    auto input = workspace.localExpertInput(0, 0);
+    auto output = workspace.localExpertOutput(0, 0);
+    input.residency_epoch = 1;
+    input.live_row_count = 1;
+    input.live_entry_count = 4;
+    input.row_ids_host[0] = 1;
+    input.entry_offsets_host[0] = 0;
+    input.entry_offsets_host[1] = 4;
+    const float weights[4]{0.25f, 0.0f, 0.75f, 0.5f};
+    for (int entry = 0; entry < experts; ++entry)
+    {
+        input.expert_ids_host[entry] = entry;
+        input.original_route_slots_host[entry] = 4 + entry;
+        input.compact_route_slots_host[entry] = entry;
+        input.route_weights_host[entry] = weights[entry];
+    }
+    std::fill_n(input.hidden_rows_fp32, width, 1.0f);
+    auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
+        MoELocalExpertSerialBufferArena::Config{
+            .device_id = DeviceId::cpu(), .row_capacity = 1,
+            .d_model = width, .routing_top_k = 4,
+            .cpu_canonical_route_storage = MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
+        });
+    std::vector<std::unique_ptr<CanonicalRouteTestGemm>> owned;
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.return_layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.serial_compact_buffer_arena = arena;
+    params.graph_row_capacity = 1;
+    params.num_experts = experts;
+    params.top_k = 4;
+    params.d_model = width;
+    params.expert_intermediate = 16;
+    params.layer_idx = 0;
+    params.expert_mask = {true, true, false, true};
+    for (int expert = 0; expert < experts; ++expert)
+    {
+        owned.push_back(std::make_unique<CanonicalRouteTestGemm>(expert, false));
+        params.prepared_gate_gemm.push_back(owned.back().get());
+        owned.push_back(std::make_unique<CanonicalRouteTestGemm>(expert, false));
+        params.prepared_up_gemm.push_back(owned.back().get());
+        owned.push_back(std::make_unique<CanonicalRouteTestGemm>(expert, true));
+        params.prepared_down_gemm.push_back(owned.back().get());
+    }
+    MoELocalExpertStage stage(params);
+    llaminar2::testing::MockDeviceContext context(DeviceId::cpu(), ComputeBackendType::CPU);
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(output.layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
+    ASSERT_EQ(output.live_row_count, 2u);
+    EXPECT_EQ(output.row_ids_host[0], 4);
+    EXPECT_EQ(output.row_ids_host[1], 7);
+    for (int col = 0; col < width; ++col)
+    {
+        EXPECT_EQ(output.output_rows_fp32[col], 16.0f + col);
+        EXPECT_EQ(output.output_rows_fp32[width + col], 64.0f + col);
+    }
+}
+
 /**
  * @brief Stable single-pass admission preserves row and route order after filtering.
  *

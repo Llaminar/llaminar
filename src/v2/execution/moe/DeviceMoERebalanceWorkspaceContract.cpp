@@ -266,6 +266,25 @@ namespace llaminar2
         return slots * static_cast<std::size_t>(participant_count);
     }
 
+    std::size_t DeviceMoERebalanceWorkspaceCapacity::movementJournalEdgeCapacity() const
+    {
+        // Retain one complete expert turnover per participant between terminal
+        // observations. This is diagnostic storage, not a movement/admission
+        // limit: exhaustion is explicit and cannot stall serving or wrap.
+        if (!usesTransferSlots())
+            return 0;
+        const auto count = checkedMultiply(checkedMultiply(num_layers, num_experts,
+            "movement journal layer experts"), participant_count, "movement journal participants");
+        if (count > UINT32_MAX)
+            throw std::overflow_error("Device movement journal exceeds its wire index capacity");
+        return std::max<std::size_t>(2, count);
+    }
+
+    std::size_t DeviceMoERebalanceWorkspaceCapacity::movementJournalWaveCapacity() const
+    {
+        return movementJournalEdgeCapacity() / 2;
+    }
+
     std::uint64_t
     DeviceMoERebalanceWorkspaceContract::collectivePayloadSlotBytes(
         std::size_t wire_payload_bytes)
@@ -356,6 +375,15 @@ namespace llaminar2
             WS_CONTROLLER_STATE,
             binding.workspace_suffix,
             sizeof(DeviceMoERebalanceGraphControllerState));
+        if (capacity.usesTransferSlots())
+        {
+            append(requirements, WS_MOVEMENT_WAVES, binding.workspace_suffix,
+                checkedMultiply(capacity.movementJournalWaveCapacity(),
+                    sizeof(DeviceMoERebalanceMovementWave), "movement journal wave bytes"));
+            append(requirements, WS_MOVEMENT_EDGES, binding.workspace_suffix,
+                checkedMultiply(capacity.movementJournalEdgeCapacity(),
+                    sizeof(DeviceMoERebalanceMovementEdge), "movement journal edge bytes"));
+        }
         /* Planning writes a private RCU bank before any live table can publish it. */
         append(
             requirements,

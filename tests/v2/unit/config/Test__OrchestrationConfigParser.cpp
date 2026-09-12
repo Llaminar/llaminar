@@ -375,6 +375,36 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_Device_CpuExplicitNuma)
     EXPECT_FALSE(config.cpu_global_tp_all_local);
 }
 
+/** Serialized unknown NUMA must remain unresolved in every configuration surface. */
+TEST(Test__OrchestrationConfigParser, DeviceNumaIntentSurvivesAddressSerialization)
+{
+    OrchestrationConfigParser parser;
+    for (const auto *backend : {"cpu", "cuda", "rocm"})
+    {
+        for (const int numa : {-1, 0, 1})
+        {
+            const auto address = std::string("localhost:") +
+                std::to_string(numa) + ":" + backend + ":0";
+            SCOPED_TRACE(address);
+            ArgvHelper args{"llaminar2", "--device", address.c_str()};
+            const auto cli = parser.parseArgs(args.argc(), args.argv());
+            const auto yaml = parser.parseYamlString("device: " + address + "\n");
+            const auto map = "0=" + address;
+            ArgvHelper mapped_args{"llaminar2", "--device-map", map.c_str()};
+            const auto mapped = parser.parseArgs(mapped_args.argc(), mapped_args.argv());
+            for (const auto *config : {&cli, &yaml})
+            {
+                ASSERT_TRUE(config->device_for_this_rank);
+                EXPECT_EQ(config->device_for_this_rank->numa_node, numa);
+                EXPECT_EQ(config->device_for_this_rank_numa_explicit, numa >= 0);
+                EXPECT_FALSE(config->cpu_global_tp_all_local);
+            }
+            ASSERT_EQ(mapped.device_map_numa_explicit.size(), 1u);
+            EXPECT_EQ(mapped.device_map_numa_explicit.front().second, numa >= 0);
+        }
+    }
+}
+
 TEST(Test__OrchestrationConfigParser, ParseArgs_DeviceMode)
 {
     ArgvHelper args{"llaminar2", "--device-mode", "round_robin"};

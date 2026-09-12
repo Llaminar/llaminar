@@ -9,6 +9,7 @@
  */
 
 #include "MoEOverlayDistributedResidencyProtocol.h"
+#include "MoEOverlayWireIO.h"
 
 #include <algorithm>
 #include <limits>
@@ -21,6 +22,8 @@ namespace llaminar2
 {
     namespace
     {
+        using moe_overlay_wire::readLittleEndian;
+        using moe_overlay_wire::writeLittleEndian;
         /** @brief Two independently seeded byte mixers used as a 128-bit digest. */
         class StableDigestBuilder final
         {
@@ -208,6 +211,12 @@ namespace llaminar2
                     digest.addScalar(world_rank);
             }
 
+            digest.addScalar(plan.replica_cache_capacity.has_value());
+            if (plan.replica_cache_capacity)
+            {
+                digest.addScalar(plan.replica_cache_capacity->requested());
+                digest.addScalar(plan.replica_cache_capacity->admitted());
+            }
             digest.addScalar(
                 static_cast<std::uint64_t>(plan.routed_tiers.size()));
             for (const auto &tier : plan.routed_tiers)
@@ -251,6 +260,38 @@ namespace llaminar2
             addLayeredOwnership(digest, snapshot.layered_ownership);
         }
 
+        /** @brief One semantic fingerprint recipe shared by windows and complete plans. */
+        void addHistogramWindow(StableDigestBuilder &digest, const DecodeExpertHistogramWindow &window)
+        {
+            digest.addScalar(window.generation);
+            digest.addScalar(window.token_count);
+            for (const auto count : window.source_token_counts) digest.addScalar(count);
+            digest.addScalar(window.num_layers);
+            digest.addScalar(window.num_experts);
+            digest.addScalar(static_cast<uint64_t>(window.expert_counts.size()));
+            for (const auto count : window.expert_counts) digest.addScalar(count);
+            digest.addScalar(static_cast<uint64_t>(window.source_expert_counts.size()));
+            for (const auto count : window.source_expert_counts) digest.addScalar(count);
+            digest.addScalar(window.transaction_demand != nullptr);
+            if (!window.transaction_demand) return;
+            const auto &demand = *window.transaction_demand;
+            digest.addScalar(demand.topK());
+            digest.addScalar(demand.tokenBoundaryLayer());
+            for (int layer = 0; layer < window.num_layers; ++layer)
+            {
+                const auto records = demand.layerTransactions(layer);
+                digest.addScalar(static_cast<uint64_t>(records.size()));
+                for (size_t batch = 0; batch < records.size(); ++batch)
+                {
+                    digest.addScalar(records[batch].logical_rows);
+                    digest.addScalar(records[batch].phase);
+                    const auto routes = demand.routes(layer, batch);
+                    for (uint64_t slot = 0; slot < routes.capacity_slots; ++slot)
+                        digest.addScalar(routes.expert_ids[slot]);
+                }
+            }
+        }
+
         /** @brief Stable diagnostic digest retained in a fixed-layout failed vote. */
         std::uint64_t diagnosticFingerprint(
             const std::string &diagnostic) noexcept
@@ -268,42 +309,6 @@ namespace llaminar2
                 *error = message;
         }
 
-        /** @brief Write one integral scalar in canonical little-endian order. */
-        template <typename Value>
-        void writeLittleEndian(
-            std::span<std::uint8_t> destination,
-            std::size_t &offset,
-            Value value)
-        {
-            static_assert(std::is_integral_v<Value>);
-            using Unsigned = std::make_unsigned_t<Value>;
-            Unsigned bits = static_cast<Unsigned>(value);
-            for (std::size_t byte_idx = 0; byte_idx < sizeof(Value);
-                 ++byte_idx)
-            {
-                destination[offset++] =
-                    static_cast<std::uint8_t>(bits & 0xffu);
-                bits >>= 8u;
-            }
-        }
-
-        /** @brief Read one canonical little-endian integral scalar. */
-        template <typename Value>
-        Value readLittleEndian(
-            std::span<const std::uint8_t> packet,
-            std::size_t &offset)
-        {
-            static_assert(std::is_integral_v<Value>);
-            using Unsigned = std::make_unsigned_t<Value>;
-            Unsigned bits = 0;
-            for (std::size_t byte_idx = 0; byte_idx < sizeof(Value);
-                 ++byte_idx)
-            {
-                bits |= static_cast<Unsigned>(packet[offset++])
-                        << (byte_idx * 8u);
-            }
-            return static_cast<Value>(bits);
-        }
     } // namespace
 
     namespace
@@ -323,8 +328,8 @@ namespace llaminar2
             StableDigestBuilder digest;
             digest.addString(
                 include_economy
-                    ? "MoEOverlayResidencyTransaction/v4"
-                    : "MoEOverlayResidencyExecutionPlan/v1");
+                    ? "MoEOverlayResidencyTransaction/v6"
+                    : "MoEOverlayResidencyExecutionPlan/v2");
             digest.addScalar(transaction.purpose);
             digest.addScalar(transaction.calibration_sequence);
             digest.addScalar(transaction.expected_epoch);
@@ -335,24 +340,7 @@ namespace llaminar2
             digest.addScalar(transaction.histogram_window != nullptr);
             if (transaction.histogram_window)
             {
-                const auto &window = *transaction.histogram_window;
-                digest.addScalar(window.generation);
-                digest.addScalar(window.token_count);
-                for (const std::uint64_t count : window.source_token_counts)
-                    digest.addScalar(count);
-                digest.addScalar(window.num_layers);
-                digest.addScalar(window.num_experts);
-                digest.addScalar(static_cast<std::uint64_t>(
-                    window.expert_counts.size()));
-                for (const std::uint64_t count : window.expert_counts)
-                    digest.addScalar(count);
-                digest.addScalar(static_cast<std::uint64_t>(
-                    window.source_expert_counts.size()));
-                for (const std::uint64_t count :
-                     window.source_expert_counts)
-                {
-                    digest.addScalar(count);
-                }
+                addHistogramWindow(digest, *transaction.histogram_window);
             }
 
             digest.addScalar(
@@ -452,6 +440,7 @@ namespace llaminar2
                     transaction.economy.migration_profile_identity);
                 digest.addScalar(
                     transaction.economy.smoothed_through_generation);
+                digest.addScalar(transaction.economy.forecast_fingerprint);
                 digest.addScalar(
                     transaction.economy.historical_window_weight);
                 digest.addScalar(
@@ -520,7 +509,8 @@ namespace llaminar2
 
     std::size_t moeOverlayDistributedHistogramWireBytes(
         int num_layers,
-        int num_experts)
+        int num_experts,
+        const moe_overlay_economy::TransactionDemandCapacity *transactions)
     {
         if (num_layers <= 0 || num_experts <= 0)
         {
@@ -549,8 +539,22 @@ namespace llaminar2
             throw std::overflow_error(
                 "Distributed ExpertOverlay histogram packet size overflows size_t");
         }
-        return fixed_bytes +
-               entries * count_vectors * sizeof(std::uint64_t);
+        const auto counts = fixed_bytes + entries * count_vectors * sizeof(std::uint64_t);
+        const auto demand = transactions ? DecodeExpertTransactionWindow::maximumWireBytes(
+            *transactions, num_layers, num_experts) : 0u;
+        if (demand > std::numeric_limits<size_t>::max() - counts)
+            throw std::overflow_error("ExpertOverlay histogram receive capacity overflows size_t");
+        return counts + demand;
+    }
+
+    std::size_t moeOverlayDistributedHistogramWireBytes(const DecodeExpertHistogramWindow &window)
+    {
+        if (!window.valid()) throw std::invalid_argument("Cannot size an invalid histogram window");
+        const auto counts = moeOverlayDistributedHistogramWireBytes(window.num_layers, window.num_experts);
+        const auto demand = window.transaction_demand ? window.transaction_demand->wireBytes() : 0u;
+        if (demand > std::numeric_limits<size_t>::max() - counts)
+            throw std::overflow_error("ExpertOverlay histogram packet size overflows size_t");
+        return counts + demand;
     }
 
     std::uint64_t fingerprintDecodeExpertHistogramWindow(
@@ -562,21 +566,8 @@ namespace llaminar2
                 "Cannot fingerprint an invalid ExpertOverlay histogram window");
         }
         StableDigestBuilder digest;
-        digest.addString("MoEOverlayHistogramWindow/v2");
-        digest.addScalar(window.generation);
-        digest.addScalar(window.token_count);
-        for (const std::uint64_t count : window.source_token_counts)
-            digest.addScalar(count);
-        digest.addScalar(window.num_layers);
-        digest.addScalar(window.num_experts);
-        digest.addScalar(
-            static_cast<std::uint64_t>(window.expert_counts.size()));
-        for (const std::uint64_t count : window.expert_counts)
-            digest.addScalar(count);
-        digest.addScalar(static_cast<std::uint64_t>(
-            window.source_expert_counts.size()));
-        for (const std::uint64_t count : window.source_expert_counts)
-            digest.addScalar(count);
+        digest.addString("MoEOverlayHistogramWindow/v3");
+        addHistogramWindow(digest, window);
         return digest.finish().low;
     }
 
@@ -593,13 +584,12 @@ namespace llaminar2
             return false;
         }
         const std::size_t required =
-            moeOverlayDistributedHistogramWireBytes(
-                window.num_layers, window.num_experts);
+            moeOverlayDistributedHistogramWireBytes(window);
         if (destination.size() != required)
         {
             setError(
                 error,
-                "ExpertOverlay histogram destination has the wrong fixed packet size");
+                "ExpertOverlay histogram destination has the wrong compact packet size");
             return false;
         }
 
@@ -618,6 +608,7 @@ namespace llaminar2
                 window.source_expert_counts.size()),
             .counts_fingerprint =
                 fingerprintDecodeExpertHistogramWindow(window),
+            .transaction_bytes = window.transaction_demand ? window.transaction_demand->wireBytes() : 0u,
         };
         if (!header.valid())
         {
@@ -643,6 +634,7 @@ namespace llaminar2
             destination, offset, header.source_expert_count_entries);
         writeLittleEndian(
             destination, offset, header.counts_fingerprint);
+        writeLittleEndian(destination, offset, header.transaction_bytes);
         if (offset != MoEOverlayDistributedHistogramHeader::kWireBytes)
         {
             throw std::logic_error(
@@ -654,6 +646,11 @@ namespace llaminar2
             writeLittleEndian(destination, offset, count);
         for (const std::uint64_t count : window.source_expert_counts)
             writeLittleEndian(destination, offset, count);
+        if (window.transaction_demand)
+        {
+            window.transaction_demand->encodeWire(destination.subspan(offset, header.transaction_bytes));
+            offset += header.transaction_bytes;
+        }
         if (offset != destination.size())
         {
             throw std::logic_error(
@@ -669,7 +666,8 @@ namespace llaminar2
         int expected_layers,
         int expected_experts,
         DecodeExpertHistogramWindow *window,
-        std::string *error)
+        std::string *error,
+        const ExpertHistogramTransactionConfig *transactions)
     {
         if (!window || expected_layers <= 0 || expected_experts <= 0)
         {
@@ -678,14 +676,25 @@ namespace llaminar2
                 "ExpertOverlay histogram decoder requires output and positive model geometry");
             return false;
         }
-        const std::size_t expected_size =
+        // Reuse count-vector capacity but retire any previous sample identity.
+        window->generation = 0;
+        window->token_count = 0;
+        window->source_token_counts.fill(0);
+        window->num_layers = 0;
+        window->num_experts = 0;
+        window->expert_counts.clear();
+        window->source_expert_counts.clear();
+        window->transaction_demand.reset();
+        const std::size_t minimum_size =
             moeOverlayDistributedHistogramWireBytes(
                 expected_layers, expected_experts);
-        if (packet.size() != expected_size)
+        const std::size_t maximum_size = moeOverlayDistributedHistogramWireBytes(
+            expected_layers, expected_experts, transactions ? &transactions->capacity : nullptr);
+        if (packet.size() < minimum_size || packet.size() > maximum_size)
         {
             setError(
                 error,
-                "ExpertOverlay histogram packet has the wrong fixed size");
+                "ExpertOverlay histogram packet is outside admitted receive size");
             return false;
         }
 
@@ -712,12 +721,19 @@ namespace llaminar2
             readLittleEndian<std::uint64_t>(packet, offset);
         header.counts_fingerprint =
             readLittleEndian<std::uint64_t>(packet, offset);
+        header.transaction_bytes = readLittleEndian<uint64_t>(packet, offset);
         if (!header.valid() || header.num_layers != expected_layers ||
             header.num_experts != expected_experts)
         {
             setError(
                 error,
                 "ExpertOverlay histogram header or model geometry is invalid");
+            return false;
+        }
+        if (header.transaction_bytes != packet.size() - minimum_size ||
+            (header.transaction_bytes != 0u) != (transactions != nullptr))
+        {
+            setError(error, "ExpertOverlay transaction evidence is missing, unadmitted, or has the wrong extent");
             return false;
         }
 
@@ -736,6 +752,21 @@ namespace llaminar2
                 header.source_expert_count_entries));
         for (auto &count : window->source_expert_counts)
             count = readLittleEndian<std::uint64_t>(packet, offset);
+        if (transactions)
+        {
+            try
+            {
+                window->transaction_demand = DecodeExpertTransactionWindow::decodeWire(
+                    *transactions, *window, packet.subspan(offset, header.transaction_bytes));
+                offset += header.transaction_bytes;
+            }
+            catch (const std::exception &failure)
+            {
+                *window = {};
+                setError(error, std::string("ExpertOverlay transaction authentication failed: ") + failure.what());
+                return false;
+            }
+        }
         if (offset != packet.size() || !window->valid() ||
             fingerprintDecodeExpertHistogramWindow(*window) !=
                 header.counts_fingerprint)
@@ -863,7 +894,8 @@ namespace llaminar2
 
     std::size_t moeOverlayDistributedResidencyProposalWireBytes(
         int num_layers,
-        int num_experts)
+        int num_experts,
+        const moe_overlay_economy::TransactionDemandCapacity *transactions)
     {
         if (num_layers <= 0 || num_experts <= 0)
         {
@@ -880,10 +912,11 @@ namespace llaminar2
         const std::size_t entries = layers * experts;
         const std::size_t histogram_bytes =
             moeOverlayDistributedHistogramWireBytes(
-                num_layers, num_experts);
+                num_layers, num_experts, transactions);
         constexpr std::size_t header_bytes =
             MoEOverlayDistributedResidencyProposalHeader::kWireBytes;
-        if (entries >
+        if (histogram_bytes > std::numeric_limits<std::size_t>::max() - header_bytes ||
+            entries >
             (std::numeric_limits<std::size_t>::max() - header_bytes -
              histogram_bytes) /
                 kAuthoritativeEntryWireBytes)
@@ -893,6 +926,19 @@ namespace llaminar2
         }
         return header_bytes + histogram_bytes +
                entries * kAuthoritativeEntryWireBytes;
+    }
+
+    std::size_t moeOverlayDistributedResidencyProposalWireBytes(
+        const MoEOverlayDistributedResidencyProposal &proposal)
+    {
+        if (!proposal.valid()) throw std::invalid_argument("Cannot size an invalid residency proposal");
+        const auto fixed = moeOverlayDistributedResidencyProposalWireBytes(
+            proposal.plan.num_layers, proposal.plan.num_experts);
+        const auto &demand = proposal.plan.histogram_window->transaction_demand;
+        const auto extra = demand ? demand->wireBytes() : 0u;
+        if (extra > std::numeric_limits<size_t>::max() - fixed)
+            throw std::overflow_error("Residency proposal compact size overflows size_t");
+        return fixed + extra;
     }
 
     bool encodeMoEOverlayDistributedResidencyProposal(
@@ -908,9 +954,7 @@ namespace llaminar2
             return false;
         }
         const std::size_t required =
-            moeOverlayDistributedResidencyProposalWireBytes(
-                proposal.plan.num_layers,
-                proposal.plan.num_experts);
+            moeOverlayDistributedResidencyProposalWireBytes(proposal);
         if (destination.size() != required)
         {
             setError(
@@ -972,9 +1016,7 @@ namespace llaminar2
         }
 
         const std::size_t histogram_bytes =
-            moeOverlayDistributedHistogramWireBytes(
-                proposal.plan.num_layers,
-                proposal.plan.num_experts);
+            moeOverlayDistributedHistogramWireBytes(*proposal.plan.histogram_window);
         if (!encodeMoEOverlayDistributedHistogramWindow(
                 *proposal.plan.histogram_window,
                 destination.subspan(offset, histogram_bytes),
@@ -1019,7 +1061,8 @@ namespace llaminar2
         int expected_layers,
         int expected_experts,
         MoEOverlayDistributedResidencyProposal *proposal,
-        std::string *error)
+        std::string *error,
+        const ExpertHistogramTransactionConfig *transactions)
     {
         if (!proposal || expected_layers <= 0 || expected_experts <= 0)
         {
@@ -1029,14 +1072,16 @@ namespace llaminar2
             return false;
         }
         *proposal = {};
-        const std::size_t expected_size =
+        const std::size_t minimum_size =
             moeOverlayDistributedResidencyProposalWireBytes(
                 expected_layers, expected_experts);
-        if (packet.size() != expected_size)
+        const auto maximum_size = moeOverlayDistributedResidencyProposalWireBytes(
+            expected_layers, expected_experts, transactions ? &transactions->capacity : nullptr);
+        if (packet.size() < minimum_size || packet.size() > maximum_size)
         {
             setError(
                 error,
-                "ExpertOverlay proposal packet has the wrong fixed size");
+                "ExpertOverlay proposal packet is outside admitted receive size");
             return false;
         }
 
@@ -1080,7 +1125,7 @@ namespace llaminar2
 
         const std::size_t histogram_bytes =
             moeOverlayDistributedHistogramWireBytes(
-                expected_layers, expected_experts);
+                expected_layers, expected_experts) + packet.size() - minimum_size;
         auto histogram =
             std::make_shared<DecodeExpertHistogramWindow>();
         if (!decodeMoEOverlayDistributedHistogramWindow(
@@ -1088,7 +1133,7 @@ namespace llaminar2
                 expected_layers,
                 expected_experts,
                 histogram.get(),
-                error))
+                error, transactions))
         {
             return false;
         }

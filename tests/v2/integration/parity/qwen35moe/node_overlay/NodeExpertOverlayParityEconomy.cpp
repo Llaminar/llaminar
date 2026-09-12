@@ -334,23 +334,22 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     }
 
     /**
-     * @brief Build the exact cache-distinct prefill that closes a demand bank.
+     * @brief Build the exact stationary prefill that closes a demand bank.
      *
      * The authority supplies the remaining logical routed-row count. This
-     * helper changes only the prefix-cache identity and repeats authenticated
-     * model tokens for the requested causal length, so closure remains ordinary
-     * production inference rather than synthetic histogram mutation.
+     * helper repeats authenticated model tokens for the requested causal
+     * length. The caller purges the reusable cache through the public API;
+     * changing a leading token would change every later routed expert and
+     * prevent the short-window controller from converging on one workload.
      *
-     * @param request_index Stable identity in the closure traffic namespace.
      * @param routed_rows Exact positive active-bank headroom to consume.
      * @return One valid model prompt with exactly @p routed_rows rows.
      */
     auto Qwen35MoENodeExpertOverlayParityTest::makeDemandWindowClosurePrompt(
-        int request_index,
         std::uint64_t routed_rows) const -> std::vector<int32_t>
     {
         const auto &test_case = activeModelParityCaseOrThrow();
-        if (request_index < 0 || config_.token_ids.empty() ||
+        if (config_.token_ids.empty() ||
             routed_rows == 0u ||
             routed_rows > static_cast<std::uint64_t>(
                               test_case.model.max_seq_len) ||
@@ -361,18 +360,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 "Demand-window closure requires a positive in-context production prompt");
         }
 
-        const std::size_t rows = static_cast<std::size_t>(routed_rows);
-        std::vector<int32_t> prompt;
-        prompt.reserve(rows);
-        prompt.push_back(economyPromptLeadingToken(
-            EconomyPromptNamespace::StationaryConvergence,
-            request_index));
-        for (std::size_t row = 1u; row < rows; ++row)
-        {
-            prompt.push_back(config_.token_ids.at(
-                (row - 1u) % config_.token_ids.size()));
-        }
-        return prompt;
+        return stationaryDemandWindowPrompt(
+            config_.token_ids, static_cast<std::size_t>(routed_rows));
     }
 
     /** @return Median of a non-empty timing corpus without changing it. */
@@ -426,24 +415,19 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     }
 
     /**
-     * @return Model-workload and topology-specific convergence objective.
+     * @return Evidence-role and topology-specific convergence objective.
      *
-     * An ordinary 122B cell needs one wide publication whose durable ledger
-     * proves both available axes. The centrally designated speed witness and
-     * the smaller-model campaign require four successive publications to reach
-     * the measured taper before timing. Every caller consumes this one value
-     * rather than reproducing model/evidence-role integer tests at later
-     * lifecycle boundaries.
+     * Every movement-only cell needs a durable publication proving its
+     * applicable axes, irrespective of model size. Only a centrally designated
+     * speed witness requires the longer convergence workload before timing.
+     * Consume the definition-owned role mapping here so a fixture cannot
+     * silently impose a second model-specific evidence policy.
      */
     auto Qwen35MoENodeExpertOverlayParityTest::dynamicResidencyConvergenceTarget() const -> DynamicResidencyConvergenceTarget
     {
         return {
-            .minimum_published_waves =
-                isQwen122ProductionTest() &&
-                    !requiresObservedConvergenceSpeedup()
-                    ? 1u
-                    : static_cast<std::uint64_t>(
-                          kObservedSpeedupConvergenceWindows),
+            .minimum_published_waves = qwen35MoEMinimumMovementPublications(
+                activeModelParityCaseOrThrow().dynamic_evidence),
             .axis_contract =
                 dynamicMovementAxisContract(resolvedOverlayPlan()),
         };
@@ -1329,12 +1313,17 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 {
                     LOG_ERROR(
                         "[Qwen3.5 MoE GraphNative] Convergence training prefix replay was neither an exact admitted restore nor a movement-invalidated cold prefill: cold_admission_epoch="
-                        << cold_request->admission_movement_epoch
+                        << cold_request->admission_placement_epochs.earliest()
+                        << " cold_admission_latest_epoch="
+                        << cold_request->admission_placement_epochs.latest()
                         << " cold_completion_epoch="
                         << cold_request->completion_movement_epoch
                         << " restore_admission_epoch="
                         << restored_prefix.prefix_request
-                               .admission_movement_epoch
+                               .admission_placement_epochs.earliest()
+                        << " restore_admission_latest_epoch="
+                        << restored_prefix.prefix_request
+                               .admission_placement_epochs.latest()
                         << " restore_completion_epoch="
                         << restored_prefix.prefix_request
                                .completion_movement_epoch

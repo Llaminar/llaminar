@@ -1,6 +1,11 @@
 /**
  * @file MoERoutingStage.cpp
- * @brief Implementation of MoE routing stage (softmax top-k)
+ * @brief Participant-local routing and phase-tagged executed-work publication.
+ *
+ * CPU routing publishes whole invocation demand while its row geometry and
+ * top-k results are live. This evidence never changes KV, sampler or accepted
+ * token state. GPU routing stays device-owned or uses an explicitly declared
+ * heterogeneous ticket boundary; no host readback is introduced here.
  */
 
 #include "MoERoutingStage.h"
@@ -83,6 +88,12 @@ namespace llaminar2
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
         if (params_.decode_histogram)
         {
+            if (params_.device_id.is_cpu() &&
+                (expertHistogramProductionSourceIndex(params_.host_routing_source) ==
+                     kExpertHistogramProductionSourceCount ||
+                 (params_.force_decode_equivalent_verifier_prefill &&
+                  params_.host_routing_source != ExpertHistogramSource::GroupedVerifier)))
+                throw std::invalid_argument("CPU routing evidence requires its explicit production phase");
             if (params_.num_experts <= 0)
             {
                 throw std::invalid_argument(
@@ -211,17 +222,11 @@ namespace llaminar2
             params_.decode_histogram->recordTokenBoundary(params_.layer_idx);
     }
 
-    bool MoERoutingStage::publishCPUGroupedRoutingEvidence(
-        ExpertHistogramSource source) const
+    bool MoERoutingStage::publishCPURoutingEvidence() const
     {
         if (!params_.decode_histogram)
             return true;
-        if (source == ExpertHistogramSource::GroupedVerifier)
-        {
-            LOG_ERROR("[MoERoutingStage] CPU grouped-verifier demand must be "
-                      "published by the accepted-state transaction");
-            return false;
-        }
+        const auto source = params_.host_routing_source;
         if (!params_.device_id.is_cpu())
         {
             LOG_ERROR("[MoERoutingStage] Host grouped-routing evidence is CPU-only; "
@@ -293,154 +298,13 @@ namespace llaminar2
                 "moe_rebalance",
                 "cpu_grouped_routing_evidence_rows",
                 static_cast<double>(logical_rows),
-                source == ExpertHistogramSource::GroupedVerifier
-                    ? "verifier"
-                    : "prefill",
+                source == ExpertHistogramSource::GroupedVerifier ? "verifier" :
+                    source == ExpertHistogramSource::PrefillChunk ? "prefill" : "decode",
                 params_.device_id.toString(),
                 PerfStatsCollector::Tags{
                     {"layer", std::to_string(params_.layer_idx)},
                     {"physical_rows", std::to_string(params_.seq_len)}});
         }
-        return true;
-    }
-
-    bool MoERoutingStage::validateHostGroupedVerifierHistogramPublication(
-        const int32_t *accepted_state_counts,
-        int request_count,
-        int rows_per_request,
-        std::string *error) const
-    {
-        auto fail = [&](std::string reason) -> bool
-        {
-            if (error)
-                *error = std::move(reason);
-            return false;
-        };
-
-        if (!requiresHostGroupedVerifierHistogramPublication())
-        {
-            return fail(
-                "router does not own deferred CPU grouped-verifier demand");
-        }
-        if (!accepted_state_counts)
-            return fail("accepted_state_counts must not be null");
-        if (params_.layer_idx < 0)
-            return fail("routed layer index must be non-negative");
-        if (request_count <= 0 || rows_per_request <= 0)
-            return fail("request geometry must be positive");
-        if (params_.seq_len != request_count * rows_per_request)
-        {
-            std::ostringstream msg;
-            msg << "router row geometry does not match request-major verifier shape"
-                << " stage_rows=" << params_.seq_len
-                << " request_count=" << request_count
-                << " rows_per_request=" << rows_per_request;
-            return fail(msg.str());
-        }
-        if (params_.host_logical_row_count != params_.seq_len)
-        {
-            std::ostringstream msg;
-            msg << "CPU verifier router must retain every physical request row"
-                << " logical_rows=" << params_.host_logical_row_count
-                << " stage_rows=" << params_.seq_len;
-            return fail(msg.str());
-        }
-        if (params_.top_k <= 0)
-            return fail("router top_k must be positive");
-
-        for (int request = 0; request < request_count; ++request)
-        {
-            const int accepted = accepted_state_counts[request];
-            if (accepted < 0 || accepted > rows_per_request)
-            {
-                std::ostringstream msg;
-                msg << "accepted row count is outside its verifier group"
-                    << " request=" << request
-                    << " accepted=" << accepted
-                    << " rows_per_request=" << rows_per_request;
-                return fail(msg.str());
-            }
-        }
-
-        const size_t required_routes =
-            static_cast<size_t>(params_.seq_len) *
-            static_cast<size_t>(params_.top_k);
-        if (cached_routing_.expert_indices.size() < required_routes)
-        {
-            std::ostringstream msg;
-            msg << "retained CPU verifier routes are incomplete"
-                << " available=" << cached_routing_.expert_indices.size()
-                << " required=" << required_routes;
-            return fail(msg.str());
-        }
-        return true;
-    }
-
-    bool MoERoutingStage::publishHostGroupedVerifierHistograms(
-        const int32_t *accepted_state_counts,
-        int request_count,
-        int rows_per_request,
-        std::string *error)
-    {
-        if (!validateHostGroupedVerifierHistogramPublication(
-                accepted_state_counts,
-                request_count,
-                rows_per_request,
-                error))
-        {
-            return false;
-        }
-
-        uint64_t accepted_rows = 0;
-        for (int request = 0; request < request_count; ++request)
-        {
-            const int accepted = accepted_state_counts[request];
-            if (accepted == 0)
-                continue;
-
-            const size_t route_offset =
-                static_cast<size_t>(request) *
-                static_cast<size_t>(rows_per_request) *
-                static_cast<size_t>(params_.top_k);
-            const ExpertHistogramMergeResult merged =
-                params_.decode_histogram->mergeRoutedExpertRows(
-                    cached_routing_.expert_indices.data() + route_offset,
-                    RoutedExpertHistogramMerge{
-                        .source = ExpertHistogramSource::GroupedVerifier,
-                        .layer_idx = params_.layer_idx,
-                        .real_token_count = accepted,
-                        .bucket_token_count = rows_per_request,
-                        .top_k = params_.top_k,
-                        .route_stride = params_.top_k,
-                        .count_window_tokens = true,
-                    },
-                    routing_evidence_count_scratch_);
-            if (!merged)
-            {
-                if (error)
-                {
-                    std::ostringstream msg;
-                    msg << "histogram rejected accepted verifier prefix"
-                        << " layer=" << params_.layer_idx
-                        << " request=" << request
-                        << " accepted=" << accepted
-                        << " reason=" << merged.error;
-                    *error = msg.str();
-                }
-                return false;
-            }
-            accepted_rows += static_cast<uint64_t>(accepted);
-        }
-
-        PerfStatsCollector::addCounter(
-            "moe_rebalance",
-            "cpu_committed_grouped_verifier_histogram_rows",
-            static_cast<double>(accepted_rows),
-            "verifier",
-            params_.device_id.toString(),
-            {{"layer", std::to_string(params_.layer_idx)},
-             {"requests", std::to_string(request_count)},
-             {"rows_per_request", std::to_string(rows_per_request)}});
         return true;
     }
 
@@ -768,12 +632,10 @@ namespace llaminar2
              {"route", "grouped_tensor"},
              {"seq_len", std::to_string(seq_len)},
              {"layer", std::to_string(params_.layer_idx)}});
-        /*
-         * Acceptance is produced after the verifier graph completes.  Retain
-         * request-major top-k rows here; DeviceGraphOrchestrator commits only
-         * accepted prefixes as part of the CPU spec-state transaction.
-         */
-        return true;
+        // Every executed candidate costs service, even when MTP later rejects
+        // it. Preserve one whole invocation; request groups are concurrent work,
+        // not serial samples. Accepted KV/GDN/token publication is independent.
+        return publishCPURoutingEvidence();
     }
 
     bool MoERoutingStage::prepareGroupedVerifierHistogramProducer(
@@ -1282,10 +1144,9 @@ namespace llaminar2
         // Publish exact host-owned routing evidence. Multi-row CPU execution
         // contributes every logical row at once; GPU evidence remains in its
         // device runtime table until an explicit maintenance boundary.
-        if (params_.decode_histogram && params_.device_id.is_cpu() && seq_len > 1)
+        if (params_.decode_histogram && params_.device_id.is_cpu())
         {
-            if (!publishCPUGroupedRoutingEvidence(
-                    ExpertHistogramSource::PrefillChunk))
+            if (!publishCPURoutingEvidence())
             {
                 return false;
             }

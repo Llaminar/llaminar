@@ -1,3 +1,12 @@
+/**
+ * @file Test__MPIBootstrap.cpp
+ * @brief Device-free launch policy and typed NUMA intent regressions.
+ *
+ * Test command construction with synthetic topology and validate malformed
+ * placement before any hardware discovery, MPI launch, or model allocation.
+ * Actual worker affinity belongs in the model-free CPU startup integration.
+ */
+
 #include "utils/MPIBootstrap.h"
 #include "app/MPIBootstrapPhase.h"
 #include "backends/ComputeBackend.h"
@@ -11,6 +20,7 @@
 
 namespace
 {
+    /** @return MPI command for a synthetic topology without starting MPI. */
     std::vector<std::string> buildCommand(llaminar2::MPILaunchConfig config,
                                           llaminar2::CPUTopology topology)
     {
@@ -24,6 +34,7 @@ namespace
             topology);
     }
 
+    /** @return Whether the constructed command contains an exact argument. */
     bool contains(const std::vector<std::string> &values,
                   const std::string &needle)
     {
@@ -31,6 +42,18 @@ namespace
     }
 
 } // namespace
+
+/** Explicit intent may never carry the unresolved NUMA sentinel into launch. */
+TEST(Test__MPIBootstrap, ExplicitCpuPlacementRejectsUnknownNode)
+{
+    llaminar2::OrchestrationConfig config;
+    config.device_for_this_rank = llaminar2::GlobalDeviceAddress::cpu();
+    config.device_for_this_rank_numa_explicit = true;
+    EXPECT_THROW(
+        llaminar2::MPIBootstrapPhase::resolveInferenceNUMANodes(
+            config, llaminar2::DeviceManager::instance(), {}),
+        std::invalid_argument);
+}
 
 TEST(Test__MPIBootstrap, SocketMappedCpuTPReservesFullSocketProcessingElements)
 {

@@ -1898,6 +1898,8 @@ namespace llaminar2
          * transport, promotes the destination storage into the tensor's primary
          * device slot, and publishes destination ownership. Callers must not
          * repair or restate coherence after this method returns.
+         * Same-vendor GPU movement is asynchronous: the destination event
+         * certifies receipt and consumers must use the tensor input contract.
          *
          * @param tensor Tensor whose activation storage is being moved.
          * @param target_device Destination CPU or GPU.
@@ -1909,7 +1911,7 @@ namespace llaminar2
             DeviceId target_device,
             size_t bytes_override = 0);
 
-        /// Copy activation data from one tensor INTO another tensor's buffer on
+        /// @brief Copy activation data from one tensor INTO another tensor's buffer on
         /// dst_device, choosing the optimal transport automatically:
         ///   - same physical GPU            → device-to-device copy (intra-VRAM)
         ///   - same-vendor, different GPU   → peer copy (NCCL/RCCL or peer DMA)
@@ -1922,6 +1924,15 @@ namespace llaminar2
         /// destination are distinct buffers. Used for the PP hidden-state
         /// handoff, where the producer's output must land in the consumer
         /// graph's working buffer without a redundant device→host→device trip.
+        /// GPU copies acquire the source event before submission, extend its
+        /// lifetime through the read, and publish the exact receiving stream.
+        /// Same-vendor GPU paths never block for device completion. Both tensor
+        /// owners must remain alive until their published events have completed.
+        /// @param src Tensor owning the published source generation.
+        /// @param dst Tensor receiving the active bytes.
+        /// @param dst_device Exact CPU/GPU destination.
+        /// @param bytes Extent within both physical allocations.
+        /// @return Submission result; device completion is carried by tensors.
         TransferResult copyActivation(TensorBase *src, TensorBase *dst,
                                       DeviceId dst_device, size_t bytes);
 

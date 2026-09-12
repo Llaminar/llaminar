@@ -11,6 +11,7 @@
 #include "execution/compute_stages/ComputeStageFactory.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
 #include "execution/moe/DecodeExpertHistogram.h"
+#include "../../../utils/ObservedExpertDemandFixture.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
 
@@ -27,6 +28,24 @@ namespace llaminar2::test
 {
 namespace
 {
+    /** Captured placement is an input, never a request to admit the latest bank. */
+    TEST(Test__MoEExpertDispatchEpoch, CapturedRequestRequiresExactPublishedEpoch)
+    {
+        using Authority = MoEOverlayDispatchEpochAuthority;
+        EXPECT_EQ(resolveMoEOverlayDispatchPlacementEpoch(Authority::CapturedRequest, 2u, 0u), 2u);
+        EXPECT_EQ(resolveMoEOverlayDispatchPlacementEpoch(Authority::CapturedRequest, 2u, 2u), 2u);
+        EXPECT_THROW(resolveMoEOverlayDispatchPlacementEpoch(Authority::CapturedRequest, 0u, 0u), std::logic_error);
+        EXPECT_THROW(resolveMoEOverlayDispatchPlacementEpoch(Authority::CapturedRequest, 2u, 3u), std::logic_error);
+    }
+
+    /** Reused host-admitted headers must not resurrect a retired sequence. */
+    TEST(Test__MoEExpertDispatchEpoch, HostAdmissionIgnoresPreviousHeaderResult)
+    {
+        using Authority = MoEOverlayDispatchEpochAuthority;
+        EXPECT_EQ(resolveMoEOverlayDispatchPlacementEpoch(Authority::HostAdmission, 2u, 0u), 0u);
+        EXPECT_EQ(resolveMoEOverlayDispatchPlacementEpoch(Authority::HostAdmission, 2u, 3u), 3u);
+    }
+
 
     TEST(Test__MoEExpertDispatchLeaseLifecycle,
          MappedParentCannotStealHostLeaseTerminalOwnership)
@@ -640,99 +659,110 @@ TEST_F(Test__MoEExpertDispatchStage, CapturedTicketRoutesOnlyLogicalPrefixAndDec
 
 TEST_F(
     Test__MoEExpertDispatchStage,
-    CapturedTicketPublishesExactRealPrefillRowsWithoutPaddingContamination)
+    CapturedTicketPublishesWholeBatchesInEveryProductionPhase)
 {
-    constexpr int bucket_rows = 4;
-    constexpr int logical_rows = 2;
-    constexpr int top_k = 2;
-    auto ticket_storage =
-        std::make_shared<MoEOverlayDispatchTicketStorage>();
-    ticket_storage->bindFixedCapacity(
-        /*layer_idx=*/4,
-        bucket_rows,
-        top_k,
-        /*d_model=*/8,
-        DeviceId::cpu(),
-        /*workspace_generation=*/29);
-    auto &ticket = ticket_storage->ticket();
-    ticket.header->logical_row_count = logical_rows;
+    for (const auto phase : {ExpertHistogramSource::DecodeToken,
+                            ExpertHistogramSource::PrefillChunk,
+                            ExpertHistogramSource::GroupedVerifier})
+    {
+        SCOPED_TRACE(static_cast<int>(phase));
+        constexpr int bucket_rows = 4;
+        const int logical_rows = phase == ExpertHistogramSource::DecodeToken ? 1 : 2;
+        constexpr int top_k = 2;
+        auto ticket_storage =
+            std::make_shared<MoEOverlayDispatchTicketStorage>();
+        ticket_storage->bindFixedCapacity(
+            /*layer_idx=*/4,
+            bucket_rows,
+            top_k,
+            /*d_model=*/8,
+            DeviceId::cpu(),
+            /*workspace_generation=*/29);
+        auto &ticket = ticket_storage->ticket();
+        ticket.header->logical_row_count = logical_rows;
 
-    const std::vector<float> indices{
-        3.0f, 1.0f,
-        3.0f, 2.0f,
-        99.0f, 99.0f,
-        99.0f, 99.0f,
-    };
-    const std::vector<float> weights{
-        0.75f, 0.25f,
-        0.60f, 0.40f,
-        123.0f, 123.0f,
-        123.0f, 123.0f,
-    };
-    std::copy(
-        indices.begin(), indices.end(), ticket.routing_indices_fp32);
-    std::copy(
-        weights.begin(), weights.end(), ticket.routing_weights_fp32);
-
-    DecodeExpertHistogramConfig histogram_config;
-    histogram_config.num_layers = 5;
-    histogram_config.num_experts = 4;
-    histogram_config.top_k = top_k;
-    histogram_config.window_size = 8;
-    histogram_config.sockets = {DeviceId::cpu()};
-    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
-        /*num_layers=*/5,
-        /*participant_count=*/1,
-        {0, 0, 0, 0});
-    DecodeExpertHistogram histogram(std::move(histogram_config));
-
-    MoEExpertDispatchOutput output;
-    auto params = paramsFor(
-        nullptr,
-        nullptr,
-        bucket_rows,
-        top_k,
-        placement({0, 1, 0, 1}),
-        {tier("tier_0", "gpu_domain"),
-         tier("tier_1", "cpu_domain")},
-        &output);
-    params.ticket_storage = ticket_storage;
-    params.routing_evidence_publication =
-        MoEExpertDispatchStage::RoutingEvidencePublication{
-            .histogram = &histogram,
-            .source = ExpertHistogramSource::PrefillChunk,
+        const std::vector<float> indices{
+            3.0f, 1.0f,
+            3.0f, 2.0f,
+            99.0f, 99.0f,
+            99.0f, 99.0f,
         };
+        const std::vector<float> weights{
+            0.75f, 0.25f,
+            0.60f, 0.40f,
+            123.0f, 123.0f,
+            123.0f, 123.0f,
+        };
+        std::copy(
+            indices.begin(), indices.end(), ticket.routing_indices_fp32);
+        std::copy(
+            weights.begin(), weights.end(), ticket.routing_weights_fp32);
 
-    MoEExpertDispatchStage stage(std::move(params));
-    ASSERT_TRUE(stage.execute(ctx_.get()));
+        DecodeExpertHistogramConfig histogram_config;
+        histogram_config.num_layers = 5;
+        histogram_config.num_experts = 4;
+        histogram_config.top_k = top_k;
+        histogram_config.window_size = 8;
+        histogram_config.sockets = {DeviceId::cpu()};
+        histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+            /*num_layers=*/5,
+            /*participant_count=*/1,
+            {0, 0, 0, 0});
+        llaminar2::test::admitObservedExpertDemand(histogram_config,
+            {.target_rows = 8, .max_transaction_rows = bucket_rows, .top_k = top_k}, 1);
+        DecodeExpertHistogram histogram(std::move(histogram_config));
 
-    EXPECT_EQ(output.residency_epoch, 1u);
-    EXPECT_EQ(ticket.header->residency_epoch, 1u);
-    EXPECT_EQ(histogram.windowTokenCount(), 2u);
-    EXPECT_EQ(
-        histogram.layerHistogram(ExpertHistogramSource::PrefillChunk, 4),
-        (std::vector<uint64_t>{0, 1, 1, 2}));
-    EXPECT_EQ(
-        histogram.layerHistogram(ExpertHistogramSource::DecodeToken, 4),
-        (std::vector<uint64_t>{0, 0, 0, 0}));
-    EXPECT_EQ(
-        histogram.layerHistogram(ExpertHistogramSource::GroupedVerifier, 4),
-        (std::vector<uint64_t>{0, 0, 0, 0}));
-    EXPECT_EQ(
-        histogram.layerHistogram(4),
-        (std::vector<uint64_t>{0, 1, 1, 2}));
+        MoEExpertDispatchOutput output;
+        auto params = paramsFor(
+            nullptr,
+            nullptr,
+            bucket_rows,
+            top_k,
+            placement({0, 1, 0, 1}),
+            {tier("tier_0", "gpu_domain"),
+             tier("tier_1", "cpu_domain")},
+            &output);
+        params.ticket_storage = ticket_storage;
+        params.routing_evidence_publication =
+            MoEExpertDispatchStage::RoutingEvidencePublication{
+                .histogram = &histogram,
+                .source = phase,
+            };
 
-    const auto frozen = histogram.freezeAndRotateWindow();
-    ASSERT_TRUE(frozen.valid());
-    EXPECT_EQ(frozen.token_count, 2u);
-    EXPECT_EQ(frozen.source_token_counts[1], 2u);
-    EXPECT_EQ(frozen.source_token_counts[0], 0u);
-    EXPECT_EQ(frozen.source_token_counts[2], 0u);
+        MoEExpertDispatchStage stage(std::move(params));
+        ASSERT_TRUE(stage.execute(ctx_.get()));
+
+        EXPECT_EQ(output.residency_epoch, 1u);
+        EXPECT_EQ(ticket.header->residency_epoch, 1u);
+        const std::vector<uint64_t> expected = logical_rows == 1
+            ? std::vector<uint64_t>{0, 1, 0, 1} : std::vector<uint64_t>{0, 1, 1, 2};
+        EXPECT_EQ(histogram.windowTokenCount(), logical_rows);
+        for (const auto source : {ExpertHistogramSource::DecodeToken,
+                                 ExpertHistogramSource::PrefillChunk,
+                                 ExpertHistogramSource::GroupedVerifier})
+            EXPECT_EQ(histogram.layerHistogram(source, 4),
+                source == phase ? expected
+                                : (std::vector<uint64_t>{0, 0, 0, 0}));
+        EXPECT_EQ(
+            histogram.layerHistogram(4),
+            expected);
+
+        const auto frozen = histogram.freezeAndRotateWindow();
+        ASSERT_TRUE(frozen.valid());
+        EXPECT_EQ(frozen.token_count, logical_rows);
+        EXPECT_EQ(frozen.source_token_counts[expertHistogramProductionSourceIndex(phase)], logical_rows);
+        const auto &demand = frozen.validatedView().transactionDemand();
+        ASSERT_EQ(demand.layerTransactions(4).size(), 1u);
+        EXPECT_EQ(demand.layerTransactions(4)[0].phase, phase);
+        EXPECT_EQ(demand.routes(4, 0).logical_rows, logical_rows);
+        EXPECT_EQ(demand.routes(4, 0).expert_ids[0], 3);
+        EXPECT_EQ(demand.routes(4, 0).expert_ids[logical_rows * top_k - 1], logical_rows == 1 ? 1 : 2);
+    }
 }
 
 TEST_F(
     Test__MoEExpertDispatchStage,
-    CapturedTicketRejectsSpeculativeVerifierEvidenceBeforeAcceptedCommit)
+    CapturedTicketRejectsSyntheticPhaseAsProductionEvidence)
 {
     auto ticket_storage =
         std::make_shared<MoEOverlayDispatchTicketStorage>();
@@ -769,7 +799,7 @@ TEST_F(
     params.routing_evidence_publication =
         MoEExpertDispatchStage::RoutingEvidencePublication{
             .histogram = &histogram,
-            .source = ExpertHistogramSource::GroupedVerifier,
+            .source = ExpertHistogramSource::SyntheticTest,
         };
 
     EXPECT_THROW(

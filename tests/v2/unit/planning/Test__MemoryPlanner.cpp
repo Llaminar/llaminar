@@ -377,7 +377,7 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
             cfg.batch_size);
     constexpr size_t expected_terminal_hidden =
         5120ULL * sizeof(float);
-    const size_t expected_kv = KVCacheMemoryEstimator::estimate(
+    const size_t expected_kv = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         /*n_layers=*/17,
         /*batch_size=*/1,
         /*max_seq_len=*/4096,
@@ -404,7 +404,7 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
         << "Device sequence metadata must remain explicitly accounted.";
 
     const auto logical_prefix =
-        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
             cfg.prefix_cache.block_size,
             profile.n_kv_heads,
             profile.head_dim,
@@ -491,7 +491,7 @@ TEST(Test__MemoryPlanner,
         [](const auto &candidate) { return candidate.device().is_rocm(); });
     ASSERT_NE(replicated, replicated_plan.devices.end());
 
-    const size_t expected_main = KVCacheMemoryEstimator::estimate(
+    const size_t expected_main = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         /*n_layers=*/16,
         cfg.batch_size,
         cfg.max_seq_len,
@@ -499,7 +499,7 @@ TEST(Test__MemoryPlanner,
         profile.head_dim,
         cfg.kv_precision,
         cfg.device);
-    const size_t expected_shifted = KVCacheMemoryEstimator::estimate(
+    const size_t expected_shifted = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         /*n_layers=*/1,
         cfg.batch_size,
         cfg.max_seq_len,
@@ -512,14 +512,14 @@ TEST(Test__MemoryPlanner,
         expected_main + expected_shifted);
 
     const auto main_prefix =
-        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
             cfg.prefix_cache.block_size,
             /*n_kv_heads=*/4,
             profile.head_dim,
             cfg.kv_precision,
             cfg.device);
     const auto shifted_prefix =
-        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
             cfg.prefix_cache.block_size,
             /*n_kv_heads=*/8,
             profile.head_dim,
@@ -552,7 +552,7 @@ TEST(Test__MemoryPlanner,
     ASSERT_NE(sharded, sharded_plan.devices.end());
     EXPECT_EQ(
         sharded->kv_cache_bytes(),
-        expected_main + KVCacheMemoryEstimator::estimate(
+        expected_main + KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
                             /*n_layers=*/1,
                             cfg.batch_size,
                             cfg.max_seq_len,
@@ -851,7 +851,7 @@ TEST(Test__MemoryPlanner,
         resolveCapturedServingGraphMemoryInventory(
             {32, 64, 128},
             retained_mtp);
-    EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, 5u);
+    EXPECT_EQ(cfg.captured_serving_graphs.fixed_executable_count, 6u);
     const MTPGraphOwnerPlan owner_plan(retained_mtp);
     EXPECT_EQ(owner_plan.sidecarGraphSlots(), 21u);
     EXPECT_EQ(owner_plan.terminalHiddenGraphSlots(), 35u);
@@ -877,7 +877,7 @@ TEST(Test__MemoryPlanner,
             cfg.device,
             CapturedGraphExecutableInventory{
                 .model_graph_identity_count =
-                    /*two prefill + decode + prefix bridge + three MTP forwards=*/7u,
+                    /*two prefill + decode + prefix bridge + four MTP forwards=*/8u,
                 .model_graph_topology_variant_count = 1u,
                 .auxiliary_executable_count =
                     owner_plan.generalAuxiliaryExecutableSlotCount(),
@@ -888,7 +888,7 @@ TEST(Test__MemoryPlanner,
         plan.devices.front().captured_graph_bytes(),
         estimateCapturedGraphExecutableBytes(
             cfg.device,
-            /*two prefill + decode + prefix bridge + three MTP forwards=*/7u));
+            /*two prefill + decode + prefix bridge + four MTP forwards=*/8u));
 }
 
 TEST(Test__MemoryPlanner,
@@ -1066,7 +1066,7 @@ TEST(Test__MemoryPlanner,
     ASSERT_NE(terminal, plan.devices.end());
 
     const auto logical_block =
-        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
             first_stage.prefix_cache.block_size,
             profile.n_kv_heads,
             profile.head_dim,
@@ -1090,6 +1090,73 @@ TEST(Test__MemoryPlanner,
             terminal_stage.prefix_cache.device_budget_bytes,
             terminal_block_bytes))
         << "The terminal PP stage must retain the exact full-vocabulary logits slot.";
+}
+
+/**
+ * @brief Hybrid main and shifted MTP caches retain distinct physical Q8 codecs.
+ *
+ * A hybrid model's FA-only pipeline slice still selects the hybrid factory.
+ * The predictor instead selects the attention-only factory even beside a
+ * hybrid main cache. Both admission and prefix staging must retain that fact.
+ */
+TEST(Test__MemoryPlanner, HybridQ8MainAndMTPUseTheirOwnCacheFamilies)
+{
+    const auto profile = createQwen36HybridMTPStateProfile();
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool fa_only_slice : {false, true})
+    {
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ULL << 30;
+        cfg.device_compute_units = 60;
+        cfg.batch_size = 1;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 16;
+        cfg.kv_precision = "q8_1";
+        cfg.mtp_enabled = !fa_only_slice;
+        cfg.prefix_cache = PrefixCacheRuntimeConfig{};
+        cfg.associated_host_memory = PhysicalMemoryResource{
+            .world_rank = -1, .device = DeviceId::cpu(),
+            .total_bytes = 64ULL << 30, .admission_available_bytes = 64ULL << 30};
+        if (fa_only_slice)
+            cfg.first_layer = cfg.last_layer = 3;
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        const auto entry = std::find_if(plan.devices.begin(), plan.devices.end(),
+            [&](const auto &candidate) { return candidate.device() == device; });
+        ASSERT_NE(entry, plan.devices.end());
+        const int fa_layers = fa_only_slice ? 1 : 16;
+        const auto main = KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheFamily::Hybrid, cfg.prefix_cache.block_size,
+            profile.n_kv_heads, profile.head_dim, cfg.kv_precision, device);
+        const auto shifted = KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheFamily::AttentionOnly, cfg.prefix_cache.block_size,
+            profile.n_kv_heads, profile.head_dim, cfg.kv_precision, device);
+        EXPECT_NE(main.k_bytes, shifted.k_bytes);
+        size_t prefix_bytes = fa_layers * main.totalBytes();
+        size_t kv_bytes = KVCacheMemoryEstimator::estimate(KVCacheFamily::Hybrid,
+            fa_layers, 1, cfg.max_seq_len, profile.n_kv_heads,
+            profile.head_dim, cfg.kv_precision, device);
+        size_t staging_bytes = main.totalBytes();
+        if (!fa_only_slice)
+        {
+            const auto gdn = HybridGDNStateGeometry::resolve(profile.n_heads,
+                0, profile.n_heads, profile.gdn_group_count,
+                profile.gdn_time_step_rank, profile.gdn_state_size,
+                profile.gdn_inner_size, profile.gdn_conv_kernel_size);
+            const size_t recurrent = gdn.deviceSerializedPayloadBytes(48);
+            prefix_bytes += recurrent + shifted.totalBytes() +
+                (profile.d_model + profile.vocab_size) * sizeof(float);
+            staging_bytes += recurrent + shifted.totalBytes();
+            kv_bytes += KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+                1, 1, cfg.max_seq_len, profile.n_kv_heads,
+                profile.head_dim, cfg.kv_precision, device);
+        }
+        EXPECT_EQ(entry->kv_cache_bytes(), kv_bytes);
+        EXPECT_EQ(entry->prefix_cache_staging_bytes(), staging_bytes);
+        EXPECT_EQ(entry->prefix_cache_device_hot_bytes(),
+            prefixCacheWholeBlockReservationBytes(
+                cfg.prefix_cache.device_budget_bytes, prefix_bytes));
+    }
 }
 
 TEST(Test__MemoryPlanner,
@@ -2377,4 +2444,87 @@ TEST(Test__MemoryPlanner,
     EXPECT_EQ(
         cpu_bom->bytes(PhysicalMemoryOwner::GraphSnapshotArena),
         0u);
+}
+
+/** @brief Full-cache diagnostics use context and TP geometry, not prompt rows. */
+TEST(Test__MemoryPlanner, EffectiveKVSnapshotCapacityCoversEveryBackendFormatAndTPDegree)
+{
+    auto profile = createTestProfile();
+    profile.n_kv_heads = 8;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const std::string codec : {"fp16", "bf16", "fp32", "q8_1", "tq4", "tq"})
+    for (int shards = 1; shards <= 8; ++shards)
+    {
+        SCOPED_TRACE(device.toString() + " " + codec + " TP=" + std::to_string(shards));
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_total_bytes = cfg.device_free_bytes = 32ull << 30;
+        cfg.device_compute_units = 60;
+        cfg.batch_size = 2;
+        cfg.max_seq_len = 4096;
+        cfg.activation_seq_len = 9;
+        cfg.kv_precision = codec;
+        cfg.total_shards = shards;
+        // Uneven/replicated KV ownership is already resolved by the topology.
+        cfg.local_kv_heads = (profile.n_kv_heads + shards - 1) / shards;
+        cfg.graph_snapshot_memory = {
+            .per_accelerator_bytes = 128,
+            .effective_kv = GraphSnapshotMemoryCapacity::EffectiveKV{
+                .layer = 7, .retained_arena_count = 3}};
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        const std::size_t per_bank = 2u * 4096u * cfg.local_kv_heads * 64u * 2u * sizeof(float);
+        const std::size_t metadata = 2u * 2u * sizeof(std::int32_t);
+        EXPECT_EQ(plan.devices.front().graph_snapshot_bytes(), 128u + 3u * (per_bank + metadata));
+        cfg.graph_snapshot_memory.effective_kv->layer.reset();
+        const auto all = MemoryPlanner::plan(profile, {cfg});
+        EXPECT_EQ(all.devices.front().graph_snapshot_bytes(), 128u + 3u * 24u * (per_bank + metadata));
+    }
+}
+
+/** @brief Absent diagnostics, non-KV roles and recurrent layers add no banks. */
+TEST(Test__MemoryPlanner, EffectiveKVSnapshotSelectionRespectsLayerOwnership)
+{
+    auto profile = createTestProfile();
+    // Tensor metadata takes precedence over the model's periodic layer hint.
+    profile.tensors.erase(std::remove_if(profile.tensors.begin(), profile.tensors.end(),
+        [](const auto &tensor) { return tensor.layer_index == 5; }), profile.tensors.end());
+    profile.full_attention_interval = 4;
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::cuda(0);
+    cfg.device_total_bytes = cfg.device_free_bytes = 32ull << 30;
+    cfg.device_compute_units = 60;
+    cfg.max_seq_len = 16;
+    cfg.graph_snapshot_memory = {
+        .per_accelerator_bytes = 128,
+        .effective_kv = GraphSnapshotMemoryCapacity::EffectiveKV{
+            .layer = 5, .retained_arena_count = 1}};
+    // Query only the FA-containing PP interval, so an unrelated GDN layer's
+    // recurrent dimensions are not part of this minimal fixture's admission.
+    cfg.first_layer = 6;
+    cfg.last_layer = 8;
+    EXPECT_EQ(MemoryPlanner::plan(profile, {cfg}).devices.front().graph_snapshot_bytes(), 128u);
+    cfg.graph_snapshot_memory.effective_kv->layer = 7;
+    EXPECT_GT(MemoryPlanner::plan(profile, {cfg}).devices.front().graph_snapshot_bytes(), 128u);
+    cfg.graph_snapshot_memory.effective_kv.reset();
+    EXPECT_EQ(MemoryPlanner::plan(profile, {cfg}).devices.front().graph_snapshot_bytes(), 128u);
+    cfg.device = DeviceId::cpu();
+    EXPECT_EQ(MemoryPlanner::plan(profile, {cfg}).devices.front().graph_snapshot_bytes(), 0u);
+}
+
+/** @brief Missing inventories and wrapped byte counts cannot pass admission. */
+TEST(Test__MemoryPlanner, EffectiveKVSnapshotRejectsIncompleteOrOverflowingInventory)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::rocm(0);
+    cfg.max_seq_len = 4096;
+    cfg.graph_snapshot_memory = {
+        .per_accelerator_bytes = 128,
+        .effective_kv = GraphSnapshotMemoryCapacity::EffectiveKV{}};
+    EXPECT_THROW(MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
+    cfg.graph_snapshot_memory.effective_kv->retained_arena_count = std::numeric_limits<std::size_t>::max();
+    EXPECT_THROW(MemoryPlanner::plan(profile, {cfg}), std::runtime_error);
+    cfg.graph_snapshot_memory.effective_kv->retained_arena_count = 1;
+    cfg.graph_snapshot_memory.effective_kv->layer = profile.n_layers;
+    EXPECT_THROW(MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
 }

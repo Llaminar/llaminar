@@ -19,6 +19,7 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/prefix_cache/PrefixCacheCoordinator.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "utils/DebugEnv.h"
 
@@ -716,7 +717,7 @@ TEST(Test__PrefixCachePrefillFlow,
     mock_ptr->lookup_result.cache_enabled = true;
     mock_ptr->lookup_result.block_size = 2;
     mock_ptr->lookup_result.cached_tokens = 0;
-    mock_ptr->lookup_result.placement_epoch = 7;
+    mock_ptr->lookup_result.placement_epochs = PrefixPlacementEpochSpan::at(7);
     mock_ptr->runtime_movement_epoch = 7;
     mock_ptr->movement_epoch_after_harvest = 8;
 
@@ -724,22 +725,55 @@ TEST(Test__PrefixCachePrefillFlow,
     ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
 
     const auto probe = runner->prefixStateProbe();
-    EXPECT_EQ(probe.prefix_request.admission_movement_epoch, 7u);
+    EXPECT_EQ(probe.prefix_request.admission_placement_epochs.earliest(), 7u);
     EXPECT_EQ(probe.prefix_request.completion_movement_epoch, 8u);
     EXPECT_TRUE(probe.prefix_request.crossedMovementEpoch());
+}
+
+/**
+ * @brief Publication after lookup must not rewrite that lookup's admission.
+ *
+ * The cache selected epoch seven before the maintenance thread published
+ * eight. Model output may still complete correctly, but harvest can discard
+ * the old archive. Resampling eight during coordination would conceal that
+ * interval and falsely require the following request to restore the archive.
+ */
+TEST(Test__PrefixCachePrefillFlow,
+     MovementAfterLookupCannotRelabelItsAdmission)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.placement_epochs = PrefixPlacementEpochSpan::at(7);
+    mock_ptr->runtime_movement_epoch = 8;
+    mock_ptr->movement_epoch_after_harvest = 8;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    const auto summary = runner->prefixStateProbe().prefix_request;
+    EXPECT_EQ(summary.admission_placement_epochs.earliest(), 7u);
+    EXPECT_EQ(summary.completion_movement_epoch, 8u);
+    EXPECT_TRUE(summary.crossedMovementEpoch());
+    EXPECT_TRUE(summary.movementPrecededAdmissionOf(
+        PrefixCacheRequestSummary{
+            .admission_placement_epochs = PrefixPlacementEpochSpan::at(8),
+            .completion_movement_epoch = 8}));
 }
 
 TEST(Test__PrefixCachePrefillFlow,
      MovementAfterLaterAdmissionCannotExplainThatRequestsLookup)
 {
     const PrefixCacheRequestSummary archived{
-        .admission_movement_epoch = 7,
+        .admission_placement_epochs = PrefixPlacementEpochSpan::at(7),
         .completion_movement_epoch = 7,
     };
     const PrefixCacheRequestSummary restored_then_moved{
         .hit = true,
         .matched_tokens = 17,
-        .admission_movement_epoch = 7,
+        .admission_placement_epochs = PrefixPlacementEpochSpan::at(7),
         .completion_movement_epoch = 8,
     };
 
@@ -748,15 +782,58 @@ TEST(Test__PrefixCachePrefillFlow,
     EXPECT_TRUE(restored_then_moved.crossedMovementEpoch());
 }
 
+/**
+ * @brief A nested TP lookup must retain movement across its child admissions.
+ *
+ * One child obtains epoch seven before publication and its peer obtains eight
+ * afterwards. Harvest at eight correctly discards the first child's stale
+ * archive. Reducing the admission to MAX alone conceals that interval and
+ * incorrectly claims that an immediate cold replay has no movement cause.
+ */
+TEST(Test__PrefixCachePrefillFlow,
+     MovementBetweenParticipantLookupsCannotRelabelOlderAdmission)
+{
+    PrefixLookupResult before_publication;
+    before_publication.supported = true;
+    before_publication.cache_enabled = true;
+    before_publication.block_size = 2;
+    before_publication.placement_epochs = PrefixPlacementEpochSpan::at(7);
+    PrefixLookupResult after_publication = before_publication;
+    after_publication.placement_epochs = PrefixPlacementEpochSpan::at(8);
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    mock->lookup_result = makePrefixLookupResult(
+        coordinatePrefixLookups({
+            makePrefixParticipantLookup(
+                0, DeviceId::cpu(), before_publication, {},
+                PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally),
+            makePrefixParticipantLookup(
+                1, DeviceId::cpu(), after_publication, {},
+                PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally),
+        }),
+        2);
+    mock->runtime_movement_epoch = 8;
+    mock->movement_epoch_after_harvest = 8;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+    const auto summary = runner->prefixStateProbe().prefix_request;
+    EXPECT_EQ(summary.admission_placement_epochs, PrefixPlacementEpochSpan::covering(7, 8));
+    EXPECT_TRUE(summary.crossedMovementEpoch());
+    EXPECT_TRUE(summary.movementPrecededAdmissionOf(
+        PrefixCacheRequestSummary{
+            .admission_placement_epochs = PrefixPlacementEpochSpan::at(8),
+            .completion_movement_epoch = 8}));
+}
+
 TEST(Test__PrefixCachePrefillFlow,
      MovementBeforeLaterAdmissionCanInvalidateAnArchive)
 {
     const PrefixCacheRequestSummary movement_crossed_harvest{
-        .admission_movement_epoch = 7,
+        .admission_placement_epochs = PrefixPlacementEpochSpan::at(7),
         .completion_movement_epoch = 8,
     };
     const PrefixCacheRequestSummary next_after_crossed_harvest{
-        .admission_movement_epoch = 8,
+        .admission_placement_epochs = PrefixPlacementEpochSpan::at(8),
         .completion_movement_epoch = 8,
     };
     EXPECT_TRUE(
@@ -764,15 +841,29 @@ TEST(Test__PrefixCachePrefillFlow,
             next_after_crossed_harvest));
 
     const PrefixCacheRequestSummary archived_before_gap{
-        .admission_movement_epoch = 7,
+        .admission_placement_epochs = PrefixPlacementEpochSpan::at(7),
         .completion_movement_epoch = 7,
     };
     const PrefixCacheRequestSummary next_after_gap{
-        .admission_movement_epoch = 8,
+        .admission_placement_epochs = PrefixPlacementEpochSpan::at(8),
         .completion_movement_epoch = 8,
     };
     EXPECT_TRUE(
         archived_before_gap.movementPrecededAdmissionOf(next_after_gap));
+}
+
+/** @brief Publication between the later request's child lookups precedes its aggregate miss. */
+TEST(Test__PrefixCachePrefillFlow, MovementWithinLaterLookupCanInvalidateAnArchive)
+{
+    const PrefixCacheRequestSummary archived{
+        .admission_placement_epochs = PrefixPlacementEpochSpan::at(7),
+        .completion_movement_epoch = 7,
+    };
+    const PrefixCacheRequestSummary next{
+        .admission_placement_epochs = PrefixPlacementEpochSpan::covering(7, 8),
+        .completion_movement_epoch = 8,
+    };
+    EXPECT_TRUE(archived.movementPrecededAdmissionOf(next));
 }
 
 TEST(Test__PrefixCachePrefillFlow, PrefixHarvestFailureIsFatalToRequest)

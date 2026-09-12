@@ -6,6 +6,8 @@
  * Coordination then clamps all reports to one restorable token boundary and
  * verifies terminal-state availability. Replicated payloads additionally
  * require one identical fingerprint; TP/PP payload slices deliberately do not.
+ * Admission MIN/MAX survive nesting so asynchronous publication between child
+ * lookups cannot be erased by an aggregate's newest observed epoch.
  */
 
 #pragma once
@@ -35,7 +37,7 @@ namespace llaminar2
         std::string domain_id;
         int participant_id = -1;
         DeviceId device = DeviceId::cpu();
-        uint64_t placement_epoch = 0;
+        PrefixPlacementEpochSpan placement_epochs;
         uint64_t fingerprint_key = 0;
         PrefixFingerprintCoordinationPolicy fingerprint_policy =
             PrefixFingerprintCoordinationPolicy::RequireIdentical;
@@ -55,7 +57,7 @@ namespace llaminar2
     struct PrefixCoordinationResult
     {
         std::string domain_id;
-        uint64_t placement_epoch = 0;
+        PrefixPlacementEpochSpan placement_epochs;
         uint64_t fingerprint_key = 0;
         bool supported = false;
         bool cache_enabled = false;
@@ -87,6 +89,15 @@ namespace llaminar2
         virtual bool allMinUInt64(uint64_t local_value, uint64_t *global_value) = 0;
         /** Reduce one unsigned scalar with MAX. */
         virtual bool allMaxUInt64(uint64_t local_value, uint64_t *global_value) = 0;
+        /**
+         * @brief Reduce a complete admission span in one collective round trip.
+         * @param local_value This rank's already-coordinated child admissions.
+         * @param global_value Receives both globally admitted endpoints.
+         * @return Whether the collective completed successfully.
+         */
+        virtual bool allPlacementEpochs(
+            PrefixPlacementEpochSpan local_value,
+            PrefixPlacementEpochSpan *global_value) = 0;
         /** Reduce one boolean with logical AND. */
         virtual bool allAndBool(bool local_value, bool *global_value) = 0;
         /** Reduce one boolean with logical OR. */
@@ -106,6 +117,10 @@ namespace llaminar2
         bool allMinUInt64(uint64_t local_value, uint64_t *global_value) override;
         /** @copydoc IPrefixCollectiveCoordinator::allMaxUInt64 */
         bool allMaxUInt64(uint64_t local_value, uint64_t *global_value) override;
+        /** @copydoc IPrefixCollectiveCoordinator::allPlacementEpochs */
+        bool allPlacementEpochs(
+            PrefixPlacementEpochSpan local_value,
+            PrefixPlacementEpochSpan *global_value) override;
         /** @copydoc IPrefixCollectiveCoordinator::allAndBool */
         bool allAndBool(bool local_value, bool *global_value) override;
         /** @copydoc IPrefixCollectiveCoordinator::allOrBool */
@@ -115,13 +130,23 @@ namespace llaminar2
         MPI_Comm communicator_ = MPI_COMM_NULL;
     };
 
-    /** Build one coordinator record from a participant-local cache lookup. */
+    /**
+     * @brief Preserve the immutable identity of a participant-local lookup.
+     * @param participant_id Logical member of the coordination domain.
+     * @param device Participant that owns the cached payload.
+     * @param hit Completed lookup, including its admitted placement epoch span.
+     * @param domain_id Optional named coordination domain.
+     * @param fingerprint_policy Whether participant payload keys must agree.
+     * @return Coordination record for this lookup, never a later live epoch.
+     *
+     * No epoch override is accepted: movement may publish after lookup and
+     * relabeling the result would conceal a stale-harvest interval.
+     */
     PrefixParticipantLookup makePrefixParticipantLookup(
         int participant_id,
         DeviceId device,
         const PrefixLookupResult &hit,
         std::string domain_id = {},
-        uint64_t placement_epoch = 0,
         PrefixFingerprintCoordinationPolicy fingerprint_policy =
             PrefixFingerprintCoordinationPolicy::RequireIdentical);
 

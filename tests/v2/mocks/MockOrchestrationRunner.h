@@ -2,6 +2,9 @@
  * @file MockOrchestrationRunner.h
  * @brief Mock implementation of IOrchestrationRunner for unit testing
  *
+ * Terminal-observation methods remain separate from live-state probes so
+ * handler tests can reject accidental ledger copies or device inspection.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
@@ -67,7 +70,7 @@ namespace llaminar2::test
             ON_CALL(*this, setDecodeStepTokenBudget(testing::_)).WillByDefault(testing::Return());
             ON_CALL(*this, maybeApplyMoERebalance(testing::_))
                 .WillByDefault(testing::Return(true));
-            ON_CALL(*this, prefixStateProbe()).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
+            ON_CALL(*this, prefixStateProbe(testing::_)).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
             ON_CALL(*this, purgePrefixCache()).WillByDefault(testing::Return(true));
             ON_CALL(*this, inferenceReadiness())
                 .WillByDefault(testing::Return(InferenceReadiness{}));
@@ -116,6 +119,8 @@ namespace llaminar2::test
         MOCK_METHOD(DeviceId, primaryDeviceId, (), (const, override));
         MOCK_METHOD(uint64_t, moeRuntimeMovementEpoch, (), (const, override));
         MOCK_METHOD(MoEOptimizationStatus, moeOptimizationStatus, (), (const, override));
+        /** @return Passive completed ledger; expectations distinguish opt-in export from routine logs. */
+        MOCK_METHOD(MoEOptimizationMovementLedger, moeOptimizationMovementLedger, (), (const, override));
         MOCK_METHOD(InferenceReadiness, inferenceReadiness, (), (const, override));
         MOCK_METHOD(bool, prepareForInference, (), (override));
 
@@ -140,7 +145,9 @@ namespace llaminar2::test
         MOCK_METHOD(void, setSkipLogitsGatherPrefill, (bool skip), (override));
         MOCK_METHOD(std::string, getStopThinkingPrompt, (), (const, override));
         MOCK_METHOD(ToolCallFormat, getToolCallFormat, (), (const, override));
-        MOCK_METHOD(PrefixRuntimeStateSnapshot, prefixStateProbe, (), (const, override));
+        /** @brief Observe the exact per-cache diagnostic policy sent by callers. */
+        MOCK_METHOD(PrefixRuntimeStateSnapshot, prefixStateProbe,
+                    (const PrefixProbeCapturePolicy &capture_policy), (const, override));
         MOCK_METHOD(RequestRuntimeSummary, requestRuntimeSummary, (), (const, override));
 
         // MPI worker coordination

@@ -14,6 +14,20 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Concrete cache construction family, independent of storage precision.
+     *
+     * GPU hybrid caches currently store linear Q8_1 K/V, whereas attention-only
+     * Q8 caches store anchored AQ8 keys. CPU caches use anchored keys in both
+     * families. Every admission caller must name the family explicitly: a dtype
+     * alone is not a complete physical allocation or serialization contract.
+     */
+    enum class KVCacheFamily
+    {
+        AttentionOnly, ///< Ordinary attention and the shifted MTP sidecar.
+        Hybrid,        ///< Main cache with the model's FA/GDN layer mapping.
+    };
+
     /** @brief Native packed bytes for one logical GPU prefix-cache layer. */
     struct GPULogicalKVBlockEstimate
     {
@@ -35,6 +49,7 @@ namespace llaminar2
     public:
         /**
          * @brief Estimate persistent KV-cache ownership for one device.
+         * @param family Concrete cache family selected by production construction.
          * @param n_layers Full-attention layers resident on this device.
          * @param batch_size Maximum concurrent request slots.
          * @param max_seq_len Ring horizon per request.
@@ -50,6 +65,7 @@ namespace llaminar2
          *         represented by `size_t`.
          */
         static std::size_t estimate(
+            KVCacheFamily family,
             int n_layers,
             int batch_size,
             int max_seq_len,
@@ -67,6 +83,7 @@ namespace llaminar2
          * part of a serialized prefix payload and remain in @ref estimate.
          *
          * @param token_count Tokens serialized in the prefix block.
+         * @param family Concrete cache family, not merely the model's family.
          * @param n_kv_heads Participant-local KV head count.
          * @param head_dim Coordinates per head.
          * @param kv_precision Canonical runtime storage precision.
@@ -77,6 +94,7 @@ namespace llaminar2
          * @throws std::overflow_error when byte arithmetic overflows.
          */
         static GPULogicalKVBlockEstimate estimateGPULogicalBlock(
+            KVCacheFamily family,
             int token_count,
             int n_kv_heads,
             int head_dim,

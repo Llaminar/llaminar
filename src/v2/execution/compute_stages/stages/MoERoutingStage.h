@@ -54,8 +54,7 @@ namespace llaminar2
      */
     class MoERoutingStage : public IComputeStage,
                             public IWorkspaceConsumer,
-                            public IMoEGroupedVerifierHistogramPublisher,
-                            public IMoEHostGroupedVerifierHistogramPublisher
+                            public IMoEGroupedVerifierHistogramPublisher
     {
     public:
         struct Params
@@ -76,6 +75,15 @@ namespace llaminar2
             // Layer info for histogram
             int layer_idx = -1;
             DecodeExpertHistogram *decode_histogram = nullptr;
+            /**
+             * @brief Explicit phase of CPU execution evidence, independent of M.
+             *
+             * A one-row MTP predictor is not ordinary decode, and a grouped
+             * verifier is not prefill. CPU callers attaching a histogram must
+             * select a production phase; the test-only sentinel is rejected.
+             * GPU producers use their device ledger or heterogeneous ticket.
+             */
+            ExpertHistogramSource host_routing_source = ExpertHistogramSource::SyntheticTest;
             /**
              * @brief CPU-owned logical rows eligible for routing evidence.
              *
@@ -266,50 +274,6 @@ namespace llaminar2
             int rows_per_request,
             void *producer_stream) override;
 
-        /** @inheritdoc IMoEHostGroupedVerifierHistogramPublisher */
-        [[nodiscard]] bool
-        requiresHostGroupedVerifierHistogramPublication() const noexcept override
-        {
-            return params_.device_id.is_cpu() &&
-                   params_.decode_histogram != nullptr &&
-                   params_.force_decode_equivalent_verifier_prefill;
-        }
-
-        /** @inheritdoc IMoEHostGroupedVerifierHistogramPublisher */
-        [[nodiscard]] int
-        hostGroupedVerifierHistogramLayerIndex() const noexcept override
-        {
-            return params_.layer_idx;
-        }
-
-        /** @inheritdoc IMoEHostGroupedVerifierHistogramPublisher */
-        [[nodiscard]] std::string_view
-        hostGroupedVerifierHistogramPublisherName() const noexcept override
-        {
-            return "moe_router_cpu_grouped_verifier";
-        }
-
-        /**
-         * @brief Validate retained CPU routes against accepted request geometry.
-         *
-         * @copydetails IMoEHostGroupedVerifierHistogramPublisher::validateHostGroupedVerifierHistogramPublication
-         */
-        [[nodiscard]] bool validateHostGroupedVerifierHistogramPublication(
-            const int32_t *accepted_state_counts,
-            int request_count,
-            int rows_per_request,
-            std::string *error) const override;
-
-        /**
-         * @brief Commit accepted CPU verifier prefixes into routing demand.
-         *
-         * @copydetails IMoEHostGroupedVerifierHistogramPublisher::publishHostGroupedVerifierHistograms
-         */
-        bool publishHostGroupedVerifierHistograms(
-            const int32_t *accepted_state_counts,
-            int request_count,
-            int rows_per_request,
-            std::string *error) override;
 
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
@@ -506,19 +470,20 @@ namespace llaminar2
         bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
         void recordRuntimeHistogramTokenBoundary() const;
         /**
-         * @brief Publish one CPU grouped-routing result into Dynamic evidence.
+         * @brief Publish one complete CPU invocation into phase-tagged work evidence.
          *
          * The helper consumes only the leading `host_logical_row_count` rows
          * from `cached_routing_`.  It is deliberately unavailable to GPU
          * execution, whose evidence remains device-owned and is merged by the
          * runtime-table lifecycle at an explicit maintenance boundary.
          *
-         * @param source Workload regime that produced the grouped rows.
+         * The graph supplies host_routing_source; neither row count nor later
+         * MTP acceptance is permitted to guess the phase or split the batch.
          * @return True when no histogram is attached or the complete logical
          *         row prefix was validated and merged; false on any contract
          *         violation.
          */
-        bool publishCPUGroupedRoutingEvidence(ExpertHistogramSource source) const;
+        bool publishCPURoutingEvidence() const;
         void stashRoutingResults(
             const std::vector<int> &expert_indices,
             const std::vector<float> &expert_weights,

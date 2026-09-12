@@ -105,6 +105,9 @@ namespace llaminar2
      *
      * @p d_row_count optionally limits fixed bucket geometry to the request's
      * real resident row count.
+     * An empty cache copies its first input key as its immutable basis, even
+     * if an oversized append evicts it. Non-empty/restored caches preserve the
+     * existing basis; prefill and verifier callers cannot select another rule.
      */
     extern "C" bool hip_tq_quantize_grouped_ring_dynamic(
         const float *d_k_input, const float *d_v_input,
@@ -115,7 +118,6 @@ namespace llaminar2
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
         TurboQuantKVMode mode,
-        AttentionKeyAnchorPolicy anchor_policy,
         hipStream_t stream);
 
     // =========================================================================

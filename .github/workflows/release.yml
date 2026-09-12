@@ -84,17 +84,26 @@ jobs:
           TAG: ${{ needs.release-please.outputs.tag_name }}
           MAJOR: ${{ needs.release-please.outputs.major }}
           MINOR: ${{ needs.release-please.outputs.minor }}
+          CERTIFIED_AVX512: ${{ needs.ci.outputs.image-ref-avx512 }}
+          CERTIFIED_AVX2: ${{ needs.ci.outputs.image-ref-avx2 }}
         run: |
           set -euo pipefail
-          SRC="${REGISTRY}/${IMAGE_NAME}:${TAG}"
-          docker pull "${SRC}"
-          for alias in latest "${MAJOR}" "${MAJOR}.${MINOR}"; do
-            dst="${REGISTRY}/${IMAGE_NAME}:${alias}"
-            docker tag "${SRC}" "${dst}"
-            docker push "${dst}"
+          for isa in AVX512 AVX2; do
+            suffix=""
+            SRC="${CERTIFIED_AVX512}"
+            if [[ "$isa" == AVX2 ]]; then
+              suffix="-avx2"
+              SRC="${CERTIFIED_AVX2}"
+            fi
+            docker pull "${SRC}"
+            for alias in latest "${MAJOR}" "${MAJOR}.${MINOR}"; do
+              dst="${REGISTRY}/${IMAGE_NAME,,}:${alias}${suffix}"
+              docker tag "${SRC}" "${dst}"
+              docker push "${dst}"
+            done
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${SRC}" | awk -F'@' '{print $2}')
+            echo "DIGEST_${isa}=${DIGEST}" >> "${GITHUB_ENV}"
           done
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${SRC}" | awk -F'@' '{print $2}')
-          echo "DIGEST=${DIGEST}" >> "${GITHUB_ENV}"
 
       - name: Attach image reference to release
         env:
@@ -111,9 +120,13 @@ jobs:
           \`\`\`
           docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
           docker pull ${REGISTRY}/${IMAGE_NAME}:latest
+          docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}-avx2
+          docker pull ${REGISTRY}/${IMAGE_NAME}:latest-avx2
           \`\`\`
 
-          Image digest: \`${DIGEST}\`
+          Independently certified image digests:
+          AVX512: \`${DIGEST_AVX512}\`
+          AVX2: \`${DIGEST_AVX2}\`
 
           ### Quick start
 

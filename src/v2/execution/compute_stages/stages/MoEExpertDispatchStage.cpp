@@ -240,11 +240,11 @@ namespace
                 throw std::invalid_argument(
                     "MoE ExpertOverlay routing evidence requires a histogram authority");
             }
-            if (publication.source == ExpertHistogramSource::SyntheticTest ||
-                publication.source == ExpertHistogramSource::GroupedVerifier)
+            if (expertHistogramProductionSourceIndex(publication.source) ==
+                kExpertHistogramProductionSourceCount)
             {
                 throw std::invalid_argument(
-                    "MoE ExpertOverlay dispatch may publish only committed decode or real-prefill evidence");
+                    "MoE ExpertOverlay dispatch requires an explicit production routing phase");
             }
             if (!params_.ticket_storage)
             {
@@ -390,6 +390,24 @@ namespace
             return false;
         }
 
+        uint64_t requested_epoch = 0u;
+        const auto epoch_authority = params_.ticket_storage
+            ? params_.ticket_storage->epochAuthority()
+            : MoEOverlayDispatchEpochAuthority::HostAdmission;
+        try
+        {
+            requested_epoch = resolveMoEOverlayDispatchPlacementEpoch(
+                epoch_authority,
+                epoch_authority == MoEOverlayDispatchEpochAuthority::CapturedRequest
+                    ? params_.ticket_storage->ticket().header->residency_epoch : 0u,
+                runtime_params_.placement_epoch);
+        }
+        catch (const std::logic_error &error)
+        {
+            LOG_ERROR("[MoEExpertDispatchStage] " << error.what());
+            return false;
+        }
+
         const RoutedExpertLayerPlacement *effective_placement =
             &params_.placement.value();
         const std::vector<RoutedExpertTier> *effective_tiers =
@@ -427,8 +445,8 @@ namespace
                     "[MoEExpertDispatchStage] CPU LLEP dispatch has no complete active child publication");
                 return false;
             }
-            if (runtime_params_.hasPinnedPlacementEpoch() &&
-                runtime_params_.placement_epoch !=
+            if (requested_epoch != 0u &&
+                requested_epoch !=
                     cpu_llep_state->durable_parent_epoch)
             {
                 LOG_ERROR(
@@ -464,9 +482,7 @@ namespace
         }
         else if (params_.residency_authority)
         {
-            const uint64_t requested_epoch =
-                runtime_params_.placement_epoch;
-            auto acquired = runtime_params_.hasPinnedPlacementEpoch()
+            auto acquired = requested_epoch != 0u
                                 ? params_.residency_authority
                                       ->tryAcquireTicketSnapshot(
                                           requested_epoch)
@@ -474,7 +490,7 @@ namespace
                                       ->tryAcquireTicketSnapshot();
             if (!acquired.has_value())
             {
-                if (runtime_params_.hasPinnedPlacementEpoch())
+                if (requested_epoch != 0u)
                 {
                     LOG_ERROR(
                         "[MoEExpertDispatchStage] Graph-sequence residency epoch is no longer addressable; requested_epoch="
@@ -523,7 +539,7 @@ namespace
             effective_tiers = &snapshot.placement_plan->routed_tiers;
             effective_owner_map = &snapshot.owner_map;
             residency_epoch = snapshot.epoch;
-            if (runtime_params_.hasPinnedPlacementEpoch() &&
+            if (requested_epoch != 0u &&
                 residency_epoch != requested_epoch)
             {
                 LOG_ERROR(
@@ -759,13 +775,13 @@ namespace
         if (!publishRoutingEvidence(logical_seq_len))
             return false;
 
-        if (params_.ticket_storage)
+        if (params_.ticket_storage &&
+            epoch_authority == MoEOverlayDispatchEpochAuthority::HostAdmission)
         {
             /*
-             * Publish the epoch actually used by this dispatch. The fixed
-             * ticket storage is replayed, so an older non-zero value may be
-             * present when the producer begins; the sequence runtime binding,
-             * not that reusable field, is the admission authority.
+             * Only host admission authors this result field. A device-admitted
+             * ticket already carries the request's epoch and must remain an
+             * immutable input until the sparse return releases its lease.
              */
             params_.ticket_storage->ticket().header->residency_epoch =
                 result.residency_epoch;

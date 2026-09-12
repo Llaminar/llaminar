@@ -1055,6 +1055,96 @@ TEST(Test__SnapshotCapture_Capture, MTPEmbeddingAllreduceUsesReducedSemanticName
            "schema-facing snapshot key";
 }
 
+/**
+ * @brief Complete embedding publication replaces a local vocabulary partial.
+ *
+ * A token outside this participant's vocabulary produces a valid zero partial.
+ * The existing collective, not a value-dependent rank selector, completes the
+ * semantic embedding. Retain the previous immutable observation and prove that
+ * depth/context naming and producer discovery reach the same completed bytes.
+ */
+TEST(Test__SnapshotCapture_Capture, EmbeddingFinalizerOwnsCanonicalValue)
+{
+    std::vector<std::string> stages = {"embedding"};
+    for (int depth = 0; depth <= 15; ++depth)
+    {
+        stages.push_back("mtp" + std::to_string(depth) + "_embedding");
+        stages.push_back("MTP" + std::to_string(depth) + "_embedding");
+    }
+    for (const auto &stage : stages)
+    for (const std::string context : {"", "mtp_primary::", "mtp_chained_draft::"})
+    for (const bool owns_token : {false, true})
+    {
+        SCOPED_TRACE(stage + " context=" + context + " owns=" + std::to_string(owns_token));
+        const std::vector<float> complete = {1.0f, -2.0f, 3.0f, -4.0f};
+        const std::vector<float> partial = owns_token ? complete : std::vector<float>(4, 0.0f);
+        std::string canonical = SnapshotCapture::convertStageNameToSnapshotKey(stage);
+        if (!context.empty())
+        {
+            std::string prefix = context.substr(0, context.size() - 2);
+            std::transform(prefix.begin(), prefix.end(), prefix.begin(),
+                [](unsigned char value) { return static_cast<char>(std::toupper(value)); });
+            canonical = prefix + "_" + canonical;
+        }
+        SnapshotCapture capture;
+        capture.captureStage(context + stage,
+            makeSingleOutputDump("output", partial.data(), 2, 2));
+        auto before = capture.getShared(canonical);
+        ASSERT_TRUE(before);
+        EXPECT_EQ(before->publication, SnapshotPublication::SchemaPartition);
+
+        const auto producer = context + stage + "_allreduce";
+        const auto dump = makeSingleOutputDump("output", complete.data(), 2, 2);
+        for (const auto &keys : {SnapshotCapture::possibleKeysForStageName(producer),
+                                SnapshotCapture::possibleKeysForStage(producer, dump)})
+        {
+            EXPECT_NE(std::find(keys.begin(), keys.end(), canonical), keys.end())
+                << "A canonical-only filter must select its collective producer";
+        }
+        capture.captureStage(producer, dump);
+        auto after = capture.getShared(canonical);
+        ASSERT_TRUE(after);
+        EXPECT_EQ(after->publication, SnapshotPublication::CompleteValue);
+        EXPECT_EQ(after->data, complete);
+        EXPECT_EQ(before->data, partial);
+        EXPECT_EQ(before->publication, SnapshotPublication::SchemaPartition);
+        EXPECT_EQ(after.get(), capture.getShared(canonical + "_ALLREDUCED").get())
+            << "The two names must share one immutable payload, not duplicate bytes";
+        EXPECT_NE(after.get(), before.get());
+        capture.clear();
+        EXPECT_FALSE(capture.getShared(canonical));
+        EXPECT_EQ(after->data, complete) << "Retained readers own their publication lifetime";
+    }
+}
+
+/** @brief Completeness and alias lifetime are independent of floating payload encoding. */
+TEST(Test__SnapshotCapture_Capture, EmbeddingFinalizerPreservesFloatingPayloads)
+{
+    const std::vector<float> values = {1.0f, -2.0f, 4.0f, -8.0f};
+    for (const std::string dtype : {"FP32", "FP16", "BF16"})
+    {
+        SCOPED_TRACE(dtype);
+        std::vector<uint16_t> narrow;
+        for (const float value : values)
+            narrow.push_back(dtype == "BF16" ? simd::fp32_to_bf16(value) : fp32_to_fp16(value));
+        auto dump = makeSingleOutputDump("output", values.data(), 2, 2);
+        auto &output = dump.outputs.front();
+        output.dtype = dtype.c_str();
+        if (dtype != "FP32")
+        {
+            output.data = narrow.data();
+            output.element_size = sizeof(uint16_t);
+        }
+        SnapshotCapture capture;
+        capture.captureStage("mtp0_embedding_allreduce", dump);
+        const auto complete = capture.getShared("MTP0_EMBEDDING");
+        ASSERT_TRUE(complete);
+        EXPECT_EQ(complete->data, values);
+        EXPECT_EQ(complete->publication, SnapshotPublication::CompleteValue);
+        EXPECT_EQ(complete.get(), capture.getShared("MTP0_EMBEDDING_ALLREDUCED").get());
+    }
+}
+
 TEST(Test__SnapshotCapture_Capture, GDNProjectionSplitsAlphaAndBeta)
 {
     std::vector<float> qkv = {1.0f, 2.0f};
@@ -1520,6 +1610,51 @@ TEST_F(Test__SnapshotCapture_Routing, KeysReturnsAllKeys)
 // =========================================================================
 // Test: StoredSnapshot shape metadata
 // =========================================================================
+
+/**
+ * @brief Finalizer completeness survives immutable replacement and chunk joins.
+ *
+ * The same semantic key can first denote an expert partial and later a whole
+ * routed row. Old readers retain their old contract; new readers get the
+ * finalizer's contract. A prefill cannot concatenate unlike publications.
+ */
+TEST(Test__SnapshotCapture_Capture, CompletePublicationSurvivesCaptureAndChunks)
+{
+    const std::vector<float> data = {1, 2, 3, 4};
+    for (const char *finalizer : {"shared_expert_gate", "moe_canonical_publication_finalize"})
+    {
+        SnapshotCapture capture;
+        capture.captureStage("MTP0_moe_expert_ffn",
+            makeSingleOutputDump("output", data.data(), 2, 2));
+        auto partial = capture.getShared("MTP0_MOE_EXPERT_OUTPUT");
+        ASSERT_TRUE(partial);
+        capture.captureStage(std::string("MTP0_") + finalizer,
+            makeSingleOutputDump("routed_output", data.data(), 2, 2));
+        auto complete = capture.getShared("MTP0_MOE_EXPERT_OUTPUT");
+        ASSERT_TRUE(complete);
+        EXPECT_EQ(partial->publication, SnapshotPublication::SchemaPartition);
+        EXPECT_EQ(complete->publication, SnapshotPublication::CompleteValue);
+        EXPECT_EQ(complete->data, data);
+        for (int chunk = 0; chunk < 2; ++chunk)
+            capture.captureStage("chunk" + std::to_string(chunk) + "::layer0_" + finalizer,
+                makeSingleOutputDump("routed_output", data.data(), 2, 2));
+        const std::vector<SnapshotChunkSequencePart> chunks = {
+            {.context = "chunk0", .logical_rows = 2},
+            {.context = "chunk1", .logical_rows = 2}};
+        auto joined = capture.aggregateSequentialChunkSnapshots(chunks);
+        ASSERT_TRUE(joined) << joined.error;
+        auto sequence = capture.getShared("layer0_MOE_EXPERT_OUTPUT");
+        ASSERT_TRUE(sequence);
+        EXPECT_EQ(sequence->rows, 4u);
+        EXPECT_EQ(sequence->publication, SnapshotPublication::CompleteValue);
+
+        capture.captureStage("chunk1::layer0_moe_expert_ffn",
+            makeSingleOutputDump("output", data.data(), 2, 2));
+        auto invalid = capture.aggregateSequentialChunkSnapshots(chunks);
+        EXPECT_FALSE(invalid);
+        EXPECT_NE(invalid.error.find("inconsistent chunk"), std::string::npos);
+    }
+}
 
 TEST_F(Test__SnapshotCapture_Routing, ShapeMetadataPreserved)
 {

@@ -35,6 +35,7 @@
 #include "kernels/IMoEKernel.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/Logger.h"
+#include "utils/Assertions.h"
 
 #include <algorithm>
 #include <atomic>
@@ -222,6 +223,9 @@ namespace llaminar2
         if (!admission_open || phase_index >= pending_tokens_.size())
             return {};
 
+        // This mutex never participates in inference notification. It prevents
+        // a diagnostic reader from pairing a reset counter with its old epoch.
+        std::lock_guard lock(observation_mutex_);
         const std::uint64_t required_tokens =
             required_tokens_.load(std::memory_order_acquire);
         auto &pending = pending_tokens_[phase_index];
@@ -234,6 +238,10 @@ namespace llaminar2
                     std::memory_order_acq_rel,
                     std::memory_order_acquire))
             {
+                if (consumed_windows_ == std::numeric_limits<std::uint64_t>::max())
+                    LLAMINAR_UNREACHABLE(
+                        "ExpertOverlay maintenance observation generation overflowed");
+                ++consumed_windows_;
                 return {
                     .phase = phase,
                     .completed_tokens = observed,
@@ -268,6 +276,7 @@ namespace llaminar2
         double growth_factor,
         MoEOverlayMaintenanceCadenceReceipt receipt) noexcept
     {
+        std::lock_guard lock(observation_mutex_);
         const std::uint64_t current =
             required_tokens_.load(std::memory_order_acquire);
         if (!receipt.permitsCooldown() || maximum_tokens == 0u ||
@@ -299,6 +308,33 @@ namespace llaminar2
         return {
             pending_tokens_[0].load(std::memory_order_acquire),
             pending_tokens_[1].load(std::memory_order_acquire),
+        };
+    }
+
+    MoEOptimizationDemandWindow
+    MoEOverlayMaintenanceBoundaryGate::demandWindow(
+        std::array<std::uint64_t, 2> queued_tokens) const
+    {
+        std::lock_guard lock(observation_mutex_);
+        const auto capacity = required_tokens_.load(std::memory_order_acquire);
+        auto occupied = pendingTokens();
+        for (std::size_t phase = 0u; phase < occupied.size(); ++phase)
+        {
+            // A coalesced batch may exceed its decision threshold. Headroom is
+            // already zero there; clamp this projection, never the real gate.
+            occupied[phase] = std::min(occupied[phase], capacity);
+            occupied[phase] += std::min(
+                queued_tokens[phase], capacity - occupied[phase]);
+        }
+        const bool decode_limits = occupied[1] > occupied[0];
+        return {
+            .generation = consumed_windows_,
+            .collected_routed_rows = occupied[decode_limits ? 1u : 0u],
+            .capacity_routed_rows = capacity,
+            .scope = decode_limits
+                         ? MoEOptimizationDemandScope::DecodeCadence
+                         : MoEOptimizationDemandScope::PrefillCadence,
+            .pending_submission_rows = queued_tokens[decode_limits ? 1u : 0u],
         };
     }
 
@@ -954,6 +990,36 @@ namespace llaminar2
         (void)stopAndDrain();
     }
 
+    MoEOverlayDeviceControllerDrainIntent
+    agreeMoEOverlayDeviceControllerDrainIntent(
+        const IMPIContext &context,
+        MoEOverlayDeviceControllerDrainIntent local_intent)
+    {
+        if (context.world_size() <= 0 || context.rank() < 0 ||
+            context.rank() >= context.world_size())
+            throw std::logic_error("Overlay drain has invalid communicator membership");
+
+        const auto local = static_cast<std::uint8_t>(local_intent);
+        std::vector<std::uint8_t> intents(
+            static_cast<std::size_t>(context.world_size()));
+        context.allgather_bytes(&local, intents.data(), sizeof(local));
+        auto result = MoEOverlayDeviceControllerDrainIntent::ReleaseResources;
+        for (const auto value : intents)
+        {
+            switch (static_cast<MoEOverlayDeviceControllerDrainIntent>(value))
+            {
+            case MoEOverlayDeviceControllerDrainIntent::ReleaseResources:
+                break;
+            case MoEOverlayDeviceControllerDrainIntent::RestorePreparedContext:
+                result = MoEOverlayDeviceControllerDrainIntent::RestorePreparedContext;
+                break;
+            default:
+                throw std::logic_error("Overlay drain received an invalid rank intent");
+            }
+        }
+        return result;
+    }
+
     MoEOverlayDeviceControllerDrainResult
     MoEOverlayDeviceControllerGraphService::stopAndDrain(
         MoEOverlayDeviceControllerDrainIntent intent) noexcept
@@ -1020,9 +1086,13 @@ namespace llaminar2
              * join a transaction that a faster peer already admitted. A
              * local jthread cancellation is not a distributed protocol edge.
              */
+            // This all-rank rendezvous replaces the admission barrier. A peer
+            // retaining its model still needs our physical transfer endpoints,
+            // even when this rank will discard its own prepared context.
+            intent = agreeMoEOverlayDeviceControllerDrainIntent(
+                *config_.mpi_ctx, intent);
             dynamic_worker_->drain_intent.store(
                 intent, std::memory_order_release);
-            config_.mpi_ctx->barrier();
             const auto drain_request = dynamic_worker_->drain.request();
             dynamic_worker_->wake_cv.notify_all();
 
@@ -2256,7 +2326,8 @@ namespace llaminar2
     }
 
     MoEOptimizationStatus
-    MoEOverlayDeviceControllerGraphService::optimizationStatus() const
+    MoEOverlayDeviceControllerGraphService::optimizationStatus(
+        std::array<std::uint64_t, 2> queued_tokens) const
     {
         const auto activation_state = state();
         if (activation_state ==
@@ -2313,6 +2384,12 @@ namespace llaminar2
             config_.fabric->demandHistogramsRebased())
         {
             status.state = MoEOptimizationLifecycleState::Active;
+            // Read headroom before activity: consuming a window first marks
+            // the worker non-quiescent, so an empty successor cannot inherit
+            // a stale CollectingDemand observation from its predecessor.
+            if (dynamic_worker_)
+                status.demand_window =
+                    dynamic_worker_->boundary_gate.demandWindow(queued_tokens);
             status.activity = dynamic_worker_
                                   ? dynamic_worker_->activity.load(
                                         std::memory_order_acquire)
@@ -4784,6 +4861,7 @@ namespace llaminar2
                 .command_count = batch.command_count,
                 .cycle_count = static_cast<std::uint64_t>(
                     batch.migration_cycles.size()),
+                .proof = MoEOptimizationTimeEconomy{
                 .projected_service_gain_ns =
                     command.header.projected_service_gain_ns,
                 .projected_transfer_and_repack_ns =
@@ -4792,6 +4870,7 @@ namespace llaminar2
                     command.header.projected_inference_interference_ns,
                 .projected_net_benefit_ns =
                     command.header.projected_net_benefit_ns,
+                },
             };
             if (!completed_economy->valid())
             {

@@ -78,6 +78,10 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
 
+        /** @copydoc IKVCache::describeDeviceReadStorage */
+        std::optional<DeviceReadStorage> describeDeviceReadStorage(
+            const DeviceReadStorageRequest &request) const override;
+
         /**
          * @brief Dequantize independent TQ rings from device-owned metadata.
          *

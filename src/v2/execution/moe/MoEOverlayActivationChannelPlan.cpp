@@ -383,6 +383,9 @@ namespace llaminar2
                     .d_model = input.d_model,
                     .activation_graph_family_count =
                         input.graph_family_count,
+                    .return_layout = source->device.is_cpu()
+                        ? MoEOverlayReturnLayout::CanonicalExpertRoutes
+                        : MoEOverlayReturnLayout::ParticipantTokenPartials,
                 });
             auto &source_host_bytes = charge_by_resource[PhysicalKey{
                 source->world_rank, DeviceId::cpu()}];

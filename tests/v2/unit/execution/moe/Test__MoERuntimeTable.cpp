@@ -1,12 +1,16 @@
 /**
  * @file Test__MoERuntimeTable.cpp
  * @brief Unit tests for graph-facing MoE runtime placement tables.
+ *
+ * Device-free snapshots exercise publication and movement-evidence contracts,
+ * including reused empty waves and logical assignments with no payload copy.
  */
 
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DecodeExpertHistogram.h"
+#include "execution/moe/DeviceMoERebalanceMovementJournal.h"
 
 #include <gtest/gtest.h>
 
@@ -15,10 +19,222 @@
 #endif
 
 #include <cstdint>
+#include <array>
 #include <stdexcept>
 
 namespace llaminar2::test
 {
+    /** @return A paid swap that improves serial layers despite cancelling totals. */
+    static DeviceMoERebalanceLoadSpreadProof journalProof()
+    {
+        return {.accepted_spread_improvement = 40, .pre_wave_spread = 100,
+            .post_wave_spread = 60, .pre_wave_total = 200, .post_wave_total = 200,
+            .pre_participant_spread = 0, .post_participant_spread = 20,
+            .pre_participant_total = 200, .post_participant_total = 200,
+            .requested_payload_slots = 1, .minimum_improvement_per_slot = 40,
+            .maximum_post_spread_per_mille = 300, .ownership_swap_accepts = 1};
+    }
+
+    /** Preparation/abandonment never advertises movement; commit is exact-once. */
+    TEST(Test__MoERuntimeTable, NativeMovementJournalPublishesWholeImmutableWaves)
+    {
+        DeviceMoERebalanceMovementJournalState state;
+        std::array<DeviceMoERebalanceMovementWave, 2> waves{};
+        std::array<DeviceMoERebalanceMovementEdge, 4> edges{};
+        const DeviceMoERebalanceMovementJournalView view{
+            &state, waves.data(), edges.data(), 2, 4};
+        auto proof = journalProof();
+        const auto abandoned = prepareDeviceMoEMovementJournalAppend(view, 2, 1, 2, proof, 6144);
+        EXPECT_EQ(abandoned.disposition, DeviceMoEMovementJournalDisposition::Record);
+        EXPECT_EQ(state.committed_waves, 0u);
+        EXPECT_EQ(state.committed_edges, 0u);
+        // Preparing again after an abandoned candidate consumes no space. The
+        // proof value is sealed, so mutable planner scratch cannot replace it.
+        const auto first = prepareDeviceMoEMovementJournalAppend(view, 3, 2, 2, proof, 6144);
+        edges[first.first_edge] = {.layer = 0, .expert = 7,
+            .source_participant = 0, .destination_participant = 1,
+            .activation_count = 100, .estimated_weight_bytes = 4096};
+        edges[first.first_edge + 1] = {.layer = 0, .expert = 8,
+            .source_participant = 1, .destination_participant = 0,
+            .activation_count = 20, .estimated_weight_bytes = 4096};
+        proof.accepted_spread_improvement = 99;
+        ASSERT_TRUE(commitDeviceMoEMovementJournalAppend(view, first));
+        EXPECT_EQ(waves[0].proof.accepted_spread_improvement, 40u);
+        EXPECT_EQ(waves[0].candidate_epoch, 3u);
+        EXPECT_EQ(waves[0].command_epoch, 2u);
+        EXPECT_EQ(waves[0].physical_payload_bytes, 6144u);
+        EXPECT_EQ(state.committed_edges, 2u);
+        EXPECT_FALSE(commitDeviceMoEMovementJournalAppend(view, first));
+        EXPECT_FALSE(commitDeviceMoEMovementJournalAppend(view, abandoned));
+        EXPECT_EQ(state.committed_edges, 2u);
+        // Request-local command epochs may restart; the durable selector does
+        // not. This identity is safe to append to a model-lifetime archive.
+        const auto second = prepareDeviceMoEMovementJournalAppend(view, 4, 1, 2, proof, 4096);
+        ASSERT_TRUE(commitDeviceMoEMovementJournalAppend(view, second));
+        EXPECT_EQ(waves[1].first_edge, 2u);
+        EXPECT_EQ(waves[1].edge_count, 2u);
+        EXPECT_EQ(state.committed_waves, 2u);
+        EXPECT_EQ(edges[waves[0].first_edge].expert, 7u);
+        EXPECT_EQ(edges[waves[0].first_edge + 1].expert, 8u);
+        EXPECT_EQ(edges[0].activation_count, 100u);
+        EXPECT_EQ(edges[0].estimated_weight_bytes, 4096u);
+    }
+
+    /** Exhaustion is sticky, nonblocking, and cannot wrap into complete evidence. */
+    TEST(Test__MoERuntimeTable, NativeMovementJournalNeverOverwritesOrPublishesPartialWaves)
+    {
+        for (const bool wave_limited : {false, true})
+        {
+            DeviceMoERebalanceMovementJournalState state;
+            std::array<DeviceMoERebalanceMovementWave, 2> waves{};
+            std::array<DeviceMoERebalanceMovementEdge, 4> edges{};
+            const DeviceMoERebalanceMovementJournalView view{
+                &state, waves.data(), edges.data(), wave_limited ? 1u : 2u,
+                wave_limited ? 4u : 3u};
+            const auto first = prepareDeviceMoEMovementJournalAppend(view, 2, 1, 2, journalProof(), 4096);
+            ASSERT_TRUE(commitDeviceMoEMovementJournalAppend(view, first));
+            const auto full = prepareDeviceMoEMovementJournalAppend(view, 3, 2, 2, journalProof(), 4096);
+            EXPECT_EQ(full.disposition, DeviceMoEMovementJournalDisposition::Exhausted);
+            ASSERT_TRUE(commitDeviceMoEMovementJournalAppend(view, full));
+            EXPECT_EQ(state.committed_edges, 2u);
+            EXPECT_EQ(state.committed_waves, 1u);
+            EXPECT_EQ(waves[0].candidate_epoch, 2u);
+            EXPECT_EQ(state.discarded_edges, 2u);
+            EXPECT_EQ(state.discarded_waves, 1u);
+            EXPECT_EQ(state.last_candidate_epoch, 3u);
+            EXPECT_FALSE(commitDeviceMoEMovementJournalAppend(view, full));
+            state.discarded_edges = UINT64_MAX;
+            state.discarded_waves = UINT64_MAX;
+            const auto saturated = prepareDeviceMoEMovementJournalAppend(view, 4, 3, 2, journalProof(), 4096);
+            ASSERT_TRUE(commitDeviceMoEMovementJournalAppend(view, saturated));
+            EXPECT_EQ(state.discarded_edges, UINT64_MAX);
+            EXPECT_EQ(state.discarded_waves, UINT64_MAX);
+        }
+    }
+
+    /** Corrupt binding, identity, arithmetic, or prefix cannot reserve live bytes. */
+    TEST(Test__MoERuntimeTable, NativeMovementJournalRejectsInvalidBindingsAndPolicy)
+    {
+        DeviceMoERebalanceMovementJournalState state;
+        DeviceMoERebalanceMovementWave wave;
+        std::array<DeviceMoERebalanceMovementEdge, 2> edges{};
+        const DeviceMoERebalanceMovementJournalView good{&state, &wave, edges.data(), 1, 2};
+        for (int fault = 0; fault < 11; ++fault)
+        {
+            auto view = good;
+            auto proof = journalProof();
+            state = {};
+            std::uint64_t candidate = 2;
+            std::uint32_t epoch = 1;
+            std::uint64_t payload_bytes = 4096;
+            switch (fault)
+            {
+            case 0: view.state = nullptr; break;
+            case 1: view.waves = nullptr; break;
+            case 2: view.edges = nullptr; break;
+            case 3: view.edge_capacity = 0; break;
+            case 4: state.committed_edges = 3; break;
+            case 5: state.committed_waves = 1; break;
+            case 6: candidate = 0; break;
+            case 7: epoch = 0; break;
+            case 8: proof.post_wave_total += 1; break;
+            case 9: proof.ownership_swap_accepts = UINT32_MAX; break;
+            case 10: payload_bytes = 0; break;
+            }
+            SCOPED_TRACE(fault);
+            const auto invalid = prepareDeviceMoEMovementJournalAppend(view, candidate, epoch, 2, proof, payload_bytes);
+            EXPECT_EQ(invalid.disposition, DeviceMoEMovementJournalDisposition::Invalid);
+            EXPECT_FALSE(commitDeviceMoEMovementJournalAppend(view, invalid));
+        }
+    }
+
+    /** Equal counters do not authorize a reservation to publish into another arena. */
+    TEST(Test__MoERuntimeTable, NativeMovementJournalRejectsEveryReboundStorageComponent)
+    {
+        DeviceMoERebalanceMovementJournalState state, peer_state;
+        std::array<DeviceMoERebalanceMovementWave, 2> waves{}, peer_waves{};
+        std::array<DeviceMoERebalanceMovementEdge, 4> edges{}, peer_edges{};
+        const DeviceMoERebalanceMovementJournalView original{&state, waves.data(), edges.data(), 2, 4};
+        const auto append = prepareDeviceMoEMovementJournalAppend(original, 2, 1, 2, journalProof(), 4096);
+        for (int component = 0; component < 5; ++component)
+        {
+            auto rebound = original;
+            switch (component)
+            {
+            case 0: rebound.state = &peer_state; break;
+            case 1: rebound.waves = peer_waves.data(); break;
+            case 2: rebound.edges = peer_edges.data(); break;
+            case 3: rebound.wave_capacity = 1; break;
+            case 4: rebound.edge_capacity = 2; break;
+            }
+            SCOPED_TRACE(component);
+            EXPECT_FALSE(commitDeviceMoEMovementJournalAppend(rebound, append));
+            EXPECT_EQ(state.committed_waves, 0u);
+            EXPECT_EQ(peer_state.committed_waves, 0u);
+        }
+        EXPECT_TRUE(commitDeviceMoEMovementJournalAppend(original, append));
+    }
+
+    /** Every edge in a native capacity exchange must have its reciprocal peer. */
+    TEST(Test__MoERuntimeTable, NativeMovementPairsRejectMalformedOwnershipCycles)
+    {
+        constexpr auto ownership = static_cast<std::uint32_t>(DeviceMoERebalancePlanOp::OwnershipTransfer);
+        const DeviceMoERebalancePlanEntry outgoing{.op = ownership, .layer = 1u,
+            .expert = 2u, .source_participant = 3u, .destination_participant = 1u};
+        const DeviceMoERebalancePlanEntry returning{.op = ownership, .layer = 1u,
+            .expert = 4u, .source_participant = 1u, .destination_participant = 3u};
+        EXPECT_TRUE(nativeMovementPairValid(outgoing, returning, 2u, 5u, 4u, ownership));
+        for (int fault = 0; fault < 10; ++fault)
+        {
+            auto a = outgoing;
+            auto b = returning;
+            switch (fault)
+            {
+            case 0: a.op = 0u; break;
+            case 1: b.op = 2u; break;
+            case 2: a.layer = 2u; break;
+            case 3: b.layer = 0u; break;
+            case 4: a.expert = 5u; break;
+            case 5: b.expert = 5u; break;
+            case 6: b.expert = a.expert; break;
+            case 7: a.source_participant = 4u; break;
+            case 8: a.destination_participant = a.source_participant; break;
+            case 9: b.destination_participant = 2u; break;
+            }
+            SCOPED_TRACE(fault);
+            EXPECT_FALSE(nativeMovementPairValid(a, b, 2u, 5u, 4u, ownership));
+        }
+    }
+
+    /** Validate every original admission predicate, including representable bounds. */
+    TEST(Test__MoERuntimeTable, NativeLoadProofRetainsPolicyUnitsAndOverflowSafety)
+    {
+        const auto good = journalProof();
+        ASSERT_TRUE(good.valid());
+        for (int fault = 0; fault < 7; ++fault)
+        {
+            auto proof = good;
+            switch (fault)
+            {
+            case 0: proof.requested_payload_slots = 0; break;
+            case 1: proof.ownership_swap_accepts = 0; break;
+            case 2: proof.accepted_spread_improvement -= 1; break;
+            case 3: proof.post_wave_spread = proof.pre_wave_spread; break;
+            case 4: proof.post_wave_total += 1; break;
+            case 5: proof.post_participant_total += 1; break;
+            case 6: proof.maximum_post_spread_per_mille -= 1; break;
+            }
+            SCOPED_TRACE(fault);
+            EXPECT_FALSE(proof.valid());
+        }
+        auto huge = good;
+        huge.pre_wave_total = huge.post_wave_total = UINT64_MAX / 300u + 1u;
+        EXPECT_TRUE(huge.valid()) << "A large RHS must not wrap into a false rejection";
+        huge.post_wave_spread = UINT64_MAX / 1000u + 1u;
+        huge.pre_wave_spread = huge.post_wave_spread + 1u;
+        EXPECT_FALSE(huge.valid()) << "An unrepresentable LHS still fails the native policy";
+    }
+
     namespace
     {
         DeviceNativeVNNIMatrixDesc matrixDesc(uintptr_t base, int n, int k)
@@ -621,14 +837,84 @@ namespace llaminar2::test
             << "No-work waves must not look like empty payload-bucket transfers.";
     }
 
+    /** @brief Only the exact fully prepared wave can cross durable publication. */
+    TEST(Test__MoERuntimeTable, DurablePublicationAuthenticatesPreparedWave)
+    {
+        DeviceMoERebalanceGraphControllerState controller{};
+        controller.participant_count = 2u;
+        std::array<DeviceMoERebalanceCommandBufferHeader, 2> headers{};
+        auto &wave = controller.waves[1];
+        wave.epoch = 19u;
+        wave.state = static_cast<std::uint32_t>(
+            DeviceMoERebalanceWaveLifecycle::PreparedForPublication);
+        wave.command_count = 2u;
+        wave.planned_layer_count = wave.applied_layer_count = 3u;
+        headers[1].epoch = wave.epoch;
+        headers[1].command_count = headers[1].command_capacity = 2u;
+        headers[1].participant_count = 2u;
+        DeviceMoERebalanceApplyStatus apply{};
+        apply.changed_layers = 3u;
+        apply.transaction_wave_index = 1u;
+        apply.transaction_epoch = wave.epoch;
+        apply.transaction_command_count = 2u;
+        const auto valid = [&]
+        {
+            return moe_rebalance_publication::preparedWaveMatches(
+                &controller, headers.data(), 2u, &apply);
+        };
+        ASSERT_TRUE(valid());
+        for (const auto state : {DeviceMoERebalanceWaveLifecycle::Idle,
+                                 DeviceMoERebalanceWaveLifecycle::ReadyToApply,
+                                 DeviceMoERebalanceWaveLifecycle::Applying,
+                                 DeviceMoERebalanceWaveLifecycle::Applied,
+                                 DeviceMoERebalanceWaveLifecycle::Error})
+        {
+            wave.state = static_cast<std::uint32_t>(state);
+            EXPECT_FALSE(valid());
+        }
+        wave.state = static_cast<std::uint32_t>(
+            DeviceMoERebalanceWaveLifecycle::PreparedForPublication);
+        --wave.applied_layer_count;
+        EXPECT_FALSE(valid());
+        ++wave.applied_layer_count;
+        ++headers[1].epoch;
+        EXPECT_FALSE(valid());
+        --headers[1].epoch;
+        --headers[1].command_capacity;
+        EXPECT_FALSE(valid());
+        ++headers[1].command_capacity;
+        --apply.transaction_command_count;
+        EXPECT_FALSE(valid());
+        ++apply.transaction_command_count;
+        apply.transaction_wave_index = 2u;
+        EXPECT_FALSE(valid());
+        apply.transaction_wave_index = 1u;
+        controller.last_error_code = 1u;
+        EXPECT_FALSE(valid());
+        controller.last_error_code = 0u;
+        EXPECT_FALSE(moe_rebalance_publication::preparedWaveMatches(
+            &controller, headers.data(), 1u, &apply));
+        EXPECT_FALSE(moe_rebalance_publication::preparedWaveMatches(
+            &controller, headers.data(), 3u, &apply));
+        ASSERT_TRUE(valid());
+    }
+
     TEST(Test__MoERuntimeTable,
          DeviceRebalanceRequestMovementEvidenceSurvivesEmptyFinalWave)
     {
         constexpr uint64_t kSlotBytes = 1024;
+        std::array<DeviceMoERebalanceWaveProgress, 2> waves{};
+        auto &wave = waves[0];
+        wave.epoch = 7;
+        wave.state = static_cast<uint32_t>(DeviceMoERebalanceWaveLifecycle::Applied);
+        wave.command_count = 3;
+        wave.copied_arrivals = 3;
+        wave.applied_arrivals = 2;
+        wave.requested_payload_slots = 2;
+        wave.payload_bucket_slots = 2;
 
         const auto dynamic = deviceMoERebalanceRequestMovementEvidence(
-            /*wave_copied_arrivals=*/3,
-            /*wave_applied_arrivals=*/2,
+            waves,
             /*prefill_current_batch_movement_layers=*/0,
             kSlotBytes);
         EXPECT_EQ(dynamic.copied_payload_lower_bound, 3u);
@@ -638,8 +924,7 @@ namespace llaminar2::test
 
         const auto current_batch_llep =
             deviceMoERebalanceRequestMovementEvidence(
-                /*wave_copied_arrivals=*/0,
-                /*wave_applied_arrivals=*/0,
+                /*waves=*/{},
                 /*prefill_current_batch_movement_layers=*/40,
                 kSlotBytes);
         EXPECT_EQ(current_batch_llep.copied_payload_lower_bound, 40u);
@@ -650,9 +935,9 @@ namespace llaminar2::test
             << "The sticky LLEP apply marker must retain physical movement "
                "evidence after its layer-local status buffer is reused.";
 
+        wave.command_count = wave.copied_arrivals = wave.applied_arrivals = 4;
         const auto overlapping = deviceMoERebalanceRequestMovementEvidence(
-            /*wave_copied_arrivals=*/4,
-            /*wave_applied_arrivals=*/4,
+            waves,
             /*prefill_current_batch_movement_layers=*/3,
             kSlotBytes);
         EXPECT_EQ(overlapping.completed_payload_lower_bound, 4u)
@@ -660,10 +945,63 @@ namespace llaminar2::test
                "not be double counted.";
 
         const auto no_payload_lane =
-            deviceMoERebalanceRequestMovementEvidence(1, 1, 0, 0);
+            deviceMoERebalanceRequestMovementEvidence(waves, 0, 0);
         EXPECT_EQ(no_payload_lane.useful_payload_bytes_lower_bound, 0u)
             << "Logical placement without whole-expert payload bytes cannot "
                "certify physical movement.";
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceMovementEvidenceQualifiesEachWave)
+    {
+        std::array<DeviceMoERebalanceWaveProgress, 2> waves{};
+        auto &wave = waves[0];
+        wave.epoch = 7;
+        wave.state = static_cast<uint32_t>(DeviceMoERebalanceWaveLifecycle::Applied);
+        wave.command_count = wave.copied_arrivals = wave.applied_arrivals = 2;
+        // Resident-only assignments set copied_arrivals too, even when the
+        // instance has transfer storage. Storage capacity is not traffic.
+        EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(waves, 0, 1024)
+                      .useful_payload_bytes_lower_bound, 0u);
+        wave.requested_payload_slots = wave.payload_bucket_slots = 1;
+        const auto valid = wave;
+        EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(waves, 0, 1024)
+                      .useful_payload_bytes_lower_bound, 2048u);
+
+        for (auto state : {DeviceMoERebalanceWaveLifecycle::Idle,
+                           DeviceMoERebalanceWaveLifecycle::Planning,
+                           DeviceMoERebalanceWaveLifecycle::TransferInFlight,
+                           DeviceMoERebalanceWaveLifecycle::Error})
+        {
+            wave = valid;
+            wave.state = static_cast<uint32_t>(state);
+            EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(waves, 0, 1024)
+                          .useful_payload_bytes_lower_bound, 0u);
+        }
+        for (auto field : {&DeviceMoERebalanceWaveProgress::error_code,
+                           &DeviceMoERebalanceWaveProgress::payload_bucket_overflow})
+        {
+            wave = valid;
+            wave.*field = 1;
+            EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(waves, 0, 1024)
+                          .useful_payload_bytes_lower_bound, 0u);
+        }
+        wave = valid;
+        wave.command_count = 3; // two physical commands and one resident-only
+        wave.applied_arrivals = 1;
+        EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(waves, 0, 1024)
+                      .completed_payload_lower_bound, 0u);
+        wave.applied_arrivals = 2;
+        EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(waves, 0, 1024)
+                      .completed_payload_lower_bound, 1u);
+
+        // An unrelated resident-only apply cannot complete this copied wave.
+        wave = valid;
+        wave.applied_arrivals = 0;
+        waves[1] = valid;
+        waves[1].epoch = 8;
+        waves[1].requested_payload_slots = waves[1].payload_bucket_slots = 0;
+        EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(waves, 0, 1024)
+                      .completed_payload_lower_bound, 0u);
     }
 
     TEST(Test__MoERuntimeTable, DeviceRebalanceRouterBenefitFloorAllowsBootstrapThenRejectsLowValueWaves)

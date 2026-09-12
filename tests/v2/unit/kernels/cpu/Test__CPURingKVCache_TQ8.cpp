@@ -21,6 +21,15 @@
 #include <numeric>
 #include <random>
 
+/**
+ * @brief These packed-operand tests select their physical K/V types explicitly.
+ *
+ * They prove the generic ring's lossless copy and the TQ tensor primitives, not
+ * the public compressed-cache policy. Runtime Q8/TQ selectors now use anchored
+ * keys; their factory/append/attention/prefix proofs live in the model-free
+ * CPUAttentionCacheSource integration suite. Do not use convenience policy
+ * aliases here: that would silently change the input codec being tested.
+ */
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "tensors/Tensors.h"
@@ -131,7 +140,7 @@ protected:
 
 TEST_F(Test__CPURingKVCache_TQ8, TQ8_Precision_Report)
 {
-    CPURingKVCacheTQ8 cache(mpi_ctx_, 1, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
+    CPURingKVCache<ActivationPrecision::TQ8> cache(mpi_ctx_, 1, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
     EXPECT_EQ(cache.k_precision(), ActivationPrecision::TQ8);
     EXPECT_EQ(cache.v_precision(), ActivationPrecision::TQ8);
 }
@@ -141,7 +150,7 @@ TEST_F(Test__CPURingKVCache_TQ8, TQ8_AppendAndGather_RoundTrip)
     constexpr int MAX_SEQ = 8;
     constexpr int N_TOKENS = 3;
 
-    CPURingKVCacheTQ8 cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                             N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(N_TOKENS, 100);
@@ -173,7 +182,7 @@ TEST_F(Test__CPURingKVCache_TQ8, TQ8_RingWrap_PreservesNewestTokens)
 {
     constexpr int MAX_SEQ = 4;
 
-    CPURingKVCacheTQ8 cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                             N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(6, 500);
@@ -212,7 +221,7 @@ TEST_F(Test__CPURingKVCache_TQ8, TQ8_CosineSimilarity_Bounds)
     constexpr int MAX_SEQ = 32;
     constexpr int N_TOKENS = 16;
 
-    CPURingKVCacheTQ8 cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                             N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(N_TOKENS, 4100);
@@ -274,7 +283,7 @@ TEST_F(Test__CPURingKVCache_TQ8, TQ8_CosineSimilarity_Bounds)
 
 TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_Precision_Report)
 {
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
     EXPECT_EQ(cache.k_precision(), ActivationPrecision::TQ8);
     EXPECT_EQ(cache.v_precision(), ActivationPrecision::TQ4);
 }
@@ -284,7 +293,7 @@ TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_AppendAndGather_RoundTrip)
     constexpr int MAX_SEQ = 8;
     constexpr int N_TOKENS = 3;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(N_TOKENS, 100);
@@ -318,7 +327,7 @@ TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_HeadMajor_AppendAndGather_RoundTrip)
     constexpr int MAX_SEQ = 8;
     constexpr int N_TOKENS = 4;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu(),
                            KVCacheLayoutMode::HEAD_MAJOR);
 
@@ -349,7 +358,7 @@ TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_RingWrap_PreservesNewestTokens)
 {
     constexpr int MAX_SEQ = 4;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(6, 500);
@@ -387,7 +396,7 @@ TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_IncrementalAppend_DecodeLike)
 {
     constexpr int MAX_SEQ = 16;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     // Prefill 5 tokens
@@ -440,7 +449,7 @@ TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_MultiLayer_IndependentData)
     constexpr int MAX_SEQ = 8;
     constexpr int N_LAYERS = 3;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, N_LAYERS, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, N_LAYERS, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     for (int l = 0; l < N_LAYERS; ++l)
@@ -478,7 +487,7 @@ TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_MultiLayer_IndependentData)
 
 TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_Clear_ResetsAllLayers)
 {
-    CPURingKVCacheTQ cache(mpi_ctx_, 2, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 2, 1, 8, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto k = makeRandomFP32(3, 1400);
     auto v = makeRandomFP32(3, 1500);
@@ -504,7 +513,7 @@ TEST_F(Test__CPURingKVCache_TQ8, SplitTQ_KQuality_StrictlyBetterThan_V)
     constexpr int MAX_SEQ = 32;
     constexpr int N_TOKENS = 16;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, 1, 1, MAX_SEQ,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, 1, 1, MAX_SEQ,
                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(N_TOKENS, 5100);

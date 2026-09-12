@@ -55,6 +55,7 @@
 #pragma once
 
 #include "CPUKVCache.h"
+#include "../kvcache/TurboQuantKVMode.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
@@ -85,6 +86,7 @@ namespace llaminar2
 
         std::shared_ptr<KTensorT> K; ///< Key tensor, pre-allocated to max_seq_len rows.
         std::shared_ptr<VTensorT> V; ///< Value tensor, pre-allocated to max_seq_len rows.
+        std::vector<const TurboQuantContext *> value_head_contexts; ///< Prebound immutable rotations; never resolved in the append hot loop.
         int head = 0;                ///< Ring buffer head: index of the oldest valid token.
         int size = 0;                ///< Number of valid tokens currently stored in the ring.
     };
@@ -150,11 +152,13 @@ namespace llaminar2
          * @param n_kv_heads  Total number of KV attention heads.
          * @param head_dim    Dimension of each attention head.
          * @param device      Device to allocate K/V tensors on (default: CPU).
+         * @param value_context Model-owned root value-rotation context; outlives the cache.
          * @param layout_mode Memory layout for K/V tensors (default: POSITION_MAJOR).
          */
         CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, DeviceId device = DeviceId::cpu(),
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
         /**
          * @brief Construct a non-sharded KV cache with per-layer device placement.
@@ -170,11 +174,13 @@ namespace llaminar2
          * @param n_kv_heads        Total number of KV attention heads.
          * @param head_dim          Dimension of each attention head.
          * @param attention_devices Per-layer device assignment (size >= n_layers).
+         * @param value_context Model-owned root value-rotation context; outlives the cache.
          * @param layout_mode       Memory layout (default: POSITION_MAJOR).
          */
         CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
         /**
          * @brief Construct a sharded KV cache with uniform device placement.
@@ -192,12 +198,14 @@ namespace llaminar2
          * @param kv_head_start    Starting head index for this rank's shard.
          * @param head_dim         Dimension of each attention head.
          * @param device           Device for all layers (default: CPU).
+         * @param value_context Model-owned root value-rotation context; outlives the cache.
          * @param layout_mode      Memory layout (default: POSITION_MAJOR).
          */
         CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                        int head_dim, DeviceId device = DeviceId::cpu(),
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
         /**
          * @brief Construct a sharded KV cache with per-layer device placement.
@@ -214,12 +222,14 @@ namespace llaminar2
          * @param kv_head_start     Starting head index for this rank's shard.
          * @param head_dim          Dimension of each attention head.
          * @param attention_devices Per-layer device assignment (size >= n_layers).
+         * @param value_context Model-owned root value-rotation context; outlives the cache.
          * @param layout_mode       Memory layout (default: POSITION_MAJOR).
          */
         CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                        int head_dim, const std::vector<int> &attention_devices,
-                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+                       KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
         // =====================================================================
         // Metadata Accessors
@@ -522,6 +532,7 @@ namespace llaminar2
         bool is_sharded_;               ///< True if local_n_kv_heads_ != n_kv_heads_.
         int total_evicted_ = 0;         ///< Running count of evicted tokens (for diagnostics).
         bool wrap_warned_ = false;      ///< One-time warning when ring buffer wraps (context full).
+        const TurboQuantContext *value_context_ = nullptr; ///< Model-owned immutable TQ value rotations, when required.
         KVCacheLayoutMode layout_mode_; ///< POSITION_MAJOR or HEAD_MAJOR.
 
         /// @brief 2D array of ring entries: entries_[layer][seq_idx].
@@ -580,19 +591,19 @@ namespace llaminar2
         bool append_kv_impl(int layer, int seq_idx, const KTensorT *new_k, const VTensorT *new_v, int num_tokens);
 
         /**
-         * @brief Append tokens from a single source tensor to a single destination
-         *        tensor using raw byte copies.
-         *
-         * This is an alternative simpler append path that works on raw byte rows.
-         * Used internally as a fallback. Handles ring wrap-around.
-         *
-         * @param dst        Destination ring buffer tensor.
-         * @param src        Source tensor with new token data.
-         * @param entry      Ring buffer entry to update (head/size).
-         * @param num_tokens Number of tokens to copy.
-         * @return true on success.
+         * @brief Encode FP32 projections directly into native anchored K/V slots.
+         * @param layer Local attention layer owning the cache entry.
+         * @param seq_idx Request slot owning the immutable key basis.
+         * @param new_k FP32 key projections in position- or head-major form.
+         * @param new_v FP32 value projections with the same logical geometry.
+         * @param rows Live source rows, excluding bucket padding.
+         * @return True after all physical writes and one cursor publication.
          */
-        bool append_one_tensor(TensorBase *dst, const TensorBase *src, EntryT &entry, int num_tokens);
+        template <int D>
+        bool append_anchored(int layer, int seq_idx, const TensorBase *new_k,
+                             const TensorBase *new_v, int rows)
+            requires (KPrecision == ActivationPrecision::AQ8);
+
     };
 
     // =========================================================================
@@ -602,12 +613,12 @@ namespace llaminar2
     using CPURingKVCacheFP32 = CPURingKVCache<ActivationPrecision::FP32>;   ///< 32-bit float KV cache.
     using CPURingKVCacheBF16 = CPURingKVCache<ActivationPrecision::BF16>;   ///< BFloat16 KV cache.
     using CPURingKVCacheFP16 = CPURingKVCache<ActivationPrecision::FP16>;   ///< Float16 KV cache.
-    using CPURingKVCacheQ8_1 = CPURingKVCache<ActivationPrecision::Q8_1>;   ///< 8-bit quantized KV cache.
+    using CPURingKVCacheQ8_1 = CPURingKVCache<ActivationPrecision::AQ8, ActivationPrecision::Q8_1>; ///< AQ8 keys and Q8_1 values.
     using CPURingKVCacheQ16_1 = CPURingKVCache<ActivationPrecision::Q16_1>; ///< 16-bit quantized KV cache.
     using CPURingKVCacheTQ4 = CPURingKVCache<ActivationPrecision::TQ4>;     ///< Legacy symmetric TQ4 test type.
-    using CPURingKVCacheTQ8 = CPURingKVCache<ActivationPrecision::TQ8>;     ///< Symmetric TQ8-K/TQ8-V cache.
+    using CPURingKVCacheTQ8 = CPURingKVCache<ActivationPrecision::AQ8, ActivationPrecision::TQ8>; ///< AQ8 keys and TQ8 values.
     /// Asymmetric TQ: TQ8 for K (high-fidelity scores), TQ4 for V (graceful degradation).
-    using CPURingKVCacheTQ = CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4>;
+    using CPURingKVCacheTQ = CPURingKVCache<ActivationPrecision::AQ8, ActivationPrecision::TQ4>;
 
     // =========================================================================
     // Factory Functions
@@ -627,7 +638,8 @@ namespace llaminar2
      * @param n_kv_heads  Total number of KV heads.
      * @param head_dim    Dimension per head.
      * @param device      Device placement (default: CPU).
-     * @param layout_mode Memory layout (default: POSITION_MAJOR).
+     * @param value_context Model-owned root value-rotation context; outlives the cache.
+         * @param layout_mode Memory layout (default: POSITION_MAJOR).
      * @return Unique pointer to the created cache, or nullptr on unsupported precision.
      */
     std::unique_ptr<ICPUKVCache> createCPURingKVCache(
@@ -636,7 +648,8 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         DeviceId device = DeviceId::cpu(),
-        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
     /**
      * @brief Create a non-sharded ring KV cache with per-layer device placement.
@@ -649,7 +662,8 @@ namespace llaminar2
      * @param n_kv_heads        Total KV heads.
      * @param head_dim          Dimension per head.
      * @param attention_devices Per-layer device indices (0=CPU, 1+=CUDA N-1).
-     * @param layout_mode       Memory layout (default: POSITION_MAJOR).
+     * @param value_context Model-owned root value-rotation context; outlives the cache.
+         * @param layout_mode       Memory layout (default: POSITION_MAJOR).
      * @return Unique pointer to the created cache, or nullptr on unsupported precision.
      */
     std::unique_ptr<ICPUKVCache> createCPURingKVCache(
@@ -658,7 +672,8 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         const std::vector<int> &attention_devices,
-        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
     /**
      * @brief Create a sharded ring KV cache for tensor-parallel inference.
@@ -675,7 +690,8 @@ namespace llaminar2
      * @param kv_head_start    Starting KV head index for this rank.
      * @param head_dim         Dimension per head.
      * @param device           Device placement (default: CPU).
-     * @param layout_mode      Memory layout (default: POSITION_MAJOR).
+     * @param value_context Model-owned root value-rotation context; outlives the cache.
+         * @param layout_mode      Memory layout (default: POSITION_MAJOR).
      * @return Unique pointer to the created cache, or nullptr on unsupported precision.
      */
     std::unique_ptr<ICPUKVCache> createShardedCPURingKVCache(
@@ -684,7 +700,8 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, DeviceId device = DeviceId::cpu(),
-        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
     /**
      * @brief Create a sharded ring KV cache with per-layer device placement.
@@ -701,7 +718,8 @@ namespace llaminar2
      * @param kv_head_start     Starting KV head index for this rank.
      * @param head_dim          Dimension per head.
      * @param attention_devices Per-layer device indices.
-     * @param layout_mode       Memory layout (default: POSITION_MAJOR).
+     * @param value_context Model-owned root value-rotation context; outlives the cache.
+         * @param layout_mode       Memory layout (default: POSITION_MAJOR).
      * @return Unique pointer to the created cache, or nullptr on unsupported precision.
      */
     std::unique_ptr<ICPUKVCache> createShardedCPURingKVCache(
@@ -711,6 +729,7 @@ namespace llaminar2
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim,
         const std::vector<int> &attention_devices,
-        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
+        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR,
+                       const TurboQuantContext *value_context = nullptr);
 
 } // namespace llaminar2

@@ -8,9 +8,17 @@
  * request token limits, cancellation, and failure can end a response.
  * Parsing retains only a possible marker suffix, avoiding repeated scans of
  * the complete generated transcript during long requests.
+ * Opt-in terminal token IDs retain already published runner output, including
+ * stop tokens and forced thinking continuations. They never probe live state,
+ * re-tokenize generated text, change decode batching, or enable snapshots.
+ * Opt-in runtime summaries project the runner's already completed outcome;
+ * JSON and logs share one snapshot, without querying GPUs or optional PerfStats.
+ * Only opt-in JSON also exports one passive model-lifetime movement ledger;
+ * ordinary logs do not copy the growing journal or advance maintenance.
  */
 
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/MoEMovementLedgerJson.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Tokenizer.h"
 #include "utils/DebugEnv.h"
@@ -168,18 +176,17 @@ namespace llaminar2
 
         /**
          * @brief Log completed observations without reading live inference state.
-         * @param runner Request authority holding validated terminal statistics.
+         * @param summary Request authority's validated terminal observations.
          * @param mode HTTP response mode used only as a diagnostic label.
          *
          * The deep prefix probe may synchronize whole devices. It must never
          * be used for routine logging, even at INFO; filtering after probing
          * still performs that work when the message itself is suppressed.
          */
-        void logRuntimeStateSummary(IOrchestrationRunner &runner, const char *mode)
+        void logRuntimeStateSummary(const RequestRuntimeSummary &summary, const char *mode)
         {
             if (!Logger::getInstance().shouldLog(LogLevel::INFO))
                 return;
-            const RequestRuntimeSummary summary = runner.requestRuntimeSummary();
             const auto &prefix = summary.prefix_request;
             if (prefix.enabled || prefix.bypassed)
             {
@@ -220,6 +227,51 @@ namespace llaminar2
                          << " bypassed=" << boolString(mtp.bypassed)
                          << " bypass_reason=" << mtp.bypass_reason);
             }
+        }
+
+        /**
+         * @brief Serialize one immutable terminal observation without recomputing facts.
+         * @param summary Runner-owned outcome sampled after the request completed.
+         * @return Versioned, optional HTTP extension; no cache contents or live state.
+         *
+         * Prefix admission epochs explain legitimate movement invalidation. They
+         * come from the prefix authority, not inferred from profiling counters.
+         */
+        json runtimeSummaryJson(const RequestRuntimeSummary &summary)
+        {
+            const auto &prefix = summary.prefix_request;
+            const auto &mtp = summary.mtp_request;
+            return {{"schema", 1}, {"prefix_cache", {
+                {"enabled", prefix.enabled}, {"bypassed", prefix.bypassed},
+                {"bypass_reason", prefix.bypass_reason}, {"hit", prefix.hit},
+                {"partial_hit", prefix.partial_hit}, {"requested_tokens", prefix.requested_tokens},
+                {"matched_tokens", prefix.matched_tokens}, {"matched_blocks", prefix.matched_blocks},
+                {"terminal_logits_restored", prefix.terminal_logits_restored},
+                {"terminal_hidden_restored", prefix.terminal_hidden_restored},
+                {"mtp_state_restored", prefix.mtp_state_restored},
+                {"hybrid_state_restored", prefix.hybrid_state_restored},
+                {"storage_tier", prefix.storage_tier},
+                {"admission_epoch_earliest", prefix.admission_placement_epochs.earliest()},
+                {"admission_epoch_latest", prefix.admission_placement_epochs.latest()},
+                {"completion_movement_epoch", prefix.completion_movement_epoch}}},
+                {"mtp", {{"enabled", mtp.enabled}, {"bypassed", mtp.bypassed},
+                {"bypass_reason", mtp.bypass_reason}, {"verify_mode", mtp.verify_mode},
+                {"stochastic_verify", mtp.stochastic_verify},
+                {"adaptive_depth_enabled", mtp.adaptive_depth_enabled},
+                {"depth_policy_mode", mtp.depth_policy_mode}, {"current_depth", mtp.current_depth},
+                {"min_depth", mtp.min_depth}, {"max_depth", mtp.max_depth},
+                {"depth_policy_updates", mtp.depth_policy_updates},
+                {"last_depth_policy_reason", mtp.last_depth_policy_reason},
+                {"draft_steps", mtp.draft_steps}, {"accepted_tokens", mtp.accepted_tokens},
+                {"rejected_tokens", mtp.rejected_tokens}, {"rollbacks", mtp.rollbacks},
+                {"acceptance_rate", mtp.acceptance_rate},
+                {"verifier_runs", summary.mtp_verifier_runs},
+                {"verifier_token_count", summary.mtp_verifier_token_count},
+                {"stochastic_accept_tests", mtp.stochastic_accept_tests},
+                {"stochastic_accepts", mtp.stochastic_accepts},
+                {"stochastic_residual_samples", mtp.stochastic_residual_samples},
+                {"stochastic_terminal_samples", mtp.stochastic_terminal_samples},
+                {"stochastic_acceptance_rate", mtp.stochastic_acceptance_rate}}}};
         }
 
         bool runChatMoERebalanceMaintenance(
@@ -461,6 +513,52 @@ namespace llaminar2
             request.stream = body["stream"].get<bool>();
         if (body.contains("enable_thinking"))
             request.enable_thinking = body["enable_thinking"].get<bool>();
+
+        if (body.contains("return_token_ids"))
+        {
+            if (!body["return_token_ids"].is_boolean())
+            {
+                error_out.ok = false;
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "return_token_ids must be a boolean"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            request.token_output = body["return_token_ids"].get<bool>()
+                ? CompletionTokenOutput::TextAndIds : CompletionTokenOutput::TextOnly;
+        }
+        if (request.stream && request.token_output == CompletionTokenOutput::TextAndIds)
+        {
+            error_out.ok = false;
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_token_ids is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
+
+        if (body.contains("return_runtime_summary"))
+        {
+            if (!body["return_runtime_summary"].is_boolean())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "return_runtime_summary must be a boolean"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            request.runtime_output = body["return_runtime_summary"].get<bool>()
+                ? CompletionRuntimeOutput::Include : CompletionRuntimeOutput::Omit;
+        }
+        if (request.stream && request.runtime_output == CompletionRuntimeOutput::Include)
+        {
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_runtime_summary is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
 
         // Model identifier (optional, echoed back in response)
         if (body.contains("model"))
@@ -723,6 +821,12 @@ namespace llaminar2
         // Decode loop
         std::string content;
         std::string reasoning_content;
+        // Allocate only for an explicitly requested terminal observation. The
+        // runner already publishes these IDs for ordinary text output; keeping
+        // them requires no extra device transfer or speculative-state access.
+        std::vector<int32_t> completion_token_ids;
+        // Grow with actual output, not an untrusted max_tokens reservation:
+        // requests can ask for more tokens than are available before EOS.
         int completion_tokens = 0;
         std::string finish_reason = "length";
         std::string thinking_end_tag;
@@ -859,6 +963,8 @@ namespace llaminar2
                  ++token_idx)
             {
                 int32_t next_token = step_tokens[token_idx];
+                if (request.token_output == CompletionTokenOutput::TextAndIds)
+                    completion_token_ids.push_back(next_token);
                 const bool is_final_returned_token = token_idx + 1 == step_tokens.size();
                 if (tokenizer_.is_stop_token(next_token) ||
                     (step_complete && is_final_returned_token))
@@ -917,7 +1023,15 @@ namespace llaminar2
         }
 
         runner_.flushStageTimeline();
-        logRuntimeStateSummary(runner_, "non-streaming");
+        // Read once after the terminal result, before RAII request cleanup.
+        // Logging and the opt-in response see the same immutable outcome.
+        std::optional<RequestRuntimeSummary> runtime_summary;
+        if (request.runtime_output == CompletionRuntimeOutput::Include ||
+            Logger::getInstance().shouldLog(LogLevel::INFO))
+        {
+            runtime_summary = runner_.requestRuntimeSummary();
+            logRuntimeStateSummary(*runtime_summary, "non-streaming");
+        }
 
         // HTTP and SSE share marker decisions, including token-split closes;
         // non-streaming only accumulates the same safe fields into one response.
@@ -974,6 +1088,27 @@ namespace llaminar2
                                           {"finish_reason", finish_reason}}})},
             {"usage", {{"prompt_tokens", prompt_tokens}, {"completion_tokens", completion_tokens}, {"total_tokens", prompt_tokens + completion_tokens}, {"context_window", max_context}, {"context_used", prompt_tokens + completion_tokens}}}};
 
+        if (request.token_output == CompletionTokenOutput::TextAndIds)
+        {
+            // Preserve the tokenizer's actual prompt and the runner's ordered
+            // completion, including EOS. Text framing may hide either, so
+            // re-encoding the displayed answer would not be equivalent.
+            json_response["token_ids"] = {
+                {"prompt", input_ids}, {"completion", completion_token_ids}};
+        }
+
+        if (request.runtime_output == CompletionRuntimeOutput::Include)
+        {
+            json_response["runtime_summary"] = runtimeSummaryJson(*runtime_summary);
+            // This is an immutable, already-published ledger, not a request
+            // reset or maintenance join. Keep it out of routine INFO logging:
+            // only an explicit terminal representation pays the copy cost.
+            json_response["runtime_summary"]["expert_movement"] =
+                moeMovementLedgerJson(runner_.moeOptimizationMovementLedger());
+            json_response["runtime_summary"]["expert_movement_topology"] =
+                moeMovementTopologyJson(runner_.moeOptimizationMovementTopology());
+        }
+
         response.ok = true;
         response.http_status = 200;
         response.json_body = dumpJsonForHttp(json_response);
@@ -998,6 +1133,25 @@ namespace llaminar2
     try
     {
         ChatCompletionResponse response;
+        if (request.runtime_output == CompletionRuntimeOutput::Include)
+        {
+            // Typed callers share JSON admission; reject before touching state.
+            response.http_status = 400;
+            response.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_runtime_summary is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return response;
+        }
+        if (request.token_output == CompletionTokenOutput::TextAndIds)
+        {
+            // Direct typed callers must obey the same admission contract as
+            // JSON callers, before any request reset or GPU work is submitted.
+            response.http_status = 400;
+            response.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_token_ids is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return response;
+        }
         RequestCacheCleanup request_cleanup(runner_);
         std::vector<int32_t> input_ids;
 
@@ -1311,7 +1465,8 @@ namespace llaminar2
         }
 
         runner_.flushStageTimeline();
-        logRuntimeStateSummary(runner_, "streaming");
+        if (Logger::getInstance().shouldLog(LogLevel::INFO))
+            logRuntimeStateSummary(runner_.requestRuntimeSummary(), "streaming");
 
         // Post-generation: if tools were provided, parse for tool calls and emit
         if (has_tools)

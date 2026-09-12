@@ -1385,8 +1385,10 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                             continue;
                         }
 
+                        const auto byte_evidence = compareNativeVerifierRow(
+                            {grouped, serial_values.size()}, serial_values);
                         bool finite = true;
-                        bool exact_indices = true;
+                        const bool exact_indices = byte_evidence.passed();
                         double max_abs_diff = 0.0;
                         for (size_t index = 0;
                              index < serial_values.size();
@@ -1400,23 +1402,13 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                                 std::abs(
                                     static_cast<double>(grouped[index]) -
                                     static_cast<double>(serial_values[index])));
-                            exact_indices = exact_indices &&
-                                            grouped[index] ==
-                                                serial_values[index];
                         }
                         const float cosine = computeCosineSimilarity(
                             grouped,
                             serial_values.data(),
                             serial_values.size());
-                        const bool routing_indices =
-                            std::string_view(key).ends_with(
-                                "MOE_ROUTING_INDICES");
                         float kl = 0.0f;
-                        bool passed = finite &&
-                                      (routing_indices
-                                           ? exact_indices
-                                           : cosine >=
-                                                 config_.decode_cosine_threshold);
+                        bool passed = byte_evidence.passed();
                         if (key == "LM_HEAD")
                         {
                             kl = computeKLDivergence(

@@ -10,6 +10,8 @@
  * that final ownership edge through TransferEngine's two-phase retirement
  * protocol so JIT replacement and short-lived campaign processes have the same
  * deterministic reclamation semantics.
+ * A discarded model drains existing work but does not rebuild its loader-era
+ * placement. Only an exported reusable-context authority requires that seal.
  */
 
 #pragma once
@@ -21,6 +23,24 @@
 
 namespace llaminar2
 {
+    enum class MoEOverlayDeviceControllerDrainIntent : std::uint8_t;
+
+    /**
+     * @brief Project actual model retention into the local overlay drain intent.
+     * @param authority Exported reuse owner, or null for ordinary model disposal.
+     * @param movement Configured durable placement policy.
+     * @return Restoration only for a retained, exclusively owned Dynamic model.
+     * @throws std::logic_error For an invalid policy or an unowned reuse context.
+     *
+     * This is a passive ownership projection, not a second lifecycle or memory
+     * ledger. Distributed controller shutdown combines every rank's obligation
+     * before workers act; even a rank discarding its own context may need to
+     * participate in a peer's restoration.
+     */
+    [[nodiscard]] MoEOverlayDeviceControllerDrainIntent
+    modelContextOverlayDrainIntent(
+        const std::shared_ptr<ModelContextReuseAuthority> &authority,
+        MoERebalanceRuntimeMode movement);
 
     /**
      * @brief Complete proof emitted after one prepared model authority retires.

@@ -110,7 +110,10 @@ namespace llaminar2
                     gpu_source_is_superblock != 0);
             if (source_format == nullptr ||
                 cpu_codebook_id != gpu_source_codebook_id ||
-                cpu_is_superblock != gpu_source_is_superblock)
+                cpu_is_superblock != gpu_source_is_superblock ||
+                ((cpu_codebook_id == 8 ||
+                  hasCompactMultiScaleVnniPayload(cpu_codebook_id)) &&
+                 cpu_encoding == Encoding::ExpandedInt8))
             {
                 return false;
             }
@@ -155,14 +158,16 @@ namespace llaminar2
                         ? Encoding::NibbleLUT
                         : (gpu_codebook_id == 8
                                ? Encoding::Q6KNativeDualScale
-                               : Encoding::ExpandedInt8);
+                               : hasCompactMultiScaleVnniPayload(gpu_codebook_id)
+                                     ? Encoding::CompactMultiScale
+                                     : Encoding::ExpandedInt8);
                 return cpu_encoding == expected_encoding;
             }
 
             // Promotion consumes final CPU bytes. Expanded CPU encodings have
             // deliberately lost their compact source representation and must
             // therefore target the normalized signed-INT8 codebooks.
-            if (gpu_has_emins != 0)
+            if (gpu_has_emins != 0 && cpu_encoding != Encoding::CompactMultiScale)
                 return false;
             switch (cpu_encoding)
             {
@@ -185,6 +190,12 @@ namespace llaminar2
                        gpu_codebook_id == 8 &&
                        gpu_payload_bytes_per_block == 24 &&
                        cpu_is_asymmetric != 0 && gpu_is_asymmetric != 0;
+            case Encoding::CompactMultiScale:
+                return hasCompactMultiScaleVnniPayload(cpu_codebook_id) &&
+                       gpu_codebook_id == cpu_codebook_id &&
+                       gpu_payload_bytes_per_block == source_format->payload_bytes &&
+                       cpu_is_asymmetric != 0 && gpu_is_asymmetric != 0 &&
+                       gpu_has_emins == static_cast<uint8_t>(source_format->has_emins);
             }
             return false;
         }

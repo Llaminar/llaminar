@@ -1,11 +1,18 @@
 /**
  * @file DeviceMoERebalanceController.h
  * @brief Graph-capturable device-side MoE rebalance publish/apply ABI.
+ *
+ * Device-owned waves publish copy completion before runtime-bank application.
+ * Terminal observers project that existing state without participating in
+ * scheduling; planner scratch and resident-only assignments are not physical
+ * transfer evidence.
  */
 
 #pragma once
 
 #include "DeviceMoERebalanceABI.h"
+#include "DeviceMoERebalancePublication.h"
+#include "DeviceMoERebalanceMovementJournal.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "DeviceMoELLEPPlannerScratch.h"
 #include "MoERuntimeTable.h"
@@ -14,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_set>
@@ -86,6 +94,8 @@ namespace llaminar2
         Applying = 4,
         Applied = 5,
         Error = 6,
+        /** Candidate bytes are prepared; only the epoch finalizer may retire commands. */
+        PreparedForPublication = moe_rebalance_publication::kPreparedForPublication,
     };
 
     enum class DeviceMoERebalanceTransferMode : uint32_t
@@ -141,6 +151,7 @@ namespace llaminar2
 
     inline constexpr uint32_t kDeviceMoEInvalidSlot = 0xffffffffu;
 
+    /** @brief Commands and their sealed policy are one immutable wire generation. */
     struct DeviceMoERebalanceCommandBufferHeader
     {
         uint32_t magic = kDeviceMoERebalanceMagic;
@@ -151,6 +162,7 @@ namespace llaminar2
         uint32_t command_capacity = 0;
         uint32_t participant_id = 0;
         uint32_t participant_count = 1;
+        DeviceMoERebalanceMovementDecision movement_decision;
     };
 
     struct DeviceMoERebalanceWaveState
@@ -206,6 +218,8 @@ namespace llaminar2
          * requiring a host-side diagnostic mirror in the execution path.
          */
         uint32_t error_participant = kDeviceMoEInvalidSlot;
+        /** Actual completed destination-copy bytes, authenticated across participants. */
+        uint64_t copied_payload_bytes = 0;
     };
 
     /**
@@ -268,6 +282,8 @@ namespace llaminar2
         /** Set when compact MTP metadata already advanced this decode boundary. */
         uint32_t decode_boundary_advanced = 0;
         DeviceMoERebalanceWaveProgress waves[2];
+        /** Reset with this request only after its immutable journal has been archived. */
+        DeviceMoERebalanceMovementJournalState movement_journal;
         /**
          * Narrow device-published decision used only by HIP's hosted scheduler.
          * CUDA retains the same ABI so controller layout stays backend-symmetric,
@@ -315,6 +331,8 @@ namespace llaminar2
         uint32_t destination_previous_layer = kDeviceMoEInvalidSlot;
         uint32_t destination_previous_expert = kDeviceMoEInvalidSlot;
         uint32_t destination_generation = 0;
+        /** Demand sealed by the planner before histogram scratch is reused. */
+        uint64_t activation_count = 0;
     };
 
     enum class DeviceMoERebalanceDirectoryFlags : uint32_t
@@ -417,6 +435,8 @@ namespace llaminar2
         uint32_t transaction_epoch = 0;
         /// Bounded command count covered by this copy transaction.
         uint32_t transaction_command_count = 0;
+        /** Bytes actually written by successful destination copy kernels. */
+        uint64_t copied_payload_bytes = 0;
     };
 
     constexpr DeviceMoERebalanceFlags operator|(DeviceMoERebalanceFlags lhs,
@@ -788,9 +808,12 @@ namespace llaminar2
                 kPrefillCurrentBatchNonOwnerAssignmentLayersOffset,
         "host resident-assignment evidence must occupy the shared status tail");
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceCommandBufferHeader>);
+    static_assert(sizeof(DeviceMoERebalanceCommandBufferHeader) == moe_rebalance_abi::kCommandHeaderBytes);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceWaveState>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceWaveProgress>);
+    static_assert(sizeof(DeviceMoERebalanceWaveProgress) == moe_rebalance_abi::kWaveProgressBytes);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceGraphControllerState>);
+    static_assert(sizeof(DeviceMoERebalanceGraphControllerState) == moe_rebalance_abi::kGraphControllerBytes);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
     static_assert(
         sizeof(DeviceMoERebalancePlanEntry) ==
@@ -798,6 +821,7 @@ namespace llaminar2
         "host rebalance plan ABI must match the shared device contract");
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDirectoryEntry>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceApplyStatus>);
+    static_assert(sizeof(DeviceMoERebalanceApplyStatus) == moe_rebalance_abi::kApplyStatusBytes);
 
     static_assert(
         std::is_trivially_copyable_v<DeviceMoETransferSlotClaimSummary>,
@@ -996,8 +1020,7 @@ namespace llaminar2
     /**
      * @brief Derive terminal movement evidence from durable device state.
      *
-     * @param wave_copied_arrivals Copied arrivals retained by rolling waves.
-     * @param wave_applied_arrivals Applied arrivals retained by rolling waves.
+     * @param waves Ordered snapshots of the controller's retained wave slots.
      * @param prefill_current_batch_movement_layers LLEP layers with an applied
      *        copy-complete payload movement marker.
      * @param slot_payload_bytes Bytes in one whole-expert transfer slot.
@@ -1005,19 +1028,51 @@ namespace llaminar2
      */
     inline DeviceMoERebalanceRequestMovementEvidence
     deviceMoERebalanceRequestMovementEvidence(
-        uint64_t wave_copied_arrivals,
-        uint64_t wave_applied_arrivals,
+        std::span<const DeviceMoERebalanceWaveProgress> waves,
         uint32_t prefill_current_batch_movement_layers,
         uint64_t slot_payload_bytes) noexcept
     {
+        uint64_t copied_payloads = 0;
+        uint64_t applied_payloads = 0;
+        for (const auto &wave : waves)
+        {
+            // Resident-only planning marks logical commands copy-ready without
+            // transferring bytes. Only a real payload wave, past authenticated
+            // copy publication, can contribute physical movement evidence.
+            const auto lifecycle =
+                static_cast<DeviceMoERebalanceWaveLifecycle>(wave.state);
+            const bool copy_published =
+                lifecycle == DeviceMoERebalanceWaveLifecycle::ReadyToApply ||
+                lifecycle == DeviceMoERebalanceWaveLifecycle::Applying ||
+                lifecycle == DeviceMoERebalanceWaveLifecycle::Applied;
+            if (wave.magic != kDeviceMoERebalanceMagic ||
+                wave.version != kDeviceMoERebalanceVersion ||
+                wave.epoch == 0 || !copy_published || wave.error_code != 0 ||
+                wave.requested_payload_slots == 0 ||
+                wave.payload_bucket_slots < wave.requested_payload_slots ||
+                wave.payload_bucket_overflow != 0 ||
+                wave.copied_arrivals > wave.command_count ||
+                wave.applied_arrivals > wave.command_count)
+                continue;
+
+            copied_payloads += wave.copied_arrivals;
+            // Copy counts are global physical arrivals; apply counts are local
+            // and may also include resident-only commands. Subtract all possible
+            // non-payload commands before claiming a local physical apply. Do
+            // this per wave: a copy in A must not authenticate an apply in B.
+            const uint32_t logical_commands =
+                wave.command_count - wave.copied_arrivals;
+            if (wave.applied_arrivals > logical_commands)
+                applied_payloads += wave.applied_arrivals - logical_commands;
+        }
         const uint64_t prefill_completed_payload_lower_bound =
             static_cast<uint64_t>(prefill_current_batch_movement_layers);
         DeviceMoERebalanceRequestMovementEvidence evidence{};
         evidence.copied_payload_lower_bound =
-            std::max(wave_copied_arrivals,
+            std::max(copied_payloads,
                      prefill_completed_payload_lower_bound);
         evidence.applied_payload_lower_bound =
-            std::max(wave_applied_arrivals,
+            std::max(applied_payloads,
                      prefill_completed_payload_lower_bound);
         evidence.completed_payload_lower_bound =
             std::min(evidence.copied_payload_lower_bound,

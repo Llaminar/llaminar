@@ -28,13 +28,23 @@
 #include "CPURingKVCache.h"
 
 #include "../kvcache/KVCacheLogicalBlockCodec.h"
+#include "../kvcache/KVRingAppendPlan.h"
+#include "attention/CPUAttentionKeyQ8.h"
+#include "turboquant/TurboQuantQuantizeTQ4.h"
+#include "turboquant/TurboQuantQuantizeTQ8.h"
+#include "../../tensors/SIMDHelpers.h"
+#include "../../utils/OpenMPUtils.h"
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cstring>
+#include <atomic>
+#include <cmath>
 
 namespace llaminar2
 {
+
+#include "CPURingKVCacheAnchored.inl"
 
     namespace
     {
@@ -75,10 +85,10 @@ namespace llaminar2
     CPURingKVCache<KPrecision, VPrecision>::CPURingKVCache(
         const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, DeviceId device,
-        KVCacheLayoutMode layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
         : CPURingKVCache(mpi_ctx, n_layers, batch_size, max_seq_len,
                          n_kv_heads, n_kv_heads, 0, head_dim,
-                         device, layout_mode)
+                         device, layout_mode, value_context)
     {
     }
 
@@ -92,10 +102,10 @@ namespace llaminar2
     CPURingKVCache<KPrecision, VPrecision>::CPURingKVCache(
         const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
-        KVCacheLayoutMode layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
         : CPURingKVCache(mpi_ctx, n_layers, batch_size, max_seq_len,
                          n_kv_heads, n_kv_heads, 0, head_dim,
-                         DeviceId::cpu(), layout_mode)
+                         DeviceId::cpu(), layout_mode, value_context)
     {
         // Only apply per-layer device overrides if enough entries are provided.
         if (attention_devices.size() >= static_cast<size_t>(n_layers_))
@@ -127,8 +137,8 @@ namespace llaminar2
         const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, DeviceId device,
-        KVCacheLayoutMode layout_mode)
-        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len), n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start), head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), is_sharded_(local_n_kv_heads != n_kv_heads), layout_mode_(layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
+        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len), n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start), head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim), is_sharded_(local_n_kv_heads != n_kv_heads), layout_mode_(layout_mode), value_context_(value_context)
     {
         // TensorFactory handles device-aware allocation (CPU pinned, CUDA, etc.).
         tensor_factory_ = std::make_unique<TensorFactory>(mpi_ctx);
@@ -154,10 +164,10 @@ namespace llaminar2
         const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, const std::vector<int> &attention_devices,
-        KVCacheLayoutMode layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
         : CPURingKVCache(mpi_ctx, n_layers, batch_size, max_seq_len,
                          n_kv_heads, local_n_kv_heads, kv_head_start,
-                         head_dim, DeviceId::cpu(), layout_mode)
+                         head_dim, DeviceId::cpu(), layout_mode, value_context)
     {
         // Apply per-layer device overrides if the vector is large enough.
         if (attention_devices.size() >= static_cast<size_t>(n_layers_))
@@ -187,7 +197,11 @@ namespace llaminar2
     std::shared_ptr<typename CPURingKVCache<KPrecision, VPrecision>::KTensorT> CPURingKVCache<KPrecision, VPrecision>::allocate_k_tensor(
         size_t rows, size_t cols, DeviceId device)
     {
-        return detail::CPUKVCacheTensor<KPrecision>::allocate(*tensor_factory_, rows, cols, head_dim_, device);
+        if constexpr (KPrecision == ActivationPrecision::AQ8)
+            return std::make_shared<AttentionKeyQ8Tensor>(max_seq_len_, local_n_kv_heads_,
+                                                        head_dim_, kv_layout(), device);
+        else
+            return detail::CPUKVCacheTensor<KPrecision>::allocate(*tensor_factory_, rows, cols, head_dim_, device);
     }
 
     /**
@@ -233,6 +247,17 @@ namespace llaminar2
                 // POSITION_MAJOR: rows = max_seq_len, cols = kv_dim
                 entry.K = allocate_k_tensor(max_seq_len_, kv_dim_, device);
                 entry.V = allocate_v_tensor(max_seq_len_, kv_dim_, device);
+            }
+            if constexpr (KPrecision == ActivationPrecision::AQ8 &&
+                          (VPrecision == ActivationPrecision::TQ4 || VPrecision == ActivationPrecision::TQ8))
+            {
+                if (!value_context_)
+                    throw std::invalid_argument("CPU AQ8/TQ cache requires a model-owned value context");
+                // The context is immutable model state, not another live cache ledger.
+                entry.V->set_turboquant_context(&value_context_->for_layer(layer));
+                entry.value_head_contexts.resize(local_n_kv_heads_);
+                entry.V->turboquant_context()->resolve_layer_contexts(local_n_kv_heads_,
+                    entry.value_head_contexts.data(), entry.value_head_contexts.size());
             }
             // Ring buffer starts empty.
             entry.head = 0;
@@ -487,6 +512,17 @@ namespace llaminar2
             return false;
         }
 
+        if constexpr (KPrecision == ActivationPrecision::AQ8)
+        {
+            switch (head_dim_)
+            {
+            case 64: return append_anchored<64>(layer, seq_idx, new_k, new_v, num_tokens);
+            case 128: return append_anchored<128>(layer, seq_idx, new_k, new_v, num_tokens);
+            case 256: return append_anchored<256>(layer, seq_idx, new_k, new_v, num_tokens);
+            default: throw std::invalid_argument("unsupported CPU AQ8 head dimension");
+            }
+        }
+
         // Downcast to the concrete tensor types for this cache's K/V precisions.
         const KTensorT *typed_k = dynamic_cast<const KTensorT *>(new_k);
         const VTensorT *typed_v = dynamic_cast<const VTensorT *>(new_v);
@@ -682,6 +718,19 @@ namespace llaminar2
             !K || !V)
         {
             return false;
+        }
+
+        if constexpr (KPrecision == ActivationPrecision::AQ8)
+        {
+            const auto *keys = dynamic_cast<const TensorBase *>(K);
+            const auto *values = dynamic_cast<const TensorBase *>(V);
+            switch (head_dim_)
+            {
+            case 64: return append_anchored<64>(layer, seq_idx, keys, values, verifier_rows);
+            case 128: return append_anchored<128>(layer, seq_idx, keys, values, verifier_rows);
+            case 256: return append_anchored<256>(layer, seq_idx, keys, values, verifier_rows);
+            default: throw std::invalid_argument("unsupported CPU AQ8 verifier head dimension");
+            }
         }
 
         const auto *new_k = dynamic_cast<const KTensorT *>(K);
@@ -881,74 +930,6 @@ namespace llaminar2
         return true;
     }
 
-    /**
-     * @brief Simplified single-tensor append using raw byte copies.
-     *
-     * This is an alternative append path that works purely at the byte level,
-     * computing row byte sizes from the tensor's total size_bytes / rows.
-     * It handles only POSITION_MAJOR-style row-wise copies.
-     *
-     * Used as a fallback for formats where typed access isn't needed or
-     * for simpler single-tensor operations.
-     */
-    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
-    bool CPURingKVCache<KPrecision, VPrecision>::append_one_tensor(TensorBase *dst, const TensorBase *src, EntryT &entry, int num_tokens)
-    {
-        if (!dst || !src || max_seq_len_ <= 0)
-        {
-            return false;
-        }
-
-        const size_t src_rows = src->rows();
-        const size_t dst_rows = dst->rows();
-        if (dst_rows < static_cast<size_t>(max_seq_len_) || src_rows == 0)
-        {
-            return false;
-        }
-
-        const int rows_to_take = std::min(num_tokens, static_cast<int>(src_rows));
-        if (rows_to_take <= 0)
-        {
-            return true;
-        }
-
-        const int src_start = std::max(0, rows_to_take - max_seq_len_);
-        const int tokens_to_write = rows_to_take - src_start;
-
-        const size_t src_row_bytes = src->size_bytes() / std::max<size_t>(1, src->rows());
-        const size_t dst_row_bytes = dst->size_bytes() / std::max<size_t>(1, dst->rows());
-        const size_t row_bytes = std::min(src_row_bytes, dst_row_bytes);
-
-        const uint8_t *src_bytes = reinterpret_cast<const uint8_t *>(src->raw_data());
-        uint8_t *dst_bytes = reinterpret_cast<uint8_t *>(dst->raw_mutable_data());
-        if (!src_bytes || !dst_bytes || row_bytes == 0)
-        {
-            return false;
-        }
-
-        for (int i = 0; i < tokens_to_write; ++i)
-        {
-            const int src_row = src_start + i;
-            int dst_row = 0;
-            if (entry.size < max_seq_len_)
-            {
-                dst_row = (entry.head + entry.size) % max_seq_len_;
-                ++entry.size;
-            }
-            else
-            {
-                dst_row = entry.head;
-                entry.head = (entry.head + 1) % max_seq_len_;
-            }
-
-            std::memcpy(dst_bytes + static_cast<size_t>(dst_row) * dst_row_bytes,
-                        src_bytes + static_cast<size_t>(src_row) * src_row_bytes,
-                        row_bytes);
-        }
-
-        return true;
-    }
-
     // =========================================================================
     // Batched Gather
     // =========================================================================
@@ -986,6 +967,35 @@ namespace llaminar2
         if (num_sequences <= 0 || num_sequences > batch_size_)
         {
             return -1;
+        }
+
+        if constexpr (KPrecision == ActivationPrecision::AQ8)
+        {
+            // A tensor has one request basis. Multiple requests must use native
+            // request views, as production attention does, not merge anchors.
+            if (num_sequences != 1)
+                throw std::invalid_argument("AQ8 batched attention requires request-local native KV views");
+            auto *keys = dynamic_cast<AttentionKeyQ8Tensor *>(out_k);
+            auto *values = dynamic_cast<VTensorT *>(out_v);
+            const auto &entry = entries_[layer][0];
+            if (!keys || !values || keys->heads() != static_cast<size_t>(local_n_kv_heads_) ||
+                keys->head_dim() != head_dim_ || keys->layout() != TensorLayout::KV_POS_HEAD_DIM ||
+                keys->positions() < static_cast<size_t>(entry.size) ||
+                values->shape() != keys->shape()) return -1;
+            out_kv_lens.assign(1, entry.size);
+            std::memcpy(keys->mutable_anchor().data(), entry.K->anchor().data(), keys->anchor_bytes());
+            const size_t kb = keys->block_bytes();
+            const size_t vb = detail::CPUKVCacheTensor<VPrecision>::head_bytes(entry.V.get(), kv_dim_, head_dim_);
+            for (int row = 0; row < entry.size; ++row)
+                for (int head = 0; head < local_n_kv_heads_; ++head)
+                {
+                    const size_t from = entry.K->block_index((entry.head + row) % max_seq_len_, head);
+                    const size_t to = keys->block_index(row, head);
+                    std::memcpy(keys->mutable_blocks() + to * kb, entry.K->blocks() + from * kb, kb);
+                    std::memcpy(static_cast<uint8_t *>(values->raw_mutable_data()) + to * vb,
+                                static_cast<const uint8_t *>(entry.V->raw_data()) + from * vb, vb);
+                }
+            return entry.size;
         }
 
         KTensorT *typed_k = dynamic_cast<KTensorT *>(out_k);
@@ -1259,6 +1269,8 @@ namespace llaminar2
                              VTrait::row_bytes(entry.V.get(), kv_dim_, head_dim_);
         }
 
+        if constexpr (KPrecision == ActivationPrecision::AQ8)
+            layout.k_bytes += entry.K->anchor_bytes();
         return layout;
     }
 
@@ -1324,6 +1336,15 @@ namespace llaminar2
         if (!src_k || !src_v)
         {
             return false;
+        }
+
+        if constexpr (KPrecision == ActivationPrecision::AQ8)
+        {
+            // Every independently restorable block carries its request basis.
+            // The block rows that follow remain in the declared native layout.
+            std::memcpy(out_k, entry.K->anchor().data(), entry.K->anchor_bytes());
+            out_k += entry.K->anchor_bytes();
+            src_k = entry.K->blocks();
         }
 
         using KTrait = detail::CPUKVCacheTensor<KPrecision>;
@@ -1436,6 +1457,36 @@ namespace llaminar2
             return false;
         }
 
+        if constexpr (KPrecision == ActivationPrecision::AQ8)
+        {
+            const size_t anchor_bytes = entry.K->anchor_bytes();
+            // Prefix input is untrusted and may not be aligned. Validate the
+            // complete basis and native key payload before changing live bytes.
+            for (size_t offset = 0; offset < anchor_bytes; offset += sizeof(float))
+            {
+                float coordinate;
+                std::memcpy(&coordinate, in_k + offset, sizeof(float));
+                if (!std::isfinite(coordinate)) return false;
+            }
+            if (entry.size > 0 && std::memcmp(entry.K->anchor().data(), in_k, anchor_bytes) != 0)
+                return false;
+            const auto *payload = in_k + anchor_bytes;
+            const size_t block_bytes = entry.K->block_bytes();
+            for (size_t block = 0; block < static_cast<size_t>(desc.token_count) * local_n_kv_heads_; ++block)
+            {
+                float scale;
+                const auto *native = payload + block * block_bytes;
+                std::memcpy(&scale, native, sizeof(float));
+                if (!std::isfinite(scale) || scale < 0.0f) return false;
+                for (int coordinate = 0; coordinate < head_dim_; ++coordinate)
+                    if (native[sizeof(float) + coordinate] == 128) return false;
+            }
+            if (entry.size == 0)
+                std::memcpy(entry.K->mutable_anchor().data(), in_k, anchor_bytes);
+            in_k = payload;
+            dst_k = entry.K->mutable_blocks();
+        }
+
         using KTrait = detail::CPUKVCacheTensor<KPrecision>;
         using VTrait = detail::CPUKVCacheTensor<VPrecision>;
         const size_t k_rb = KTrait::row_bytes(entry.K.get(), kv_dim_, head_dim_);
@@ -1528,24 +1579,24 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         DeviceId device,
-        KVCacheLayoutMode layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<CPURingKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+            return std::make_unique<CPURingKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::BF16:
-            return std::make_unique<CPURingKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+            return std::make_unique<CPURingKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::FP16:
-            return std::make_unique<CPURingKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+            return std::make_unique<CPURingKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+            return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+            return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::TQ4:
-            return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+            return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::TQ8:
-            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode, value_context);
         default:
             LOG_ERROR("createCPURingKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1561,24 +1612,24 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         const std::vector<int> &attention_devices,
-        KVCacheLayoutMode layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
-            return std::make_unique<CPURingKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPURingKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::BF16:
-            return std::make_unique<CPURingKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPURingKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::FP16:
-            return std::make_unique<CPURingKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPURingKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::Q8_1:
-            return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::Q16_1:
-            return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::TQ4:
-            return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::TQ8:
-            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+            return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode, value_context);
         default:
             LOG_ERROR("createCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1594,31 +1645,31 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, DeviceId device,
-        KVCacheLayoutMode layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
             return std::make_unique<CPURingKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::BF16:
             return std::make_unique<CPURingKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::FP16:
             return std::make_unique<CPURingKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::Q8_1:
             return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::TQ4:
             return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                      n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+                                                      n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode, value_context);
         case ActivationPrecision::TQ8:
             return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode, value_context);
         default:
             LOG_ERROR("createShardedCPURingKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1635,31 +1686,31 @@ namespace llaminar2
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim,
         const std::vector<int> &attention_devices,
-        KVCacheLayoutMode layout_mode)
+        KVCacheLayoutMode layout_mode, const TurboQuantContext *value_context)
     {
         switch (precision)
         {
         case ActivationPrecision::FP32:
             return std::make_unique<CPURingKVCacheFP32>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::BF16:
             return std::make_unique<CPURingKVCacheBF16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::FP16:
             return std::make_unique<CPURingKVCacheFP16>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::Q8_1:
             return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+                                                         n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::TQ4:
             return std::make_unique<CPURingKVCacheTQ>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                      n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+                                                      n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode, value_context);
         case ActivationPrecision::TQ8:
             return std::make_unique<CPURingKVCacheTQ8>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode, value_context);
         default:
             LOG_ERROR("createShardedCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1676,6 +1727,9 @@ namespace llaminar2
     // =========================================================================
 
     template class CPURingKVCache<ActivationPrecision::FP32>;
+    template class CPURingKVCache<ActivationPrecision::AQ8, ActivationPrecision::Q8_1>;
+    template class CPURingKVCache<ActivationPrecision::AQ8, ActivationPrecision::TQ4>;
+    template class CPURingKVCache<ActivationPrecision::AQ8, ActivationPrecision::TQ8>;
     template class CPURingKVCache<ActivationPrecision::BF16>;
     template class CPURingKVCache<ActivationPrecision::FP16>;
     template class CPURingKVCache<ActivationPrecision::Q8_1>;

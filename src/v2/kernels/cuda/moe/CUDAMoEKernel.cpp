@@ -1475,6 +1475,13 @@ extern "C"
         uint64_t *candidate_epoch,
         void *status,
         const void *apply_status,
+        void *controller_state,
+        void *command_headers,
+        uint32_t command_buffer_count,
+        const void *plan_entries,
+        uint32_t plan_capacity,
+        uint64_t estimated_expert_bytes,
+        llaminar2::DeviceMoERebalanceMovementJournalView journal,
         int device_idx,
         void *stream);
 
@@ -5473,13 +5480,24 @@ namespace llaminar2
         DeviceMoEOverlayEpochControl *control,
         std::uint64_t *candidate_epoch,
         DeviceMoEOverlayEpochStatus *reservation_and_publication_status,
-        const DeviceMoERebalanceApplyStatus *apply_status)
+        const DeviceMoERebalanceApplyStatus *apply_status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceCommandBufferHeader *command_headers,
+        std::uint32_t command_buffer_count,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        std::uint32_t plan_capacity,
+        std::uint64_t estimated_expert_bytes,
+        DeviceMoERebalanceMovementJournalView journal)
     {
         void *stream = explicitMoELaunchStream(
             launch, "finalizeMoEOverlayRebalancePublication");
         if (!runtime_layers || layer_count == 0u || expert_count == 0u ||
             !control || !candidate_epoch ||
-            !reservation_and_publication_status || !apply_status || !stream)
+            !reservation_and_publication_status || !apply_status || !stream ||
+            !controller_state || !command_headers || command_buffer_count == 0u ||
+            command_buffer_count > 2u || !plan_entries || plan_capacity == 0u ||
+            !journal.state || !journal.waves || !journal.edges ||
+            journal.wave_capacity == 0u || journal.edge_capacity == 0u)
         {
             LOG_ERROR(
                 "[CUDAMoEKernel::finalizeMoEOverlayRebalancePublication] "
@@ -5500,6 +5518,13 @@ namespace llaminar2
             candidate_epoch,
             reservation_and_publication_status,
             apply_status,
+            controller_state,
+            command_headers,
+            command_buffer_count,
+            plan_entries,
+            plan_capacity,
+            estimated_expert_bytes,
+            journal,
             device_ordinal_,
             stream);
     }

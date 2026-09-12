@@ -32,6 +32,8 @@ import torch.nn.functional as F
 
 from .base import HuggingFaceReferenceModel
 from .mtp_sidecar_reference import (
+    MTPBranchOverride,
+    mtp_branch_qualifier,
     mtp_sidecar_replay_depth,
     save_mtp_snapshot_atomic,
 )
@@ -559,7 +561,7 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
         output_dir,
         max_draft_depth: int = 3,
         verbose: bool = False,
-        draft_token_overrides: Optional[dict[int, list[int]]] = None,
+        draft_token_overrides: Optional[dict[int, MTPBranchOverride]] = None,
         reuse_canonical_main_trajectory: bool = False,
     ) -> int:
         """Generate recursive MTP0..MTPN checkpoints from real dense weights.
@@ -571,8 +573,8 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
         next main-model row, while deeper speculative rows are cropped.
 
         ``draft_token_overrides`` binds an additive reference to the recursive
-        tokens actually proposed by production. Entry zero is consumed by MTP1;
-        MTP0 always consumes the committed main-model condition token. Branch
+        tokens actually proposed by production. Its optional ``condition_token``
+        is consumed by MTP0; ``draft_tokens[0]`` is consumed by MTP1. Branch
         files include every consumed override token in their filename.
 
         ``reuse_canonical_main_trajectory`` explicitly authorizes canonical
@@ -591,7 +593,10 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
         if decode_steps <= 0:
             return 0
         draft_token_overrides = draft_token_overrides or {}
-        for step, tokens in draft_token_overrides.items():
+        if len(draft_token_overrides) > 1:
+            raise ValueError("Each additive MTP pass must own one independent branch")
+        for step, branch in draft_token_overrides.items():
+            tokens = branch["draft_tokens"]
             if step < 0 or step >= decode_steps:
                 raise ValueError(
                     f"Dense MTP draft override step {step} is outside decode range"
@@ -870,8 +875,17 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
             for step in range(decode_steps):
                 committed_cache_length = sidecar_cache.get_seq_length()
                 draft_hidden = last_hidden[:, -1:, :]
-                draft_condition_token = next_token
                 step_overrides = draft_token_overrides.get(step)
+                # The actual condition is a discrete input, not an HF argmax
+                # requirement. All hidden rows and shifted-cache history still
+                # come from the authenticated independent FP32 trajectory.
+                condition_override = (
+                    None if step_overrides is None
+                    else step_overrides["condition_token"]
+                )
+                draft_condition_token = (
+                    next_token if condition_override is None else condition_override
+                )
                 consumed_recursive_tokens = []
                 replay_depth = mtp_sidecar_replay_depth(
                     step, max_draft_depth, draft_token_overrides
@@ -880,9 +894,9 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
                     if (
                         depth_index > 0
                         and step_overrides is not None
-                        and depth_index - 1 < len(step_overrides)
+                        and depth_index - 1 < len(step_overrides["draft_tokens"])
                     ):
-                        draft_condition_token = step_overrides[depth_index - 1]
+                        draft_condition_token = step_overrides["draft_tokens"][depth_index - 1]
                     if depth_index > 0:
                         consumed_recursive_tokens.append(draft_condition_token)
                     prefix = f"MTP{depth_index}_"
@@ -922,14 +936,11 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
                             "MTP0_TERMINAL_HIDDEN_ROW_SELECT"
                         ]
 
-                    branch_qualifier = ""
-                    if step_overrides is not None and depth_index > 0:
-                        branch_qualifier = "_BRANCH_" + "_".join(
-                            str(token) for token in consumed_recursive_tokens
-                        )
+                    branch_qualifier = mtp_branch_qualifier(
+                        step_overrides, consumed_recursive_tokens)
                     persist_snapshot = (
                         not draft_token_overrides
-                        or (step_overrides is not None and depth_index > 0)
+                        or bool(branch_qualifier)
                     )
                     for snapshot_key, payload in snapshots.items():
                         if not persist_snapshot:
@@ -955,6 +966,13 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
                 # Depth zero is the sole committed shifted-MTP row. Deeper
                 # recursive predictions are discarded with their cache state.
                 sidecar_cache.crop(committed_cache_length + 1)
+
+                # The branch terminates here: its optional condition override
+                # must not enter a later canonical committed cache. Other
+                # requested branches get independent passes on this same
+                # loaded sidecar, with no full-model reload.
+                if step_overrides is not None:
+                    break
 
                 if committed_decode_tokens is None:
                     result = self.forward(

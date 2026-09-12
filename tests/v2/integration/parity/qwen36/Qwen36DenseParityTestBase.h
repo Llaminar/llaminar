@@ -994,26 +994,31 @@ namespace llaminar2::test::parity::qwen36
                << ", max_abs_diff<=" << max_abs_diff << ")";
     }
 
+    /**
+     * @brief Require finite native logits identical to the ordinary serial row.
+     * @param actual_logits Grouped verifier's selected vocabulary row.
+     * @param serial_logits Matching M=1 production row.
+     * @param vocab_size Positive full-row width.
+     * @param label Checkpoint identity included in failure diagnostics.
+     * @return Exact-byte success, or actionable finite/geometry/bit failure.
+     */
     inline ::testing::AssertionResult denseVerifierLogitsByteIdentical(
         const float *actual_logits,
         const float *serial_logits,
         int vocab_size,
         const std::string &label)
     {
+        if (!actual_logits || !serial_logits || vocab_size <= 0)
+            return ::testing::AssertionFailure() << label << " missing native verifier row";
         const size_t count = static_cast<size_t>(vocab_size);
-        if (std::memcmp(actual_logits, serial_logits, count * sizeof(float)) == 0)
+        const auto byte_evidence = compareNativeVerifierRow(
+            {actual_logits, count}, {serial_logits, count});
+        if (byte_evidence.passed())
         {
             return ::testing::AssertionSuccess();
         }
 
-        size_t first_mismatch = 0;
-        while (first_mismatch < count &&
-               std::memcmp(actual_logits + first_mismatch,
-                           serial_logits + first_mismatch,
-                           sizeof(float)) == 0)
-        {
-            ++first_mismatch;
-        }
+        const size_t first_mismatch = byte_evidence.first_mismatch;
 
         uint32_t actual_bits = 0;
         uint32_t serial_bits = 0;

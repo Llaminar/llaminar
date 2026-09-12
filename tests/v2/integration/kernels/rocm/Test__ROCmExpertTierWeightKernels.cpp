@@ -14,6 +14,8 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "execution/moe/ExpertTierWeightStream.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
@@ -169,6 +171,7 @@ extern "C"
 
 namespace llaminar2
 {
+    using llaminar::v2::kernels::KernelFactory;
     namespace
     {
         /** @brief Enable route evidence for one test without leaking env state. */
@@ -2550,6 +2553,141 @@ namespace llaminar2
                     expected_cpu.native_interleaved.data(),
                     expected_cpu.native_interleaved.size()),
                 "rocm_fused_qkv_migration");
+        }
+
+        /**
+         * @brief Service handles preserve all source/physical identities and bindings.
+         *
+         * Real device storage is lifetime-pinned through the service handle,
+         * but its workspace and stream must never replace serving bindings.
+         * This tests ownership, not arithmetic on the uninitialized test bytes.
+         */
+        TEST_F(ROCmExpertTierWeightKernelsTest,
+               PreparedServiceViewsIsolateAllQuantizedExecutionBindings)
+        {
+            const auto device = DeviceId::rocm(0);
+            TestHIPStream serving_stream;
+            TestHIPStream probe_stream;
+            DeviceWorkspaceManager serving_workspace(device, 4096);
+            DeviceWorkspaceManager probe_workspace(device, 4096);
+            constexpr int n = 64, k = 256;
+            constexpr size_t blocks = n * (k / 32);
+            for (const auto &format : native_vnni_formats::kAllSourceFormats)
+            {
+                SCOPED_TRACE(std::string(format.quant_type));
+                auto storage = std::make_shared<TestHIPBuffer<uint8_t>>(blocks * 40);
+                auto *payload = storage->data();
+                auto *scales = reinterpret_cast<uint16_t *>(payload + blocks * 32);
+                auto *mins = scales + blocks;
+                auto *emins = reinterpret_cast<uint32_t *>(mins + blocks);
+                const NativeVnniSourceIdentity identity{
+                    .codebook_id = format.metadata->codebook_id,
+                    .is_superblock = format.metadata->is_superblock,
+                    .present = true,
+                };
+                auto serving = std::make_shared<rocm::ROCmQuantisedGemmKernel>(
+                    n, k, 0, payload, scales, mins, emins,
+                    canonicalDeviceVnniCodebookId(identity.codebook_id), k / 32,
+                    storage, identity,
+                    NativeVnniReusableDeviceAllocationFormat{32, true, true});
+                serving->setGPUStream(serving_stream.opaque());
+                serving->bindWorkspace(&serving_workspace);
+                auto probe = KernelFactory::createExpertServiceExecutionView(serving, device);
+                ASSERT_NE(probe, nullptr);
+                ASSERT_NE(probe.get(), serving.get());
+                auto *probe_workspace_owner = dynamic_cast<IWorkspaceConsumer *>(probe.get());
+                ASSERT_NE(probe_workspace_owner, nullptr);
+                probe->setGPUStream(probe_stream.opaque());
+                probe_workspace_owner->bindWorkspace(&probe_workspace);
+                EXPECT_EQ(serving->requireGPUStream(), serving_stream.opaque());
+                EXPECT_EQ(serving->getWorkspace(), &serving_workspace);
+
+                DeviceNativeVNNIMatrixDesc expected, observed;
+                ASSERT_TRUE(serving->exportNativeVNNIMatrixDesc(expected));
+                ASSERT_TRUE(probe->exportNativeVNNIMatrixDesc(observed));
+                EXPECT_EQ(observed.payload, expected.payload);
+                EXPECT_EQ(observed.scales, expected.scales);
+                EXPECT_EQ(observed.mins, expected.mins);
+                EXPECT_EQ(observed.emins, expected.emins);
+                EXPECT_EQ(observed.n, expected.n);
+                EXPECT_EQ(observed.k, expected.k);
+                EXPECT_EQ(observed.codebook_id, expected.codebook_id);
+                EXPECT_EQ(observed.allocation_payload_bytes_per_block, 32);
+                NativeVnniSourceIdentity observed_identity;
+                ASSERT_TRUE(probe->exportNativeVNNISourceIdentity(observed_identity));
+                EXPECT_EQ(observed_identity, identity);
+                EXPECT_THROW((void)KernelFactory::createExpertServiceExecutionView(
+                    serving, DeviceId::cuda(0)), std::invalid_argument);
+                EXPECT_THROW((void)KernelFactory::createExpertServiceExecutionView(
+                    serving, DeviceId::rocm(1)), std::invalid_argument);
+
+                probe_workspace_owner->unbindWorkspace();
+                probe->clearGPUStreamBinding();
+                EXPECT_EQ(serving->requireGPUStream(), serving_stream.opaque());
+                EXPECT_EQ(serving->getWorkspace(), &serving_workspace);
+                std::weak_ptr<ITensorGemm> original_lifetime = serving;
+                std::weak_ptr<TestHIPBuffer<uint8_t>> weight_lifetime = storage;
+                serving.reset();
+                storage.reset();
+                EXPECT_FALSE(original_lifetime.expired());
+                EXPECT_FALSE(weight_lifetime.expired());
+                probe.reset();
+                EXPECT_TRUE(original_lifetime.expired());
+                EXPECT_TRUE(weight_lifetime.expired());
+            }
+        }
+
+        /** @brief FP16/BF16/FP32 views retain bytes but not serving library/workspace state. */
+        TEST_F(ROCmExpertTierWeightKernelsTest,
+               PreparedServiceViewsIsolateAllFloatingExecutionBindings)
+        {
+            const auto device = DeviceId::rocm(0);
+            TestHIPStream serving_stream;
+            TestHIPStream probe_stream;
+            DeviceWorkspaceManager serving_workspace(device, 4096);
+            DeviceWorkspaceManager probe_workspace(device, 4096);
+            using Kernel = rocm::ROCmFloatingPointGemmKernel;
+            constexpr int n = 64, k = 256;
+            for (const auto precision : {Kernel::Precision::FP16,
+                                         Kernel::Precision::BF16,
+                                         Kernel::Precision::FP32})
+            {
+                const size_t bytes = n * k * (precision == Kernel::Precision::FP32 ? 4u : 2u);
+                auto storage = std::make_shared<TestHIPBuffer<uint8_t>>(bytes);
+                auto serving = std::make_shared<Kernel>(
+                    storage->data(), n, k, 0, precision, storage);
+                serving->setGPUStream(serving_stream.opaque());
+                serving->bindWorkspace(&serving_workspace);
+                auto probe = KernelFactory::createExpertServiceExecutionView(serving, device);
+                ASSERT_NE(probe, nullptr);
+                ASSERT_NE(probe.get(), serving.get());
+                auto *probe_workspace_owner = dynamic_cast<IWorkspaceConsumer *>(probe.get());
+                ASSERT_NE(probe_workspace_owner, nullptr);
+                probe->setGPUStream(probe_stream.opaque());
+                probe_workspace_owner->bindWorkspace(&probe_workspace);
+                ContiguousFloatingPointWeightDescriptor expected, observed;
+                ASSERT_TRUE(serving->exportContiguousFloatingPointWeights(expected));
+                ASSERT_TRUE(probe->exportContiguousFloatingPointWeights(observed));
+                EXPECT_EQ(observed.data, expected.data);
+                EXPECT_EQ(observed.bytes, bytes);
+                EXPECT_EQ(observed.type, expected.type);
+                EXPECT_EQ(observed.n, n);
+                EXPECT_EQ(observed.k, k);
+                probe_workspace_owner->unbindWorkspace();
+                probe->clearGPUStreamBinding();
+                EXPECT_EQ(serving->getWorkspace(), &serving_workspace);
+                EXPECT_THROW((void)KernelFactory::createExpertServiceExecutionView(
+                    serving, DeviceId::cuda(0)), std::invalid_argument);
+                std::weak_ptr<ITensorGemm> original_lifetime = serving;
+                std::weak_ptr<TestHIPBuffer<uint8_t>> weight_lifetime = storage;
+                serving.reset();
+                storage.reset();
+                EXPECT_FALSE(original_lifetime.expired());
+                EXPECT_FALSE(weight_lifetime.expired());
+                probe.reset();
+                EXPECT_TRUE(original_lifetime.expired());
+                EXPECT_TRUE(weight_lifetime.expired());
+            }
         }
     } // namespace
 } // namespace llaminar2

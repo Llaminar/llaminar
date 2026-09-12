@@ -4,15 +4,14 @@
  * @author David Sanftenberg
  * @date January 2026
  *
- * Provides zero-blocking stage buffer dumping by using background I/O threads.
- * The main execution thread only copies tensor data to a memory queue, while
- * dedicated I/O threads handle the actual file writes in the background.
+ * Copies admitted stage buffers into a background file-writing queue. Host
+ * publication, snapshot copies and queue backpressure remain diagnostic costs;
+ * this facility is not part of an uninstrumented inference timing path.
  *
  * Key Benefits:
- * - Near-zero impact on inference latency
- * - Memory copies are fast (memcpy is ~10GB/s)
  * - File I/O happens in parallel with computation
  * - Automatic backpressure if I/O can't keep up
+ * - Declined dump admission never observes or copies tensor storage
  *
  * Architecture:
  *   Main Thread                    I/O Thread Pool (2-4 threads)
@@ -45,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -266,12 +266,15 @@ namespace llaminar2
          * @brief Enqueue inputs from a StageDumpInfo
          * @param ctx Dump context with paths
          * @param dump_info Stage dump info
-         * @param cfg Debug config (for dump_inputs flag)
+         * @throws std::invalid_argument If admitted context has no directory.
+         * @note Exhausted/filtered admission returns before host publication.
          */
         static void enqueueInputs(
             const StageDumpContext &ctx,
             const StageDumpInfo &dump_info)
         {
+            if (!hasDumpAdmission(ctx))
+                return;
             const auto &cfg = debugEnv().stage_dump;
             if (!cfg.dump_inputs && !cfg.dump_weights)
                 return;
@@ -322,12 +325,19 @@ namespace llaminar2
 
         /**
          * @brief Enqueue outputs from a StageDumpInfo
+         * @param ctx StageDumper admission result, possibly declined.
+         * @param dump_info Output descriptors to publish and copy if admitted.
+         * @param stream Exact GPU producer stream when host publication is needed.
+         * @throws std::invalid_argument If admitted context has no directory.
+         * @note Declined admission must not observe GPU output state.
          */
         static void enqueueOutputs(
             const StageDumpContext &ctx,
             const StageDumpInfo &dump_info,
             void *stream = nullptr)
         {
+            if (!hasDumpAdmission(ctx))
+                return;
             const auto &cfg = debugEnv().stage_dump;
             if (!cfg.dump_outputs)
                 return;
@@ -395,6 +405,26 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Enforce StageDumper admission before any snapshot side effect.
+         *
+         * A negative ID is the canonical filtered/exhausted result. Do not
+         * reinterpret its empty directory as an absolute /inputs or /outputs
+         * path, and do not publish device data for a dump that was declined.
+         * A nonnegative ID without its path is malformed, not a skipped dump.
+         * @param ctx Immutable result returned by StageDumper::beginDump().
+         * @return Whether snapshot work was admitted.
+         * @throws std::invalid_argument For an admitted context with no path.
+         */
+        static bool hasDumpAdmission(const StageDumpContext &ctx)
+        {
+            if (ctx.dump_id < 0)
+                return false;
+            if (ctx.dump_dir.empty())
+                throw std::invalid_argument("Admitted async stage dump requires a directory");
+            return true;
+        }
+
         static AsyncStageDumper &getInstance()
         {
             static AsyncStageDumper instance;

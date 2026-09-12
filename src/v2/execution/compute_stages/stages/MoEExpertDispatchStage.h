@@ -1,6 +1,10 @@
 /**
  * @file MoEExpertDispatchStage.h
  * @brief Host-side routed-row dispatch descriptor stage.
+ *
+ * CPU admission and captured GPU request admission are distinct typed epoch
+ * owners. The stage must preserve the selected immutable placement through
+ * sparse execution even when a newer maintenance bank becomes globally live.
  */
 
 #pragma once
@@ -12,17 +16,44 @@
 #include "../../moe/MoEExpertTokenRowTransfer.h"
 #include "../../moe/MoEExpertOwnerMap.h"
 #include "../../moe/MoEOverlayResidencyAuthority.h"
+#include "../../moe/MoEOverlaySparseCollective.h"
 #include "../../moe/CPUCurrentBatchLLEP.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace llaminar2
 {
+    /**
+     * @brief Resolve the only legal placement epoch at a heterogeneous boundary.
+     * @param authority Immutable source ownership declared by the ticket binding.
+     * @param published_epoch Epoch acquire-published by the captured producer.
+     * @param sequence_epoch Optional independently pinned host sequence epoch.
+     * @return Exact epoch, or zero only for a host-owned admission without a lease yet.
+     * @throws std::logic_error For a missing captured epoch or conflicting authorities.
+     *
+     * A reusable host-admitted header can contain an old result and is ignored.
+     * A captured header is instead an input: consulting current placement would
+     * split CPU routing from the GPU's still-live request lease during movement.
+     */
+    inline uint64_t resolveMoEOverlayDispatchPlacementEpoch(
+        MoEOverlayDispatchEpochAuthority authority,
+        uint64_t published_epoch,
+        uint64_t sequence_epoch)
+    {
+        if (authority == MoEOverlayDispatchEpochAuthority::HostAdmission)
+            return sequence_epoch;
+        if (published_epoch == 0u ||
+            (sequence_epoch != 0u && sequence_epoch != published_epoch))
+            throw std::logic_error("Captured dispatch placement epoch is absent or conflicts with its sequence");
+        return published_epoch;
+    }
+
     class MoEOverlayDispatchTicketStorage;
 
     /**
@@ -157,8 +188,9 @@ namespace llaminar2
          * tensors into a fixed-capacity host ticket.  The following manual
          * dispatch boundary may therefore merge those exact real rows without
          * adding another device transfer or synchronizing an inference stream.
-         * Grouped-verifier callers must not use this contract until accepted
-         * prefix length is known; speculative rows are not production demand.
+         * Every actually executed verifier candidate contributes service work,
+         * accepted or rejected. One ticket is one concurrent batch; accepted
+         * KV/token state is owned by MTP and never inferred from this evidence.
          */
         struct RoutingEvidencePublication
         {

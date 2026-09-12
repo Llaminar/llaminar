@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 
 namespace llaminar2
 {
@@ -29,6 +30,32 @@ namespace llaminar2
     struct GraphSnapshotMemoryCapacity
     {
         std::size_t per_accelerator_bytes = 0u;
+
+        /**
+         * @brief Additional cache-read diagnostics absent from reference files.
+         *
+         * The planner resolves this selection against the actual FA layer,
+         * TP-head, request, context and retained-graph inventories. These are
+         * full-capacity banks, not prompt-row tensors. Their bytes are charged
+         * to the same GraphSnapshotArena owner as the declared checkpoints.
+         */
+        struct EffectiveKV
+        {
+            /** Global model layer, or all full-attention layers when absent. */
+            std::optional<int> layer;
+            /**
+             * Upper bound on independently retained forward snapshot arenas.
+             * Supplied by the serving-family inventory, not by token counts.
+             * Zero is incomplete and rejected by memory planning.
+             */
+            std::size_t retained_arena_count = 0u;
+
+            friend constexpr bool operator==(
+                const EffectiveKV &, const EffectiveKV &) = default;
+        };
+
+        /** Absent means no effective-K/V payloads enter the captured topology. */
+        std::optional<EffectiveKV> effective_kv;
 
         /** @return Whether the declaration names a usable non-empty capacity. */
         [[nodiscard]] constexpr bool valid() const noexcept

@@ -8,6 +8,8 @@
  * - BF16 weights × BF16 activations → FP32 output
  *
  * For quantized weight GEMM (Q4_0, Q8_0, Q8_1, etc.), use CPUQuantisedGemmKernel.
+ * Service-measurement execution handles may alias an existing prepared
+ * engine's immutable tensor while retaining independent workspace bindings.
  *
  * @author David Sanftenberg
  * @date 2025-11-26
@@ -2210,6 +2212,28 @@ namespace llaminar2
             }
 
             ~FloatingPointGemmKernel() override = default;
+
+            /**
+             * @brief Fork execution bindings while retaining the exact prepared tensor.
+             *
+             * The aliasing shared pointer pins the source engine, not a copied
+             * or repacked tensor. CPUKernelBase is default-constructed, so its
+             * workspace cannot be inherited from or rebound on the serving
+             * engine. Arithmetic policy is immutable and is preserved exactly.
+             *
+             * @param source Fully prepared CPU floating-point expert engine.
+             * @throws std::invalid_argument For a missing source or tensor.
+             */
+            explicit FloatingPointGemmKernel(
+                std::shared_ptr<const FloatingPointGemmKernel> source)
+                : weight_tensor_lifetime_(source, source ? source->weight_tensor_ : nullptr),
+                  weight_tensor_(weight_tensor_lifetime_.get()),
+                  numerical_policy_(source ? source->numerical_policy_ : NumericalPolicy::BackendNative)
+            {
+                if (!source || !weight_tensor_)
+                    throw std::invalid_argument("CPU floating execution view requires a prepared source");
+                validateBoundWeight();
+            }
 
             /** @brief Export the engine's exact live row-major CPU weights. */
             bool exportContiguousFloatingPointWeights(

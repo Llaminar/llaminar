@@ -1,6 +1,11 @@
 /**
  * @file MoEOverlayEconomyCalibrationPlanner.cpp
  * @brief Exact closed-cycle construction for non-publishable calibration waves.
+ *
+ * The authenticated layer catalog owns both transfer equivalence and service
+ * coverage. Sparse routing cannot guarantee a sample of every cold format, so
+ * preparation can enumerate missing service coordinates without fabricating
+ * costs or changing the live histogram/residency epoch.
  */
 
 #include "MoEOverlayEconomyCalibrationPlanner.h"
@@ -288,6 +293,127 @@ namespace llaminar2
             service_telemetry_layers_.begin(),
             service_telemetry_layers_.end(),
             layer);
+    }
+
+    std::vector<MoEOverlayServiceEvidenceGap>
+    MoEOverlayEconomyCalibrationLayerCatalog::serviceEvidenceGaps(
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+        const std::vector<int> &participant_ids,
+        const ExpertHistogramProductionTopology &topology) const
+    {
+        if (!topology.valid() || topology.layerCount() != layerCount() ||
+            !std::is_sorted(participant_ids.begin(), participant_ids.end()) ||
+            std::adjacent_find(participant_ids.begin(), participant_ids.end()) !=
+                participant_ids.end() ||
+            (!participant_ids.empty() && participant_ids.front() < 0) ||
+            rows.size() != checkedProduct(
+                participant_ids.size(), layerCount(), "service matrix"))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay service coverage requires canonical participants, complete rows, and exact graph topology");
+        }
+
+        // Validate the entire snapshot before returning even its first gap.
+        // Otherwise a cold early coordinate could conceal corrupt later rows.
+        for (std::size_t participant = 0; participant < participant_ids.size();
+             ++participant)
+        {
+            const std::size_t base = participant * layerCount();
+            for (std::size_t layer = 0; layer < layerCount(); ++layer)
+            {
+                const auto &row = rows[base + layer];
+                if (!row.valid() || row.participant_id != participant_ids[participant] ||
+                    row.layer != static_cast<int>(layer))
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay service snapshot is malformed, overflowed, or non-canonical");
+                }
+                for (std::size_t phase = 0;
+                     phase < kExpertHistogramProductionSourceCount; ++phase)
+                {
+                    if (!topology.reachable(static_cast<int>(layer), phase) &&
+                        row.sample_count[phase] != 0)
+                    {
+                        std::ostringstream message;
+                        message << "ExpertOverlay service snapshot sampled a runtime-disabled inference phase"
+                                << " participant=" << row.participant_id
+                                << " layer=" << layer << " source_index=" << phase;
+                        throw std::invalid_argument(message.str());
+                    }
+                }
+            }
+        }
+
+        constexpr std::array sources{
+            ExpertHistogramSource::DecodeToken,
+            ExpertHistogramSource::PrefillChunk,
+            ExpertHistogramSource::GroupedVerifier};
+        std::vector<MoEOverlayServiceEvidenceGap> gaps;
+        for (std::size_t participant = 0; participant < participant_ids.size();
+             ++participant)
+        {
+            const std::size_t base = participant * layerCount();
+            for (const auto &group : groups_)
+            {
+                for (const auto source : sources)
+                {
+                    const auto phase = expertHistogramProductionSourceIndex(source);
+                    MoEOverlayServiceEvidenceGap gap{
+                        .participant_id = participant_ids[participant],
+                        .representative_layer = group.representative_layer,
+                        .source = source,
+                    };
+                    bool observed = false;
+                    for (const int layer : group.member_layers)
+                    {
+                        if (!topology.requiresServiceEvidence(layer, phase))
+                            continue;
+                        gap.eligible_layers.push_back(layer);
+                        observed |= rows[base + static_cast<std::size_t>(layer)]
+                                        .sample_count[phase] != 0;
+                    }
+                    // Reachable-but-unpriced catch-up graphs cannot create a
+                    // measurement obligation or satisfy a priced phase.
+                    if (!observed && !gap.eligible_layers.empty())
+                        gaps.push_back(std::move(gap));
+                }
+            }
+        }
+        return gaps;
+    }
+
+    std::vector<MoEOverlayParticipantLayerServiceTotals>
+    MoEOverlayEconomyCalibrationLayerCatalog::withPreparedServiceEvidence(
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> &live,
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> &prepared,
+        const std::vector<int> &participant_ids,
+        const ExpertHistogramProductionTopology &topology) const
+    {
+        const auto missing = serviceEvidenceGaps(live, participant_ids, topology);
+        // Validate all setup rows even when live evidence already covers every
+        // class. Irrelevance to this profile cannot excuse corrupt provenance.
+        (void)serviceEvidenceGaps(prepared, participant_ids, topology);
+        auto combined = live;
+        for (const auto &gap : missing)
+        {
+            const auto participant = std::lower_bound(
+                participant_ids.begin(), participant_ids.end(), gap.participant_id);
+            const auto base = static_cast<std::size_t>(participant - participant_ids.begin()) * layerCount();
+            const auto phase = expertHistogramProductionSourceIndex(gap.source);
+            for (const int layer : gap.eligible_layers)
+            {
+                const auto index = base + static_cast<std::size_t>(layer);
+                const auto &probe = prepared[index];
+                if (probe.sample_count[phase] == 0) continue;
+                // The coverage query proved there are no live samples anywhere
+                // in this exact class/phase. Copy measured totals rather than
+                // adding them to device-authored cumulative counters.
+                combined[index].total_nanoseconds[phase] = probe.total_nanoseconds[phase];
+                combined[index].activation_count[phase] = probe.activation_count[phase];
+                combined[index].sample_count[phase] = probe.sample_count[phase];
+            }
+        }
+        return combined;
     }
 
     MoEOverlaySealedMigrationMeasurements

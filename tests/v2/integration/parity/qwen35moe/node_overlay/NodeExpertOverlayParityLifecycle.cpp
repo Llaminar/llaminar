@@ -342,6 +342,25 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     }
 
     /**
+     * @brief Bind evidence retention to the same probe that admits runner reuse.
+     * @return Fresh on a miss; retained only for complete matching ownership.
+     * @throws std::logic_error If the cache splits identity from ownership.
+     *
+     * Called before adoption and before the new cell clears its measurements.
+     * Incompatible runners have already been retired before Base::SetUp; their
+     * construction records must not certify this cell's new topology.
+     */
+    auto Qwen35MoENodeExpertOverlayParityTest::productionParityRunnerEvidenceLifetime() const -> ParityRunnerEvidenceLifetime
+    {
+        std::string error;
+        const bool retained = hasCompatibleQwen122OverlayRunner(&error);
+        if (!error.empty())
+            throw std::logic_error(error);
+        return retained ? ParityRunnerEvidenceLifetime::RetainedRunner
+                        : ParityRunnerEvidenceLifetime::FreshRunner;
+    }
+
+    /**
      * @brief Transfer an exact yielded runner into this fixture.
      * @return Sole runner ownership, or null on an exact cache miss.
      */
@@ -843,7 +862,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
              */
             const std::uint64_t protected_routed_rows =
                 convergenceProtectedRoutedRows() +
-                qwen35MoEConvergenceTimingRequestRoutedRows();
+                qwen35MoEConvergenceTrainingMaximumRoutedRows();
             const int configured_window =
                 orchestration.moe_rebalance.window_size;
             if (protected_routed_rows >=

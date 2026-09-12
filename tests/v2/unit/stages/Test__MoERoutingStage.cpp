@@ -16,6 +16,7 @@
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
+#include "../../utils/ObservedExpertDemandFixture.h"
 #include "utils/DebugEnv.h"
 
 #include <cmath>
@@ -234,6 +235,7 @@ TEST_F(MoERoutingStageTest, CPUGroupedRoutingEvidenceExcludesPhysicalSuffix)
     params.layer_idx = 0;
     params.decode_histogram = &histogram;
     params.host_logical_row_count = kLogicalRows;
+    params.host_routing_source = ExpertHistogramSource::PrefillChunk;
 
     MoERoutingStage stage(params);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
@@ -300,6 +302,7 @@ TEST_F(MoERoutingStageTest, CPUGroupedRoutingEvidenceRequiresLogicalGeometry)
     params.layer_idx = 0;
     params.decode_histogram = &histogram;
 
+    params.host_routing_source = ExpertHistogramSource::PrefillChunk;
     MoERoutingStage stage(params);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
     EXPECT_EQ(histogram.windowTokenCount(), 0u);
@@ -553,171 +556,174 @@ TEST_F(MoERoutingStageTest, CPUDecodeEquivalentVerifierFlagSplitsRows)
 }
 
 /**
- * @brief Prove CPU migration evidence observes only accepted request prefixes.
+ * @brief Retain actual verifier work as whole batches, independent of acceptance.
  *
- * The graph routes two padded request groups in one production stage call.
- * Routing itself must leave the histogram untouched because acceptance is not
- * known yet.  The accepted-state transaction then admits one row from request
- * zero and two rows from request one; the rejected rows are deliberately
- * interleaved between those prefixes in request-major storage, so treating the
- * complete tensor as one leading prefix would produce a different histogram.
+ * Includes depth-15 capacity and two request-major groups. The real CPU router
+ * produces every top-k row once. A zero/partial acceptance cannot erase that
+ * service cost; reset retires cached graph data without retiring frozen evidence.
  */
-TEST_F(MoERoutingStageTest, CPUGroupedVerifierHistogramCommitIsAcceptedPrefixExact)
+TEST_F(MoERoutingStageTest, CPUGroupedVerifierEvidenceRetainsExecutedBatches)
 {
-    constexpr int kRequestCount = 2;
-    constexpr int kRowsPerRequest = 3;
-    constexpr int kPhysicalRows = kRequestCount * kRowsPerRequest;
-    const int32_t accepted_state_counts[kRequestCount] = {1, 2};
-
-    auto input = TestTensorFactory::createFP32Random(
-        {kPhysicalRows, D_MODEL}, -0.5f, 0.5f, 1220);
-    auto gate_weights = TestTensorFactory::createFP32Random(
-        {NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 1221);
-    auto output_indices = TestTensorFactory::createFP32(
-        {kPhysicalRows, TOP_K});
-    auto output_weights = TestTensorFactory::createFP32(
-        {kPhysicalRows, TOP_K});
-
-    DecodeExpertHistogramConfig histogram_config;
-    histogram_config.num_layers = 1;
-    histogram_config.num_experts = NUM_EXPERTS;
-    histogram_config.top_k = TOP_K;
-    histogram_config.window_size = 32;
-    histogram_config.token_boundary_layer_idx = 0;
-    histogram_config.sockets = {DeviceId::cpu()};
-    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
-        1, 1, std::vector<int>(NUM_EXPERTS, 0));
-    DecodeExpertHistogram histogram(histogram_config);
-
-    MoERoutingStage::Params params;
-    params.device_id = DeviceId::cpu();
-    params.input = input.get();
-    params.gate_weights = gate_weights.get();
-    params.output_indices = output_indices.get();
-    params.output_weights = output_weights.get();
-    params.seq_len = kPhysicalRows;
-    params.d_model = D_MODEL;
-    params.num_experts = NUM_EXPERTS;
-    params.top_k = TOP_K;
-    params.norm_topk_prob = true;
-    params.layer_idx = 0;
-    params.decode_histogram = &histogram;
-    params.host_logical_row_count = kPhysicalRows;
-    params.force_decode_equivalent_verifier_prefill = true;
-
-    MoERoutingStage stage(params);
-    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
-
-    for (int expert = 0; expert < NUM_EXPERTS; ++expert)
+    for (const int rows : {1, 2, 3, 15, 16, 32})
     {
-        EXPECT_EQ(
-            histogram.activationCount(
-                ExpertHistogramSource::GroupedVerifier,
-                0,
-                expert),
-            0u)
-            << "routing must not publish speculative rows before acceptance";
-    }
-    EXPECT_EQ(histogram.windowTokenCount(), 0u);
+        SCOPED_TRACE(rows);
+        auto input = TestTensorFactory::createFP32Random(
+            {rows, D_MODEL}, -0.5f, 0.5f, 1220);
+        auto gate_weights = TestTensorFactory::createFP32Random(
+            {NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 1221);
+        auto output_indices = TestTensorFactory::createFP32({rows, TOP_K});
+        auto output_weights = TestTensorFactory::createFP32({rows, TOP_K});
 
-    std::string error;
-    ASSERT_TRUE(stage.validateHostGroupedVerifierHistogramPublication(
-        accepted_state_counts,
-        kRequestCount,
-        kRowsPerRequest,
-        &error)) << error;
-    ASSERT_TRUE(stage.publishHostGroupedVerifierHistograms(
-        accepted_state_counts,
-        kRequestCount,
-        kRowsPerRequest,
-        &error)) << error;
+        DecodeExpertHistogramConfig config;
+        config.num_layers = 1;
+        config.num_experts = NUM_EXPERTS;
+        config.top_k = TOP_K;
+        config.window_size = 64;
+        config.token_boundary_layer_idx = 0;
+        config.sockets = {DeviceId::cpu()};
+        config.ownership = MoELayeredExpertOwnership::uniform(
+            1, 1, std::vector<int>(NUM_EXPERTS, 0));
+        admitObservedExpertDemand(config, {.target_rows = 64,
+            .max_transaction_rows = 32, .top_k = TOP_K}, 1);
+        DecodeExpertHistogram histogram(config);
 
-    std::vector<uint64_t> expected(static_cast<size_t>(NUM_EXPERTS), 0);
-    const float *indices = output_indices->data();
-    for (int request = 0; request < kRequestCount; ++request)
-    {
-        for (int row = 0; row < accepted_state_counts[request]; ++row)
+        MoERoutingStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.input = input.get();
+        params.gate_weights = gate_weights.get();
+        params.output_indices = output_indices.get();
+        params.output_weights = output_weights.get();
+        params.seq_len = rows;
+        params.d_model = D_MODEL;
+        params.num_experts = NUM_EXPERTS;
+        params.top_k = TOP_K;
+        params.norm_topk_prob = true;
+        params.layer_idx = 0;
+        params.decode_histogram = &histogram;
+        params.host_logical_row_count = rows;
+        params.host_routing_source = ExpertHistogramSource::GroupedVerifier;
+        params.force_decode_equivalent_verifier_prefill = true;
+
+        MoERoutingStage stage(params);
+        ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+        EXPECT_EQ(histogram.windowTokenCount(), rows)
+            << "execution evidence must not wait for accepted-state publication";
+        std::vector<int> expected_routes(rows * TOP_K);
+        std::transform(output_indices->data(), output_indices->data() + rows * TOP_K,
+            expected_routes.begin(), [](float id) { return static_cast<int>(id); });
+
+        // A second call is another actual invocation, not another publication
+        // of the first one. This also checks retained-bank reuse after reset.
+        stage.resetSessionState();
+        ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+        const auto frozen = histogram.freezeAndRotateWindow();
+        ASSERT_EQ(frozen.token_count, 2u * rows);
+        const auto &demand = frozen.validatedView().transactionDemand();
+        ASSERT_EQ(demand.layerTransactions(0).size(), 2u);
+        for (std::size_t batch = 0; batch < 2; ++batch)
         {
-            const int physical_row = request * kRowsPerRequest + row;
-            for (int slot = 0; slot < TOP_K; ++slot)
-            {
-                const int expert = static_cast<int>(
-                    indices[physical_row * TOP_K + slot]);
-                ASSERT_GE(expert, 0);
-                ASSERT_LT(expert, NUM_EXPERTS);
-                ++expected[static_cast<size_t>(expert)];
-            }
+            const auto route = demand.routes(0, batch);
+            EXPECT_EQ(demand.layerTransactions(0)[batch].phase,
+                ExpertHistogramSource::GroupedVerifier);
+            EXPECT_EQ(route.logical_rows, rows);
+            for (int slot = 0; slot < rows * TOP_K; ++slot)
+                EXPECT_EQ(route.expert_ids[slot], expected_routes[slot]);
         }
+        stage.resetSessionState();
+        EXPECT_EQ(demand.layerTransactions(0).size(), 2u);
+        EXPECT_EQ(histogram.windowTokenCount(), 0u);
     }
-
-    uint64_t total = 0;
-    for (int expert = 0; expert < NUM_EXPERTS; ++expert)
-    {
-        const uint64_t actual = histogram.activationCount(
-            ExpertHistogramSource::GroupedVerifier,
-            0,
-            expert);
-        EXPECT_EQ(actual, expected[static_cast<size_t>(expert)]);
-        total += actual;
-    }
-    EXPECT_EQ(total, 3u * static_cast<uint64_t>(TOP_K));
-    EXPECT_EQ(histogram.windowTokenCount(), 3u);
 }
 
-/**
- * @brief Reject malformed accepted geometry before any histogram mutation.
- */
-TEST_F(MoERoutingStageTest, CPUGroupedVerifierHistogramPrevalidationIsAtomic)
+/** @brief Invalid executed-row geometry cannot publish a partial demand batch. */
+TEST_F(MoERoutingStageTest, CPUGroupedVerifierEvidenceRejectsInvalidGeometry)
 {
-    constexpr int kRows = 2;
+    constexpr int rows = 2;
     auto input = TestTensorFactory::createFP32Random(
-        {kRows, D_MODEL}, -0.5f, 0.5f, 1230);
+        {rows, D_MODEL}, -0.5f, 0.5f, 1230);
     auto gate_weights = TestTensorFactory::createFP32Random(
         {NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 1231);
-    auto output_indices = TestTensorFactory::createFP32({kRows, TOP_K});
-    auto output_weights = TestTensorFactory::createFP32({kRows, TOP_K});
+    auto indices = TestTensorFactory::createFP32({rows, TOP_K});
+    auto weights = TestTensorFactory::createFP32({rows, TOP_K});
 
-    DecodeExpertHistogramConfig histogram_config;
-    histogram_config.num_layers = 1;
-    histogram_config.num_experts = NUM_EXPERTS;
-    histogram_config.top_k = TOP_K;
-    histogram_config.window_size = 32;
-    histogram_config.token_boundary_layer_idx = 0;
-    histogram_config.sockets = {DeviceId::cpu()};
-    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+    DecodeExpertHistogramConfig config;
+    config.num_layers = 1;
+    config.num_experts = NUM_EXPERTS;
+    config.top_k = TOP_K;
+    config.window_size = 32;
+    config.token_boundary_layer_idx = 0;
+    config.sockets = {DeviceId::cpu()};
+    config.ownership = MoELayeredExpertOwnership::uniform(
         1, 1, std::vector<int>(NUM_EXPERTS, 0));
-    DecodeExpertHistogram histogram(histogram_config);
+    admitObservedExpertDemand(config, {.target_rows = 32,
+        .max_transaction_rows = rows, .top_k = TOP_K}, 1);
+    DecodeExpertHistogram histogram(config);
 
     MoERoutingStage::Params params;
     params.device_id = DeviceId::cpu();
     params.input = input.get();
     params.gate_weights = gate_weights.get();
-    params.output_indices = output_indices.get();
-    params.output_weights = output_weights.get();
-    params.seq_len = kRows;
+    params.output_indices = indices.get();
+    params.output_weights = weights.get();
+    params.seq_len = rows;
     params.d_model = D_MODEL;
     params.num_experts = NUM_EXPERTS;
     params.top_k = TOP_K;
     params.layer_idx = 0;
     params.decode_histogram = &histogram;
-    params.host_logical_row_count = kRows;
+    params.host_logical_row_count = rows + 1;
+    params.host_routing_source = ExpertHistogramSource::GroupedVerifier;
     params.force_decode_equivalent_verifier_prefill = true;
-
     MoERoutingStage stage(params);
-    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
-
-    const int32_t invalid_accepted_count[] = {kRows + 1};
-    std::string error;
-    EXPECT_FALSE(stage.validateHostGroupedVerifierHistogramPublication(
-        invalid_accepted_count,
-        1,
-        kRows,
-        &error));
-    EXPECT_NE(error.find("outside its verifier group"), std::string::npos)
-        << error;
+    EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
     EXPECT_EQ(histogram.windowTokenCount(), 0u);
     for (int expert = 0; expert < NUM_EXPERTS; ++expert)
         EXPECT_EQ(histogram.activationCount(0, expert), 0u);
+}
+
+/** @brief One row does not imply serial decode: phase is a graph-owned fact. */
+TEST_F(MoERoutingStageTest, CPUOneRowRoutingEvidenceHasExplicitPhase)
+{
+    auto input = TestTensorFactory::createFP32Random({1, D_MODEL}, -0.5f, 0.5f, 1240);
+    auto gate = TestTensorFactory::createFP32Random({NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 1241);
+    auto indices = TestTensorFactory::createFP32({1, TOP_K});
+    auto weights = TestTensorFactory::createFP32({1, TOP_K});
+    for (const auto phase : {ExpertHistogramSource::DecodeToken,
+         ExpertHistogramSource::PrefillChunk, ExpertHistogramSource::GroupedVerifier})
+    {
+        SCOPED_TRACE(static_cast<int>(phase));
+        DecodeExpertHistogramConfig config;
+        config.num_layers = 1;
+        config.num_experts = NUM_EXPERTS;
+        config.top_k = TOP_K;
+        config.window_size = 4;
+        config.sockets = {DeviceId::cpu()};
+        config.ownership = MoELayeredExpertOwnership::uniform(1, 1, std::vector<int>(NUM_EXPERTS, 0));
+        admitObservedExpertDemand(config, {.target_rows = 4, .max_transaction_rows = 1, .top_k = TOP_K}, 1);
+        DecodeExpertHistogram histogram(config);
+        MoERoutingStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.input = input.get();
+        params.gate_weights = gate.get();
+        params.output_indices = indices.get();
+        params.output_weights = weights.get();
+        params.seq_len = 1;
+        params.d_model = D_MODEL;
+        params.num_experts = NUM_EXPERTS;
+        params.top_k = TOP_K;
+        params.layer_idx = 0;
+        params.decode_histogram = &histogram;
+        EXPECT_THROW((void)MoERoutingStage(params), std::invalid_argument);
+        params.host_routing_source = phase;
+        MoERoutingStage stage(params);
+        ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+        const auto frozen = histogram.freezeAndRotateWindow();
+        ASSERT_EQ(frozen.token_count, 1u);
+        const auto &demand = frozen.validatedView().transactionDemand();
+        ASSERT_EQ(demand.layerTransactions(0).size(), 1u);
+        EXPECT_EQ(demand.layerTransactions(0)[0].phase, phase);
+        EXPECT_EQ(demand.routes(0, 0).logical_rows, 1u);
+    }
 }
 
 TEST_F(MoERoutingStageTest, NullInputsReturnError)

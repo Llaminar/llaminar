@@ -128,6 +128,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief Name the complete semantic value produced by an embedding join.
+         *
+         * Vocabulary-parallel embedding stages publish local partials. Their
+         * already-existing collective is the finalizer on every participant;
+         * the diagnostic suffix must not hide that complete canonical value.
+         * Keep the existing name parser as the authority for MTP depth spelling.
+         * @return Canonical embedding key, or empty for an unrelated producer.
+         */
+        std::string finalizedEmbeddingSnapshotKey(const std::string &stage_name)
+        {
+            if (stage_name != "embedding_allreduce" &&
+                !stage_name.ends_with("_embedding_allreduce"))
+                return {};
+            const auto diagnostic = SnapshotCapture::convertStageNameToSnapshotKey(stage_name);
+            constexpr std::string_view suffix = "_ALLREDUCED";
+            return diagnostic.substr(0, diagnostic.size() - suffix.size());
+        }
+
+        /**
+         * @brief Apply the immutable capture bank's context grammar to filter keys.
+         * @param context Request/transaction context before the `::` boundary.
+         * @param keys Semantic producer keys within that context.
+         * @return Qualified keys using exactly the capture publication spelling.
+         */
+        std::vector<std::string> qualifySnapshotKeys(
+            const std::string &context, std::vector<std::string> keys)
+        {
+            const auto prefix = snapshotContextPrefix(context) + "_";
+            for (auto &key : keys)
+                key = prefix + key;
+            return keys;
+        }
+
+        /**
          * @brief Name one ordered cumulative ExpertOverlay contribution.
          *
          * Each graph-native overlay ticket consume copies the routed-expert
@@ -241,6 +275,25 @@ namespace llaminar2
 
         LOG_TRACE("[Snapshot] Callback invoked for stage: " << name
                                                             << " outputs.size=" << dump.outputs.size());
+
+        if (const auto key = finalizedEmbeddingSnapshotKey(name); !key.empty())
+        {
+            if (dump.outputs.empty() || !dump.outputs.front().data)
+                return;
+            const auto &output = dump.outputs.front();
+            auto values = extractFp32FromOutput(output);
+            if (values.empty())
+                return;
+
+            // Replace the canonical local partial with the ordered collective's
+            // complete value. Both names share one immutable payload; old readers
+            // still own their earlier partial, and no additional device copy or
+            // inference collective is introduced by semantic publication.
+            storeSnapshot(key, std::move(values), output.rows, output.cols,
+                          SnapshotPublication::CompleteValue);
+            snapshots_[key + "_ALLREDUCED"] = snapshots_.at(key);
+            return;
+        }
 
         // Handle fused QKV stage — split into separate Q, K, V snapshots
         if (name.find("_qkv_proj") != std::string::npos)
@@ -588,11 +641,14 @@ namespace llaminar2
                 const std::string output_name =
                     output.name ? output.name : "";
                 if (output_name == "routed_output" && output.data)
-                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output,
+                                SnapshotPublication::CompleteValue);
                 else if (output_name == "shared_output" && output.data)
-                    storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
+                    storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output,
+                                SnapshotPublication::CompleteValue);
                 else if (output_name == "combined_output" && output.data)
-                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
+                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output,
+                                SnapshotPublication::CompleteValue);
             }
             return;
         }
@@ -673,7 +729,11 @@ namespace llaminar2
                 if (output_name == "shared_output" && output.data)
                     storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
                 else if (output_name == "routed_output" && output.data)
-                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
+                    // The fused gate consumes the complete routed row. Other
+                    // participants may still retain earlier expert partials;
+                    // those must not be added to this final publication.
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output,
+                                SnapshotPublication::CompleteValue);
                 else if (output_name == "combined_output" && output.data)
                     storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
             }
@@ -973,6 +1033,7 @@ namespace llaminar2
                         : piece.rows >= live_rows &&
                               piece.rows % rows_per_logical_row == 0;
                 if (!row_geometry_valid ||
+                    piece.publication != first.publication ||
                     piece.cols != first.cols ||
                     piece.rows > std::numeric_limits<size_t>::max() / piece.cols ||
                     piece.data.size() != piece.rows * piece.cols ||
@@ -1024,7 +1085,8 @@ namespace llaminar2
                 semantic_key,
                 std::move(joined),
                 total_rows,
-                first.cols);
+                first.cols,
+                first.publication);
             ++result.aggregated_sequence_keys;
         }
 
@@ -1294,6 +1356,12 @@ namespace llaminar2
 
     std::vector<std::string> SnapshotCapture::possibleKeysForStageName(const std::string &stage_name)
     {
+        if (const auto separator = stage_name.find("::"); separator != std::string::npos)
+            return qualifySnapshotKeys(stage_name.substr(0, separator),
+                possibleKeysForStageName(stage_name.substr(separator + 2)));
+        if (const auto key = finalizedEmbeddingSnapshotKey(stage_name); !key.empty())
+            return {key, key + "_ALLREDUCED"};
+
         auto prefixBefore = [&](const std::string &needle) -> std::string
         {
             const size_t pos = stage_name.find(needle);
@@ -1484,6 +1552,10 @@ namespace llaminar2
         const std::string &stage_name,
         const StageDumpInfo &dump_info)
     {
+        if (const auto separator = stage_name.find("::"); separator != std::string::npos)
+            return qualifySnapshotKeys(stage_name.substr(0, separator),
+                possibleKeysForStage(stage_name.substr(separator + 2), dump_info));
+
         auto prefixBefore = [&](const std::string &needle) -> std::string
         {
             const size_t pos = stage_name.find(needle);
@@ -1607,23 +1679,28 @@ namespace llaminar2
         const std::string &key,
         std::vector<float> data,
         size_t rows,
-        size_t cols)
+        size_t cols,
+        SnapshotPublication publication)
     {
         snapshots_[key] = std::make_shared<const StoredSnapshot>(
             StoredSnapshot{
                 .data = std::move(data),
                 .rows = rows,
                 .cols = cols,
+                .publication = publication,
             });
     }
 
-    void SnapshotCapture::storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out)
+    void SnapshotCapture::storeOutput(
+        const std::string &key,
+        const StageDumpInfo::OutputBuffer &out,
+        SnapshotPublication publication)
     {
         if (!out.data)
             return;
         auto data = extractFp32FromOutput(out);
         if (!data.empty())
-            storeSnapshot(key, std::move(data), out.rows, out.cols);
+            storeSnapshot(key, std::move(data), out.rows, out.cols, publication);
     }
 
 } // namespace llaminar2

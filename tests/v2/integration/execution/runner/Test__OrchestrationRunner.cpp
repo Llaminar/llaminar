@@ -20,7 +20,7 @@
 #include "execution/runner/IOrchestrationRunner.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "execution/runner/OrchestrationRunner.h"
-#include "execution/runner/NamedDomainGlobalRunner.h"
+#include "execution/global/NamedDomainGraphBuilder.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -527,13 +527,12 @@ namespace
     }
 
     // =========================================================================
-    // Phase 5: NamedDomainGlobalRunner factory dispatch
+    // Named domains share ordinary initialization and admission
     // =========================================================================
 
-    TEST_F(Test__OrchestrationRunner, NamedDomainGlobalConfig_CreatesNamedDomainGlobalRunner)
+    TEST_F(Test__OrchestrationRunner, NamedDomainsUseOrdinaryInitializationAuthority)
     {
-        // A config with named domains having scope=node_local should cause the
-        // factory to return a NamedDomainGlobalRunner rather than OrchestrationRunner.
+        // Cross-rank graph construction must not select a second lifecycle.
         OrchestrationConfig cfg;
         cfg.domain_definitions.push_back(DomainDefinition::parse(
             "rocm_domain=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0"));
@@ -543,18 +542,22 @@ namespace
         cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("1=cpu_domain:14-27"));
 
         // Verify shouldUse() predicate matches
-        EXPECT_TRUE(NamedDomainGlobalRunner::shouldUse(cfg));
+        EXPECT_TRUE(requiresNamedDomainGlobalGraph(cfg));
 
         auto runner = factory_->createFromOrchestrationConfig(cfg);
         ASSERT_NE(runner, nullptr);
 
-        // Should be a NamedDomainGlobalRunner, not OrchestrationRunner
-        auto *named_runner = dynamic_cast<NamedDomainGlobalRunner *>(runner.get());
         auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get());
-        EXPECT_NE(named_runner, nullptr)
-            << "Expected NamedDomainGlobalRunner but got OrchestrationRunner or other type";
-        EXPECT_EQ(orch_runner, nullptr)
-            << "Should not be an OrchestrationRunner for cross-rank named domain config";
+        ASSERT_NE(orch_runner, nullptr);
+        EXPECT_FALSE(runner->isInitialized());
+        EXPECT_FALSE(runner->setSnapshotMemoryCapacity({}));
+        EXPECT_NE(runner->lastError().find("positive"), std::string::npos);
+        EXPECT_TRUE(runner->setSnapshotMemoryCapacity({.per_accelerator_bytes = 4096}));
+        runner->setSnapshotCaptureFilter({"embedding", "lm_head"});
+        EXPECT_TRUE(runner->prepareInactiveSnapshotCapture(""));
+        EXPECT_FALSE(runner->activatePreparedSnapshotCapture())
+            << "Accepting setup policy must not prematurely certify readiness";
+        EXPECT_FALSE(runner->isInitialized());
     }
 
     /**
@@ -575,26 +578,55 @@ namespace
         cfg.pp_stage_definitions.push_back(
             PPStageDefinition::parse("1=tail:14-27"));
 
-        ASSERT_TRUE(NamedDomainGlobalRunner::shouldUse(cfg));
+        ASSERT_TRUE(requiresNamedDomainGlobalGraph(cfg));
         auto runner = factory_->createFromOrchestrationConfig(cfg);
         ASSERT_NE(runner, nullptr);
-        EXPECT_NE(dynamic_cast<NamedDomainGlobalRunner *>(runner.get()), nullptr);
+        EXPECT_NE(dynamic_cast<OrchestrationRunner *>(runner.get()), nullptr);
+        EXPECT_TRUE(runner->setSnapshotMemoryCapacity({.per_accelerator_bytes = 4096}));
     }
 
-    TEST_F(Test__OrchestrationRunner, SimpleSingleDeviceConfig_DoesNotCreateNamedDomainRunner)
+    /**
+     * @brief Pre-initialization policy is backend-independent and ignores idle domains.
+     *
+     * No model or device is created: topology intent alone must select the
+     * common lifecycle. A declared-but-unused cross-rank domain must not turn
+     * an otherwise local graph into a global one.
+     */
+    TEST_F(Test__OrchestrationRunner, NamedDomainSetupPolicyIsBackendSymmetric)
+    {
+        for (const std::string backend : {"cpu", "cuda", "rocm"})
+        {
+            SCOPED_TRACE(backend);
+            OrchestrationConfig cfg;
+            cfg.domain_definitions.push_back(DomainDefinition::parse(
+                "head=0:" + backend + ":0;scope=rank_local;owner=0"));
+            cfg.domain_definitions.push_back(DomainDefinition::parse(
+                "tail=1:" + backend + ":0;scope=rank_local;owner=1"));
+            cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("0=head:0-13"));
+            EXPECT_FALSE(requiresNamedDomainGlobalGraph(cfg));
+            cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("1=tail:14-27"));
+            ASSERT_TRUE(requiresNamedDomainGlobalGraph(cfg));
+            auto runner = factory_->createFromOrchestrationConfig(cfg);
+            ASSERT_NE(dynamic_cast<OrchestrationRunner *>(runner.get()), nullptr);
+            ASSERT_TRUE(runner->setSnapshotMemoryCapacity({.per_accelerator_bytes = 8192}));
+            runner->setSnapshotCaptureFilter({"lm_head"});
+            runner->enableSnapshotCapture("");
+            EXPECT_FALSE(runner->isInitialized());
+        }
+    }
+
+    TEST_F(Test__OrchestrationRunner, SingleDeviceUsesOrdinaryInitializationAuthority)
     {
         // Simple single-device config must still go through OrchestrationRunner
         OrchestrationConfig cfg;
         cfg.device_for_this_rank = GlobalDeviceAddress::cpu();
 
-        EXPECT_FALSE(NamedDomainGlobalRunner::shouldUse(cfg));
+        EXPECT_FALSE(requiresNamedDomainGlobalGraph(cfg));
 
         auto runner = factory_->createFromOrchestrationConfig(cfg);
         ASSERT_NE(runner, nullptr);
 
-        auto *named_runner = dynamic_cast<NamedDomainGlobalRunner *>(runner.get());
-        EXPECT_EQ(named_runner, nullptr)
-            << "Simple single-device config should use OrchestrationRunner, not NamedDomainGlobalRunner";
+        EXPECT_NE(dynamic_cast<OrchestrationRunner *>(runner.get()), nullptr);
     }
 
     /**
@@ -624,7 +656,7 @@ namespace
         cfg.pp_stage_definitions.push_back(
             PPStageDefinition::parse("0=cpu_domain:0-27"));
 
-        ASSERT_TRUE(NamedDomainGlobalRunner::shouldUse(cfg));
+        ASSERT_TRUE(requiresNamedDomainGlobalGraph(cfg));
         EXPECT_EQ(
             resolveRunnerModelAuthorityScope(cfg),
             RunnerModelAuthorityScope::MultiRankSet);

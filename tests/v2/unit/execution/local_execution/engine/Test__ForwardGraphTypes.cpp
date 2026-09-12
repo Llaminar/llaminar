@@ -32,6 +32,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "../../../../utils/HeterogeneousTicketParityEvidence.h"
 #include "../../../../mocks/MockComputeStage.h"
 
 using namespace llaminar2;
@@ -1191,6 +1192,50 @@ TEST(Test__ForwardGraphTypes,
         ForwardStateTransaction::Ordinary,
         /*batch_size=*/1,
         /*seq_len=*/2));
+}
+
+/** @brief Cadence ownership is explicit, independent of format or backend. */
+TEST(Test__ForwardGraphSignature, SerialCommitOwnershipExcludesSpeculationAndPrefix)
+{
+    for (const auto role : {ForwardExecutionRole::MainInference,
+                            ForwardExecutionRole::MTPCondition,
+                            ForwardExecutionRole::GroupedMTPVerifier})
+        for (const auto phase : {ForwardExecutionPhase::Prefill,
+                                 ForwardExecutionPhase::Decode})
+            for (const auto transaction : {ForwardStateTransaction::Ordinary,
+                 ForwardStateTransaction::CommittedMTPCondition,
+                 ForwardStateTransaction::RestoredPrefixMTPDecodeBridge})
+            {
+                const bool expected = phase == ForwardExecutionPhase::Decode &&
+                    ((role == ForwardExecutionRole::MainInference &&
+                      transaction == ForwardStateTransaction::Ordinary) ||
+                     (role == ForwardExecutionRole::MTPCondition &&
+                      transaction == ForwardStateTransaction::CommittedMTPCondition));
+                EXPECT_EQ(ownsSerialDecodeCommitBoundary(role, phase, transaction), expected);
+            }
+    EXPECT_EQ(mtpConditionForwardInvocation(MTPConditionForwardPurpose::SpeculativeContinuation),
+              ForwardInvocationKind::ExplicitDecode);
+    EXPECT_EQ(mtpConditionForwardInvocation(MTPConditionForwardPurpose::CommittedSerialToken),
+              ForwardInvocationKind::CommittedMTPCondition);
+    EXPECT_THROW((void)mtpConditionForwardInvocation(static_cast<MTPConditionForwardPurpose>(255)),
+                 std::invalid_argument);
+}
+
+/** @brief Identical math and addresses cannot alias different commit semantics. */
+TEST(Test__ForwardGraphSignature, MTPConditionCommitPurposeIsCapturedIdentity)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        ForwardGraphSignature speculative{
+            .seq_len = 1, .batch_size = 1, .device = device,
+            .execution_role = ForwardExecutionRole::MTPCondition,
+            .decode = true};
+        auto committed = speculative;
+        committed.state_transaction = ForwardStateTransaction::CommittedMTPCondition;
+        EXPECT_NE(speculative, committed);
+        EXPECT_NE(ForwardGraphSignatureHash{}(speculative),
+                  ForwardGraphSignatureHash{}(committed));
+    }
 }
 
 TEST(Test__ForwardGraphSignature,
@@ -4652,7 +4697,8 @@ TEST(Test__GraphSegmentCache,
         findCounterValue(
             PerfStatsCollector::snapshot({"forward_graph"}),
             "heterogeneous_ticket_transactions",
-            {{"capturable_segments", "2"},
+            {{"lifecycle_contract", "typed_marker_adjacency_v1"},
+             {"capturable_segments", "2"},
              {"manual_segments", "1"},
              {"ticket_publication_authority",
               "stage_owned_mapped_timeline"},
@@ -4758,6 +4804,8 @@ TEST(Test__GraphSegmentCache,
 TEST(Test__GraphSegmentCache,
      HeterogeneousTicketLifecycleAdmitsAdditionalCapturedChildren)
 {
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
     ComputeGraph graph;
     addFakeSegmentStage(
         graph, "prefix", true, false, ComputeStageType::COPY, false,
@@ -4852,6 +4900,100 @@ TEST(Test__GraphSegmentCache,
     EXPECT_EQ(
         cache.segments[4].stage_names,
         std::vector<std::string>{"cpu_ticket_service"});
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const auto evidence = std::find_if(records.begin(), records.end(), [](const auto &record)
+    {
+        return record.name == "heterogeneous_ticket_transactions";
+    });
+    ASSERT_NE(evidence, records.end());
+    EXPECT_EQ(
+        llaminar2::test::parity::classifyHeterogeneousTicketLifecycleEvidence(*evidence),
+        llaminar2::test::parity::HeterogeneousTicketEvidenceDisposition::Authority);
+}
+
+/**
+ * @brief Logical ticket evidence survives many-to-one CPU service lowering.
+ *
+ * Exercise the real planner on CUDA/ROCm-addressed graphs, both roles, and
+ * one/two/full-model boundary counts. Stages are device-free fixtures; the
+ * planner, retained-parent lowering and parity evidence interpreter are real.
+ */
+TEST(HeterogeneousTicketLifecycleEvidence, RetainedLoweringPreservesLogicalProof)
+{
+    using namespace llaminar2::test::parity;
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool authority : {true, false})
+    for (const int layers : {1, 2, 48})
+    {
+        SCOPED_TRACE(::testing::Message() << "layers=" << layers << " authority=" << authority);
+        PerfStatsCollector::reset();
+        ComputeGraph graph;
+        std::string previous;
+        for (int layer = 0; layer < layers; ++layer)
+        {
+            const auto producer = "producer_" + std::to_string(layer);
+            const auto service = "service_" + std::to_string(layer);
+            const auto consumer = "consumer_" + std::to_string(layer);
+            addFakeSegmentStage(graph, producer, true, false, ComputeStageType::COPY,
+                                false, false, false, nullptr, device);
+            if (!previous.empty())
+                graph.addDependency(producer, previous);
+            graph.setHeterogeneousTicketUnitContract(producer,
+                GraphHeterogeneousTicketUnitContract{.identity = "boundary_" + std::to_string(layer)});
+            if (authority)
+            {
+                addFakeSegmentStage(graph, service, false, true, ComputeStageType::MOE_LOCAL_EXPERT,
+                    false, false, false, nullptr, DeviceId::cpu(), false,
+                    ManualGraphBoundaryScheduling::ConcurrentTicketService,
+                    ConcurrentManualFailureRole::DeviceIngressPublisher);
+                graph.addDependency(service, producer);
+            }
+            addFakeSegmentStage(graph, consumer, true, false, ComputeStageType::COPY,
+                                false, false, false, nullptr, device);
+            graph.addDependency(consumer, authority ? service : producer);
+            previous = consumer;
+        }
+        graph.setTerminalNode(previous);
+        graph.setHeterogeneousTicketUnitContract(previous,
+            GraphHeterogeneousTicketUnitContract{
+                .identity = "terminal",
+                .disposition = GraphHeterogeneousTicketUnitDisposition::TransactionTerminal});
+        graph.setNativeCaptureEnvelope(authority
+            ? GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction
+            : GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction);
+        const auto plan = makeMoEOverlayRetainedParentPlan(graph);
+        ASSERT_TRUE(plan.has_value());
+        DeviceGraphExecutor::GraphSegmentCache cache;
+        ASSERT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(
+            graph, cache, nullptr, false, false, plan->replay_policy));
+        EXPECT_EQ(std::count_if(cache.segments.begin(), cache.segments.end(),
+            [](const auto &segment) { return !segment.capturable; }), authority ? 1 : 0)
+            << "Lowering must keep the one compiled CPU service program";
+
+        const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+        const auto found = std::find_if(records.begin(), records.end(), [](const auto &record)
+        { return record.name == "heterogeneous_ticket_transactions"; });
+        ASSERT_NE(found, records.end());
+        EXPECT_EQ(found->tags.at("manual_segments"), std::to_string(authority ? layers : 0));
+        EXPECT_EQ(found->tags.at("unit_boundaries"), std::to_string(layers));
+        EXPECT_EQ(classifyHeterogeneousTicketLifecycleEvidence(*found), authority
+            ? HeterogeneousTicketEvidenceDisposition::Authority
+            : HeterogeneousTicketEvidenceDisposition::Follower);
+
+        // A consumer must reject old mixed-phase records and corrupt evidence.
+        for (const auto &[key, value] : std::vector<std::pair<std::string, std::string>>{
+                 {"lifecycle_contract", ""}, {"role", "unknown"},
+                 {"unit_boundaries", "0"}, {"terminal_units", "2"},
+                 {"capturable_segments", "1"}, {"manual_segments", "-1"},
+                 {"unit_boundaries", "18446744073709551616"}})
+        {
+            auto corrupt = *found;
+            corrupt.tags[key] = value;
+            EXPECT_EQ(classifyHeterogeneousTicketLifecycleEvidence(corrupt),
+                      HeterogeneousTicketEvidenceDisposition::Malformed);
+        }
+    }
 }
 
 /**
@@ -4957,7 +5099,8 @@ TEST(Test__GraphSegmentCache,
         findCounterValue(
             PerfStatsCollector::snapshot({"forward_graph"}),
             "heterogeneous_ticket_transactions",
-            {{"capturable_segments", "3"},
+            {{"lifecycle_contract", "typed_marker_adjacency_v1"},
+             {"capturable_segments", "3"},
              {"manual_segments", "2"},
              {"ticket_publication_authority",
               "stage_owned_mapped_timeline"},
@@ -5147,7 +5290,8 @@ TEST(Test__GraphSegmentCache,
         findCounterValue(
             PerfStatsCollector::snapshot({"forward_graph"}),
             "heterogeneous_ticket_transactions",
-            {{"capturable_segments", "2"},
+            {{"lifecycle_contract", "typed_marker_adjacency_v1"},
+             {"capturable_segments", "2"},
              {"manual_segments", "0"},
              {"ticket_publication_authority",
               "stage_owned_mapped_timeline"},

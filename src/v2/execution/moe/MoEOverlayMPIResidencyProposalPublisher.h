@@ -20,12 +20,14 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace llaminar2
 {
     class IMPIContext;
+    class PhysicalMemoryAllocationLease;
 
     /** @brief Observable local lifecycle of one proposal publication lane. */
     enum class MoEOverlayMPIResidencyProposalPublisherState
@@ -86,7 +88,8 @@ namespace llaminar2
      * @brief Private point-to-point lane for one authoritative frozen window.
      *
      * The coordinator may be any world rank; no device or socket number is
-     * inferred from it. Peers keep one exact-size Irecv posted. After a peer
+     * inferred from it. Peers keep one capacity-bounded Irecv posted; each send
+     * carries only the compact used payload. After a peer
      * decodes a window it returns the immutable object in `AwaitingValidation`.
      * Only explicit semantic adoption may start the exact-generation
      * acknowledgement. The coordinator returns Ready only after every peer
@@ -106,6 +109,8 @@ namespace llaminar2
             int num_layers = 0;
             int num_experts = 0;
             std::string perf_device;
+            /// Admitted route geometry and local physical owner, when required.
+            std::optional<ExpertHistogramTransactionConfig> transaction_demand;
         };
 
         /**
@@ -128,7 +133,7 @@ namespace llaminar2
 
         /**
          * @brief Publish one coordinator-frozen generation to every peer.
-         * @param window Valid exact-geometry immutable routing evidence.
+         * @param proposal Valid exact-geometry immutable plan and routing evidence.
          * @param error Optional validation or MPI diagnostic.
          * @return True after all non-blocking sends are owned by MPI.
          */
@@ -138,7 +143,7 @@ namespace llaminar2
 
         /**
          * @brief Poll the active send or receive generation once.
-         * @param received_window On a peer, receives an authenticated window
+         * @param received_proposal On a peer, receives an authenticated proposal
          *        only when Ready is returned; coordinator leaves it empty.
          * @param error Optional failure diagnostic.
          * @return Pending, Ready, or Failed without waiting.
@@ -215,10 +220,13 @@ namespace llaminar2
         std::vector<MPI_Request> send_requests_;
         std::vector<MPI_Request> acknowledgement_receive_requests_;
         std::vector<std::uint64_t> acknowledgement_receive_generations_;
+        // The packet must be destroyed before its physical ownership is released.
+        std::unique_ptr<PhysicalMemoryAllocationLease> wire_claim_;
         std::vector<std::uint8_t> wire_buffer_;
-        std::uint64_t publishing_generation_ = 0;
-        std::uint64_t awaiting_validation_generation_ = 0;
-        std::uint64_t acknowledgement_send_generation_ = 0;
+        // Generation zero is real routing evidence. One identity survives from
+        // publication/decoding through acknowledgement; MPI borrows its stable
+        // storage until completion, and only then may the lane reset it.
+        std::optional<std::uint64_t> active_generation_;
         std::chrono::steady_clock::time_point operation_started_at_{};
         MoEOverlayMPIResidencyProposalPublisherState state_ =
             MoEOverlayMPIResidencyProposalPublisherState::Idle;

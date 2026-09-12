@@ -15,6 +15,7 @@
 #include "MoEOverlayActivationChannelPlan.h"
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoEExpertOverlayExecutionPlan.h"
+#include "MoEOverlayHostDemandMemoryPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "loaders/GPUVramPreflight.h"
@@ -123,6 +124,8 @@ namespace llaminar2
         int activation_channel_row_capacity = 0;
         /** Main plus routed MTP graph families sharing each channel. */
         std::size_t activation_graph_family_count = 0;
+        /** Exact CPU evidence owners when the frozen Dynamic authority is host-resident. */
+        std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
         /** Exact compile/resident graph topology retained per GPU. */
         MoEOverlayCapturedGraphPlan captured_graph_plan;
         /** Graph-resident diagnostic checkpoint capacity per accelerator. */
@@ -136,6 +139,8 @@ namespace llaminar2
     struct MoEOverlayLocalCapacityPlannerResult
     {
         int resident_graph_rows = 0;
+        /** Exact ingress geometry priced by this rank, retained with its BOM. */
+        std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
         MemoryPlan fixed_memory_plan;
         /** Shared pure topology/BOM also consumed by transport preflight. */
         MoEOverlayActivationChannelPlan activation_channel_plan;

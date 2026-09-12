@@ -6,6 +6,8 @@
  * This precedes every inventory query in both the launcher and its MPI children:
  * naming a CPU domain must not create foreign CUDA/HIP contexts merely to choose
  * a NUMA placement. The same intent then selects the CPU MPI tuning profile.
+ * An explicit CPU node requires a real physical-core set before self-launch;
+ * unresolved locality never disables the default full-team MPI binding.
  */
 
 #include "app/MPIBootstrapPhase.h"
@@ -172,6 +174,9 @@ namespace llaminar2
             config.device_for_this_rank->isCPU() &&
             config.device_for_this_rank_numa_explicit)
         {
+            if (!config.device_for_this_rank->hasValidNuma())
+                throw std::invalid_argument(
+                    "Explicit CPU NUMA placement requires a non-negative node");
             numa_nodes.insert(config.device_for_this_rank->numa_node);
             return numa_nodes;
         }
@@ -502,28 +507,26 @@ namespace llaminar2
                 launch_config.num_procs = 1;
             }
 
-            launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
+            const int target_numa = config.device_for_this_rank->numa_node;
+            const auto cpu_set = MPIBootstrap::getPhysicalCpuSetForNumaNode(target_numa);
+            if (cpu_set.empty())
+            {
+                throw std::runtime_error(
+                    "Explicit CPU NUMA target " + std::to_string(target_numa) +
+                    " has no physical CPU set; refusing to launch with different affinity");
+            }
+
+            // Only replace socket mapping once the requested node is proven.
+            // A NUMA node may be smaller than a socket: size its worker team
+            // from these actual physical cores, never an unrelated socket sum.
+            launch_config.cpu_set = cpu_set;
+            launch_config.omp_threads_per_rank = static_cast<int>(parseCpuList(cpu_set).size());
             launch_config.omp_places = "cores";
             launch_config.omp_proc_bind = "close";
             launch_config.bind_to_socket = false;
             launch_config.map_by_socket = false;
-            launch_config.cpu_set = MPIBootstrap::getPhysicalCpuSetForNumaNode(config.device_for_this_rank->numa_node);
-
-            if (launch_config.cpu_set.empty())
-            {
-                launch_config.cpu_set = MPIBootstrap::getCpuSetForNumaNode(config.device_for_this_rank->numa_node);
-            }
-
-            if (!launch_config.cpu_set.empty())
-            {
-                LOG_INFO("[Main] Explicit CPU NUMA target " << config.device_for_this_rank->numa_node
-                                                            << " detected; applying MPI cpu-set='" << launch_config.cpu_set << "'");
-            }
-            else
-            {
-                LOG_WARN("[Main] Explicit CPU NUMA target " << config.device_for_this_rank->numa_node
-                                                            << " requested, but cpu-set lookup failed; relying on launcher defaults");
-            }
+            LOG_INFO("[Main] Explicit CPU NUMA target " << target_numa
+                     << " detected; applying MPI cpu-set='" << cpu_set << "'");
         }
 
         // GPU NUMA affinity

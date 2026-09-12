@@ -63,7 +63,13 @@ namespace llaminar2
         void setSuppressTimeline(bool suppress) override;
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        /**
+         * @brief Observe runtime state without transferring execution authority.
+         * @param capture_policy Exact diagnostic ranges, forwarded unchanged to participants.
+         * @return Immutable combined cache and terminal-state evidence.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override;
         uint64_t moeRuntimeMovementEpoch() const override;
         MoEOptimizationStatus moeOptimizationStatus() const override;
         /**

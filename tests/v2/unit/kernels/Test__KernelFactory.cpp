@@ -9,6 +9,8 @@
  * 3. createGemm() for all tensor types (CPU path)
  * 4. Error handling for invalid device indices
  * 5. Error handling for unsupported GPU backends
+ * 6. Setup service views preserve immutable CPU expert storage for every
+ *    quantized source and floating format without a second allocation/repack.
  */
 
 #include <gtest/gtest.h>
@@ -16,9 +18,98 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorSlice.h"
 #include "backends/ComputeBackend.h"
+#include "../../utils/QuantizedVerifierFormats.h"
+#include "execution/moe/MoEOverlayPreparedWeightSource.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+
+#include <limits>
 
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;
+
+/** @brief Metadata-only admission must exactly equal all allocated CPU scratch. */
+TEST(PreparedExpertServiceView, CPUWorkspaceBOMMatchesEveryPayload)
+{
+    for (size_t rows : {1u, 4u, 8u, 17u})
+        for (int hidden : {256, 512})
+            for (int intermediate : {256, 1024})
+                for (int top_k : {1, 2, 4})
+                {
+                    const CPUGroupedMoESerialWorkspace::Config geometry{
+                        .row_capacity = rows, .d_model = hidden,
+                        .expert_intermediate = intermediate, .num_experts = 4,
+                        .routing_top_k = top_k};
+                    const auto bytes = CPUGroupedMoESerialWorkspace::plannedAllocationBytes(geometry);
+                    CPUGroupedMoESerialWorkspace workspace(geometry);
+                    EXPECT_EQ(workspace.allocationBytes(), bytes);
+                }
+    EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes({}), std::invalid_argument);
+    EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes({
+        .row_capacity = std::numeric_limits<size_t>::max(), .d_model = 256,
+        .expert_intermediate = 256, .num_experts = 4, .routing_top_k = 4}), std::overflow_error);
+}
+
+/** @brief Prepared CPU execution shares immutable bytes, never a GPU binding. */
+TEST(PreparedExpertServiceView, AllCPUFormatsRetainOriginalStorageAndLifetime)
+{
+    DeviceWorkspaceManager serving_workspace(DeviceId::cpu(), 4096);
+    DeviceWorkspaceManager probe_workspace(DeviceId::cpu(), 4096);
+    std::vector<std::unique_ptr<TensorBase>> weights;
+    for (const auto &format : test::quantizedVerifierFormats())
+        weights.push_back(format.create({64, 256}, 42));
+    weights.push_back(std::make_unique<FP16Tensor>(std::vector<size_t>{64, 256}));
+    weights.push_back(std::make_unique<BF16Tensor>(std::vector<size_t>{64, 256}));
+    weights.push_back(std::make_unique<FP32Tensor>(std::vector<size_t>{64, 256}));
+    for (auto &tensor : weights)
+    {
+        SCOPED_TRACE(static_cast<int>(tensor->native_type()));
+        std::shared_ptr<TensorBase> owner(std::move(tensor));
+        auto source = KernelFactory::prepareExpertGemmLocal(owner, DeviceId::cpu());
+        ASSERT_NE(source, nullptr);
+        auto *serving_binding = dynamic_cast<IWorkspaceConsumer *>(source.get());
+        if (serving_binding)
+            serving_binding->bindWorkspace(&serving_workspace);
+        std::weak_ptr<ITensorGemm> lifetime = source;
+        auto view = KernelFactory::createExpertServiceExecutionView(source, DeviceId::cpu());
+        if (auto *workspace = dynamic_cast<IWorkspaceConsumer *>(view.get()))
+        {
+            ASSERT_NE(view.get(), source.get());
+            ASSERT_NE(serving_binding, nullptr);
+            EXPECT_FALSE(workspace->hasWorkspace());
+            EXPECT_EQ(workspace->getWorkspace(), nullptr);
+            workspace->bindWorkspace(&probe_workspace);
+            EXPECT_EQ(serving_binding->getWorkspace(), &serving_workspace);
+            workspace->unbindWorkspace();
+            EXPECT_EQ(serving_binding->getWorkspace(), &serving_workspace);
+            ContiguousFloatingPointWeightDescriptor original, borrowed;
+            ASSERT_TRUE(source->exportContiguousFloatingPointWeights(original));
+            ASSERT_TRUE(view->exportContiguousFloatingPointWeights(borrowed));
+            EXPECT_EQ(original.data, borrowed.data);
+            EXPECT_EQ(original.type, borrowed.type);
+            EXPECT_EQ(original.bytes, borrowed.bytes);
+        }
+        else
+            EXPECT_EQ(view.get(), source.get());
+        source.reset();
+        EXPECT_FALSE(lifetime.expired());
+        MoEOverlayPreparedWeightSource prepared;
+        std::string error;
+        EXPECT_TRUE(resolveMoEOverlayPreparedWeightSource(
+            view, DeviceId::cpu(), prepared, &error)) << error;
+        prepared = {};
+        view.reset();
+        EXPECT_TRUE(lifetime.expired());
+    }
+}
+
+/** @brief Malformed requests fail before any GPU runtime or allocation is used. */
+TEST(PreparedExpertServiceView, NullSourceIsNeverAnExecutionView)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        EXPECT_THROW((void)KernelFactory::createExpertServiceExecutionView({}, device),
+                     std::invalid_argument);
+}
 
 // ============================================================================
 // DeviceType Enum Tests

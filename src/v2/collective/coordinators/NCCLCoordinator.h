@@ -404,28 +404,24 @@ namespace llaminar2
                   size_t bytes);
 
         /**
-         * @brief Point-to-point copy from one GPU to another using NCCL send/recv (asynchronous)
+         * @brief Submit paired GPU send/receive on caller-owned exact streams.
          *
-         * Uses NCCL's ncclSend/ncclRecv within ncclGroupStart/ncclGroupEnd to enqueue
-         * a direct GPU-to-GPU transfer. Returns immediately after enqueuing; completion
-         * events are recorded on both source and destination devices.
+         * The coordinator serializes host submission only. Tensor dependency
+         * acquisition and lifetime publication belong to TransferEngine.
          *
-         * Caller should use getCompletionEvent(dst_device_idx) to synchronize:
-         * @code
-         *   coord.copyAsync(dst, dst_idx, src, src_idx, bytes);
-         *   cudaStreamWaitEvent(my_stream, coord.getCompletionEvent(dst_idx));
-         * @endcode
-         *
-         * @param dst_ptr Destination buffer pointer (on dst_device)
-         * @param dst_device_idx Local device index of destination (0 to num_devices-1)
-         * @param src_ptr Source buffer pointer (on src_device)
-         * @param src_device_idx Local device index of source (0 to num_devices-1)
-         * @param bytes Number of bytes to copy
-         * @return true on success (transfer enqueued)
+         * @param dst_ptr Receiving allocation.
+         * @param dst_device_idx Receiving communicator slot.
+         * @param src_ptr Sending allocation.
+         * @param src_device_idx Sending communicator slot.
+         * @param bytes Positive payload extent.
+         * @param source_stream Exact non-null sending GPU stream.
+         * @param destination_stream Exact non-null receiving GPU stream.
+         * @return True when both native submissions have been accepted.
          */
-        bool copyAsync(void *dst_ptr, int dst_device_idx,
-                       const void *src_ptr, int src_device_idx,
-                       size_t bytes);
+        bool copyOnStreams(void *dst_ptr, int dst_device_idx,
+                           const void *src_ptr, int src_device_idx,
+                           size_t bytes, void *source_stream,
+                           void *destination_stream);
 
         /**
          * @brief Get last error message
@@ -479,9 +475,22 @@ namespace llaminar2
         bool doReduceScatterMulti(const std::vector<const void *> &send_buffers,
                                   const std::vector<void *> &recv_buffers,
                                   size_t recv_count, int dtype_int, int op_int);
+        /**
+         * @brief Submit paired native point-to-point work on exact endpoints.
+         * @param dst_ptr Receiving allocation.
+         * @param dst_device_idx Receiving communicator slot.
+         * @param src_ptr Sending allocation.
+         * @param src_device_idx Sending communicator slot.
+         * @param bytes Payload extent.
+         * @param wait_for_completion Legacy synchronous copy boundary only.
+         * @param source_stream Exact sending stream.
+         * @param destination_stream Exact receiving stream.
+         * @return Whether submission and any explicitly requested wait succeeded.
+         */
         bool doCopy(void *dst_ptr, int dst_device_idx,
                     const void *src_ptr, int src_device_idx,
-                    size_t bytes, bool wait_for_completion);
+                    size_t bytes, bool wait_for_completion,
+                    void *source_stream, void *destination_stream);
 
         // State
         std::vector<int> device_ordinals_;

@@ -416,6 +416,30 @@ namespace llaminar2
             const MoEOverlayCapacityAdmissionPolicy &policy = {});
 
         /**
+         * @brief Admit complete expert coverage and the largest bounded cache.
+         *
+         * The native directory's requested replica count is an upper bound.
+         * Search uses complete canonical BOMs, keeps rolling transfer lanes
+         * unchanged, and never turns an enabled cache or movement mode off.
+         * Other storage regimes retain their exact supplied policy.
+         *
+         * @param plan Hardware-bound topology, optionally carrying a retained grant.
+         * @param num_experts Complete model expert count per layer.
+         * @param layer_weight_manifest Authenticated prepared-weight geometry.
+         * @param physical_budgets Canonical observed allocator budgets.
+         * @param policy Requested directory/workspace and migration geometry.
+         * @return Complete physical certificate and its immutable cache grant.
+         * @throws MoEOverlayCapacityExhausted if mandatory coverage cannot fit.
+         * @throws std::invalid_argument for malformed policy or topology.
+         */
+        [[nodiscard]] static MoEOverlayResolvedCapacityPlan resolveCapacity(
+            const MoERoutedExpertPlacementPlan &plan,
+            int num_experts,
+            const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
+            const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
+            const MoEOverlayCapacityAdmissionPolicy &policy = {});
+
+        /**
          * @brief Resolve capacity and install its exact quotas into a plan copy.
          *
          * @param plan Hardware-bound tier/domain topology.

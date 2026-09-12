@@ -162,6 +162,9 @@ namespace llaminar2
             case CpuEncoding::Q6KNativeDualScale:
                 packed.payload_bytes = 24;
                 break;
+            case CpuEncoding::CompactMultiScale:
+                packed.payload_bytes = source->payload_bytes;
+                break;
             }
 
             const std::uint64_t unit_count =

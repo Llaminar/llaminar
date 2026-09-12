@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/mtp/MTPVerifierPolicy.h"
+#include "execution/mtp/MTPServingForwardCaptureGeometry.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/DeviceRowWorkGrid.h"
 #include "tensors/TensorKernels.h"
@@ -18,6 +19,90 @@
 
 namespace llaminar2
 {
+
+/** @brief Response clipping and checkpoint sizing share one executed width. */
+TEST(Test__MTPVerifierPolicy, TransactionDraftAdmissionSeparatesCommitBudgetAndGraphWidth)
+{
+    for (int capacity = 1; capacity <= 31; ++capacity)
+        for (int budget = 0; budget <= 33; ++budget)
+            for (int leading_cost : {0, 1})
+                for (const auto authority : {MTPCommitBudgetAuthority::Host,
+                                             MTPCommitBudgetAuthority::Device})
+                {
+                    const int remaining = std::max(0, budget - leading_cost);
+                    const int expected = budget == 0 ? capacity :
+                        remaining == 0 ? 0 :
+                        authority == MTPCommitBudgetAuthority::Device ? capacity :
+                        std::min(capacity, remaining);
+                    EXPECT_EQ(mtpTransactionDraftCount(
+                        capacity, budget, leading_cost, authority), expected);
+                }
+    EXPECT_EQ(mtpTransactionDraftCount(-1, 1, 1, MTPCommitBudgetAuthority::Host), -1);
+    EXPECT_EQ(mtpTransactionDraftCount(15, -1, 1, MTPCommitBudgetAuthority::Device), -1);
+    EXPECT_EQ(mtpTransactionDraftCount(15, 1, 2, MTPCommitBudgetAuthority::Device), -1);
+}
+
+/** @brief Request depth must not shrink the immutable setup capture envelope. */
+TEST(Test__MTPVerifierPolicy, ServingCaptureUsesRetainedCapacityAcrossRequests)
+{
+    for (const int retained_depth : {1, 2, 3, 7, 15})
+        for (const auto mode : {MTPDepthPolicyMode::Fixed,
+                                MTPDepthPolicyMode::Observe,
+                                MTPDepthPolicyMode::Dynamic})
+            for (int selected_depth = 1; selected_depth <= retained_depth;
+                 ++selected_depth)
+            {
+                SCOPED_TRACE(::testing::Message()
+                    << "retained=" << retained_depth
+                    << " selected=" << selected_depth
+                    << " mode=" << static_cast<int>(mode));
+                MTPRuntimeConfig mtp;
+                mtp.enabled = true;
+                mtp.draft_tokens = selected_depth;
+                mtp.graph_capacity_draft_tokens = retained_depth;
+                mtp.depth_policy.mode = mode;
+                mtp.depth_policy.min_depth = 1;
+                mtp.depth_policy.initial_depth = selected_depth;
+                mtp.depth_policy.max_depth = selected_depth;
+                const auto geometry = resolveMTPServingForwardCaptureGeometry(
+                    mtp, retained_depth + 1);
+                ASSERT_TRUE(geometry.enabled);
+                ASSERT_TRUE(geometry.valid());
+                EXPECT_EQ(geometry.draft_depth, retained_depth);
+                EXPECT_EQ(geometry.verifier_rows, retained_depth + 1);
+
+                // The wider capture envelope must never authorize deeper
+                // execution: only request admission owns the active policy.
+                const auto policy = resolveMTPDeviceGenerationDepthPolicy(mtp);
+                EXPECT_EQ(policy.initial_depth, selected_depth);
+                EXPECT_EQ(policy.maximum_depth, selected_depth);
+            }
+}
+
+/** @brief Largest-first ordering includes a later verifier, not just request one. */
+TEST(Test__MTPVerifierPolicy, RetainedVerifierWinsSharedArenaCaptureOrdering)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 1;
+    mtp.graph_capacity_draft_tokens = 15;
+    const auto geometry = resolveMTPServingForwardCaptureGeometry(mtp, 16);
+    for (const int prefill_rows : {1, 2, 4, 8, 16})
+        EXPECT_TRUE(materializeMTPWideCheckpointLaneFirst(
+            true, prefill_rows, geometry));
+    EXPECT_FALSE(materializeMTPWideCheckpointLaneFirst(true, 32, geometry));
+    EXPECT_FALSE(materializeMTPWideCheckpointLaneFirst(false, 8, geometry));
+    EXPECT_FALSE(materializeMTPWideCheckpointLaneFirst(true, 0, geometry));
+    const auto undersized = resolveMTPServingForwardCaptureGeometry(mtp, 8);
+    EXPECT_FALSE(undersized.valid());
+    EXPECT_FALSE(materializeMTPWideCheckpointLaneFirst(true, 8, undersized));
+
+    // An ordinary non-MTP runner has no verifier to put first.
+    const auto disabled = resolveMTPServingForwardCaptureGeometry({}, 0);
+    EXPECT_FALSE(disabled.enabled);
+    EXPECT_TRUE(disabled.valid());
+    EXPECT_FALSE(materializeMTPWideCheckpointLaneFirst(true, 8, disabled));
+}
 
 /** @brief Bounded grids cover every live row exactly once without consulting its owner. */
 TEST(Test__MTPVerifierPolicy, CountedWorkerGridCoversEveryLiveTile)

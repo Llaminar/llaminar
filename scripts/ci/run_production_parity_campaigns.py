@@ -85,6 +85,7 @@ PRODUCTION_PARITY_PREFLIGHT_LABEL = "ProductionParityPreflight"
 PRODUCTION_PARITY_UNIT_PREFIX = "V2_Unit_"
 PRODUCTION_PARITY_UNIT_LABEL = "Unit"
 PRODUCTION_PARITY_UNIT_BUILD_TARGET = "v2_unit_gate"
+PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET = "v2_production_parity_preflight_gate"
 MODEL_RAMDISK_ROOT = Path("/dev/shm")
 SESSION_IPC_RAMDISK_ROOT = Path("/dev/shm")
 PERSISTENT_MODEL_CACHE_SCHEMA_VERSION = 2
@@ -102,6 +103,11 @@ PARITY_RESULTS_DIRECTORY = (
     / "integration"
     / "parity"
     / "results"
+)
+MOE_ROUTE_PROOF_CSV_HEADER = (
+    "proof_authority,canonical_passed,route_conditioned_evaluated,"
+    "route_conditioned_passed,route_conditioned_cosine,route_conditioned_rel_l2,"
+    "route_conditioned_max_abs,route_weights_max_error,hf_reconstruction_rel_l2"
 )
 REQUIRED_CSV_HEADERS = {
     "prefill_layers.csv": (
@@ -124,7 +130,7 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_mean,pytorch_stddev,pytorch_kurtosis,pytorch_skewness,"
         "pytorch_p95,pytorch_p99,pytorch_outlier_frac,pytorch_dynamic_range,"
         "pytorch_sparsity,pytorch_zero_frac,pytorch_nan_count,"
-        "pytorch_inf_count,pytorch_elements"
+        "pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER + ",passed"
     ),
     "decode_steps.csv": (
         "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,"
@@ -145,7 +151,7 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_max,pytorch_mean,pytorch_stddev,pytorch_kurtosis,"
         "pytorch_skewness,pytorch_p95,pytorch_p99,pytorch_outlier_frac,"
         "pytorch_dynamic_range,pytorch_sparsity,pytorch_zero_frac,"
-        "pytorch_nan_count,pytorch_inf_count,pytorch_elements"
+        "pytorch_nan_count,pytorch_inf_count,pytorch_elements," + MOE_ROUTE_PROOF_CSV_HEADER + ",passed"
     ),
     "prefix_restore.csv": (
         "backend,phase,cache_config_enabled,cache_ready,cache_bypassed,"
@@ -190,7 +196,11 @@ REQUIRED_CSV_HEADERS = {
         "oracle_terminal_logits_hash_available,"
         "oracle_terminal_logits_bytes,oracle_terminal_logits_hash,"
         "checkpoint_compared,checkpoint_cosine,"
-        "checkpoint_passed,passed"
+        "checkpoint_passed,passed,cached_prefix_moe_movement_epoch,"
+        "shifted_mtp_kv_numerically_compared,shifted_mtp_kv_exact_prefix_segments,"
+        "shifted_mtp_kv_numerical_suffix_payloads,shifted_mtp_kv_numerical_elements,"
+        "shifted_mtp_kv_minimum_cosine,shifted_mtp_kv_maximum_relative_l2,"
+        "shifted_mtp_kv_maximum_abs,shifted_mtp_kv_numerically_passed"
     ),
     "production_path.csv": (
         "backend,device,execution_path,execution_topology,graph_contract,"
@@ -229,6 +239,10 @@ MTP_TRANSACTIONS_HEADER = (
     "dynamic_policy_witness_emitted_tokens,"
     "dynamic_policy_witness_serial_oracle_tokens"
 )
+NATIVE_VERIFIER_ROWS_HEADER = (
+    "reference_step,condition_position,stage,physical_rows,row,row_elements,"
+    "status,first_mismatch,grouped_bits,serial_bits,max_abs_diff,passed"
+)
 CSV_ARTIFACTS_REQUIRING_DATA = frozenset(
     {
         "prefill_layers.csv",
@@ -237,6 +251,7 @@ CSV_ARTIFACTS_REQUIRING_DATA = frozenset(
         "decode_steps.csv",
         "prefix_restore.csv",
         "production_path.csv",
+        "mtp_native_verifier_rows.csv",
     }
 )
 REQUIRED_CAMPAIGN_LABELS = {
@@ -260,6 +275,7 @@ INDIVIDUAL_GREEN_PROVENANCE = frozenset(
         "exact_process_exit_zero_and_fresh_artifact_contract",
         "aggregate_exit_zero_and_fresh_artifact_contract",
         "aggregate_gtest_fail_fast_prefix_before_declared_first_red",
+        "prior_gtest_pass_and_complete_artifact_contract",
     }
 )
 
@@ -1528,12 +1544,14 @@ def _reuse_persistent_model(
     started = time.monotonic()
     source_before = source.stat()
     if (
-        raw_entry.get("source_path") != str(source)
-        or raw_entry.get("source_identity")
+        raw_entry.get("source_identity")
         != list(_source_identity(source_before))
         or raw_entry.get("size_bytes") != source_before.st_size
     ):
         return None
+    # A bind mount can give the exact same inode a different absolute spelling.
+    # The full stat tuple is authoritative; source_path is diagnostic metadata,
+    # not a second identity that forces a multi-gigabyte recopy across namespaces.
     try:
         cached_before = destination.stat(follow_symlinks=False)
     except FileNotFoundError:
@@ -1935,7 +1953,41 @@ def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
         gtest_case,
     ):
         headers["mtp_transactions.csv"] = MTP_TRANSACTIONS_HEADER
+        headers["mtp_native_verifier_rows.csv"] = NATIVE_VERIFIER_ROWS_HEADER
     return headers
+
+
+def validate_native_verifier_rows(rows: list[list[str]]) -> str | None:
+    """Require finite-byte success and one coherent mandatory checkpoint bank.
+
+    These are native M=1/grouped equations, not HF tolerance rows. Preserve a
+    failing artifact for diagnosis, but never accept header-only, duplicate,
+    truncated, nonfinite, or merely numerically-close evidence as a certificate.
+    """
+    stages: set[str] = set()
+    identity: tuple[int, int, int] | None = None
+    try:
+        for values in rows[1:]:
+            row = dict(zip(rows[0], values, strict=True))
+            current = (int(row["reference_step"]), int(row["condition_position"]),
+                       int(row["physical_rows"]))
+            if (min(current[:2]) < 0 or current[2] < 2 or
+                    int(row["row"]) != 0 or int(row["row_elements"]) <= 0):
+                return "invalid native verifier row geometry"
+            if identity is not None and current != identity:
+                return "mixed native verifier checkpoint identities"
+            identity = current
+            if not row["stage"] or row["stage"] in stages:
+                return "duplicate or empty native verifier stage"
+            stages.add(row["stage"])
+            if (row["status"] != "exact" or row["passed"] != "1" or
+                    float(row["max_abs_diff"]) != 0.0):
+                return f"native verifier stage is not byte-exact: {row['stage']}"
+        if not {"EMBEDDING", "FINAL_NORM", "LM_HEAD"}.issubset(stages):
+            return "missing mandatory native verifier checkpoints"
+    except (ValueError, KeyError, TypeError) as error:
+        return f"malformed native verifier evidence: {error}"
+    return None
 
 
 def _prior_artifact_file_has_evidence(
@@ -2134,6 +2186,11 @@ def validate_campaign_artifacts(
             if requires_data and len(rows) < 2:
                 errors.append(f"{gtest_case}: {filename} has no evidence row")
                 continue
+            if filename == "mtp_native_verifier_rows.csv":
+                native_error = validate_native_verifier_rows(rows)
+                if native_error:
+                    errors.append(f"{gtest_case}: {filename}: {native_error}")
+                    continue
             validated += 1
 
     return validated, tuple(directories), tuple(errors)
@@ -2848,9 +2905,31 @@ def _run_process(
             pass
 
 
+@dataclass(frozen=True)
+class PrerequisiteReport:
+    """Standalone model-free gate evidence, never a model/image certificate.
+
+    Completion time belongs to the actual gate, not to subsequent publication
+    or model progress. Keeping it explicit prevents a rewritten report from
+    authenticating an intervening build.
+    """
+
+    preflight_return_code: int
+    preflight_elapsed_seconds: float
+    preflight_tests: tuple[str, ...]
+    preflight_build_directory: str
+    preflight_completed_ns: int
+    preflight_test_count: int
+    schema: int = 1
+    mode: str = "model-free-prerequisites"
+    certification_eligible: bool = False
+
+
 def run_production_parity_preflight(
     build_dir: Path,
     timeout_seconds: float | None,
+    installed_build_receipt: Path | None = None,
+    artifact_directory: Path | None = None,
 ) -> tuple[int, float, tuple[str, ...]]:
     """Build and run every model-free prerequisite before model staging.
 
@@ -2878,6 +2957,19 @@ def run_production_parity_preflight(
             return None
         return max(deadline - time.monotonic(), 0.001)
 
+    def complete(return_code: int, elapsed: float) -> tuple[int, float, tuple[str, ...]]:
+        """Publish this gate's own receipt without requiring a model run."""
+        if artifact_directory is not None:
+            write_report(artifact_directory / "prerequisites.json", PrerequisiteReport(
+                preflight_return_code=return_code,
+                preflight_elapsed_seconds=elapsed,
+                preflight_tests=tests,
+                preflight_build_directory=str(build_dir.expanduser().resolve()),
+                preflight_completed_ns=time.time_ns(),
+                preflight_test_count=len(tests),
+            ))
+        return return_code, elapsed, tests
+
     print(
         "[production-parity] preflight_status=RUNNING "
         f"unit_test_count={len(unit_tests)} "
@@ -2894,28 +2986,41 @@ def run_production_parity_preflight(
         "--parallel",
         "--target",
         PRODUCTION_PARITY_UNIT_BUILD_TARGET,
+        PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET,
     ]
+    # Both CTest namespaces must consume current executables. An additive
+    # Integration regression is not necessarily reachable from the Unit target.
+    # Build their CMake-owned inventories together, once before either phase.
+    build_targets = ",".join((PRODUCTION_PARITY_UNIT_BUILD_TARGET,
+                              PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET))
     print(
-        "[production-parity] unit_build_status=RUNNING "
-        f"target={PRODUCTION_PARITY_UNIT_BUILD_TARGET}",
+        "[production-parity] prerequisite_build_status=RUNNING "
+        f"targets={build_targets}",
         flush=True,
     )
-    return_code = _run_process(build_command, remaining_timeout())
+    if installed_build_receipt is None:
+        return_code = _run_process(build_command, remaining_timeout())
+    else:
+        # An immutable CI test image ships binaries, not compiler intermediates.
+        # Validate its complete installed inventory; never skip either test gate.
+        import prebuilt_test_image
+        prebuilt_test_image.validate(installed_build_receipt, build_dir)
+        return_code = 0
     print(
-        "[production-parity] unit_build_status="
+        "[production-parity] prerequisite_build_status="
         f"{'PASS' if return_code == 0 else 'FAIL'} "
-        f"target={PRODUCTION_PARITY_UNIT_BUILD_TARGET}",
+        f"targets={build_targets}",
         flush=True,
     )
     if return_code != 0:
         elapsed = time.monotonic() - started
         print(
             "[production-parity] preflight_status=FAIL "
-            f"phase=unit_build test_count={len(tests)} "
+            f"phase=prerequisite_build test_count={len(tests)} "
             f"elapsed_seconds={elapsed:.3f}",
             flush=True,
         )
-        return return_code, elapsed, tests
+        return complete(return_code, elapsed)
 
     # Ninja can regenerate CMake while building the gate, adding or removing
     # registrations. CTest below consumes that regenerated inventory, so its
@@ -2924,15 +3029,29 @@ def run_production_parity_preflight(
     integration_tests = discover_production_parity_preflight_tests(build_dir)
     tests = unit_tests + integration_tests
 
+    # CTest before 3.29 requires an explicit parallel level. Use the kernel's
+    # full affinity mask on every supported CTest version, not a fixed worker
+    # cap. CMake's per-test PROCESSORS weights still own physical-core budgets.
+    test_parallelism = str(len(os.sched_getaffinity(0)))
+    def evidence_arguments(phase: str) -> list[str]:
+        """Retain CTest's own complete evidence beyond Docker console delivery."""
+        if artifact_directory is None:
+            return []
+        artifact_directory.mkdir(parents=True, exist_ok=True)
+        return ["--output-log", str((artifact_directory / f"{phase}.log").resolve()),
+                "--output-junit", str((artifact_directory / f"{phase}.xml").resolve())]
+
     unit_command = [
         "ctest",
         "--test-dir",
         str(build_dir),
         "--output-on-failure",
         "--parallel",
+        test_parallelism,
         "--no-tests=error",
         "-R",
         f"^{PRODUCTION_PARITY_UNIT_PREFIX}",
+        *evidence_arguments("unit"),
     ]
     print(
         "[production-parity] unit_test_status=RUNNING "
@@ -2954,7 +3073,7 @@ def run_production_parity_preflight(
             f"elapsed_seconds={elapsed:.3f}",
             flush=True,
         )
-        return return_code, elapsed, tests
+        return complete(return_code, elapsed)
 
     integration_command = [
         "ctest",
@@ -2962,9 +3081,11 @@ def run_production_parity_preflight(
         str(build_dir),
         "--output-on-failure",
         "--parallel",
+        test_parallelism,
         "--no-tests=error",
         "-L",
         f"^{PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
+        *evidence_arguments("integration"),
     ]
     print(
         "[production-parity] integration_preflight_status=RUNNING "
@@ -2985,16 +3106,17 @@ def run_production_parity_preflight(
         f"test_count={len(tests)} elapsed_seconds={elapsed:.3f}",
         flush=True,
     )
-    return return_code, elapsed, tests
+    return complete(return_code, elapsed)
 
 
 def reuse_unchanged_production_parity_preflight(
     build_dir: Path,
     report_path: Path,
 ) -> tuple[int, float, tuple[str, ...]]:
-    """Reuse a passed individual preflight only for an unchanged build tree.
+    """Reuse canonical prerequisite evidence only for an unchanged build tree.
 
-    The prior report is evidence that the canonical runner admitted its cell
+    Numerical and generation runners share this admission authority. The prior
+    report is evidence that its runner admitted a cell
     only after a successful preflight. Ninja's append-only command log is the
     conservative rebuild boundary, while every generated CTest registration
     file is the inventory boundary. A newer boundary makes the receipt stale
@@ -3011,14 +3133,22 @@ def reuse_unchanged_production_parity_preflight(
         ) from error
     if not isinstance(document, dict):
         raise ValueError("reusable preflight report must be a JSON object")
+    individual_receipt = (
+        document.get("schema_version") == INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION
+        and document.get("mode") == "sequential_unseen_exact_cells")
+    generation_receipt = (
+        document.get("schema") == 1
+        and document.get("mode") in {"collect-controls", "compare-controls"})
+    standalone_receipt = (
+        document.get("schema") == 1
+        and document.get("mode") == "model-free-prerequisites")
     if (
-        document.get("schema_version") != INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION
-        or document.get("mode") != "sequential_unseen_exact_cells"
+        not (individual_receipt or generation_receipt or standalone_receipt)
         or document.get("certification_eligible") is not False
         or document.get("preflight_return_code") != 0
     ):
         raise ValueError(
-            "reusable preflight report is not a passed individual-run receipt"
+            "reusable preflight report is not a passed canonical prerequisite receipt"
         )
 
     resolved_build = build_dir.expanduser().resolve(strict=True)
@@ -3032,6 +3162,14 @@ def reuse_unchanged_production_parity_preflight(
             f"build tree has no generated CTest registration: {resolved_build}"
         )
     report_mtime_ns = resolved_report.stat().st_mtime_ns
+    if generation_receipt or standalone_receipt:
+        # Model progress rewrites the outer report. It must never refresh the
+        # prerequisite timestamp or make an intervening rebuild look certified.
+        completed_ns = document.get("preflight_completed_ns")
+        if (type(completed_ns) is not int or not 0 < completed_ns <= report_mtime_ns
+                or document.get("preflight_build_directory") != str(resolved_build)):
+            raise ValueError("prerequisite receipt has no valid build/time identity")
+        report_mtime_ns = completed_ns
     for boundary in build_boundaries:
         try:
             boundary_mtime_ns = boundary.stat().st_mtime_ns
@@ -3590,9 +3728,9 @@ def run_campaign_matrix(
 
 def write_report(
     path: Path,
-    result: CampaignMatrixResult | IndividualProgressReport,
+    result: CampaignMatrixResult | IndividualProgressReport | PrerequisiteReport,
 ) -> None:
-    """Atomically publish global matrix coverage and timing evidence."""
+    """Atomically publish typed gate, matrix coverage and timing evidence."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -3670,6 +3808,8 @@ def _campaign_case_pair(raw: str) -> tuple[str, str]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=Path("build_v2_integration"))
+    parser.add_argument("--installed-build-receipt", type=Path,
+                        help="Docker-only installed test inventory; replaces rebuilding, never test execution")
     parser.add_argument(
         "--backend",
         default=".*",
@@ -4308,6 +4448,9 @@ def main(argv: list[str] | None = None) -> int:
         ) = run_production_parity_preflight(
             args.build_dir,
             max(global_completion_deadline - time.monotonic(), 0.001),
+            artifact_directory=args.report.resolve().parent / "prerequisites",
+            **({"installed_build_receipt": args.installed_build_receipt}
+               if args.installed_build_receipt else {}),
         )
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(

@@ -42,7 +42,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint64_t kSharedChannelMagic = 0x5a43574f454d4c4cULL;
-        constexpr uint32_t kSharedChannelVersion = 5;
+        constexpr uint32_t kSharedChannelVersion = 6;
         constexpr size_t kCacheLine = 64;
 
         enum class PublicationState : uint32_t
@@ -103,7 +103,7 @@ namespace llaminar2
             int32_t return_source_participant = -1;
             int32_t return_target_participant = -1;
             int32_t return_d_model = 0;
-            uint32_t reserved1 = 0;
+            MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
             uint64_t return_residency_epoch = 0;
             uint64_t return_live_rows = 0;
         };
@@ -163,6 +163,7 @@ namespace llaminar2
             mix(config.domain_ordinal);
             mix(config.max_rows_per_participant);
             mix(config.max_entries_per_participant);
+            mix(config.activation_layout.geometry.return_layout);
             mix(config.d_model);
             mix(config.top_k);
             mix(config.transaction_topology.workspace_generation);
@@ -457,8 +458,11 @@ namespace llaminar2
             };
 
             const size_t return_begin = cursor;
-            participant.return_row_ids = appendRegion(row_id_bytes);
-            participant.output_rows = appendRegion(activation_bytes);
+            participant.return_row_ids = appendRegion(checkedMultiply(
+                geometry.returnRowCapacity(), sizeof(int32_t), "return row identities"));
+            participant.output_rows = appendRegion(checkedMultiply(
+                checkedMultiply(geometry.returnRowCapacity(), static_cast<size_t>(geometry.d_model), "return elements"),
+                sizeof(float), "return bytes"));
             cursor = alignUp(cursor, result.page_size);
             participant.return_pages = {
                 return_begin,
@@ -865,6 +869,7 @@ namespace llaminar2
                     .d_model = d_model_,
                     .activation_graph_family_count =
                         activation_family_count_,
+                    .return_layout = config.activation_layout.geometry.return_layout,
                 });
             if (!config.activation_layout.valid() ||
                 config.activation_layout != expected_layout)
@@ -990,7 +995,8 @@ namespace llaminar2
             MoEOverlayReturnRows rows;
             rows.source_participant = participant_id;
             rows.d_model = d_model_;
-            rows.row_capacity = max_rows_;
+            rows.row_capacity = layout_.geometry.returnRowCapacity();
+            rows.layout = layout_.geometry.return_layout;
             rows.row_ids_host = at<int32_t>(layout.return_row_ids);
             rows.output_rows_fp32 = at<float>(layout.output_rows);
             return rows;
@@ -2247,6 +2253,7 @@ namespace llaminar2
                     rows->source_participant != participant ||
                     rows->d_model != config_.d_model ||
                     rows->live_row_count > rows->row_capacity ||
+                    !isValidMoEOverlayReturnLayout(rows->layout) ||
                     (rows->live_row_count != 0 &&
                      rows->residency_epoch == 0))
                 {
@@ -2259,6 +2266,7 @@ namespace llaminar2
                 control.return_source_participant = rows->source_participant;
                 control.return_target_participant = rows->target_participant;
                 control.return_d_model = rows->d_model;
+                control.return_layout = rows->layout;
                 control.return_residency_epoch = rows->residency_epoch;
                 control.return_live_rows = rows->live_row_count;
                 logical_bytes = checkedAdd(
@@ -2309,6 +2317,7 @@ namespace llaminar2
                     !mapping_->returnPointersMatch(participant, *rows) ||
                     control.return_source_participant != participant ||
                     control.return_d_model != config_.d_model ||
+                    !isValidMoEOverlayReturnLayout(control.return_layout) ||
                     control.return_live_rows > rows->row_capacity ||
                     (control.return_live_rows != 0 &&
                      control.return_residency_epoch == 0))
@@ -2342,6 +2351,7 @@ namespace llaminar2
                                       key.direction);
                 rows->key.histogram_source = key.histogram_source;
                 rows->residency_epoch = control.return_residency_epoch;
+                rows->layout = control.return_layout;
                 rows->source_participant =
                     control.return_source_participant;
                 rows->target_participant =

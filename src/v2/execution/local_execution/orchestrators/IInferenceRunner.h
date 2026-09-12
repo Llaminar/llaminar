@@ -22,6 +22,7 @@
 #include <stdexcept>
 
 #include "../../../backends/DeviceId.h"
+#include "../../../snapshots/SnapshotPublication.h"
 #include "../../InferenceReadiness.h"
 #include "../../mtp/DeviceGenerationContract.h"
 #include "../../moe/DeviceMoERebalanceABI.h"
@@ -29,6 +30,7 @@
 #include "../../moe/MoEOverlayDeviceControllerRuntimeBinding.h"
 #include "../../moe/MoEOptimizationStatus.h"
 #include "../../mtp/MTPRejectionSampler.h"
+#include "../../mtp/MTPConditionForwardPurpose.h"
 #include "../../mtp/MTPVerifierOutcomeGraph.h"
 #include "../../prefix_cache/PrefixCacheStateProbe.h"
 #include "../../prefix_cache/PrefixStateSnapshot.h"
@@ -1138,6 +1140,9 @@ namespace llaminar2
          */
         std::shared_ptr<const void> lifetime_owner;
 
+        /// Producer completeness belongs to these exact bytes, not to the key.
+        SnapshotPublication publication = SnapshotPublication::SchemaPartition;
+
         explicit operator bool() const { return data != nullptr && size > 0; }
     };
 
@@ -1555,16 +1560,19 @@ namespace llaminar2
          *
          * @param token_shadow Host-visible identity of the condition token.
          * @param logical_state Current typed device logical-state publication.
+         * @param purpose Whether this row owns a new serial decode commit.
          * @param request_index Request row to consume from the publication.
          * @return true when the main condition graph advances successfully.
          */
         virtual bool advanceMTPMainConditionFromDeviceResidentLogicalState(
             int32_t token_shadow,
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            MTPConditionForwardPurpose purpose,
             int request_index = 0)
         {
             (void)token_shadow;
             (void)logical_state;
+            (void)purpose;
             (void)request_index;
             return false;
         }
@@ -1580,14 +1588,17 @@ namespace llaminar2
          *
          * @param token_shadow Host-visible identity of the sampled token.
          * @param target_sample_slot Runner-owned device target-sample slot.
+         * @param purpose Commit ownership, preserved by all TP participants.
          * @return true when publication and main condition advance both succeed.
          */
         virtual bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
-            int target_sample_slot)
+            int target_sample_slot,
+            MTPConditionForwardPurpose purpose)
         {
             (void)token_shadow;
             (void)target_sample_slot;
+            (void)purpose;
             return false;
         }
 
@@ -3329,6 +3340,18 @@ namespace llaminar2
          *         hard failure so it does not silently copy logits to host.
          */
         virtual int sampleGreedyOnDevice() { return -1; }
+
+        /**
+         * @brief Optional world-rank authority imposed by a global model graph.
+         * @return The vocabulary-head leader, or no override for a local graph.
+         *
+         * The outer runner binds this once before readiness. Local graphs do
+         * not know world placement; their enclosing plan retains authority.
+         * Global pipelines must name their actual terminal owner so request
+         * commands, host sampling and HTTP results cannot land on a head-only
+         * rank. This is immutable topology metadata, never downloaded state.
+         */
+        virtual std::optional<int> requestAuthorityRank() const { return std::nullopt; }
 
         /**
          * @brief Sample current main logits greedily into a device target slot.
@@ -5246,6 +5269,18 @@ namespace llaminar2
         }
 
         /**
+         * @brief Read completed movement evidence retained by this execution owner.
+         * @return Model-lifetime diagnostic values; no device query or progress.
+         *
+         * Composite runners forward the selected publisher, never sum redundant
+         * participant mirrors or reconstruct movement from profiling counters.
+         */
+        virtual MoEOptimizationMovementLedger moeOptimizationMovementLedger() const
+        {
+            return {};
+        }
+
+        /**
          * @brief Enumerate MoE rebalance controllers owned by this runner.
          *
          * Single-device runners may own a primary controller plus routed-overlay
@@ -5397,8 +5432,11 @@ namespace llaminar2
          *
          * This is diagnostic state only: callers must not mutate runner-owned
          * buffers through the returned value.
+         * @param capture_policy Immutable diagnostic payload and per-cache range plan.
+         * @return Read-only evidence; empty when this interface has no live runner.
          */
-        virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
+        virtual PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const { return {}; }
     };
 
 } // namespace llaminar2

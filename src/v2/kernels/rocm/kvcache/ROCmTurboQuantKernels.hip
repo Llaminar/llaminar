@@ -581,11 +581,13 @@ namespace llaminar2
      * which is the requirement for serial-decode byte equivalence.
      */
     /**
-     * @brief Publish a deterministic mean-key basis for an empty AQ8 cache.
+     * @brief Publish the first input key as the immutable basis of an empty cache.
      *
-     * Each thread owns one coordinate and accumulates retained input rows in a
-     * fixed ascending order. The following quantization grid is ordered behind
-     * this kernel by the caller's exact HIP stream.
+     * The same first input token defines prefill, decode and verifier encoding,
+     * including oversized appends which evict that token. A chunk mean is not
+     * invariant under prefix restore. Each thread copies one coordinate in O(1)
+     * work; the following encoding grid consumes it on this exact HIP stream.
+     * Restored and otherwise non-empty caches retain their existing basis.
      */
     template <int D>
     __global__ void hip_prepare_attention_key_anchor_kernel(
@@ -593,11 +595,9 @@ namespace llaminar2
         float *__restrict__ key_anchor,
         const int *__restrict__ cached_count,
         const int *__restrict__ row_count,
-        int max_seq_len,
         int verifier_rows,
         int n_kv_heads,
-        bool head_major,
-        AttentionKeyAnchorPolicy anchor_policy)
+        bool head_major)
     {
         const int head = static_cast<int>(blockIdx.x);
         const int coordinate = static_cast<int>(threadIdx.x);
@@ -605,32 +605,14 @@ namespace llaminar2
             return;
 
         const int rows_to_write = row_count ? *row_count : verifier_rows;
-        const int source_start = rows_to_write > max_seq_len
-                                     ? rows_to_write - max_seq_len
-                                     : 0;
-        if (rows_to_write <= source_start || rows_to_write > verifier_rows)
+        if (rows_to_write <= 0 || rows_to_write > verifier_rows)
             return;
 
-        if (anchor_policy == AttentionKeyAnchorPolicy::FirstRetained)
-        {
-            const size_t index = head_major
-                                     ? (static_cast<size_t>(head) * verifier_rows + source_start) * D + coordinate
-                                     : (static_cast<size_t>(source_start) * n_kv_heads + head) * D + coordinate;
-            key_anchor[static_cast<size_t>(head) * D + coordinate] =
-                key_input[index];
-            return;
-        }
-
-        float sum = 0.0f;
-        for (int row = source_start; row < rows_to_write; ++row)
-        {
-            const size_t index = head_major
-                                     ? (static_cast<size_t>(head) * verifier_rows + row) * D + coordinate
-                                     : (static_cast<size_t>(row) * n_kv_heads + head) * D + coordinate;
-            sum += key_input[index];
-        }
+        const size_t index = (head_major
+                                 ? static_cast<size_t>(head) * verifier_rows
+                                 : static_cast<size_t>(head)) * D + coordinate;
         key_anchor[static_cast<size_t>(head) * D + coordinate] =
-            sum / static_cast<float>(rows_to_write - source_start);
+            key_input[index];
     }
 
     template <int D, bool VUsesTQ8, bool VUsesQ8_1>
@@ -684,10 +666,11 @@ namespace llaminar2
         if (phase == 0)
         {
             /*
-             * The preceding stream-ordered kernel publishes the exact mean of
-             * the initial retained pre-RoPE keys. Projection bias is largely
-             * shared between tokens, so AQ8 spends its codes on the much
-             * smaller token residual without a cross-block publication race.
+             * The preceding stream-ordered kernel publishes the first input
+             * key as the immutable basis, independent of initial chunk size.
+             * Projection bias is largely shared between tokens, so AQ8 spends
+             * its codes on the much smaller token residual without a
+             * cross-block publication race.
              */
             float key_anchor = 0.0f;
             if (d_k_anchor)
@@ -2292,7 +2275,6 @@ namespace llaminar2
             int n_kv_heads, int head_dim,
             bool k_head_major, bool v_head_major,
             TurboQuantKVMode mode,
-            AttentionKeyAnchorPolicy anchor_policy,
             hipStream_t stream)
         {
             if (!d_k_input || !d_v_input ||
@@ -2313,22 +2295,19 @@ namespace llaminar2
                         hip_prepare_attention_key_anchor_kernel<64>,
                         dim3(n_kv_heads), dim3(64), 0, stream,
                         d_k_input, d_k_anchor, d_cached_count, d_row_count,
-                        max_seq_len, verifier_rows, n_kv_heads, k_head_major,
-                        anchor_policy);
+                    verifier_rows, n_kv_heads, k_head_major);
                 else if (head_dim == 128)
                     hipLaunchKernelGGL(
                         hip_prepare_attention_key_anchor_kernel<128>,
                         dim3(n_kv_heads), dim3(128), 0, stream,
                         d_k_input, d_k_anchor, d_cached_count, d_row_count,
-                        max_seq_len, verifier_rows, n_kv_heads, k_head_major,
-                        anchor_policy);
+                    verifier_rows, n_kv_heads, k_head_major);
                 else if (head_dim == 256)
                     hipLaunchKernelGGL(
                         hip_prepare_attention_key_anchor_kernel<256>,
                         dim3(n_kv_heads), dim3(256), 0, stream,
                         d_k_input, d_k_anchor, d_cached_count, d_row_count,
-                        max_seq_len, verifier_rows, n_kv_heads, k_head_major,
-                        anchor_policy);
+                    verifier_rows, n_kv_heads, k_head_major);
                 else
                     return false;
             }
@@ -2437,8 +2416,7 @@ namespace llaminar2
             d_k_input, d_v_input, d_rotations, d_k_ring, d_v_ring,
             nullptr, ring_head, nullptr, nullptr, nullptr,
             max_seq_len, verifier_rows, n_kv_heads, head_dim,
-            k_head_major, v_head_major, mode,
-            AttentionKeyAnchorPolicy::FirstRetained, stream);
+            k_head_major, v_head_major, mode, stream);
     }
 
     extern "C" bool hip_tq_quantize_grouped_ring_dynamic(
@@ -2450,7 +2428,6 @@ namespace llaminar2
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
         TurboQuantKVMode mode,
-        AttentionKeyAnchorPolicy anchor_policy,
         hipStream_t stream)
     {
         if (!d_ring_head || !d_cached_count || !d_k_anchor)
@@ -2459,7 +2436,7 @@ namespace llaminar2
             d_k_input, d_v_input, d_rotations, d_k_ring, d_v_ring,
             d_k_anchor, 0, d_ring_head, d_cached_count, d_row_count,
             max_seq_len, verifier_rows, n_kv_heads, head_dim,
-            k_head_major, v_head_major, mode, anchor_policy, stream);
+            k_head_major, v_head_major, mode, stream);
     }
 
     extern "C" bool hip_tq8_dequantize_fp32(

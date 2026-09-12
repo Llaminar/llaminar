@@ -12,21 +12,40 @@
  * capture, and no timing threshold belongs in this functional preflight.
  * Exact-overlay promotion also sweeps every structurally staged output tile;
  * byte proof for the historical tile alone cannot certify another launch grid.
+ * BK256 additionally exercises the public launch bridge on every device before
+ * any resource query can accidentally configure its context-local attributes.
  */
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
+#include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <memory>
 #include <stdexcept>
 #include <set>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+extern "C" {
+/** @brief Production prefill bridge; the fixture never recompiles a device body. */
+bool cudaNativeVNNIPrefill_fp32_withPolicy(
+    const int8_t*, const uint8_t*, const uint16_t*, const uint16_t*,
+    const uint32_t*, float*, const float*, const int32_t*, int, int, int,
+    float, float, const float*, const float*, uint8_t, uint8_t, int, void*,
+    CUDAPrefillContext*);
+/** @brief Select the existing diagnostic BK256 candidate before workers start. */
+void cudaNativeVNNIPrefill_setBK256Mode(int);
+/** @brief Preserve the caller's launch policy across the focused fixture. */
+int cudaNativeVNNIPrefill_getBK256Mode();
+}
 
 namespace
 {
@@ -70,6 +89,84 @@ struct Session {
         if(stream) cudaStreamDestroy(stream);
     }
 };
+
+/** @brief Scope candidate selection; worker threads only read this policy. */
+struct BK256Candidate {
+    const int previous = cudaNativeVNNIPrefill_getBK256Mode();
+    /** @brief Force both BK256 geometries through the ordinary launch bridge. */
+    BK256Candidate() { cudaNativeVNNIPrefill_setBK256Mode(1); }
+    /** @brief Restore AUTO or the original caller selection after all joins. */
+    ~BK256Candidate() { cudaNativeVNNIPrefill_setBK256Mode(previous); }
+};
+
+/**
+ * @brief Capture the production BK256 launch without metadata-query priming.
+ * @param device CUDA ordinal whose current context must own the opt-in.
+ * @param rows Logical M; 32 selects narrow and larger M selects wide BK256.
+ *
+ * Q4_0 nibble 9 with unit FP16 scale decodes to +1. Unit INT8 activations and
+ * FP32 block scales therefore have the independent, exactly representable
+ * answer K. All buffers precede capture and twenty replays poison output plus
+ * guards. Resource queries deliberately happen only AFTER successful replay:
+ * those queries configure shared-memory attributes and would hide the defect.
+ */
+void verifyBK256Context(int device, int rows)
+{
+    check(cudaSetDevice(device));
+    constexpr int n = 896, k = 4864;
+    const std::size_t blocks = std::size_t(n) * (k / 32);
+    const std::size_t elements = std::size_t(rows) * k;
+    const std::size_t outputs = std::size_t(rows) * n;
+    Buffer<uint8_t> payload(blocks * 16);
+    Buffer<uint16_t> scales(blocks);
+    Buffer<int8_t> activation(elements);
+    Buffer<float> activation_scales(elements / 32), output(outputs + 8);
+    std::unique_ptr<CUDAPrefillContext, decltype(&cudaPrefillContext_destroy)>
+        context(cudaPrefillContext_create(device), cudaPrefillContext_destroy);
+    if (!context) throw std::runtime_error("missing production prefill context");
+    const std::vector<uint8_t> host_payload(payload.count, 0x99);
+    const std::vector<uint16_t> host_scales(scales.count, 0x3c00);
+    const std::vector<int8_t> host_activation(activation.count, 1);
+    const std::vector<float> host_activation_scales(activation_scales.count, 1);
+    Session session;
+    payload.upload(host_payload, session.stream);
+    scales.upload(host_scales, session.stream);
+    activation.upload(host_activation, session.stream);
+    activation_scales.upload(host_activation_scales, session.stream);
+    check(cudaStreamSynchronize(session.stream));
+    check(cudaStreamBeginCapture(session.stream, cudaStreamCaptureModeThreadLocal));
+    const bool launched = cudaNativeVNNIPrefill_fp32_withPolicy(
+        activation.data, payload.data, scales.data, nullptr, nullptr, output.data,
+        activation_scales.data, nullptr, rows, n, k, 1, 0, nullptr, nullptr,
+        0, 0, device, session.stream, context.get());
+    // End even an invalidated capture before unwinding its stream/buffers.
+    const auto ended = cudaStreamEndCapture(session.stream, &session.graphs[0]);
+    if (!launched) throw std::runtime_error("BK256 production launch failed on CUDA:" +
+        std::to_string(device) + " rows=" + std::to_string(rows));
+    check(ended);
+    check(cudaGraphInstantiate(&session.execs[0], session.graphs[0], nullptr, nullptr, 0));
+    std::vector<float> actual(output.count);
+    for (int replay = 0; replay < 20; ++replay) {
+        check(cudaMemsetAsync(output.data, 0x7e, output.count * sizeof(float), session.stream));
+        check(cudaGraphLaunch(session.execs[0], session.stream));
+        check(cudaMemcpyAsync(actual.data(), output.data, output.count * sizeof(float),
+            cudaMemcpyDeviceToHost, session.stream));
+        check(cudaStreamSynchronize(session.stream));
+        for (std::size_t i = 0; i < outputs; ++i)
+            if (actual[i] != float(k)) throw std::runtime_error("BK256 analytic output mismatch");
+        for (std::size_t i = outputs; i < actual.size(); ++i) {
+            uint32_t bits;
+            std::memcpy(&bits, &actual[i], sizeof(bits));
+            if (bits != 0x7e7e7e7eu) throw std::runtime_error("BK256 output guard corruption");
+        }
+    }
+    CUDADensePrefillKernelResources primary{}, auxiliary{};
+    if (!cudaNativeVNNIPrefill_queryLastLaunchResources(0, n, k, device, &primary, &auxiliary))
+        throw std::runtime_error("BK256 resource identity missing");
+    EXPECT_EQ(primary.dynamic_shared_memory_bytes, rows <= 32 ? 40960u : 59392u);
+    EXPECT_EQ(primary.local_memory_bytes_per_thread, 0u);
+    EXPECT_GT(primary.max_active_blocks_per_sm, 0);
+}
 
 /** @brief Cheap deterministic fixture bytes; no source-format conversion occurs. */
 uint32_t mixed(uint32_t x) {
@@ -292,6 +389,55 @@ void verifyCodebook()
         }
 }
 } // namespace
+
+/** @brief Device switches cannot reuse another CUDA context's function opt-in. */
+TEST(CUDANativeVNNIPrefillStaging, BK256CapturedLaunchOwnsEveryDeviceContext)
+{
+    int count = 0;
+    check(cudaGetDeviceCount(&count));
+    ASSERT_GT(count, 0);
+    const BK256Candidate candidate;
+    // First launch on each device must work without another API priming it.
+    // A single-GPU host still proves the same launch contract; multi-GPU hosts
+    // additionally expose the old process-global "already configured" flag.
+    for (int device = 0; device < count; ++device) {
+        SCOPED_TRACE(::testing::Message() << "device=" << device);
+        verifyBK256Context(device, 129);
+        verifyBK256Context(device, 32);
+    }
+    // Fresh instance-owned contexts, reverse device order and the exact failed
+    // production bucket exercise stable attributes without changing weights.
+    for (int device = count - 1; device >= 0; --device)
+        verifyBK256Context(device, 4096);
+}
+
+/** @brief Concurrent participants cannot race a shared capability/opt-in cache. */
+TEST(CUDANativeVNNIPrefillStaging, BK256ConcurrentCapturedParticipants)
+{
+    int count = 0;
+    check(cudaGetDeviceCount(&count));
+    ASSERT_GT(count, 0);
+    const BK256Candidate candidate;
+    // Two streams per device exercise concurrent same-context preparation as
+    // well as cross-device preparation. No diagnostic policy mutates in flight.
+    const int participants = 2 * count;
+    std::barrier start(participants);
+    std::vector<std::exception_ptr> failures(participants);
+    std::vector<std::jthread> workers;
+    for (int participant = 0; participant < participants; ++participant)
+        workers.emplace_back([&, participant] {
+            start.arrive_and_wait();
+            try {
+                verifyBK256Context(participant % count, 129);
+                verifyBK256Context(participant % count, 32);
+            } catch (...) {
+                failures[participant] = std::current_exception();
+            }
+        });
+    for (auto& worker : workers) worker.join();
+    for (auto failure : failures)
+        if (failure) std::rethrow_exception(failure);
+}
 
 /** @brief Prove every admitted nibble-payload candidate in retained graphs. */
 TEST(CUDANativeVNNIPrefillStaging, CapturedCandidatesMatchRegisterDecode)

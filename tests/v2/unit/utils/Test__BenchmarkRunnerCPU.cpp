@@ -294,7 +294,8 @@ namespace
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock_gpu"; }
         int get_position() const override { return 0; }
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override { return snapshot_; }
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override { return snapshot_; }
 
         void setPrefixRuntimeState(PrefixRuntimeStateSnapshot snapshot)
         {
@@ -356,7 +357,8 @@ namespace
     class MockStatsInferenceRunner : public MockCPUInferenceRunner
     {
     public:
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override
         {
             return snapshot;
         }
@@ -720,7 +722,8 @@ namespace
     class MockMeasuredMTPStatsRunner : public MockOrchestratedDecodeRunner
     {
     public:
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override
         {
             ++probe_count_;
             PrefixRuntimeStateSnapshot snapshot;

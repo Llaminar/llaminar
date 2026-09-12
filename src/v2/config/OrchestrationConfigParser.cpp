@@ -8,6 +8,8 @@
  * CLI environment publications also refresh the canonical startup snapshot:
  * early logging must not give direct launches different kernel policy from
  * self-launched MPI children that inherit the same options through environ.
+ * NUMA intent comes from the parsed address, not its textual width: serialized
+ * unknown locality remains unresolved across CLI, YAML and rank-map surfaces.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -1139,6 +1141,11 @@ namespace llaminar2
 
     namespace
     {
+        /**
+         * @brief Preserve parsed locality intent for each explicit rank mapping.
+         * @param spec Already validated rank=device declarations.
+         * @return Rank-local NUMA intent; bare CPU retains automatic placement.
+         */
         std::vector<std::pair<int, bool>> parseDeviceMapNumaExplicit(const std::string &spec)
         {
             std::vector<std::pair<int, bool>> explicitness;
@@ -1166,15 +1173,11 @@ namespace llaminar2
                 const std::string device_spec = part.substr(eq_pos + 1);
                 const std::string lower = toLower(device_spec);
 
-                if (lower.rfind("cpu:", 0) == 0)
-                {
-                    explicitness.emplace_back(rank, true);
-                }
-                else
-                {
-                    const size_t colon_count = static_cast<size_t>(std::count(device_spec.begin(), device_spec.end(), ':'));
-                    explicitness.emplace_back(rank, colon_count >= 2);
-                }
+                // Punctuation describes serialization, not resolved locality.
+                // In particular localhost:-1:<backend>:0 is still unresolved.
+                explicitness.emplace_back(
+                    rank, lower != "cpu" &&
+                              GlobalDeviceAddress::parse(device_spec).hasValidNuma());
             }
 
             return explicitness;
@@ -1552,9 +1555,7 @@ namespace llaminar2
                         throw std::invalid_argument(
                             "Invalid device specification: '" + value + "'");
                     c.device_for_this_rank = *addr;
-                    size_t colon_count = static_cast<size_t>(
-                        std::count(value.begin(), value.end(), ':'));
-                    c.device_for_this_rank_numa_explicit = (colon_count >= 2);
+                    c.device_for_this_rank_numa_explicit = addr->hasValidNuma();
                     c.cpu_global_tp_all_local = false;
                 }),
         });
@@ -1782,7 +1783,7 @@ namespace llaminar2
             .long_name = "--moe-hot-expert-cache",
             .category = "MoE Configuration",
             .value_label = "<count|percent|off>",
-            .description = "Remote hot expert replica cap per rank/device (default: 10%)",
+            .description = "Remote hot expert replica upper bound per layer/device (default: 10%); native GPU admission fits the largest positive cache after complete model coverage",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -3280,8 +3281,7 @@ namespace llaminar2
                     if (addr)
                     {
                         config.device_for_this_rank = *addr;
-                        size_t colon_count = static_cast<size_t>(std::count(value.begin(), value.end(), ':'));
-                        config.device_for_this_rank_numa_explicit = (colon_count >= 2);
+                        config.device_for_this_rank_numa_explicit = addr->hasValidNuma();
                         config.cpu_global_tp_all_local = false;
                     }
                 }

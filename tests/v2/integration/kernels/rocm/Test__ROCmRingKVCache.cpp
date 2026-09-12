@@ -1,6 +1,6 @@
 /**
  * @file Test__ROCmRingKVCache.cpp
- * @brief Unit tests for ROCm Ring Buffer KV Cache
+ * @brief Real-device integration proofs for ROCm ring-buffer KV caches.
  * @author Llaminar Team
  * @date January 2026
  *
@@ -10,6 +10,8 @@
  * 3. O(1) eviction correctness
  * 4. Sliding window pattern
  * 5. Multi-precision (FP32, FP16, BF16, Q8_1)
+ * 6. Captured unequal-length continuation and seed-authenticated diagnostic
+ *    partitions, with external producer events joined before capture.
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
  */
@@ -29,6 +31,8 @@
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheFactory.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/prefix_cache/PrefixCacheStateProbe.h"
+#include "transfer/TransferEngine.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -2605,8 +2609,12 @@ TEST(Test__ROCmRingKVCache, CapturedUnequalRequestLengthsPreserveContinuationAll
         auto v_tensor = makeNativeTensor(v_fp32, format.precision);
         ASSERT_NE(k_tensor, nullptr);
         ASSERT_NE(v_tensor, nullptr);
-        ASSERT_TRUE(k_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
-        ASSERT_TRUE(v_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+        // Mirror the executor's external-input admission: residency alone is
+        // not an authenticated producer-event join for a captured consumer.
+        TransferEngine::prepareDeviceInput(k_tensor.get(), DeviceId::rocm(0), stream.opaque());
+        TransferEngine::prepareDeviceInput(v_tensor.get(), DeviceId::rocm(0), stream.opaque());
+        TransferEngine::requireDeviceInput(k_tensor.get(), DeviceId::rocm(0), stream.opaque());
+        TransferEngine::requireDeviceInput(v_tensor.get(), DeviceId::rocm(0), stream.opaque());
 
         int32_t *device_lengths = nullptr;
         ASSERT_EQ(
@@ -2711,6 +2719,16 @@ TEST(Test__ROCmRingKVCache, CapturedUnequalRequestLengthsPreserveContinuationAll
             EXPECT_EQ(device_head, initial_counts[request]);
         }
 
+        // Device-owned unequal sequence lengths, not the captured padded M,
+        // determine each diagnostic prefix boundary. Observe before replay.
+        PrefixProbeCapturePolicy probe_policy;
+        probe_policy.hash_full_kv_payloads = true;
+        probe_policy.capture_requested_kv_segment_payloads = true;
+        PrefixRuntimeStateSnapshot seed;
+        seed.initialized = true;
+        seed.mtp_kv_caches = {inspectKVCacheForPrefixProbe(
+            *cache, "mtp:0", DeviceId::rocm(0), batch_size, stream.stream(), probe_policy)};
+        const auto continuation_policy = probe_policy.forKVContinuationOf(seed);
         constexpr std::array<int32_t, batch_size> continuation_lengths{1, 1};
         ASSERT_EQ(
             hipMemcpyAsync(
@@ -2813,6 +2831,23 @@ TEST(Test__ROCmRingKVCache, CapturedUnequalRequestLengthsPreserveContinuationAll
                 << " request " << request;
         }
 
+        const auto continued = inspectKVCacheForPrefixProbe(
+            *cache, "mtp:0", DeviceId::rocm(0), batch_size, stream.stream(), continuation_policy);
+        ASSERT_EQ(continued.layers.size(), batch_size);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const auto &layer = continued.layers[request];
+            const auto &seed_layer = seed.mtp_kv_caches.front().layers[request];
+            EXPECT_EQ(layer.leading_segment_tokens, initial_counts[request]);
+            EXPECT_EQ(layer.leading_k_payload_hash, seed_layer.k_payload_hash);
+            EXPECT_EQ(layer.leading_v_payload_hash, seed_layer.v_payload_hash);
+            ASSERT_EQ(layer.segments.size(), 1u);
+            const auto &suffix = layer.segments.front();
+            EXPECT_EQ(suffix.token_start, initial_counts[request]);
+            EXPECT_EQ(suffix.token_count, 1);
+            EXPECT_EQ(suffix.k_payload.size(), row_bytes);
+            EXPECT_EQ(suffix.v_payload.size(), row_bytes);
+        }
         EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
         EXPECT_EQ(hipFree(device_lengths), hipSuccess);

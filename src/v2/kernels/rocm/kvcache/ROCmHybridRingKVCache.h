@@ -420,6 +420,21 @@ namespace llaminar2
          * metadata use that compressed index, so the remap must happen once
          * here before the native grouped gather is enqueued.
          */
+        /**
+         * @brief Resolve a model layer once before describing its FA storage.
+         * @param request Immutable model-layer read geometry.
+         * @return Base-cache storage for that FA layer, never a GDN slot.
+         */
+        std::optional<typename IKVCache::DeviceReadStorage> describeDeviceReadStorage(
+            const typename IKVCache::DeviceReadStorageRequest &request) const override
+        {
+            auto local = request;
+            local.layer = layer_map_.toKVIndex(normalizeLayerIndex(request.layer));
+            if (local.layer < 0)
+                return std::nullopt;
+            return Base::describeDeviceReadStorage(local);
+        }
+
         bool get_kv_batched_device_view(
             int layer,
             int first_seq_idx,

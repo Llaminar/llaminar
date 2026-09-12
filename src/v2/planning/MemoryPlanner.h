@@ -326,8 +326,10 @@ struct DevicePlanConfig
     /**
      * Diagnostic checkpoint storage retained beside captured executables.
      * Zero is valid only when graph snapshots are disabled. The caller that
-     * selects a snapshot topology owns this complete per-accelerator bound;
-     * MemoryPlanner merely converts it into the canonical physical BOM.
+     * selects a snapshot topology declares its reference checkpoint bound.
+     * Optional effective-cache diagnostics are then priced here from the same
+     * physical layer/head/request geometry as live KV storage, never from the
+     * smaller prompt-row geometry of reference checkpoints.
      */
     GraphSnapshotMemoryCapacity graph_snapshot_memory;
 

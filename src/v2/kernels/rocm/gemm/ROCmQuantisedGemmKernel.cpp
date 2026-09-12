@@ -5287,11 +5287,27 @@ namespace llaminar2
         // Internal methods - STUBS
         // =====================================================================
 
+        /**
+         * @brief Materialize host/prepacked weights and their destination resources.
+         * @details Already-resident descriptors were prepared by the weight loader.
+         * Host-backed weights publish IQ constants here, once, before uploading
+         * weights. Pure CPU packing therefore needs no live GPU and replay retains
+         * the existing immediate weights_converted_ fast path.
+         * @throws std::runtime_error If destination IQ table publication fails.
+         */
         void ROCmQuantisedGemmKernel::ensureWeightsConverted()
         {
             if (weights_converted_)
             {
                 return; // Already converted and uploaded
+            }
+
+            const auto source_codebook = impl_->native_source_identity.codebook_id;
+            if (source_codebook >= 11 && source_codebook <= 17 &&
+                !ensureIQGridTablesInitialized(rocm_device_id_))
+            {
+                throw std::runtime_error(
+                    "ROCm weight preparation could not publish destination IQ tables");
             }
 
             // Path 1: Pre-packed weights (ROCmPackedWeights* passed to constructor)

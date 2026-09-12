@@ -18,6 +18,7 @@
 #pragma once
 
 #include "MoEOverlayPhysicalResidencyFabric.h"
+#include "MoEOverlayHostDemandMemoryPlan.h"
 #include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
 #include "planning/PhysicalMemoryAuthority.h"
@@ -346,10 +347,29 @@ namespace llaminar2
         PhysicalMemoryAllocatorIdentity identity_;
     };
 
+    /**
+     * @brief A valid candidate exceeds its physical budget, not a policy error.
+     *
+     * Bounded capacity selection may reject only this typed outcome. Malformed
+     * geometry, stale grants, unsupported paths and arithmetic overflow remain
+     * fatal rather than being disguised as a smaller cache candidate.
+     */
+    class MoEOverlayCapacityExhausted final : public std::invalid_argument
+    {
+    public:
+        /** @brief Preserve the exact limiting-resource diagnostic. */
+        explicit MoEOverlayCapacityExhausted(const std::string &message)
+            : std::invalid_argument(message) {}
+    };
+
     /** @brief Immutable capacity result consumed by placement and admission. */
     struct MoEOverlayResolvedCapacityPlan
     {
         int num_experts = 0;
+        /** Rank-local ingress geometry; reused with retained prepared-weight admission. */
+        std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
+        /** Bounded native-directory cache grant, carried into retained plans. */
+        std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;
         std::vector<MoEOverlayPreparedExpertFootprint> layer_footprints;
         std::vector<MoEOverlayResolvedTierCapacity> tiers;
         /** One immutable admission proof for every CPU/GPU allocator. */

@@ -20,6 +20,7 @@
 #include "../tensors/BlockStructures.h"                 // Q8_1Block, Q16_1Block
 #include "../tensors/FP16Utils.h"                       // fp16_to_fp32, bf16_to_fp32
 #include "../utils/Logger.h"
+#include "SnapshotPublication.h"
 
 namespace llaminar2
 {
@@ -32,6 +33,7 @@ namespace llaminar2
         std::vector<float> data;
         size_t rows = 0;
         size_t cols = 0;
+        SnapshotPublication publication = SnapshotPublication::SchemaPartition;
     };
 
     /**
@@ -292,20 +294,28 @@ namespace llaminar2
          * @param data Fully materialized FP32 values.
          * @param rows Logical row count reported by the producing stage.
          * @param cols Logical column count reported by the producing stage.
+         * @param publication Whether the producer already assembled the value.
          */
         void storeSnapshot(
             const std::string &key,
             std::vector<float> data,
             size_t rows,
-            size_t cols);
+            size_t cols,
+            SnapshotPublication publication = SnapshotPublication::SchemaPartition);
 
         /**
          * @brief Extract and publish one stage output while the capture lock is held.
          *
          * This helper keeps dtype conversion in one place and delegates the
          * replacement/lifetime rule to storeSnapshot().
+         * @param key Semantic output key, independent of the implementation name.
+         * @param out Producer-owned output geometry and bytes.
+         * @param publication Completeness guaranteed by this named producer.
          */
-        void storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out);
+        void storeOutput(
+            const std::string &key,
+            const StageDumpInfo::OutputBuffer &out,
+            SnapshotPublication publication = SnapshotPublication::SchemaPartition);
 
         mutable std::mutex mutex_;
         SnapshotMap snapshots_;

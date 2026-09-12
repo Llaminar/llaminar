@@ -5,6 +5,8 @@
  * Verifies that buildExecutionPlan() (called from initialize()) hard-fails
  * when the model file does not exist or is not valid GGUF, instead of silently
  * falling back to defaults.
+ * Terminal-policy regressions distinguish ordinary disposal from an exported
+ * prepared-model reuse obligation without loading a model or starting a GPU.
  */
 
 #include <gtest/gtest.h>
@@ -13,6 +15,7 @@
 
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/runner/ModelContextRetirement.h"
+#include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "execution/local_execution/device/ReusableExecutionWorkspace.h"
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
@@ -150,6 +153,52 @@ namespace
         EXPECT_FALSE(runner.initialize());
         EXPECT_NE(runner.lastError().find(path), std::string::npos)
             << "Error should contain the file path. Error was: " << runner.lastError();
+    }
+
+    /** Disposal cannot manufacture an absent prepared-context consumer. */
+    TEST(Test__ModelContextRetirement, UnexportedModelNeverRestoresExpertPlacement)
+    {
+        for (const auto mode : {MoERebalanceRuntimeMode::Off,
+                                MoERebalanceRuntimeMode::Observe,
+                                MoERebalanceRuntimeMode::Dynamic})
+        {
+            EXPECT_EQ(modelContextOverlayDrainIntent(nullptr, mode),
+                      MoEOverlayDeviceControllerDrainIntent::ReleaseResources);
+        }
+    }
+
+    /** Both entry points to retained teardown preserve its physical obligation. */
+    TEST(Test__ModelContextRetirement, RetainedDynamicModelRequiresRestoration)
+    {
+        auto authority = std::make_shared<ModelContextReuseAuthority>();
+        for (int phase = 0; phase < 2; ++phase)
+        {
+            EXPECT_EQ(modelContextOverlayDrainIntent(authority, MoERebalanceRuntimeMode::Dynamic),
+                      MoEOverlayDeviceControllerDrainIntent::RestorePreparedContext);
+            for (const auto mode : {MoERebalanceRuntimeMode::Off, MoERebalanceRuntimeMode::Observe})
+                EXPECT_EQ(modelContextOverlayDrainIntent(authority, mode),
+                          MoEOverlayDeviceControllerDrainIntent::ReleaseResources);
+            if (phase == 0)
+                ASSERT_TRUE(authority->beginSealing());
+        }
+        // Reading the policy cannot certify or mutate the retained context.
+        EXPECT_EQ(authority->state(), ModelContextReuseAuthority::State::Sealing);
+        EXPECT_FALSE(authority->sealedDeviceMemoryRetention().has_value());
+    }
+
+    /** Invalid policy/state must fail, not masquerade as ordinary disposal. */
+    TEST(Test__ModelContextRetirement, OverlayDrainRejectsUnownedContextAndInvalidPolicy)
+    {
+        auto authority = std::make_shared<ModelContextReuseAuthority>();
+        ASSERT_TRUE(authority->beginSealing());
+        ASSERT_TRUE(authority->publishReusable({}));
+        EXPECT_THROW((void)modelContextOverlayDrainIntent(authority, MoERebalanceRuntimeMode::Dynamic),
+                     std::logic_error);
+        authority->invalidate("test retirement failure");
+        EXPECT_THROW((void)modelContextOverlayDrainIntent(authority, MoERebalanceRuntimeMode::Off),
+                     std::logic_error);
+        EXPECT_THROW((void)modelContextOverlayDrainIntent(nullptr, static_cast<MoERebalanceRuntimeMode>(99)),
+                     std::logic_error);
     }
 
     TEST(Test__ModelContextReuseAuthority, PublishesFinalRetentionOnlyAtReusableSeal)

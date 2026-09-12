@@ -523,6 +523,7 @@ namespace llaminar2
     {
         Ordinary = 0, ///< No additional restored-prefix state transition.
         RestoredPrefixMTPDecodeBridge, ///< Decode plus shifted-MTP KV/archive bridge.
+        CommittedMTPCondition, ///< Scalar condition plus one new decode commit.
     };
 
     /**

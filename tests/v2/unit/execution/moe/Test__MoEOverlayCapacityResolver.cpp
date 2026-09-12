@@ -11,6 +11,7 @@
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
+#include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "tensors/NativeVnniFormatInfo.h"
@@ -169,6 +170,13 @@ namespace llaminar2
         [[nodiscard]] constexpr std::size_t expectedCpuStride(
             const NativeVnniFormatInfo &format)
         {
+            // Independently describe the compact multi-scale unit: 16 native
+            // payload bytes per column, two half scales and two half minima.
+            // The final minimum vector stays reserved/zero outside Q2_K.
+            if (format.codebook_id == 9 || format.codebook_id == 10 ||
+                format.codebook_id == 13 || format.codebook_id == 14 ||
+                format.codebook_id == 17)
+                return 64 * (16 + 2 * sizeof(uint16_t) + 2 * sizeof(uint16_t));
             if (format.codebook_id == 8)
                 return 1792;
             if (format.codebook_id == 0 ||
@@ -224,6 +232,12 @@ namespace llaminar2
         [[nodiscard]] constexpr int expectedMigrationPayload(
             const NativeVnniFormatInfo &format)
         {
+            // These sources never normalize to a single-scale INT8 GPU blob.
+            // Migration preserves their native payload and all metadata planes.
+            if (format.codebook_id == 9 || format.codebook_id == 10 ||
+                format.codebook_id == 13 || format.codebook_id == 14 ||
+                format.codebook_id == 17)
+                return format.payload_bytes;
             if (format.codebook_id == 8)
                 return 24;
             if (format.codebook_id == 0 ||
@@ -547,7 +561,19 @@ namespace llaminar2
             const auto workspace_requirements =
                 DeviceMoERebalanceWorkspaceContract::requirements(
                     workspace_binding);
-            ASSERT_EQ(workspace_requirements.buffers.size(), 19u);
+            ASSERT_EQ(workspace_requirements.buffers.size(), 21u);
+            // Durable movement evidence is part of the same canonical arena
+            // BOM on every codebook, never an unaccounted diagnostic allocation.
+            const auto *movement_waves = workspace_requirements.find(
+                "moe_rebalance_movement_waves_all_codebooks");
+            const auto *movement_edges = workspace_requirements.find(
+                "moe_rebalance_movement_edges_all_codebooks");
+            ASSERT_NE(movement_waves, nullptr);
+            ASSERT_NE(movement_edges, nullptr);
+            EXPECT_EQ(movement_waves->size_bytes,
+                workspace_capacity.movementJournalWaveCapacity() * sizeof(DeviceMoERebalanceMovementWave));
+            EXPECT_EQ(movement_edges->size_bytes,
+                workspace_capacity.movementJournalEdgeCapacity() * sizeof(DeviceMoERebalanceMovementEdge));
             const auto *local_payload = workspace_requirements.find(
                 "moe_rebalance_local_transfer_payload_all_codebooks");
             const auto *gathered_payload = workspace_requirements.find(
@@ -564,6 +590,122 @@ namespace llaminar2
                     workspace_binding),
                 DeviceMoERebalanceWorkspaceContract::logicalBytes(
                     workspace_binding));
+        }
+    }
+
+    TEST(MoEOverlayCapacityAdmission, ReplicaGrantRejectsDisabledOrStalePolicy)
+    {
+        EXPECT_THROW((MoEOverlayReplicaCacheCapacity{8, 0}), std::invalid_argument);
+        EXPECT_THROW((MoEOverlayReplicaCacheCapacity{8, 9}), std::invalid_argument);
+        EXPECT_THROW((MoEOverlayReplicaCacheCapacity{-1, 0}), std::invalid_argument);
+        const MoEOverlayReplicaCacheCapacity grant{8, 3};
+        EXPECT_EQ(grant.resolve(8), 3);
+        EXPECT_THROW((void)grant.resolve(7), std::logic_error);
+        EXPECT_EQ((MoEOverlayReplicaCacheCapacity{0, 0}.resolve(0)), 0);
+    }
+
+    TEST(MoEOverlayCapacityAdmission, BoundedReplicaCachePreservesCoverageOnBothGpuBackendsAndEveryCodebook)
+    {
+        constexpr int layers = 2;
+        constexpr int experts = 8;
+        // Small geometry exercises the same byte contracts without creating a
+        // backend or mapping a model. One GPU is deliberately the limiting peer.
+        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(::testing::Message() << source.quant_type << '/' << static_cast<int>(backend));
+            const auto model_manifest = manifest(layers, *source.metadata);
+            const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+            plan.continuation_domain = plan.base_model_domain = plan.shared_expert_domain = "gpu";
+            RoutedExpertDomain domain;
+            domain.name = "gpu";
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
+            domain.backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+            domain.participants = backend == DeviceType::CUDA
+                ? std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}
+                : std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+            domain.owner_rank = 0;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+            plan.domains = {domain};
+            plan.routed_tiers = {RoutedExpertTier{.name = "tier", .domain = "gpu", .priority = 0, .fallback = true}};
+            const auto policy_for = [](std::uint32_t replicas)
+            {
+                const auto directory = DeviceMoETransferSlotDirectory::planBufferedCapacity(
+                    layers * std::max(1u, replicas), 2u, 2u);
+                return MoEOverlayCapacityAdmissionPolicy{
+                    .migration_storage = MoEOverlayMigrationStorageKind::DeviceTransferDirectory,
+                    .device_transfer_directory_capacity = directory,
+                    .device_rebalance_workspace_capacity = DeviceMoERebalanceWorkspaceCapacity{
+                        .num_layers = layers, .num_experts = experts, .participant_count = 2,
+                        .layer_window_count = 1, .max_hot_replicas_per_participant = replicas,
+                        .flags = replicas > 0 ? static_cast<std::uint32_t>(DeviceMoERebalanceFlags::HotReplicaCache) : 0u,
+                        .local_transfer_slot_count = directory.total_slots,
+                        .collective_payload_slot_capacity = 1,
+                        .phase = DeviceMoERebalanceStagePhase::PlanCopyApply,
+                        .transfer_mode = DeviceMoERebalanceTransferMode::CompactTransferSlots},
+                    .overlay_world_size = 1};
+            };
+            const auto budgets_for = [&](std::size_t left, std::size_t right)
+            {
+                const auto device = [&](int index)
+                { return backend == DeviceType::CUDA ? DeviceId::cuda(index) : DeviceId::rocm(index); };
+                return std::vector<MoEOverlayBoundPhysicalMemoryBudget>{
+                    boundBudget(0, physicalBudget("left", device(0), left, 4096, 0)),
+                    boundBudget(0, physicalBudget("right", device(1), right, 4096, 0))};
+            };
+            const auto ample = budgets_for(1u << 28, 1u << 28);
+            const auto full = MoEOverlayCapacityAdmission::resolveCapacity(
+                plan, experts, model_manifest, ample, policy_for(8));
+            ASSERT_TRUE(full.replica_cache_capacity);
+            EXPECT_EQ(full.replica_cache_capacity->admitted(), 8);
+            const auto off = MoEOverlayCapacityAdmission::resolveCapacity(
+                plan, experts, model_manifest, ample, policy_for(0));
+            ASSERT_TRUE(off.replica_cache_capacity);
+            EXPECT_EQ(off.replica_cache_capacity->admitted(), 0);
+            const auto exact = MoEOverlayCapacityResolver::resolve(
+                MoEOverlayCapacityAdmission::buildResolverInput(plan, experts, model_manifest, ample, policy_for(3)));
+            const auto exact_bytes = exact.resource("right")->usedBytes();
+            const auto bounded = budgets_for(1u << 28, exact_bytes);
+            const auto result = MoEOverlayCapacityAdmission::resolveCapacity(
+                plan, experts, model_manifest, bounded, policy_for(8));
+            ASSERT_TRUE(result.replica_cache_capacity);
+            EXPECT_EQ(result.replica_cache_capacity->requested(), 8);
+            EXPECT_EQ(result.replica_cache_capacity->admitted(), 3);
+            EXPECT_EQ(result.resource("right")->remainingBytes(), 0u);
+            EXPECT_EQ(result.resource("left")->live_copies_per_layer, (std::vector<int>{4, 4}));
+            EXPECT_EQ(result.resource("right")->live_copies_per_layer, (std::vector<int>{4, 4}));
+            EXPECT_EQ(result.resource("right")->bom().bytes(PhysicalMemoryOwner::ExpertMigrationStaging),
+                      exact.resource("right")->bom().bytes(PhysicalMemoryOwner::ExpertMigrationStaging));
+            const auto installed = MoEOverlayCapacityResolver::installResolvedQuotas(plan, result);
+            ASSERT_TRUE(installed.replica_cache_capacity);
+            EXPECT_EQ(installed.replica_cache_capacity->resolve(8), 3);
+            const auto retained = MoEOverlayCapacityAdmission::resolveCapacity(
+                installed, experts, model_manifest, bounded, policy_for(3));
+            EXPECT_EQ(retained.replica_cache_capacity, result.replica_cache_capacity);
+            EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
+                installed, experts, model_manifest, bounded, policy_for(8)), std::logic_error);
+
+            // One byte less crosses a real physical boundary; the largest
+            // remaining cache is selected without removing any model expert.
+            const auto one_less = MoEOverlayCapacityAdmission::resolveCapacity(
+                plan, experts, model_manifest, budgets_for(1u << 28, exact_bytes - 1), policy_for(8));
+            EXPECT_EQ(one_less.replica_cache_capacity->admitted(), 2);
+            const auto minimum = MoEOverlayCapacityResolver::resolve(
+                MoEOverlayCapacityAdmission::buildResolverInput(plan, experts, model_manifest, ample, policy_for(1)));
+            EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
+                plan, experts, model_manifest, budgets_for(1u << 28, minimum.resource("right")->usedBytes() - 1), policy_for(8)),
+                MoEOverlayCapacityExhausted);
+            auto invalid = policy_for(8);
+            invalid.device_rebalance_workspace_capacity->num_experts = 0;
+            EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
+                plan, experts, model_manifest, bounded, invalid), std::invalid_argument);
+            invalid = policy_for(8);
+            --invalid.device_transfer_directory_capacity.active_slots;
+            EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
+                plan, experts, model_manifest, bounded, invalid), std::invalid_argument);
         }
     }
 
@@ -2041,7 +2183,8 @@ namespace llaminar2
         };
 
         const auto gpu_weight_load = testGPUWeightLoadCapacityInput();
-        const auto result = MoEOverlayLocalCapacityPlanner::plan({
+        rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        MoEOverlayLocalCapacityPlannerInput capacity_input{
             .model_profile = &profile,
             .rank_plan = &rank_plan,
             .overlay_plan = &overlay,
@@ -2053,7 +2196,43 @@ namespace llaminar2
             .max_cpu_memory_bytes = 512u * 1024u * 1024u,
             .resident_graph_rows = 8,
             .gpu_weight_load = gpu_weight_load,
-        });
+        };
+        const auto result = MoEOverlayLocalCapacityPlanner::plan(capacity_input);
+        rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+        overlay.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+        capacity_input.host_demand_memory.emplace(MoEOverlayHostDemandGeometry{
+            .num_layers = profile.n_layers, .num_experts = profile.expert_count,
+            .top_k = profile.expert_used_count,
+            .initial_window_rows = rank_plan.runtime.moe_rebalance.window_size,
+            .maximum_window_rows = rank_plan.runtime.moe_rebalance.max_window_size,
+            .maximum_invocation_rows = 8});
+        const auto dynamic = MoEOverlayLocalCapacityPlanner::plan(capacity_input);
+        ASSERT_TRUE(dynamic.host_demand_memory);
+        EXPECT_FALSE(result.host_demand_memory);
+        EXPECT_EQ(dynamic.host_demand_memory->capacity().max_transaction_rows, 8u);
+        EXPECT_EQ(dynamic.host_demand_memory->allocationBytes(),
+            capacity_input.host_demand_memory->allocationBytes());
+        rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        const auto cpu_identity = PhysicalMemoryAllocatorIdentity{5, DeviceId::cpu()};
+        const auto *static_bom = result.physical_memory_admission->plan().find(cpu_identity);
+        const auto *dynamic_bom = dynamic.physical_memory_admission->plan().find(cpu_identity);
+        ASSERT_NE(static_bom, nullptr);
+        ASSERT_NE(dynamic_bom, nullptr);
+        EXPECT_EQ(dynamic_bom->bytes(PhysicalMemoryOwner::ExecutionWorkspace) -
+                      static_bom->bytes(PhysicalMemoryOwner::ExecutionWorkspace),
+                  MoEOverlayCPUServiceMeasurement::allocationBytes({
+                      .d_model = profile.d_model,
+                      .intermediate = profile.expert_feed_forward_length}) +
+                      capacity_input.host_demand_memory->allocationBytes());
+        // Missing evidence is an admission defect; an all-GPU authority or
+        // Static policy must not silently acquire a host routing mirror either.
+        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), std::invalid_argument);
+        rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+        overlay.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), std::invalid_argument);
+        overlay.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+        capacity_input.host_demand_memory.reset();
+        EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), std::invalid_argument);
         ASSERT_EQ(result.fixed_memory_plan.devices.size(), 2u);
         ASSERT_EQ(result.physical_budgets.size(), 2u);
 
@@ -2559,6 +2738,9 @@ namespace llaminar2
             EXPECT_NE(message.find("remaining_bytes=0"), std::string::npos);
             EXPECT_NE(message.find("fixed_bytes=113"), std::string::npos);
             EXPECT_NE(message.find("staging_bytes=257"), std::string::npos);
+            EXPECT_NE(message.find("weight_load_staging_bytes=0"), std::string::npos);
+            EXPECT_NE(message.find("activation_transport_staging_bytes=0"), std::string::npos);
+            EXPECT_NE(message.find("expert_migration_staging_bytes=257"), std::string::npos);
             EXPECT_NE(message.find("shadow_bytes=0"), std::string::npos);
             EXPECT_NE(
                 message.find(

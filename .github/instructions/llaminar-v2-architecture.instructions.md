@@ -19,8 +19,7 @@ The control flow is:
 Main / subcommand
   -> AppLifecycle + RuntimeInitPhase
   -> IOrchestrationRunner
-       -> OrchestrationRunner                         ordinary path
-       -> NamedDomainGlobalRunner                    cross-rank named domains
+       -> OrchestrationRunner                         one initialization owner
   -> ExecutionPlanBuilder -> RankExecutionPlan
   -> runner construction
        -> GlobalOrchestrator                         cross-rank PP / global TP
@@ -161,9 +160,16 @@ initialization order is:
 6. construct the selected inference runner and its graphs;
 7. install GPU-resident logits and request-state policy.
 
-`NamedDomainGlobalRunner` is selected when named PP domains span ranks. It
-builds global topology and communicator state, stage-local runners, a
-`GlobalOrchestrator`, and an adapter implementing `IOrchestrationRunner`.
+Named PP domains use the same `OrchestrationRunner` initialization, physical
+memory admission, snapshot setup, and serving preparation as local execution.
+`NamedDomainGraphBuilder` constructs the explicit `GlobalOrchestrator` and its
+stage-local runners at the ordinary graph-build phase; it owns no parallel
+model-loading or request lifecycle. The global graph's immutable
+`requestAuthorityRank()` names its vocabulary-head domain leader. Before
+readiness, the outer runner binds command, sampling and frontend ownership to
+that same rank. A pipeline head cannot sample another rank's absent logits;
+the tail is selected by topology, not by rank numbering. Local graphs leave
+the enclosing plan's existing continuation authority unchanged.
 
 ### 3.3 Three execution tiers
 
@@ -260,6 +266,13 @@ Important stage families live under
 
 ## 5. Device graph execution
 
+Cache-backed attention always consumes the configured native post-append KV
+cache, on CPU as well as GPU. The graph orders append before attention. Cold
+prefill, restored suffixes, decode and grouped verification cannot switch to
+transient FP32 projections based on row count or an independent read-mode flag.
+An explicitly cacheless attention stage consumes its supplied K/V operands.
+Missing publication is an error, not permission to change precision or source.
+
 ### 5.1 DeviceGraphOrchestrator
 
 `DeviceGraphOrchestrator` is the owner of a participant's executable model
@@ -336,11 +349,29 @@ to overlap may share capacity according to the memory plan.
 state before runner construction. Initialization fails when the selected plan
 does not fit; allocation is not deferred to the hot path.
 
+KV admission requires both `KVCacheFamily` and storage precision. The main
+hybrid cache retains its family through FA-only pipeline slices; shifted MTP
+caches are independently attention-only. `KVCacheMemoryEstimator` supplies
+their distinct ring and serialized-block BOMs to both planning and factory
+allocation. Precision alone must never select those byte formulas: hybrid GPU
+Q8 uses linear K/V blocks, while attention-only Q8 uses anchored keys. Native
+cache layout versus whole-slot prefix admission is covered on both GPUs in
+the model-free preflight suite.
+
 `PhysicalMemoryAuthority` owns the canonical physical admission, reservation,
 materialization, and release ledger. Planners contribute typed BOMs, not live
 capacity arithmetic. Opaque native graph pools are admitted as complete retained
 families through `GPUGraphMemoryContract`; an individual pool-growth observation
 is diagnostic evidence, not bytes owned by the graph that triggered it.
+
+Native homogeneous-GPU ExpertOverlay treats its replica-cache request as an
+upper bound. `MoEOverlayCapacityAdmission` selects the largest positive cache
+that fits alongside complete model coverage and all named graph/runtime BOMs.
+Only a typed physical-capacity exhaustion permits another candidate; invalid
+topology or format still fails. The immutable replica-count grant travels with
+the resolved placement plan into graph setup and retained-runner reuse. Rolling
+transfer lanes remain unchanged, and admission never switches Dynamic or an
+enabled cache off. The grant is geometry, not a parallel physical-byte ledger.
 
 `MTPGraphOwnerPlan` supplies the same general/bounded-helper owner partition to
 ordinary and ExpertOverlay admission. `ComputeGraph` declares the executable
@@ -363,6 +394,54 @@ providers, device slot pools, and transfer services. Rebalance changes are
 published through graph-visible maintenance/state rather than by rewriting
 ordinary stage ownership behind the graph.
 
+Terminal model disposal and prepared-context reuse have different obligations.
+`modelContextOverlayDrainIntent` projects the exported reuse authority into the
+local device-controller drain intent. Ordinary server disposal drains admitted
+transactions but never restores a discarded model's initial placement. The
+existing shutdown rendezvous joins the rank-local obligations; if any rank
+retains a Dynamic prepared context, all physical peers participate in its
+restoration. Only that retained branch can certify prepared-context reuse.
+This exchanges host-owned resource lifetime, not GPU placement or inference
+state, and adds no inference-time collective.
+
+Host-authoritative placement keeps its smoothed demand forecast private to
+`MoEOverlayResidencyAuthority`. Executable transactions retain the original
+observed window and derive movement activity from it. Repeated generations
+authenticate complete routing identity, including retained batch boundaries,
+before reusing a forecast. Only the coordinator's policy fingerprint includes
+the forecast identity; followers adopt the selected plan without reconstructing
+history or receiving a second histogram.
+
+Host service economics uses one observed-transaction objective for participant
+search, bounded tier selection and final cycle/cohort admission. It sums the
+slowest participant's work in each actual routed invocation; taking a maximum
+after summing the entire window loses co-occurrence and can reverse the payoff.
+Private forecasts still rank placement, but cannot supply service evidence or
+its token denominator. Missing invocation evidence is a hard error when pricing
+service. Production setup must admit the bounded routing banks and publication
+storage before enabling this contract.
+
+`MoEOverlayHostDemandMemoryPlan` composes those payload owners into the host
+`ExecutionWorkspace` BOM before automatic expert filling. Its geometry comes
+from model-resolved routed layers, the maximum adaptive window and retained
+invocation bounds, not a fixed model or topology cap. The plan covers both RCU
+banks, overlapping immutable observations and one reused MPI mailbox. Static
+and device-resident authorities cannot request this host evidence allocation.
+The retained-weight capacity identity includes both window bounds; it cannot
+reuse an admission made for smaller routing storage.
+
+The admitted host-demand plan is retained with the resolved capacity result and
+binds live histogram storage to the same PMA and model/window identity. CPU
+routers and declared heterogeneous dispatch-ticket boundaries publish complete
+executed invocations, including MTP candidates later rejected. Phase is explicit:
+a one-row predictor is MTP work, not ordinary decode. Histograms measure routed
+work at the named main-layer boundary, not accepted response-token progress.
+KV/GDN, sampler and accepted-token publication remain separate authorities;
+CPU accepted-state publication does not walk routers or republish their history.
+The ticket path adds no readback beyond its existing heterogeneous boundary.
+Native all-GPU accepted-row ledgers remain device-owned; their transaction-cost
+port is a separate implementation requirement, not a host-policy substitution.
+
 The device overlay controller separates the open transaction's phase intent
 from its last sealed command. Opening snapshot N+1 must retain command N and
 its publication word: an empty decision can finish before a remote transport
@@ -370,6 +449,38 @@ worker acquires it. Every worker consumes N before joining snapshot N+1, so the
 existing topology-wide snapshot fan-in is the sole command-buffer reuse edge.
 Do not add a second acknowledgement, clear the command at transaction-open,
 or reconstruct a missed command from host-side policy state.
+
+Native homogeneous GPU maintenance likewise retains the exact command wave
+through durable publication. Applying it prepares the reserved RCU bank and
+publishes `PreparedForPublication`, not `Applied`. The existing all-layer
+finalizer authenticates the apply's wave/epoch/count against the retained
+headers, switches the selector, and only then recycles the commands. Invalid
+publication poisons that controller and preserves the failed identity. This
+uses the same captured stream DAG; no host acknowledgement or extra launch is
+part of retirement.
+
+The native finalizer also seals a bounded movement receipt after selector
+publication. At the existing terminal request boundary, the configured root
+exports only the populated journal ranges and authenticates request generation,
+workspace identity and monotonically increasing model epochs.
+`NativeMoEMovementArchive` retains these immutable diagnostic facts across
+request resets; it is never consulted by inference or placement policy. Native
+load-spread proofs retain their routed-work units and completed copy receipts
+retain actual payload bytes. Optional PerfStats mirrors use the common
+completed transaction/edge/byte vocabulary. The public runner forwards the
+unique publication root, not the first participant or the dormant setup-time
+residency object. Device-owned activity is explicitly opaque to this terminal
+observer; an old receipt cannot certify current between-wave quiescence.
+
+`moeOptimizationStatus()` projects passive admission headroom from the actual
+owner. Host policy exposes its active RCU routing bank; a mapped all-GPU
+controller exposes the fuller of its independent prefill/decode submission
+windows, including retired progress queued for the next command. The typed
+scope distinguishes cadence from GPU routing histograms and names the traffic
+that can close the window. This diagnostic is not a reservation or a host
+placement mirror. Only an exclusively admitting observer may use it to place
+an evidence cohort between waves; ordinary inference retains lock-free progress
+notification and device-authored policy/receipts.
 
 ### 6.3 Coherence and transfers
 
@@ -382,6 +493,22 @@ The executor may join a consumer stream to a published event. It may not
 allocate, upload, download, migrate, or guess a stream to repair a stage input
 while a graph is running. CPU consumers explicitly materialize host data;
 cross-device and cross-vendor transfers use a declared transfer plan.
+
+Same-vendor activation copies acquire the source tensor event and submit
+NCCL/RCCL through `copyOnStreams` with exact sending and receiving streams.
+Coordinators may serialize host submission but cannot replace those streams or
+wait for GPU completion. TransferEngine publishes the receiving event and
+extends the source lifetime through its read. Retained PP replay imports its
+single newly written ingress buffer before launch; cached residency is not
+proof of fresh-byte readiness. CPU-visible and cross-vendor host boundaries
+likewise acquire the source event before observing its bytes.
+
+Every successful forward publishes its graph-declared result tensor after
+launch, including deferred decode and verifier execution. A private sampler
+stream handoff is not that public tensor event: nonterminal PP stages publish
+hidden state for transfer consumers, while terminal stages publish logits.
+Deferring completion never suppresses result publication; publication records
+an event without waiting or making host data visible.
 
 Background mapped expert copies use prepared `PersistentTransferExecutionLane`
 leases and `TransferEngine::enqueueBackgroundMappedCopy`. Its progress contract
@@ -436,6 +563,15 @@ dependency ahead of every otherwise-independent client on the same stream.
 Repack kernels keep their exact stream and terminal event; only TransferEngine
 selects the physical copy mechanism, independently of expert tensor format.
 
+Captured GPU-to-CPU dispatch publishes the request's pinned placement epoch
+with its route and activation payload through the existing mapped release
+edge. CPU dispatch acquires exactly that residency snapshot, not the latest
+global publication. A background wave may publish a newer bank while the
+forward still holds its old GPU reader. Device-authored ticket epochs are
+immutable inputs; only explicitly host-admitted transactions may author their
+epoch during host admission. A missing captured epoch or conflict with a
+sequence lease is fatal.
+
 CPU canonical-route ingress is a captured acquire/materialize/acknowledge DAG.
 One thread acquires the CPU publication, then parallel row tiles copy its
 immutable contributions, and the exact-stream terminal acknowledges reuse.
@@ -444,6 +580,11 @@ maintenance and its event markers must remain runnable while the producer works.
 Route metadata is shared per row rather than re-read from mapped host memory
 for each contribution element. CPU ownership lasts until publication; the
 ticket and payload remain immutable until the GPU acknowledgement.
+Canonical GPU expert publication writes the complete original route bank,
+including zeroes for non-local slots. CPU ticket materialization therefore
+depends on the local GPU publication before replacing those slots. Only CPU
+compute overlaps the GPU writer; joining both writers at the final reducer is
+insufficient to order their overlapping stores.
 
 ## 7. Parallel execution
 
@@ -466,6 +607,13 @@ and an `ILocalPPContext`. `FactoryPPStageConfig` records layer range plus
 embedding/LM-head ownership. Activation movement appears as local pipeline
 transfer stages. Local TP may be nested inside one PP stage through that
 stage's own rank-local runner.
+
+The pipeline chunk distinguishes logical token rows from physical transfer
+capacity. GPU children retain captured bucket geometry and mask padding; CPU
+children execute only logical rows. A nonterminal CPU child zeroes unused
+outgoing activation rows for the next captured participant, without evaluating
+fake tokens or appending them to KV. Terminal logits, snapshots and prefix
+state describe the logical frontier, never the transport bucket tail.
 
 ### 7.3 Global pipeline and tensor parallelism
 
@@ -497,6 +645,14 @@ harvest, promotion/demotion, and device rehydration are explicit lifecycle
 operations. Cache fingerprints include model/graph policy needed to reject an
 incompatible state image.
 
+Coordinated prefix admission retains a typed placement-epoch span, not just
+the newest participant epoch. Local and MPI nesting preserve both endpoints;
+request completion samples the placement authority after harvest. This makes
+publication during child lookups or harvest observable without changing cache
+keys, inventing a host placement mirror, or synchronizing inference with
+maintenance. A stale participant admission is discarded by the existing
+participant-local harvest contract, never relabeled with a newer fingerprint.
+
 MTP is not a separate eager model loop. The main graph, sidecar drafts,
 all-position verifier, stochastic/greedy outcome graphs, shifted caches,
 request-batched state, and accepted-state publication share typed transaction
@@ -504,6 +660,23 @@ objects and device events. `MTPDepthController` selects a permitted draft depth;
 `MTPVerifierForwardExecutor` and the runner interfaces coordinate verifier
 forwards. Production grouped verification must preserve serial-row byte
 equivalence while publishing accepted state without row replay.
+
+Logical rollback checkpoint admission carries the scheduler cursor and explicit
+main/shifted append bounds for the admitted transaction. Resolve its draft
+extent before checkpointing and use the same extent for execution. Retained
+graph/workspace capacity is not live KV demand; every later transaction obtains
+its own checkpoint. Participants reject append extents that could wrap over
+archived prefix bytes. Device-owned positive-width transactions retain their
+selected geometry and clip accepted publication on device.
+
+Scalar condition forwards also carry explicit commit ownership. A speculative
+continuation has already been counted by accepted-result publication; a
+budget-one or forced-token forward owns a new serial commit. The latter is a
+distinct `ForwardStateTransaction` in graph-cache identity, setup capture, and
+canonical memory admission. HIP embeds the existing serial cadence publisher
+at that graph's terminal; CUDA retains its native conditional maintenance
+transaction. Never infer this distinction from shape or add a host cadence
+counter to compensate for a missing captured publication.
 
 Request reset uses typed reset transactions and KV-cache reset boundaries. It
 joins outstanding device work, resets data and live-state generations, then
@@ -535,6 +708,13 @@ Snapshot capture, stage dumps, stage-output printing, and tensor verification
 are diagnostic features configured through `utils/DebugEnv.h`. They may add
 host copies or synchronization and therefore cannot certify production
 residency or performance.
+
+Snapshot bytes, shape, lifetime, and publication completeness share one
+immutable owner. A named finalizer may publish a complete value under a key
+whose earlier producer held a TP partial. `SnapshotPublication` carries that
+distinction to collectors: completed copies must agree and are never summed
+with earlier partials; partial-only captures retain ordinary schema assembly.
+Prefill chunk joins preserve the same completeness contract across all rows.
 
 The test hierarchy mirrors ownership:
 

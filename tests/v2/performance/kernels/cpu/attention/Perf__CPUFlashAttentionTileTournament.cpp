@@ -36,6 +36,7 @@
 
 #include <gtest/gtest.h>
 
+#include "backends/BackendManager.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUFlashAttentionLaunchPolicy.h"
@@ -69,11 +70,30 @@
 #include <vector>
 
 #include <omp.h>
+#include <numa.h>
+#include <sched.h>
 
 namespace
 {
     using namespace llaminar2;
     using namespace llaminar2::cpu::fa2_policy;
+
+    /**
+     * @brief Declare the benchmark's pinned NUMA participant before allocation.
+     *
+     * A standalone worker has no MPI bootstrap. Backend lookup intentionally
+     * cannot invent an aggregate CPU owner, so this harness must declare the
+     * node selected by its external affinity before preparing persistent FA2
+     * workspace. This happens before warmup and never inside a timed sample.
+     */
+    void prepareBenchmarkCPUBackend()
+    {
+        const int cpu = sched_getcpu();
+        const int node = cpu >= 0 ? numa_node_of_cpu(cpu) : -1;
+        if (node < 0)
+            throw std::runtime_error("CPU FA2 benchmark cannot resolve its pinned NUMA participant");
+        initCPUBackend(node);
+    }
 
     /** Native K/V tensor pairing exercised by one production invocation. */
     enum class NativeKVFormat : std::uint8_t
@@ -545,7 +565,6 @@ namespace
 
         if (format == NativeKVFormat::Q16_1)
         {
-            constexpr float kCacheScale = 8.0f;
             const Q16BlockSize block_size = q16BlockSizeForHead(head_dim);
             const std::vector<std::size_t> head_major_shape{
                 static_cast<std::size_t>(n_kv_heads) * kv_len,
@@ -558,10 +577,9 @@ namespace
                 key_fp32, kv_len, n_kv_heads, head_dim);
             const std::vector<float> value_head_major = toQ16HeadMajor(
                 value_fp32, kv_len, n_kv_heads, head_dim);
-            if (!key->copyFrom_fp32_fixed_scale(
-                    key_head_major.data(), kCacheScale, head_dim) ||
-                !value->copyFrom_fp32_fixed_scale(
-                    value_head_major.data(), kCacheScale, head_dim))
+            // Match native cache publication, including full-range int16 keys.
+            if (!key->copyFrom_fp32(key_head_major.data()) ||
+                !value->copyFrom_fp32(value_head_major.data()))
             {
                 return {};
             }
@@ -1248,6 +1266,7 @@ namespace
      */
     void runFullQwenTPByteTotality()
     {
+        prepareBenchmarkCPUBackend();
         ScopedOpenMPThreadLimit thread_limit(/*requested=*/8);
         const std::vector<ParticipantAttentionGeometry> participants =
             buildDistinctParticipantGeometries();
@@ -1334,6 +1353,7 @@ namespace
     /** Execute and certify either the compact or exhaustive tournament. */
     void runTournament(bool full)
     {
+        prepareBenchmarkCPUBackend();
         const TournamentFilter filter = TournamentFilter::fromEnvironment();
         const CacheInfo &cache = cache_info();
         ASSERT_GT(cache.l2_size, 0U);

@@ -1,624 +1,99 @@
 name: CI
 
+# Repository Actions remains administratively disabled until explicitly enabled.
+# Once enabled, hosted and local certification have exactly one entry point.
 on:
   pull_request:
     branches: [develop, master]
-    paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'changelog/**'
-      - '.devcontainer/**'
-      - '.vscode/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '**/*.md'
-      - '**/.gitkeep'
   push:
     branches: [develop]
     paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'changelog/**'
-      - '.devcontainer/**'
-      - '.vscode/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '**/*.md'
-      - '**/.gitkeep'
+      - 'benchmarks/production/results/**'
+      - 'benchmarks/production/high_water.json'
   workflow_dispatch:
   workflow_call:
     inputs:
       image-tag:
-        description: "Deprecated; runtime image tags are derived from branch, SHA, CUDA, and ROCm versions."
+        description: Optional immutable release tag for the certified image.
         required: false
         type: string
-        default: ""
+        default: ''
     outputs:
-      image-ref:
-        description: "Published runtime image references."
-        value: ${{ jobs.runtime-image-refs.outputs.image-refs }}
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+      image-ref-avx512:
+        description: Independently certified full-backend AVX512 image.
+        value: ${{ jobs.production.outputs.image-ref-avx512 }}
+      image-ref-avx2:
+        description: Independently certified full-backend AVX2 image.
+        value: ${{ jobs.production.outputs.image-ref-avx2 }}
 
 permissions:
   contents: read
-  packages: write
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  MODELS_DIR: /opt/llaminar-models
-  BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
-  CUDA_VERSION: "13.0"
-  ROCM_VERSION: "7.1.1"
-  LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE: "256GB"
-  RCCL_ONLY_FUNCS: >-
-    AllReduce RING/TREE LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Reduce RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|ReduceScatter RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|AllGather RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Broadcast RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|SendRecv RING SIMPLE Sum i8
+# One node owns the full heterogeneous topology. Never cancel a run halfway
+# through model teardown or overlap two workflows on the same accelerators.
+concurrency:
+  group: llaminar-production-certification
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build builder image, unit tests, and focused integration tests
+  production:
+    name: Build → Unit → Preflight → Parity → E2E → Benchmarks → Certify
     runs-on: [llaminar-bench]
-    timeout-minutes: 120
-    outputs:
-      builder-image: ${{ steps.builder-image.outputs.ref }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Record builder image ref
-        id: builder-image
-        shell: bash
-        run: |
-          echo "ref=${BUILDER_IMAGE}" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          driver: docker
-
-      - name: Build builder image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile
-          target: builder
-          network: host
-          load: true
-          tags: ${{ env.BUILDER_IMAGE }}
-          build-args: |
-            VERSION=${{ github.ref_name }}
-            VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ github.event.repository.updated_at }}
-            LLAMINAR_CUDA_ARCHS=86
-            RCCL_ONLY_FUNCS=${{ env.RCCL_ONLY_FUNCS }}
-
-      - name: Stage runner host state
-        run: |
-          if [ ! -d "${MODELS_DIR}" ]; then
-            echo "::error::Models directory ${MODELS_DIR} not found on runner."
-            exit 1
-          fi
-
-      - name: Preflight - clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-
-      - name: Run unit tests
-        run: |
-          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
-            --probe-image "${BUILDER_IMAGE}" \
-            --required)
-          docker run --rm \
-            "${nvidia_args[@]}" \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --ulimit core=-1 \
-            --shm-size=16g \
-            -e MODELS_DIR="${MODELS_DIR}" \
-            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            --workdir /src \
-            ${{ env.BUILDER_IMAGE }} \
-            ctest --test-dir build_v2_integration \
-                  -R '^V2_Unit_' \
-                  --output-on-failure \
-                  --parallel
-
-      - name: Run all-format grouped verifier integration tests
-        run: |
-          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
-            --probe-image "${BUILDER_IMAGE}" \
-            --required)
-          docker run --rm \
-            "${nvidia_args[@]}" \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --ulimit core=-1 \
-            --shm-size=16g \
-            -e MODELS_DIR="${MODELS_DIR}" \
-            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            --workdir /src \
-            ${{ env.BUILDER_IMAGE }} \
-            ctest --test-dir build_v2_integration \
-                  -R '^V2_Integration_GroupedVerifierRows_' \
-                  --output-on-failure \
-                  --parallel
-
-      - name: Run long-context prefill M-totality integration tests
-        run: |
-          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
-            --probe-image "${BUILDER_IMAGE}" \
-            --required)
-          docker run --rm \
-            "${nvidia_args[@]}" \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --ulimit core=-1 \
-            --shm-size=16g \
-            -e MODELS_DIR="${MODELS_DIR}" \
-            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            --workdir /src \
-            ${{ env.BUILDER_IMAGE }} \
-            ctest --test-dir build_v2_integration \
-                  -R '^V2_Integration_(CUDA_MoERowGridMTotality|PrefillGraphCacheLongContextMTotality_(CUDA|ROCm)|PrefillLongContextMTotality_CPU|(CUDA|ROCm)TrainerFullBufferByteCertificate)$' \
-                  --output-on-failure \
-                  --parallel
-
-      - name: Run Qwen3.6 stochastic MTP depth matrix
-        run: |
-          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
-            --probe-image "${BUILDER_IMAGE}" \
-            --required)
-          docker run --rm \
-            "${nvidia_args[@]}" \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --ulimit core=-1 \
-            --shm-size=16g \
-            -e MODELS_DIR="${MODELS_DIR}" \
-            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            --workdir /src \
-            ${{ env.BUILDER_IMAGE }} \
-            ctest --test-dir build_v2_integration \
-                  -R '^(V2_Integration_Parity_Qwen36_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36MoE_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36_LocalTP_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfterClearCache|V2_Integration_Parity_Qwen36MoE_(ExpertOverlay|NodeTP)_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfter(ClearCache|PrefixRestore).*|V2_Integration_Parity_Qwen36MoE_ExpertOverlay_.*PrefixCacheMTPRestore_(CUDA2TP|ROCm2TP)(Dynamic|LLEP)PhaseSplit)$' \
-                  --output-on-failure
-
-      - name: Export canonical E2E certification selections
-        run: |
-          mkdir -p parity-e2e-manifest
-          docker run --rm \
-            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${{ github.workspace }}/parity-e2e-manifest:/e2e-export" \
-            --workdir /src \
-            ${{ env.BUILDER_IMAGE }} \
-            python3 scripts/ci/run_model_parity_e2e.py \
-              --build-dir build_v2_integration \
-              --export-manifest /e2e-export/certifiable.json \
-              --source-revision "${{ github.sha }}"
-
-      - name: Publish canonical E2E manifest
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-parity-e2e-manifest
-          path: parity-e2e-manifest/certifiable.json
-          if-no-files-found: error
-
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-build-tests-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Remove builder image tag
-        if: always()
-        run: docker image rm "${{ env.BUILDER_IMAGE }}" || true
-
-      - name: Bound Docker build cache
-        if: always()
-        run: bash scripts/ci/prune_docker_build_cache.sh
-
-  runtime-containers:
-    name: Runtime ${{ matrix.variant }} ${{ matrix.cpu_isa }} image
-    needs: build
-    runs-on: [llaminar-bench]
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      # Keep the DAG split for visibility while still protecting the shared
-      # self-hosted runner from concurrent GPU-heavy E2E segments.
-      max-parallel: 1
-      matrix:
-        include:
-          - variant: cpu
-            e2e_variant: cpu
-            port: 21100
-            cpu_isa: AVX2
-            tag_suffix: -avx2
-          - variant: cuda
-            e2e_variant: cuda
-            port: 21200
-            cpu_isa: AVX2
-            tag_suffix: -avx2
-          - variant: rocm
-            e2e_variant: rocm
-            port: 21300
-            cpu_isa: AVX2
-            tag_suffix: -avx2
-          - variant: full
-            e2e_variant: hybrid
-            port: 21400
-            cpu_isa: AVX2
-            tag_suffix: -avx2
-          - variant: cpu
-            e2e_variant: cpu
-            port: 20100
-            cpu_isa: AVX512
-            tag_suffix: ""
-          - variant: cuda
-            e2e_variant: cuda
-            port: 20200
-            cpu_isa: AVX512
-            tag_suffix: ""
-          - variant: rocm
-            e2e_variant: rocm
-            port: 20300
-            cpu_isa: AVX512
-            tag_suffix: ""
-          - variant: full
-            e2e_variant: hybrid
-            port: 20400
-            cpu_isa: AVX512
-            tag_suffix: ""
-    # Serialize release-container E2E segments across workflow runs so the
-    # self-hosted GPU runner never oversubscribes NVIDIA/AMD VRAM.
-    concurrency:
-      group: llaminar-runtime-container-e2e
-      cancel-in-progress: false
-    env:
-      # The self-hosted ARC runner invokes Docker builds from inside
-      # Kubernetes. Host networking avoids TLS stalls to codeload.github.com
-      # seen from BuildKit RUN layers while preserving exact dependency refs.
-      LLAMINAR_DOCKER_BUILD_NETWORK: host
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          driver: docker
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Preflight - clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-
-      - name: Resolve runtime image tags
-        id: runtime-tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-            --variant "${{ matrix.variant }}" \
-            --image "$image" \
-            --branch "${GITHUB_REF_NAME}" \
-            --sha "${GITHUB_SHA}" \
-            --tag-suffix "${{ matrix.tag_suffix }}" \
-            --format refs)
-          ((${#refs[@]} > 0))
-          {
-            echo "primary_ref=${refs[0]}"
-            echo "refs<<EOF"
-            printf '%s\n' "${refs[@]}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "## Runtime ${{ matrix.variant }} ${{ matrix.cpu_isa }} image tags"
-            echo ""
-            for ref in "${refs[@]}"; do
-              echo "- \`${ref}\`"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build runtime image
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-            --variant "${{ matrix.variant }}" \
-            --image "$image" \
-            --branch "${GITHUB_REF_NAME}" \
-            --sha "${GITHUB_SHA}" \
-            --tag-suffix "${{ matrix.tag_suffix }}" \
-            --format refs)
-          build_args=(scripts/docker/build-runtime-image.sh --variant "${{ matrix.variant }}" --cpu-isa "${{ matrix.cpu_isa }}" --load --no-verify)
-          for ref in "${refs[@]}"; do
-            build_args+=(--tag "$ref")
-          done
-          "${build_args[@]}"
-
-      - name: Prepare host NUMA memory for E2E
-        run: bash scripts/ci/prepare_numa_e2e_host.sh
-
-      - name: Download canonical E2E manifest
-        uses: actions/download-artifact@v4
-        with:
-          name: model-parity-e2e-manifest
-          path: parity-e2e-manifest
-
-      - name: Prepare persistent model staging
-        run: scripts/ci/setup_production_parity_tmpfs.sh
-
-      - name: E2E test runtime image
-        env:
-          LLAMINAR_E2E_DOCKER_NETWORK: bridge
-        run: |
-          scripts/ci/run_release_container_e2e.sh \
-            --variant "${{ matrix.e2e_variant }}" \
-            --manifest parity-e2e-manifest/certifiable.json \
-            --image "${{ steps.runtime-tags.outputs.primary_ref }}" \
-            --port "${{ matrix.port }}" \
-            --log-dir "/tmp/llaminar-e2e-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-container"
-
-      - name: Benchmark full runtime image
-        if: matrix.variant == 'full'
-        env:
-          LLAMINAR_BENCHMARK_RESULTS_DIR: ${{ github.workspace }}/benchmark-results-${{ matrix.cpu_isa }}
-        run: |
-          .githooks/run_benchmark_check.sh \
-            --container-image "${{ steps.runtime-tags.outputs.primary_ref }}" \
-            --cpu-isa "${{ matrix.cpu_isa }}" \
-            --host-models-dir "${MODELS_DIR}" \
-            --container-models-dir "${MODELS_DIR}"
-
-      - name: Upload benchmark results
-        if: matrix.variant == 'full'
-        uses: actions/upload-artifact@v7
-        with:
-          name: benchmark-results-${{ matrix.cpu_isa }}
-          path: ${{ github.workspace }}/benchmark-results-${{ matrix.cpu_isa }}/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Push tested SHA image
-        if: github.event_name != 'pull_request'
-        run: docker push "${{ steps.runtime-tags.outputs.primary_ref }}"
-
-      - name: Upload E2E logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: runtime-e2e-logs-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            /tmp/llaminar-e2e-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-container/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-runtime-containers-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Remove runtime image tags
-        if: always()
-        shell: bash
-        run: |
-          image="${REGISTRY}/${IMAGE_NAME}"
-          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-            --variant "${{ matrix.variant }}" \
-            --image "$image" \
-            --branch "${GITHUB_REF_NAME}" \
-            --sha "${GITHUB_SHA}" \
-            --tag-suffix "${{ matrix.tag_suffix }}" \
-            --format refs)
-          for ref in "${refs[@]}"; do
-            [[ -n "$ref" ]] && docker image rm "$ref" >/dev/null 2>&1 || true
-          done
-
-      - name: Bound Docker build cache
-        if: always()
-        run: bash scripts/ci/prune_docker_build_cache.sh
-
-  publish-runtime-aliases:
-    name: Publish runtime latest aliases
-    needs: runtime-containers
-    if: github.event_name != 'pull_request'
-    runs-on: [llaminar-bench]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish latest aliases from tested SHA images
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          variants=(cpu cuda rocm full)
-          tag_suffixes=("" "-avx2")
-          for tag_suffix in "${tag_suffixes[@]}"; do
-            for variant in "${variants[@]}"; do
-              mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-                --variant "$variant" \
-                --image "$image" \
-                --branch "${GITHUB_REF_NAME}" \
-                --sha "${GITHUB_SHA}" \
-                --tag-suffix "$tag_suffix" \
-                --format refs)
-              ((${#refs[@]} > 0))
-              primary="${refs[0]}"
-              docker pull "$primary"
-              for ref in "${refs[@]:1}"; do
-                docker tag "$primary" "$ref"
-                docker push "$ref"
-              done
-              docker image rm "${refs[@]}" >/dev/null 2>&1 || true
-            done
-          done
-
-      - name: Bound Docker build cache
-        if: always()
-        run: bash scripts/ci/prune_docker_build_cache.sh
-
-  benchmark-results:
-    name: Merge benchmark results
-    needs: [runtime-containers, publish-runtime-aliases]
-    if: >-
-      always() &&
-      needs.runtime-containers.result == 'success' &&
-      (github.event_name == 'pull_request' ||
-       needs.publish-runtime-aliases.result == 'success' ||
-       needs.publish-runtime-aliases.result == 'skipped')
-    runs-on: [llaminar-bench]
-    timeout-minutes: 30
+    timeout-minutes: 360
     permissions:
-      actions: read
       contents: write
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Prepare branch for result commit
-        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-        run: git checkout -B "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
-
-      - name: Resolve benchmark result path
-        id: benchmark-path
-        run: |
-          short_sha="${GITHUB_SHA::8}"
-          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "dir=benchmark_results/${short_sha}" >> "$GITHUB_OUTPUT"
-
-      - name: Download benchmark artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: benchmark-results-*
-          path: benchmark-artifacts
-
-      - name: Merge ISA benchmark artifacts
-        run: |
-          set -euo pipefail
-          python3 scripts/ci/merge_benchmark_results.py \
-            --input benchmark-artifacts \
-            --output-dir "${{ steps.benchmark-path.outputs.dir }}" \
-            --commit "${{ steps.benchmark-path.outputs.short_sha }}"
-
-      - name: Summarize benchmark results
-        run: python3 scripts/ci/summarize_perf_results.py --results-root benchmark_results
-
-      - name: Upload merged benchmark results
-        uses: actions/upload-artifact@v7
-        with:
-          name: benchmark-results-merged
-          path: ${{ steps.benchmark-path.outputs.dir }}/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Commit benchmark results
-        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "${{ steps.benchmark-path.outputs.dir }}/benchmark_results.json" \
-                  "${{ steps.benchmark-path.outputs.dir }}/benchmark_results.csv"
-          if git diff --cached --quiet; then
-            echo "No benchmark result changes to commit."
-            exit 0
-          fi
-          git commit -m "ci: add benchmark results for ${{ steps.benchmark-path.outputs.short_sha }} [skip ci]"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
-
-  runtime-image-refs:
-    name: Runtime image refs
-    needs: [runtime-containers, publish-runtime-aliases]
-    if: always()
-    runs-on: [llaminar-bench]
+      packages: write
     outputs:
-      image-refs: ${{ steps.refs.outputs.image_refs }}
+      image-ref-avx512: ${{ steps.certify.outputs.image-ref-avx512 }}
+      image-ref-avx2: ${{ steps.certify.outputs.image-ref-avx2 }}
     steps:
       - uses: actions/checkout@v6
-
-      - name: Resolve published runtime image refs
-        id: refs
+        with:
+          submodules: false
+          lfs: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker
+      - name: Log in to GHCR for official publication
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare persistent model staging (never clears an existing cache)
+        run: |
+          bash scripts/ci/setup_production_parity_tmpfs.sh
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/llaminar-parity-references
+      - name: Run canonical production pipeline
+        id: certify
+        env:
+          RELEASE_TAG: ${{ inputs.image-tag }}
         shell: bash
         run: |
           set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          variants=(cpu cuda rocm full)
-          tag_suffixes=("" "-avx2")
-          all_refs=()
-          for tag_suffix in "${tag_suffixes[@]}"; do
-            for variant in "${variants[@]}"; do
-              mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-                --variant "$variant" \
-                --image "$image" \
-                --branch "${GITHUB_REF_NAME}" \
-                --sha "${GITHUB_SHA}" \
-                --tag-suffix "$tag_suffix" \
-                --format refs)
-              all_refs+=("${refs[@]}")
-            done
-          done
-          {
-            echo "image_refs<<EOF"
-            printf '%s\n' "${all_refs[@]}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "## Runtime image refs"
-            echo ""
-            for ref in "${all_refs[@]}"; do
-              echo "- \`${ref}\`"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${RELEASE_TAG:-${GITHUB_SHA}-full}"
+          args=(--models /opt/llaminar-models
+                --reference-cache-root /opt/llaminar-parity-references
+                --output parity-results/production-ci --image "$image")
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            args+=(--publish)
+          fi
+          python3 scripts/ci/run_production_pipeline.py "${args[@]}"
+          echo "image-ref-avx512=$image" >> "$GITHUB_OUTPUT"
+          echo "image-ref-avx2=${image}-avx2" >> "$GITHUB_OUTPUT"
+      - name: Preserve reports, certificates and failure logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: production-certification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            parity-results/production-ci/*.json
+            parity-results/production-ci/*/*.json
+            parity-results/production-ci/*/*.log
+            parity-results/production-ci/*/prerequisites/**
+            parity-results/production-ci/*/e2e-*/**
+            parity-results/production-ci/*/benchmarks-*/**
+            parity-results/production-ci/*/production-campaign-artifacts/**
+          if-no-files-found: warn
+          retention-days: 30

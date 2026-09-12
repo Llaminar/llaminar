@@ -854,6 +854,11 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayInferenceTransaction,
          RankCoordinatorRollsBoundedSerialPrefillChunksWithoutDuplicateTickets)
     {
+        ScopedEnvironmentVariable perf_export(
+            "LLAMINAR_PERF_STATS_JSON", "1");
+        ScopedEnvironmentVariable perf_filter(
+            "LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        PerfStatsCollector::reset();
         auto publisher = std::make_shared<RecordingPublisher>(1);
         std::uint64_t retired_prefill_tokens = 0u;
         auto coordinator =
@@ -889,12 +894,14 @@ namespace llaminar2::test
             .logical_rows_per_request = 8,
             .physical_rows_per_request = 8,
         };
+        std::vector<std::uint64_t> admitted_sequences;
         auto submit_chunk = [&]
         {
             ASSERT_TRUE(coordinator->admitSerialPrefillGraph(0));
             auto first = coordinator->beginParticipantGraph(prefill, 0);
             ASSERT_TRUE(first.ok) << first.error;
             ASSERT_TRUE(first.active);
+            admitted_sequences.push_back(first.sequence_id);
             ASSERT_TRUE(coordinator->admitSerialPrefillGraph(1));
             auto second = coordinator->beginParticipantGraph(prefill, 1);
             ASSERT_TRUE(second.ok) << second.error;
@@ -923,6 +930,23 @@ namespace llaminar2::test
         EXPECT_EQ(publisher->completeCount(), 1u);
         EXPECT_EQ(retired_prefill_tokens, 16u)
             << "Each real prefill row must advance cadence exactly once";
+
+        // Both chunks share an outer command. Evidence must retain the actual
+        // admitted sequence identities instead of coalescing distinct returns.
+        const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+        std::vector<std::uint64_t> retired_sequences;
+        for (const auto &record : records)
+        {
+            if (record.name != "segmented_replay_segments") continue;
+            EXPECT_EQ(record.count, 1u);
+            EXPECT_DOUBLE_EQ(record.value, 2.0);
+            const auto sequence = record.tags.find("sequence");
+            ASSERT_NE(sequence, record.tags.end());
+            retired_sequences.push_back(std::stoull(sequence->second));
+        }
+        std::sort(retired_sequences.begin(), retired_sequences.end());
+        EXPECT_EQ(retired_sequences, admitted_sequences);
+        PerfStatsCollector::reset();
     }
 
     TEST(Test__MoEOverlayInferenceTransaction,

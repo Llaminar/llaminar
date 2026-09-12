@@ -2,6 +2,10 @@
  * @file GlobalOrchestrator.cpp
  * @brief Implementation of cross-machine MPI cluster inference orchestrator
  *
+ * Named-domain runners own participant-local execution; this layer joins
+ * their immutable request results. Prefix coordination preserves the epoch
+ * selected by each lookup rather than relabeling it from later live state.
+ *
  * @author David Sanftenberg
  * @date April 2026
  */
@@ -936,7 +940,6 @@ namespace llaminar2
                 entry.runner->primaryDeviceId(),
                 hit,
                 entry.domain_name,
-                entry.runner->moeRuntimeMovementEpoch(),
                 PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally));
             last_prefix_hits_.push_back(std::move(hit));
         }
@@ -950,7 +953,6 @@ namespace llaminar2
                 compatibility_runner_->primaryDeviceId(),
                 hit,
                 "compatibility",
-                compatibility_runner_->moeRuntimeMovementEpoch(),
                 PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally));
             compatibility_prefix_hit_ = std::move(hit);
         }
@@ -1093,14 +1095,15 @@ namespace llaminar2
                    compatibility_prefix_hit_->clampedTo(common_tokens));
     }
 
-    PrefixRuntimeStateSnapshot StageRunnerRegistry::prefixStateProbeAll() const
+    PrefixRuntimeStateSnapshot StageRunnerRegistry::prefixStateProbeAll(
+        const PrefixProbeCapturePolicy &capture_policy) const
     {
         std::vector<PrefixRuntimeStateSnapshot> children;
         children.reserve(entries_.size() + (compatibility_runner_ ? 1u : 0u));
         for (const auto &entry : entries_)
-            children.push_back(entry.runner->prefixStateProbe());
+            children.push_back(entry.runner->prefixStateProbe(capture_policy));
         if (compatibility_runner_)
-            children.push_back(compatibility_runner_->prefixStateProbe());
+            children.push_back(compatibility_runner_->prefixStateProbe(capture_policy));
         if (children.empty())
             return {};
         if (children.size() == 1u)
@@ -2529,14 +2532,23 @@ namespace llaminar2
         return stage_runners_.truncateLivePrefixStateAll(cached_tokens, seq_idx);
     }
 
-    PrefixRuntimeStateSnapshot GlobalOrchestrator::prefixStateProbe() const
+    PrefixRuntimeStateSnapshot GlobalOrchestrator::prefixStateProbe(
+        const PrefixProbeCapturePolicy &capture_policy) const
     {
-        return stage_runners_.prefixStateProbeAll();
+        return stage_runners_.prefixStateProbeAll(capture_policy);
     }
 
     // =========================================================================
     // GPU-side Sampling with Cross-Rank Broadcast
     // =========================================================================
+
+    bool GlobalOrchestrator::requiresMPICoordinatedDecodeSampling(
+        const SamplingParams &params) const
+    {
+        // Every rank must enter sampleGreedyOnDevice's terminal-token Bcast.
+        // Stochastic CPU sampling consumes only the tail's complete host row.
+        return params.is_greedy();
+    }
 
     int GlobalOrchestrator::sampleGreedyOnDevice()
     {
@@ -2932,30 +2944,28 @@ namespace llaminar2
 
     int GlobalOrchestrator::findTailRank() const
     {
+        std::optional<int> owner;
         for (const auto &stage : config_.topology.stages)
         {
             if (stage.has_lm_head)
             {
+                if (owner)
+                    throw std::invalid_argument("GlobalOrchestrator: multiple vocabulary-head stages");
                 if (stage.is_global_tp)
                 {
-                    // For global TP stages, all participating ranks have the LM head.
-                    // Use the first participating rank as the "primary" tail for
-                    // broadcasting purposes.
-                    if (!stage.participating_ranks.empty())
-                        return stage.participating_ranks[0];
+                    // The domain leader is shared by all ranks' resolved plan;
+                    // it is not necessarily the last physical rank in the job.
+                    if (stage.participating_ranks.empty())
+                        throw std::invalid_argument("GlobalOrchestrator: vocabulary domain has no participants");
+                    owner = stage.participating_ranks.front();
                 }
-                return stage.owning_rank;
+                else
+                    owner = stage.owning_rank;
             }
         }
-        // Fallback: last stage's owner
-        if (!config_.topology.stages.empty())
-        {
-            const auto &last = config_.topology.stages.back();
-            return last.is_global_tp && !last.participating_ranks.empty()
-                       ? last.participating_ranks[0]
-                       : last.owning_rank;
-        }
-        return 0;
+        if (!owner || *owner < 0 || *owner >= config_.world_size)
+            throw std::invalid_argument("GlobalOrchestrator: no valid vocabulary-head request authority");
+        return *owner;
     }
 
 } // namespace llaminar2

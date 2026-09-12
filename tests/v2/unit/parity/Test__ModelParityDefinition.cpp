@@ -10,6 +10,9 @@
 
 #include "integration/parity/ModelParityDefinition.h"
 #include "integration/parity/ProductionParityModelPath.h"
+#include "integration/parity/qwen2/Qwen2ModelParityDefinitions.h"
+#include "integration/parity/qwen3/Qwen3ModelParityDefinitions.h"
+#include "integration/parity/qwen35/Qwen35ModelParityDefinitions.h"
 #include "integration/parity/qwen35moe/Qwen35MoEModelParityDefinitions.h"
 #include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 #include "integration/parity/qwen36/Ornith15ModelParityDefinitions.h"
@@ -17,8 +20,10 @@
 #include "config/OrchestrationConfigParser.h"
 
 #include "config/OrchestrationConfig.h"
+#include "kernels/common/SamplingMath.h"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -53,6 +58,7 @@ namespace llaminar2::test::parity
                 .attention_heads = 14,
                 .kv_heads = 2,
                 .maximum_mtp_draft_depth = maximum_mtp_depth,
+                .prefix_state = ModelParityPrefixState::AttentionKV,
             };
         }
 
@@ -316,6 +322,75 @@ namespace llaminar2::test::parity
         };
     } // namespace
 
+    /**
+     * @brief A mandatory partial-cache proof is new routed work after decode.
+     *
+     * The public purge removes the prompt-plus-token entry produced by decode.
+     * Its following seed must execute the base prompt again before the final
+     * one-row suffix can prove a partial hit. Neither operation is optional or
+     * covered by the earlier numerical prefill/decode request.
+     */
+    TEST(ModelParityDefinition, OrdinaryTrafficIncludesPartialPrefixReseed)
+    {
+        using namespace qwen35moe;
+        const auto prompt = kQwen35MoEParityTokenIds.size();
+        const std::array<std::uint64_t, 4> required_forward_rows{
+            prompt, // Fresh numerical prefill.
+            kQwen35MoEMaximumParityDecodeForwards,
+            prompt, // Mandatory seed after the public prefix purge.
+            1u,     // Uncached suffix of the required partial restore.
+        };
+        std::uint64_t actual_request_rows = 0;
+        for (const auto rows : required_forward_rows)
+            actual_request_rows += rows;
+        EXPECT_EQ(qwen35MoEMaximumNumericalParityRoutedRows(), actual_request_rows);
+        EXPECT_GT(
+            static_cast<std::uint64_t>(kQwen35MoEConvergenceHistogramWindowRows),
+            qwen35MoEConvergenceTrainingMaximumRoutedRows() +
+                qwen35MoEConvergenceTimingCohortRoutedRows() + actual_request_rows)
+            << "Publication overlap, the measured cohort, and the complete prefix proof must fit strictly before another wave";
+    }
+
+    /** @brief Shared execution/admission geometry rejects unusable requests. */
+    TEST(ModelParityDefinition, PartialPrefixPlanOwnsSeedAndSuffixGeometry)
+    {
+        for (const std::size_t prompt : {1u, 9u, 17u, 4096u, 8192u})
+        {
+            const ProductionParityPrefixRestorePlan plan(prompt);
+            EXPECT_EQ(plan.seedTokens(), prompt);
+            EXPECT_EQ(plan.suffixTokens(), 1);
+            EXPECT_EQ(plan.extendedTokens(), prompt + 1u);
+            EXPECT_EQ(plan.routedRows(), prompt + 1u);
+        }
+        EXPECT_THROW(ProductionParityPrefixRestorePlan{0u}, std::invalid_argument);
+        EXPECT_THROW(
+            ProductionParityPrefixRestorePlan{static_cast<std::size_t>(std::numeric_limits<int>::max())},
+            std::invalid_argument);
+        EXPECT_THROW(
+            ProductionParityPrefixRestorePlan{std::numeric_limits<std::size_t>::max()},
+            std::invalid_argument);
+        constexpr ProductionParityPrefixRestorePlan largest{
+            static_cast<std::size_t>(std::numeric_limits<int>::max()) - 1u};
+        EXPECT_EQ(largest.extendedTokens(), std::numeric_limits<int>::max());
+    }
+
+    /** @brief Publication can turn the second training prefill into real work. */
+    TEST(ModelParityDefinition, TrainingOverlapIncludesInvalidatedRepeatedPrefixes)
+    {
+        using namespace qwen35moe;
+        std::uint64_t maximum_rows = 0u;
+        for (int sample = 0; sample < kQwen35MoEConvergenceTimingDecodeForwards; ++sample)
+        {
+            maximum_rows += kQwen35MoEConvergenceTimingPromptRows;
+            ++maximum_rows; // The sampled prefill boundary itself forwards no row.
+        }
+        EXPECT_EQ(maximum_rows, 36u);
+        EXPECT_EQ(qwen35MoEConvergenceTrainingMaximumRoutedRows(), maximum_rows);
+        EXPECT_EQ(
+            kQwen35MoEConvergenceHistogramWindowRows,
+            maximum_rows + qwen35MoEConvergenceProtectedRoutedRows() + 1u);
+    }
+
     TEST(ModelParityDefinition, ProcessCampaignRejectsMissingTmpfsAuthority)
     {
         ScopedEnvironmentVariable process_campaign(
@@ -402,6 +477,51 @@ namespace llaminar2::test::parity
         const std::string configured = "/models/focused-diagnostic.gguf";
 
         EXPECT_EQ(productionParityResolvedModelPath(configured), configured);
+    }
+
+    /** @brief Distinct mount paths must authenticate by file identity, not text. */
+    TEST(ModelParityDefinition, ModelManifestAcceptsSameFileThroughAnotherFilesystemAlias)
+    {
+        ScopedReferenceDirectory declared;
+        ScopedReferenceDirectory alias;
+        ScopedReferenceDirectory staged;
+        declared.add("declared.gguf");
+        staged.add("declared.gguf");
+        const auto declared_path = declared.path() / "declared.gguf";
+        const auto alias_path = alias.path() / "alias.gguf";
+        // Hard links reproduce the distinct canonical names but identical
+        // device/inode pair produced by two Docker bind mounts, without sudo.
+        std::filesystem::create_hard_link(declared_path, alias_path);
+        ASSERT_NE(std::filesystem::canonical(declared_path),
+                  std::filesystem::canonical(alias_path));
+        ASSERT_TRUE(std::filesystem::equivalent(declared_path, alias_path));
+        ScopedEnvironmentVariable manifest(
+            std::string(kProductionParityDeclaredModelsEnvironment), declared_path.string());
+        ScopedEnvironmentVariable ramdisk(
+            std::string(kProductionParityModelRamdiskEnvironment), staged.path().string());
+        const auto expected = (staged.path() / "declared.gguf").string();
+        EXPECT_EQ(productionParityResolvedModelPath(alias_path.string()), expected);
+        EXPECT_EQ(productionParityResolvedModelPath(expected), expected);
+    }
+
+    /** @brief Same name/size/content is not authority to select another source. */
+    TEST(ModelParityDefinition, ModelManifestRejectsDistinctSameNamedFileAndMissingStagedCopy)
+    {
+        ScopedReferenceDirectory declared;
+        ScopedReferenceDirectory impostor;
+        ScopedReferenceDirectory staged;
+        declared.add("model.gguf");
+        impostor.add("model.gguf");
+        staged.add("model.gguf");
+        const auto declared_path = declared.path() / "model.gguf";
+        ScopedEnvironmentVariable manifest(
+            std::string(kProductionParityDeclaredModelsEnvironment), declared_path.string());
+        ScopedEnvironmentVariable ramdisk(
+            std::string(kProductionParityModelRamdiskEnvironment), staged.path().string());
+        EXPECT_THROW(productionParityResolvedModelPath(
+                         (impostor.path() / "model.gguf").string()), std::runtime_error);
+        std::filesystem::remove(staged.path() / "model.gguf");
+        EXPECT_THROW(productionParityResolvedModelPath(declared_path.string()), std::runtime_error);
     }
 
     TEST(ModelParityDefinition, SnapshotInventoryDefaultsToAuthenticatedCheckpoints)
@@ -762,6 +882,39 @@ namespace llaminar2::test::parity
         }
         EXPECT_EQ(witnesses, 1u);
         EXPECT_EQ(movement_only, 23u);
+    }
+
+    TEST(ModelParityDefinition,
+         Qwen35MoEMovementPublicationsFollowTypedEvidenceRole)
+    {
+        using qwen35moe::qwen35MoEMinimumMovementPublications;
+        EXPECT_EQ(qwen35MoEMinimumMovementPublications(
+                      ModelParityDynamicEvidence::NotApplicable), 0u);
+        EXPECT_EQ(qwen35MoEMinimumMovementPublications(
+                      ModelParityDynamicEvidence::EconomicMovement), 1u);
+        EXPECT_EQ(qwen35MoEMinimumMovementPublications(
+                      ModelParityDynamicEvidence::EconomicMovementAndObservedSpeedup),
+                  4u);
+        EXPECT_THROW(static_cast<void>(qwen35MoEMinimumMovementPublications(
+                         static_cast<ModelParityDynamicEvidence>(255))),
+                     std::invalid_argument);
+
+        // Exercise the real 35B declarations: ordinary cells must not inherit
+        // the timing witness's publication count from their model identity.
+        for (const auto &spec : qwen35moe::qwen35MoE35BOverlayTopologySpecs())
+        {
+            const auto cases = expandModelParityDefinition(
+                qwen35moe::qwen35MoE35BGraphNativeParityDefinition(spec));
+            for (const auto &test_case : cases)
+            {
+                const auto required = qwen35MoEMinimumMovementPublications(
+                    test_case.dynamic_evidence);
+                EXPECT_EQ(required,
+                          test_case.requiresObservedConvergenceSpeedup() ? 4u :
+                          test_case.requiresPhysicalExpertMovement() ? 1u : 0u)
+                    << test_case.testName();
+            }
+        }
     }
 
     TEST(ModelParityDefinition,
@@ -1314,6 +1467,29 @@ namespace llaminar2::test::parity
         EXPECT_EQ(legacy.mtp_expected_graph_capacity, 15);
     }
 
+    /** Prove the declared first epoch cannot split a reusable MTP checkpoint. */
+    TEST(ModelParityDefinition, Qwen36InitialEpochAdmitsOneMTPCheckpoint)
+    {
+        using namespace sampling_math;
+        const auto economics = qwen36::qwen36MoEDynamicParityEconomics();
+        for (int depth = 1; depth <= kModelParityRequiredMaximumMTPDepth; ++depth)
+        {
+            const auto checkpoint = makeMTPParityCheckpointTransactionPlan(true, depth);
+            std::array<int, kDeviceGenerationControlCount> controller{};
+            ASSERT_TRUE(initialize_device_generation_control(
+                checkpoint.response_token_budget, checkpoint.response_token_budget,
+                DeviceGenerationPolicy::fixed(depth), controller.data()));
+            // Exercise the same host/device transition called by both vendor
+            // kernels. A one-row cadence legally clips the two-row response;
+            // it cannot certify one transaction from reusable snapshot banks.
+            EXPECT_EQ(prepare_device_generation_transaction_budget(
+                          depth + 1, economics.device_initial_maintenance_period_tokens,
+                          controller.data()),
+                      checkpoint.response_token_budget)
+                << "depth=" << depth;
+        }
+    }
+
     TEST(ModelParityDefinition, ExpertOverlayRejectsEnvironmentOwnedMovementCadence)
     {
         auto definition = makeDefinition(makeOverlayTopology());
@@ -1716,7 +1892,7 @@ namespace llaminar2::test::parity
     /** @return Public CLI round trip of one exported certification cell. */
     OrchestrationConfig parseE2EArguments(const ModelParityCase &cell)
     {
-        auto args = modelParityE2EServerArguments(cell);
+        auto args = modelParityServerArguments(cell);
         args.insert(args.begin(), "llaminar2");
         std::vector<char *> argv;
         for (auto &arg : args) argv.push_back(arg.data());
@@ -1742,6 +1918,356 @@ namespace llaminar2::test::parity
         definition.e2e_certifiable.front().profile.thinking_modes =
             static_cast<ModelParityE2EThinkingModes>(-1);
         EXPECT_THROW(expandModelParityDefinition(definition), std::invalid_argument);
+    }
+
+    TEST(ModelParityDefinition, RuntimeExportCoversUntaggedCellsWithoutChangingE2ESelection)
+    {
+        std::vector<ModelParityDefinition> definitions{
+            qwen36::qwen36MoECPU2NodeTPParityDefinition(),
+            qwen36::qwen36MoEParityDefinition(qwen36::qwen36MoECuda2ExpertOverlayTopology(), "/reference", {}),
+            qwen36::qwen36MoEParityDefinition(qwen36::qwen36MoERocm2ExpertOverlayTopology(), "/reference", {})};
+        for (const auto address : {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+            definitions.push_back(qwen38::qwen38DenseParityDefinition(
+                qwen36::qwen36SingleDeviceTopology("single", address), "/reference"));
+        for (auto definition : definitions)
+        {
+            // Tagging governs the expensive HTTP workload, not whether the
+            // cell can use the public production runner for token regression.
+            const auto tagged = expandModelParityDefinition(definition);
+            definition.e2e_certifiable.clear();
+            const auto untagged = expandModelParityDefinition(definition);
+            ASSERT_EQ(tagged.size(), untagged.size());
+            for (std::size_t i = 0; i < untagged.size(); ++i)
+            {
+                const auto &cell = untagged[i];
+                SCOPED_TRACE(cell.testName());
+                EXPECT_EQ(modelParityServerArguments(cell), modelParityServerArguments(tagged[i]));
+                const auto config = parseE2EArguments(cell);
+                const auto expected = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+                EXPECT_EQ(config.mtp.enabled, cell.mtpEnabled());
+                if (cell.mtpEnabled())
+                    EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
+                EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, expected.mtp.graph_capacity_draft_tokens);
+                EXPECT_EQ(config.moe_rebalance.mode, expected.moe_rebalance.mode);
+                EXPECT_EQ(config.activation_precision, expected.activation_precision);
+                EXPECT_EQ(config.kv_cache_precision, expected.kv_cache_precision);
+                EXPECT_TRUE(config.prefix_cache.enabled);
+                std::ostringstream output;
+                PrintTo(cell, &output);
+                const auto record = nlohmann::json::parse(output.str());
+                EXPECT_TRUE(record.at("e2e").is_null());
+                EXPECT_EQ(record.at("runtime").at("context_length"), cell.model.max_seq_len);
+                EXPECT_EQ(record.at("runtime").at("generation").at("max_tokens"), 384);
+                EXPECT_EQ(record.at("runtime").at("generation").at("minimum_completion_tokens"), 384);
+                const auto &generation = record.at("runtime").at("generation");
+                auto control = cell;
+                control.mtp = ModelParityMTP::Off;
+                EXPECT_EQ(generation.at("serial_control_id"), control.testName());
+                EXPECT_EQ(generation.at("mtp_policy"), modelParityMTPPolicyName(cell.mtp));
+                EXPECT_EQ(generation.at("mtp_verify_mode"), "speculative-sampling");
+                EXPECT_EQ(generation.at("prefix_state"), modelParityPrefixStateName(cell.model.prefix_state));
+                ASSERT_EQ(generation.at("requests").size(), 4u);
+                for (const auto &request : generation.at("requests"))
+                {
+                    EXPECT_EQ(request.at("body").at("return_runtime_summary"), true);
+                    EXPECT_GT(request.at("body").at("seed").get<int>(), 0);
+                    EXPECT_GT(request.at("body").at("temperature").get<float>(), 0.0f);
+                }
+                EXPECT_EQ(generation.at("requests")[0].at("prefix"), "fresh");
+                EXPECT_EQ(generation.at("requests")[1].at("prefix"), "full");
+                EXPECT_EQ(generation.at("requests")[2].at("prefix"), "partial");
+                EXPECT_EQ(generation.at("requests")[0].at("body"), generation.at("requests")[1].at("body"));
+                EXPECT_EQ(generation.at("requests")[2].at("body"), generation.at("requests")[3].at("body"));
+                const auto &seed_messages = generation.at("requests")[0].at("body").at("messages");
+                const auto &extended_messages = generation.at("requests")[2].at("body").at("messages");
+                ASSERT_EQ(seed_messages.size(), 2u);
+                ASSERT_EQ(extended_messages.size(), 3u);
+                EXPECT_EQ(extended_messages[0], seed_messages[0]);
+                EXPECT_EQ(extended_messages[1], seed_messages[1]);
+                EXPECT_EQ(extended_messages[2].at("role"), "assistant");
+                EXPECT_EQ(record.at("runtime").at("server_args"), modelParityServerArguments(cell));
+                EXPECT_EQ(record.at("runtime").at("movement_evidence"),
+                          modelParityE2EMovementEvidenceName(cell.movementEvidence()));
+                if (cell.expert_overlay)
+                {
+                    ASSERT_TRUE(config.moe_routed_expert_plan);
+                    EXPECT_EQ(config.moe_routed_expert_plan->owner_order, cell.expert_overlay->owner_order);
+                    EXPECT_EQ(config.moe_routed_expert_plan->residency_policy,
+                              expected.moe_routed_expert_plan->residency_policy);
+                }
+            }
+        }
+    }
+
+    TEST(ModelParityDefinition, ModelPrefixStateIsMandatoryAndIndependentOfMTP)
+    {
+        auto definition = makeDefinition(makeSingleDeviceTopology(), kModelParityRequiredMaximumMTPDepth);
+        definition.features.mtp = ModelParityAxisProfile::Standard;
+        for (const auto invalid : {ModelParityPrefixState::Unspecified, static_cast<ModelParityPrefixState>(99)})
+        {
+            definition.model.prefix_state = invalid;
+            EXPECT_THROW(expandModelParityDefinition(definition), std::invalid_argument);
+            EXPECT_THROW(modelParityPrefixStateName(invalid), std::invalid_argument);
+        }
+        for (const auto state : {ModelParityPrefixState::AttentionKV, ModelParityPrefixState::HybridRecurrent})
+        {
+            definition.model.prefix_state = state;
+            const auto cells = expandModelParityDefinition(definition);
+            ASSERT_EQ(cells.size(), 6u);
+            for (const auto &cell : cells)
+            {
+                SCOPED_TRACE(cell.testName());
+                EXPECT_EQ(cell.model.prefix_state, state);
+                std::ostringstream output;
+                PrintTo(cell, &output);
+                EXPECT_EQ(nlohmann::json::parse(output.str())["runtime"]["generation"]["prefix_state"],
+                          modelParityPrefixStateName(state));
+            }
+        }
+    }
+
+    TEST(ModelParityDefinition, RealModelFamiliesDeclareTheirMainStateWithoutFilenameInference)
+    {
+        for (auto model : {qwen2::qwen2Q40ParityModel(), qwen3::qwen3Q80ParityModel()})
+        {
+            model.model_path = "/renamed/hybrid.gguf";
+            EXPECT_EQ(model.prefix_state, ModelParityPrefixState::AttentionKV);
+        }
+        for (auto model : {qwen35::qwen35_08B_Q40ParityModel(), qwen35::qwen35_4B_Q80ParityModel(),
+                           qwen35::qwen35_27B_Q4KMParityModel(), qwen35moe::qwen35MoE35BQ4KXLParityModel(),
+                           qwen36::qwen36Dense27BQ4KSParityModel(), qwen36::qwen36MoE35BIQ3SParityModel("reference"),
+                           qwen38::qwen38DenseParityDefinition(makeSingleDeviceTopology(), "reference").model})
+        {
+            model.model_path = "/renamed/attention-only.gguf";
+            EXPECT_EQ(model.prefix_state, ModelParityPrefixState::HybridRecurrent);
+        }
+    }
+
+    TEST(ModelParityDefinition, ModelOwnedGenerationTextPreservesEveryPolicyAndPrefixBoundary)
+    {
+        const ModelParityGenerationPrompt defaults;
+        EXPECT_EQ(defaults.system(), ModelParityGenerationWorkload::systemPrompt());
+        EXPECT_EQ(defaults.user(), ModelParityGenerationWorkload::userPrompt());
+        EXPECT_EQ(defaults.continuation(), ModelParityGenerationWorkload::assistantContinuation());
+        EXPECT_FALSE(defaults.followup());
+        EXPECT_THROW((ModelParityGenerationPrompt("", "user", "continuation")), std::invalid_argument);
+        EXPECT_THROW((ModelParityGenerationPrompt("system", "", "continuation")), std::invalid_argument);
+        EXPECT_THROW((ModelParityGenerationPrompt("system", "user", "")), std::invalid_argument);
+        EXPECT_THROW((ModelParityGenerationPrompt("system", "user", "continuation", "")), std::invalid_argument);
+        for (const ModelParityGenerationPrompt custom : {
+                 ModelParityGenerationPrompt("Exact system\nwith quotes: \"text\"", "Exact user", "Fixed continuation"),
+                 ModelParityGenerationPrompt("Exact system\nwith quotes: \"text\"", "Exact user", "Fixed continuation",
+                                             "Next user turn\nwith \"quotes\"")})
+        for (auto topology : {makeSingleDeviceTopology(), makeOverlayTopology()})
+        {
+            auto definition = makeDefinition(std::move(topology), kModelParityRequiredMaximumMTPDepth);
+            definition.features.mtp = ModelParityAxisProfile::Standard;
+            definition.model.generation_prompt = custom;
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                SCOPED_TRACE(cell.testName());
+                EXPECT_EQ(cell.model.generation_prompt, custom);
+                std::ostringstream output;
+                PrintTo(cell, &output);
+                const auto generation = nlohmann::json::parse(output.str())["runtime"]["generation"];
+                EXPECT_EQ(generation["max_tokens"], 384);
+                EXPECT_EQ(generation["minimum_completion_tokens"], 384);
+                for (const auto &request : generation["requests"])
+                {
+                    const auto &body = request["body"];
+                    EXPECT_EQ(body["seed"], 4242);
+                    EXPECT_EQ(body["messages"][0]["content"], custom.system());
+                    EXPECT_EQ(body["messages"][1]["content"], custom.user());
+                    if (body["messages"].size() > 2)
+                    {
+                        EXPECT_EQ(body["messages"][2]["content"], custom.continuation());
+                        ASSERT_EQ(body["messages"].size(), custom.followup() ? 4u : 3u);
+                        if (custom.followup())
+                        {
+                            EXPECT_EQ(body["messages"][3]["role"], "user");
+                            EXPECT_EQ(body["messages"][3]["content"], *custom.followup());
+                        }
+                    }
+                }
+                EXPECT_EQ(generation["requests"][0]["body"], generation["requests"][1]["body"]);
+                EXPECT_EQ(generation["requests"][2]["body"], generation["requests"][3]["body"]);
+            }
+        }
+        EXPECT_NE(qwen2::qwen2Q40ParityModel().generation_prompt,
+                  qwen2::qwen2ParityModel("Qwen2_Q8_0", "other.gguf", "other-reference").generation_prompt);
+        EXPECT_EQ(qwen2::qwen2ParityModel("Qwen2_Q8_0", "other.gguf", "other-reference").generation_prompt,
+                  longFormTranslationGenerationPrompt());
+        EXPECT_NE(qwen2::qwen2Q40ParityModel().generation_prompt, defaults);
+        EXPECT_NE(qwen3::qwen3Q80ParityModel().generation_prompt,
+                  qwen2::qwen2Q40ParityModel().generation_prompt);
+        EXPECT_EQ(qwen36::qwen36MoE35BIQ3SParityModel("reference").generation_prompt, defaults);
+    }
+
+    TEST(ModelParityDefinition, SmallModelRevisionDoesNotChangeNumericalInputsOrRequestPolicy)
+    {
+        const auto prompt = longFormRevisionGenerationPrompt();
+        for (const auto &model : {qwen2::qwen2Q40ParityModel(),
+                                 qwen3::qwen3Q80ParityModel()})
+        {
+            const auto &model_prompt = model.generation_prompt;
+            EXPECT_EQ(model_prompt.system(), prompt.system());
+            EXPECT_EQ(model_prompt.user(), prompt.user());
+            EXPECT_EQ(model_prompt.continuation(), prompt.continuation());
+            EXPECT_EQ(model.prompt, "The quick brown fox jumps over the lazy dog");
+            EXPECT_EQ(model.token_ids, (std::vector<int>{785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562}));
+            EXPECT_EQ(model.decode_steps, 5);
+            for (const auto device : {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cuda(0),
+                                      GlobalDeviceAddress::rocm(0)})
+            {
+                auto topology = makeSingleDeviceTopology();
+                topology.participants.front().address = device;
+                auto definition = makeDefinition(std::move(topology));
+                definition.model = model;
+                for (const auto &cell : expandModelParityDefinition(definition))
+                {
+                    std::ostringstream output;
+                    PrintTo(cell, &output);
+                    const auto runtime = nlohmann::json::parse(output.str())["runtime"];
+                    const auto &generation = runtime["generation"];
+                    EXPECT_EQ(generation["max_tokens"], 384);
+                    EXPECT_EQ(generation["minimum_completion_tokens"], 384);
+                    ASSERT_EQ(generation["requests"].size(), 4u);
+                    for (const auto &request : generation["requests"])
+                    {
+                        const auto &body = request["body"];
+                        EXPECT_EQ(body["seed"], model.generation_seed.value());
+                        EXPECT_EQ(body["temperature"], 0.7);
+                        EXPECT_EQ(body["top_k"], 40);
+                        EXPECT_EQ(body["top_p"], 0.9);
+                        EXPECT_EQ(body["messages"][0]["content"], prompt.system());
+                        EXPECT_EQ(body["messages"][1]["content"], prompt.user());
+                    }
+                    const auto &requests = generation["requests"];
+                    EXPECT_EQ(requests[0]["body"], requests[1]["body"]);
+                    EXPECT_EQ(requests[2]["body"], requests[3]["body"]);
+                    EXPECT_EQ(requests[2]["body"]["messages"][2]["content"], prompt.continuation());
+                    const auto &initial = requests[0]["body"]["messages"];
+                    const auto &extended = requests[2]["body"]["messages"];
+                    ASSERT_EQ(initial.size(), 2u);
+                    ASSERT_EQ(extended.size(), model_prompt.followup() ? 4u : 3u);
+                    EXPECT_EQ(extended[0], initial[0]);
+                    EXPECT_EQ(extended[1], initial[1]);
+                    if (model_prompt.followup())
+                    {
+                        EXPECT_EQ(extended[3]["role"], "user");
+                        EXPECT_EQ(extended[3]["content"], *model_prompt.followup());
+                    }
+                }
+            }
+        }
+        EXPECT_TRUE(qwen2::qwen2Q40ParityModel().generation_prompt.followup());
+        EXPECT_FALSE(qwen3::qwen3Q80ParityModel().generation_prompt.followup());
+        EXPECT_EQ(qwen2::qwen2Q40ParityModel().generation_seed.value(), 17u);
+        EXPECT_EQ(qwen3::qwen3Q80ParityModel().generation_seed.value(), 4242u);
+        EXPECT_EQ(qwen2::qwen2ParityModel("Qwen2_Q8_0", "other.gguf", "reference").generation_seed.value(), 4242u);
+        // Larger hybrid families retain their existing independently acquired
+        // workload; a small-model EOS must not silently invalidate that corpus.
+        EXPECT_EQ(qwen35::qwen35_08B_Q40ParityModel().generation_prompt, ModelParityGenerationPrompt{});
+        EXPECT_EQ(qwen36::qwen36MoE35BIQ3SParityModel("reference").generation_prompt, ModelParityGenerationPrompt{});
+        EXPECT_EQ(qwen38::qwen38DenseParityDefinition(makeSingleDeviceTopology(), "reference").model.generation_prompt,
+                  ModelParityGenerationPrompt{});
+    }
+
+    TEST(ModelParityDefinition, ModelOwnedGenerationSeedIsValidatedAndSharedByEveryCell)
+    {
+        EXPECT_EQ(ModelParityGenerationSeed{}.value(), 4242u);
+        EXPECT_THROW((ModelParityGenerationSeed{0}), std::invalid_argument);
+        EXPECT_THROW((ModelParityGenerationSeed{-1}), std::invalid_argument);
+        EXPECT_THROW((ModelParityGenerationSeed{std::int64_t{1} << 32}), std::invalid_argument);
+        for (const auto seed : std::array<std::int64_t, 3>{17, 42, std::numeric_limits<std::uint32_t>::max()})
+        for (auto topology : {makeSingleDeviceTopology(), makeOverlayTopology()})
+        {
+            auto definition = makeDefinition(std::move(topology), kModelParityRequiredMaximumMTPDepth);
+            definition.features.mtp = ModelParityAxisProfile::Standard;
+            definition.model.generation_seed = ModelParityGenerationSeed{seed};
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                SCOPED_TRACE(cell.testName());
+                EXPECT_EQ(cell.model.generation_seed, definition.model.generation_seed);
+                std::ostringstream output;
+                PrintTo(cell, &output);
+                const auto requests = nlohmann::json::parse(output.str())["runtime"]["generation"]["requests"];
+                ASSERT_EQ(requests.size(), 4u);
+                for (const auto &request : requests)
+                {
+                    EXPECT_EQ(request["body"]["seed"], seed);
+                    EXPECT_EQ(request["body"]["temperature"], 0.7);
+                    EXPECT_EQ(request["body"]["top_k"], 40);
+                    EXPECT_EQ(request["body"]["top_p"], 0.9);
+                }
+                EXPECT_EQ(requests[0]["body"], requests[1]["body"]);
+                EXPECT_EQ(requests[2]["body"], requests[3]["body"]);
+            }
+        }
+    }
+
+    TEST(ModelParityDefinition, ContinuousGenerationHorizonIsSharedByEveryMTPPolicyAndSerialControl)
+    {
+        for (auto definition : std::vector<ModelParityDefinition>{
+                 qwen38::qwen38DenseParityDefinition(makeSingleDeviceTopology(), "/reference"),
+                 qwen36::qwen36MoECPU2NodeTPParityDefinition(),
+                 qwen36::qwen36MoEParityDefinition(qwen36::qwen36MoERocm2ExpertOverlayTopology(), "/reference", {})})
+        {
+            // A longer model-specific workload is inherited by Off and all
+            // speculative policies equally, without multiplying the matrix.
+            definition.generation_workload = ModelParityGenerationWorkload(1024, 768);
+            std::set<ModelParityMTP> policies;
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                SCOPED_TRACE(cell.testName());
+                policies.insert(cell.mtp);
+                EXPECT_EQ(cell.generation_workload, definition.generation_workload);
+                std::ostringstream output;
+                PrintTo(cell, &output);
+                const auto exported = nlohmann::json::parse(output.str());
+                EXPECT_EQ(exported.at("runtime").at("generation").at("max_tokens"), 1024);
+                EXPECT_EQ(exported.at("runtime").at("generation").at("minimum_completion_tokens"), 768);
+            }
+            EXPECT_EQ(policies, (std::set<ModelParityMTP>{ModelParityMTP::Off,
+                ModelParityMTP::Depth1, ModelParityMTP::Depth2, ModelParityMTP::Depth3,
+                ModelParityMTP::Depth15, ModelParityMTP::DynamicDepth}));
+        }
+    }
+
+    TEST(ModelParityDefinition, ContinuousGenerationHorizonRejectsShortOrImpossibleEvidence)
+    {
+        for (const int minimum : {-1, 0, 1, 200, 383})
+            EXPECT_THROW(ModelParityGenerationWorkload(384, minimum), std::invalid_argument);
+        for (const int maximum : {-1, 0, 200, 383, 767})
+            EXPECT_THROW(ModelParityGenerationWorkload(maximum, 768), std::invalid_argument);
+        EXPECT_NO_THROW(ModelParityGenerationWorkload(384, 384));
+        EXPECT_NO_THROW(ModelParityGenerationWorkload(1024, 768));
+        EXPECT_THROW(ModelParityGenerationWorkload{}.withReadiness(0), std::invalid_argument);
+        EXPECT_THROW(ModelParityGenerationWorkload{}.withReadiness(601), std::invalid_argument);
+        EXPECT_EQ(ModelParityGenerationWorkload{}.withReadiness(180).minimumTokens(), 384);
+    }
+
+    TEST(ModelParityDefinition, ContinuousHorizonIncludesModelsWithoutAnMTPLane)
+    {
+        for (const auto device : {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+        {
+            auto topology = makeSingleDeviceTopology();
+            topology.participants.front().address = device;
+            for (const int capacity : {0, kModelParityRequiredMaximumMTPDepth})
+            {
+                auto definition = makeDefinition(topology, capacity);
+                definition.features.mtp = capacity ? ModelParityAxisProfile::Standard : ModelParityAxisProfile::Disabled;
+                for (const auto &cell : expandModelParityDefinition(definition))
+                {
+                    SCOPED_TRACE(cell.testName());
+                    std::ostringstream output;
+                    PrintTo(cell, &output);
+                    const auto profile = nlohmann::json::parse(output.str())["runtime"]["generation"];
+                    EXPECT_EQ(profile["minimum_completion_tokens"], 384);
+                    EXPECT_EQ(profile["max_tokens"], 384);
+                }
+            }
+        }
     }
 
     TEST(ModelParityDefinition, OrnithCertificationInheritsTopologyButNotReferenceIdentity)
@@ -1805,9 +2331,9 @@ namespace llaminar2::test::parity
                 ASSERT_EQ(before[j].e2e_certification.has_value(), after[j].e2e_certification.has_value());
                 if (!after[j].e2e_certification) continue;
                 ++added_tags;
-                auto expected = modelParityE2EServerArguments(before[j]);
+                auto expected = modelParityServerArguments(before[j]);
                 std::replace(expected.begin(), expected.end(), source->model.model_path, variant.model.model_path);
-                EXPECT_EQ(expected, modelParityE2EServerArguments(after[j]));
+                EXPECT_EQ(expected, modelParityServerArguments(after[j]));
                 EXPECT_EQ(after[j].e2e_certification->readiness_timeout_seconds,
                           before[j].e2e_certification->readiness_timeout_seconds);
                 EXPECT_EQ(after[j].e2e_certification->thinking_modes,

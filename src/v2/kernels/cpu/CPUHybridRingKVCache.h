@@ -785,7 +785,7 @@ namespace llaminar2
     using CPUHybridRingKVCacheFP32 = CPUHybridRingKVCache<ActivationPrecision::FP32>;
     using CPUHybridRingKVCacheBF16 = CPUHybridRingKVCache<ActivationPrecision::BF16>;
     using CPUHybridRingKVCacheFP16 = CPUHybridRingKVCache<ActivationPrecision::FP16>;
-    using CPUHybridRingKVCacheQ8_1 = CPUHybridRingKVCache<ActivationPrecision::Q8_1>;
+    using CPUHybridRingKVCacheQ8_1 = CPUHybridRingKVCache<ActivationPrecision::AQ8, ActivationPrecision::Q8_1>;
     using CPUHybridRingKVCacheQ16_1 = CPUHybridRingKVCache<ActivationPrecision::Q16_1>;
     using CPUHybridRingKVCacheTQ4 = CPUHybridRingKVCache<ActivationPrecision::TQ4>;
     using CPUHybridRingKVCacheTQ8 = CPUHybridRingKVCache<ActivationPrecision::TQ8>;

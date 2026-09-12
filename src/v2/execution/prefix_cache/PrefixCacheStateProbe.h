@@ -23,6 +23,24 @@
 namespace llaminar2
 {
     class IKVCache;
+    struct PrefixRuntimeStateSnapshot;
+
+    /**
+     * @brief One cache-owned copied/recomputed boundary for diagnostic capture.
+     *
+     * The immutable seed supplies this length. Main and shifted-MTP caches may
+     * have different lengths, even on the same device and logical request.
+     * Owner/device/layer/sequence identity prevents a sibling cache's boundary
+     * from silently selecting the bytes to certify.
+     */
+    struct PrefixKVProbePartition
+    {
+        std::string owner;
+        DeviceId device = DeviceId::cpu();
+        int global_layer = 0;
+        int seq_idx = 0;
+        int copied_tokens = 0;
+    };
 
     /**
      * @brief Hash of one requested logical KV token range.
@@ -132,6 +150,21 @@ namespace llaminar2
      */
     struct PrefixProbeCapturePolicy
     {
+        /** Seed-authenticated per-cache boundaries; empty means ordinary probing. */
+        std::vector<PrefixKVProbePartition> kv_continuation_partitions;
+
+        /**
+         * @brief Derive exact prefix hashes and bounded suffix capture from a seed.
+         * @param seed Initialized immutable cache state before continuation.
+         * @return This policy with one validated partition per seed cache layer.
+         * @throws std::invalid_argument for invalid or ambiguous seed geometry.
+         *
+         * Only recomputed rows retain payload bytes. Copied rows keep a digest;
+         * this replaces global numeric split guesses for both KV families.
+         */
+        PrefixProbeCapturePolicy forKVContinuationOf(
+            const PrefixRuntimeStateSnapshot &seed) const;
+
         /// Hash every logical K/V token currently retained by each FA layer.
         bool hash_full_kv_payloads = false;
 
@@ -147,10 +180,9 @@ namespace llaminar2
         /**
          * @brief Retain canonical bytes for explicitly requested KV segments.
          *
-         * This never retains a full cache implicitly: only entries named in
-         * @ref requested_kv_segments receive payload vectors.  It is intended
-         * for bounded parity boundaries such as the single suffix row
-         * recomputed after a partial prefix hit.
+         * Only explicitly named ranges or seed-derived continuation suffixes
+         * retain payload vectors. Copied prefix rows keep hashes only. Shifted
+         * MTP may recompute more rows than the main cache and retains all of them.
          */
         bool capture_requested_kv_segment_payloads = false;
 

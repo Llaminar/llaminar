@@ -1,6 +1,10 @@
 /**
  * @file KVCacheAppendStage.h
- * @brief Explicit KV cache append stage
+ * @brief Explicit publication of projection rows into native KV cache storage.
+ *
+ * Append semantics and producer ordering are graph-owned. Native CPU Q16 uses
+ * independent physical-block scales; compressed anchored caches own their
+ * request basis and encoding. Neither may depend on the grouping of rows.
  */
 
 #pragma once
@@ -52,13 +56,11 @@ namespace llaminar2
      * - Explicit control: Manual cache management for advanced use cases
      * - Cross-device caches: Cache on GPU while computing on CPU
      *
-     * VNNI-Safe Quantization (Q16_1 cache):
-     * When the cache is Q16_1, this stage uses FIXED-SCALE quantization with
-     * VNNI-safe clipping to prevent INT32 overflow during attention computation.
-     * Set kv_cache_scale and head_dim to enable proper clipping limits.
-     *
-     * See: kernels/cpu/attention/q16_1/VNNISafetyConstants.h for clipping limits
-     * See: docs/v2/projects/2025-12/PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
+     * Native Q16 cache publication preserves a separate scale in every physical
+     * block and keeps native input bytes unchanged. CPU attention bounds its
+     * ephemeral query codes through CPUQ16AttentionMath rather than clipping
+     * persistent keys/values to a model-wide range. Serial, grouped and batched
+     * appends therefore use the same encoding and prefix-restorable bytes.
      */
     class KVCacheAppendStage : public IComputeStage
     {

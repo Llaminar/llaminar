@@ -12,12 +12,14 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "DeviceMoERebalanceLoadSpreadProof.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
 #include <vector>
+#include <variant>
 
 namespace llaminar2
 {
@@ -26,7 +28,7 @@ namespace llaminar2
     {
         None,   ///< No ExpertOverlay execution authority exists.
         Host,   ///< A host-owned multi-tier or heterogeneous authority is live.
-        Device, ///< A homogeneous all-GPU device authority is live.
+        Device, ///< An all-GPU device authority is live, including mixed vendors.
     };
 
     /** Explicit lifecycle state of adaptive ExpertOverlay movement. */
@@ -63,6 +65,7 @@ namespace llaminar2
         PublishingResidency, ///< A prepared placement is becoming selectable.
         Draining, ///< New work is closed while admitted work is reaped.
         Failed,   ///< The activity owner failed terminally.
+        DeviceOwned, ///< Activity is GPU-resident; terminal receipts do not imply live quiescence.
     };
 
     /**
@@ -176,37 +179,21 @@ namespace llaminar2
         }
     };
 
-    /**
-     * @brief Immutable economic proof for one committed movement transaction.
-     *
-     * Only the policy authority publishes this record. Distributed execution
-     * followers retain the same movement edges but do not manufacture local
-     * service economics. This distinction makes a single coordinator-owned
-     * proof available even when PerfStats is disabled on every rank.
-     */
-    struct MoEOptimizationMovementEconomy
+    /** @brief Exact nanosecond equation sealed by a time-based placement policy. */
+    struct MoEOptimizationTimeEconomy
     {
-        MoEOptimizationAuthority authority =
-            MoEOptimizationAuthority::None;
-        std::uint64_t transaction = 0u;
-        std::uint64_t candidate_epoch = 0u;
-        std::uint64_t command_count = 0u;
-        std::uint64_t cycle_count = 0u;
         std::uint64_t projected_service_gain_ns = 0u;
         std::uint64_t projected_transfer_and_repack_ns = 0u;
         std::uint64_t projected_inference_interference_ns = 0u;
         std::uint64_t projected_net_benefit_ns = 0u;
 
         /** @brief Compare the complete authoritative economy identity. */
-        bool operator==(const MoEOptimizationMovementEconomy &) const = default;
+        bool operator==(const MoEOptimizationTimeEconomy &) const = default;
 
         /** @return Whether identity and exact net-benefit arithmetic agree. */
         [[nodiscard]] bool valid() const noexcept
         {
-            if (authority == MoEOptimizationAuthority::None ||
-                transaction == 0u || candidate_epoch == 0u ||
-                command_count == 0u || cycle_count == 0u ||
-                projected_service_gain_ns == 0u ||
+            if (projected_service_gain_ns == 0u ||
                 projected_net_benefit_ns == 0u ||
                 projected_transfer_and_repack_ns >
                     std::numeric_limits<std::uint64_t>::max() -
@@ -220,6 +207,46 @@ namespace llaminar2
             return projected_service_gain_ns > projected_cost_ns &&
                    projected_net_benefit_ns ==
                        projected_service_gain_ns - projected_cost_ns;
+        }
+    };
+
+    /**
+     * @brief Immutable economic proof for one committed movement transaction.
+     *
+     * The variant preserves the admitting policy's units. Native homogeneous
+     * GPU decisions retain routed-load equations; time-based host/mixed-vendor
+     * policies retain their nanosecond estimates. Neither can stand in for the
+     * other. Followers may mirror the sealed proof but cannot manufacture it.
+     */
+    struct MoEOptimizationMovementEconomy
+    {
+        MoEOptimizationAuthority authority = MoEOptimizationAuthority::None;
+        std::uint64_t transaction = 0u;
+        std::uint64_t candidate_epoch = 0u;
+        std::uint64_t command_count = 0u;
+        std::uint64_t cycle_count = 0u;
+        std::variant<MoEOptimizationTimeEconomy, DeviceMoERebalanceLoadSpreadProof> proof;
+
+        /** @brief Compare identity and the complete unit-qualified proof. */
+        bool operator==(const MoEOptimizationMovementEconomy &) const = default;
+
+        /** @return Whether identity and the actual admitting equation agree. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            if ((authority != MoEOptimizationAuthority::Host &&
+                 authority != MoEOptimizationAuthority::Device) || transaction == 0u ||
+                candidate_epoch == 0u || command_count == 0u || cycle_count == 0u)
+                return false;
+            if (const auto *load = std::get_if<DeviceMoERebalanceLoadSpreadProof>(&proof))
+            {
+                // Native ownership swaps are two-edge cycles. A host policy
+                // cannot acquire a cheaper evidence contract by changing units.
+                return authority == MoEOptimizationAuthority::Device && load->valid() &&
+                    cycle_count == load->ownership_swap_accepts &&
+                    cycle_count <= std::numeric_limits<std::uint64_t>::max() / 2u &&
+                    command_count == cycle_count * 2u;
+            }
+            return std::get<MoEOptimizationTimeEconomy>(proof).valid();
         }
     };
 
@@ -410,11 +437,22 @@ namespace llaminar2
         }
     };
 
+    /** Input whose next completed window can admit a placement transaction. */
+    enum class MoEOptimizationDemandScope : std::uint8_t
+    {
+        RoutedRows, ///< Host-owned RCU histogram combines real routed rows.
+        PrefillCadence, ///< Device scheduler's retired-prefill submission window.
+        DecodeCadence, ///< Device scheduler's retired-decode submission window.
+    };
+
     /**
-     * @brief Passive occupancy of the authority's active routing-demand window.
+     * @brief Passive headroom before the authority may admit another decision.
      *
-     * This value describes the exact RCU histogram bank accepting new routed
-     * rows. It is not a reservation: a caller may use it to admit an immutable
+     * Host policy projects its RCU histogram bank. Device policy projects the
+     * more occupied of its independent prefill/decode submission windows; the
+     * scope names which real traffic can close that window. Cadence is not a
+     * host copy of GPU histograms and cannot prove routing or profitable moves.
+     * This is not a reservation: a caller may use it to admit an immutable
      * measurement cohort only while that caller owns exclusive inference
      * admission. Keeping the capacity beside the count prevents callers from
      * copying a controller window constant or inferring lifecycle state from
@@ -422,14 +460,21 @@ namespace llaminar2
      */
     struct MoEOptimizationDemandWindow
     {
-        std::uint64_t generation = 0u; ///< Active RCU histogram generation.
-        std::uint64_t collected_routed_rows = 0u; ///< Rows already admitted.
+        std::uint64_t generation = 0u; ///< Histogram rotation or cadence consumption.
+        std::uint64_t collected_routed_rows = 0u; ///< Occupancy in the named scope.
         std::uint64_t capacity_routed_rows = 0u; ///< Decision threshold.
+        MoEOptimizationDemandScope scope =
+            MoEOptimizationDemandScope::RoutedRows;
+        /** Selected phase's retired rows awaiting next-command delivery. */
+        std::uint64_t pending_submission_rows = 0u;
 
         /** @return Whether the authority published a usable window geometry. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
-            return capacity_routed_rows > 0u;
+            return capacity_routed_rows > 0u &&
+                   (scope == MoEOptimizationDemandScope::RoutedRows ||
+                    scope == MoEOptimizationDemandScope::PrefillCadence ||
+                    scope == MoEOptimizationDemandScope::DecodeCadence);
         }
 
         /**
@@ -572,7 +617,7 @@ namespace llaminar2
         std::uint64_t published_movement_waves = 0u;
         /** Cumulative completed physical movement from the owning authority. */
         MoEOptimizationMovementTotals completed_movement;
-        /** Active authority-owned demand window, when host policy owns one. */
+        /** Passive headroom from the actual histogram/submission owner. */
         MoEOptimizationDemandWindow demand_window;
         /**
          * Latest externally published maintenance-progress generation.

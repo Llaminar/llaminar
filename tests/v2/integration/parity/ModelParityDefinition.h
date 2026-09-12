@@ -16,6 +16,7 @@
 #pragma once
 
 #include "ParityTestBase.h"
+#include "ModelParityGenerationWorkload.h"
 
 #include "backends/GlobalDeviceAddress.h"
 #include "config/ActivationPrecisionPolicy.h"
@@ -328,6 +329,15 @@ namespace llaminar2::test::parity
     };
 
     /**
+     * @brief Main-model state that a prefix hit must restore, independent of MTP.
+     *
+     * Hybrid models require recurrent/convolution state as well as attention KV.
+     * Unspecified is deliberately inadmissible: a new model must declare its
+     * restore contract, rather than silently inheriting the weaker KV-only one.
+     */
+    enum class ModelParityPrefixState { Unspecified, AttentionKV, HybridRecurrent };
+
+    /**
      * @brief Immutable real-model and authenticated reference identity.
      *
      * `reference_directory` contains the CPU/PyTorch-Hugging Face checkpoint
@@ -376,6 +386,12 @@ namespace llaminar2::test::parity
          * because the Hugging Face oracle can expose it.
          */
         std::vector<std::string> mtp_checkpoint_surface;
+        /** Model-owned restore obligation; never inferred from a response or filename. */
+        ModelParityPrefixState prefix_state = ModelParityPrefixState::Unspecified;
+        /** Long-form message bytes inherited by every topology and MTP control. */
+        ModelParityGenerationPrompt generation_prompt{};
+        /** One positive sampled workload identity shared by all cells for this model. */
+        ModelParityGenerationSeed generation_seed{};
     };
 
     /**
@@ -584,6 +600,8 @@ namespace llaminar2::test::parity
             collective_evidence_source;
         std::string tp_allreduce_precision_override;
         std::vector<ModelParityE2ESelection> e2e_certifiable;
+        /** One continuous regression workload shared by all policies and controls. */
+        ModelParityGenerationWorkload generation_workload;
     };
 
     /** Placement and durable movement axes present only on ExpertOverlay. */
@@ -664,6 +682,8 @@ namespace llaminar2::test::parity
 
         /** Eligibility is not a certificate: the HTTP runner must prove it. */
         std::optional<ModelParityE2EProfile> e2e_certification;
+        /** Actual-output obligation, independent of the short deep-parity prompts. */
+        ModelParityGenerationWorkload generation_workload;
 
         /** @return Whether this cell executes an MTP generation policy. */
         [[nodiscard]] constexpr bool mtpEnabled() const noexcept
@@ -1453,6 +1473,15 @@ namespace llaminar2::test::parity
             throw std::invalid_argument(
                 "model parity requires non-empty model id, GGUF path, and reference directory");
         }
+        switch (model.prefix_state)
+        {
+        case ModelParityPrefixState::AttentionKV:
+        case ModelParityPrefixState::HybridRecurrent:
+            break;
+        default:
+            throw std::invalid_argument(
+                "model parity requires an explicit main-model prefix-state contract");
+        }
         if (!is_test_identifier(model.test_id) ||
             !is_test_identifier(topology.test_id))
         {
@@ -2023,6 +2052,7 @@ namespace llaminar2::test::parity
                                     definition.collective_evidence_source,
                                 .tp_allreduce_precision_override =
                                     definition.tp_allreduce_precision_override,
+                                .generation_workload = definition.generation_workload,
                             };
                             if (!names.insert(test_case.testName()).second)
                             {
@@ -2075,4 +2105,4 @@ namespace llaminar2::test::parity
 
 // Kept separate so the matrix definition and its HTTP transport projection
 // have independently reviewable ownership boundaries.
-#include "ModelParityE2EExport.h"
+#include "ModelParityRuntimeExport.h"

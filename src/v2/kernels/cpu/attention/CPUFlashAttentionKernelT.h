@@ -62,6 +62,9 @@
 #include "../turboquant/TurboQuantContext.h"
 #include "CPUFlashAttentionLaunchPolicy.h"
 #include "TQFusedAttentionPrimitives.h"
+#include "CPUAttentionKeyQ8.h"
+#include "CPUQ16AttentionMath.h"
+#include "../../../tensors/AttentionKeyQ8Tensor.h"
 
 #include <algorithm>
 #include <chrono>
@@ -938,11 +941,17 @@ namespace llaminar2
 #endif
 
             // ---------------------------------------------------------------
+            // AQ8 request-relative keys use the same fixed-order FA2 scheduler.
             // Q8_1 native K/V path: inline int8-to-float dequantization for
             // decode, grouped verification, and prefill. No FP32 shadow cache
             // is materialized for any query-row count.
             // ---------------------------------------------------------------
 #if defined(__AVX512F__) || defined(__AVX2__)
+            if (K->native_type() == TensorType::AQ8 && batch_size == 1)
+                return compute_aq8kv(Q_base->fp32_data(), dynamic_cast<const AttentionKeyQ8Tensor *>(K),
+                    V, O_base->mutable_data(), seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                    causal, window_size, std::max(0, kv_len - seq_len), head_start, gqa_n_rep,
+                    execution_policy, kv_logical_view);
             if (K->native_type() == TensorType::Q8_1 &&
                 V->native_type() == TensorType::Q8_1 &&
                 batch_size == 1)
@@ -1238,6 +1247,17 @@ namespace llaminar2
                     });
             }
 #if defined(__AVX512F__) || defined(__AVX2__)
+            else if (key_type == TensorType::AQ8)
+            {
+                success = run_requests([&](int request, const float *query, float *result,
+                    int kv_len, const attention::AttentionKVLogicalView &view)
+                {
+                    return compute_aq8kv(query, dynamic_cast<const AttentionKeyQ8Tensor *>(K_by_request[request]),
+                        V_by_request[request], result, query_rows, kv_len, n_heads, n_kv_heads, head_dim,
+                        causal, window_size, std::max(0, kv_len - query_rows), head_start, gqa_n_rep,
+                        execution_policy, view);
+                });
+            }
             else if (key_type == TensorType::Q8_1 &&
                      value_type == TensorType::Q8_1)
             {
@@ -5216,8 +5236,11 @@ namespace llaminar2
             const int attn_threads = computeOptimalAttentionThreads(
                 n_heads, seq_len, kv_len, head_dim, causal);
 
-            // For VNNI QK: Q is quantized per-head to int16
-            constexpr int QMAX = 2047;
+            // Native K uses the full int16 range. Bound the complete block dot
+            // product, not merely a SIMD lane: horizontal sums must fit too.
+            // The same bound feeds scalar, AVX2 and AVX512 grouped/serial paths.
+            const int QMAX = cpu::q16AttentionQueryLimit(
+                std::min(head_dim, static_cast<int>(block_elems)));
 
             const cpu::fa2_policy::CPUFA2ParallelPlan partition_plan =
                 cpu::fa2_policy::selectCPUFA2ParallelPlan({
@@ -6855,6 +6878,7 @@ namespace llaminar2
                 accumulate_tile,
                 finalize_row);
         }
+#include "CPUFlashAttentionAQ8.inl"
 #endif // __AVX512F__ || __AVX2__ (TQ fused)
 
         /**

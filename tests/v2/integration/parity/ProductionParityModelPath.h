@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -55,8 +56,10 @@ namespace llaminar2::test::parity
      *
      * The aggregate campaign stages every selected model before any inference
      * process starts. A test may use either the repository `models` symlink or
-     * the canonical source path, so membership is checked by canonical source
-     * identity while the collision-checked basename selects the staged file.
+     * the canonical source path, or another bind mount of that same file.
+     * Membership is checked by filesystem identity, not path spelling; the
+     * matched manifest entry's collision-checked basename selects the staged
+     * file. This uses metadata only, never a content read or GGUF hash.
      * A focused invocation outside the process-campaign lifecycle has no
      * staging contract and retains its configured path unchanged.
      *
@@ -114,7 +117,7 @@ namespace llaminar2::test::parity
                 configured_path + "': " + error.message());
         }
 
-        bool declared = false;
+        std::optional<std::filesystem::path> staged;
         std::istringstream manifest(raw_manifest);
         std::string entry;
         while (std::getline(manifest, entry, '|'))
@@ -123,30 +126,37 @@ namespace llaminar2::test::parity
                 continue;
             error.clear();
             const auto candidate = std::filesystem::canonical(entry, error);
-            if (!error &&
-                (candidate == configured ||
-                 (configured.parent_path() == ramdisk &&
-                  candidate.filename() == configured.filename())))
+            if (error)
+                continue;
+
+            // canonical() resolves symlinks, but separate Docker bind mounts
+            // retain different canonical strings for the same device/inode.
+            // Equal filenames, sizes, or contents are deliberately insufficient.
+            const bool same_source = candidate == configured ||
+                std::filesystem::equivalent(candidate, configured, error);
+            const bool already_staged =
+                configured.parent_path() == ramdisk &&
+                candidate.filename() == configured.filename();
+            if ((!error && same_source) || already_staged)
             {
-                declared = true;
+                staged = ramdisk / candidate.filename();
                 break;
             }
         }
-        if (!declared)
+        if (!staged)
         {
             throw std::runtime_error(
                 "production parity configured an undeclared GGUF: " +
                 configured_path);
         }
 
-        const auto staged = ramdisk / configured.filename();
         error.clear();
-        if (!std::filesystem::is_regular_file(staged, error) || error)
+        if (!std::filesystem::is_regular_file(*staged, error) || error)
         {
             throw std::runtime_error(
                 "declared production GGUF was not staged in RAM: " +
-                staged.string());
+                staged->string());
         }
-        return staged.string();
+        return staged->string();
     }
 }

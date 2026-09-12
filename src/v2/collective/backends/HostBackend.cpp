@@ -790,14 +790,7 @@ namespace llaminar2
         return true;
     }
 
-    bool HostBackend::copyAsync(
-        void *dst_ptr, DeviceId dst_device,
-        const void *src_ptr, DeviceId src_device,
-        size_t bytes, void *stream)
-    {
-        (void)stream; // No streams on CPU
-        return copy(dst_ptr, dst_device, src_ptr, src_device, bytes);
-    }
+
 
     bool HostBackend::supportsCopy(DeviceId src_device, DeviceId dst_device) const
     {

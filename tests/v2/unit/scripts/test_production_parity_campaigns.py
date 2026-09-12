@@ -32,6 +32,55 @@ sys.modules[SPEC.name] = campaigns
 SPEC.loader.exec_module(campaigns)
 
 
+class EmptyGTestGateTests(unittest.TestCase):
+    """Execute CTest's real registration policy without loading any device."""
+
+    def test_stale_filter_cannot_report_a_green_gate(self) -> None:
+        """Brief, ordinary and colorized empty GTest runs fail despite exit 0."""
+        source = (REPO_ROOT / "tests/v2/CMakeLists.txt").read_text(encoding="utf-8")
+        begin = source.index("function(add_v2_test TEST_NAME)")
+        end = source.index("endfunction()", begin) + len("endfunction()")
+        # Exercise the installed registration function, not a copied regex.
+        with tempfile.TemporaryDirectory(prefix="llaminar-empty-gtest-") as directory:
+            root = Path(directory)
+            printer = root / "gtest_summary.py"
+            summaries = [
+                "[==========] Running 0 tests from 0 test suites.",
+                "[==========] 0 tests from 0 test suites ran. (0 ms total)",
+                "\x1b[0;32m[==========] \x1b[m0 tests from 0 test suites ran.",
+                "[==========] 1 test from 1 test suite ran. (0 ms total)",
+            ]
+            printer.write_text(
+                f"import sys\nsummaries = {summaries!r}\nprint(summaries[int(sys.argv[1])])\n",
+                encoding="utf-8",
+            )
+            registrations = []
+            for index, summary in enumerate(summaries):
+                registrations.append(
+                    f'add_v2_test(V2_Unit_Summary{index} COMMAND "{sys.executable}" '
+                    f'"{printer}" {index} LABELS "V2;Unit" NO_MPI NO_MODELS)'
+                )
+            (root / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(EmptyGTestGate NONE)\n"
+                "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
+                + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+            )
+            configured = subprocess.run(
+                ["cmake", "-S", str(root), "-B", str(root / "build")],
+                text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            for index in range(len(summaries)):
+                with self.subTest(summary=index):
+                    observed = subprocess.run(
+                        ["ctest", "--test-dir", str(root / "build"), "--output-on-failure",
+                         "-R", f"^V2_Unit_Summary{index}$"],
+                        text=True, capture_output=True, timeout=10,
+                    )
+                    self.assertEqual(observed.returncode, 0 if index == 3 else 8,
+                                     observed.stdout + observed.stderr)
+
+
 def ctest_document(*names: str) -> str:
     """Build the minimal CTest JSON shape used by discovery."""
 
@@ -171,6 +220,21 @@ class ProductionParityCampaignTest(unittest.TestCase):
             ],
         )
 
+    def test_prefix_restore_schema_names_the_actual_seed_authority(self) -> None:
+        """The cached seed epoch is distinct from the old serial oracle epoch."""
+        header = campaigns.REQUIRED_CSV_HEADERS["prefix_restore.csv"]
+        columns = next(campaigns.csv.reader([header]))
+        self.assertEqual(columns[-9], "cached_prefix_moe_movement_epoch")
+        self.assertEqual(columns[-8:], [
+            "shifted_mtp_kv_numerically_compared", "shifted_mtp_kv_exact_prefix_segments",
+            "shifted_mtp_kv_numerical_suffix_payloads", "shifted_mtp_kv_numerical_elements",
+            "shifted_mtp_kv_minimum_cosine", "shifted_mtp_kv_maximum_relative_l2",
+            "shifted_mtp_kv_maximum_abs", "shifted_mtp_kv_numerically_passed",
+        ])
+        self.assertIn("oracle_moe_movement_epoch", columns)
+        self.assertIn("observed_moe_movement_epoch", columns)
+        self.assertEqual(columns.count("cached_prefix_moe_movement_epoch"), 1)
+
     @mock.patch.object(campaigns.subprocess, "run")
     def test_complete_unit_inventory_is_discovered_from_ctest(
         self,
@@ -305,6 +369,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         unit_command = run_process.call_args_list[1].args[0]
         command = run_process.call_args_list[2].args[0]
         self.assertIn(campaigns.PRODUCTION_PARITY_UNIT_BUILD_TARGET, build_command)
+        self.assertIn("v2_production_parity_preflight_gate", build_command)
         self.assertIn("--parallel", unit_command)
         self.assertIn("--no-tests=error", unit_command)
         self.assertIn(f"^{campaigns.PRODUCTION_PARITY_UNIT_PREFIX}", unit_command)
@@ -400,15 +465,68 @@ class ProductionParityCampaignTest(unittest.TestCase):
             discover_units.assert_called_once_with(build.resolve())
             discover.assert_called_once_with(build.resolve())
 
+            # The same prerequisite authority admits generation reports even
+            # when the later model cell failed. Model status is not gate status.
+            generation = {
+                "schema": 1, "mode": "collect-controls", "certification_eligible": False,
+                "passed": False, "preflight_return_code": 0, "preflight_test_count": 2,
+                "preflight_tests": list(tests), "preflight_build_directory": str(build.resolve()),
+                "preflight_completed_ns": 2_000_000_000,
+            }
+            for mode in ("collect-controls", "compare-controls", "model-free-prerequisites"):
+                receipt = {**generation, "mode": mode}
+                report.write_text(json.dumps(receipt))
+                os.utime(report, ns=(4_000_000_000, 4_000_000_000))
+                self.assertEqual(campaigns.reuse_unchanged_production_parity_preflight(build, report), (0, 0.0, tests))
+                for mutation in ({"preflight_completed_ns": None}, {"preflight_completed_ns": 5_000_000_000},
+                                 {"preflight_build_directory": str(root)}, {"preflight_test_count": 1},
+                                 {"preflight_tests": list(reversed(tests))},
+                                 {"preflight_return_code": 1}, {"mode": "unknown"}):
+                    report.write_text(json.dumps({**receipt, **mutation}))
+                    os.utime(report, ns=(4_000_000_000, 4_000_000_000))
+                    with self.subTest(mode=mode, mutation=mutation), self.assertRaises(ValueError):
+                        campaigns.reuse_unchanged_production_parity_preflight(build, report)
+            # A later model-progress report cannot hide a rebuild after the
+            # actual gate, even though it is newer than the Ninja boundary.
             os.utime(
                 boundaries[0],
                 ns=(3_000_000_000, 3_000_000_000),
             )
-            with self.assertRaisesRegex(ValueError, "build or CTest"):
-                campaigns.reuse_unchanged_production_parity_preflight(
-                    build,
-                    report,
-                )
+            for mode in ("collect-controls", "compare-controls", "model-free-prerequisites"):
+                report.write_text(json.dumps({**generation, "mode": mode}))
+                os.utime(report, ns=(4_000_000_000, 4_000_000_000))
+                with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "build or CTest"):
+                    campaigns.reuse_unchanged_production_parity_preflight(build, report)
+
+    def test_standalone_gate_publishes_its_actual_result_without_a_model_run(self) -> None:
+        """Every exit publishes its own result; a later failure cannot retain green."""
+        tests = ("V2_Unit_Example", "V2_Integration_Example")
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            for outcomes in ((0, 0, 0), (1,), (0, 2), (0, 0, 3)):
+                with self.subTest(outcomes=outcomes), mock.patch.object(
+                    campaigns, "discover_production_parity_unit_tests", return_value=tests[:1]
+                ), mock.patch.object(
+                    campaigns, "discover_production_parity_preflight_tests", return_value=tests[1:]
+                ), mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as run, mock.patch.object(
+                    campaigns.time, "time_ns", return_value=123456789
+                ):
+                    code, elapsed, inventory = campaigns.run_production_parity_preflight(
+                        directory, None, artifact_directory=directory / "gate"
+                    )
+                    report = json.loads((directory / "gate/prerequisites.json").read_text())
+                    self.assertEqual(report["mode"], "model-free-prerequisites")
+                    self.assertEqual(report["preflight_return_code"], outcomes[-1])
+                    self.assertEqual(report["preflight_return_code"], code)
+                    self.assertEqual(report["preflight_completed_ns"], 123456789)
+                    self.assertEqual(report["preflight_build_directory"], str(directory.resolve()))
+                    self.assertEqual(report["preflight_elapsed_seconds"], elapsed)
+                    self.assertEqual(report["preflight_tests"], list(inventory))
+                    self.assertEqual(report["preflight_test_count"], len(tests))
+                    self.assertIs(report["certification_eligible"], False)
+                    for command in run.call_args_list[1:]:
+                        self.assertIn("--output-log", command.args[0])
+                        self.assertIn("--output-junit", command.args[0])
 
     def test_main_orders_preflight_before_model_fixture_and_staging(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -859,6 +977,18 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(reloaded.green_cases, frozenset((cases[0],)))
         self.assertFalse(reloaded.certification_eligible)
 
+        # A recovered per-test OK plus complete historical CSVs is scheduling
+        # evidence even if a later sibling failed/cancelled its aggregate. It
+        # must remain visibly historical and can never certify the new tree.
+        recovered = json.loads(json.dumps(campaigns.asdict(reloaded)))
+        recovered["entries"][0]["provenance"] = "prior_gtest_pass_and_complete_artifact_contract"
+        decoded = campaigns._decode_individual_green_ledger(recovered)
+        self.assertEqual(decoded.green_cases, reloaded.green_cases)
+        self.assertFalse(decoded.certification_eligible)
+        recovered["certification_eligible"] = True
+        with self.assertRaisesRegex(ValueError, "non-certifying"):
+            campaigns._decode_individual_green_ledger(recovered)
+
     def test_green_ledger_rejects_changed_registered_execution_contract(self) -> None:
         case = "MatrixSuite.ProductionParity/Ordinal_KVFP16_MTPOff"
         original = campaigns.CampaignCell(
@@ -1305,14 +1435,38 @@ time.sleep(30)
                 + "\n",
                 encoding="utf-8",
             )
+            (result_directory / "mtp_native_verifier_rows.csv").write_text(
+                campaigns.NATIVE_VERIFIER_ROWS_HEADER + "\n" + "".join(
+                    f"0,4,{stage},16,0,128,exact,0,0,0,0,1\n"
+                    for stage in ("EMBEDDING", "FINAL_NORM", "LM_HEAD")),
+                encoding="utf-8",
+            )
             count, _, errors = campaigns.validate_campaign_artifacts(
                 cell,
                 campaigns.time.time_ns(),
                 revision_results_root=root,
             )
 
-        self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) + 1)
+        self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) + 2)
         self.assertEqual(errors, ())
+
+    def test_native_verifier_artifacts_reject_close_or_incomplete_evidence(self) -> None:
+        header = campaigns.NATIVE_VERIFIER_ROWS_HEADER.split(",")
+        rows = [header] + [
+            f"0,4,{stage},16,0,128,exact,0,0,0,0,1".split(",")
+            for stage in ("EMBEDDING", "FINAL_NORM", "LM_HEAD")
+        ]
+        self.assertIsNone(campaigns.validate_native_verifier_rows(rows))
+        self.assertIsNotNone(campaigns.validate_native_verifier_rows(rows[:-1]))
+        self.assertIsNotNone(campaigns.validate_native_verifier_rows(rows + [rows[1]]))
+        for field, value in (("status", "byte_mismatch"), ("passed", "0"),
+                             ("max_abs_diff", "1e-7"), ("max_abs_diff", "nan"),
+                             ("physical_rows", "1"), ("row_elements", "0"),
+                             ("condition_position", "5"), ("row", "1")):
+            mutated = [list(row) for row in rows]
+            mutated[-1][header.index(field)] = value
+            with self.subTest(field=field, value=value):
+                self.assertIsNotNone(campaigns.validate_native_verifier_rows(mutated))
 
     @mock.patch.object(
         campaigns,
@@ -1331,7 +1485,8 @@ time.sleep(30)
             gtest_cases=("MatrixSuite.ProductionParity/CPU_KV_FP16",),
         )
 
-        result = campaigns.run_campaign(Path("build"), cell, 30.0)
+        result = campaigns.run_campaign(
+            Path("build"), cell, 30.0, artifact_results_root=Path("artifacts"))
 
         self.assertEqual(result.return_code, 126)
         self.assertEqual(result.outcome, "artifact_contract_failed")
@@ -1749,10 +1904,10 @@ time.sleep(30)
                 "#!/bin/sh\n"
                 "cat <<'EOF'\n"
                 "MatrixSuite.\n"
-                "  ProductionParity/CPU_KV_FP16\n"
-                "  ProductionParity/CPU_KV_Q8_1\n"
-                "  ProductionParity/CUDA_KV_FP16\n"
-                "  ProductionParity/CUDA_ROCm_CPU_KV_FP16\n"
+                '  ProductionParity/CPU_KV_FP16  # GetParam() = {"argv":["truncated...\n'
+                '  ProductionParity/CPU_KV_Q8_1  # GetParam() = {"argv":["a;b;c...\n'
+                '  ProductionParity/CUDA_KV_FP16  # GetParam() = [ [ ] unmatched...\n'
+                '  ProductionParity/CUDA_ROCm_CPU_KV_FP16  # GetParam() = ] ] \\ ; ...\n'
                 "  FocusedInfrastructure/CPU\n"
                 "EOF\n",
                 encoding="utf-8",
@@ -1897,6 +2052,23 @@ time.sleep(30)
         )
         self.assertIn("FocusedInfrastructure_CPU", registration)
         self.assertNotIn("ProductionParity_CPU_KV_FP16", registration)
+
+    def test_failed_or_empty_binary_discovery_is_fatal_not_an_empty_gate(self) -> None:
+        """A broken list operation cannot publish a successful smaller matrix."""
+        discovery = REPO_ROOT / "tests/v2/cmake/V2ParityTestDiscovery.cmake"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "v2_integration_parity_fake_matrix"
+            output = root / "discovered.cmake"
+            for script in ("exit 7", "exit 0"):
+                with self.subTest(script=script):
+                    binary.write_text("#!/bin/sh\n" + script + "\n")
+                    binary.chmod(0o755)
+                    result = subprocess.run(["cmake", f"-DTEST_EXECUTABLE={binary}",
+                        f"-DCTEST_FILE={output}", "-P", str(discovery)],
+                        capture_output=True, text=True, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
 
     def test_cmake_discovery_shards_campaigns_by_explicit_mpi_world(self) -> None:
         discovery = (
@@ -2270,6 +2442,32 @@ time.sleep(30)
                 campaigns._source_identity(source.stat()),
             )
             filesystem_type.assert_called_once_with(staging)
+
+    @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
+    def test_persistent_cache_reuses_same_inode_under_another_mount_spelling(self, _: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "host" / "model.gguf"
+            alias = root / "container" / "model.gguf"
+            source.parent.mkdir()
+            alias.parent.mkdir()
+            source.write_bytes(b"immutable model fixture")
+            # Create both names before admission: linking changes ctime, whereas
+            # an existing bind mount only changes the file's absolute spelling.
+            os.link(source, alias)
+            def selected(path):
+                return campaigns.CampaignCell("cell", campaigns.CampaignGroup("CPU", "ALL"),
+                                              model_files=(str(path),))
+            with mock.patch.object(campaigns, "_stage_one_model", wraps=campaigns._stage_one_model) as copy:
+                first, _ = campaigns.stage_models_in_ramdisk(
+                    [selected(source)], root / "cache/models", None, persistent=True)
+                second, _ = campaigns.stage_models_in_ramdisk(
+                    [selected(alias)], root / "cache/models", None, persistent=True)
+            self.assertEqual(copy.call_count, 1)
+            self.assertEqual(first[0].cache_status, "copied")
+            self.assertEqual(second[0].cache_status, "reused")
+            self.assertEqual(second[0].source_path, str(alias))
+            self.assertEqual(first[0].source_identity, second[0].source_identity)
 
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
     def test_persistent_ramdisk_cache_reuses_identity_stable_hits_without_reread(

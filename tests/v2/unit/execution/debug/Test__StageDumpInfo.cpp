@@ -22,6 +22,7 @@
  * - getDumpInfo() returns non-empty info when buffers are set
  * - Scalar parameters are captured correctly
  * - Input/output buffers are referenced correctly
+ * - Fused GEMM operands retain their reduction width even when output N differs
  */
 
 #include <gtest/gtest.h>
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "execution/debug/AsyncStageDumper.h"
 
 #include "backends/BackendManager.h"
 #include "utils/MPIContext.h"
@@ -227,6 +229,49 @@ TEST_F(StageDumpInfoTest, EnsureOutputsOnHostRejectsGpuOutputWithoutExplicitStre
 // GEMMStage Tests
 // =============================================================================
 
+/**
+ * @brief A declined dump must not resolve any input or output host address.
+ *
+ * Model capture leaves this mock tensor device-owned without a terminal copy
+ * event. Output publication would throw and input publication would attempt a
+ * copy. Exhausted dump admission must return before coherence, allocation,
+ * queueing or filesystem access instead.
+ */
+TEST_F(StageDumpInfoTest, DeclinedAsyncDumpDoesNotObserveDeviceStorage)
+{
+    MockBackend backend(DeviceType::CUDA);
+    auto tensor = TestTensorFactory::createFP32({2, 2});
+    tensor->setBackendForTesting(&backend);
+    const auto device = DeviceId::cuda(0);
+    void *stream = reinterpret_cast<void *>(0xD00F0002);
+    ASSERT_TRUE(tensor->allocateOnDevice(device, stream));
+    TransferEngine::publishGraphOwnedDeviceWrite(tensor, device);
+
+    StageDumpInfo info;
+    info.addInput("input", tensor.get(), 2, 2);
+    info.addOutput("output", tensor.get(), 2, 2);
+    const StageDumpContext declined;
+    ASSERT_LT(declined.dump_id, 0);
+    const auto previous_d2h = backend.getD2HCount();
+    const auto previous_syncs = backend.getSyncCount();
+    EXPECT_NO_THROW(AsyncStageDumper::enqueueInputs(declined, info));
+    EXPECT_NO_THROW(AsyncStageDumper::enqueueOutputs(declined, info));
+    EXPECT_EQ(backend.getD2HCount(), previous_d2h);
+    EXPECT_EQ(backend.getSyncCount(), previous_syncs);
+    EXPECT_EQ(AsyncStageDumper::pendingTasks(), 0u);
+}
+
+/** @brief An admitted ID without its directory is malformed, not a skipped dump. */
+TEST_F(StageDumpInfoTest, MalformedAsyncDumpAdmissionFailsBeforeSnapshot)
+{
+    StageDumpContext malformed;
+    malformed.dump_id = 0;
+    const StageDumpInfo empty;
+    EXPECT_THROW(AsyncStageDumper::enqueueInputs(malformed, empty), std::invalid_argument);
+    EXPECT_THROW(AsyncStageDumper::enqueueOutputs(malformed, empty), std::invalid_argument);
+    EXPECT_EQ(AsyncStageDumper::pendingTasks(), 0u);
+}
+
 TEST_F(StageDumpInfoTest, GEMMStage_GetDumpInfo)
 {
     int m = 32, n = 64, k = 128;
@@ -262,6 +307,49 @@ TEST_F(StageDumpInfoTest, GEMMStage_GetDumpInfo)
 // =============================================================================
 // FusedQKVGEMMStage Tests
 // =============================================================================
+
+/**
+ * @brief Fused down-projection evidence must include every gate input element.
+ *
+ * SwiGLU consumes gate[M,K] and up[M,K] before projecting to output[M,N].
+ * Using N for the gate dump silently truncates real down-projection evidence
+ * when K>N and advertises out-of-bounds reads when N>K. Exercise both directions
+ * without running kernels or allocating a model.
+ */
+TEST_F(StageDumpInfoTest, FusedGEMMGateDumpUsesReductionWidth)
+{
+    constexpr size_t m = 3;
+    for (const auto &[n, k] : std::vector<std::pair<size_t, size_t>>{{32, 128}, {128, 32}})
+    {
+        SCOPED_TRACE(::testing::Message() << "m=" << m << " n=" << n << " k=" << k);
+        auto up = TestTensorFactory::createFP32({m, k});
+        auto gate = TestTensorFactory::createFP32({m, k});
+        auto weight = TestTensorFactory::createFP32({n, k});
+        auto output = TestTensorFactory::createFP32({m, n});
+        GEMMStage::Params params;
+        params.A = up.get();
+        params.B = weight.get();
+        params.C = output.get();
+        params.gate_input = gate.get();
+        params.do_swiglu = true;
+        params.m = m;
+        params.n = n;
+        params.k = k;
+        GEMMStage stage(params);
+        const auto dump = stage.getDumpInfoSnapshot();
+        bool found_gate = false;
+        for (const auto &input : dump.inputs)
+        {
+            if (std::string(input.name) != "gate_input")
+                continue;
+            found_gate = true;
+            EXPECT_EQ(input.rows, m);
+            EXPECT_EQ(input.cols, k);
+            EXPECT_EQ(input.byte_size, m * k * sizeof(float));
+        }
+        EXPECT_TRUE(found_gate);
+    }
+}
 
 TEST_F(StageDumpInfoTest, FusedQKVGEMMStage_GetDumpInfo)
 {

@@ -11,6 +11,8 @@
  * 4. Sliding window pattern
  * 5. Batched gather
  * 6. Multi-precision (FP32, FP16, BF16)
+ * 7. Captured unequal-length continuation and seed-authenticated diagnostic
+ *    partitions, with external producer events joined before capture.
  */
 
 #include <gtest/gtest.h>
@@ -23,6 +25,8 @@
 #include <random>
 #include <cmath>
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/prefix_cache/PrefixCacheStateProbe.h"
+#include "transfer/TransferEngine.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -2455,8 +2459,12 @@ TEST(Test__CUDARingKVCache, CapturedUnequalRequestLengthsPreserveContinuationAll
         auto v_tensor = makeNativeTensor(v_fp32, format.precision);
         ASSERT_NE(k_tensor, nullptr);
         ASSERT_NE(v_tensor, nullptr);
-        ASSERT_TRUE(k_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
-        ASSERT_TRUE(v_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+        // Mirror the executor's external-input admission: residency alone is
+        // not an authenticated producer-event join for a captured consumer.
+        TransferEngine::prepareDeviceInput(k_tensor.get(), DeviceId::cuda(0), stream.opaque());
+        TransferEngine::prepareDeviceInput(v_tensor.get(), DeviceId::cuda(0), stream.opaque());
+        TransferEngine::requireDeviceInput(k_tensor.get(), DeviceId::cuda(0), stream.opaque());
+        TransferEngine::requireDeviceInput(v_tensor.get(), DeviceId::cuda(0), stream.opaque());
 
         int32_t *device_lengths = nullptr;
         ASSERT_EQ(
@@ -2566,6 +2574,16 @@ TEST(Test__CUDARingKVCache, CapturedUnequalRequestLengthsPreserveContinuationAll
          * persistent device length row is restamped before launch; no graph
          * node or cache metadata is rebuilt on the host.
          */
+        // Device-owned unequal sequence lengths, not the captured padded M,
+        // determine each diagnostic prefix boundary. Observe before replay.
+        PrefixProbeCapturePolicy probe_policy;
+        probe_policy.hash_full_kv_payloads = true;
+        probe_policy.capture_requested_kv_segment_payloads = true;
+        PrefixRuntimeStateSnapshot seed;
+        seed.initialized = true;
+        seed.mtp_kv_caches = {inspectKVCacheForPrefixProbe(
+            *cache, "mtp:0", DeviceId::cuda(0), batch_size, stream.stream(), probe_policy)};
+        const auto continuation_policy = probe_policy.forKVContinuationOf(seed);
         constexpr std::array<int32_t, batch_size> continuation_lengths{1, 1};
         ASSERT_EQ(
             cudaMemcpyAsync(
@@ -2668,6 +2686,23 @@ TEST(Test__CUDARingKVCache, CapturedUnequalRequestLengthsPreserveContinuationAll
                 << " request " << request;
         }
 
+        const auto continued = inspectKVCacheForPrefixProbe(
+            *cache, "mtp:0", DeviceId::cuda(0), batch_size, stream.stream(), continuation_policy);
+        ASSERT_EQ(continued.layers.size(), batch_size);
+        for (int request = 0; request < batch_size; ++request)
+        {
+            const auto &layer = continued.layers[request];
+            const auto &seed_layer = seed.mtp_kv_caches.front().layers[request];
+            EXPECT_EQ(layer.leading_segment_tokens, initial_counts[request]);
+            EXPECT_EQ(layer.leading_k_payload_hash, seed_layer.k_payload_hash);
+            EXPECT_EQ(layer.leading_v_payload_hash, seed_layer.v_payload_hash);
+            ASSERT_EQ(layer.segments.size(), 1u);
+            const auto &suffix = layer.segments.front();
+            EXPECT_EQ(suffix.token_start, initial_counts[request]);
+            EXPECT_EQ(suffix.token_count, 1);
+            EXPECT_EQ(suffix.k_payload.size(), row_bytes);
+            EXPECT_EQ(suffix.v_payload.size(), row_bytes);
+        }
         EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
         EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
         EXPECT_EQ(cudaFree(device_lengths), cudaSuccess);

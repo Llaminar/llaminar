@@ -1,6 +1,10 @@
 /**
  * @file Test__MoERebalanceController.cpp
- * @brief Unit tests for MoERebalanceController
+ * @brief Device-free proofs of MoE placement policy and transaction contracts.
+ *
+ * Exercise canonical host/device policy arithmetic, authenticated transfer-slot
+ * leases, controller scheduling, and explicit publication-state semantics.
+ * These fixtures never allocate accelerator memory or load model weights.
  */
 
 #include <gtest/gtest.h>
@@ -258,8 +262,9 @@ TEST(Test__MoERebalanceController,
  * @brief Lock the generation-stamped transfer-slot transaction into the ABI.
  *
  * Destination projection turns a logical root command into a participant-local
- * compare-and-replace transaction. ABI version 12 also authenticates the
- * overlay-wide destination separately from the intra-domain participant. The
+ * compare-and-replace transaction. The ABI authenticates the overlay-wide
+ * destination separately from the intra-domain participant and distinguishes
+ * an unpublished prepared bank from a durably applied wave. The
  * invalid prior identity is meaningful for an empty slot, while generation
  * zero is the first valid directory generation. These defaults must therefore
  * remain explicit and trivially transportable through device command buffers.
@@ -268,7 +273,9 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 12u);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 14u);
+    EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
+              DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(
         sizeof(DeviceMoERebalanceConfig),
         moe_rebalance_abi::kConfigBytes);

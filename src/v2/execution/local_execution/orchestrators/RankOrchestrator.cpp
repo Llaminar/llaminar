@@ -3418,6 +3418,7 @@ namespace llaminar2
         advanceMTPMainConditionFromDeviceResidentLogicalState(
             int32_t token_shadow,
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            MTPConditionForwardPurpose purpose,
             int request_index)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
@@ -3426,6 +3427,7 @@ namespace llaminar2
                 ->advanceMTPMainConditionFromDeviceResidentLogicalState(
                     token_shadow,
                     logical_state,
+                    purpose,
                     request_index);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
@@ -3434,6 +3436,7 @@ namespace llaminar2
                 ->advanceMTPMainConditionFromDeviceResidentLogicalState(
                     token_shadow,
                     logical_state,
+                    purpose,
                     request_index);
         }
 
@@ -3454,7 +3457,7 @@ namespace llaminar2
 
         const bool advanced = dispatchLocalTPMTPMainCondition(
             "advanceMTPMainConditionFromDeviceResidentLogicalState",
-            [this, token_shadow, request_index](
+            [this, token_shadow, purpose, request_index](
                 IInferenceRunner &child,
                 size_t participant)
             {
@@ -3462,6 +3465,7 @@ namespace llaminar2
                     .advanceMTPMainConditionFromDeviceResidentLogicalState(
                         token_shadow,
                         rank_resident_child_logical_state_handles_[participant],
+                        purpose,
                         request_index);
             });
         if (!advanced)
@@ -3486,20 +3490,23 @@ namespace llaminar2
 
     bool RankOrchestrator::advanceMTPMainConditionFromDeviceTargetSample(
         int32_t token_shadow,
-        int target_sample_slot)
+        int target_sample_slot,
+        MTPConditionForwardPurpose purpose)
     {
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar->advanceMTPMainConditionFromDeviceTargetSample(
                 token_shadow,
-                target_sample_slot);
+                target_sample_slot,
+                purpose);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
             return device_runners_[0]
                 ->advanceMTPMainConditionFromDeviceTargetSample(
                     token_shadow,
-                    target_sample_slot);
+                    target_sample_slot,
+                    purpose);
         }
         if (target_sample_slot < 0 ||
             target_sample_slot >= rank_stochastic_slot_capacity_)
@@ -3512,13 +3519,14 @@ namespace llaminar2
 
         const bool advanced = dispatchLocalTPMTPMainCondition(
             "advanceMTPMainConditionFromDeviceTargetSample",
-            [token_shadow, target_sample_slot](
+            [token_shadow, target_sample_slot, purpose](
                 IInferenceRunner &child,
                 size_t)
             {
                 return child.advanceMTPMainConditionFromDeviceTargetSample(
                     token_shadow,
-                    target_sample_slot);
+                    target_sample_slot,
+                    purpose);
             });
         if (!advanced)
             return false;
@@ -16298,6 +16306,37 @@ namespace llaminar2
         return epoch;
     }
 
+    const IInferenceRunner *RankOrchestrator::moeOptimizationOwner() const
+    {
+        const IInferenceRunner *owner = nullptr;
+        auto inspect = [&](const auto &runners)
+        {
+            for (const auto &runner : runners)
+            {
+                if (!runner || runner->moeOptimizationStatus().authority == MoEOptimizationAuthority::None)
+                    continue;
+                if (owner)
+                    throw std::logic_error("Rank MoE movement evidence has multiple publication authorities");
+                owner = runner.get();
+            }
+        };
+        inspect(device_runners_);
+        inspect(pp_stage_runners_);
+        return owner;
+    }
+
+    MoEOptimizationStatus RankOrchestrator::moeOptimizationStatus() const
+    {
+        const auto *owner = moeOptimizationOwner();
+        return owner ? owner->moeOptimizationStatus() : MoEOptimizationStatus{};
+    }
+
+    MoEOptimizationMovementLedger RankOrchestrator::moeOptimizationMovementLedger() const
+    {
+        const auto *owner = moeOptimizationOwner();
+        return owner ? owner->moeOptimizationMovementLedger() : MoEOptimizationMovementLedger{};
+    }
+
     PrefixLookupResult RankOrchestrator::lookupPrefix(const std::vector<int32_t> &tokens)
     {
         PrefixLookupResult aggregate;
@@ -16334,7 +16373,6 @@ namespace llaminar2
                     runner->primaryDeviceId(),
                     hit,
                     {},
-                    runner->moePlacementEpoch(),
                     fingerprint_policy);
                 participants.push_back(std::move(participant));
                 hits.push_back(hit);
@@ -16585,8 +16623,13 @@ namespace llaminar2
             }
         }
 
-        if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
+        if (!skip_logits_gather_prefill_ &&
+            !pp_stage_runners_.empty() && pp_stage_runners_.back())
         {
+            // A full prefix hit is a prefill terminal observation. Preserve
+            // the same logits ownership as ordinary prefill: CPU consumers
+            // refresh their aggregate, while GPU samplers keep the restored
+            // row on its existing device instead of manufacturing a D2H copy.
             if (!logits_gatherer_)
             {
                 logits_gatherer_ = std::make_unique<LogitsGatherer>(
@@ -16863,7 +16906,8 @@ namespace llaminar2
         return saw_runner && ok;
     }
 
-    PrefixRuntimeStateSnapshot RankOrchestrator::prefixStateProbe() const
+    PrefixRuntimeStateSnapshot RankOrchestrator::prefixStateProbe(
+        const PrefixProbeCapturePolicy &capture_policy) const
     {
         PrefixRuntimeStateSnapshot snapshot;
         snapshot.initialized = true;
@@ -17187,7 +17231,7 @@ namespace llaminar2
             if (runner)
             {
                 const PrefixRuntimeStateSnapshot child =
-                    runner->prefixStateProbe();
+                    runner->prefixStateProbe(capture_policy);
                 adopt_authoritative_child_logical_state(child);
                 merge_child(child);
                 saw_child = true;
@@ -17197,7 +17241,7 @@ namespace llaminar2
         {
             if (runner)
             {
-                merge_child(runner->prefixStateProbe());
+                merge_child(runner->prefixStateProbe(capture_policy));
                 saw_child = true;
             }
         }
@@ -17702,23 +17746,22 @@ namespace llaminar2
             return {};
         }
 
-        // Default (TP mode): prefer primary, then search participants for
-        // participant-local diagnostics that were included in merged keys.
-        if (!device_runners_.empty() && device_runners_[0])
-        {
-            auto primary = device_runners_[0]->getSnapshotWithShape(key);
-            if (primary)
-                return primary;
-        }
-        for (size_t i = 1; i < device_runners_.size(); ++i)
+        // A completed publication is authoritative even when its owner is not
+        // participant zero. Keep an ordinary shard only when no finalizer has
+        // published this semantic value; getTPSnapshot owns shard assembly.
+        SnapshotInfo first_partition;
+        for (size_t i = 0; i < device_runners_.size(); ++i)
         {
             if (!device_runners_[i])
                 continue;
             auto participant = device_runners_[i]->getSnapshotWithShape(key);
-            if (participant)
+            if (participant && participant.publication ==
+                                   SnapshotPublication::CompleteValue)
                 return participant;
+            if (participant && !first_partition)
+                first_partition = std::move(participant);
         }
-        return {};
+        return first_partition;
     }
 
     TPSnapshot RankOrchestrator::getTPSnapshot(const std::string &key) const
@@ -17797,6 +17840,23 @@ namespace llaminar2
         // TP Mode (non-PP): Collect from device_runners_
         // =========================================================================
 
+        // Acquire each immutable publication once. A root finalizer can share
+        // a semantic key with pre-finalization partials left on other devices.
+        // Complete values supersede those partials; when several finalizers
+        // publish, REPLICATED assembly still verifies their agreement.
+        std::vector<SnapshotInfo> publications(device_runners_.size());
+        bool has_complete_publication = false;
+        for (size_t i = 0; i < device_runners_.size(); ++i)
+        {
+            if (device_runners_[i])
+                publications[i] = device_runners_[i]->getSnapshotWithShape(key);
+            has_complete_publication |=
+                publications[i] && publications[i].publication ==
+                                       SnapshotPublication::CompleteValue;
+        }
+        if (has_complete_publication)
+            result.mode = SnapshotShardingMode::REPLICATED;
+
         // Special case: GATHERED stages (e.g., LM_HEAD) with combined logits already gathered
         if (result.mode == SnapshotShardingMode::GATHERED &&
             device_runners_.size() > 1 && logits_gatherer_ && logits_gatherer_->isAllocated() && tp_ctx_)
@@ -17836,7 +17896,7 @@ namespace llaminar2
             }
         }
 
-        // Collect snapshots from all device runners
+        // Collect only the publications belonging to the selected assembly.
         size_t global_col_offset = 0;
         for (size_t i = 0; i < device_runners_.size(); ++i)
         {
@@ -17846,7 +17906,11 @@ namespace llaminar2
             // Use shape-aware snapshot retrieval — the stage itself reported
             // its output rows/cols via getDumpInfo() at capture time, so we
             // don't need model-specific dimension calculations here.
-            auto snap = device_runners_[i]->getSnapshotWithShape(key);
+            const auto &snap = publications[i];
+
+            if (has_complete_publication && snap.publication !=
+                                                SnapshotPublication::CompleteValue)
+                continue;
 
             if (!snap)
             {

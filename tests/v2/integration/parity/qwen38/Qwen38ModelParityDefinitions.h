@@ -30,6 +30,7 @@ namespace llaminar2::test::parity::qwen38
             .kv_heads = 4,
             .maximum_mtp_draft_depth = kModelParityRequiredMaximumMTPDepth,
             .mtp_checkpoint_surface = qwen36::qwen36DenseMTPCheckpointSurface(),
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
         definition.topology = std::move(topology);
         // Retain the prior dense gate until fresh CSV evidence proves this

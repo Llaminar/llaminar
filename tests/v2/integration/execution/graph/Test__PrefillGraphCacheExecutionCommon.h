@@ -7,7 +7,9 @@
  * HiddenStateRowSelectStage so replay-param updates are exercised across real
  * lengths. The graph is intentionally tiny so the test isolates cache lifecycle
  * behavior while still using DeviceGraphExecutor, backend streams, and HIP/CUDA
- * graph capture/replay.
+ * graph capture/replay. Deferred decode additionally proves that a private
+ * sampler-stream handoff never suppresses public tensor event publication to
+ * a pipeline transfer consumer.
  * Backend-specific wrapper files provide the registration/support/device hooks.
  */
 
@@ -742,12 +744,17 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Select the probe's declared captured execution policy.
+         * @return Full native replay for deferred decode; segmentation only
+         *         when the fixture explicitly declares a heterogeneous boundary.
+         */
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool, IDeviceContext *) const override
         {
             DeviceGraphExecutor::DecodeCapturePolicy policy;
             policy.allow_cached_graph_replay =
-                heterogeneous_segmented_prefill_;
+                heterogeneous_segmented_prefill_ || deferred_decode_;
             policy.heterogeneous_segmented_enabled =
                 heterogeneous_segmented_prefill_;
             if (heterogeneous_segmented_prefill_)
@@ -759,7 +766,41 @@ namespace
             return policy;
         }
 
-        PPCopyInfo resolvePPCopyInfo(const ForwardInput &) const override { return {}; }
+        /** @brief Enable the ordinary asynchronous graph-to-sampler contract. */
+        void enableDeferredDecodeProbe() { deferred_decode_ = true; }
+
+        /** @return Whether the test's sampler consumes graph completion on device. */
+        bool shouldDeferMainDecodeFinalSync() const override
+        {
+            return deferred_decode_;
+        }
+
+        /** @brief Retain the private handoff independently of tensor publication. */
+        void setPendingMainDecodeStream(void *stream) override
+        {
+            deferred_decode_stream = stream;
+        }
+
+        /**
+         * @brief Bind an optional PP ingress to the retained graph's input.
+         *
+         * The caller owns the upstream tensor; the arena owns the destination.
+         * This is the same copy contract used by a non-embedding model stage,
+         * without introducing a test-only copy inside the compute graph.
+         */
+        PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override
+        {
+            if (!input.external_hidden_state)
+                return {};
+            PPCopyInfo info;
+            info.external_hidden = input.external_hidden_state;
+            info.working_buffer = input_tensor_;
+            info.device = device_;
+            info.copy_bytes = static_cast<size_t>(input.seq_len) *
+                              static_cast<size_t>(kHiddenDim) * sizeof(float);
+            info.needs_copy = true;
+            return info;
+        }
 
         uint64_t moePlacementEpoch() const override { return placement_epoch; }
         std::string prefillGraphDomainId() const override { return domain_id; }
@@ -925,6 +966,21 @@ namespace
         /// @brief Return the tensor exposed as logits/hidden by the synthetic graph.
         FP32Tensor *outputTensor() const { return output_tensor_; }
 
+        /**
+         * @brief Admit the probe's constant residual operand before setup capture.
+         *
+         * Address-only materialization intentionally does not upload activation
+         * payloads. This fixture input is external to the graph just like the
+         * live upstream PP activation, and needs its own producer publication.
+         */
+        bool admitProbeResidual(void *stream)
+        {
+            if (!residual_tensor_->ensureOnDevice(device_, stream))
+                return false;
+            TransferEngine::publishDeviceWrite(residual_tensor_, device_, stream);
+            return true;
+        }
+
         /// @brief Return the residual probe stage built for the cached graph.
         GPUResidualAddProbeStage *stage() const { return stage_; }
 
@@ -1005,6 +1061,8 @@ namespace
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
         int sync_logits_calls = 0;
+        bool deferred_decode_ = false; ///< Test-only selection of the production deferred policy.
+        void *deferred_decode_stream = nullptr; ///< Exact private sampler handoff, not public tensor readiness.
         int committed_forward_output_calls = 0;
         TensorBase *last_committed_logits = nullptr;
         ForwardExecutionProvenance last_committed_execution{};
@@ -1431,6 +1489,188 @@ namespace
         std::unique_ptr<ForwardExecutionEngine> engine_;
         std::unique_ptr<PrefillGraphCacheTestHost> host_;
     };
+
+    /**
+     * @brief Setup-only PP graphs consume new ingress bytes on their first replay.
+     *
+     * Materialize several shapes before any inference, as the serving runner
+     * does. Revisit both shapes across request reset with different upstream
+     * payloads. All rows must match exact binary fractions, with no rebuild or
+     * recapture: initialization values are never valid inference inputs.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, SetupMaterializedPipelineIngressAcrossBucketsAndReset)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        });
+        constexpr int max_rows = 256;
+        ForwardExecutionEngine::Config engine_config;
+        engine_config.cache_config.enabled = true;
+        FactoryPPStageConfig pp_stage;
+        pp_stage.first_layer = 1;
+        pp_stage.last_layer = 2;
+        pp_stage.has_embedding = false;
+        pp_stage.has_lm_head = true;
+        engine_config.pp_stage_config = pp_stage;
+        engine_ = std::make_unique<ForwardExecutionEngine>(
+            std::move(engine_config), *executor_);
+        auto upstream = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{max_rows, kHiddenDim});
+        auto tokens = makeSequentialInts(max_rows, 1000);
+        ForwardInput input;
+        input.token_ids = tokens.data();
+        input.batch_size = 1;
+        input.device = device_;
+        input.position_policy = ForwardPositionPolicy::ContiguousOffset;
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.external_hidden_state = upstream.get();
+        input.graph_submission_intent =
+            ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output;
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        void *producer_stream = nullptr;
+        worker->submitAndWait([&]() { producer_stream = worker->defaultStream(); });
+        ASSERT_NE(producer_stream, nullptr);
+        ASSERT_TRUE(host_->admitProbeResidual(producer_stream));
+        ASSERT_TRUE(upstream->ensureOnDevice(device_, producer_stream));
+        TransferEngine::publishDeviceWrite(upstream.get(), device_, producer_stream);
+
+        for (const int rows : {64, 256})
+        {
+            input.seq_len = rows;
+            input.real_seq_len = rows;
+            input.bucket_seq_len = rows;
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+        }
+        ASSERT_EQ(host_->build_calls, 2);
+        EXPECT_EQ(host_->committed_forward_output_calls, 0);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        for (int request = 0; request < 2; ++request)
+        {
+            for (const int rows : {64, 256, 64})
+            {
+                SCOPED_TRACE(::testing::Message() << "request=" << request << " rows=" << rows);
+                float *payload = upstream->mutable_data();
+                const size_t count = static_cast<size_t>(rows) * kHiddenDim;
+                for (size_t i = 0; i < count; ++i)
+                    payload[i] = static_cast<float>(request + rows) +
+                                 static_cast<float>(i % 7) * 0.125f;
+                ASSERT_TRUE(upstream->ensureOnDevice(device_, producer_stream));
+                TransferEngine::publishDeviceWrite(upstream.get(), device_, producer_stream);
+                input.seq_len = rows;
+                input.real_seq_len = rows;
+                input.bucket_seq_len = rows;
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                ASSERT_NE(output.logits, nullptr);
+                const auto *actual = static_cast<FP32Tensor *>(output.logits)->data();
+                for (size_t i = 0; i < count; ++i)
+                    ASSERT_EQ(actual[i], payload[i] + 0.25f +
+                                            static_cast<float>(i % 13) * 0.0625f)
+                        << "element=" << i;
+                EXPECT_EQ(host_->build_calls, 2);
+            }
+            engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+        EXPECT_EQ(host_->committed_forward_output_calls, 6);
+        for (const int rows : {64, 256})
+        {
+            auto signature = bucketedPrefillSignature(device_, rows);
+            signature.standard_path = false;
+            signature.pp_stage_enabled = true;
+            signature.pp_first_layer = pp_stage.first_layer;
+            signature.pp_last_layer = pp_stage.last_layer;
+            signature.pp_has_lm_head = true;
+            const auto snapshot = engine_->prefillGraphCacheSnapshot(
+                signature, prefillGraphKey(device_, rows));
+            ASSERT_TRUE(snapshot.has_value());
+            EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
+            EXPECT_EQ(snapshot->capture_count, 1u);
+            EXPECT_EQ(snapshot->warmup_count, 0u);
+            EXPECT_EQ(snapshot->replay_count, rows == 64 ? 4 : 2);
+            EXPECT_GT(snapshot->node_count, 0u);
+        }
+    }
+
+    /**
+     * @brief A deferred decode result is published for public transfer consumers.
+     *
+     * The real captured residual kernel produces a different row on every
+     * replay. Copy it through TransferEngine before observing the destination.
+     * A private sampler handoff alone cannot order that independent transfer
+     * stream. Setup must launch nothing; request reset must preserve capture.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, DeferredDecodePublishesPipelineTransferResult)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        FP32Tensor downstream(std::vector<size_t>{1, kHiddenDim});
+        int token = 17;
+        int position = 139;
+        ForwardInput input;
+        input.token_ids = &token;
+        input.position_ids = &position;
+        input.position_offset = position;
+        input.batch_size = 1;
+        input.seq_len = 1;
+        input.real_seq_len = 1;
+        input.device = device_;
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.external_hidden_state = &upstream;
+        input.graph_submission_intent =
+            ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        void *admission_stream = nullptr;
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&]() { admission_stream = worker->defaultStream(); });
+        ASSERT_NE(admission_stream, nullptr);
+        ASSERT_TRUE(host_->admitProbeResidual(admission_stream));
+        ASSERT_TRUE(upstream.ensureOnDevice(device_, admission_stream));
+        ASSERT_TRUE(downstream.ensureOnDevice(device_, admission_stream));
+        TransferEngine::publishDeviceWrite(&upstream, device_, admission_stream);
+        TransferEngine::publishDeviceWrite(&downstream, device_, admission_stream);
+        ForwardOutput output;
+        ASSERT_TRUE(engine_->execute(input, output, *host_));
+        EXPECT_EQ(host_->committed_forward_output_calls, 0);
+        EXPECT_EQ(host_->sync_logits_calls, 0);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        for (int step = 0; step < 6; ++step)
+        {
+            SCOPED_TRACE(step);
+            auto *payload = upstream.mutable_data();
+            for (int i = 0; i < kHiddenDim; ++i)
+                payload[i] = static_cast<float>(step * 4) + static_cast<float>(i) * 0.125f;
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, admission_stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, admission_stream);
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+            ASSERT_EQ(host_->deferred_decode_stream, output.execution.stream);
+            ASSERT_NE(host_->deferred_decode_stream, nullptr);
+            EXPECT_EQ(host_->sync_logits_calls, step + 1)
+                << "A private stream handoff must not suppress the public result event.";
+            const auto transfer = TransferEngine::instance().copyActivation(
+                output.hidden, &downstream, device_, kHiddenDim * sizeof(float));
+            ASSERT_TRUE(transfer.success);
+            const auto *actual = downstream.data();
+            for (int i = 0; i < kHiddenDim; ++i)
+                ASSERT_EQ(actual[i], payload[i] + 0.25f + static_cast<float>(i % 13) * 0.0625f);
+            EXPECT_EQ(host_->build_calls, 1);
+            if (step == 2)
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+        EXPECT_EQ(host_->committed_forward_output_calls, 6);
+    }
 
     TEST_F(PrefillGraphCacheExecutionTest, ExactBucketWarmupCaptureReplayLifecycle)
     {

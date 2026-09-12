@@ -69,6 +69,23 @@ namespace llaminar2
         }
     };
 
+    /**
+     * @brief Close inference admission and agree the topology's terminal intent.
+     * @param context Exact controller communicator, including every service rank.
+     * @param local_intent This rank's model-retention obligation.
+     * @return Restoration if any rank retains a prepared context, else release.
+     * @throws std::logic_error For invalid membership or a malformed peer intent.
+     *
+     * One byte per rank carries host-owned resource lifetime, never placement or
+     * GPU execution state. This replaces the first shutdown barrier; it adds no
+     * collective to inference. All peers validate the complete vector before
+     * requesting worker drain, including malformed local contributions.
+     */
+    [[nodiscard]] MoEOverlayDeviceControllerDrainIntent
+    agreeMoEOverlayDeviceControllerDrainIntent(
+        const IMPIContext &context,
+        MoEOverlayDeviceControllerDrainIntent local_intent);
+
     /** Inference phase whose retired logical rows advance maintenance. */
     enum class MoEOverlayInferencePhase : std::uint8_t
     {
@@ -268,6 +285,20 @@ namespace llaminar2
         [[nodiscard]] std::array<std::uint64_t, 2> pendingTokens() const
             noexcept;
 
+        /**
+         * @brief Observe the next phase-specific submission boundary.
+         * @param queued_tokens Retired prefill/decode rows still in the owning
+         *        runner's next-command sideband, not yet delivered to this gate.
+         * @return Conservative headroom for an exclusively admitted mixed cohort.
+         *
+         * The fuller phase bounds any mixed cohort's total row count. Include
+         * queued sidebands so the next command cannot expose an omitted full
+         * window. Only diagnostic readers and background consumers share the
+         * short snapshot lock; inference notifications remain lock-free.
+         */
+        [[nodiscard]] MoEOptimizationDemandWindow demandWindow(
+            std::array<std::uint64_t, 2> queued_tokens = {}) const;
+
         /** @return Immutable minimum boundary count for one transaction. */
         [[nodiscard]] std::uint64_t requiredTokens() const noexcept
         {
@@ -279,6 +310,10 @@ namespace llaminar2
         std::atomic<std::uint64_t> required_tokens_;
         /** Independent counters prevent prefill and decode demand from mixing. */
         std::array<std::atomic<std::uint64_t>, 2> pending_tokens_{};
+        /** Makes consume/reset and its diagnostic generation one observation. */
+        mutable std::mutex observation_mutex_;
+        /** Advances on actual window consumption, never on status polling. */
+        std::uint64_t consumed_windows_ = 0u;
     };
 
     /**
@@ -379,9 +414,10 @@ namespace llaminar2
          * The coordinated runner must publish its worker-loop shutdown command
          * before entering this transition.
          *
-         * @param intent Whether teardown only releases runtime resources or
-         *        first restores the loader-prepared model-context placement.
-         * @return Immutable terminal evidence naming the requested intent,
+         * @param intent Local obligation to release resources or retain prepared
+         *        placement. The entry rendezvous joins obligations across ranks;
+         *        any retained context requires all physical peers to restore.
+         * @return Immutable terminal evidence naming the agreed topology intent,
          *         durable epoch, restoration work, and success state.
          */
         [[nodiscard]] MoEOverlayDeviceControllerDrainResult stopAndDrain(
@@ -449,8 +485,11 @@ namespace llaminar2
          *
          * The mapped words are device-authored lifecycle publications; this
          * method does not download policy state or consult PerfStats.
+         * @param queued_tokens Retired prefill/decode sideband not delivered yet.
+         * @return Passive lifecycle and exact scheduler headroom, not GPU demand.
          */
-        [[nodiscard]] MoEOptimizationStatus optimizationStatus() const;
+        [[nodiscard]] MoEOptimizationStatus optimizationStatus(
+            std::array<std::uint64_t, 2> queued_tokens = {}) const;
 
         /**
          * @brief Snapshot exact device-authored edges completed by the follower.

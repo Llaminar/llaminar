@@ -43,8 +43,10 @@ namespace llaminar2 {
 /// Magic bytes identifying a packed weights blob: "LPWT"
 static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little-endian
 
-/// Current wire format version.
-static constexpr uint32_t PACKED_WEIGHTS_VERSION = 2;
+/// Version 3 requires lossless native multi-scale preparation. Version-2
+/// archives may contain lossy expanded experts with otherwise valid metadata;
+/// reject them rather than accepting stale arithmetic from an older producer.
+static constexpr uint32_t PACKED_WEIGHTS_VERSION = 3;
 
 #pragma pack(push, 1)
 
@@ -112,6 +114,8 @@ inline cpu::native_vnni::CPUNativeVNNIEncoding decodePreparedEncoding(
         return Encoding::ExpandedInt8;
     case static_cast<uint8_t>(Encoding::Q6KNativeDualScale):
         return Encoding::Q6KNativeDualScale;
+    case static_cast<uint8_t>(Encoding::CompactMultiScale):
+        return Encoding::CompactMultiScale;
     default:
         throw std::invalid_argument(
             "Packed-weight transfer received an unknown prepared encoding");

@@ -11,10 +11,18 @@ reference generators from acquiring subtly different failure semantics.
 import os
 import tempfile
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
 
 from .snapshot_metadata import write_metadata_atomically
+
+
+class MTPBranchOverride(TypedDict):
+    """Exact discrete sidecar inputs; FP32 hidden/cache remain HF-owned."""
+
+    condition_token: int | None
+    draft_tokens: list[int]
 
 
 def normalize_mtp_branch_override_batches(raw_overrides):
@@ -37,15 +45,33 @@ def normalize_mtp_branch_override_batches(raw_overrides):
     normalized_batches = []
     for batch in raw_batches:
         normalized = {}
-        for step, tokens in batch.items():
-            if not isinstance(tokens, list) or any(
-                isinstance(token, (list, dict)) for token in tokens
-            ):
+        for step, branch in batch.items():
+            # A flat array explicitly requests only recursive overrides. The
+            # structured form also names MTP0's actual main-model condition.
+            if isinstance(branch, list):
+                branch = {"condition_token": None, "draft_tokens": branch}
+            if not isinstance(branch, dict) or set(branch) != {
+                "condition_token", "draft_tokens"
+            }:
+                raise ValueError("Invalid MTP branch input fields")
+            tokens = branch["draft_tokens"]
+            condition = branch["condition_token"]
+            if not isinstance(tokens, list) or any(type(token) is not int for token in tokens):
                 raise ValueError(
                     "Every MTP branch override must be one flat token array"
                 )
-            normalized[int(step)] = [int(token) for token in tokens]
-        normalized_batches.append(normalized)
+            if (condition is not None and (type(condition) is not int or condition < 0)) or any(token < 0 for token in tokens):
+                raise ValueError("MTP branch tokens must be non-negative integers")
+            if int(step) < 0 or len(tokens) >= 15 or (condition is None and not tokens):
+                raise ValueError("Invalid MTP branch step/depth identity")
+            normalized[int(step)] = MTPBranchOverride(
+                condition_token=condition, draft_tokens=list(tokens))
+        if not normalized:
+            raise ValueError("An MTP branch batch must not be empty")
+        # Each base-token override is a different trajectory. Independent
+        # passes share the loaded sidecar, never a cache altered by another
+        # branch. This also makes terminal-only replay sufficient.
+        normalized_batches.extend({step: branch} for step, branch in normalized.items())
     return normalized_batches
 
 
@@ -80,7 +106,7 @@ def promote_mtp_sidecar_metadata(metadata_path: Path, maximum_depth: int) -> Non
 def mtp_sidecar_replay_depth(
     step: int,
     max_draft_depth: int,
-    draft_token_overrides: dict[int, list[int]],
+    draft_token_overrides: dict[int, MTPBranchOverride],
 ) -> int:
     """Return the minimum predictor depth needed by one additive branch pass.
 
@@ -91,8 +117,23 @@ def mtp_sidecar_replay_depth(
 
     if not draft_token_overrides:
         return max_draft_depth
-    tokens = draft_token_overrides.get(step)
-    return 1 if tokens is None else len(tokens) + 1
+    branch = draft_token_overrides.get(step)
+    return 1 if branch is None else len(branch["draft_tokens"]) + 1
+
+
+def mtp_branch_qualifier(branch: MTPBranchOverride | None, consumed_tokens: list[int]) -> str:
+    """Name only consumed inputs, including a noncanonical MTP0 condition.
+
+    A depth-zero base override must never overwrite the canonical MTP0 pack.
+    The current row's output is deliberately absent from this identity.
+    """
+    if branch is None:
+        return ""
+    condition = branch["condition_token"]
+    prefix = "" if condition is None else f"_CONDITION_{condition}"
+    if consumed_tokens:
+        prefix += "_BRANCH_" + "_".join(str(token) for token in consumed_tokens)
+    return prefix
 
 
 def save_mtp_snapshot_atomic(path: Path, payload: np.ndarray) -> None:

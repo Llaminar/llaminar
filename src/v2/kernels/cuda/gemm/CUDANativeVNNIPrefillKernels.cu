@@ -17,6 +17,9 @@
  * CUDANativeVNNIPrefillDevice.cuh body; this file owns public planning, launch
  * selection and resource queries. Production staging remains RegisterDecode
  * until an authenticated candidate tournament authorizes a different schedule.
+ * CUDA function attributes belong to the current device context, not the host
+ * process. Launch preparation applies them idempotently for that context; no
+ * process-global readiness bit may outlive or alias a device/module lifetime.
  */
 
 #include <cuda_runtime.h>
@@ -1199,20 +1202,21 @@ namespace
         return {tile};
     }
 
+    /**
+     * @brief Query the selected device without a mutable cross-device cache.
+     * @param device_id CUDA ordinal whose prefill capability is being admitted.
+     * @return True only for a successfully queried Ampere-or-newer device.
+     *
+     * Parallel participant capture can inspect different ordinals at once.
+     * Caching an ordinal and result in separate statics races their publication.
+     * This setup-time runtime query adds no node or work to captured replay.
+     */
     bool isAmperePlus(int device_id)
     {
-        static int cached_device = -1;
-        static bool cached_result = false;
-        if (cached_device == device_id)
-            return cached_result;
-
-        cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, device_id) != cudaSuccess)
-            return false;
-
-        cached_result = (prop.major >= 8);
-        cached_device = device_id;
-        return cached_result;
+        int major = 0;
+        return cudaDeviceGetAttribute(
+            &major, cudaDevAttrComputeCapabilityMajor, device_id) == cudaSuccess &&
+            major >= 8;
     }
 
     /** Map a compile-time output geometry back to its stable policy ID. */
@@ -1535,8 +1539,20 @@ namespace
         return scales_a_aligned + BM * 8 * static_cast<int>(sizeof(float));
     }
 
-    // =========================================================================
-    // BK=256 launch helper: sets >48KB dynamic smem opt-in before first launch
+    /**
+     * @brief Prepare the current context and capture one exact BK256 kernel.
+     * @tparam BM Output rows per CTA.
+     * @tparam BN Output columns per CTA.
+     * @tparam WM Row warp count.
+     * @tparam WN Column warp count.
+     * @return False if context-local resource admission or launch fails.
+     *
+     * The wide specialization exceeds CUDA's default dynamic shared-memory
+     * limit. Opt-in is function AND context local, including after context
+     * reclamation. Apply it idempotently rather than maintaining another live
+     * context ledger. This host preparation runs while constructing the graph;
+     * graph replay executes the unchanged kernel with no additional nodes.
+     */
     template <int BM, int BN, int WM, int WN>
     bool launchNativeVNNITC_BK256(
         const int8_t *d_A_int8,
@@ -1563,44 +1579,13 @@ namespace
          * register schedules, so configure and launch the exact specialization
          * selected by the immutable public-M1 arithmetic contract.
          */
-        static bool smem_configured[2] = {false, false};
-        const int ordered_index =
-            serial_m1_uses_ordered_reducer ? 1 : 0;
-        if (!smem_configured[ordered_index])
-        {
-            cudaError_t attribute_status = cudaSuccess;
-            if (serial_m1_uses_ordered_reducer)
-            {
-                auto fn_ptr =
-                    nativeVnniTC_BK256<
-                        BM,
-                        BN,
-                        WM,
-                        WN,
-                        true>;
-                attribute_status = cudaFuncSetAttribute(
-                    fn_ptr,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    smem_bytes);
-            }
-            else
-            {
-                auto fn_ptr =
-                    nativeVnniTC_BK256<
-                        BM,
-                        BN,
-                        WM,
-                        WN,
-                        false>;
-                attribute_status = cudaFuncSetAttribute(
-                    fn_ptr,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    smem_bytes);
-            }
-            if (attribute_status != cudaSuccess)
-                return false;
-            smem_configured[ordered_index] = true;
-        }
+        const auto kernel = serial_m1_uses_ordered_reducer
+            ? nativeVnniTC_BK256<BM, BN, WM, WN, true>
+            : nativeVnniTC_BK256<BM, BN, WM, WN, false>;
+        if (cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes) != cudaSuccess)
+            return false;
 
         const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
         const dim3 block(WM * WN * 32);

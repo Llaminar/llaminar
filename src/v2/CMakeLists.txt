@@ -790,11 +790,16 @@ if(HAVE_ROCM)
            "Clone and build RCCL from source (workaround for broken gfx906 binaries in packaged RCCL)"
            OFF)
 
+    # Discovery must know the local dependency location even when it is
+    # already built and nested dependency compilation is disabled. Runtime
+    # loading now honors this CMake selection exactly.
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
+    set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
+
     if(LLAMINAR_BUILD_RCCL_FROM_SOURCE)
         find_package(Git REQUIRED)
     
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
     set(RCCL_SOURCE_REF_FILE "${RCCL_EXTERNAL_DIR}/.llaminar-rccl-source-ref")
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
     set(RCCL_GIT_REF "rocm-7.1.1")  # Match our ROCm version
@@ -876,7 +881,6 @@ if(HAVE_ROCM)
     endif()
     
     # Check if RCCL build is up-to-date
-    set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
     
     set(RCCL_BUILD_COMMIT "missing")
@@ -982,6 +986,13 @@ if(HAVE_ROCM)
     if(RCCL_INCLUDE_DIR AND RCCL_LIBRARY)
         set(HAVE_RCCL ON CACHE BOOL "RCCL library found")
         add_compile_definitions(HAVE_RCCL)
+
+        # Dynamic loading isolates RCCL's NCCL-named symbols, but must not
+        # rediscover a different library at runtime. Compile the exact selected
+        # dependency into only the loader TU; packaged images install it at the
+        # same stable path in both their builder and runtime stages.
+        set_property(SOURCE collective/backends/RCCLDynamicLoader.cpp APPEND
+            PROPERTY COMPILE_DEFINITIONS "LLAMINAR_RCCL_LIBRARY_PATH=\"${RCCL_LIBRARY}\"")
         
         # Check if we're using our local build or system RCCL
         string(FIND "${RCCL_LIBRARY}" "${RCCL_BUILD_DIR}" RCCL_IS_LOCAL)
@@ -1438,9 +1449,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/ExpertWeightCache.cpp
     execution/moe/ExpertRebalancer.cpp
     execution/moe/DecodeExpertHistogram.cpp
+    execution/moe/NativeMoEMovementArchive.cpp
     execution/moe/MoERoutedExpertPlacementPlanner.cpp
     execution/moe/MoEOverlayEconomyProfileComposer.cpp
     execution/moe/MoEOverlayEconomyCalibrationPlanner.cpp
+    execution/moe/MoEOverlayCPUServiceMeasurement.cpp
     execution/moe/MoEOverlayEconomyCalibrationController.cpp
     execution/moe/MoEOverlayEconomyCertificationController.cpp
     execution/moe/MoEOverlayEconomyEvidenceExchange.cpp
@@ -1452,7 +1465,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayCapacityAdmission.cpp
     execution/moe/MoEOverlayActivationChannelPlan.cpp
     execution/moe/MoEOverlayLocalCapacityPlanner.cpp
+    execution/moe/MoEOverlayHostDemandMemoryPlan.cpp
     execution/moe/MoEExpertOverlayAuthorityPlan.cpp
+    execution/moe/MoEOptimizationMovementTopology.cpp
     execution/moe/MoEExpertOwnerMap.cpp
     execution/moe/MoEOverlayDevicePlacementPolicy.cpp
     execution/moe/MoEOverlayDeviceControllerProtocol.cpp
@@ -1566,6 +1581,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorMovement.cpp
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
@@ -1662,6 +1678,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     loaders/ModelContext.cpp
     loaders/ModelContextConfig.cpp
     loaders/WeightManager.cpp
+    loaders/PreparedOverlaySourceRetirement.cpp
     loaders/WeightSlicer.cpp
     loaders/WeightPlacementMap.cpp
     loaders/DeviceOrchestrator.cpp
@@ -1731,6 +1748,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # TurboQuant KV cache tensors
     tensors/TQ4Tensor.cpp
     tensors/TQ8Tensor.cpp
+    tensors/AttentionKeyQ8Tensor.cpp
     # KV Cache implementation (moved from tensors/)
     kernels/cpu/CPURingKVCache.cpp
     # Vectorized primitives (ported from V1)
@@ -1833,7 +1851,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/runner/ModelContextRetirement.cpp
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
-    execution/runner/NamedDomainGlobalRunner.cpp
+    execution/global/NamedDomainGraphBuilder.cpp
     # Snapshot capture (Phase 2: extracted from DeviceGraphOrchestrator)
     snapshots/SnapshotCapture.cpp
     # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)
@@ -2078,6 +2096,10 @@ if(HAVE_CUDA)
     target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(llaminar2_core PUBLIC 
         CUDA::cudart 
+        # Shared-core consumers must explicitly resolve Driver API symbols when
+        # building against toolkit stubs without an installed NVIDIA driver.
+        # This is a link dependency, never a stub copied into the runtime image.
+        CUDA::cuda_driver
         CUDA::cublas
         CUDA::cublasLt  # For fused GEMM+bias operations
     )

@@ -1,6 +1,11 @@
 /**
  * @file MoEOverlayEconomyCertificationController.cpp
  * @brief Local or all-rank measured-economy composition and installation.
+ *
+ * The exact layer catalog owns service coverage; this controller owns the
+ * ordered readiness exchange, immutable profile installation, and routing
+ * evidence rebase. A cold-format price remains missing until a real
+ * participant-local measurement supplies it.
  */
 
 #include "MoEOverlayEconomyCertificationController.h"
@@ -124,6 +129,14 @@ namespace llaminar2
         }
         if (config_.perf_device.empty())
             config_.perf_device = "expert_overlay";
+
+        if (!config_.prepared_service_measurements.empty())
+        {
+            (void)config_.layer_catalog->serviceEvidenceGaps(
+                config_.prepared_service_measurements,
+                config_.registry->localParticipantIds(),
+                config_.production_topology);
+        }
 
         const auto snapshot = config_.authority->snapshot();
         if (!snapshot || !snapshot->valid() ||
@@ -507,6 +520,16 @@ namespace llaminar2
             {
                 service_snapshot_contentions_.fetch_add(
                     1, std::memory_order_relaxed);
+            }
+            else if (!config_.prepared_service_measurements.empty())
+            {
+                // Certification owns the composition, not either measurement
+                // producer's live ledger. A later device snapshot still imports
+                // its original cumulative values without a fabricated offset.
+                raw_service = config_.layer_catalog->withPreparedServiceEvidence(
+                    raw_service, config_.prepared_service_measurements,
+                    config_.registry->localParticipantIds(),
+                    config_.production_topology);
             }
             const auto local_coverage = snapshot_ready
                                             ? serviceEvidenceCoverage(
@@ -974,114 +997,19 @@ namespace llaminar2
             throw std::logic_error(
                 "ExpertOverlay service certification lost its live snapshot");
         }
-        const std::size_t expected =
-            participant_ids.size() *
-            static_cast<std::size_t>(config_.model_metadata.num_layers);
-        if (rows.size() != expected)
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay service snapshot omitted a participant/layer row");
-        }
-
-        std::size_t row_index = 0;
-        for (const int participant_id : participant_ids)
-        {
-            for (int layer = 0;
-                 layer < config_.model_metadata.num_layers;
-                 ++layer, ++row_index)
-            {
-                const auto &row = rows[row_index];
-                if (!row.valid() ||
-                    row.participant_id != participant_id ||
-                    row.layer != layer)
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay service snapshot is malformed, overflowed, or non-canonical");
-                }
-                for (std::size_t phase = 0;
-                     phase < kExpertHistogramProductionSourceCount;
-                     ++phase)
-                {
-                    if (!config_.production_topology.reachable(
-                            layer, phase) &&
-                        row.sample_count[phase] != 0)
-                    {
-                        std::ostringstream message;
-                        message
-                            << "ExpertOverlay service snapshot sampled a "
-                               "runtime-disabled inference phase"
-                            << " participant=" << participant_id
-                            << " layer=" << layer
-                            << " source=" << serviceSourceName(phase)
-                            << " samples=" << row.sample_count[phase]
-                            << " activations="
-                            << row.activation_count[phase];
-                        throw std::invalid_argument(message.str());
-                    }
-                }
-            }
-        }
-
-        /*
-         * Sparse packets may legitimately leave individual equivalent layers
-         * idle. Readiness is therefore one real observation per participant,
-         * authenticated manifest class, and economy-priced production phase. The
-         * composer later pools exact integer totals over the same classes.
-         */
-        for (std::size_t participant = 0;
-             participant < participant_ids.size();
-             ++participant)
-        {
-            const std::size_t base = participant *
-                static_cast<std::size_t>(
-                    config_.model_metadata.num_layers);
-            for (const auto &group : config_.layer_catalog->groups())
-            {
-                if (!group.valid())
-                {
-                    throw std::logic_error(
-                        "ExpertOverlay service readiness received an invalid layer-equivalence class");
-                }
-                for (std::size_t phase = 0;
-                     phase < kExpertHistogramProductionSourceCount;
-                     ++phase)
-                {
-                    const bool class_phase_requires_evidence = std::any_of(
-                        group.member_layers.begin(),
-                        group.member_layers.end(),
-                        [this, phase](int layer)
-                        {
-                            return config_.production_topology
-                                .requiresServiceEvidence(layer, phase);
-                        });
-                    if (!class_phase_requires_evidence)
-                        continue;
-                    const bool observed = std::any_of(
-                        group.member_layers.begin(),
-                        group.member_layers.end(),
-                        [this, &rows, base, phase](int layer)
-                        {
-                            return config_.production_topology
-                                       .requiresServiceEvidence(layer, phase) &&
-                                   rows[
-                                       base + static_cast<std::size_t>(layer)]
-                                       .sample_count[phase] != 0;
-                        });
-                    if (!observed)
-                    {
-                        return {
-                            .complete = false,
-                            .participant_id =
-                                participant_ids[participant],
-                            .representative_layer =
-                                group.representative_layer,
-                            .source_index = phase,
-                        };
-                    }
-                }
-            }
-        }
-        return {.complete = true};
+        // The catalog owns coverage for preparation and certification alike.
+        // Keep the first-gap diagnostic without a second set of coverage rules.
+        const auto gaps = config_.layer_catalog->serviceEvidenceGaps(
+            rows, participant_ids, config_.production_topology);
+        if (gaps.empty())
+            return {.complete = true};
+        const auto &gap = gaps.front();
+        return {
+            .complete = false,
+            .participant_id = gap.participant_id,
+            .representative_layer = gap.representative_layer,
+            .source_index = expertHistogramProductionSourceIndex(gap.source),
+        };
     }
 
     std::string

@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 sys.path.insert(0, str(ROOT / "tests/v2/e2e/server"))
 import run_model_parity_e2e as e2e
+import model_parity_inventory as cell_inventory
 import long_context_checks as long_context
 
 
@@ -51,12 +52,12 @@ class E2EDiscoveryTests(unittest.TestCase):
     def test_full_parameter_survives_large_domain_arguments_and_escaping(self):
         record = {"model_parity_schema": 1, "id": "cell", "model": "/models/a model.gguf",
                   "e2e": {"server_args": ["--define-domain", "name=" + "x" * 1000, "a\n\"b"]}}
-        actual = e2e.parse_parameters(inventory([("ProductionParity/cell", record)]))
+        actual = cell_inventory.parse_parameters(inventory([("ProductionParity/cell", record)]))
         self.assertEqual(actual["Suite.ProductionParity/cell"], record)
 
     def test_untagged_cells_and_focused_diagnostics_do_not_become_certificates(self):
         record = {"model_parity_schema": 1, "e2e": None}
-        actual = e2e.parse_parameters(inventory([
+        actual = cell_inventory.parse_parameters(inventory([
             ("ProductionParity/off", record), ("FocusedDiagnostic", {"ignored": True})]))
         self.assertEqual(len(actual), 1)
         self.assertIsNone(actual["Suite.ProductionParity/off"]["e2e"])
@@ -64,11 +65,11 @@ class E2EDiscoveryTests(unittest.TestCase):
     def test_duplicate_stale_or_truncated_metadata_fails_closed(self):
         record = {"model_parity_schema": 1, "e2e": None}
         with self.assertRaises(ValueError):
-            e2e.parse_parameters(inventory([("ProductionParity/a", record)] * 2))
+            cell_inventory.parse_parameters(inventory([("ProductionParity/a", record)] * 2))
         with self.assertRaises(ValueError):
-            e2e.parse_parameters(inventory([("ProductionParity/a", {"model_parity_schema": 0})]))
+            cell_inventory.parse_parameters(inventory([("ProductionParity/a", {"model_parity_schema": 0})]))
         with self.assertRaises(ValueError):
-            e2e.parse_parameters('{"testsuites":')
+            cell_inventory.parse_parameters('{"testsuites":')
 
     def test_inherited_lite_or_small_context_cannot_weaken_profile(self):
         profile = {"context_length": 8192, "minimum_prompt_tokens": 4096,

@@ -765,32 +765,34 @@ namespace llaminar2
         }
 
         /**
-         * @brief Async copy data between devices
+         * @brief Enqueue a GPU copy on the exact source and destination streams.
          *
-         * Same semantics as copy() but returns immediately. Completion can be
-         * tracked via the stream or by calling synchronize().
+         * TransferEngine joins tensor producer events before submission and
+         * publishes completion on these same streams afterwards. Backends must
+         * not replace them with private streams or wait for GPU completion.
+         * Pointers and streams must remain alive through their completion.
          *
-         * @param dst_ptr Destination pointer
-         * @param dst_device Destination device
-         * @param src_ptr Source pointer
-         * @param src_device Source device
-         * @param bytes Number of bytes to copy
-         * @param stream Device stream for ordering (nullptr for default stream)
-         * @return true if copy was successfully enqueued, false if unsupported
-         *
-         * @note Caller must synchronize before reading dst_ptr
+         * @param dst_ptr Destination storage on dst_device.
+         * @param dst_device Exact receiving GPU.
+         * @param src_ptr Source storage on src_device.
+         * @param src_device Exact sending GPU.
+         * @param bytes Positive extent within both allocations.
+         * @param source_stream Non-null source event-acquired stream.
+         * @param destination_stream Non-null receiving stream.
+         * @return True only after both endpoint submissions succeed.
          */
-        virtual bool copyAsync(
+        virtual bool copyOnStreams(
             void *dst_ptr, DeviceId dst_device,
             const void *src_ptr, DeviceId src_device,
-            size_t bytes, void *stream = nullptr)
+            size_t bytes, void *source_stream, void *destination_stream)
         {
             (void)dst_ptr;
             (void)dst_device;
             (void)src_ptr;
             (void)src_device;
             (void)bytes;
-            (void)stream;
+            (void)source_stream;
+            (void)destination_stream;
             return false;
         }
 

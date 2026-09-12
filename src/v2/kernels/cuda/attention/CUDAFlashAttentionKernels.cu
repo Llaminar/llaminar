@@ -8,7 +8,7 @@
  * Algorithms implemented:
  * - Flash Attention 2 with Pipelined Prefetching: Optimized for Ampere (SM >= 8.0)
  *   - Uses dedicated producer warps to overlap global-to-shared K/V loads
- *   - Vectorized FP16/FP32 cache loads into double-buffered K/V tiles
+ *   - Vectorized FP16/BF16/FP32 cache loads into double-buffered K/V tiles
  *   - Producer/consumer warp specialization
  *   - WMMA (Tensor Core) acceleration for Q @ K^T matmul
  *   - Adaptive tile sizing for head_dim=64, head_dim=128, and head_dim=256
@@ -22,6 +22,8 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <type_traits>
 #include <mma.h> // WMMA (Warp Matrix Multiply-Accumulate) for Tensor Cores
 #include <cstdint>
 #include <cmath>
@@ -35,6 +37,7 @@
 #include "../../../backends/cuda/CUDAGraphCapture.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include "CUDAFlashAttentionLaunchPolicy.h"
+#include "../../../tensors/TensorType.h"
 #include "utils/DebugEnv.h"
 
 // WMMA namespace for Tensor Core operations
@@ -47,6 +50,22 @@ namespace
     // =========================================================================
 
     constexpr int WARP_SIZE = 32;
+
+    /** @brief Physical cache dtype, independent of FP32 model activations. */
+    enum class NativeKVType { FP32, FP16, BF16 };
+
+    /** @brief Native element type; no whole-cache conversion buffer is used. */
+    template <NativeKVType TYPE>
+    using NativeKVElement = std::conditional_t<TYPE == NativeKVType::FP32,
+        float, std::conditional_t<TYPE == NativeKVType::FP16, half, __nv_bfloat16>>;
+
+    /** @return An unchanged FP32 cache element for ordered accumulation. */
+    __device__ __forceinline__ float nativeKVLoad(float value) { return value; }
+    /** @return The exact FP32 representation of a native FP16 cache element. */
+    __device__ __forceinline__ float nativeKVLoad(half value) { return __half2float(value); }
+    /** @return The exact FP32 representation of a native BF16 cache element. */
+    __device__ __forceinline__ float nativeKVLoad(__nv_bfloat16 value) { return __bfloat162float(value); }
+
 
     // WMMA fragment dimensions (M x N x K)
     // We use 16x16x16 for FP16->FP32 accumulation which is well-supported
@@ -493,7 +512,7 @@ namespace
      * The caller's existing CTA barriers publish the current tile and protect
      * double-buffer reuse; this helper introduces no extra ordering operation.
      *
-     * @tparam KV_FP16 True for native half cache storage, false for FP32.
+     * @tparam KV_TYPE Native floating-point cache storage; only tile operands convert.
      * @param K Source cache base, aligned to sixteen bytes.
      * @param V Source value-cache base with the same geometry and alignment.
      * @param K_dst Current shared-memory key tile.
@@ -509,14 +528,14 @@ namespace
      * @param ring_row_origin Physical row representing logical cache row zero.
      * @param ring_row_capacity Zero for linear storage, positive for a ring.
      */
-    template <bool KV_FP16>
+    template <NativeKVType KV_TYPE>
     __device__ __forceinline__ void stageFA2KVTile(
         const void *K, const void *V, half *K_dst, half *V_dst,
         int batch_idx, int kv_stride, int n_kv_heads, int kv_head_idx,
         int head_dim, int smem_stride, int kv_start, int tile_rows,
         int ring_row_origin, int ring_row_capacity)
     {
-        constexpr int kVectorElements = KV_FP16 ? 8 : 4;
+        constexpr int kVectorElements = KV_TYPE == NativeKVType::FP32 ? 4 : 8;
         const int vectors_per_row = head_dim / kVectorElements;
         const size_t batch_offset =
             static_cast<size_t>(batch_idx) * kv_stride * n_kv_heads * head_dim;
@@ -537,7 +556,7 @@ namespace
                 kv_head_idx * head_dim + d;
             half *key_destination = K_dst + row * smem_stride + d;
             half *value_destination = V_dst + row * smem_stride + d;
-            if constexpr (KV_FP16)
+            if constexpr (KV_TYPE == NativeKVType::FP16)
             {
                 *reinterpret_cast<uint4 *>(key_destination) =
                     *reinterpret_cast<const uint4 *>(
@@ -545,6 +564,30 @@ namespace
                 *reinterpret_cast<uint4 *>(value_destination) =
                     *reinterpret_cast<const uint4 *>(
                         static_cast<const half *>(V) + source_offset);
+            }
+            else if constexpr (KV_TYPE == NativeKVType::BF16)
+            {
+                // Eight BF16 elements still occupy one coalesced 16-byte load.
+                // Conversion happens only in registers/on-chip tiles, exactly
+                // where FP32 storage already converts for the WMMA operand.
+                const uint4 key = *reinterpret_cast<const uint4 *>(
+                    static_cast<const __nv_bfloat16 *>(K) + source_offset);
+                const uint4 value = *reinterpret_cast<const uint4 *>(
+                    static_cast<const __nv_bfloat16 *>(V) + source_offset);
+                const unsigned int key_words[4] = {key.x, key.y, key.z, key.w};
+                const unsigned int value_words[4] = {value.x, value.y, value.z, value.w};
+                auto *key_pairs = reinterpret_cast<half2 *>(key_destination);
+                auto *value_pairs = reinterpret_cast<half2 *>(value_destination);
+#pragma unroll
+                for (int pair = 0; pair < 4; ++pair)
+                {
+                    key_pairs[pair] = __floats2half2_rn(
+                        __uint_as_float(key_words[pair] << 16),
+                        __uint_as_float(key_words[pair] & 0xffff0000u));
+                    value_pairs[pair] = __floats2half2_rn(
+                        __uint_as_float(value_words[pair] << 16),
+                        __uint_as_float(value_words[pair] & 0xffff0000u));
+                }
             }
             else
             {
@@ -593,17 +636,14 @@ namespace
      * MAX_Q_WARP_GROUPS. The launch block contains producer warps plus exactly
      * the active consumer warps, so narrow geometry does not carry idle
      * threads while every row executes one canonical compiled instruction body.
-     *   KV_FP16: When true, K/V pointers are const half* (FP16) and producer
-     *            warps copy them directly into shared memory.
-     *            When false, K/V are const float* — converted to FP16 per element.
-     *            FP16 path eliminates the FP16→FP32→FP16 round-trip when KV cache
-     *            is already FP16, roughly halving K/V global memory bandwidth.
+     *   KV_TYPE: Native FP16/BF16/FP32 storage. Only producer loads differ;
+     *            shared operands and the arithmetic tree remain unchanged.
      */
     template <int MAX_Q_WARP_GROUPS,
               int PV_WARPS_PER_Q_GROUP,
               int HEAD_DIM,
               int TILE_KV,
-              bool KV_FP16 = false,
+              NativeKVType KV_TYPE = NativeKVType::FP32,
               bool WRITE_CONTEXT_PARTIAL = false>
     __global__ void flash_attention_2_pipelined_kernel(
         const float *__restrict__ Q,
@@ -836,11 +876,9 @@ namespace
         // Pointers for this batch/head
         const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
 
-        // K/V pointers depend on KV_FP16 template parameter.
-        // When KV_FP16=true, K/V are already FP16 in global memory (KV cache);
-        // when false, they are FP32 workspace buffers.
+        // Native storage is selected at compile time; the producer owns only
+        // on-chip conversion, never a persistent whole-cache staging buffer.
 
-        // ALL warps: Load Q tile (done once, always FP32→FP16)
         for (int i = threadIdx.x; i < q_tile_rows * head_dim; i += blockDim.x)
         {
             int local_row = i / head_dim;
@@ -901,7 +939,7 @@ namespace
             half *K_dst_0 = get_K_tile(0);
             half *V_dst_0 = get_V_tile(0);
 
-            stageFA2KVTile<KV_FP16>(
+            stageFA2KVTile<KV_TYPE>(
                 K, V, K_dst_0, V_dst_0, batch_idx, kv_stride, n_kv_heads,
                 kv_head_idx, head_dim, smem_stride, kv_start_0, actual_len_0,
                 ring_row_origin, ring_row_capacity);
@@ -949,7 +987,7 @@ namespace
                 half *K_dst = get_K_tile(next_stage);
                 half *V_dst = get_V_tile(next_stage);
 
-                stageFA2KVTile<KV_FP16>(
+                stageFA2KVTile<KV_TYPE>(
                     K, V, K_dst, V_dst, batch_idx, kv_stride, n_kv_heads,
                     kv_head_idx, head_dim, smem_stride, next_kv_start,
                     next_actual_len, ring_row_origin, ring_row_capacity);
@@ -1501,17 +1539,23 @@ namespace
     FA2_INSTANTIATE(QW, PVW, HD, 32, KV16);      \
     FA2_INSTANTIATE(QW, PVW, HD, 64, KV16)
 
-    FA2_INSTANTIATE_TILES(6, 1, 64, false);
-    FA2_INSTANTIATE_TILES(4, 1, 128, false);
-    FA2_INSTANTIATE_TILES(2, 1, 256, false);
-    FA2_INSTANTIATE_TILES(2, 2, 256, false);
-    FA2_INSTANTIATE_TILES(2, 4, 256, false);
+    FA2_INSTANTIATE_TILES(6, 1, 64, NativeKVType::FP32);
+    FA2_INSTANTIATE_TILES(4, 1, 128, NativeKVType::FP32);
+    FA2_INSTANTIATE_TILES(2, 1, 256, NativeKVType::FP32);
+    FA2_INSTANTIATE_TILES(2, 2, 256, NativeKVType::FP32);
+    FA2_INSTANTIATE_TILES(2, 4, 256, NativeKVType::FP32);
 
-    FA2_INSTANTIATE_TILES(6, 1, 64, true);
-    FA2_INSTANTIATE_TILES(4, 1, 128, true);
-    FA2_INSTANTIATE_TILES(2, 1, 256, true);
-    FA2_INSTANTIATE_TILES(2, 2, 256, true);
-    FA2_INSTANTIATE_TILES(2, 4, 256, true);
+    FA2_INSTANTIATE_TILES(6, 1, 64, NativeKVType::FP16);
+    FA2_INSTANTIATE_TILES(4, 1, 128, NativeKVType::FP16);
+    FA2_INSTANTIATE_TILES(2, 1, 256, NativeKVType::FP16);
+    FA2_INSTANTIATE_TILES(2, 2, 256, NativeKVType::FP16);
+    FA2_INSTANTIATE_TILES(2, 4, 256, NativeKVType::FP16);
+
+    FA2_INSTANTIATE_TILES(6, 1, 64, NativeKVType::BF16);
+    FA2_INSTANTIATE_TILES(4, 1, 128, NativeKVType::BF16);
+    FA2_INSTANTIATE_TILES(2, 1, 256, NativeKVType::BF16);
+    FA2_INSTANTIATE_TILES(2, 2, 256, NativeKVType::BF16);
+    FA2_INSTANTIATE_TILES(2, 4, 256, NativeKVType::BF16);
 
 #undef FA2_INSTANTIATE_TILES
 #undef FA2_INSTANTIATE
@@ -1559,216 +1603,6 @@ namespace
         return min(
             max_num_splits,
             max(1, kv_len / max(1, min_kv_per_split)));
-    }
-
-    /**
-     * @brief Flash Decoding kernel for single-query decode (warp-cooperative)
-     *
-     * Parallelizes over KV cache using split-K pattern.
-     * Grid: (n_heads, num_splits, batch_size)
-     * Block: (256,) threads = 8 warps
-     *
-     * Each warp processes KV positions cooperatively: all 32 lanes share the
-     * dot product and V accumulation for each position. For head_dim=128,
-     * each lane owns 4 output dimensions (128/32 = 4).
-     */
-    __global__ __launch_bounds__(256, 4) void flash_decoding_fp32_kernel(
-        const float *__restrict__ Q,
-        const float *__restrict__ K_cache,
-        const float *__restrict__ V_cache,
-        float *__restrict__ O_partial,
-        float *__restrict__ m_partial,
-        float *__restrict__ l_partial,
-        int kv_len,
-        int n_heads,
-        int n_kv_heads,
-        int head_dim,
-        int num_splits,
-        float softmax_scale,
-        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
-        int head_start = 0,
-        int gqa_n_rep = 0)
-    {
-        int kv_stride = kv_len;
-        int kv_len_runtime = kv_len;
-        int ring_row_origin = 0;
-        int ring_row_capacity = 0;
-        if (device_params)
-        {
-            kv_len_runtime = device_params->kv_len;
-            kv_stride = device_params->kv_stride;
-            ring_row_origin = device_params->ring_row_origin;
-            ring_row_capacity = device_params->ring_row_capacity;
-        }
-
-        const int head_idx = blockIdx.x;
-        const int split_idx = blockIdx.y;
-        const int batch_idx = blockIdx.z;
-
-        const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
-        const int kv_head_idx = (gqa_n_rep > 0)
-                                    ? (head_start + head_idx) / effective_gqa
-                                    : head_idx / effective_gqa;
-
-        const int row_num_splits =
-            activeDecodeSplits(kv_len_runtime, num_splits, 16);
-        if (split_idx >= row_num_splits)
-            return;
-
-        const int split_size =
-            (kv_len_runtime + row_num_splits - 1) / row_num_splits;
-        const int kv_start = split_idx * split_size;
-        const int kv_end = min(kv_start + split_size, kv_len_runtime);
-
-        const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
-
-        // Empty ranges use the same zero-initialized online reduction below.
-        // Keeping one terminal partial publisher also avoids retaining an
-        // early-exit output address across the complete K/V traversal.
-
-        const int tid = threadIdx.x;
-        const int num_threads = blockDim.x;
-        const int warp_id = tid / WARP_SIZE;
-        const int lane_id = tid % WARP_SIZE;
-        const int num_warps = num_threads / WARP_SIZE;
-
-        // Load Q into shared memory (all threads cooperate)
-        extern __shared__ char smem[];
-        float *Q_shared = reinterpret_cast<float *>(smem);
-
-        const float *Q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
-        for (int d = tid; d < head_dim; d += num_threads)
-        {
-            Q_shared[d] = Q_ptr[d];
-        }
-        __syncthreads();
-
-        // Per-lane O accumulators — only this lane's output dimensions
-        // For head_dim=128, WARP_SIZE=32: each lane owns 4 dims
-        // Lane i owns dims: i, i+32, i+64, i+96 (strided by WARP_SIZE)
-        constexpr int MAX_DIMS_PER_LANE = 8; // supports head_dim up to 256
-        float O_lane[MAX_DIMS_PER_LANE] = {0};
-        float m_local = -FLT_MAX;
-        float l_local = 0.0f;
-
-        const float *K_batch = K_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
-        const float *V_batch = V_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
-
-        // =================================================================
-        // Main loop: warp-cooperative KV processing
-        //
-        // Each warp processes a strided subset of KV positions.
-        // Within each position, all 32 lanes cooperate on the dot product
-        // and V accumulation. K/V loads are coalesced across lanes.
-        // =================================================================
-        for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
-        {
-            const int physical_kv_pos = ring_row_capacity > 0
-                                            ? (ring_row_origin + kv_pos) %
-                                                  ring_row_capacity
-                                            : kv_pos;
-            const float *K_ptr =
-                K_batch + physical_kv_pos * n_kv_heads * head_dim +
-                kv_head_idx * head_dim;
-
-            // Cooperative dot product: each lane handles head_dim/32 elements
-            float partial_dot = 0.0f;
-            for (int d = lane_id; d < head_dim; d += WARP_SIZE)
-            {
-                partial_dot += Q_shared[d] * K_ptr[d];
-            }
-
-            // Warp reduce → all lanes get full dot product (5 shuffles)
-            float score = warpReduceSum(partial_dot) * softmax_scale;
-
-            // Online softmax — score is uniform across all lanes,
-            // so m_local and l_local stay warp-uniform
-            float m_new = fmaxf(m_local, score);
-            float scale_old = __expf(m_local - m_new);
-            float p = __expf(score - m_new);
-
-            l_local = l_local * scale_old + p;
-
-            // V accumulation: each lane updates only its own output dims
-            const float *V_ptr =
-                V_batch + physical_kv_pos * n_kv_heads * head_dim +
-                kv_head_idx * head_dim;
-            int o_idx = 0;
-            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
-            {
-                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * V_ptr[d];
-            }
-
-            m_local = m_new;
-        }
-
-        // =================================================================
-        // Inter-warp reduction using shared memory
-        //
-        // Each warp has (m_local, l_local) uniform across its lanes,
-        // and O distributed across lanes (each lane owns head_dim/32 dims).
-        // We merge all warps' results, then write the final partial output.
-        // =================================================================
-        __shared__ float block_m[8];
-        __shared__ float block_l[8];
-        __shared__ float block_O[8 * 256]; // 8 warps × max head_dim=256
-
-        if (lane_id == 0)
-        {
-            block_m[warp_id] = m_local;
-            block_l[warp_id] = l_local;
-        }
-        // Each lane writes its O values to the correct positions in block_O
-        {
-            int o_idx = 0;
-            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
-            {
-                block_O[warp_id * head_dim + d] = O_lane[o_idx];
-            }
-        }
-        __syncthreads();
-
-        // Thread 0 computes per-warp rescaling factors
-        __shared__ float warp_scales[8];
-        if (tid == 0)
-        {
-            float final_m = block_m[0];
-            float final_l = block_l[0];
-            warp_scales[0] = 1.0f;
-
-            for (int w = 1; w < num_warps; w++)
-            {
-                float other_m = block_m[w];
-                float other_l = block_l[w];
-
-                float m_new = fmaxf(final_m, other_m);
-                float scale_self = __expf(final_m - m_new);
-                float scale_other = __expf(other_m - m_new);
-
-                for (int prev = 0; prev < w; prev++)
-                    warp_scales[prev] *= scale_self;
-                warp_scales[w] = scale_other;
-
-                final_l = scale_self * final_l + scale_other * other_l;
-                final_m = m_new;
-            }
-
-            m_partial[partial_idx] = final_m;
-            l_partial[partial_idx] = final_l;
-        }
-        __syncthreads();
-
-        // Parallel output write — all threads cooperate
-        float *O_out = O_partial + partial_idx * head_dim;
-        for (int d = tid; d < head_dim; d += num_threads)
-        {
-            float sum = 0.0f;
-            for (int w = 0; w < num_warps; w++)
-            {
-                sum += warp_scales[w] * block_O[w * head_dim + d];
-            }
-            O_out[d] = sum;
-        }
     }
 
     /**
@@ -1852,11 +1686,10 @@ namespace
     }
 
     // =========================================================================
-    // Flash Decoding kernel — FP16 KV cache variant
+    // Flash Decoding kernel — typed native floating-point cache
     //
-    // Identical to flash_decoding_fp32_kernel but reads K/V from FP16 (half)
-    // storage directly, eliminating the FP16→FP32 conversion kernel launches
-    // and halving KV cache bandwidth.
+    // One arithmetic body serves scalar and grouped execution for every native
+    // floating-point cache type. Only loads and bank ownership are specialized.
     // =========================================================================
 
     /**
@@ -1870,7 +1703,7 @@ namespace
     };
 
     /**
-     * @brief FP16-KV flash-decode phase shared by every grouped row policy.
+     * @brief Native floating-point flash-decode phase shared by every row policy.
      *
      * The arithmetic in an active block is intentionally identical for scalar,
      * shared-cache verifier, and independent-request execution.  The mode only
@@ -1878,11 +1711,11 @@ namespace
      * derive the split count with the exact scalar policy, allowing one fixed
      * launch geometry to remain byte-equivalent across unequal KV lengths.
      */
-    template <FlashDecodeRowMode ROW_MODE>
-    __global__ __launch_bounds__(256, 4) void flash_decoding_fp16kv_kernel(
+    template <NativeKVType KV_TYPE, FlashDecodeRowMode ROW_MODE>
+    __global__ __launch_bounds__(256, 4) void flash_decoding_nativekv_kernel(
         const float *__restrict__ Q,
-        const half *__restrict__ K_cache,
-        const half *__restrict__ V_cache,
+        const NativeKVElement<KV_TYPE> *__restrict__ K_cache,
+        const NativeKVElement<KV_TYPE> *__restrict__ V_cache,
         float *__restrict__ O_partial,
         float *__restrict__ m_partial,
         float *__restrict__ l_partial,
@@ -1981,8 +1814,8 @@ namespace
                       static_cast<size_t>(kv_stride) *
                       static_cast<size_t>(n_kv_heads) *
                       static_cast<size_t>(head_dim);
-        const half *K_batch = K_cache + kv_batch_offset;
-        const half *V_batch = V_cache + kv_batch_offset;
+        const NativeKVElement<KV_TYPE> *K_batch = K_cache + kv_batch_offset;
+        const NativeKVElement<KV_TYPE> *V_batch = V_cache + kv_batch_offset;
 
         for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
         {
@@ -1990,14 +1823,14 @@ namespace
                                             ? (ring_row_origin + kv_pos) %
                                                   ring_row_capacity
                                             : kv_pos;
-            const half *K_ptr =
+            const NativeKVElement<KV_TYPE> *K_ptr =
                 K_batch + physical_kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
 
             // Cooperative dot product across head_dim
             float partial_dot = 0.0f;
             for (int d = lane_id; d < head_dim; d += WARP_SIZE)
             {
-                partial_dot += Q_shared[d] * __half2float(K_ptr[d]);
+                partial_dot += Q_shared[d] * nativeKVLoad(K_ptr[d]);
             }
 
             float score = warpReduceSum(partial_dot) * softmax_scale;
@@ -2008,12 +1841,12 @@ namespace
 
             l_local = l_local * scale_old + p;
 
-            const half *V_ptr =
+            const NativeKVElement<KV_TYPE> *V_ptr =
                 V_batch + physical_kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
             int o_idx = 0;
             for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
             {
-                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * __half2float(V_ptr[d]);
+                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * nativeKVLoad(V_ptr[d]);
             }
 
             m_local = m_new;
@@ -2871,12 +2704,12 @@ __global__ void dequant_q8_1_to_fp32_dynamic_kernel(
 // =============================================================================
 
 /**
- * @brief Internal templated FA2 launcher — dispatches based on head_dim + KV_FP16 flag.
+ * @brief Internal templated FA2 launcher — dispatches based on head_dim and native KV storage type.
  * Query groups are selected from every compiled width through 6 (HD64), 4
  * (HD128), or 2 (HD256). P@V striping remains an independent HD256 choice.
  * Returns -1 on invalid input, -2 if GPU doesn't support SM 8.0.
  */
-template <bool KV_FP16>
+template <NativeKVType KV_TYPE>
 static int fa2_prefill_launch(
     const float *Q, const void *K, const void *V, float *O,
     int batch_size, int seq_len, int kv_len,
@@ -2997,12 +2830,12 @@ static int fa2_prefill_launch(
 #define FA2_LAUNCH(QW, PVW, HD, TKV)                                                                       \
     do                                                                                                     \
     {                                                                                                      \
-        auto kernel_fn = flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_FP16>;                    \
+        auto kernel_fn = flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE>;                    \
         err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg.smem_size); \
         if (err != cudaSuccess)                                                                            \
         {                                                                                                  \
             printf("[cudaFlashAttn_prefill_fa2] cudaFuncSetAttribute<%d,%d,%d,%d,%d>(smem=%zu) FAILED: %s\n", \
-                   QW, PVW, HD, TKV, (int)KV_FP16, cfg.smem_size, cudaGetErrorString(err));               \
+                   QW, PVW, HD, TKV, (int)KV_TYPE, cfg.smem_size, cudaGetErrorString(err));               \
             return -1;                                                                                     \
         }                                                                                                  \
         kernel_fn<<<grid, cfg.block_size, cfg.smem_size, cuda_stream>>>(                                   \
@@ -3057,7 +2890,7 @@ static int fa2_prefill_launch(
                "grid=(%d,%d,%d), block=%d)\n",
                cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
                cfg.num_q_warp_groups, cfg.pv_warps_per_q_group, cfg.consumerWarps(),
-               (int)KV_FP16, grid.x, grid.y, grid.z, cfg.block_size);
+               (int)KV_TYPE, grid.x, grid.y, grid.z, cfg.block_size);
         return -1;
     }
     return 0;
@@ -3299,7 +3132,7 @@ static bool appendFA2ReducerConditionalNode(
  * @tparam PVW P@V stripe warps assigned to each query group.
  * @tparam HD Compile-time head-dimension ceiling.
  * @tparam TKV Physical K/V shared-memory tile.
- * @tparam KV_FP16 True when K/V storage is native FP16.
+ * @tparam KV_TYPE Physical floating-point K/V storage.
  * @param arguments Immutable transaction tensors and logical geometry.
  * @param config Capture-time physical launch configuration.
  * @param schedule Sequence-node or context-grid physical scheduling. During
@@ -3310,7 +3143,7 @@ static bool appendFA2ReducerConditionalNode(
  * @param stream Exact non-null producer stream captured by the caller.
  * @return Zero on successful launch submission, otherwise a fatal launch error.
  */
-template <int QW, int PVW, int HD, int TKV, bool KV_FP16>
+template <int QW, int PVW, int HD, int TKV, NativeKVType KV_TYPE>
 static int launchFA2ContextTransactionSpecialization(
     const FA2ContextTransactionArguments &arguments,
     const FA2KernelConfig &config,
@@ -3318,7 +3151,7 @@ static int launchFA2ContextTransactionSpecialization(
     cudaStream_t stream)
 {
     auto context_phase =
-        flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_FP16, true>;
+        flash_attention_2_pipelined_kernel<QW, PVW, HD, TKV, KV_TYPE, true>;
     const cudaError_t attribute_status = cudaFuncSetAttribute(
         context_phase,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -3355,7 +3188,7 @@ static int launchFA2ContextTransactionSpecialization(
 
     auto direct_phase =
         flash_attention_2_pipelined_kernel<
-            QW, PVW, HD, TKV, KV_FP16, false>;
+            QW, PVW, HD, TKV, KV_TYPE, false>;
     if (arguments.device_direct_partition_limit > 0)
     {
         const cudaError_t direct_attribute_status = cudaFuncSetAttribute(
@@ -3644,9 +3477,9 @@ static int launchFA2ContextTransactionSpecialization(
  * stream, head mapping, partition envelope, adaptive schedule, or unsupported
  * specialization fails closed.
  *
- * @tparam KV_FP16 True for native FP16 K/V storage.
+ * @tparam KV_TYPE Physical floating-point K/V storage.
  */
-template <bool KV_FP16>
+template <NativeKVType KV_TYPE>
 static int fa2_context_transaction_launch(
     const float *Q,
     const void *K,
@@ -3793,7 +3626,7 @@ static int fa2_context_transaction_launch(
 
 #define FA2_CONTEXT_DISPATCH(QW, PVW, HD, TKV)                              \
     return launchFA2ContextTransactionSpecialization<                       \
-        QW, PVW, HD, TKV, KV_FP16>(arguments, config, schedule, stream)
+        QW, PVW, HD, TKV, KV_TYPE>(arguments, config, schedule, stream)
 
 #define FA2_CONTEXT_DISPATCH_TILE(QW, PVW, HD) \
     do                                          \
@@ -3825,6 +3658,84 @@ static int fa2_context_transaction_launch(
     return -1;
 }
 
+
+/**
+ * @brief Submit two native-KV decode nodes for any row ownership policy.
+ *
+ * Cache dtype changes loads only. A row's device-owned length selects the
+ * scalar split tree; the fixed launch envelope and persistent partial buffers
+ * make reset/replay and grouped execution use exactly the same arithmetic.
+ * @tparam KV_TYPE Physical floating-point cache storage.
+ * @tparam ROW_MODE Bank/parameter ownership, never a different reduction policy.
+ * @return Zero for successful submission, -1 for invalid input or a CUDA error.
+ */
+template <NativeKVType KV_TYPE, FlashDecodeRowMode ROW_MODE>
+static int nativeKVDecodeLaunch(
+    const float *Q, const void *K, const void *V, float *O,
+    float *O_partial, float *m_partial, float *l_partial,
+    int total_rows, int query_rows, int kv_len,
+    int n_heads, int n_kv_heads, int head_dim, int num_splits,
+    const llaminar2::attention::AttentionDeviceParams *device_params,
+    void *stream, int device_idx, int head_start, int gqa_n_rep)
+{
+    constexpr bool row_local = ROW_MODE != FlashDecodeRowMode::OrdinaryBatch;
+    if (!Q || !K || !V || !O || !O_partial || !m_partial || !l_partial ||
+        !stream || total_rows <= 0 || query_rows <= 0 || kv_len <= 0 ||
+        n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 ||
+        num_splits <= 0 || num_splits > 32 ||
+        (row_local && (!device_params || total_rows >
+            llaminar2::attention::kMaxGroupedVerifierAttentionRows)))
+        return -1;
+    if (cudaSetDevice(device_idx) != cudaSuccess)
+        return -1;
+
+    const auto cuda_stream = static_cast<cudaStream_t>(stream);
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const dim3 phase_grid(n_heads, num_splits, total_rows);
+    flash_decoding_nativekv_kernel<KV_TYPE, ROW_MODE>
+        <<<phase_grid, 256, head_dim * sizeof(float), cuda_stream>>>(
+            Q, static_cast<const NativeKVElement<KV_TYPE> *>(K),
+            static_cast<const NativeKVElement<KV_TYPE> *>(V),
+            O_partial, m_partial, l_partial, kv_len, n_heads, n_kv_heads,
+            head_dim, num_splits, scale, device_params, query_rows,
+            head_start, gqa_n_rep);
+    // Surface a failed producer before submitting its dependent reduction.
+    if (cudaGetLastError() != cudaSuccess)
+        return -1;
+
+    const int output_tiles = head_dim >= 256 ? 2 : 1;
+    const dim3 reduce_grid(n_heads, total_rows, output_tiles);
+    const int reduce_threads = min((head_dim + output_tiles - 1) / output_tiles, 256);
+    if constexpr (row_local)
+        flash_decoding_grouped_row_reduce_fp32_kernel
+            <<<reduce_grid, reduce_threads, 0, cuda_stream>>>(
+                O_partial, m_partial, l_partial, O, n_heads, head_dim,
+                num_splits, device_params);
+    else
+        flash_decoding_reduce_fp32_kernel
+            <<<reduce_grid, reduce_threads, 0, cuda_stream>>>(
+                O_partial, m_partial, l_partial, O, n_heads, head_dim,
+                num_splits, kv_len, /*min_kv_per_split=*/16, device_params);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/** @brief Resolve native storage once on submission, never inside a device row. */
+template <typename Launch>
+static int dispatchNativeKV(llaminar2::TensorType type, Launch launch)
+{
+    switch (type)
+    {
+    case llaminar2::TensorType::FP16:
+        return launch.template operator()<NativeKVType::FP16>();
+    case llaminar2::TensorType::BF16:
+        return launch.template operator()<NativeKVType::BF16>();
+    case llaminar2::TensorType::FP32:
+        return launch.template operator()<NativeKVType::FP32>();
+    default:
+        return -1;
+    }
+}
+
 // =============================================================================
 // Extern "C" Wrapper Functions
 // =============================================================================
@@ -3843,7 +3754,7 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        return fa2_prefill_launch<false>(
+        return fa2_prefill_launch<NativeKVType::FP32>(
             Q, static_cast<const void *>(K), static_cast<const void *>(V), O,
             batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
             causal, window_size, position_offset, device_params, mask,
@@ -3870,8 +3781,34 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        return fa2_prefill_launch<true>(
+        return fa2_prefill_launch<NativeKVType::FP16>(
             Q, K_fp16, V_fp16, O,
+            batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+            causal, window_size, position_offset, device_params, mask,
+            static_cast<cudaStream_t>(stream), device_idx,
+            head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Native BF16 FA2 transaction using the canonical tiled producer.
+     * Storage remains BF16; only on-chip WMMA operands convert to half, just as
+     * native FP32 operands do. Captured topology and workspace are unchanged.
+     * @return Zero on submission, otherwise the precise launch failure.
+     */
+    int cudaFlashAttn_prefill_fa2_bf16kv(
+        const float *Q, const void *K_bf16, const void *V_bf16, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        return fa2_prefill_launch<NativeKVType::BF16>(
+            Q, K_bf16, V_bf16, O,
             batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
             causal, window_size, position_offset, device_params, mask,
             static_cast<cudaStream_t>(stream), device_idx,
@@ -3917,7 +3854,7 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        return fa2_context_transaction_launch<true>(
+        return fa2_context_transaction_launch<NativeKVType::FP16>(
             Q,
             K_fp16,
             V_fp16,
@@ -3987,7 +3924,7 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        return fa2_context_transaction_launch<false>(
+        return fa2_context_transaction_launch<NativeKVType::FP32>(
             Q,
             K,
             V,
@@ -4058,10 +3995,78 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        return fa2_context_transaction_launch<true>(
+        return fa2_context_transaction_launch<NativeKVType::FP16>(
             Q,
             K_fp16,
             V_fp16,
+            O,
+            O_partial,
+            m_partial,
+            l_partial,
+            batch_size,
+            seq_len,
+            kv_capacity,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            causal,
+            window_size,
+            position_offset,
+            device_params,
+            mask,
+            context_partition_size,
+            max_context_partitions,
+            context_partition_slots,
+            device_direct_partition_limit,
+            reducer_dimension_warps,
+            capture_conditional,
+            FA2ContextPartitionSchedule::ContextParallelGrid,
+            static_cast<cudaStream_t>(stream),
+            device_idx,
+            head_start,
+            gqa_n_rep);
+    }
+
+    /**
+     * @brief Native BF16 FA2 transaction using the canonical tiled producer.
+     * Storage remains BF16; only on-chip WMMA operands convert to half, just as
+     * native FP32 operands do. Captured topology and workspace are unchanged.
+     * @return Zero on submission, otherwise the precise launch failure.
+     */
+    int cudaFlashAttn_prefill_fa2_bf16kv_context_parallel(
+        const float *Q,
+        const void *K_bf16,
+        const void *V_bf16,
+        float *O,
+        float *O_partial,
+        float *m_partial,
+        float *l_partial,
+        int batch_size,
+        int seq_len,
+        int kv_capacity,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        bool causal,
+        int window_size,
+        int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        const float *mask,
+        int context_partition_size,
+        int max_context_partitions,
+        int context_partition_slots,
+        int device_direct_partition_limit,
+        int reducer_dimension_warps,
+        void *capture_conditional,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        return fa2_context_transaction_launch<NativeKVType::BF16>(
+            Q,
+            K_bf16,
+            V_bf16,
             O,
             O_partial,
             m_partial,
@@ -4110,43 +4115,11 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        // Ensure correct device is active for kernel launch and any implicit allocations
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // Phase 1: Compute partial attention per split
-        {
-            dim3 grid(n_heads, num_splits, batch_size);
-            int block_size = 256;
-
-            size_t smem_size = head_dim * sizeof(float); // Q_shared
-
-            flash_decoding_fp32_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
-                Q, K_cache, V_cache,
-                O_partial, m_partial, l_partial,
-                kv_len, n_heads, n_kv_heads, head_dim,
-                num_splits, softmax_scale, device_params,
-                head_start, gqa_n_rep);
-        }
-
-        // Phase 2: Reduce partials to final output
-        {
-            const int output_tiles = head_dim >= 256 ? 2 : 1;
-            dim3 grid(n_heads, batch_size, output_tiles);
-            const int block_size =
-                min((head_dim + output_tiles - 1) / output_tiles, 256);
-
-            flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
-                O_partial, m_partial, l_partial, O,
-                n_heads, head_dim, num_splits,
-                kv_len,
-                /*min_kv_per_split=*/16,
-                device_params);
-        }
-
-        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        return nativeKVDecodeLaunch<NativeKVType::FP32, FlashDecodeRowMode::OrdinaryBatch>(
+            Q, K_cache, V_cache, O, O_partial, m_partial, l_partial,
+            batch_size, /*query_rows=*/1, kv_len, n_heads, n_kv_heads,
+            head_dim, num_splits, device_params, stream, device_idx,
+            head_start, gqa_n_rep);
     }
 
     /**
@@ -4168,49 +4141,35 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        return nativeKVDecodeLaunch<NativeKVType::FP16, FlashDecodeRowMode::OrdinaryBatch>(
+            Q, K_cache_fp16, V_cache_fp16, O, O_partial, m_partial, l_partial,
+            batch_size, /*query_rows=*/1, kv_len, n_heads, n_kv_heads,
+            head_dim, num_splits, device_params, stream, device_idx,
+            head_start, gqa_n_rep);
+    }
 
-        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-
-        // Phase 1: Compute partial attention per split (FP16 KV)
-        {
-            dim3 grid(n_heads, num_splits, batch_size);
-            int block_size = 256;
-            size_t smem_size = head_dim * sizeof(float);
-
-            flash_decoding_fp16kv_kernel<FlashDecodeRowMode::OrdinaryBatch>
-                <<<grid, block_size, smem_size, cuda_stream>>>(
-                Q,
-                static_cast<const half *>(K_cache_fp16),
-                static_cast<const half *>(V_cache_fp16),
-                O_partial, m_partial, l_partial,
-                kv_len, n_heads, n_kv_heads, head_dim,
-                num_splits, softmax_scale, device_params,
-                /*query_rows_per_request=*/1,
-                head_start, gqa_n_rep);
-        }
-
-        // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
-        {
-            const int output_tiles = head_dim >= 256 ? 2 : 1;
-            dim3 grid(n_heads, batch_size, output_tiles);
-            const int block_size =
-                min((head_dim + output_tiles - 1) / output_tiles, 256);
-
-            flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
-                O_partial, m_partial, l_partial, O,
-                n_heads, head_dim, num_splits,
-                kv_len,
-                /*min_kv_per_split=*/16,
-                device_params);
-        }
-
-        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    /** @brief Native BF16 decode; expands each cache element only in registers. */
+    int cudaFlashAttn_decode_bf16kv(
+        const float *Q, const void *K_cache_bf16, const void *V_cache_bf16, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
+    {
+        return nativeKVDecodeLaunch<NativeKVType::BF16, FlashDecodeRowMode::OrdinaryBatch>(
+            Q, K_cache_bf16, V_cache_bf16, O, O_partial, m_partial, l_partial,
+            batch_size, /*query_rows=*/1, kv_len, n_heads, n_kv_heads,
+            head_dim, num_splits, device_params, stream, device_idx,
+            head_start, gqa_n_rep);
     }
 
     /**
-     * @brief Launch an economical, serial-equivalent grouped FP16-KV verifier.
+     * @brief Launch an economical, serial-equivalent grouped native-KV verifier.
      *
      * This is not an ordinary attention batch. Q/output have one row per MTP
      * verifier position, while K/V name one shared cache whose visible prefix
@@ -4218,10 +4177,11 @@ extern "C"
      * graph-capturable; row-local device metadata masks surplus split blocks and
      * reproduces the exact scalar split partition.
      */
-    int cudaFlashAttn_decode_fp16kv_grouped_verifier_rows(
+    int cudaFlashAttn_decode_nativekv_grouped_verifier_rows(
+        llaminar2::TensorType cache_type,
         const float *Q,
-        const void *K_cache_fp16,
-        const void *V_cache_fp16,
+        const void *K_cache,
+        const void *V_cache,
         float *O,
         float *O_partial,
         float *m_partial,
@@ -4238,86 +4198,30 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        if (!Q || !K_cache_fp16 || !V_cache_fp16 || !O ||
-            !O_partial || !m_partial || !l_partial || !device_params ||
-            !stream || verifier_rows < 2 ||
-            verifier_rows >
-                llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
-            max_kv_len <= verifier_rows || n_heads <= 0 ||
-            n_kv_heads <= 0 || head_dim <= 0 ||
-            max_num_splits <= 0 || max_num_splits > 32)
-        {
+        if (verifier_rows < 2 || max_kv_len <= verifier_rows)
             return -1;
-        }
-
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        const float softmax_scale =
-            1.0f / sqrtf(static_cast<float>(head_dim));
-
-        /*
-         * Phase 1 uses one z-plane per verifier row. All rows share K/V, but
-         * each active block reads that row's logical length and scalar-equivalent
-         * split count from stable device metadata.
-         */
-        {
-            const dim3 grid(n_heads, max_num_splits, verifier_rows);
-            constexpr int block_size = 256;
-            const size_t smem_size =
-                static_cast<size_t>(head_dim) * sizeof(float);
-            flash_decoding_fp16kv_kernel<FlashDecodeRowMode::SharedKVVerifier>
-                <<<grid, block_size, smem_size, cuda_stream>>>(
-                    Q,
-                    static_cast<const half *>(K_cache_fp16),
-                    static_cast<const half *>(V_cache_fp16),
-                    O_partial,
-                    m_partial,
-                    l_partial,
-                    max_kv_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_num_splits,
-                    softmax_scale,
-                    device_params,
-                    /*query_rows_per_request=*/1,
-                    head_start,
-                    gqa_n_rep);
-        }
-
-        /* Phase 2 merges each row's active split prefix in serial order. */
-        {
-            const int output_tiles = head_dim >= 256 ? 2 : 1;
-            const dim3 grid(n_heads, verifier_rows, output_tiles);
-            const int block_size =
-                min((head_dim + output_tiles - 1) / output_tiles, 256);
-            flash_decoding_grouped_row_reduce_fp32_kernel
-                <<<grid, block_size, 0, cuda_stream>>>(
-                    O_partial,
-                    m_partial,
-                    l_partial,
-                    O,
-                    n_heads,
-                    head_dim,
-                    max_num_splits,
-                    device_params);
-        }
-
-        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        return dispatchNativeKV(cache_type, [&]<NativeKVType KV_TYPE>() {
+            return nativeKVDecodeLaunch<KV_TYPE, FlashDecodeRowMode::SharedKVVerifier>(
+                Q, K_cache, V_cache, O, O_partial, m_partial, l_partial,
+                verifier_rows, 1, max_kv_len, n_heads, n_kv_heads,
+                head_dim, max_num_splits, device_params, stream, device_idx,
+                head_start, gqa_n_rep);
+        });
     }
 
     /**
-     * @brief Launch serial-equivalent FP16 attention for independent requests.
+     * @brief Launch serial-equivalent native attention for independent requests.
      *
      * K/V use request-major fixed strides of `max_kv_len`.  The z dimension
      * covers every request/query row, while device parameters select each row's
      * logical prefix and scalar-equivalent split count.  This keeps the launch
      * count constant at two regardless of request count.
      */
-    int cudaFlashAttn_decode_fp16kv_grouped_request_rows(
+    int cudaFlashAttn_decode_nativekv_grouped_request_rows(
+        llaminar2::TensorType cache_type,
         const float *Q,
-        const void *K_cache_fp16,
-        const void *V_cache_fp16,
+        const void *K_cache,
+        const void *V_cache,
         float *O,
         float *O_partial,
         float *m_partial,
@@ -4335,67 +4239,15 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
-        const int total_rows = request_count * query_rows;
-        if (!Q || !K_cache_fp16 || !V_cache_fp16 || !O ||
-            !O_partial || !m_partial || !l_partial || !device_params ||
-            !stream || request_count < 2 || query_rows <= 0 ||
-            total_rows >
-                llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
-            max_kv_len <= 0 || n_heads <= 0 ||
-            n_kv_heads <= 0 || head_dim <= 0 ||
-            max_num_splits <= 0 || max_num_splits > 32)
-        {
+        if (request_count < 2 || query_rows <= 0 || request_count > llaminar2::attention::kMaxGroupedVerifierAttentionRows / query_rows)
             return -1;
-        }
-
-        cudaSetDevice(device_idx);
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        const float softmax_scale =
-            1.0f / sqrtf(static_cast<float>(head_dim));
-
-        {
-            const dim3 grid(n_heads, max_num_splits, total_rows);
-            constexpr int block_size = 256;
-            const size_t smem_size =
-                static_cast<size_t>(head_dim) * sizeof(float);
-            flash_decoding_fp16kv_kernel<FlashDecodeRowMode::IndependentRequest>
-                <<<grid, block_size, smem_size, cuda_stream>>>(
-                    Q,
-                    static_cast<const half *>(K_cache_fp16),
-                    static_cast<const half *>(V_cache_fp16),
-                    O_partial,
-                    m_partial,
-                    l_partial,
-                    max_kv_len,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_num_splits,
-                    softmax_scale,
-                    device_params,
-                    query_rows,
-                    head_start,
-                    gqa_n_rep);
-        }
-
-        {
-            const int output_tiles = head_dim >= 256 ? 2 : 1;
-            const dim3 grid(n_heads, total_rows, output_tiles);
-            const int block_size =
-                min((head_dim + output_tiles - 1) / output_tiles, 256);
-            flash_decoding_grouped_row_reduce_fp32_kernel
-                <<<grid, block_size, 0, cuda_stream>>>(
-                    O_partial,
-                    m_partial,
-                    l_partial,
-                    O,
-                    n_heads,
-                    head_dim,
-                    max_num_splits,
-                    device_params);
-        }
-
-        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        return dispatchNativeKV(cache_type, [&]<NativeKVType KV_TYPE>() {
+            return nativeKVDecodeLaunch<KV_TYPE, FlashDecodeRowMode::IndependentRequest>(
+                Q, K_cache, V_cache, O, O_partial, m_partial, l_partial,
+                request_count * query_rows, query_rows, max_kv_len, n_heads, n_kv_heads,
+                head_dim, max_num_splits, device_params, stream, device_idx,
+                head_start, gqa_n_rep);
+        });
     }
 
     /**

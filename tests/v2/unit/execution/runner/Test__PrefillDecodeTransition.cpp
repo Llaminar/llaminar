@@ -13,6 +13,10 @@
  * Fix: prefill() sets prefill_logits_ready_ = true. The first decodeStep()
  * detects this flag, skips the forward() call, and samples from the existing
  * prefill logits directly.
+ * Seeded CPU sampling also compares ordinary and MTP entrypoints with broad
+ * distributions, so peaked argmax fixtures cannot conceal a different RNG key.
+ * Penalty ownership is checked independently: CPU stochastic distribution
+ * construction must see unmodified logits and apply history exactly once.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -175,6 +179,32 @@ namespace
             kMockResidentOutcomeRequestCapacity *
             sampling_math::kSpeculativeBatchMaxOutputTokens;
 
+        /**
+         * @brief Replace ready CPU rows with an adversarial sampling distribution.
+         * @param row One complete vocabulary row, copied to every ready batch row.
+         * @throws std::invalid_argument for a non-CPU endpoint or wrong geometry.
+         */
+        void setHostTerminalSamplingLogits(const std::vector<float> &row)
+        {
+            if (!primary_device_.is_cpu() || row.size() != VOCAB_SIZE)
+                throw std::invalid_argument("CPU sampling fixture needs one complete host row");
+            logits_ = row;
+            for (size_t offset = 0; offset < batch_logits_.size(); offset += row.size())
+                std::copy(row.begin(), row.end(), batch_logits_.begin() + offset);
+        }
+
+        /**
+         * @brief Supply stable model-free CPU logits for subsequent serial rows.
+         * @param row Complete vocabulary projection before any sampling penalties.
+         * @throws std::invalid_argument for a non-CPU endpoint or wrong geometry.
+         */
+        void setHostDecodeSamplingLogits(const std::vector<float> &row)
+        {
+            if (!primary_device_.is_cpu() || row.size() != VOCAB_SIZE)
+                throw std::invalid_argument("CPU decode fixture needs one complete host row");
+            host_decode_sampling_logits_ = row;
+        }
+
         MockInferenceRunner()
         {
             device_target_sample_tokens_.fill(-1);
@@ -297,9 +327,11 @@ namespace
         bool advanceMTPMainConditionFromDeviceResidentLogicalState(
             int32_t token_shadow,
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            MTPConditionForwardPurpose purpose,
             int request_index = 0) override
         {
             ++resident_main_condition_advance_count_;
+            condition_forward_purposes_.push_back(purpose);
             if (!supports_mtp_device_draft_token_input_ ||
                 !logical_state.coversRequest(request_index) ||
                 logical_state.next_condition_tokens_device !=
@@ -316,9 +348,11 @@ namespace
 
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
-            int target_sample_slot) override
+            int target_sample_slot,
+            MTPConditionForwardPurpose purpose) override
         {
             ++target_sample_main_condition_advance_count_;
+            condition_forward_purposes_.push_back(purpose);
             if (!supports_mtp_device_draft_token_input_ ||
                 target_sample_slot < 0 ||
                 target_sample_slot >=
@@ -5022,6 +5056,12 @@ namespace
         {
             return target_sample_main_condition_advance_count_;
         }
+
+        /** @return Commit ownership actually passed by production orchestration. */
+        const std::vector<MTPConditionForwardPurpose> &conditionForwardPurposes() const
+        {
+            return condition_forward_purposes_;
+        }
         int residentLogicalStateShiftedCommitCount() const
         {
             return resident_logical_state_shifted_commit_count_;
@@ -5759,7 +5799,8 @@ namespace
             return true;
         }
 
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override
         {
             ++prefix_probe_call_count_;
             PrefixRuntimeStateSnapshot probe;
@@ -6479,6 +6520,11 @@ namespace
 
         void setupDecodeLogits()
         {
+            if (!host_decode_sampling_logits_.empty())
+            {
+                logits_ = host_decode_sampling_logits_;
+                return;
+            }
             logits_.assign(VOCAB_SIZE, -10.0f);
             int token = DECODE_ARGMAX_TOKEN;
             if (decode_argmax_script_index_ < decode_argmax_script_.size())
@@ -6695,6 +6741,7 @@ namespace
         }
 
         std::vector<float> logits_;
+        std::vector<float> host_decode_sampling_logits_;
         std::vector<float> mtp_logits_;
         std::vector<float> all_position_logits_;
         std::shared_ptr<FP32Tensor> logits_local_;
@@ -6792,6 +6839,7 @@ namespace
         int device_target_shifted_commit_count_{0};
         int resident_main_condition_advance_count_{0};
         int target_sample_main_condition_advance_count_{0};
+        std::vector<MTPConditionForwardPurpose> condition_forward_purposes_;
         int resident_logical_state_shifted_commit_count_{0};
         int device_outcome_initial_shifted_commit_count_{0};
         int device_outcome_shifted_commit_count_{0};
@@ -7428,6 +7476,127 @@ namespace
         EXPECT_EQ(mock->forwardCallCount(), 1);
         EXPECT_EQ(mock->lastForwardSeqLen(), 5);
         EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(1, 2, 3, 4, 5));
+    }
+
+    /** Ordinary and speculative entrypoints must key draws by the same output position. */
+    TEST_F(Test__PrefillDecodeTransition, CPUSeededScalarSamplingUsesLogicalPosition)
+    {
+        const std::vector<float> logits = {0.3f, 0.4f, 0.1f, 0.2f, -0.1f,
+                                           0.0f, -0.3f, -0.2f, -0.5f, -0.4f};
+        for (unsigned seed : {1u, 123u, 4242u})
+        for (int position : {3, 214, 216, 512})
+        for (bool speculative : {false, true})
+        {
+            SCOPED_TRACE(std::to_string(seed) + ":" + std::to_string(position) +
+                         (speculative ? ":MTP" : ":serial"));
+            auto [runner, mock] = createRunner(
+                speculative, true, {}, nullptr, false, false, DeviceId::cpu(),
+                1, false, false, {}, MTPVerifyMode::SpeculativeSampling);
+            SamplingParams params;
+            params.temperature = 0.7f;
+            params.top_k = 7;
+            params.top_p = 0.9f;
+            params.seed = seed;
+            runner->setSamplingParams(params);
+            ASSERT_TRUE(runner->prefill(std::vector<int32_t>(position, 1)));
+            mock->setHostTerminalSamplingLogits(logits);
+            Sampler oracle(seed);
+            const auto distribution = oracle.compute_distribution(logits.data(), logits.size(), params);
+            const int expected = sampleMTPDistributionWithThreshold(
+                distribution, sampling_math::mtp_spec_threshold_from_seed(seed, position, 0));
+            const auto result = decodeWithBudget(runner, 2);
+            ASSERT_TRUE(result.success()) << result.error;
+            ASSERT_FALSE(result.tokens.empty());
+            EXPECT_EQ(result.tokens.front(), expected);
+        }
+    }
+
+    /**
+     * @brief CPU stochastic sampling applies each history penalty exactly once.
+     *
+     * The mock deliberately implements the backend-named in-place penalty API,
+     * just like the real CPU runner. This catches double application before the
+     * host sampler as well as unwanted mutation of the original model logits.
+     * History spans repeated words so presence, frequency, and DRY all execute.
+     */
+    TEST_F(Test__PrefillDecodeTransition, CPUStochasticPenaltyOwnership)
+    {
+        const std::vector<float> logits = {0.3f, 0.4f, 0.1f, 0.2f, -0.1f,
+                                           0.0f, -0.3f, -0.2f, -0.5f, -0.4f};
+        const std::array<SamplingParams, 4> penalty_policies{{
+            {.presence_penalty = 1.5f},
+            {.frequency_penalty = 0.4f},
+            {.dry_multiplier = 0.75f, .dry_allowed_length = 1},
+            {.presence_penalty = 1.5f, .frequency_penalty = 0.4f,
+             .dry_multiplier = 0.75f, .dry_allowed_length = 1},
+        }};
+        for (unsigned seed : {1u, 4242u})
+        for (std::size_t policy = 0; policy < penalty_policies.size(); ++policy)
+        {
+            SCOPED_TRACE(std::to_string(seed) + ":policy=" + std::to_string(policy));
+            auto [runner, mock] = createRunner();
+            auto params = penalty_policies[policy];
+            params.temperature = 0.7f;
+            params.top_k = 7;
+            params.top_p = 0.9f;
+            params.seed = seed;
+            runner->setSamplingParams(params);
+            ASSERT_TRUE(runner->prefill(std::vector<int32_t>(214, 1)));
+            mock->setHostTerminalSamplingLogits(logits);
+            mock->setHostDecodeSamplingLogits(logits);
+            Sampler oracle(seed);
+            for (int output = 0; output < 64; ++output)
+            {
+                SCOPED_TRACE("output=" + std::to_string(output));
+                const int expected = sampleMTPDistributionWithThreshold(
+                    oracle.compute_distribution(logits.data(), logits.size(), params),
+                    sampling_math::mtp_spec_threshold_from_seed(seed, 214 + output, 0));
+                const auto result = runner->decodeStep();
+                ASSERT_TRUE(result.success()) << result.error;
+                ASSERT_EQ(result.tokens.size(), 1u);
+                EXPECT_EQ(result.tokens.front(), expected);
+                EXPECT_EQ(mock->applyMainPenaltiesCount(), 0)
+                    << "the host distribution builder is the sole penalty owner";
+                EXPECT_TRUE(std::equal(logits.begin(), logits.end(), mock->logits()))
+                    << "sampling must not penalize the model-owned row in place";
+                oracle.record_token(expected);
+            }
+        }
+    }
+
+    /** Each batched CPU request uses its own unpadded position, not a mutable draw counter. */
+    TEST_F(Test__PrefillDecodeTransition, CPUSeededBatchedSamplingUsesLogicalPosition)
+    {
+        const std::vector<float> logits = {0.3f, 0.4f, 0.1f, 0.2f, -0.1f,
+                                           0.0f, -0.3f, -0.2f, -0.5f, -0.4f};
+        for (unsigned seed : {1u, 123u, 4242u})
+        {
+            auto [runner, mock] = createSingleDeviceRequestBatchRunner(
+                2, 1, MTPVerifyMode::SpeculativeSampling);
+            SamplingParams params;
+            params.temperature = 0.7f;
+            params.top_k = 7;
+            params.top_p = 0.9f;
+            params.seed = seed;
+            runner->setSamplingParams(params);
+            const std::vector<std::vector<int32_t>> prompts = {
+                std::vector<int32_t>(214, 1), std::vector<int32_t>(216, 2)};
+            ASSERT_TRUE(runner->prefillBatch(prompts)) << runner->lastError();
+            mock->setHostTerminalSamplingLogits(logits);
+            const auto result = runner->decodeStepBatch(2);
+            ASSERT_TRUE(result.error.empty()) << result.error;
+            ASSERT_EQ(result.requests.size(), prompts.size());
+            Sampler oracle(seed);
+            const auto distribution = oracle.compute_distribution(logits.data(), logits.size(), params);
+            for (size_t request = 0; request < prompts.size(); ++request)
+            {
+                const int expected = sampleMTPDistributionWithThreshold(
+                    distribution, sampling_math::mtp_spec_threshold_from_seed(
+                        seed, static_cast<int>(prompts[request].size()), 0));
+                ASSERT_FALSE(result.requests[request].tokens.empty());
+                EXPECT_EQ(result.requests[request].tokens.front(), expected);
+            }
+        }
     }
 
     TEST_F(Test__PrefillDecodeTransition, PrefillBatchInitializesRequestSlotsAndBlocksScalarDecode)
@@ -9162,6 +9331,9 @@ namespace
         EXPECT_EQ(mock->targetSampleMainConditionAdvanceCount(), 2);
         EXPECT_EQ(mock->forwardCallCount(), 3);
         EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(4));
+        EXPECT_THAT(mock->conditionForwardPurposes(), ElementsAre(
+            MTPConditionForwardPurpose::CommittedSerialToken,
+            MTPConditionForwardPurpose::CommittedSerialToken));
     }
 
     /**
@@ -17079,6 +17251,91 @@ namespace
         EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+        EXPECT_THAT(mock->conditionForwardPurposes(), ElementsAre(
+            MTPConditionForwardPurpose::CommittedSerialToken));
+    }
+
+    /** @brief Budget-one requests on either GPU backend own every new commit. */
+    TEST_F(Test__PrefillDecodeTransition,
+           MTPBudgetOneContinuationPreservesSerialCommitOwnershipOnBothBackends)
+    {
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            SCOPED_TRACE(device.toString());
+            auto [runner, mock] = createRunner(true, true);
+            mock->setPrimaryDevice(device);
+            mock->enableMTPTokenCoordination(false);
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            ASSERT_TRUE(runner->prefill({1, 2, 3}));
+            runner->setDecodeStepTokenBudget(1);
+            for (int row = 0; row != 3; ++row)
+            {
+                const auto step = runner->decodeStep();
+                ASSERT_TRUE(step.success()) << step.error;
+                ASSERT_EQ(step.tokens.size(), 1u);
+            }
+            EXPECT_THAT(mock->conditionForwardPurposes(), ElementsAre(
+                MTPConditionForwardPurpose::CommittedSerialToken,
+                MTPConditionForwardPurpose::CommittedSerialToken,
+                MTPConditionForwardPurpose::CommittedSerialToken));
+            EXPECT_EQ(mock->forwardGroupedMTPVerifierWithDeviceTokenIdsCount(), 0);
+        }
+    }
+
+    /**
+     * @brief CPU/CUDA/HIP budget-one calls protect only the rows they append.
+     *
+     * This device-free serving regression recreates the 4080/4096 boundary
+     * through the real request runner at fixed and dynamic depth 15. The mock
+     * records the typed request; no host cache mirror or diagnostic counter
+     * supplies admission geometry. The final row remains executable and a
+     * fresh request uses the same retained draft policy afterward.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           MTPCheckpointAppendBoundsFollowAdmittedWorkAcrossBackends)
+    {
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+            for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+            {
+                SCOPED_TRACE(::testing::Message() << device.toString()
+                    << " policy=" << static_cast<int>(mode));
+                MTPDepthPolicyConfig policy;
+                policy.mode = mode;
+                policy.min_depth = 1;
+                policy.initial_depth = 15;
+                policy.max_depth = 15;
+                auto [runner, mock] = createRunner(
+                    true, true, {}, nullptr, device.is_gpu(), false,
+                    device, 15, true, false, policy);
+                if (device.is_gpu())
+                {
+                    mock->enableMTPDeviceDraftTokenInput();
+                    mock->enableDeviceResidentMTPSpecStatePublication();
+                }
+                ASSERT_TRUE(runner->prefill(std::vector<int32_t>(4080, 1)));
+                runner->setDecodeStepTokenBudget(1);
+                for (int position = 4080; position < 4096; ++position)
+                {
+                    const auto step = runner->decodeStep();
+                    ASSERT_TRUE(step.success()) << step.error;
+                    ASSERT_EQ(step.tokens.size(), 1u);
+                    ASSERT_FALSE(mock->capturedCheckpointRequests().empty());
+                    const auto &request = mock->capturedCheckpointRequests().back();
+                    EXPECT_EQ(request.logical_cached_tokens, position);
+                    EXPECT_EQ(request.maximum_main_append_tokens, 1);
+                    EXPECT_EQ(request.maximum_shifted_append_tokens, 1);
+                    EXPECT_LE(request.logical_cached_tokens +
+                        request.maximum_main_append_tokens, 4096);
+                }
+                EXPECT_EQ(mock->forwardMTPCount(), 0);
+                EXPECT_EQ(mock->forwardGroupedMTPVerifierWithDeviceTokenIdsCount(), 0);
+                runner->clearCache();
+                ASSERT_TRUE(runner->prefill({1, 2, 3}));
+                const auto fresh = runner->decodeStep();
+                ASSERT_TRUE(fresh.success()) << fresh.error;
+                EXPECT_EQ(mock->capturedCheckpointRequests().back().maximum_main_append_tokens, 1);
+            }
     }
 
     /**
@@ -17331,6 +17588,10 @@ namespace
                 target_advances_before[child_index] + 1)
                 << "Every participant advances the resident terminal condition "
                    "exactly once on device.";
+            ASSERT_FALSE(child->conditionForwardPurposes().empty());
+            EXPECT_EQ(child->conditionForwardPurposes().back(),
+                      MTPConditionForwardPurpose::CommittedSerialToken)
+                << "Rank dispatch must preserve commit ownership for every child.";
             EXPECT_EQ(
                 child->residentNextConditionTokenObservationCount(),
                 observations_before[child_index] +

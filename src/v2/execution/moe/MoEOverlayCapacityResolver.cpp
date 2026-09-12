@@ -291,6 +291,17 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Reject an unmet quota with the exact limiting physical owners.
+         * @param tier Logical tier requesting another complete expert.
+         * @param layer_idx Layer whose next allocation could not be admitted.
+         * @param requested_quota Required logical expert count for this demand.
+         * @param demand Diagnostic name of the mandatory coverage obligation.
+         * @param footprints Canonical prepared projection footprints by layer.
+         * @param resource_index Logical participant to physical resource lookup.
+         * @param resources Current setup BOMs, never a separate runtime ledger.
+         * @throws std::invalid_argument with category-level admission evidence.
+         */
         [[noreturn]] void throwTierCapacityFailure(
             const TierState &tier,
             int layer_idx,
@@ -356,12 +367,22 @@ namespace llaminar2
                           bom.bytes(PhysicalMemoryOwner::RoutedExpertWeights))
                       << " staging_bytes="
                       << staging
+                      // Expose the canonical owners separately. A transfer
+                      // directory, weight-loader peak, and activation wire
+                      // buffer have different lifetimes and tuning controls;
+                      // their aggregate alone cannot identify an admission bug.
+                      << " weight_load_staging_bytes="
+                      << bom.bytes(PhysicalMemoryOwner::WeightLoadStaging)
+                      << " activation_transport_staging_bytes="
+                      << bom.bytes(PhysicalMemoryOwner::ActivationTransportStaging)
+                      << " expert_migration_staging_bytes="
+                      << bom.bytes(PhysicalMemoryOwner::ExpertMigrationStaging)
                       << " shadow_bytes="
                       << bom.bytes(PhysicalMemoryOwner::ExpertShadowSlots)
                       << " live_expert_bytes="
                       << bom.bytes(PhysicalMemoryOwner::RoutedExpertWeights);
             }
-            throw std::invalid_argument(error.str());
+            throw MoEOverlayCapacityExhausted(error.str());
         }
     } // namespace
 
@@ -938,6 +959,10 @@ namespace llaminar2
         }
 
         MoERoutedExpertPlacementPlan result = plan;
+        if (plan.replica_cache_capacity &&
+            plan.replica_cache_capacity != capacity.replica_cache_capacity)
+            throw std::logic_error("ExpertOverlay retained replica-cache grant changed during admission");
+        result.replica_cache_capacity = capacity.replica_cache_capacity;
         std::vector<bool> installed(result.routed_tiers.size(), false);
         for (const auto &resolved : capacity.tiers)
         {

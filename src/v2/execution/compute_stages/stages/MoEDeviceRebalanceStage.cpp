@@ -1,6 +1,11 @@
 /**
  * @file MoEDeviceRebalanceStage.cpp
  * @brief Implementation of graph-capturable MoE device rebalance stage.
+ *
+ * The stage binds persistent command/workspace storage and explicit collective
+ * streams. A durable apply prepares the reserved peer bank; its existing
+ * all-layer finalizer owns both selector publication and command retirement.
+ * Neither host scheduling nor payload-copy completion may release that lease.
  */
 
 #include "MoEDeviceRebalanceStage.h"
@@ -273,6 +278,25 @@ namespace llaminar2
     {
         return std::string(WS_PLACEMENT_PLAN_SCRATCH) + "_" +
                workspaceSuffix();
+    }
+
+    DeviceMoERebalanceMovementJournalView MoEDeviceRebalanceStage::movementJournalView() const
+    {
+        const auto capacity = workspaceCapacity();
+        if (!bound_workspace_ || !capacity.usesTransferSlots())
+            return {};
+        auto *controller = static_cast<DeviceMoERebalanceGraphControllerState *>(
+            bound_workspace_->getBuffer(controllerStateBufferName()));
+        // Taking an embedded-field address is pointer arithmetic, not a host
+        // read of the live controller. All counters remain device-owned.
+        return {
+            controller ? &controller->movement_journal : nullptr,
+            static_cast<DeviceMoERebalanceMovementWave *>(bound_workspace_->getBuffer(
+                workspaceBufferName(WS_MOVEMENT_WAVES, workspaceSuffix()))),
+            static_cast<DeviceMoERebalanceMovementEdge *>(bound_workspace_->getBuffer(
+                workspaceBufferName(WS_MOVEMENT_EDGES, workspaceSuffix()))),
+            static_cast<uint32_t>(capacity.movementJournalWaveCapacity()),
+            static_cast<uint32_t>(capacity.movementJournalEdgeCapacity())};
     }
 
     std::string MoEDeviceRebalanceStage::llepLayerPlansBufferName() const
@@ -1300,7 +1324,13 @@ namespace llaminar2
                     params_.overlay_epoch_arena->control(),
                     params_.overlay_epoch_arena->maintenanceEpoch(),
                     overlay_status,
-                    apply_status))
+                    apply_status,
+                    controller_state,
+                    command_header,
+                    static_cast<uint32_t>(commandBufferCount()),
+                    plan_entries, static_cast<uint32_t>(transferPlanCapacity()),
+                    params_.collective_payload_slot_bytes,
+                    movementJournalView()))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to enqueue durable overlay publication finalizer after "
                           << context);

@@ -14,40 +14,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     /** @return Whether @p key is a grouped main-verifier checkpoint. */
     auto Qwen35MoENodeExpertOverlayParityTest::isMTPMainVerifierDiagnosticKey(std::string_view key) -> bool
     {
-        static constexpr std::array<std::string_view, 21> kStageSuffixes = {
-            "ATTENTION_NORM",
-            "QKV_PROJECTION",
-            "Q_PROJECTION",
-            "GDN_Z_PROJECTION",
-            "ATTENTION_CONTEXT",
-            "ATTENTION_OUTPUT",
-            "ATTENTION_OUTPUT_ALLREDUCED",
-            "FFN_NORM_RESIDUAL_OUT",
-            "FFN_NORM",
-            "MOE_ROUTER_OUTPUT",
-            "MOE_ROUTING_INDICES",
-            "MOE_ROUTING_WEIGHTS",
-            "MOE_EXPERT_OUTPUT",
-            "MOE_SHARED_EXPERT_OUTPUT",
-            "MOE_SHARED_GATE_OUTPUT",
-            "MOE_COMBINED_OUTPUT",
-            "FFN_RESIDUAL",
-            "GDN_CONV1D_OUTPUT",
-            "GDN_DELTA_RULE_OUTPUT",
-            "GDN_NORM_GATE_OUTPUT",
-            "GDN_OUTPUT",
-        };
-        if (key == "EMBEDDING" || key == "FINAL_NORM" ||
-            key == "LM_HEAD" || key == "LM_HEAD_ROWS_SELECT")
-        {
-            return true;
-        }
-        if (!key.starts_with("layer"))
-            return false;
-        return std::any_of(
-            kStageSuffixes.begin(),
-            kStageSuffixes.end(),
-            [key](std::string_view suffix) { return key.ends_with(suffix); });
+        return isNativeVerifierRowCheckpoint(key);
     }
 
     /**
@@ -140,12 +107,11 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     }
 
     /**
-     * @brief Retain one serial main-model row under its exact placement epoch.
+     * @brief Retain the single same-prefix serial verifier oracle for this cell.
      *
-     * A later live-oracle extension may revisit the same logical row after an
-     * ExpertOverlay epoch change. In that case the newer row replaces the old
-     * diagnostic so grouped row zero is never compared with a stale physical
-     * placement. Re-observing the same epoch must carry the same token identity.
+     * The generic proof owns one captured serial request and publishes exactly
+     * one checkpoint. Placement alone is not request identity: accepting an
+     * older row from the same epoch would compare different hidden/KV inputs.
      */
     auto Qwen35MoENodeExpertOverlayParityTest::retainMTPSerialVerifierDiagnostic(
         const ProductionParityMTPSerialOracleBoundary &boundary) -> void
@@ -157,17 +123,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         if (!placement.has_value())
             return;
 
-        if (mtp_serial_verifier_diagnostic_.has_value() &&
-            mtp_serial_verifier_diagnostic_->execution_epoch == placement->epoch)
-        {
-            EXPECT_EQ(
-                mtp_serial_verifier_diagnostic_->boundary.output_index,
-                boundary.output_index);
-            EXPECT_EQ(
-                mtp_serial_verifier_diagnostic_->boundary.token,
-                boundary.token);
-            return;
-        }
+        ASSERT_FALSE(mtp_serial_verifier_diagnostic_.has_value())
+            << "A cell may publish only one same-prefix serial verifier oracle";
 
         mtp_serial_verifier_diagnostic_ = MTPSerialVerifierDiagnostic{
             .boundary = boundary,
@@ -178,56 +135,6 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             << "Serial MTP oracle exposed no main-model diagnostic snapshots";
     }
 
-    /**
-     * @brief Reuse the compared captured M=1 row before placement maintenance.
-     *
-     * GPU fixed-depth cells need no serial replay: ordinary parity already
-     * executed and compared the exact row selected for grouped verification.
-     * Dynamic-depth and CPU cells can require a longer oracle than the compact
-     * checkpoint corpus, so their explicit live-oracle callback remains the
-     * authority.
-     */
-    auto Qwen35MoENodeExpertOverlayParityTest::observeProductionParityDecodeBoundary(
-        const ProductionParityDecodeBoundary &boundary) -> void
-    {
-        if (!isQwen122ProductionTest() || !activeMTPEnabled() ||
-            !isRootParityRank() || !activePrimaryDevice().is_gpu() ||
-            config_.mtp_expectation == ParityMTPExpectation::DynamicDepth)
-        {
-            return;
-        }
-
-        const auto accepted = productionParityMTPAcceptedDraftReference();
-        if (!accepted.has_value() ||
-            accepted->reference_step != boundary.reference_step)
-        {
-            return;
-        }
-
-        const auto &boundaries = productionParityDecodeBoundaries();
-        ASSERT_FALSE(boundaries.empty());
-        ASSERT_EQ(&boundaries.back(), &boundary)
-            << "Decode observer did not receive the newly published boundary";
-        const PrefixRuntimeStateSnapshot *before = nullptr;
-        if (boundaries.size() == 1u)
-        {
-            ASSERT_TRUE(productionParityDecodePrefillState().has_value());
-            before = &*productionParityDecodePrefillState();
-        }
-        else
-        {
-            before = &boundaries[boundaries.size() - 2u].runtime_state;
-        }
-
-        const ProductionParityMTPSerialOracleBoundary serial_boundary{
-            .output_index = boundary.reference_step,
-            .token = boundary.committed_token,
-            .checkpoint_reference = true,
-            .before = *before,
-            .after = boundary.runtime_state,
-        };
-        retainMTPSerialVerifierDiagnostic(serial_boundary);
-    }
 
     /**
      * @brief Observe the primary sidecar bank under its exact live namespace.
@@ -295,7 +202,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                         std::max_element(reference.begin(), reference.end())));
             }
 
-            if (!comparison.passed)
+            if (!comparison.passed || (comparison.route_conditioned_proof &&
+                    !comparison.route_conditioned_proof->canonical_passed))
             {
                 size_t production_elements = 0u;
                 const float *const production =
@@ -321,6 +229,33 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                     diagnostic,
                     std::span<const float>(production, production_elements),
                     reference);
+                if (suffix == "MOE_EXPERT_OUTPUT")
+                {
+                    // Retain the operands of this failed expert equation too.
+                    // Independent CPU FP32 replay can attribute a cutoff-route
+                    // substitution versus faulty arithmetic without changing
+                    // the live routes or asking for another full-model run.
+                    for (const char *operand : {
+                             "FFN_NORM", "MOE_ROUTER_OUTPUT",
+                             "MOE_ROUTING_INDICES"})
+                    {
+                        auto operand_diagnostic = diagnostic;
+                        operand_diagnostic.stage = operand;
+                        operand_diagnostic.production_key =
+                            checkpoint.production_stage_prefix + operand;
+                        operand_diagnostic.reference_key =
+                            checkpoint.reference_stage_prefix + operand;
+                        size_t count = 0;
+                        const float *values = activeSnapshot(
+                            operand_diagnostic.production_key, count);
+                        const auto reference_values = loadPyTorchSnapshot(
+                            operand_diagnostic.reference_key);
+                        ASSERT_NE(values, nullptr);
+                        ASSERT_EQ(count, reference_values.size());
+                        retainMTPFailureValues(operand_diagnostic,
+                            std::span<const float>(values, count), reference_values);
+                    }
+                }
             }
         }
 
@@ -573,14 +508,15 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 continue;
             }
 
+            const auto byte_evidence = compareNativeVerifierRow(
+                {grouped, serial_values.size()}, serial_values);
             bool finite = true;
-            bool exact = true;
+            const bool exact = byte_evidence.passed();
             double maximum_absolute_error = 0.0;
             for (size_t index = 0u; index < serial_values.size(); ++index)
             {
                 finite = finite && std::isfinite(grouped[index]) &&
                          std::isfinite(serial_values[index]);
-                exact = exact && grouped[index] == serial_values[index];
                 maximum_absolute_error = std::max(
                     maximum_absolute_error,
                     std::abs(
@@ -601,11 +537,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 comparison.routing_overlap = exact ? 1.0f : 0.0f;
                 comparison.routing_top1_match = exact ? 1.0f : 0.0f;
             }
-            bool passed = finite &&
-                          (comparison.is_routing_stage
-                               ? exact
-                               : comparison.cosine_similarity >=
-                                     config_.decode_cosine_threshold);
+            bool passed = byte_evidence.passed();
             if (key == "LM_HEAD")
             {
                 comparison.kl_divergence = computeKLDivergence(
@@ -755,7 +687,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         snapshot_csv
             << "call,reference_step,reference_depth,production_key,reference_key,"
                "elements,cosine,max_abs_diff,kl,exact_indices,routing_overlap,"
-               "routing_top1_match,finite,passed\n";
+               "routing_top1_match,finite,passed,";
+        writeMoERouteProofCSVHeader(snapshot_csv);
+        snapshot_csv << '\n';
         failure_values_csv
             << "call,reference_step,reference_depth,stage,index,production,reference\n"
             << std::setprecision(std::numeric_limits<float>::max_digits10);
@@ -870,7 +804,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                         ? row.comparison.routing_top1_match
                         : 1.0f)
                 << ',' << (row.finite ? 1 : 0) << ','
-                << (row.passed ? 1 : 0) << '\n';
+                << (row.passed ? 1 : 0) << ',';
+            writeMoERouteProofCSV(snapshot_csv, row.comparison.route_conditioned_proof, row.passed);
+            snapshot_csv << '\n';
         };
 
         for (const MTPCheckpointDiagnostic &bank :

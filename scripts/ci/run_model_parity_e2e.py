@@ -9,98 +9,24 @@ behavioral oracle; mathematical parity remains a separate, complementary gate.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
 
 import run_production_parity_campaigns as parity
+from production_artifacts import digest, image_identity
+from model_parity_inventory import InventoryScope, discover as discover_inventory, export_manifest, source_revision
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def parse_parameters(output: str) -> dict[str, dict]:
-    """Read typed discovery JSON; reject duplicate or stale production entries."""
-    records = {}
-    for suite in json.loads(output)["testsuites"]:
-        for test in suite["testsuite"]:
-            if not test["name"].startswith("ProductionParity/"):
-                continue
-            exact = suite["name"] + "." + test["name"]
-            record = json.loads(test["value_param"])
-            if record.get("model_parity_schema") != 1:
-                raise ValueError(f"unsupported parameter schema: {exact}")
-            if exact in records:
-                raise ValueError(f"duplicate parameter: {exact}")
-            records[exact] = record
-    return records
-
-
 def discover(args: argparse.Namespace) -> list[tuple[parity.CampaignCell, str, dict]]:
-    """Join existing CTest cells to typed tags without interpreting cell names."""
-    if args.manifest:
-        manifest = json.loads(args.manifest.read_text())
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        if manifest.get("schema") != 1 or manifest.get("source_revision") != revision:
-            raise ValueError("E2E manifest must be generated from this source revision")
-        selected = []
-        for row in manifest["cells"]:
-            if (re.fullmatch(args.backend, row["backends"])
-                    and re.fullmatch(args.campaign, row["campaign"])
-                    and re.fullmatch(args.cell, row["case"])):
-                record = row["configuration"]
-                if record.get("model_parity_schema") != 1 or not record.get("e2e"):
-                    raise ValueError("manifest contains a non-certifiable configuration")
-                campaign = parity.CampaignCell(row["campaign"],
-                    parity.CampaignGroup(row["backends"], "ALL"),
-                    model_files=(record["model"],))
-                selected.append((campaign, row["case"], record))
-        if not selected or len({exact for _, exact, _ in selected}) != len(selected):
-            raise ValueError("E2E manifest selection is empty or contains duplicate cells")
-        return selected
-    campaigns = parity.discover_campaigns(
-        args.build_dir, backend_regex=args.backend, campaign_regex=args.campaign)
-    inventories = {}
-    selected = []
-    for campaign in campaigns:
-        binaries = [Path(arg) for arg in campaign.command
-                    if Path(arg).name.startswith("v2_integration_parity_")
-                    and Path(arg).name.endswith("_matrix")]
-        if len(binaries) != 1:
-            raise ValueError(f"ambiguous matrix executable: {campaign.name}")
-        binary = binaries[0]
-        if binary not in inventories:
-            # Console discovery truncates values at 250 characters. Google's
-            # JSON list output retains the complete parameter without running
-            # a test, so it is the only admissible export transport.
-            with tempfile.TemporaryDirectory(prefix="llaminar-e2e-discovery-") as directory:
-                manifest = Path(directory) / "parameters.json"
-                subprocess.run(
-                    [str(binary), "--gtest_list_tests", f"--gtest_output=json:{manifest}"],
-                    cwd=campaign.working_directory,
-                    env={**os.environ, "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "1",
-                         "HWLOC_COMPONENTS": "-gl,-opencl",
-                         "OMPI_MCA_btl_vader_single_copy_mechanism": "none"},
-                    check=True, capture_output=True, text=True, timeout=30)
-                inventories[binary] = parse_parameters(manifest.read_text())
-        for exact in campaign.gtest_cases:
-            if exact not in inventories[binary]:
-                raise ValueError(f"stale CTest registration, rebuild {binary}: {exact}")
-            record = inventories[binary][exact]
-            if record["e2e"] is not None and re.fullmatch(args.cell, exact):
-                # The builder container bind-mounts the corpus at both /src/models
-                # and /opt/llaminar-models. Compare file identity, not mount text.
-                if not any(Path(record["model"]).samefile(p) for p in campaign.model_files):
-                    raise ValueError(f"E2E model is not in the canonical GGUF manifest: {exact}")
-                selected.append((campaign, exact, record))
-    if not selected:
-        raise ValueError("no E2E-certifiable cells selected; add typed tags or correct selectors")
-    return selected
+    """Select typed E2E tags from the same inventory as generation regression."""
+    return discover_inventory(args, InventoryScope.E2E)
 
 
 def readiness_timeout_seconds(profile: dict) -> int:
@@ -213,14 +139,8 @@ def main(argv: list[str] | None = None) -> int:
     selected = discover(args)
     if args.export_manifest:
         args.export_manifest.parent.mkdir(parents=True, exist_ok=True)
-        args.export_manifest.write_text(json.dumps({
-            "schema": 1,
-            "source_revision": args.source_revision or subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-            "cells": [{"campaign": campaign.name, "backends": campaign.group.backends,
-                       "case": exact, "configuration": record}
-                      for campaign, exact, record in selected],
-        }, indent=2) + "\n")
+        args.export_manifest.write_text(json.dumps(export_manifest(
+            selected, source_revision(args), InventoryScope.E2E), indent=2) + "\n")
         return 0
     for _, exact, record in selected:
         readiness = readiness_timeout_seconds(record["e2e"])
@@ -229,11 +149,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[model-parity-e2e] selected {exact} context={record['e2e']['context_length']} readiness={readiness}s", flush=True)
     if args.list:
         return 0
+    if args.container_image:
+        # Pin tags once so every server and its report describe identical bytes.
+        args.container_image = image_identity(args.container_image)["id"]
     if not args.container_image:
         cache = args.binary.resolve().parent / "CMakeCache.txt"
         if not cache.is_file() or not re.search(r"^CMAKE_BUILD_TYPE:STRING=Release$", cache.read_text(), re.M):
             raise ValueError("E2E certification requires a Release binary and its CMakeCache.txt")
-    report = {"schema": 1, "selected": len(selected), "correctness_passed": False, "cells": []}
+    report = {"schema": 1, "selected": len(selected), "correctness_passed": False, "cells": [],
+              "image": args.container_image,
+              "source_revision": args.source_revision or subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+              "manifest_digest": digest(json.loads(args.manifest.read_text())) if args.manifest else None}
     args.report = args.report.resolve()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     run_root = args.report.parent / ("e2e-" + str(time.time_ns()))
@@ -241,8 +168,9 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     # Reuse the campaign's only staging/cache authority and keep its lease
     # until every server exits. Only the tagged models enter the RAM corpus.
-    staging_cells = [dataclasses.replace(campaign, model_files=(record["model"],))
-                     for campaign, _, record in selected]
+    # Retain CMake's complete model manifest, including every GGUF shard. The
+    # entry file alone is not a complete weight artifact for split models.
+    staging_cells = [campaign for campaign, _, _ in selected]
     try:
         with parity.model_staging_workspace(args.model_ramdisk_root,
                                            args.persistent_model_cache_dir, None) as workspace:

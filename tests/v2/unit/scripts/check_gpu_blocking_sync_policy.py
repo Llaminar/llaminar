@@ -317,7 +317,9 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/coherence/CrossDomainTransfer.cpp", "CrossDomainTransfer::transferGpuToCpuImpl", "backend_sync_copy", 1),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::buildRankStochasticDistributionFromLocalTP", "backend_sync_compute", 1),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::buildRankStochasticTargetDistributionsFromLocalTPRows", "backend_sync_compute", 1),
-        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::copyActivation", "backend_sync_copy", 3),
+        # Only the explicit cross-vendor/host staging boundary blocks. Local
+        # and same-vendor GPU copies acquire/publish exact stream events.
+        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::copyActivation", "backend_sync_copy", 2),
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::executeDeviceToHost", "backend_sync_copy", 1),
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::executeHostStaged", "backend_sync_copy", 2),
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::executeHostToDevice", "backend_sync_copy", 1),

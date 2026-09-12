@@ -10,6 +10,10 @@
  *   3. requantizeRowToInt8()  → per-format INT8 requantization (no FP32 round-trip)
  *   4. packNativeVNNI()       → generic loop calling the polymorphic methods
  *
+ * Host packing is device-free and may run before any ROCm runtime exists.
+ * IQ lookup-table publication belongs to the destination's device preparation
+ * transaction, not to byte-layout conversion on a CPU worker.
+ *
  * @see ROCmWeightPacker.h for public API
  * @see ROCmQuantisedGemmKernel.h for ROCmPackedWeights struct
  * @see tensors/VnniPackContext.h for packing context struct
@@ -64,6 +68,14 @@ namespace llaminar2
 {
     namespace rocm
     {
+        /**
+         * @brief Publish every IQ constant-table shard for one live runtime generation.
+         * @param device_id Exact destination ROCm device ordinal.
+         * @return True only after all required table publications succeeded.
+         * @details Device preparation calls this before capture. A mutex serializes
+         * the one-time publication, and a runtime generation change requires fresh
+         * tables; host packing must never enter this device lifecycle.
+         */
         bool ensureIQGridTablesInitialized(int device_id)
         {
 #ifdef HAVE_ROCM
@@ -179,18 +191,8 @@ namespace llaminar2
             if (!info)
                 return false;
 
-            // Lazy-initialize IQ grid lookup tables in GPU __constant__ memory
-            if (info->codebook_id >= 11 && info->codebook_id <= 17)
-            {
-                int current_device = 0;
-#ifdef HAVE_ROCM
-                (void)hipGetDevice(&current_device);
-#endif
-
-                if (!ensureIQGridTablesInitialized(current_device))
-                    return false;
-            }
-
+            // This conversion only reads host tensor tables and writes host
+            // vectors. GPU constant tables are a separate destination resource.
             const int N = static_cast<int>(tensor->rows());
             const int K = static_cast<int>(tensor->cols());
             if ((K % 32) != 0)

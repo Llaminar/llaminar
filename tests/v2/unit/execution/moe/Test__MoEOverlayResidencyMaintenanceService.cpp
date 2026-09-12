@@ -11,6 +11,7 @@
 
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
 #include "execution/moe/MoEOverlayMPIResidencyProposalPublisher.h"
+#include "utils/ObservedExpertDemandFixture.h"
 
 #include <gtest/gtest.h>
 
@@ -127,8 +128,8 @@ namespace llaminar2::test
             DecodeExpertHistogramConfig config;
             config.num_layers = 1;
             config.num_experts = 6;
-            config.top_k = 2;
-            config.window_size = 4;
+            config.top_k = 1;
+            config.window_size = 370;
             config.token_boundary_layer_idx = 0;
             config.sockets = {
                 DeviceId::cuda(0),
@@ -139,11 +140,14 @@ namespace llaminar2::test
                 1,
                 3,
                 {0, 0, 1, 1, 2, 2});
+            // One 370-row initial prefill, then at most one 400-row reversed
+            // prefill. The controlled observer may retain the first window
+            // while a proposal and its replacement briefly coexist.
+            admitObservedExpertDemand(config, {370, 400, 1}, 3);
             auto histogram =
                 std::make_shared<DecodeExpertHistogram>(std::move(config));
             const std::vector<uint64_t> counts{90, 20, 80, 10, 100, 70};
-            histogram->mergeLayerCounts(0, counts.data(), 6, false);
-            histogram->recordTokenBoundary(0, 4);
+            recordObservedPrefillBatch(*histogram, 0, counts);
             return histogram;
         }
 
@@ -961,6 +965,7 @@ namespace llaminar2::test
             1,
             3,
             {0, 0, 1, 1, 2, 2});
+        admitObservedExpertDemand(histogram_config, {4, 4, 2}, 3);
         auto histogram = std::make_shared<DecodeExpertHistogram>(
             std::move(histogram_config));
 
@@ -973,14 +978,11 @@ namespace llaminar2::test
                                  1;
                 if (poll == 1)
                     return RuntimeExpertHistogramDrainResult::pending();
-                const uint64_t device_counts[6] = {
-                    90, 20, 80, 10, 100, 70};
-                histogram->mergeLayerCounts(
-                    0,
-                    device_counts,
-                    6,
-                    /*count_window_tokens=*/true,
-                    ExpertHistogramSource::GroupedVerifier);
+                // The completed drain retains one real four-row verifier
+                // invocation, not unrelated counts attached to four tokens.
+                const int device_routes[]{0, 4, 2, 4, 0, 5, 4, 5};
+                recordObservedExpertBatch(*histogram, 0,
+                    ExpertHistogramSource::GroupedVerifier, device_routes);
                 return RuntimeExpertHistogramDrainResult::ready();
             });
 
@@ -1052,15 +1054,17 @@ namespace llaminar2::test
             .candidate_epoch = 2u,
             .command_count = 4u,
             .cycle_count = 2u,
+            .proof = MoEOptimizationTimeEconomy{
             .projected_service_gain_ns = 1'000u,
             .projected_transfer_and_repack_ns = 200u,
             .projected_inference_interference_ns = 100u,
             .projected_net_benefit_ns = 700u,
+            },
         };
         EXPECT_TRUE(valid.valid());
 
         auto mismatched_net = valid;
-        mismatched_net.projected_net_benefit_ns = 701u;
+        std::get<MoEOptimizationTimeEconomy>(mismatched_net.proof).projected_net_benefit_ns = 701u;
         EXPECT_FALSE(mismatched_net.valid());
 
         auto follower_fabrication = valid;
@@ -1068,7 +1072,7 @@ namespace llaminar2::test
         EXPECT_FALSE(follower_fabrication.valid());
 
         auto overflowed_cost = valid;
-        overflowed_cost.projected_transfer_and_repack_ns =
+        std::get<MoEOptimizationTimeEconomy>(overflowed_cost.proof).projected_transfer_and_repack_ns =
             std::numeric_limits<std::uint64_t>::max();
         EXPECT_FALSE(overflowed_cost.valid());
     }
@@ -1412,7 +1416,7 @@ namespace llaminar2::test
 
         /* These routes belong to the clean RCU bank installed by proposal. */
         const std::vector<uint64_t> later_counts{0, 0, 0, 0, 7, 0};
-        histogram->mergeLayerCounts(0, later_counts.data(), 6, false);
+        recordObservedPrefillBatch(*histogram, 0, later_counts);
         EXPECT_EQ(histogram->activationCount(0, 4), 7u);
 
         transport->setStartEnabled(true);
@@ -1456,13 +1460,8 @@ namespace llaminar2::test
         /* Queue a deliberately reversed hotness window while epoch two is
          * waiting on its publication event. The next poll must consume this
          * complete demand rather than briefly advertise an idle boundary. */
-        const std::vector<uint64_t> reversed_counts{2, 100, 3, 90, 1, 4};
-        histogram->mergeLayerCounts(
-            0,
-            reversed_counts.data(),
-            reversed_counts.size(),
-            false);
-        histogram->recordTokenBoundary(0, 4);
+        const std::vector<uint64_t> reversed_counts{4, 200, 6, 180, 2, 8};
+        recordObservedPrefillBatch(*histogram, 0, reversed_counts);
         ASSERT_TRUE(histogram->windowFull());
 
         /* Epoch two no longer needs staging. Hold epoch three at that event so

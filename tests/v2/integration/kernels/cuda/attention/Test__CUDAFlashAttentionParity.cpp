@@ -1409,7 +1409,6 @@ protected:
         attn_params.auto_detect_mode = true;
         attn_params.kv_cache = kv_cache.get();
         attn_params.layer_idx = 0;
-        attn_params.read_kv_from_cache = true;
         attn_params.execution_policy.key_cache = {
             .encoding = attention::AttentionKeyCacheEncoding::
                 PreRotaryDeviceTransform,
@@ -1464,7 +1463,7 @@ protected:
             ASSERT_TRUE(capture_ok);
             if (kv_len >= 256 && n_heads <= 24)
                 expectParallelDecodeProducer(
-                    graph, "flash_decoding_fp16kv_kernel", n_heads, seq_len);
+                    graph, "flash_decoding_nativekv_kernel", n_heads, seq_len);
             ASSERT_TRUE(graph.instantiate());
             ASSERT_TRUE(graph.launch());
             ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
@@ -4094,7 +4093,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStage_FP16Cache_Qwen36M2RoPEOnRe
     params.auto_detect_mode = true;
     params.kv_cache = kv_cache.get();
     params.layer_idx = 0;
-    params.read_kv_from_cache = true;
     params.execution_policy.key_cache = {
         .encoding = attention::AttentionKeyCacheEncoding::
             PreRotaryDeviceTransform,
@@ -5272,7 +5270,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStagePrefillRequiresAndUsesDevic
     EXPECT_FALSE(rejected_stage.execute(nullptr));
     EXPECT_EQ(cache_trap.forbiddenScalarReadCount(), 0);
 
-    params.read_kv_from_cache = true;
     AttentionComputeStage stage(params);
     stage.setGPUStream(stream);
     const WorkspaceRequirements stage_reqs =
@@ -5738,7 +5735,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageAppendHandoff_FP16KV_Qwen35
     attn_params.auto_detect_mode = true;
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
-    attn_params.read_kv_from_cache = true;
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage append_stage(append_params);
@@ -5940,7 +5936,6 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedGrowingRequestBatchFP16CacheMatch
         },
         .kv_cache = kv_cache.get(),
         .layer_idx = 0,
-        .read_kv_from_cache = true,
     });
     append_stage.setGPUStream(stream);
     attention_stage.setGPUStream(stream);
@@ -6497,7 +6492,6 @@ TEST_F(
             },
             .kv_cache = production_cache.get(),
             .layer_idx = 0,
-            .read_kv_from_cache = true,
         });
         append_stage.setGPUStream(stream);
         attention_stage.setGPUStream(stream);
@@ -6911,7 +6905,7 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedVariableLengthRequestBatchFP16Dec
     }
 
     /*
-     * K/V fields satisfy the stage's declarative inputs, but read_kv_from_cache
+     * K/V fields satisfy the stage's declarative inputs, but the bound cache
      * makes the captured production gather authoritative.  The supplied tensor
      * is intentionally only request zero's variable-length allocation: treating
      * it as a contiguous batch would therefore fail this test immediately.
@@ -6933,7 +6927,6 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedVariableLengthRequestBatchFP16Dec
         .auto_detect_mode = true,
         .kv_cache = kv_cache.get(),
         .layer_idx = 0,
-        .read_kv_from_cache = true,
     });
     attention_stage.setGPUStream(stream);
     const WorkspaceRequirements attention_requirements =
@@ -7205,7 +7198,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageAppendHandoff_ConvertsGpuFP
     attn_params.auto_detect_mode = true;
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
-    attn_params.read_kv_from_cache = true;
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage append_stage(append_params);
@@ -7383,7 +7375,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageAppendHandoff_RealQwen35Lay
     attn_params.auto_detect_mode = true;
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
-    attn_params.read_kv_from_cache = true;
     attn_params.mpi_ctx = &mpi_ctx_;
 
     KVCacheAppendStage append_stage(append_params);
@@ -7566,7 +7557,6 @@ TEST_F(Test__CUDAFlashAttentionParity, AttentionStageRoPEOnRead_RealQwen35Layer3
     attn_params.auto_detect_mode = true;
     attn_params.kv_cache = kv_cache.get();
     attn_params.layer_idx = 0;
-    attn_params.read_kv_from_cache = true;
     attn_params.execution_policy.key_cache = {
         .encoding = attention::AttentionKeyCacheEncoding::
             PreRotaryDeviceTransform,

@@ -159,7 +159,8 @@ namespace llaminar2
             {"mtp_state_restored", request.mtp_state_restored},
             {"hybrid_state_restored", request.hybrid_state_restored},
             {"storage_tier", request.storage_tier},
-            {"admission_movement_epoch", request.admission_movement_epoch},
+            {"admission_movement_epoch", request.admission_placement_epochs.earliest()},
+            {"admission_latest_movement_epoch", request.admission_placement_epochs.latest()},
             {"completion_movement_epoch", request.completion_movement_epoch},
             {"crossed_movement_epoch", request.crossedMovementEpoch()},
         };

@@ -18,6 +18,7 @@
 #include "kernels/common/EmbeddingWorkspaceContract.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "kernels/kvcache/KVCacheWorkspaceContract.h"
+#include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmWorkspaceContract.h"
 #include "kernels/rope/RoPEWorkspaceContract.h"
 #include "tensors/TensorType.h"
@@ -29,6 +30,49 @@ using namespace llaminar2;
 
 namespace
 {
+
+/**
+ * @brief Price only the attention ABI when updating historical family goldens.
+ * @param geometry Unchanged captured participant geometry.
+ * @param heads Concrete local query heads.
+ * @param kv_heads Concrete local KV heads.
+ * @param head_dim Width of each local head.
+ * @param family_rows Query range covered by the prefill envelope.
+ * @return Canonical descriptor bytes, including compact and conversion storage.
+ *
+ * Historical runtime snapshots included summaries for unadmitted query widths.
+ * Subtract only that named-buffer delta from those goldens: every other byte,
+ * alignment check, and upper bound remains protected. This is test evidence,
+ * not a second production allocation calculation.
+ */
+size_t rocmAttentionDescriptorBytes(
+    const WorkspaceMemoryGeometry &geometry,
+    int heads, int kv_heads, int head_dim, int family_rows)
+{
+    const auto family = rocm::fa2_policy::selectROCmFA2GeometrySelectedWorkspaceEnvelope({
+        .batch_size = geometry.batch_size,
+        .query_rows = family_rows,
+        .local_query_heads = heads,
+        .head_dim = head_dim,
+        .kv_capacity = geometry.max_context_rows,
+        .compute_unit_count = geometry.device_compute_units,
+        .lds_capacity_bytes = rocm::fa2_policy::kROCmFA2LDSCapacityBytes,
+        .requested_axis = attention::AttentionPrefillParallelAxis::GeometrySelected,
+    });
+    const auto cardinality = attention::planAttentionWorkspaceCardinality(
+        geometry.resident_graph_rows, geometry.batch_size);
+    return attention_workspace::requirements({
+        .compact_query_rows = cardinality.compact_query_rows,
+        .request_count = cardinality.request_count,
+        .local_query_heads = heads,
+        .local_kv_heads = kv_heads,
+        .head_dim = head_dim,
+        .context_rows = geometry.max_context_rows,
+        .partial_output_floor_bytes = family.partial_output_bytes,
+        .partial_m_floor_bytes = family.partial_m_bytes,
+        .partial_l_floor_bytes = family.partial_l_bytes,
+    }).total_bytes_with_alignment();
+}
 
 /**
  * @brief Construct the routing geometry of the production Qwen3.6 35B MoE model.
@@ -396,11 +440,12 @@ TEST(Test__WorkspaceMemoryEstimator,
 /**
  * @brief Reproduce the exact Qwen2 PP terminal-stage workspace admission miss.
  *
- * The production serial family requires 199,837,188 bytes. Its canonical
- * descriptor sum rounds to 199,837,440 bytes: quantized GEMM, full attention,
+ * The historical serial family required 199,837,188 bytes. Its canonical
+ * descriptor sum rounded to 199,837,440 bytes: quantized GEMM, full attention,
  * both independent K/V conversion pairs, and RoPE publications. Admission
  * formerly omitted the attention-owned pair and all RoPE state and reserved
- * only 195,633,920 bytes.
+ * only 195,633,920 bytes. Preserve that regression while deducting the exact
+ * attention summaries retired by bounding query M to the admitted bucket.
  */
 TEST(Test__WorkspaceMemoryEstimator,
      Qwen2ROCmPipelineStageCoversCanonicalAttentionAndRoPEABI)
@@ -456,13 +501,16 @@ TEST(Test__WorkspaceMemoryEstimator,
         .total_shards = 1,
     };
 
-    constexpr std::size_t kRuntimeSerialFamilyBytes = 199837188ULL;
-    constexpr std::size_t kAlignedCanonicalAdmissionBytes = 199837440ULL;
+    const size_t removed_unadmitted_summaries =
+        rocmAttentionDescriptorBytes(geometry, 14, 2, 64, geometry.max_context_rows) -
+        rocmAttentionDescriptorBytes(geometry, 14, 2, 64, geometry.resident_graph_rows);
+    const std::size_t runtime_serial_family_bytes = 199837188ULL - removed_unadmitted_summaries;
+    const std::size_t aligned_canonical_admission_bytes = 199837440ULL - removed_unadmitted_summaries;
     const std::size_t admitted =
         WorkspaceMemoryEstimator::estimate(profile, geometry);
-    EXPECT_EQ(admitted, kAlignedCanonicalAdmissionBytes);
-    EXPECT_GE(admitted, kRuntimeSerialFamilyBytes);
-    EXPECT_LT(admitted - kRuntimeSerialFamilyBytes, 256u)
+    EXPECT_EQ(admitted, aligned_canonical_admission_bytes);
+    ASSERT_GE(admitted, runtime_serial_family_bytes);
+    EXPECT_LT(admitted - runtime_serial_family_bytes, 256u)
         << "Only terminal descriptor alignment may exceed the runtime interval plan.";
 }
 
@@ -795,6 +843,48 @@ TEST(Test__WorkspaceMemoryEstimator, Qwen35MoE4K_CoversObservedCUDAFamilyPlan)
            "plan measured for Qwen3.6-35B-A3B at 4K rows.";
 }
 
+/**
+ * @brief Largest-bucket admission must dominate intermediate attention peaks.
+ *
+ * CUDA's 4096-row direct plan needs no context summaries while its 3072-row
+ * plan does. Use an otherwise small dense metadata profile so unrelated GEMM
+ * storage cannot hide that missing contribution. Both vendors and TP through
+ * eight participants owe the same graph-family capacity invariant.
+ */
+TEST(Test__WorkspaceMemoryEstimator, PrefillFamilyCoversIntermediateAttentionBuckets)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_layers = 1;
+    profile.d_model = 24 * 256;
+    profile.d_ff = 1;
+    profile.n_heads = 24;
+    profile.n_kv_heads = 4;
+    profile.head_dim = 256;
+    profile.vocab_size = 1;
+    profile.max_seq_len = 4096;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        for (const int tp : {1, 2, 4, 8})
+        {
+            for (const int context : {4096, 16384})
+            {
+                auto geometry = graphGeometry(device, 1, tp);
+                geometry.last_layer = 0;
+                geometry.max_context_rows = context;
+                const auto family = WorkspaceMemoryEstimator::estimate(profile, geometry);
+                for (const int rows : {32, 128, 512, 1024, 2048, 3072})
+                {
+                    geometry.resident_graph_rows = rows;
+                    EXPECT_GE(family, WorkspaceMemoryEstimator::estimate(profile, geometry))
+                        << device.toString() << " TP=" << tp
+                        << " context=" << context << " M=" << rows;
+                }
+            }
+        }
+    }
+}
+
 TEST(Test__WorkspaceMemoryEstimator,
      Qwen122TP2_CoversExactAttentionAndFloatingProjectionArenas)
 {
@@ -989,13 +1079,17 @@ TEST(Test__WorkspaceMemoryEstimator,
 
     const std::size_t bytes =
         WorkspaceMemoryEstimator::estimate(profile, geometry);
-    constexpr std::size_t kExactRuntimeSerialFamilyBytes = 2546278148ULL;
-    EXPECT_GE(bytes, kExactRuntimeSerialFamilyBytes)
+    const size_t removed_unadmitted_summaries =
+        rocmAttentionDescriptorBytes(geometry, 8, 2, 256, geometry.max_context_rows) -
+        rocmAttentionDescriptorBytes(geometry, 8, 2, 256, geometry.resident_graph_rows);
+    const std::size_t exact_runtime_serial_family_bytes =
+        2546278148ULL - removed_unadmitted_summaries;
+    EXPECT_GE(bytes, exact_runtime_serial_family_bytes)
         << "Preflight must cover the runtime interval plan before expert "
            "weights consume the remaining VRAM.";
     EXPECT_LE(
         bytes,
-        kExactRuntimeSerialFamilyBytes + 33ULL * 1024ULL * 1024ULL)
+        exact_runtime_serial_family_bytes + 33ULL * 1024ULL * 1024ULL)
         << "The typed contract should not strand meaningful expert capacity "
            "behind a coarse safety reserve. The final MiB covers the routed "
            "fused-scatter ABI added by the explicit expert-parent inventory.";

@@ -74,7 +74,7 @@ namespace llaminar2
         };
 
         /**
-         * @brief Aggregate proof for recomputed main-KV suffix payloads.
+         * @brief Aggregate proof for one cache family's recomputed KV suffix.
          *
          * A partial prefix hit restores its cached prefix byte-for-byte but
          * recomputes the uncached suffix.  If ExpertOverlay changed the
@@ -83,7 +83,7 @@ namespace llaminar2
          * strict prefix hashes and full suffix-value comparisons across every
          * affected layer and both K/V payloads.
          */
-        struct MainKVNumericalEvidence
+        struct KVNumericalEvidence
         {
             bool compared = false;
             bool passed = false;
@@ -120,7 +120,10 @@ namespace llaminar2
         TerminalPayloadNumericalEvidence terminal_logits_numerical;
 
         /// Evidence for placement-aware main-KV suffix recomputation.
-        MainKVNumericalEvidence main_kv_numerical;
+        KVNumericalEvidence main_kv_numerical;
+
+        /// Independent proof for the shifted-MTP cache family's own seed split.
+        KVNumericalEvidence shifted_mtp_kv_numerical;
 
         /// Evidence for placement-aware or explicitly numerical GDN state.
         GDNStateNumericalEvidence gdn_numerical;
@@ -147,9 +150,9 @@ namespace llaminar2
     };
 
     /**
-     * @brief Legal comparison policies for persistent main-model KV payloads.
+     * @brief Legal comparison policies for main-model and shifted-MTP KV bytes.
      */
-    enum class MTPMainKVPayloadComparisonPolicy
+    enum class MTPKVPayloadComparisonPolicy
     {
         /** Require the complete canonical K/V payload to be byte-identical. */
         ExactBytes,
@@ -201,7 +204,7 @@ namespace llaminar2
 
     /** Strict default cosine floor for a recomputed KV suffix row. */
     inline constexpr double
-        kDefaultPlacementAwareMainKVSuffixMinimumCosine = 0.99;
+        kDefaultPlacementAwareKVSuffixMinimumCosine = 0.99;
 
     /** Cosine floor for a complete GDN bank after placement changed. */
     inline constexpr double
@@ -231,9 +234,9 @@ namespace llaminar2
          */
         bool compare_main_kv_payload_hashes = true;
 
-        /** Comparison contract used when main KV payload hashing is enabled. */
-        MTPMainKVPayloadComparisonPolicy main_kv_payload_policy =
-            MTPMainKVPayloadComparisonPolicy::ExactBytes;
+        /** Partial restores apply this contract independently to both KV banks. */
+        MTPKVPayloadComparisonPolicy kv_payload_policy =
+            MTPKVPayloadComparisonPolicy::ExactBytes;
 
         /**
          * Number of leading logical tokens that must remain byte-identical.
@@ -243,9 +246,13 @@ namespace llaminar2
          */
         int main_kv_exact_prefix_tokens = -1;
 
-        /** Minimum cosine for every recomputed K and V suffix payload. */
-        double main_kv_suffix_min_cosine =
-            kDefaultPlacementAwareMainKVSuffixMinimumCosine;
+        /**
+         * Minimum cosine for every complete recomputed K and V suffix payload.
+         * The corresponding unit-vector distance sqrt(2*(1-cosine)) also
+         * bounds relative L2, rejecting scale corruption hidden by cosine.
+         */
+        double kv_suffix_min_cosine =
+            kDefaultPlacementAwareKVSuffixMinimumCosine;
 
         bool compare_shifted_mtp_kv = true;
         MTPGDNStateComparisonPolicy gdn_state_policy =
@@ -378,9 +385,44 @@ namespace llaminar2
         PrefixStateProvenance verifier_source,
         const MTPCommitValidationOptions &options = {});
 
+    /**
+     * @brief Independent authorities for a cached prefix and its continuation.
+     *
+     * Reseeding after expert movement may legitimately change the prefix's
+     * arithmetic relative to an older serial request. The actual cached seed
+     * owns exact prefix bytes; the certified serial continuation still owns
+     * suffix, recurrent and terminal-state expectations. Both references must
+     * outlive the synchronous diagnostic comparison; neither is mutated.
+     */
+    struct MTPPartialPrefixRestoreOracle
+    {
+        const PrefixRuntimeStateSnapshot &cached_prefix;
+        const PrefixRuntimeStateSnapshot &serial_continuation;
+    };
+
+    /**
+     * @brief Compare complete runtime snapshots using one state authority.
+     * @param oracle Authenticated complete reference state.
+     * @param candidate Observed state to certify.
+     * @param options Exact or explicitly placement-aware comparison contracts.
+     * @return Complete comparison evidence, or the first owning-state failure.
+     */
     MTPStateValidationResult compareMTPRuntimeStateSnapshots(
         const PrefixRuntimeStateSnapshot &oracle,
         const PrefixRuntimeStateSnapshot &candidate,
         const MTPRuntimeSnapshotComparisonOptions &options = {});
+
+    /**
+     * @brief Certify partial restore against its seed and serial continuation.
+     * @param oracle Explicit immutable prefix and continuation authorities.
+     * @param candidate State after restoring the prefix and computing a suffix.
+     * @param options Must require exact-prefix/placement-aware-suffix checking
+     *        with a prefix count equal to the seed's complete logical position.
+     * @return Exact seed-byte proof plus the unchanged continuation gates.
+     */
+    MTPStateValidationResult compareMTPPartialPrefixRestoreSnapshots(
+        const MTPPartialPrefixRestoreOracle &oracle,
+        const PrefixRuntimeStateSnapshot &candidate,
+        const MTPRuntimeSnapshotComparisonOptions &options);
 
 } // namespace llaminar2

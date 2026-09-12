@@ -5,6 +5,8 @@
  * This implementation validates graph-owned lifecycle envelopes, materializes
  * their replay units, and preserves every producer/consumer edge with streams,
  * events, or an explicitly declared immutable host ticket.
+ * Ticket evidence is authored by the logical lifecycle validator, before
+ * retained-parent lowering changes the number of physical compiler units.
  */
 
 #include "DeviceGraphCaptureController.h"
@@ -588,6 +590,14 @@ namespace llaminar2
          * service and another captured unit. A follower has the same ordered
          * marker cutpoints but no manual segment. Both roles terminate exactly
          * once in the final captured unit.
+         *
+         * @param graph Source of the typed per-node ticket contracts.
+         * @param segments Logical plan before retained-parent lowering.
+         * @param role Authority or follower ownership of manual service.
+         * @param declared_before_manual Number of declared ticket cutpoints.
+         * @param declared_terminal Number of declared transaction terminals.
+         * @throws std::runtime_error if ordering, ownership or terminal identity
+         *         is invalid. Only a successful validation publishes evidence.
          */
         void validateHeterogeneousTicketSegmentLifecycle(
             const ComputeGraph &graph,
@@ -759,6 +769,22 @@ namespace llaminar2
             {
                 fail("authority manual-service count does not match its authenticated cutpoints");
             }
+
+            /* These are logical lifecycle counts, not physical compiler units.
+             * Lowering can combine 48 CPU boundaries into one service program,
+             * while graph-only GPU children are imported into one parent.
+             * Publish here, from the validator's own observations, so no later
+             * observer has to reconstruct adjacency from lowered child counts. */
+            PerfStatsCollector::addCounter(
+                "forward_graph", "heterogeneous_ticket_transactions", 1.0,
+                "capture", "",
+                {{"lifecycle_contract", "typed_marker_adjacency_v1"},
+                 {"capturable_segments", std::to_string(observed_captured_segments)},
+                 {"manual_segments", std::to_string(observed_manual_segments)},
+                 {"ticket_publication_authority", "stage_owned_mapped_timeline"},
+                 {"unit_boundaries", std::to_string(observed_before_manual)},
+                 {"terminal_units", std::to_string(observed_terminal)},
+                 {"role", heterogeneousTicketSegmentRoleName(role)}});
         }
 
         /**
@@ -2473,31 +2499,6 @@ namespace llaminar2
                 diagnostic << '}';
             }
             throw std::runtime_error(diagnostic.str());
-        }
-
-        if (heterogeneous_ticket_transaction)
-        {
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                "heterogeneous_ticket_transactions",
-                1.0,
-                "capture",
-                "",
-                {{"capturable_segments",
-                  std::to_string(capturable_segments)},
-                 {"manual_segments", std::to_string(manual_segments)},
-                 {"ticket_publication_authority",
-                  "stage_owned_mapped_timeline"},
-                 {"unit_boundaries",
-                  std::to_string(
-                      heterogeneous_ticket_unit_boundaries)},
-                 {"terminal_units",
-                  std::to_string(
-                      heterogeneous_ticket_terminal_units)},
-                 {"role",
-                  heterogeneous_ticket_authority
-                      ? "authority"
-                      : "follower"}});
         }
 
         if (retained_parent_composition)

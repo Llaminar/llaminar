@@ -44,11 +44,12 @@ ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON
 ARG RCCL_GIT_REF=rocm-7.1.1
 ARG RCCL_GPU_TARGETS=gfx906
 ARG ROCM_RUNTIME_GPU_TARGETS=
+ARG LLAMINAR_SOURCE_TREE=
 
 # =============================================================================
 # Stage 1: Builder
 # =============================================================================
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:24.04 AS toolchain
 
 ARG CUTLASS_VERSION
 ARG NINJA_VERSION
@@ -175,9 +176,15 @@ RUN set -e; \
 # MSCCL generated kernels are optional for standard collectives and make source
 # builds dramatically slower, so release images default them off.
 ARG RCCL_ENABLE_MSCCL_KERNEL=OFF
-ARG RCCL_ONLY_FUNCS=
+# The typed collective backend exposes these five dtypes and SUM/MIN/MAX.
+# Keep direct Docker builds and the release wrapper on the same support set;
+# an explicit empty override remains the full upstream RCCL developer build.
+ARG RCCL_ONLY_FUNCS=default
+COPY scripts/docker/rccl-functions.txt /src/rccl-functions.txt
 RUN --mount=type=cache,target=/root/.ccache \
     set -e; \
+    rccl_build_funcs="${RCCL_ONLY_FUNCS}"; \
+    if [ "${rccl_build_funcs}" = "default" ]; then rccl_build_funcs="$(cat /src/rccl-functions.txt)"; fi; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         RCCL_TARBALL_URL="https://codeload.github.com/ROCm/rccl/tar.gz/refs/tags/${RCCL_GIT_REF}"; \
         echo "==> [rccl] fetch ${RCCL_GIT_REF} from ${RCCL_TARBALL_URL}"; \
@@ -199,8 +206,8 @@ RUN --mount=type=cache,target=/root/.ccache \
         rm -f /tmp/rccl.tar.gz; \
         printf '%s\n' "${RCCL_GIT_REF}" > /src/external/rccl/.llaminar-rccl-source-ref; \
         echo "==> [rccl] configure for GPU_TARGETS=${RCCL_GPU_TARGETS}"; \
-        if [ -n "${RCCL_ONLY_FUNCS}" ]; then \
-            echo "==> [rccl] ONLY_FUNCS=${RCCL_ONLY_FUNCS}"; \
+        if [ -n "${rccl_build_funcs}" ]; then \
+            echo "==> [rccl] ONLY_FUNCS=${rccl_build_funcs}"; \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
@@ -209,7 +216,7 @@ RUN --mount=type=cache,target=/root/.ccache \
                 -DROCM_PATH=/opt/rocm \
                 -DGPU_TARGETS="${RCCL_GPU_TARGETS}" \
                 -DENABLE_MSCCL_KERNEL="${RCCL_ENABLE_MSCCL_KERNEL}" \
-                -DONLY_FUNCS="${RCCL_ONLY_FUNCS}" \
+                -DONLY_FUNCS="${rccl_build_funcs}" \
                 -DBUILD_TESTS=OFF; \
         else \
             cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
@@ -240,6 +247,17 @@ RUN --mount=type=cache,target=/root/.ccache \
         echo "==> [rccl] skipped because ROCm is disabled"; \
     fi
 
+# Install the selected collective dependency before compiling either binary.
+# The runtime stage copies these same bytes; tests must not accidentally load
+# the packaged gfx906 library merely because their checkout lives under /src.
+RUN set -e; \
+    if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
+        install -m 0755 /src/external/rccl/build/librccl.so.1.0 /usr/local/lib/librccl.so.1.0; \
+        ln -sf librccl.so.1.0 /usr/local/lib/librccl.so.1; \
+        ln -sf librccl.so.1 /usr/local/lib/librccl.so; \
+        ldconfig; \
+    fi
+
 # Python dependencies for the reference tests + parity gates. Pulls the
 # CPU-only PyTorch wheel (~250 MB) plus our transformers fork. Cached as a
 # separate layer keyed only on requirements.txt so source edits don't
@@ -247,6 +265,8 @@ RUN --mount=type=cache,target=/root/.ccache \
 COPY requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --break-system-packages -r requirements.txt
+
+FROM toolchain AS builder
 
 COPY src ./src
 COPY tests ./tests
@@ -262,6 +282,11 @@ COPY python ./python
 # Unit/static tests exercise top-level helper scripts directly, so the builder
 # test image needs the full script tree rather than only CI summary helpers.
 COPY scripts ./scripts
+COPY .agents ./.agents
+COPY .github ./.github
+COPY .devcontainer ./.devcontainer
+COPY AGENTS.md README.md ./
+COPY benchmarks/production ./benchmarks/production
 
 # Integration build — what CI drives for unit, parity, and E2E tests. Has
 # debug symbols, assertions active, tensor verification enabled.
@@ -282,11 +307,13 @@ RUN --mount=type=cache,target=/root/.ccache \
     else \
         RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
         if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
-            RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/src/external/rccl/build/librccl.so"; \
+            RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"; \
         fi; \
         echo "==> [integration] cmake configure" \
      && cmake -B build_v2_integration -S src/v2 -G Ninja \
+            -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
             -DCMAKE_BUILD_TYPE=Integration \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DHAVE_CUDA="${LLAMINAR_ENABLE_CUDA}" \
             -DHAVE_ROCM="${LLAMINAR_ENABLE_ROCM}" \
             -DLLAMINAR_CPU_ISA="${LLAMINAR_CPU_ISA}" \
@@ -294,7 +321,22 @@ RUN --mount=type=cache,target=/root/.ccache \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             ${RCCL_CMAKE_ARGS} \
      && echo "==> [integration] cmake build (parallel)" \
-     && cmake --build build_v2_integration --parallel \
+     && mkdir /tmp/llaminar-build-discovery-driver \
+     && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
+            # POST_BUILD runs --gtest_list_tests, never test bodies. Permit that
+            # metadata-only process to load the SDK stub on a driver-free build
+            # node. Its private loader directory is removed before image seal;
+            # neither installed tests nor the runtime may use a driver stub.
+            ln -s "${CUDA_HOME}/lib64/stubs/libcuda.so" \
+                /tmp/llaminar-build-discovery-driver/libcuda.so.1; \
+        fi \
+     && LD_LIBRARY_PATH="/tmp/llaminar-build-discovery-driver:${LD_LIBRARY_PATH}" \
+        cmake --build build_v2_integration --parallel \
+            --target v2_unit_gate v2_production_parity_preflight_gate v2_model_parity_matrices \
+     && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
+            rm /tmp/llaminar-build-discovery-driver/libcuda.so.1; \
+        fi \
+     && rmdir /tmp/llaminar-build-discovery-driver \
      && echo "==> [integration] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
      && { find build_v2_integration \
               \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
@@ -302,12 +344,24 @@ RUN --mount=type=cache,target=/root/.ccache \
               -print0 \
           | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true; } \
      && echo "==> [integration] removing intermediates (.o/.d/.gch/CMakeFiles)" \
+     && mv build_v2_integration/CMakeFiles/rules.ninja build_v2_integration/installed-rules.ninja \
      && find build_v2_integration \
             \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
             -delete \
      && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
+     # Keep the small compiler-launcher receipt used by the build-contract
+     # Unit test. Objects remain discarded; this is evidence, not a rebuild tree.
+     && mkdir build_v2_integration/CMakeFiles \
+     && mv build_v2_integration/installed-rules.ninja build_v2_integration/CMakeFiles/rules.ninja \
      && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
      && echo "==> [integration] done; final size: $(du -sh build_v2_integration | cut -f1)"; \
+    fi
+
+# This receipt permits the campaign driver to use installed binaries without
+# reconstructing stripped objects. Both complete model-free gates still run.
+RUN if [ "${LLAMINAR_SKIP_INTEGRATION}" != "1" ]; then \
+      python3 scripts/ci/prebuilt_test_image.py --build-dir build_v2_integration \
+        --receipt /src/installed-tests.json --seal; \
     fi
 
 # Release build — what the runtime image ships. Optimized, no assertions,
@@ -315,10 +369,11 @@ RUN --mount=type=cache,target=/root/.ccache \
 RUN --mount=type=cache,target=/root/.ccache \
     RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
-        RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/src/external/rccl/build/librccl.so"; \
+        RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"; \
     fi; \
     echo "==> [release] cmake configure" \
  && cmake -B build_v2_release -S src/v2 -G Ninja \
+        -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
         -DCMAKE_BUILD_TYPE=${LLAMINAR_BUILD_TYPE} \
         -DHAVE_CUDA="${LLAMINAR_ENABLE_CUDA}" \
         -DHAVE_ROCM="${LLAMINAR_ENABLE_ROCM}" \
@@ -367,27 +422,44 @@ RUN groupadd -f render && groupadd -f video
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
+# Persistent reference/model caches belong to the invoking host user, not root.
+# Give the installed test workspace writable directories for CTest/scratch data
+# and a real passwd/home entry. Compiled files remain unchanged/root-owned; this
+# cheap directory-only metadata layer does not duplicate all compiled binaries.
+ARG LLAMINAR_TEST_UID=1000
+ARG LLAMINAR_TEST_GID=1000
+RUN set -e; \
+    if ! getent group "${LLAMINAR_TEST_GID}" >/dev/null; then \
+        groupadd --gid "${LLAMINAR_TEST_GID}" llaminar-ci; \
+    fi; \
+    if ! getent passwd "${LLAMINAR_TEST_UID}" >/dev/null; then \
+        useradd --uid "${LLAMINAR_TEST_UID}" --gid "${LLAMINAR_TEST_GID}" \
+            --create-home --shell /bin/bash llaminar-ci; \
+    fi; \
+    find /src -type d -exec chown "${LLAMINAR_TEST_UID}:${LLAMINAR_TEST_GID}" {} +; \
+    if [ -d /src/build_v2_integration/Testing ]; then \
+        chown -R "${LLAMINAR_TEST_UID}:${LLAMINAR_TEST_GID}" /src/build_v2_integration/Testing; \
+    fi
+
+# Build identity is metadata, not an input to dependency installation or
+# compilation. Declare it last so a new revision cannot invalidate otherwise
+# identical expensive layers merely by changing an inherited RUN environment.
+COPY Dockerfile .dockerignore ./
+ARG VCS_REF
+ARG LLAMINAR_SOURCE_TREE
+LABEL org.opencontainers.image.revision="${VCS_REF}" \
+      org.llaminar.source_tree="${LLAMINAR_SOURCE_TREE}"
+
 # =============================================================================
 # Stage 2: Runtime — slim image with only shared libs + the binary
 # =============================================================================
 FROM ubuntu:24.04 AS runtime
 
-ARG BUILD_DATE
-ARG VCS_REF
-ARG VERSION=dev
+ARG LLAMINAR_BUILD_TYPE
 ARG LLAMINAR_CPU_ISA=AVX512
 ARG LLAMINAR_ENABLE_CUDA=ON
 ARG LLAMINAR_ENABLE_ROCM=ON
 ARG ROCM_RUNTIME_GPU_TARGETS
-
-LABEL org.opencontainers.image.title="Llaminar" \
-      org.opencontainers.image.description="High-performance LLM inference engine (CUDA + ROCm)" \
-      org.opencontainers.image.source="https://github.com/llaminar/llaminar" \
-      org.opencontainers.image.licenses="AGPL-3.0-only" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.created="${BUILD_DATE}" \
-      org.llaminar.cpu_isa="${LLAMINAR_CPU_ISA}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     OMPI_ALLOW_RUN_AS_ROOT=1 \
@@ -440,6 +512,24 @@ RUN ln -sf libdnnl.so.3.11 /usr/local/lib/libdnnl.so.3 \
 RUN groupadd -f render \
  && groupadd -f video \
  && useradd -m -s /bin/bash -G render,video llaminar
+
+# Revision labels must not force reinstalling CUDA/ROCm on every source commit.
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION=dev
+ARG LLAMINAR_SOURCE_TREE
+LABEL org.opencontainers.image.title="Llaminar" \
+      org.opencontainers.image.description="High-performance LLM inference engine (CUDA + ROCm)" \
+      org.opencontainers.image.source="https://github.com/llaminar/llaminar" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.llaminar.cpu_isa="${LLAMINAR_CPU_ISA}" \
+      org.llaminar.source_tree="${LLAMINAR_SOURCE_TREE}" \
+      org.llaminar.build_type="${LLAMINAR_BUILD_TYPE}" \
+      org.llaminar.cuda="${LLAMINAR_ENABLE_CUDA}" \
+      org.llaminar.rocm="${LLAMINAR_ENABLE_ROCM}"
 
 USER llaminar
 WORKDIR /home/llaminar

@@ -31,12 +31,14 @@
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/mtp/MTPServingForwardCaptureGeometry.h"
 
 // GPU backend interfaces
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "snapshots/SnapshotCapture.h"
 
 // Tensors and utilities
 #include "tensors/Tensors.h"
@@ -227,6 +229,8 @@ protected:
      * @param strict_copy_consumer When true, the second stage performs a D2D
      *        copy and invokes StageGPUExecution::requirePreparedInput(), directly
      *        exercising capture-time internal-edge authority.
+     * @param result_stage_name Final producer name used to test semantic capture
+     *        routing. The concrete arithmetic remains RMSNorm plus ResidualAdd.
      * @return Populated ComputeGraph
      */
     ComputeGraph buildNormResidualGraph(size_t seq_len, size_t d_model,
@@ -234,7 +238,8 @@ protected:
                                         FP32Tensor *&residual,
                                         FP32Tensor *&result_output,
                                         FP32Tensor **norm_output_out = nullptr,
-                                        bool strict_copy_consumer = false)
+                                        bool strict_copy_consumer = false,
+                                        const std::string &result_stage_name = "residual_add")
     {
         const DeviceId device = device_ctx_->deviceId();
 
@@ -296,8 +301,8 @@ protected:
         // Assemble graph with dependency
         ComputeGraph graph;
         graph.addNode("rmsnorm", ComputeStageFactory::createRMSNorm(norm_params), device);
-        graph.addNode("residual_add", ComputeStageFactory::createResidualAdd(res_params), device);
-        graph.addDependency("residual_add", "rmsnorm");
+        graph.addNode(result_stage_name, ComputeStageFactory::createResidualAdd(res_params), device);
+        graph.addDependency(result_stage_name, "rmsnorm");
 
         return graph;
     }
@@ -1008,6 +1013,68 @@ TEST_F(GPUGraphCaptureExecutionTest,
 }
 
 /**
+ * @brief A canonical embedding filter captures its finalizer with one GPU slot.
+ *
+ * This isolates semantic publication from collective arithmetic: a real captured
+ * two-stage GPU producer supplies the final payload under the embedding-finalizer
+ * name. The existing collective suites prove transport; this test proves the
+ * production executor captures the selected producer and publishes complete,
+ * byte-exact semantic/diagnostic aliases without a second D2D snapshot allocation.
+ * Both backend-specialized binaries belong to ProductionParityPreflight.
+ */
+TEST_F(GPUGraphCaptureExecutionTest, CanonicalEmbeddingFilterPublishesOneCapturedPayload)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+    constexpr size_t rows = 4;
+    constexpr size_t columns = 64;
+    const std::string producer = "mtp0_embedding_allreduce";
+    const std::string canonical = "MTP0_EMBEDDING";
+    FP32Tensor *input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    auto graph = buildNormResidualGraph(rows, columns, input, residual, result,
+                                       nullptr, false, producer);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    SnapshotCapture published;
+    GraphExecutorConfig config;
+    config.snapshot_callback = [&](const std::string &name, const StageDumpInfo &dump)
+    {
+        published.captureStage(name, dump);
+    };
+    DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
+    executor.setSnapshotStageFilter([&](const std::string &name, const StageDumpInfo &dump)
+    {
+        const auto keys = SnapshotCapture::possibleKeysForStage(name, dump);
+        return std::find(keys.begin(), keys.end(), canonical) != keys.end();
+    });
+    void *const stream = capture_->executionStream();
+    ASSERT_NE(stream, nullptr);
+    DeviceGraphExecutor::GraphSnapshotManifest manifest;
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        graph, device_ctx_.get(), stream, "embedding_finalizer_layout", &manifest));
+    ASSERT_EQ(manifest.stage_copies.size(), 1u);
+    ASSERT_EQ(manifest.bound_slot_count, 1u);
+    ASSERT_EQ(manifest.stage_copies.at(producer).outputs.size(), 1u);
+    ASSERT_EQ(manifest.storage_allocation_count, 1u);
+
+    ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+        graph, device_ctx_.get(), stream, "embedding_finalizer_capture"));
+    ASSERT_TRUE(executeCapturedGraph(graph, executor, result));
+    expectExecutableGraph();
+    ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
+        graph, stream, "embedding_finalizer_capture"));
+    const auto value = published.getShared(canonical);
+    ASSERT_TRUE(value);
+    EXPECT_EQ(value->publication, SnapshotPublication::CompleteValue);
+    EXPECT_EQ(value.get(), published.getShared(canonical + "_ALLREDUCED").get());
+    ASSERT_EQ(value->data.size(), rows * columns);
+    EXPECT_EQ(std::memcmp(value->data.data(), result->data(), value->data.size() * sizeof(float)), 0);
+}
+
+/**
  * @brief Production snapshot allocation is bounded by one admitted GPU owner.
  *
  * This is intentionally exercised by both backend-specialized binaries. The
@@ -1106,7 +1173,9 @@ TEST_F(GPUGraphCaptureExecutionTest,
  * tensor needlessly multiplies diagnostic storage. This regression proves that
  * a largest-first alternative family aliases one stable address, a concurrent
  * MTP role remains disjoint, and an undersized frozen pool fails instead of
- * reallocating behind an already captured pointer.
+ * reallocating behind an already captured pointer. The production geometry
+ * resolver must account for a retained depth-15 verifier even when the first
+ * admitted request selects depth one.
  */
 TEST_F(GPUGraphCaptureExecutionTest,
        SnapshotAlternativeArenasReuseFrozenTypedCapacity)
@@ -1114,11 +1183,20 @@ TEST_F(GPUGraphCaptureExecutionTest,
     SKIP_IF_NO_GPU();
     ASSERT_NE(capture_, nullptr);
 
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 1;
+    mtp.graph_capacity_draft_tokens = 15;
+    const auto geometry = resolveMTPServingForwardCaptureGeometry(mtp, 16);
+    ASSERT_TRUE(geometry.valid());
+    ASSERT_EQ(geometry.verifier_rows, 16);
+    ASSERT_TRUE(materializeMTPWideCheckpointLaneFirst(true, 8, geometry));
+
     FP32Tensor *large_input = nullptr;
     FP32Tensor *large_residual = nullptr;
     FP32Tensor *large_result = nullptr;
     auto large_graph = buildNormResidualGraph(
-        /*seq_len=*/8,
+        /*seq_len=*/geometry.verifier_rows,
         /*d_model=*/64,
         large_input,
         large_residual,
@@ -1208,6 +1286,25 @@ TEST_F(GPUGraphCaptureExecutionTest,
         shared_prefill_address)
         << "Prefill publication precedes grouped verification, so their wide "
            "checkpoint graphs must reuse one frozen lane";
+
+    // Later requests may grow back to the retained ceiling after shallow
+    // requests. Their manifests must bind the original allocation, not grow
+    // or rebind storage referenced by an alternative executable.
+    for (int request = 0; request < 20; ++request)
+    {
+        SCOPED_TRACE(request);
+        auto &request_graph = request % 2 == 0 ? small_graph : large_graph;
+        DeviceGraphExecutor::GraphSnapshotManifest request_manifest;
+        request_manifest.bindStorageReusePolicy(prefill_policy);
+        ASSERT_TRUE(executor.prepareSnapshotsForGraphCapture(
+            request_graph, device_ctx_.get(), stream,
+            "retained_shallow_deep_request", &request_manifest));
+        EXPECT_EQ(request_manifest.storage_allocation_count, 0u);
+        EXPECT_EQ(request_manifest.storage_arena->gpu_data_ptr(),
+                  shared_prefill_address);
+        EXPECT_EQ(request_manifest.storage_capacity_bytes,
+                  shared_prefill_capacity);
+    }
 
     DeviceGraphExecutor::GraphSnapshotManifest condition_manifest;
     condition_manifest.bindStorageReusePolicy(ReusePolicy{

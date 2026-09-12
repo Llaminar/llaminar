@@ -34,6 +34,7 @@
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "IInferenceRunner.h"
+#include "execution/moe/NativeMoEMovementArchive.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "../device/WorkspaceAllocator.h"
@@ -2167,13 +2168,17 @@ namespace llaminar2
             const int *token_shadow,
             const void *token_ids_device,
             int seq_len) override;
+        /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceResidentLogicalState */
         bool advanceMTPMainConditionFromDeviceResidentLogicalState(
             int32_t token_shadow,
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            MTPConditionForwardPurpose purpose,
             int request_index = 0) override;
+        /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceTargetSample */
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
-            int target_sample_slot) override;
+            int target_sample_slot,
+            MTPConditionForwardPurpose purpose) override;
 
         /**
          * @brief Batched verifier forward from a flat device token buffer.
@@ -2734,6 +2739,10 @@ namespace llaminar2
          * shared immutable RCU snapshot, without a device-orchestrator mirror.
          */
         uint64_t moeRuntimeMovementEpoch() const override;
+        /** @copydoc IInferenceRunner::moeOptimizationStatus */
+        MoEOptimizationStatus moeOptimizationStatus() const override;
+        /** @copydoc IInferenceRunner::moeOptimizationMovementLedger */
+        MoEOptimizationMovementLedger moeOptimizationMovementLedger() const override;
         std::string prefillGraphDomainId() const override;
         int prefillGraphParticipantId() const override;
 
@@ -4162,8 +4171,11 @@ namespace llaminar2
 
         /**
          * @brief Inspect request-local runtime state for prefix-cache/MTP probes.
+         * @param capture_policy Exact diagnostic ranges, forwarded unchanged to participants.
+         * @return Immutable combined cache and terminal-state evidence.
          */
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override;
 
         // =========================================================================
         // Snapshot Capture API (delegated to SnapshotCapture — Phase 2 extract)
@@ -4314,7 +4326,8 @@ namespace llaminar2
                  * FP32 payload outside SnapshotCapture's map lock, while a
                  * later graph callback may replace or clear that map entry.
                  */
-                .lifetime_owner = std::move(snap),
+                .lifetime_owner = snap,
+                .publication = snap->publication,
             };
         }
 
@@ -6358,13 +6371,38 @@ namespace llaminar2
             }
         };
 
-        /** Export completed device-side MoE rebalance diagnostic status to PerfStats. */
+        /**
+         * @brief Archive completed device receipts and optionally mirror diagnostics.
+         * @param cache Retained native maintenance owner, already submitted.
+         * @param maintenance_stream Exact producer stream, at a terminal boundary.
+         * @param device_key Stable participant diagnostic name.
+         * @param maintenance_tags Bounded lifecycle context for status diagnostics.
+         * @param outcome Optional terminal failure observation, never a planner.
+         * @return False if any mandatory receipt/status readback fails.
+         */
         bool exportCompletedDeviceMoERebalanceMaintenanceStats(
             DeviceMoERebalanceMaintenanceGraphCache &cache,
             void *maintenance_stream,
             const std::string &device_key,
             const std::map<std::string, std::string> &maintenance_tags,
             DeviceMoERebalanceMaintenanceOutcome *outcome = nullptr);
+
+        /** @return The configured native root's stage, never an arbitrary GPU. */
+        const MoEDeviceRebalanceStage *nativeMoEMovementOwnerStage() const;
+
+        /**
+         * @brief Project completed journal bytes using the frozen model topology.
+         * @param stage Exact native root's immutable stage configuration.
+         * @param controller Completed controller header from the same readback.
+         * @param generation Exact retained workspace generation.
+         * @param waves Populated device-authored immutable wave range.
+         * @param edges Populated device-authored immutable command range.
+         * @throws std::invalid_argument if receipt identity or geometry is invalid.
+         */
+        void archiveCompletedNativeMoEMovement(const MoEDeviceRebalanceStage &stage,
+            const DeviceMoERebalanceGraphControllerState &controller, uint64_t generation,
+            std::span<const DeviceMoERebalanceMovementWave> waves,
+            std::span<const DeviceMoERebalanceMovementEdge> edges);
 
         /**
          * @brief Publish the newest completed device maintenance status at an epilogue.
@@ -6549,7 +6587,8 @@ namespace llaminar2
         std::unique_ptr<PrefixArchiveDeviceStaging> prefix_archive_device_staging_;
         PrefixPayloadLayout prefix_layout_;
         PrefixCacheStats prefix_cache_stats_;
-        uint64_t prefix_fingerprint_ = 0;
+        /// Immutable cache namespace and its observed epoch, never a live placement mirror.
+        PrefixCacheFingerprintResult prefix_identity_;
         bool prefix_cache_bypassed_ = false;
         std::string prefix_cache_bypass_reason_;
         /**
@@ -6661,15 +6700,17 @@ namespace llaminar2
          * `InvalidateOnRebalance` first rebases the cache's volatile capacity
          * to the new request namespace. Other policies retain compatible
          * records and only replace the active lookup key. This is the sole
-         * post-initialization writer of `prefix_fingerprint_`.
+         * post-initialization writer of `prefix_identity_`. Key and observed
+         * placement epoch are published together, even when policy permits
+         * reusing the key across movement epochs.
          *
-         * @param next_fingerprint Non-zero fingerprint built from live state.
+         * @param next_identity Non-zero fingerprint with its original epoch observation.
          * @param policy Configured MoE/prefix compatibility policy.
          * @param operation Stable lifecycle name for diagnostics.
          * @return True after the complete transition is published.
          */
         bool publishPrefixFingerprintTransition(
-            uint64_t next_fingerprint,
+            const PrefixCacheFingerprintResult &next_identity,
             PrefixCacheMoEPolicy policy,
             const char *operation);
 
@@ -8669,6 +8710,8 @@ namespace llaminar2
         };
 
         DeviceMoERebalanceMaintenanceGraphCache device_moe_rebalance_maintenance_graph_;
+        /** Model-lifetime diagnostic receipts; never consulted by inference policy. */
+        std::optional<NativeMoEMovementArchive> native_moe_movement_archive_;
 
         /** One-way pinned observer and event for the HIP MoE ticket boundary. */
         std::unique_ptr<PinnedMoERebalanceDispatchTicketScratch>

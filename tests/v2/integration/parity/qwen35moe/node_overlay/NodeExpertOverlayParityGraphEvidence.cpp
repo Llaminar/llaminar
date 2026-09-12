@@ -5,8 +5,11 @@
  * Shared by the 35B and 122B generated node ExpertOverlay matrices. This
  * translation-unit boundary does not change request ownership, reference
  * mathematics, graph execution, or evidence publication ordering.
+ * Logical ticket proof is distinct from the retained parent's compiler-shard
+ * count; the shared evidence interpreter authenticates that distinction.
  */
 #include "NodeExpertOverlayParityFixture.h"
+#include "../../../../utils/HeterogeneousTicketParityEvidence.h"
 
 namespace llaminar2::test::parity::qwen35moe::node_overlay
 {
@@ -227,7 +230,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * one merely to satisfy the mapped-follower evidence used by node-wide
      * cases. Instead, every MoE layer must materialize and capture its exact
      * canonical-ticket consumer, while the full graph must lower to typed
-     * captured/manual/captured transactions with one successor per boundary.
+     * captured/manual/captured transactions with authenticated successors.
+     * Compiler shards and the combined CPU service are not logical boundaries.
      */
     auto Qwen35MoENodeExpertOverlayParityTest::assertRankLocalCanonicalTicketGraphEvidence() const -> void
     {
@@ -441,33 +445,23 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         for (const auto &record :
              PerfStatsCollector::snapshot({"forward_graph"}))
         {
-            if (record.kind != PerfStatRecord::Kind::Counter ||
-                record.domain != "forward_graph" ||
-                record.name != "heterogeneous_ticket_transactions")
-            {
+            const auto disposition =
+                classifyHeterogeneousTicketLifecycleEvidence(record);
+            if (disposition == HeterogeneousTicketEvidenceDisposition::Unrelated)
                 continue;
-            }
-            const int captured =
-                parse_nonnegative(record, "capturable_segments");
-            const int manual =
-                parse_nonnegative(record, "manual_segments");
-            const int boundaries =
-                parse_nonnegative(record, "unit_boundaries");
-            const int terminals =
-                parse_nonnegative(record, "terminal_units");
-            const auto role = record.tags.find("role");
-            const auto authority =
-                record.tags.find("ticket_publication_authority");
-            const bool valid =
-                record.phase == "capture" && record.count > 0u &&
-                record.value > 0.0 && manual > 0 &&
-                boundaries == manual && captured == manual + 1 &&
-                terminals == 1 && role != record.tags.end() &&
-                role->second == "authority" &&
-                authority != record.tags.end() &&
-                authority->second == "stage_owned_mapped_timeline";
-            if (!valid)
+            if (disposition != HeterogeneousTicketEvidenceDisposition::Authority)
+            {
                 ++local[kMalformedRecords];
+                // Preserve the actual rejected contract instead of reporting
+                // only a global malformed count after MPI aggregation.
+                std::ostringstream diagnostic;
+                diagnostic << "Invalid rank-local ticket lifecycle evidence: phase="
+                           << record.phase << " count=" << record.count
+                           << " value=" << record.value;
+                for (const auto &[key, value] : record.tags)
+                    diagnostic << ' ' << key << '=' << value;
+                LOG_ERROR(diagnostic.str());
+            }
             else
                 local[kLifecycleTransactions] += record.count;
         }
@@ -1147,7 +1141,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * assertion consequently proves the whole lifecycle rather than inventing
      * a test-only reset edge: all schedules succeed, every captured row is
      * accounted for, both roles retain identical ordered digests, and the one
-     * snapshot-bearing parity request independently proves `[4,4,1]`. Mandatory
+     * request-scoped parity evidence independently proves `[4,4,1]`. Training
+     * and prefix seeding may also publish valid snapshot aggregations. Mandatory
      * prefix restore then contributes exactly one serial suffix-decode record.
      */
     auto Qwen35MoENodeExpertOverlayParityTest::assertSegmentedPrefillEvidence() const -> void
@@ -1155,7 +1150,6 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         constexpr uint64_t kExpectedChunks = 3;
         constexpr uint64_t kExpectedRealTokens = 9;
         constexpr uint64_t kExpectedPaddedTokens = 3;
-        constexpr uint64_t kExpectedSnapshotPrefillTransactions = 1;
         constexpr size_t kContractRecords = 0;
         constexpr size_t kSnapshotAggregationRecords = 1;
         constexpr size_t kContinuationTransactionRecords = 2;
@@ -1280,7 +1274,17 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                     tagEquals("logical_rows", "1") &&
                     tagEquals("state_transition", "main_only");
                 if (!valid)
+                {
+                    std::ostringstream detail;
+                    detail << "Malformed restored-prefix suffix evidence: "
+                           << "phase=" << record.phase
+                           << ",value=" << record.value
+                           << ",count=" << record.count;
+                    for (const auto &[name, value] : record.tags)
+                        detail << ',' << name << '=' << value;
+                    ADD_FAILURE() << detail.str();
                     ++local[kMalformedRecords];
+                }
                 else
                     local[kRestoredPrefixSuffixDecodeTransactions] +=
                         record.count;
@@ -1310,16 +1314,23 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             if (record.domain == "forward_graph" &&
                 record.name == "prefill_chunk_snapshot_sequence_keys")
             {
-                if (record.phase != "prefill" || record.value <= 0.0 ||
-                    record.count != kExpectedSnapshotPrefillTransactions ||
-                    !tagEquals("chunks", std::to_string(kExpectedChunks)) ||
-                    !tagEquals("diagnostic_only", "true"))
+                try
                 {
-                    ++local[kMalformedRecords];
+                    const auto evidence = ParityPrefillSnapshotEvidence::capture(
+                        std::span<const PerfStatRecord>(&record, 1u), kExpectedChunks);
+                    local[kSnapshotAggregationRecords] += evidence.transactions();
                 }
-                else
+                catch (const std::logic_error &error)
                 {
-                    ++local[kSnapshotAggregationRecords];
+                    std::ostringstream detail;
+                    detail << error.what() << ": "
+                           << "phase=" << record.phase
+                           << ",value=" << record.value
+                           << ",count=" << record.count;
+                    for (const auto &[name, value] : record.tags)
+                        detail << ',' << name << '=' << value;
+                    ADD_FAILURE() << detail.str();
+                    ++local[kMalformedRecords];
                 }
                 continue;
             }
@@ -1453,8 +1464,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             global[kContractRecords],
             static_cast<uint64_t>(mpiWorldSize()))
             << "Every MPI participant must install the immutable shared bucket contract";
-        EXPECT_EQ(global[kSnapshotAggregationRecords], 1u)
-            << "The continuation graph must aggregate the complete prompt into one evidence record";
+        EXPECT_GE(global[kSnapshotAggregationRecords], 1u)
+            << "The continuation graph must publish validated snapshot aggregations; "
+               "the exact parity request delta is checked with its checkpoints";
         EXPECT_EQ(
             global[kParticipantTransactionRecords],
             global[kContinuationTransactionRecords])
@@ -1506,9 +1518,19 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * `PREFILL_CHUNK_0_layer0_...` for diagnosis and rewrites the bare semantic
      * key to the ordered aggregate. This check prevents a short final chunk
      * from passing merely because a comparison used the shorter tensor length.
+     * @param before Immutable counters immediately before the parity request;
+     *               its delta excludes earlier training and later prefix seeds.
      */
-    auto Qwen35MoENodeExpertOverlayParityTest::assertSegmentedPrefillCheckpointCoverage() -> void
+    auto Qwen35MoENodeExpertOverlayParityTest::assertSegmentedPrefillCheckpointCoverage(
+        const ParityPrefillSnapshotEvidence &before) -> void
     {
+        const uint64_t chunks =
+            (config_.token_ids.size() + activeSegmentedPrefillCaptureRows() - 1u) /
+            activeSegmentedPrefillCaptureRows();
+        EXPECT_NO_THROW(ParityPrefillSnapshotEvidence::capture(
+                            PerfStatsCollector::snapshot({"forward_graph"}), chunks)
+                            .requireSingleRequestSince(before))
+            << "The authenticated prefill must aggregate its complete prompt exactly once";
         constexpr const char *kFirstChunkPrefix = "PREFILL_CHUNK_0_";
         const auto keys = activeSnapshotKeys();
         size_t checked = 0;

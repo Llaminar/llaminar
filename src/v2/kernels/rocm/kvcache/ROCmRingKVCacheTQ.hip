@@ -4,6 +4,9 @@
  * @author David Sanftenberg
  *
  * V2: Per-layer FP16 scratch, fused incremental kernel, graph capture support.
+ * Device-owned head/count and an immutable first-key basis govern append in
+ * every phase. Prefix export/import carries that basis alongside native bytes;
+ * retained graphs consume stable allocations through explicit stream edges.
  */
 
 #include "ROCmRingKVCacheTQ.h"
@@ -569,6 +572,16 @@ namespace llaminar2
         return false;
     }
 
+    /**
+     * @brief Encode projected rows with the same request basis as grouped decode.
+     * @param layer Local cache layer.
+     * @param seq_idx Independent request slot.
+     * @param k Device-resident position-major FP32 key projections.
+     * @param v Device-resident position-major FP32 value projections.
+     * @param num_tokens Captured row capacity; a device count may shorten it.
+     * @param stream Exact producer stream ordering basis, payload and cursor.
+     * @return Whether all publication kernels were accepted.
+     */
     bool ROCmRingKVCacheTQ::appendWithStream(
         int layer, int seq_idx, const ITensor *k, const ITensor *v,
         int num_tokens, void *stream)
@@ -618,8 +631,7 @@ namespace llaminar2
             entry.d_K_anchor, &d_head_params_[index],
             &d_count_params_[index], d_append_count,
             max_seq_len_, num_tokens,
-            local_n_kv_heads_, head_dim_, false, false, mode_,
-            AttentionKeyAnchorPolicy::MeanRetained, hip_stream);
+            local_n_kv_heads_, head_dim_, false, false, mode_, hip_stream);
         if (ok)
         {
             hip_kv_sequence_state_advance_dynamic(
@@ -725,7 +737,7 @@ namespace llaminar2
             &d_head_params_[index], &d_count_params_[index], d_append_count,
             max_seq_len_, verifier_rows,
             local_n_kv_heads_, head_dim_, k_head_major, v_head_major,
-            mode_, AttentionKeyAnchorPolicy::FirstRetained, stream);
+            mode_, stream);
         if (ok)
         {
             hip_kv_sequence_state_advance_dynamic(
@@ -1230,6 +1242,32 @@ namespace llaminar2
         if (out_v) *out_v = v;
         if (out_kv_len) *out_kv_len = static_cast<int>(k->rows());
         return true;
+    }
+
+    std::optional<IKVCache::DeviceReadStorage>
+    ROCmRingKVCacheTQ::describeDeviceReadStorage(
+        const DeviceReadStorageRequest &request) const
+    {
+        if (request.layer < 0 || request.layer >= n_layers_ ||
+            request.first_sequence < 0 || request.request_count <= 0 ||
+            request.request_count > batch_size_ ||
+            request.first_sequence > batch_size_ - request.request_count ||
+            (request.kind != DeviceReadStorageKind::NativeRequestMajor &&
+             request.kind != DeviceReadStorageKind::ConvertedRequestMajor) ||
+            !workspace_)
+            return std::nullopt;
+
+        // Both compressed read policies publish into the same prepared FP16
+        // request bank. They differ in arithmetic, not destination identity.
+        const auto &scratch = layer_scratch_[request.layer];
+        const size_t rows = static_cast<size_t>(request.request_count) * max_seq_len_;
+        const size_t row_bytes = static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
+        if (!scratch.d_K || !scratch.d_V || row_bytes == 0 ||
+            rows > scratch_capacity_bytes_ / row_bytes)
+            return std::nullopt;
+        return DeviceReadStorage{
+            scratch.d_K, scratch.d_V, rows, static_cast<size_t>(kv_dim_),
+            TensorType::FP16, DeviceId::rocm(device_id_)};
     }
 
     bool ROCmRingKVCacheTQ::get_kv_batched_device_view(

@@ -126,6 +126,11 @@ public:
 
 namespace
 {
+    /**
+     * @brief Read policy source using the repository-root CTest working directory.
+     * @param path Repository-relative path; never a developer-specific checkout.
+     * @return Source text, or empty text that the calling assertion rejects.
+     */
     std::string readSourceFileForDeviceGraphOrchestratorTest(const std::string &path)
     {
         std::ifstream input(path);
@@ -197,7 +202,7 @@ namespace
     {
         const std::string source =
             readSourceFileForDeviceGraphOrchestratorTest(
-                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "src/v2/execution/local_execution/orchestrators/"
                 "DeviceGraphOrchestrator.cpp");
         ASSERT_FALSE(source.empty());
 
@@ -251,7 +256,7 @@ namespace
     {
         const std::string source =
             readSourceFileForDeviceGraphOrchestratorTest(
-                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "src/v2/execution/local_execution/orchestrators/"
                 "DeviceGraphOrchestrator.cpp");
         ASSERT_FALSE(source.empty());
 
@@ -310,7 +315,7 @@ namespace
     {
         const std::string source =
             readSourceFileForDeviceGraphOrchestratorTest(
-                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "src/v2/execution/local_execution/orchestrators/"
                 "DeviceGraphOrchestrator.cpp");
         ASSERT_FALSE(source.empty());
 
@@ -428,7 +433,7 @@ namespace
     {
         const std::string source =
             readSourceFileForDeviceGraphOrchestratorTest(
-                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+                "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
         ASSERT_FALSE(source.empty());
 
         const auto execute_pos = source.find(
@@ -634,6 +639,39 @@ namespace
         cfg.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Off;
         return cfg;
     }
+
+    /**
+     * @brief Inject publication after epoch sampling, before key construction ends.
+     *
+     * This deterministic interleaving uses the ordinary model fingerprint hook
+     * and the existing test-only movement publication surface. It needs no
+     * scheduler timing, device, or real expert weights.
+     */
+    class PublishingPrefixMoEGraph : public Qwen35MoEGraph
+    {
+    public:
+        /** @brief Construct the normal lightweight MoE prefix graph fixture. */
+        explicit PublishingPrefixMoEGraph(const GraphConfig &config)
+            : Qwen35MoEGraph(config, nullptr) {}
+
+        /** @brief Arm a single publication at the next fingerprint boundary. */
+        void publishDuringNextFingerprint(DeviceGraphOrchestrator &runner)
+        {
+            publisher_ = &runner;
+        }
+
+        /** @brief Append real model fields, then deliver the armed publication. */
+        void appendPrefixCacheFingerprintMaterial(
+            PrefixFingerprintMaterial &material) const override
+        {
+            Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(material);
+            if (auto *publisher = std::exchange(publisher_, nullptr))
+                publisher->markMoERuntimeMovementForTesting();
+        }
+
+    private:
+        mutable DeviceGraphOrchestrator *publisher_ = nullptr;
+    };
 
     void fillMaintenanceWindowSkewed(DecodeExpertHistogram &hist,
                                      int window_size,
@@ -1958,10 +1996,10 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseVerifierUsesFullAllPosition
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const std::string header =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
     ASSERT_FALSE(source.empty());
     ASSERT_FALSE(header.empty());
 
@@ -2031,7 +2069,7 @@ TEST_F(Test__DeviceGraphOrchestrator,
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto begin = source.find(
@@ -2068,7 +2106,7 @@ TEST_F(Test__DeviceGraphOrchestrator, LiveHybridPrefixLayoutRefreshRekeysBeforeH
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto refresh_pos =
@@ -2110,7 +2148,7 @@ TEST_F(Test__DeviceGraphOrchestrator, LiveHybridPrefixLayoutRefreshRekeysBeforeH
         std::string::npos)
         << "InvalidateOnRebalance must recover stale volatile capacity before publication.";
     EXPECT_NE(
-        transition_body.find("prefix_fingerprint_ = next_fingerprint"),
+        transition_body.find("prefix_identity_ = next_identity", transition_body.find("rebaseFingerprint(")),
         std::string::npos)
         << "The typed transition must publish the new fingerprint only after rebase succeeds.";
 }
@@ -2119,7 +2157,7 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixRestoresHybridStateBanksForS
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto import_pos = source.find("bool importHybridPrefixPayload(");
@@ -2155,7 +2193,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GpuLiveCheckpointUsesDeviceOnlyHybridPaylo
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto checkpoint_pos =
@@ -2199,7 +2237,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GpuRollbackCheckpointUsesPreallocatedDevic
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto payload_pos =
@@ -2234,7 +2272,7 @@ TEST_F(Test__DeviceGraphOrchestrator, LocalTPPrefixCachePreservesDeviceOwnedHybr
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     EXPECT_EQ(source.find("applyDenseLocalTPHostOnlyHybridPayloadLayout"),
@@ -2289,7 +2327,7 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixWaitsForLiveGraphProducersBef
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto harvest_pos =
@@ -2387,7 +2425,7 @@ TEST_F(Test__DeviceGraphOrchestrator, RequestResetJoinNamesEveryRequiredDeviceTi
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto join_pos =
@@ -2444,7 +2482,7 @@ TEST_F(Test__DeviceGraphOrchestrator, MTPStopControlsArePublishedOnlyAtRequestBo
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto verifier_pos =
@@ -2521,7 +2559,7 @@ TEST_F(Test__DeviceGraphOrchestrator, HarvestPrefixTerminalHiddenArchiveDoesNotP
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto harvest_pos =
@@ -2674,15 +2712,15 @@ TEST_F(Test__DeviceGraphOrchestrator, DeviceHotPrefixTierHasNoRamReplayPath)
 {
     const std::string backend_source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/prefix_cache/"
+            "src/v2/execution/prefix_cache/"
             "DeviceHotPrefixStorageBackend.cpp");
     const std::string cache_source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/prefix_cache/"
+            "src/v2/execution/prefix_cache/"
             "PrefixStateCache.cpp");
     const std::string orchestrator_source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/"
+            "src/v2/execution/local_execution/"
             "orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(backend_source.empty());
     ASSERT_FALSE(cache_source.empty());
@@ -2793,10 +2831,10 @@ TEST_F(Test__DeviceGraphOrchestrator, PopulatePrefixPublishesLiveStateMutationBo
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const std::string header =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
     ASSERT_FALSE(source.empty());
     ASSERT_FALSE(header.empty());
 
@@ -2868,10 +2906,10 @@ TEST_F(
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const std::string header =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
     ASSERT_FALSE(source.empty());
     ASSERT_FALSE(header.empty());
 
@@ -3225,7 +3263,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardImplPublishesLogicalTokenOffsetAtRe
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
     const auto build_input_pos = source.find("// Build forward input");
@@ -3267,10 +3305,10 @@ TEST_F(
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const std::string header =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
     ASSERT_FALSE(source.empty());
     ASSERT_FALSE(header.empty());
 
@@ -3424,7 +3462,7 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingP
     PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
     ASSERT_TRUE(before.supported);
     ASSERT_NE(before.fingerprint_key, 0u);
-    EXPECT_EQ(before.placement_epoch, 0u);
+    EXPECT_EQ(before.placement_epochs, PrefixPlacementEpochSpan::at(0));
     EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
 
     fillMaintenanceWindowSkewed(*controller_ptr->histogram(),
@@ -3446,7 +3484,7 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingP
 
     PrefixLookupResult after = orchestrator->lookupPrefix({1, 2});
     ASSERT_TRUE(after.supported);
-    EXPECT_EQ(after.placement_epoch, 1u);
+    EXPECT_EQ(after.placement_epochs, PrefixPlacementEpochSpan::at(1));
     EXPECT_EQ(orchestrator->moePlacementEpoch(), 1u);
     EXPECT_EQ(after.fingerprint_key, before.fingerprint_key)
         << "MoE placement is restored from the portable model-runtime prefix "
@@ -3465,7 +3503,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GraphStableMoERuntimeMovementIsTrackedWith
     PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
     ASSERT_TRUE(before.supported);
     ASSERT_NE(before.fingerprint_key, 0u);
-    EXPECT_EQ(before.placement_epoch, 0u);
+    EXPECT_EQ(before.placement_epochs, PrefixPlacementEpochSpan::at(0));
     EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
     EXPECT_EQ(orchestrator->moeRuntimeMovementEpoch(), 0u);
 
@@ -3476,7 +3514,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GraphStableMoERuntimeMovementIsTrackedWith
     EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u)
         << "Graph-stable GPU movement must not force graph recapture.";
     EXPECT_EQ(orchestrator->moeRuntimeMovementEpoch(), 1u);
-    EXPECT_EQ(after.placement_epoch, 1u);
+    EXPECT_EQ(after.placement_epochs, PrefixPlacementEpochSpan::at(1));
     EXPECT_EQ(after.fingerprint_key, before.fingerprint_key)
         << "Graph-stable runtime expert movement is restored from the portable "
            "model-runtime prefix payload, not encoded into the cache key.";
@@ -3568,10 +3606,40 @@ TEST_F(Test__DeviceGraphOrchestrator, InvalidateOnRebalanceRekeysGraphStableRunt
 
     const PrefixLookupResult after = orchestrator->lookupPrefix({1, 2});
     ASSERT_TRUE(after.supported) << after.bypass_reason;
-    EXPECT_EQ(after.placement_epoch, 1u);
+    EXPECT_EQ(after.placement_epochs, PrefixPlacementEpochSpan::at(1));
     EXPECT_NE(after.fingerprint_key, before.fingerprint_key)
         << "InvalidateOnRebalance must reject prefix entries from an older "
            "graph-stable placement epoch";
+}
+
+/** @brief A concurrent publication cannot attach a new epoch to the old key. */
+TEST_F(Test__DeviceGraphOrchestrator, PrefixLookupRetainsEpochUsedToBuildFingerprint)
+{
+    auto config = makeMaintenanceMoEGraphConfig();
+    config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
+    auto graph = std::make_shared<PublishingPrefixMoEGraph>(config);
+    DeviceGraphOrchestrator runner(graph, nullptr);
+    ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    const std::vector<int32_t> prompt = {1, 2};
+    const auto before = runner.lookupPrefix(prompt);
+    ASSERT_TRUE(before.supported);
+    graph->publishDuringNextFingerprint(runner);
+    const auto admitted = runner.lookupPrefix(prompt);
+    ASSERT_TRUE(admitted.supported);
+    EXPECT_EQ(runner.moeRuntimeMovementEpoch(), before.placement_epochs.latest() + 1);
+    EXPECT_EQ(admitted.fingerprint_key, before.fingerprint_key);
+    EXPECT_EQ(admitted.placement_epochs, before.placement_epochs);
+
+    // Harvest observes the publication independently and rejects only the
+    // archive write, never the successful request or background movement.
+    ASSERT_TRUE(runner.harvestPrefix(admitted, prompt, prompt.size()));
+    const auto next = runner.lookupPrefix(prompt);
+    ASSERT_TRUE(next.supported);
+    EXPECT_EQ(next.placement_epochs,
+              PrefixPlacementEpochSpan::at(before.placement_epochs.latest() + 1));
+    EXPECT_NE(next.fingerprint_key, admitted.fingerprint_key);
+    EXPECT_EQ(next.cached_tokens, 0);
 }
 
 /**

@@ -105,12 +105,11 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      *
      * Promotion/demotion needs two integer priorities. Capacity-preserving
      * same-tier balancing additionally needs an apportioned tier with at least
-     * two participants and more resident experts than participants in at least
-     * one layer. With exactly one expert per participant, every paired exchange
-     * merely permutes loads and cannot reduce makespan. Keeping that distinction
-     * typed prevents a fully priority-filled topology from being asked to
-     * manufacture an uneconomical move while preserving the stronger two-axis
-     * gate wherever the resolved residency has a real degree of freedom.
+     * two participants and two resident experts in at least one layer. Even
+     * one expert per participant permits a profitable swap when service rates
+     * differ. Geometry establishes opportunity, never an assumption of equal
+     * endpoint speed: the production host-admission ledger proves whether an
+     * exchange survives measured economics before requiring its physical edge.
      */
     enum class DynamicMovementAxisContract : std::uint8_t
     {
@@ -119,12 +118,12 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     };
 
     /**
-     * @brief Complete movement objective required before a converged A/B cohort.
+     * @brief Complete movement objective required by the generated evidence role.
      *
      * A publication wave may contain several independent closed cycles. The
-     * 122B proof deliberately admits both a tier-residency cycle and an in-tier
-     * participant cycle in one wide asynchronous wave, whereas the 35B proof
-     * requires several successive publications to reach its measured taper.
+     * movement-only proof may admit both a tier-residency cycle and an in-tier
+     * participant cycle in one wide asynchronous wave. An observed-speedup
+     * witness additionally requires successive publications before timing.
      * Keeping publication count and logical axes in separate typed fields
      * prevents a caller from treating cycles, histogram windows, waves, and
      * placement epochs as interchangeable integers.
@@ -621,6 +620,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * as one exchange set. The plan must be the capacity-resolved frozen
      * production plan: an automatic-capacity blueprint has no concrete expert
      * membership from which an expressible movement can be inferred.
+     * Two resident experts suffice for an exchange; unequal service rates can
+     * make a one-expert-per-endpoint permutation profitable.
      *
      * @param plan Inventory-bound or rank-agnostic ExpertOverlay plan.
      * @return Exact movement-axis contract implied by its participant catalogue.
@@ -647,30 +648,30 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      *
      * Ordinary optimization must replay the exact prompt identities judged by
      * the A/B gate. Once that placement objective is satisfied, a partially
-     * occupied demand bank may still need one exact closure request; that
-     * request uses a disjoint prefix namespace so it cannot seed a cache hit in
-     * the subsequent measured cohort.
+     * occupied demand bank may still need one exact closure request. Closure
+     * uses stationary authenticated tokens and the public archive purge,
+     * rather than changing expert demand with another prompt identity.
      */
     enum class ConvergenceMovementTraffic : std::uint8_t
     {
         MeasuredWorkload,
         MovementProof,
-        DemandWindowClosure,
     };
 
     /**
      * @brief Evidence that must remain admissible after movement settles.
      *
-     * Every Dynamic cell needs a passive publication boundary before parity
-     * snapshots begin. Only the one centrally assigned speed witness also
-     * needs enough room in the active demand bank for its complete A/B timing
+     * Every Dynamic cell needs room for its prefix/decode proof before parity
+     * snapshots begin. MTP additionally needs room for its serial/prefix proof;
+     * the centrally assigned speed witness needs room for its A/B timing
      * cohort and the immediately following numerical-parity request. Keeping
-     * these purposes distinct prevents movement-only cells from trying to
-     * admit evidence they will never execute.
+     * these purposes distinct avoids speculative work budgets in ordinary
+     * decode without allowing any numerical proof to skip prefix admission.
      */
     enum class ConvergenceBoundaryPurpose : std::uint8_t
     {
-        MovementProof,
+        NumericalParity,
+        MTPNumericalParity,
         ObservedSpeedupCohort,
     };
 
@@ -680,6 +681,16 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         TimingCohort,
         MovementProof,
     };
+
+    /**
+     * @brief Repeat authenticated tokens without changing the routed workload.
+     * @param tokens Stationary reference prompt, never a request-specific nonce.
+     * @param rows Exact positive number of routed rows required by the authority.
+     * @return A stable causal prefix, repeated only when the window is longer.
+     * @throws std::invalid_argument for an empty prompt or zero-row request.
+     */
+    std::vector<int32_t> stationaryDemandWindowPrompt(
+        std::span<const int> tokens, std::size_t rows);
 
     /**
      * @brief Exact production traffic admitted to movement optimization.
@@ -719,7 +730,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      *
      * The observed-speedup cell must optimize the same three request identities
      * that its matched A/B cohort later measures.  Replaying an archived prefix
-     * would execute only decode rows and turn four 96-row windows into hundreds
+     * would execute only decode rows and turn four demand windows into hundreds
      * of tiny distributed transactions.  The fixture therefore crosses the
      * public prefix-archive purge boundary once per training request: the first
      * prefill is guaranteed to execute all authenticated-shaped rows and the
@@ -740,6 +751,12 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         guaranteedRoutedRows() const noexcept
         {
             return cold_prefill_rows + decode_forward_rows;
+        }
+
+        /** @return Maximum rows when movement invalidates each repeated prefix. */
+        [[nodiscard]] constexpr std::uint64_t maximumRoutedRows() const noexcept
+        {
+            return qwen35MoEConvergenceTrainingMaximumRoutedRows();
         }
 
         /** @return Whether the plan has the exact measured cohort geometry. */
@@ -772,29 +789,42 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         return qwen35MoEConvergenceProtectedRoutedRows();
     }
 
+    /** @return Definition-owned routed-row bound for the MTP parity lifecycle. */
+    constexpr std::uint64_t mtpNumericalParityProtectedRoutedRows() noexcept
+    {
+        return qwen35MoEMTPNumericalParityProtectedRoutedRows();
+    }
+
     /**
      * @brief Return demand-bank headroom required by a typed boundary.
      *
-     * A movement-only boundary has no following protected evidence interval,
-     * so it requires no demand-window geometry. The observed-speedup boundary
+     * Every numerical boundary protects its fresh seed and complete restore.
+     * Ordinary decode includes the mandatory partial-prefix reseed and suffix
+     * in the definition-owned budget shared by the timing witness. The MTP
+     * boundary additionally protects its
+     * native serial oracle and prefix restores. The observed-speedup boundary
      * owns the exact routed-row requirement used by its matched A/B corpus and
      * the subsequent canonical prefix/decode proof. A profitable fifth wave
      * may still be admitted later; it may not invalidate the prefix between
      * the seed and restore that certify the already-proven placement epoch.
      *
      * @param purpose Evidence executed immediately after settlement.
-     * @return Required routed rows, or no requirement for movement-only proof.
+     * @return Required routed rows; zero denotes an invalid enum value.
      */
-    constexpr std::optional<std::uint64_t>
+    constexpr std::uint64_t
     convergenceBoundaryProtectedRows(
         ConvergenceBoundaryPurpose purpose) noexcept
     {
-        if (purpose ==
-            ConvergenceBoundaryPurpose::ObservedSpeedupCohort)
+        switch (purpose)
         {
+        case ConvergenceBoundaryPurpose::NumericalParity:
+            return qwen35MoEMaximumNumericalParityRoutedRows();
+        case ConvergenceBoundaryPurpose::MTPNumericalParity:
+            return mtpNumericalParityProtectedRoutedRows();
+        case ConvergenceBoundaryPurpose::ObservedSpeedupCohort:
             return convergenceProtectedRoutedRows();
         }
-        return std::nullopt;
+        return 0u;
     }
 
     /** Exact passive disposition of one post-movement measurement boundary. */
@@ -806,17 +836,27 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         InvalidAuthorityEvidence,
     };
 
-    /** Immutable work needed to close one partially occupied demand bank. */
+    /** Which causal edge ordinary serving traffic must complete next. */
+    enum class DemandWindowClosureKind : std::uint8_t
+    {
+        CompleteWindow, ///< Supply the named phase's missing rows.
+        DeliverPendingProgress, ///< A full window only awaits command sideband.
+    };
+
+    /** Immutable work needed to close one partially occupied demand window. */
     struct DemandWindowClosure
     {
         std::uint64_t generation = 0u;
         std::uint64_t observed_routed_rows = 0u;
         std::uint64_t routed_rows = 0u;
+        MoEOptimizationDemandScope scope = MoEOptimizationDemandScope::RoutedRows;
+        DemandWindowClosureKind kind = DemandWindowClosureKind::CompleteWindow;
 
         /** @return Whether the closure names positive work in one bank. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
-            return routed_rows > 0u;
+            return (kind == DemandWindowClosureKind::CompleteWindow && routed_rows > 0u) ||
+                   (kind == DemandWindowClosureKind::DeliverPendingProgress && routed_rows == 0u);
         }
     };
 
@@ -964,10 +1004,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * Histogram geometry large enough to keep one complete A/B cohort inside
      * one immutable residency epoch while ordinary maintenance remains live.
      * Three initial requests contribute 3 * (17 prefill + 2 decode) = 57 routed
-     * rows. A 96-row window therefore cannot publish during the baseline and
-     * still admits one already-running 19-row request, the complete
-     * post-movement cohort, and the following canonical parity request after
-     * the fourth asynchronous publication.
+     * rows. The definition derives its window from the maximum overlapping
+     * training request (including a movement-invalidated prefix), the complete
+     * post-movement cohort, and the following canonical parity/prefix proof.
      * Normal movement training replays those exact prompt identities and
      * therefore includes the production prefix-hit mix rather than changing
      * the decode trajectories under test. Every accepted placement publication
@@ -986,7 +1025,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      * reaching the observed taper and making the resulting tier-residency
      * change large enough for the end-to-end economy gate to judge reliably.
      */
-    constexpr int kObservedSpeedupConvergenceWindows = 4;
+    constexpr int kObservedSpeedupConvergenceWindows = static_cast<int>(
+        qwen35MoEMinimumMovementPublications(
+            ModelParityDynamicEvidence::EconomicMovementAndObservedSpeedup));
     /**
      * Exact bounded training requests needed for the four speedup windows.
      *
@@ -1009,19 +1050,6 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
           1) /
          static_cast<int>(
              kConvergenceTrainingTraffic.guaranteedRoutedRows()));
-    /**
-     * Prefix-identity interval reserved for every movement-proof request.
-     *
-     * Reserve the largest four-wave geometry represented by this fixture.
-     * Runtime traffic stops at its topology-specific convergence target, but
-     * identity namespaces remain disjoint for the full supported range.
-     */
-    constexpr int kMovementProofIdentityNamespaceRequests =
-        kObservedSpeedupConvergenceWindows *
-        ((kConvergenceHistogramWindowTokens +
-          static_cast<int>(kQwen35MoEParityTokenIds.size()) - 1) /
-         static_cast<int>(kQwen35MoEParityTokenIds.size()));
-
     /**
      * @brief Calculate requests that guarantee a typed publication target.
      *
@@ -1064,11 +1092,6 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             return request_ordinal % kConvergenceTimingCorpusRequests;
         case ConvergenceMovementTraffic::MovementProof:
             return kConvergenceTimingCorpusRequests + request_ordinal;
-        case ConvergenceMovementTraffic::DemandWindowClosure:
-            return kConvergenceTimingCorpusRequests +
-                   kMovementProofIdentityNamespaceRequests +
-                   kMaximumDynamicPublicationOverlapRequests +
-                   request_ordinal;
         }
         return 0;
     }

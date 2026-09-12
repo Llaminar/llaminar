@@ -14,6 +14,7 @@
 
 #include "MoEOverlayMigrationMeasurementLedger.h"
 #include "MoEOverlayPhysicalResidencyFabric.h"
+#include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayResidencyAuthority.h"
 
 #include <cstddef>
@@ -24,6 +25,25 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief One unmeasured participant/exact-format/production-phase coordinate.
+     *
+     * A cold expert need never receive an ordinary route. Preparation therefore
+     * needs the complete missing set, not a request to keep inferencing until
+     * the first missing coordinate happens to execute. Eligible layers contain
+     * only members of this exact manifest class priced in this phase; another
+     * participant, codebook, geometry, or graph phase cannot supply its price.
+     * This is a measurement requirement, never permission to publish residency
+     * or routing evidence.
+     */
+    struct MoEOverlayServiceEvidenceGap
+    {
+        int participant_id = -1;
+        int representative_layer = -1;
+        ExpertHistogramSource source = ExpertHistogramSource::SyntheticTest;
+        std::vector<int> eligible_layers;
+    };
+
     /**
      * @brief One exact manifest-equivalence class used by economy calibration.
      *
@@ -139,6 +159,51 @@ namespace llaminar2
         {
             return complete_expert_bytes_per_layer_;
         }
+
+        /**
+         * @brief Enumerate every missing exact service price without mutating evidence.
+         *
+         * Preparation and certification must share this query. One real sample
+         * in an eligible equivalent layer closes that class/phase coordinate;
+         * samples from a different participant or manifest class never do.
+         * Empty participant sets are legal for relay-only ranks.
+         *
+         * @param rows Complete participant-major, layer-minor cumulative rows.
+         * @param participant_ids Strictly increasing process/global participant IDs.
+         * @param topology Canonical graph reachability and economy-priced phases.
+         * @return Missing coordinates in participant/class/phase order; empty
+         *         means complete, not that missing prices were assigned zero.
+         * @throws std::invalid_argument For incomplete, unordered, overflowed,
+         *         or phase-incompatible evidence or mismatched topology.
+         */
+        [[nodiscard]] std::vector<MoEOverlayServiceEvidenceGap>
+        serviceEvidenceGaps(
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+            const std::vector<int> &participant_ids,
+            const ExpertHistogramProductionTopology &topology) const;
+
+        /**
+         * @brief Complete unobserved classes with independent prepared-kernel measurements.
+         *
+         * Both inputs remain immutable. This produces certification evidence,
+         * never a cumulative runtime counter import. Live observations own a
+         * class/phase whenever present; otherwise only measured probe rows of
+         * that exact participant, manifest class and priced phase are admitted.
+         * An unmeasured coordinate remains missing, not a zero-cost estimate.
+         *
+         * @param live Complete canonical snapshot of ordinary service counters.
+         * @param prepared Complete canonical matrix of bounded setup observations.
+         * @param participant_ids Exact sorted participants represented by both matrices.
+         * @param topology Canonical graph reachability and economy-priced phases.
+         * @return Independent combined evidence, still subject to the coverage gate.
+         * @throws std::invalid_argument For malformed, overflowed or incompatible rows.
+         */
+        [[nodiscard]] std::vector<MoEOverlayParticipantLayerServiceTotals>
+        withPreparedServiceEvidence(
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &live,
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &prepared,
+            const std::vector<int> &participant_ids,
+            const ExpertHistogramProductionTopology &topology) const;
 
         /**
          * @brief Expand representative-only robust rows to every exact member.

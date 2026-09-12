@@ -1922,8 +1922,11 @@ namespace llaminar2
          * operation clones every untouched published layer into that peer,
          * stamps one common epoch, and switches ticket admission only after the
          * complete family is visible. A no-work apply aborts the candidate; a
-         * busy/failed reservation is a device-side no-op. On successful
+         * busy reservation leaves its commands pending. On successful
          * publication @p candidate_epoch advances in place for graph replay.
+         * The exact apply transaction remains PreparedForPublication until
+         * that selector switch succeeds; only then may its command slot be
+         * recycled. A malformed handoff poisons the device controller.
          *
          * @param launch Exact maintenance stream/workspace binding.
          * @param runtime_layers Canonical main-model placement table.
@@ -1933,6 +1936,13 @@ namespace llaminar2
          * @param candidate_epoch Persistent next-epoch scalar.
          * @param reservation_and_publication_status Reserve input and terminal output.
          * @param apply_status Device-owned result of the immediately preceding apply.
+         * @param controller_state Sole device wave owner; preparation cannot retire it.
+         * @param command_headers Retained commands, recycled only after publication.
+         * @param command_buffer_count Exact retained wave-slot extent (one or two).
+         * @param plan_entries Immutable commands retained through selector publication.
+         * @param plan_capacity Exact command extent per retained wave.
+         * @param estimated_expert_bytes Canonical wire-slot bound; not measured copy bytes.
+         * @param journal Prebound terminal journal belonging to this controller.
          * @return True when the operation executed or was enqueued.
          */
         virtual bool finalizeMoEOverlayRebalancePublication(
@@ -1943,7 +1953,14 @@ namespace llaminar2
             DeviceMoEOverlayEpochControl *control,
             std::uint64_t *candidate_epoch,
             DeviceMoEOverlayEpochStatus *reservation_and_publication_status,
-            const DeviceMoERebalanceApplyStatus *apply_status)
+            const DeviceMoERebalanceApplyStatus *apply_status,
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            DeviceMoERebalanceCommandBufferHeader *command_headers,
+            std::uint32_t command_buffer_count,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            std::uint32_t plan_capacity,
+            std::uint64_t estimated_expert_bytes,
+            DeviceMoERebalanceMovementJournalView journal)
         {
             (void)launch;
             (void)runtime_layers;
@@ -1953,6 +1970,13 @@ namespace llaminar2
             (void)candidate_epoch;
             (void)reservation_and_publication_status;
             (void)apply_status;
+            (void)controller_state;
+            (void)command_headers;
+            (void)command_buffer_count;
+            (void)plan_entries;
+            (void)plan_capacity;
+            (void)estimated_expert_bytes;
+            (void)journal;
             return false;
         }
 

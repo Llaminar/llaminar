@@ -147,9 +147,9 @@ Examples:
         type=Path,
         default=None,
         help=(
-            "JSON object mapping decode steps to production recursive MTP "
-            "condition tokens; generates additive branch-qualified sidecar "
-            "snapshots without rewriting the canonical main-model pack"
+            "JSON mapping decode steps to recursive token arrays or objects "
+            "with condition_token and draft_tokens; generate independent "
+            "additive branches without changing canonical FP32 references"
         ),
     )
     parser.add_argument(

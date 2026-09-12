@@ -818,9 +818,11 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
      *
      * A movement-only cell needs one conflict-free priority cycle and, when
      * the topology exposes it, one same-priority participant cycle.  Its
-     * observation window expands to the declared model context immediately
-     * after that publication so numerical parity executes against the proven
-     * epoch without inducing unrelated migration churn.  The designated A/B
+     * observation window expands to the declared model context after an
+     * observed no-move scan. Successful moves retain short windows while the
+     * production controller still finds profitable work. Every typed settlement
+     * must therefore prove demand headroom before admitting numerical parity;
+     * a published move alone cannot promise an immutable epoch. The designated A/B
      * witness retains the full layer-parallel transfer fabric and one fixed
      * window large enough for its complete timing cohort, canonical parity
      * request, and one publication-overlap request.
@@ -837,7 +839,6 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     {
         constexpr int kMovementProofInitialWindowRows =
             kQwen35MoEMovementProofInitialWindowRows;
-        constexpr std::uint32_t kMovementProofConcurrentCycles = 2u;
         if (maximum_context_rows < kMovementProofInitialWindowRows)
         {
             throw std::invalid_argument(
@@ -851,8 +852,10 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         movement.window_growth_factor =
             static_cast<float>(maximum_context_rows) /
             static_cast<float>(kMovementProofInitialWindowRows);
-        movement.migration_cycles_per_wave =
-            kMovementProofConcurrentCycles;
+        // Use the already allocated layer-parallel transfer fabric. A small
+        // active-cycle override serializes otherwise independent moves and
+        // can make MTP's stable evidence boundary take hundreds of waves.
+        // The production resolver bounds concurrency by the physical slots.
         /* The initial one-token device cadence publishes the proof wave. After
          * that transaction, the recurring device scheduler must match the
          * expanded host observation horizon or it can author additional
@@ -884,6 +887,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         const Qwen122OverlayTopologySpec &spec)
     {
         ModelParityDefinition definition;
+        // Weight preparation for this model owns the startup allowance on all
+        // generated cells, including untagged generation-regression controls.
+        definition.generation_workload = ModelParityGenerationWorkload{}.withReadiness(180);
         definition.model = {
             .test_id = "Qwen35_122B",
             .model_path = kQwen122ModelPath,
@@ -892,6 +898,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             .max_seq_len = 4096,
             .transformer_layers = 48,
             .maximum_mtp_draft_depth = kQwen122MaximumMTPDraftDepth,
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
         definition.topology.test_id = spec.test_id;
         definition.topology.kind =

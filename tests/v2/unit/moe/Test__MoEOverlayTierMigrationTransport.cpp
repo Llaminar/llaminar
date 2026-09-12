@@ -7,17 +7,25 @@
  * preparation starts only after all projections are ready, selector
  * publication remains atomic, old
  * banks wait for ticket retirement, malformed reservations abort, and failures
- * never expose the candidate epoch.
+ * never expose the candidate epoch. Optional evidence independently binds the
+ * transport's published bank to the owner's journal through bounded sequences;
+ * measured bytes, rather than estimated expert size, corroborate physical work.
  */
 
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "execution/moe/MoEOverlayEconomyCalibrationPlanner.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <array>
+#include <algorithm>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +34,44 @@ namespace llaminar2::test
 {
     namespace
     {
+        /** @brief Restore process-wide optional diagnostics after one device-free proof. */
+        class ScopedMovementEvidence
+        {
+        public:
+            /** @brief Enable only the movement evidence domain, preserving caller configuration. */
+            ScopedMovementEvidence()
+            {
+                for (std::size_t index = 0; index < names_.size(); ++index)
+                    if (const char *value = std::getenv(names_[index]))
+                        previous_[index] = value;
+                if (setenv(names_[0], "1", 1) != 0 ||
+                    setenv(names_[1], "moe_overlay_residency", 1) != 0)
+                    throw std::runtime_error("cannot configure scoped movement evidence");
+                PerfStatsCollector::reset();
+            }
+
+            /** @brief Restore collection policy and discard this test's diagnostic records. */
+            ~ScopedMovementEvidence()
+            {
+                for (std::size_t index = 0; index < names_.size(); ++index)
+                {
+                    if (previous_[index])
+                        setenv(names_[index], previous_[index]->c_str(), 1);
+                    else
+                        unsetenv(names_[index]);
+                }
+                PerfStatsCollector::reset();
+            }
+
+            ScopedMovementEvidence(const ScopedMovementEvidence &) = delete;
+            ScopedMovementEvidence &operator=(const ScopedMovementEvidence &) = delete;
+
+        private:
+            const std::array<const char *, 2> names_{
+                "LLAMINAR_PERF_STATS_JSON", "LLAMINAR_PERF_STATS_FILTER"};
+            std::array<std::optional<std::string>, 2> previous_;
+        };
+
         /** @brief Shared observations retained after wave objects are destroyed. */
         struct ProtocolObservations
         {
@@ -550,6 +596,7 @@ namespace llaminar2::test
         MoEOverlayTierMigrationTransport,
         AllNineProjectionsPrepareThenPublishAndOldBankWaitsForTicket)
     {
+        ScopedMovementEvidence evidence;
         auto fixture = makeAuthority();
         auto old_ticket = fixture.authority->tryAcquireTicketSnapshot();
         ASSERT_TRUE(old_ticket.has_value());
@@ -577,6 +624,14 @@ namespace llaminar2::test
             MoEOverlayResidencyApplyStatus::Staging);
         EXPECT_EQ(factory.observations->bank_begin_prepares, 0u);
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+
+        // Preparation has not exposed the bank or committed an owner epoch.
+        for (const auto &record : PerfStatsCollector::snapshot({"moe_overlay_residency"}))
+        {
+            EXPECT_NE(record.name, "placement_transport_publications");
+            EXPECT_NE(record.name, "placement_owner_publications");
+            EXPECT_NE(record.name, "placement_published_payload_bytes");
+        }
 
         EXPECT_EQ(
             fixture.authority->advanceBackground().status,
@@ -613,6 +668,35 @@ namespace llaminar2::test
         EXPECT_EQ(stats.inference_stream_waits, 0u);
         EXPECT_EQ(stats.blocking_synchronizations, 0u);
 
+        const auto records = PerfStatsCollector::snapshot({"moe_overlay_residency"});
+        const auto find = [&](const char *name)
+        {
+            return std::find_if(records.begin(), records.end(),
+                [&](const auto &record) { return record.name == name; });
+        };
+        const auto copied = find("placement_transport_publications");
+        const auto owned = find("placement_owner_publications");
+        const auto payload = find("placement_published_payload_bytes");
+        ASSERT_NE(copied, records.end());
+        ASSERT_NE(owned, records.end());
+        ASSERT_NE(payload, records.end());
+        EXPECT_EQ(copied->kind, PerfStatRecord::Kind::OrderedSequence);
+        EXPECT_EQ(owned->kind, PerfStatRecord::Kind::OrderedSequence);
+        EXPECT_EQ(copied->count, 1u);
+        EXPECT_EQ(copied->sequence_word_count, 2u);
+        EXPECT_EQ(copied->count, owned->count);
+        EXPECT_EQ(copied->sequence_word_count, owned->sequence_word_count);
+        EXPECT_EQ(copied->sequence_digest_lo, owned->sequence_digest_lo);
+        EXPECT_EQ(copied->sequence_digest_hi, owned->sequence_digest_hi);
+        EXPECT_EQ(payload->value, 9'252.0);
+        for (const auto *record : {&*copied, &*owned, &*payload})
+        {
+            EXPECT_EQ(record->tags, (PerfStatsCollector::Tags{{"purpose", "placement_change"}}))
+                << "Epoch identity belongs in sequence words, not unbounded telemetry keys";
+            EXPECT_EQ(record->phase, "maintenance");
+            EXPECT_EQ(record->device, "heterogeneous-test");
+        }
+
         old_ticket.reset();
         EXPECT_EQ(
             fixture.authority->advanceBackground().status,
@@ -647,6 +731,7 @@ namespace llaminar2::test
         MoEOverlayTierMigrationTransport,
         PreparedContextRestorationPublishesButCannotCertifyLiveOptimization)
     {
+        ScopedMovementEvidence evidence;
         auto fixture = makeAuthority();
         ScriptedWaveFactory live_factory(
             ScriptedWaveFactory::Mode::Exact,
@@ -667,6 +752,10 @@ namespace llaminar2::test
         ASSERT_EQ(fixture.authority->snapshot()->epoch, 2u);
         ASSERT_FALSE(
             fixture.authority->initialPreparedPlacementPublished());
+
+        // Isolate restoration's optional diagnostics from the preceding live
+        // transaction. Runtime placement state and its journal are not reset.
+        PerfStatsCollector::reset();
 
         const auto restoration = fixture.authority
                                      ->proposeInitialPreparedPlacementRestoration();
@@ -702,6 +791,12 @@ namespace llaminar2::test
             << "Teardown restoration is physical work, not live optimization evidence";
         EXPECT_EQ(stats.placement_transfer_payload_bytes_completed, 0u);
         EXPECT_EQ(stats.commits_completed, 1u);
+        for (const auto &record : PerfStatsCollector::snapshot({"moe_overlay_residency"}))
+        {
+            EXPECT_NE(record.name, "placement_transport_publications");
+            EXPECT_NE(record.name, "placement_owner_publications");
+            EXPECT_NE(record.name, "placement_published_payload_bytes");
+        }
     }
 
     TEST(
@@ -961,6 +1056,7 @@ namespace llaminar2::test
         MoEOverlayTierMigrationTransport,
         CalibrationPlannerCoversEveryDirectedEdgeAndPublicationIsImpossible)
     {
+        ScopedMovementEvidence evidence;
         auto fixture = makeAuthority();
         const auto live = fixture.authority->snapshot();
         ASSERT_TRUE(live && live->valid());
@@ -1053,5 +1149,11 @@ namespace llaminar2::test
             start.wave->pollAbort(&error),
             MoEOverlayResidencyWaveProgress::Ready)
             << error;
+        for (const auto &record : PerfStatsCollector::snapshot({"moe_overlay_residency"}))
+        {
+            EXPECT_NE(record.name, "placement_transport_publications");
+            EXPECT_NE(record.name, "placement_owner_publications");
+            EXPECT_NE(record.name, "placement_published_payload_bytes");
+        }
     }
 } // namespace llaminar2::test

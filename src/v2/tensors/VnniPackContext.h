@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -42,25 +43,49 @@ namespace llaminar2
         uint16_t *scales_array; ///< [blocks_per_row × N]
         uint16_t *mins_array;   ///< [blocks_per_row × N] (nullptr for symmetric)
         uint32_t *emins_array;  ///< [blocks_per_row × N] (nullptr except Q2_K)
+
+        /// First source K block represented in these destination arrays.
+        /// Zero keeps whole-matrix packing unchanged. A nonzero origin lets
+        /// streaming preparation reuse a bounded tile without rebasing source
+        /// coordinates or forming pointers before the start of an allocation.
+        int destination_block_origin = 0;
+        /// Number of blocks in the destination window; zero means the complete
+        /// remaining source range. Positive counts bound streaming scratch.
+        int destination_block_count = 0;
     };
 
     // =================================================================
     // Inline helpers for VNNI interleaved layout
     // =================================================================
 
-    /// Compute the interleaved linear index for coalesced GPU access
+    /**
+     * @brief Locate a source block in a complete or windowed destination.
+     * @param ctx Owned destination geometry and source-coordinate window.
+     * @param n Destination row, independent of the source tensor row.
+     * @param b Absolute source K-block index.
+     * @return Window-local interleaved index.
+     * @throws std::out_of_range If the coordinates precede the window or
+     *         exceed the declared source/row geometry.
+     */
     inline size_t vnniLinearIdx(const VnniPackContext &ctx, int n, int b)
     {
-        return static_cast<size_t>(b) * ctx.N + static_cast<size_t>(n);
+        if (ctx.destination_block_origin < 0 || ctx.destination_block_count < 0 ||
+            b < ctx.destination_block_origin || b >= ctx.blocks_per_row ||
+            (ctx.destination_block_count != 0 &&
+             b - ctx.destination_block_origin >= ctx.destination_block_count) ||
+            n < 0 || n >= ctx.N)
+            throw std::out_of_range("NativeVNNI packing coordinates outside destination window");
+        return static_cast<size_t>(b - ctx.destination_block_origin) * ctx.N +
+               static_cast<size_t>(n);
     }
 
-    /// Get the payload destination pointer for a given linear index
+    /** @brief Address a validated window-local block in the payload array. */
     inline uint8_t *vnniPayloadDst(const VnniPackContext &ctx, size_t linear)
     {
         return ctx.payload_array + linear * ctx.payload_bytes;
     }
 
-    /// Compute the number of 256-element super-blocks per row
+    /** @brief Number of original 256-value source blocks, including a tail. */
     inline int vnniSuperBlocksPerRow(int K) { return (K + 255) / 256; }
 
 } // namespace llaminar2

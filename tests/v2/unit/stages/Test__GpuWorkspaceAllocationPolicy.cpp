@@ -1575,6 +1575,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPDiagnosticsUseTypedForwardRo
             "advanceMTPMainConditionFromDeviceResidentLogicalState("
             "int32_ttoken_shadow,"
             "constDeviceResidentLogicalSequenceStateHandle&logical_state,"
+            "MTPConditionForwardPurposepurpose,"
             "intrequest_index=0)"),
         std::string::npos)
         << "GPU MTP condition replay must carry token and position ownership in "
@@ -1582,7 +1583,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MirroredMTPDiagnosticsUseTypedForwardRo
     EXPECT_NE(
         compact_runner_interface.find(
             "advanceMTPMainConditionFromDeviceTargetSample("
-            "int32_ttoken_shadow,inttarget_sample_slot)"),
+            "int32_ttoken_shadow,inttarget_sample_slot,MTPConditionForwardPurposepurpose)"),
         std::string::npos)
         << "A device target token must be composed with its live position before "
            "main-graph replay.";
@@ -4899,7 +4900,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
     const auto probe_body = sliceBetween(
         source,
-        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const",
+        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe(",
         "void DeviceGraphOrchestrator::disablePrefixCacheForRunner");
     const auto payload_body = sliceBetween(
         source,
@@ -5011,7 +5012,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
     expectNeedleBefore(
         compact_checkpoint,
         "waitForLiveInferenceStateReadyForObservation(",
-        "constintretained_draft_tokens=",
+        "constintcached_tokens=request.logical_cached_tokens;",
         "captureLivePrefixCheckpoint must order after all live inference-state producers before reading live metadata.");
 }
 
@@ -5385,7 +5386,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         "const float *DeviceGraphOrchestrator::getAllPositionLogits()");
     const auto probe_body = sliceBetween(
         source,
-        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const",
+        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe(",
         "void DeviceGraphOrchestrator::disablePrefixCacheForRunner");
     const auto payload_body = sliceBetween(
         source,
@@ -7307,7 +7308,7 @@ TEST(
         stripCommentsAndStringLiterals(sliceBetween(
             runner_source,
             "auto prepare_grouped_gpu_verifier_input_tokens =",
-            "int speculative_draft_count =")));
+            "bool draft_count_budget_limited =")));
     const auto device_batch_admission = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
@@ -10121,7 +10122,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         removeAsciiWhitespace(stripCommentsAndStringLiterals(capture_body));
     const auto probe_body = sliceBetween(
         source,
-        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const",
+        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe(",
         "void DeviceGraphOrchestrator::disablePrefixCacheForRunner(");
     const auto compact_probe_fallback =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
@@ -10203,7 +10204,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     const auto probe_body = sliceBetween(
         source,
-        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const",
+        "PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe(",
         "void DeviceGraphOrchestrator::disablePrefixCacheForRunner(");
     const auto compact_probe =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(probe_body));
@@ -10957,7 +10958,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPBudgetLimitedDirectEmitUsesCheckpoin
               std::string::npos)
         << "CPU direct emit must retain the checkpoint-derived scalar anchor.";
     EXPECT_NE(compact_direct_emit.find(
-                  "advanceMTPMainConditionFromDeviceTargetSample(first_token,0)"),
+                  "advanceMTPMainConditionFromDeviceTargetSample(first_token,0,MTPConditionForwardPurpose::CommittedSerialToken)"),
               std::string::npos)
         << "GPU direct emit must publish and consume an inseparable resident "
            "token/position row.";
@@ -10997,7 +10998,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPConditionForwardPublishesShiftedSide
         "condition_state,0,0,true)");
     const size_t target_advance_pos = compact_condition_forward.find(
         "advanceMTPMainConditionFromDeviceTargetSample("
-        "condition_token,kConditionTargetSampleSlot)");
+        "condition_token,kConditionTargetSampleSlot,MTPConditionForwardPurpose::SpeculativeContinuation)");
     const size_t cpu_commit_pos = compact_condition_forward.find(
         "commitMTPShiftedRowFromCurrentTerminalHidden("
         "condition_token,0,true,*cpu_condition_sidecar_position)");
@@ -11099,7 +11100,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUScalarMTPConditionRequiresPairedResi
         resident_advance.find(
             "forwardImpl(&token_shadow,condition_token_device,1,1,"
             "ForwardExecutionRole::MTPCondition,"
-            "ForwardInvocationKind::ExplicitDecode,"
+            "mtpConditionForwardInvocation(purpose),"
             "condition_position_device,condition_sequence_length_device)"),
         std::string::npos)
         << "The captured condition graph must bind the paired mailbox token, "
@@ -11113,7 +11114,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUScalarMTPConditionRequiresPairedResi
     EXPECT_NE(
         target_advance.find(
             "advanceMTPMainConditionFromDeviceResidentLogicalState("
-            "token_shadow,logical_state,0)"),
+            "token_shadow,logical_state,purpose,0)"),
         std::string::npos)
         << "Target slots must enter the same typed mailbox path rather than a "
            "token-only replay API.";

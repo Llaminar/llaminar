@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "MoEOverlayReturnLayout.h"
 
 #include <cstddef>
 #include <vector>
@@ -67,6 +68,14 @@ namespace llaminar2
         std::size_t max_entries_per_participant = 0;
         int d_model = 0;
         std::size_t activation_graph_family_count = 0;
+        MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
+
+        /** @return Exact return-row capacity consumed by admission and transport. */
+        [[nodiscard]] std::size_t returnRowCapacity() const noexcept
+        {
+            return return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes
+                       ? max_entries_per_participant : max_rows_per_participant;
+        }
 
         /** @return Whether all dimensions can describe a production channel. */
         [[nodiscard]] bool valid() const noexcept
@@ -74,7 +83,7 @@ namespace llaminar2
             return participant_count != 0u &&
                    max_rows_per_participant != 0u &&
                    max_entries_per_participant != 0u && d_model > 0 &&
-                   activation_graph_family_count != 0u;
+                   activation_graph_family_count != 0u && isValidMoEOverlayReturnLayout(return_layout);
         }
 
 

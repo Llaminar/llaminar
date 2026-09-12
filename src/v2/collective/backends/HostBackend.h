@@ -276,24 +276,7 @@ namespace llaminar2
             const void *src_ptr, DeviceId src_device,
             size_t bytes) override;
 
-        /**
-         * @brief Async copy (delegates to synchronous copy)
-         *
-         * All HostBackend copies are synchronous. The stream parameter
-         * is accepted for interface compatibility but ignored.
-         *
-         * @param dst_ptr Destination pointer
-         * @param dst_device Destination device
-         * @param src_ptr Source pointer
-         * @param src_device Source device
-         * @param bytes Number of bytes to copy
-         * @param stream Ignored
-         * @return true on success
-         */
-        bool copyAsync(
-            void *dst_ptr, DeviceId dst_device,
-            const void *src_ptr, DeviceId src_device,
-            size_t bytes, void *stream) override;
+
 
         /**
          * @brief Check if this backend supports copy between given device pair

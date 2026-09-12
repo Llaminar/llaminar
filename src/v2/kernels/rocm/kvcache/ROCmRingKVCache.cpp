@@ -2182,6 +2182,68 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
+    std::optional<IKVCache::DeviceReadStorage>
+    ROCmRingKVCache<Precision>::describeDeviceReadStorage(
+        const DeviceReadStorageRequest &request) const
+    {
+        if (request.layer < 0 || request.layer >= n_layers_ ||
+            request.first_sequence < 0 || request.request_count <= 0 ||
+            request.request_count > batch_size_ ||
+            request.first_sequence > batch_size_ - request.request_count)
+            return std::nullopt;
+
+        constexpr TensorType native_type = [] {
+            if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            return TensorType::FP32;
+        }();
+        if (request.kind == DeviceReadStorageKind::NativeRing)
+        {
+            if (Precision == ActivationPrecision::Q8_1 || request.request_count != 1)
+                return std::nullopt;
+            const auto &entry = entries_[request.layer][request.first_sequence];
+            if (!entry.d_K || !entry.d_V)
+                return std::nullopt;
+            return DeviceReadStorage{
+                entry.d_K, entry.d_V, static_cast<size_t>(max_seq_len_),
+                static_cast<size_t>(kv_dim_), native_type, DeviceId::rocm(device_id_)};
+        }
+
+        // Reading metadata must not call ensureConvScratch(): that is the
+        // execution binding operation. The prepared workspace is the storage
+        // owner and can describe its destinations before the first read.
+        if (!workspace_ || !workspace_->isAllocated())
+            return std::nullopt;
+        size_t row_bytes = 0;
+        TensorType type = native_type;
+        switch (request.kind)
+        {
+        case DeviceReadStorageKind::NativeRequestMajor:
+            row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+            break;
+        case DeviceReadStorageKind::ConvertedRequestMajor:
+            type = TensorType::FP16;
+            row_bytes = static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
+            break;
+        default:
+            return std::nullopt;
+        }
+        const size_t rows = static_cast<size_t>(request.request_count) * max_seq_len_;
+        void *key = workspace_->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+        void *value = workspace_->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+        if (!key || !value || row_bytes == 0 ||
+            rows > workspace_->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_K) / row_bytes ||
+            rows > workspace_->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_V) / row_bytes)
+            return std::nullopt;
+        return DeviceReadStorage{
+            key, value, rows, static_cast<size_t>(kv_dim_), type, DeviceId::rocm(device_id_)};
+    }
+
+    template <ActivationPrecision Precision>
     bool ROCmRingKVCache<Precision>::get_kv_batched_device_view(
         int layer,
         int first_seq_idx,

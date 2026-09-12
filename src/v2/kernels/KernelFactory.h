@@ -1462,6 +1462,30 @@ namespace llaminar
                     std::unique_ptr<llaminar2::IPackedWeights> packed_weights);
 
                 /**
+                 * @brief Borrow prepared expert bytes without borrowing GPU execution bindings.
+                 *
+                 * A setup service measurement must not rebind an inference
+                 * engine's stream, library handle, or workspace. GPU kernels
+                 * therefore receive a new execution handle over the identical
+                 * immutable allocation, retained by the original engine. CPU
+                 * floating kernels similarly isolate their workspace binding;
+                 * CPU NativeVNNI kernels have no instance-local stream or
+                 * workspace and share immutable weights/thread-local scratch
+                 * directly. No weights are copied, repacked,
+                 * registered in a global cache, or admitted a second time.
+                 *
+                 * @param source Lifetime-pinned, fully prepared expert engine.
+                 * @param device Exact physical owner of the prepared bytes.
+                 * @return Service handle with independent GPU invocation state.
+                 * @throws std::invalid_argument For an unsupported/unprepared
+                 *         engine, ambiguous format, or wrong physical device.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm>
+                createExpertServiceExecutionView(
+                    std::shared_ptr<llaminar2::ITensorGemm> source,
+                    llaminar2::DeviceId device);
+
+                /**
                  * @brief Number of active GEMM engine registry entries
                  *
                  * Alias for the device-scoped GEMM engine registry size.

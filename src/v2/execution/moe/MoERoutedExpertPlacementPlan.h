@@ -13,6 +13,7 @@
 #include "config/ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/moe/MoEOverlayAuthorityExecution.h"
+#include "execution/moe/MoEOverlayReplicaCacheCapacity.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -332,6 +333,9 @@ namespace llaminar2
          */
         MoEOverlayAuthorityExecutionKind authority_execution =
             MoEOverlayAuthorityExecutionKind::Unresolved;
+
+        /** Setup-owned replica geometry; absent before admission or without a directory. */
+        std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;
 
         /** Static whole-expert owner ordering within each routed tier. */
         RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal;

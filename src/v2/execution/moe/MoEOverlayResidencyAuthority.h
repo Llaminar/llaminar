@@ -289,6 +289,8 @@ namespace llaminar2
         std::string service_profile_identity;
         std::string migration_profile_identity;
         uint64_t smoothed_through_generation = 0;
+        /** Root-only prediction identity; never a second observed-demand payload. */
+        uint64_t forecast_fingerprint = 0;
         uint32_t historical_window_weight = 0;
         uint32_t current_window_weight = 0;
         uint64_t payoff_horizon_tokens = 0;
@@ -1283,9 +1285,11 @@ namespace llaminar2
          * @throws std::logic_error Unless Dynamic maintenance and the current
          *         epoch are valid.
          *
-         * The method performs no histogram synchronization or rotation. Every
-         * rank given identical topology, epoch, and window therefore constructs
-         * the same pointer-independent transaction fingerprint.
+         * The method performs no histogram synchronization or rotation. The
+         * coordinator retains history as a private typed forecast and publishes
+         * the original observed window. Identical topology, epoch, policy,
+         * forecast history and input have one pointer-independent policy
+         * fingerprint. Followers adopt the selected plan without rerunning it.
          */
         MoEOverlayResidencyTransaction proposeFromFrozenHistogramWindow(
             std::shared_ptr<const DecodeExpertHistogramWindow> window);

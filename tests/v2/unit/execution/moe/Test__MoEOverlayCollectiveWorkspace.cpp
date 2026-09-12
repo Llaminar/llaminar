@@ -622,6 +622,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
                               .sequence;
     std::array<const MoEOverlayReturnRows *, 2> return_views{
         &returned[0], &returned[1]};
+    returned[0].layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
     size_t return_bytes = 0;
     ASSERT_TRUE(wire.encodeReturn(
         return_key, return_views, &return_bytes, &error))
@@ -640,6 +641,8 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
         &error))
         << error;
     EXPECT_EQ(return_inbound[0].source_participant, 7);
+    EXPECT_EQ(return_inbound[0].layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
+    EXPECT_EQ(return_inbound[1].layout, MoEOverlayReturnLayout::ParticipantTokenPartials);
     EXPECT_EQ(return_inbound[0].residency_epoch, 41u);
     EXPECT_EQ(return_inbound[0].live_row_count, 1u);
     EXPECT_FLOAT_EQ(return_inbound[0].output_rows_fp32[3], 103.0f);
@@ -1146,6 +1149,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     auto returned = local_endpoint.localExpertOutput(kLayer, kTier);
     returned.key = return_key;
     returned.residency_epoch = inbound.residency_epoch;
+    returned.layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
     returned.source_participant = kTargetParticipant;
     returned.target_participant = kContinuationParticipant;
     returned.live_row_count = 2;
@@ -1167,6 +1171,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     EXPECT_TRUE(return_result.collective_complete);
     EXPECT_EQ(return_inbound.key, return_key);
     EXPECT_EQ(return_inbound.residency_epoch, 29u);
+    EXPECT_EQ(return_inbound.layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
     EXPECT_EQ(return_inbound.source_participant, kTargetParticipant);
     EXPECT_EQ(return_inbound.target_participant, kContinuationParticipant);
     EXPECT_EQ(return_inbound.live_row_count, 2u);
@@ -1451,6 +1456,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace, LocalReturnReduceMovesCompactRowsByKey
     auto outbound0 = workspace.localExpertOutput(3, 1);
     outbound0.key = key;
     outbound0.residency_epoch = 72;
+    outbound0.layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
     outbound0.source_participant = 0;
     outbound0.target_participant = 1;
     outbound0.live_row_count = 2;
@@ -1477,6 +1483,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace, LocalReturnReduceMovesCompactRowsByKey
 
     EXPECT_EQ(inbound1.live_row_count, 2u);
     EXPECT_EQ(inbound1.residency_epoch, 72u);
+    EXPECT_EQ(inbound1.layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
     EXPECT_EQ(inbound1.row_ids_host[0], 3);
     EXPECT_EQ(inbound1.row_ids_host[1], 4);
     EXPECT_FLOAT_EQ(inbound1.output_rows_fp32[0], 200.0f);
@@ -1518,6 +1525,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     auto return_outbound = workspace.localExpertOutput(3, 1);
     return_outbound.key = return_key;
     return_outbound.residency_epoch = dispatch_inbound.residency_epoch;
+    return_outbound.layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
     return_outbound.source_participant = 0;
     return_outbound.target_participant = 0;
     return_outbound.live_row_count = 1;
@@ -1529,6 +1537,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     ASSERT_TRUE(return_result.ok) << return_result.error;
     EXPECT_TRUE(return_result.collective_complete);
     EXPECT_EQ(return_inbound.residency_epoch, 99u);
+    EXPECT_EQ(return_inbound.layout, MoEOverlayReturnLayout::CanonicalExpertRoutes);
     EXPECT_EQ(return_inbound.live_row_count, 1u);
 }
 

@@ -71,7 +71,7 @@ The audit must reject wildcard GTest filters, missing production labels,
 missing `forward_graph` PerfStats, wrong timeouts, duplicate cases, and empty
 selection. Record campaign and exact-cell counts when changing coverage.
 
-Every non-list campaign invocation first builds the CMake-owned `v2_unit_gate`
+The first non-list run for a build first builds the CMake-owned `v2_unit_gate`
 target and runs the complete `V2_Unit_*` namespace. It then runs the
 `ProductionParityPreflight` integration label, all before the model fixture or
 RAM staging. Unit tests prove device-free policy and state-machine invariants;
@@ -83,6 +83,16 @@ of copying test or executable names. A preflight-label member must be an
 `Integration` test, require no fixture or external file, and have a timeout no
 greater than 120 seconds. Any build, unit, or preflight failure stops model
 admission and is recorded by the combined preflight receipt.
+
+Amortize that receipt across unchanged local diagnostic runs; do not rebuild or
+rerun the two prerequisite suites for each cell. Numerical unseen-cell runs use
+`--reuse-passed-preflight-report PATH`; the generation driver uses
+`--reuse-preflight-report PATH`. Both delegate to the same receipt validator,
+which checks the build directory, Ninja/CTest freshness and complete test
+inventory. A stale receipt is a hard error, not permission to bypass the gate.
+After a fix, run its focused regression first, finish all required executable
+builds, then refresh Unit/preflight once before resuming the affected and unseen
+cells. Receipt reuse does not reuse a cell's pass or certify an image.
 
 Run the same prerequisite phases directly when developing their infrastructure:
 
@@ -231,6 +241,32 @@ Static additionally requires an empty authoritative movement ledger. Dynamic
 two-axis topologies require at least one ledger edge whose axis advances tier
 residency and one whose axis advances participant placement; a `combined` edge
 satisfies both without demanding a gratuitous extra transfer.
+
+For public HTTP generation probes, validate every terminal
+`runtime_summary.expert_movement` snapshot with the shared
+`generation_movement_ledger.py` consumer. It checks immutable model-lifetime
+history, complete physical cycles and their owner-authored economy/admission
+proofs in both live and saved observations. Missing old evidence must fail,
+not become an empty Static journal. Device publication can recompose several
+logical objectives into one physical component; retain each command's axis
+rather than requiring identical axis labels within that component. The sibling
+`expert_movement_topology` comes from the runner's canonical frozen model plan,
+using the same geometry projection as deep parity. Require immutable geometry,
+the declared authority, and every available objective axis over a Dynamic
+cohort. Static retains an empty journal even with available axes. This is a
+passive evidence check, not a second planner. After shutdown the HTTP harness
+independently checks published payloads and matched transport/owner publication,
+then joins its committed expert identities to the HTTP journal. See the
+transport evidence section of [CSV evidence](references/csv-evidence.md) before
+diagnosing a missing movement witness. A journal-only saved pass is not complete
+transport proof.
+
+Generation requires its full continuous minimum even for models without MTP.
+During initial acquisition, a deliberate model-owned prompt/seed search may
+find a suitable long workload. Keep candidates diagnostic, freeze the chosen
+workload before canonical collection, and verify it across affected topologies
+and precisions. Never retry seeds inside the gate, suppress EOS, or waive exact
+repeats and prefix restoration for a short answer.
 
 Do not equate physical-movement coverage with the longer matched throughput
 cohort. Every Dynamic cell owns `EconomicMovement`. A model/topology definition

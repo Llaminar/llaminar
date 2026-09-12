@@ -1,9 +1,15 @@
 /**
  * @file DecodeExpertHistogram.cpp
- * @brief Per-layer decode expert utilization tracker implementation
+ * @brief Allocation-free routing ingress and RCU-owned demand publication.
+ *
+ * Writers publish complete transaction IDs and their marginal counts into one
+ * pinned bank. Maintenance redirects new writers before copying retired data;
+ * immutable copies carry their own PMA claim and never pin a reusable bank.
  */
 
 #include "DecodeExpertHistogram.h"
+#include "MoEOverlayWireIO.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -17,6 +23,14 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return A checked payload byte sum, never a parallel admission ledger. */
+        std::size_t demandBytesAdd(std::size_t lhs, std::uint64_t count,
+                                   std::size_t element_bytes)
+        {
+            if (count > (std::numeric_limits<std::size_t>::max() - lhs) / element_bytes)
+                throw std::overflow_error("Expert transaction demand payload overflow");
+            return lhs + static_cast<std::size_t>(count) * element_bytes;
+        }
         /**
          * @brief Ordering for the cross-atomic RCU bank handoff handshake.
          *
@@ -169,7 +183,7 @@ namespace llaminar2
             if (phase_sum != expert_counts[entry])
                 return false;
         }
-        return true;
+        return !transaction_demand || transaction_demand->matches(*this);
     }
 
     ValidatedDecodeExpertHistogramWindowView
@@ -210,6 +224,15 @@ namespace llaminar2
     ValidatedDecodeExpertHistogramWindowView::tokenCount() const noexcept
     {
         return window_->token_count;
+    }
+
+    const DecodeExpertTransactionWindow &
+    ValidatedDecodeExpertHistogramWindowView::transactionDemand() const
+    {
+        if (!window_->transaction_demand)
+            throw std::logic_error(
+                "ExpertOverlay service economics requires observed transaction-shaped routing evidence");
+        return *window_->transaction_demand;
     }
 
     std::uint64_t ValidatedDecodeExpertHistogramWindowView::activationCount(
@@ -314,16 +337,338 @@ namespace llaminar2
         return {begin, begin + num_experts};
     }
 
+    /** @brief One physical owner for immutable transaction arrays and count evidence. */
+    struct DecodeExpertTransactionWindow::Data
+    {
+        // Member order is intentional: arrays die before their physical claim.
+        PhysicalMemoryAllocationLease claim;
+        std::size_t bytes;
+        std::uint64_t generation = 0;
+        std::uint64_t token_count = 0;
+        std::array<std::uint64_t, kExpertHistogramProductionSourceCount> source_tokens{};
+        int num_experts = 0;
+        std::uint32_t top_k = 0;
+        int boundary_layer = -1;
+        /** @brief A compact, retired layer sample; no mutable publication state. */
+        struct Layer
+        {
+            moe_overlay_economy::TransactionDemandFrontier frontier;
+            std::vector<moe_overlay_economy::TransactionDemandRecord> records;
+            std::vector<std::int32_t> ids;
+        };
+        std::vector<Layer> layers;
+        std::vector<std::uint64_t> phase_counts;
+
+        /** @brief Claim the complete payload before materializing any array. */
+        Data(const std::shared_ptr<PhysicalMemoryAuthority> &memory, std::size_t payload)
+            : claim(memory->claimNewAllocation(DeviceId::cpu(),
+                       PhysicalMemoryOwner::ExecutionWorkspace, payload)), bytes(payload) {}
+
+        /** @brief Authenticate local and decoded samples through the same invariant. */
+        void authenticate(moe_overlay_economy::TransactionDemandCapacity capacity,
+                          const DecodeExpertHistogramWindow &window)
+        {
+            if (!capacity.valid() || !window.valid() || layers.size() != static_cast<size_t>(window.num_layers) ||
+                boundary_layer < 0 || boundary_layer >= window.num_layers || top_k != capacity.top_k)
+                throw std::invalid_argument("Transaction evidence has invalid model or boundary geometry");
+            generation = window.generation;
+            num_experts = window.num_experts;
+            phase_counts.assign(window.source_expert_counts.size(), 0);
+            token_count = 0;
+            source_tokens.fill(0);
+            for (std::size_t layer = 0; layer < layers.size(); ++layer)
+            {
+                const auto &sample = layers[layer];
+                uint64_t cursor = 0;
+                uint64_t rows = 0;
+                if (sample.records.size() != sample.frontier.transactions ||
+                    sample.records.size() > capacity.target_rows || sample.ids.size() > capacity.routeSlots())
+                    throw std::logic_error("Transaction evidence exceeds admitted layer capacity");
+                for (const auto &record : sample.records)
+                {
+                    const uint64_t slots = static_cast<uint64_t>(record.logical_rows) * record.top_k;
+                    if (record.logical_rows == 0 || record.logical_rows > capacity.max_transaction_rows ||
+                        rows >= capacity.target_rows ||
+                        record.top_k != top_k || record.first_route_slot != cursor ||
+                        slots > sample.ids.size() - cursor ||
+                        (record.phase == ExpertHistogramSource::DecodeToken && record.logical_rows != 1))
+                        throw std::logic_error("Frozen expert transaction is truncated or has invalid geometry");
+                    const auto phase = querySourceIndex(record.phase);
+                    for (uint64_t slot = cursor; slot < cursor + slots; ++slot)
+                    {
+                        const auto expert = sample.ids[slot];
+                        if (expert < 0 || expert >= num_experts)
+                            throw std::logic_error("Frozen expert transaction contains an invalid expert");
+                        ++phase_counts[sourceCountOffset(phase, static_cast<int>(layer), expert,
+                                                        window.num_layers, num_experts)];
+                    }
+                    cursor += slots;
+                    rows += record.logical_rows;
+                    if (static_cast<int>(layer) == boundary_layer)
+                    {
+                        token_count += record.logical_rows;
+                        source_tokens[phase] += record.logical_rows;
+                    }
+                }
+                if (cursor != sample.frontier.route_slots || rows != sample.frontier.logical_rows)
+                    throw std::logic_error("Frozen expert transaction frontier does not describe complete records");
+            }
+            if (token_count != window.token_count || source_tokens != window.source_token_counts ||
+                phase_counts != window.source_expert_counts)
+                throw std::logic_error("Frozen transaction routes and phase marginals describe different work");
+        }
+    };
+
+    std::size_t DecodeExpertTransactionWindow::maximumAllocationBytes(
+        moe_overlay_economy::TransactionDemandCapacity capacity,
+        int num_layers, int num_experts)
+    {
+        if (!capacity.valid() || num_layers <= 0 || num_experts <= 0 ||
+            capacity.top_k > static_cast<std::uint32_t>(num_experts))
+            throw std::invalid_argument("Expert transaction snapshot requires valid layer/route geometry");
+        auto bytes = demandBytesAdd(0, num_layers, capacity.allocationBytes());
+        return demandBytesAdd(bytes,
+            static_cast<std::uint64_t>(num_layers) * num_experts,
+            sizeof(std::uint64_t) * kExpertHistogramProductionSourceCount);
+    }
+
+    DecodeExpertTransactionWindow::DecodeExpertTransactionWindow(
+        const ExpertHistogramTransactionConfig &config,
+        std::span<const moe_overlay_economy::TransactionDemandBank> layers,
+        const DecodeExpertHistogramWindow &window, int token_boundary_layer)
+    {
+        using namespace moe_overlay_economy;
+        if (!config.memory || !window.valid() || layers.size() != static_cast<size_t>(window.num_layers))
+            throw std::invalid_argument("Expert transaction snapshot requires complete admitted histogram geometry");
+        std::size_t bytes = demandBytesAdd(0, window.source_expert_counts.size(), sizeof(uint64_t));
+        for (const auto &layer : layers)
+        {
+            if (!layer.frontier || !layer.transactions || !layer.expert_ids ||
+                layer.frontier->transactions > layer.capacity.target_rows ||
+                layer.frontier->route_slots > layer.capacity.routeSlots())
+                throw std::logic_error("Cannot freeze an incomplete expert transaction bank");
+            bytes = demandBytesAdd(bytes, 1, sizeof(TransactionDemandFrontier));
+            bytes = demandBytesAdd(bytes, layer.frontier->transactions, sizeof(TransactionDemandRecord));
+            bytes = demandBytesAdd(bytes, layer.frontier->route_slots, sizeof(int32_t));
+        }
+        data_ = std::make_unique<Data>(config.memory, bytes);
+        data_->top_k = config.capacity.top_k;
+        data_->boundary_layer = token_boundary_layer;
+        data_->layers.resize(layers.size());
+        for (std::size_t index = 0; index < layers.size(); ++index)
+        {
+            const auto &source = layers[index];
+            auto &target = data_->layers[index];
+            target.frontier = *source.frontier;
+            target.records.assign(source.transactions, source.transactions + source.frontier->transactions);
+            target.ids.assign(source.expert_ids, source.expert_ids + source.frontier->route_slots);
+        }
+        // Authenticate once while frozen. Later public-window validation compares
+        // immutable derived counts, rather than rescanning all routed transactions.
+        data_->authenticate(config.capacity, window);
+    }
+
+    DecodeExpertTransactionWindow::~DecodeExpertTransactionWindow() = default;
+
+    DecodeExpertTransactionWindow::DecodeExpertTransactionWindow(std::unique_ptr<Data> data)
+        : data_(std::move(data)) {}
+
+    uint32_t DecodeExpertTransactionWindow::topK() const noexcept { return data_->top_k; }
+    int DecodeExpertTransactionWindow::tokenBoundaryLayer() const noexcept { return data_->boundary_layer; }
+
+    std::size_t DecodeExpertTransactionWindow::wireBytes() const
+    {
+        std::size_t bytes = 8; // Common top-k and token-boundary layer.
+        for (const auto &layer : data_->layers)
+        {
+            bytes = demandBytesAdd(bytes, 1, 16); // Compact frontier, without native padding.
+            bytes = demandBytesAdd(bytes, layer.records.size(), 8); // Rows and phase; offsets/top-k are derived.
+            bytes = demandBytesAdd(bytes, layer.ids.size(), sizeof(int32_t));
+        }
+        return bytes;
+    }
+
+    std::size_t DecodeExpertTransactionWindow::maximumWireBytes(
+        moe_overlay_economy::TransactionDemandCapacity capacity, int num_layers, int num_experts)
+    {
+        (void)maximumAllocationBytes(capacity, num_layers, num_experts);
+        auto per_layer = demandBytesAdd(16, capacity.target_rows, 8);
+        per_layer = demandBytesAdd(per_layer, capacity.routeSlots(), sizeof(int32_t));
+        return demandBytesAdd(8, num_layers, per_layer);
+    }
+
+    void DecodeExpertTransactionWindow::encodeWire(std::span<uint8_t> destination) const
+    {
+        using moe_overlay_wire::writeLittleEndian;
+        if (destination.size() != wireBytes())
+            throw std::invalid_argument("Transaction evidence destination has the wrong compact size");
+        size_t offset = 0;
+        writeLittleEndian(destination, offset, data_->top_k);
+        writeLittleEndian(destination, offset, static_cast<int32_t>(data_->boundary_layer));
+        for (const auto &layer : data_->layers)
+        {
+            writeLittleEndian(destination, offset, layer.frontier.transactions);
+            writeLittleEndian(destination, offset, layer.frontier.logical_rows);
+            writeLittleEndian(destination, offset, layer.frontier.route_slots);
+            for (const auto &record : layer.records)
+            {
+                writeLittleEndian(destination, offset, record.logical_rows);
+                writeLittleEndian(destination, offset, static_cast<uint32_t>(record.phase));
+            }
+            for (const auto expert : layer.ids) writeLittleEndian(destination, offset, expert);
+        }
+    }
+
+    std::shared_ptr<const DecodeExpertTransactionWindow> DecodeExpertTransactionWindow::decodeWire(
+        const ExpertHistogramTransactionConfig &config, const DecodeExpertHistogramWindow &window,
+        std::span<const uint8_t> packet)
+    {
+        using namespace moe_overlay_economy;
+        using moe_overlay_wire::readLittleEndian;
+        if (!config.memory || !window.valid() || packet.size() >
+            maximumWireBytes(config.capacity, window.num_layers, window.num_experts))
+            throw std::invalid_argument("Transaction evidence requires bounded local physical admission");
+        size_t offset = 0;
+        const auto top_k = readLittleEndian<uint32_t>(packet, offset);
+        const auto boundary = readLittleEndian<int32_t>(packet, offset);
+        if (top_k != config.capacity.top_k || boundary < 0 || boundary >= window.num_layers)
+            throw std::invalid_argument("Transaction evidence routing width or token boundary differs from model geometry");
+        // Validate sizes before any allocation. The second pass materializes the
+        // same payload directly into its final owner; no temporary route mirror.
+        size_t bytes = demandBytesAdd(0, window.source_expert_counts.size(), sizeof(uint64_t));
+        for (int layer = 0; layer < window.num_layers; ++layer)
+        {
+            const auto records = readLittleEndian<uint32_t>(packet, offset);
+            const auto rows = readLittleEndian<uint32_t>(packet, offset);
+            const auto slots = readLittleEndian<uint64_t>(packet, offset);
+            if (records > config.capacity.target_rows || records > rows ||
+                ((records == 0) != (rows == 0)) || slots != static_cast<uint64_t>(rows) * top_k ||
+                slots > config.capacity.routeSlots())
+                throw std::invalid_argument("Transaction evidence frontier exceeds admitted capacity");
+            auto payload = demandBytesAdd(0, records, 8);
+            payload = demandBytesAdd(payload, slots, sizeof(int32_t));
+            if (payload > packet.size() - offset)
+                throw std::invalid_argument("Transaction evidence packet has a truncated layer");
+            offset += payload;
+            bytes = demandBytesAdd(bytes, 1, sizeof(TransactionDemandFrontier));
+            bytes = demandBytesAdd(bytes, records, sizeof(TransactionDemandRecord));
+            bytes = demandBytesAdd(bytes, slots, sizeof(int32_t));
+        }
+        if (offset != packet.size()) throw std::invalid_argument("Transaction evidence packet has trailing bytes");
+        auto data = std::make_unique<Data>(config.memory, bytes);
+        data->top_k = top_k;
+        data->boundary_layer = boundary;
+        data->layers.resize(window.num_layers);
+        offset = 8;
+        for (auto &layer : data->layers)
+        {
+            layer.frontier.transactions = readLittleEndian<uint32_t>(packet, offset);
+            layer.frontier.logical_rows = readLittleEndian<uint32_t>(packet, offset);
+            layer.frontier.route_slots = readLittleEndian<uint64_t>(packet, offset);
+            layer.records.resize(layer.frontier.transactions);
+            layer.ids.resize(layer.frontier.route_slots);
+            uint64_t first_slot = 0;
+            for (auto &record : layer.records)
+            {
+                record.first_route_slot = first_slot;
+                record.top_k = top_k;
+                record.logical_rows = readLittleEndian<uint32_t>(packet, offset);
+                record.phase = static_cast<ExpertHistogramSource>(readLittleEndian<uint32_t>(packet, offset));
+                const auto slots = static_cast<uint64_t>(record.logical_rows) * top_k;
+                // Validate before advancing: malformed descriptors must not
+                // overflow the cumulative offset or address the next layer.
+                if (record.logical_rows == 0 ||
+                    record.logical_rows > config.capacity.max_transaction_rows ||
+                    slots > layer.frontier.route_slots - first_slot)
+                    throw std::invalid_argument("Transaction record exceeds its admitted layer frontier");
+                first_slot += slots;
+            }
+            for (auto &expert : layer.ids) expert = readLittleEndian<int32_t>(packet, offset);
+        }
+        data->authenticate(config.capacity, window);
+        return std::shared_ptr<const DecodeExpertTransactionWindow>(new DecodeExpertTransactionWindow(std::move(data)));
+    }
+
+    std::span<const moe_overlay_economy::TransactionDemandRecord>
+    DecodeExpertTransactionWindow::layerTransactions(int layer) const
+    {
+        if (layer < 0) throw std::out_of_range("Negative expert transaction layer");
+        return data_->layers.at(static_cast<size_t>(layer)).records;
+    }
+
+    moe_overlay_economy::TransactionRoutes DecodeExpertTransactionWindow::routes(
+        int layer, std::size_t transaction) const
+    {
+        if (layer < 0) throw std::out_of_range("Negative expert transaction layer");
+        const auto &sample = data_->layers.at(static_cast<size_t>(layer));
+        const auto &record = sample.records.at(transaction);
+        return {sample.ids.data() + record.first_route_slot,
+                static_cast<uint64_t>(record.logical_rows) * record.top_k,
+                record.logical_rows, record.top_k, record.top_k};
+    }
+
+    std::size_t DecodeExpertTransactionWindow::allocationBytes() const noexcept { return data_->bytes; }
+
+    bool DecodeExpertTransactionWindow::matches(const DecodeExpertHistogramWindow &window) const noexcept
+    {
+        return window.num_layers == static_cast<int>(data_->layers.size()) &&
+            window.num_experts == data_->num_experts && window.generation == data_->generation &&
+            window.token_count == data_->token_count && window.source_token_counts == data_->source_tokens &&
+            window.source_expert_counts == data_->phase_counts;
+    }
+
+    /**
+     * @brief Stable mutable layer payload using the parent's sole reset lifecycle.
+     *
+     * Routing has one serialized producer per layer. A nonblocking writer lease
+     * rejects accidental overlapping publishers; an RCU pin alone does not provide
+     * exclusion. Maintenance never takes this mutex: it retires all RCU pins first.
+     */
+    struct DecodeExpertHistogram::LayerTransactionData
+    {
+        PhysicalMemoryAllocationLease claim;
+        moe_overlay_economy::TransactionDemandCapacity capacity;
+        std::mutex writer_mutex;
+        moe_overlay_economy::TransactionDemandFrontier frontier;
+        std::vector<moe_overlay_economy::TransactionDemandRecord> records;
+        std::vector<int32_t> ids;
+
+        /** @brief Materialize arrays only after the PMA claim succeeds. */
+        explicit LayerTransactionData(const ExpertHistogramTransactionConfig &config)
+            : claim(config.memory->claimNewAllocation(DeviceId::cpu(),
+                        PhysicalMemoryOwner::ExecutionWorkspace, config.capacity.allocationBytes())),
+              capacity(config.capacity), records(capacity.target_rows), ids(capacity.routeSlots()) {}
+
+        /** @return Borrowed stable pointers under a producer lease or retired-bank proof. */
+        moe_overlay_economy::TransactionDemandBank view() noexcept
+        {
+            return {capacity, &frontier, records.data(), ids.data()};
+        }
+
+        /** @brief Append under exclusive producer ownership without waiting on inference. */
+        moe_overlay_economy::TransactionDemandAppendStatus append(
+            ExpertHistogramSource source, moe_overlay_economy::TransactionRoutes routes,
+            uint32_t num_experts, uint32_t target)
+        {
+            std::unique_lock writer(writer_mutex, std::try_to_lock);
+            if (!writer.owns_lock())
+                throw std::logic_error("Expert transaction layer has overlapping routing publishers");
+            return view().append(source, routes, num_experts, target);
+        }
+    };
+
     // ── LayerData ─────────────────────────────────────
 
-    DecodeExpertHistogram::LayerData::LayerData(int num_experts)
+    DecodeExpertHistogram::LayerData::LayerData(
+        int num_experts, const std::optional<ExpertHistogramTransactionConfig> &transactions)
         : expert_counts(num_experts),
           source_expert_counts{
               std::vector<std::atomic<uint64_t>>(num_experts),
               std::vector<std::atomic<uint64_t>>(num_experts),
               std::vector<std::atomic<uint64_t>>(num_experts)},
           weighted_sums(num_experts, 0.0f),
-          slot_counts(num_experts)
+          slot_counts(num_experts),
+          transaction_demand(transactions ? std::make_unique<LayerTransactionData>(*transactions) : nullptr)
     {
         for (auto &c : expert_counts)
             c.store(0, std::memory_order_relaxed);
@@ -336,6 +681,8 @@ namespace llaminar2
             s.fill(0);
     }
 
+    DecodeExpertHistogram::LayerData::~LayerData() = default;
+
     DecodeExpertHistogram::LayerData::LayerData(LayerData &&other) noexcept
         : expert_counts(other.expert_counts.size()),
           source_expert_counts{
@@ -343,7 +690,8 @@ namespace llaminar2
               std::vector<std::atomic<uint64_t>>(other.expert_counts.size()),
               std::vector<std::atomic<uint64_t>>(other.expert_counts.size())},
           weighted_sums(std::move(other.weighted_sums)),
-          slot_counts(std::move(other.slot_counts))
+          slot_counts(std::move(other.slot_counts)),
+          transaction_demand(std::move(other.transaction_demand))
     {
         for (size_t i = 0; i < expert_counts.size(); ++i)
         {
@@ -363,6 +711,7 @@ namespace llaminar2
 
     void DecodeExpertHistogram::LayerData::reset()
     {
+        if (transaction_demand) transaction_demand->frontier = {};
         for (auto &c : expert_counts)
             c.store(0, std::memory_order_relaxed);
         for (auto &source_counts : source_expert_counts)
@@ -375,13 +724,11 @@ namespace llaminar2
             s.fill(0);
     }
 
-    DecodeExpertHistogram::HistogramBank::HistogramBank(
-        int num_layers,
-        int num_experts)
+    DecodeExpertHistogram::HistogramBank::HistogramBank(const DecodeExpertHistogramConfig &config)
     {
-        layers.reserve(static_cast<size_t>(num_layers));
-        for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx)
-            layers.emplace_back(num_experts);
+        layers.reserve(static_cast<size_t>(config.num_layers));
+        for (int layer_idx = 0; layer_idx < config.num_layers; ++layer_idx)
+            layers.emplace_back(config.num_experts, config.transaction_demand);
         for (auto &count : source_token_counts)
             count.store(0, std::memory_order_relaxed);
     }
@@ -484,12 +831,17 @@ namespace llaminar2
                 "DecodeExpertHistogram ownership geometry does not match its layer, expert, and participant config");
         }
 
-        banks_[0] = std::make_unique<HistogramBank>(
-            config_.num_layers,
-            config_.num_experts);
-        banks_[1] = std::make_unique<HistogramBank>(
-            config_.num_layers,
-            config_.num_experts);
+        if (config_.transaction_demand)
+        {
+            const auto &demand = *config_.transaction_demand;
+            if (!demand.memory || !demand.capacity.valid() || config_.num_layers <= 0 ||
+                config_.top_k <= 0 || config_.top_k > MAX_TOP_K || config_.num_experts < config_.top_k ||
+                demand.capacity.top_k != static_cast<uint32_t>(config_.top_k) ||
+                demand.capacity.target_rows < static_cast<uint32_t>(config_.window_size))
+                throw std::invalid_argument("Histogram transaction banks require complete physical admission and route geometry");
+        }
+        banks_[0] = std::make_unique<HistogramBank>(config_);
+        banks_[1] = std::make_unique<HistogramBank>(config_);
         banks_[0]->generation = 0;
         banks_[1]->generation = 1;
     }
@@ -510,12 +862,29 @@ namespace llaminar2
         const float *expert_weights,
         int top_k)
     {
+        if (layer_idx < 0 || layer_idx >= config_.num_layers || !expert_indices || !expert_weights ||
+            top_k <= 0 || top_k > config_.top_k || top_k > MAX_TOP_K)
+            throw std::invalid_argument("Decode histogram record has invalid layer or routing geometry");
+        for (int slot = 0; slot < top_k; ++slot)
+            if (expert_indices[slot] < 0 || expert_indices[slot] >= config_.num_experts)
+                throw std::invalid_argument("Decode histogram record has an invalid expert");
         auto bank_lease = acquireAdmittedBank();
         if (!bank_lease)
             return;
         auto &bank = bank_lease.mutableBank();
         auto &layer = bank.layers[layer_idx];
         const int k = std::min(top_k, static_cast<int>(MAX_TOP_K));
+        if (layer.transaction_demand)
+        {
+            using namespace moe_overlay_economy;
+            const auto status = layer.transaction_demand->append(ExpertHistogramSource::DecodeToken,
+                {expert_indices, static_cast<uint64_t>(top_k), 1u,
+                 static_cast<uint32_t>(top_k), static_cast<uint32_t>(top_k)},
+                config_.num_experts, windowSize());
+            if (status == TransactionDemandAppendStatus::SampleComplete) return;
+            if (status != TransactionDemandAppendStatus::Recorded)
+                throw std::logic_error("Decode histogram could not retain its complete transaction");
+        }
 
         // Lock-free atomic increments for counts
         for (int s = 0; s < k; ++s)
@@ -562,6 +931,8 @@ namespace llaminar2
             auto bank_lease = acquireAdmittedBank();
             if (!bank_lease)
                 return;
+            if (config_.transaction_demand)
+                throw std::logic_error("Transaction demand requires token boundaries from complete routed batches");
             bank_lease.mutableBank().token_count.fetch_add(
                 token_count,
                 std::memory_order_relaxed);
@@ -584,6 +955,8 @@ namespace llaminar2
         auto bank_lease = acquireAdmittedBank();
         if (!bank_lease)
             return;
+        if (config_.transaction_demand)
+            throw std::logic_error("Marginal-only ingress cannot publish transaction-shaped demand");
         auto &bank = bank_lease.mutableBank();
         auto &layer = bank.layers[layer_idx];
         const std::size_t source_index = ingestionSourceIndex(source);
@@ -675,6 +1048,28 @@ namespace llaminar2
             return result;
         }
         const std::size_t route_count = real_rows * top_k;
+        if (config_.transaction_demand && isTokenBoundaryLayer(merge.layer_idx) && !merge.count_window_tokens)
+        {
+            result.error = "transaction boundary layer must count its retained logical rows";
+            return result;
+        }
+        // Both sparse and dense counter updates share this exact admission.
+        // A closed sample succeeds without recording either routes or marginals.
+        const auto retain_transaction = [&](LayerData &layer) {
+            if (!layer.transaction_demand || real_rows == 0u) return true;
+            using namespace moe_overlay_economy;
+            const auto status = layer.transaction_demand->append(merge.source,
+                {expert_indices, static_cast<uint64_t>(merge.bucket_token_count) * route_stride,
+                 static_cast<uint32_t>(merge.real_token_count), static_cast<uint32_t>(merge.top_k),
+                 static_cast<uint32_t>(route_stride)}, config_.num_experts, windowSize());
+            if (status == TransactionDemandAppendStatus::Recorded) return true;
+            if (status == TransactionDemandAppendStatus::SampleComplete)
+                result.ok = true;
+            else
+                result.error = "could not retain complete expert transaction: status=" +
+                    std::to_string(static_cast<uint32_t>(status));
+            return false;
+        };
 
         /*
          * Validate the complete prefix before acquiring the mutable bank. A
@@ -704,13 +1099,13 @@ namespace llaminar2
             auto bank_lease = acquireAdmittedBank();
             if (!bank_lease)
             {
-                result.activations_merged = route_count;
                 result.ok = true;
                 return result;
             }
             auto &bank = bank_lease.mutableBank();
             auto &layer = bank.layers[
                 static_cast<std::size_t>(merge.layer_idx)];
+            if (!retain_transaction(layer)) return result;
             const std::size_t source_index =
                 ingestionSourceIndex(merge.source);
             for (int token = 0; token < merge.real_token_count; ++token)
@@ -780,6 +1175,7 @@ namespace llaminar2
         }
         auto &bank = bank_lease.mutableBank();
         auto &layer = bank.layers[static_cast<size_t>(merge.layer_idx)];
+        if (!retain_transaction(layer)) return result;
         const std::size_t source_index = ingestionSourceIndex(merge.source);
         for (int expert_id = 0; expert_id < config_.num_experts; ++expert_id)
         {
@@ -1236,6 +1632,9 @@ namespace llaminar2
             throw std::invalid_argument(
                 "DecodeExpertHistogram window size must be positive");
         }
+        if (config_.transaction_demand &&
+            static_cast<uint32_t>(new_size) > config_.transaction_demand->capacity.target_rows)
+            throw std::invalid_argument("Histogram window exceeds admitted transaction capacity");
         active_window_size_.store(new_size, std::memory_order_release);
     }
 
@@ -1363,6 +1762,22 @@ namespace llaminar2
             }
         }
 
+        if (config_.transaction_demand)
+        {
+            std::vector<moe_overlay_economy::TransactionDemandBank> layers;
+            layers.reserve(frozen.layers.size());
+            int boundary = -1;
+            for (int index = 0; index < config_.num_layers; ++index)
+            {
+                auto view = frozen.layers[index].transaction_demand->view();
+                layers.push_back(view);
+                if (isTokenBoundaryLayer(index)) boundary = index;
+            }
+            // No snapshot pins either bank. A slow planner may retain this copy
+            // through arbitrarily many rotations; PMA bounds total live copies.
+            window.transaction_demand = std::shared_ptr<const DecodeExpertTransactionWindow>(
+                new DecodeExpertTransactionWindow(*config_.transaction_demand, layers, window, boundary));
+        }
         frozen.reset();
         return window;
     }

@@ -563,13 +563,17 @@ namespace llaminar2
             const int *token_shadow,
             const void *token_ids_device,
             int seq_len) override;
+        /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceResidentLogicalState */
         bool advanceMTPMainConditionFromDeviceResidentLogicalState(
             int32_t token_shadow,
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            MTPConditionForwardPurpose purpose,
             int request_index = 0) override;
+        /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceTargetSample */
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
-            int target_sample_slot) override;
+            int target_sample_slot,
+            MTPConditionForwardPurpose purpose) override;
         bool forwardBatchWithDeviceTokenIds(
             const std::vector<std::vector<int>> &token_batches,
             const void *token_ids_device,
@@ -1295,11 +1299,18 @@ namespace llaminar2
         const char *architecture() const override;
         uint64_t moePlacementEpoch() const override;
         uint64_t moeRuntimeMovementEpoch() const override;
+        /** @copydoc IInferenceRunner::moeOptimizationStatus */
+        MoEOptimizationStatus moeOptimizationStatus() const override;
+        /** @copydoc IInferenceRunner::moeOptimizationMovementLedger */
+        MoEOptimizationMovementLedger moeOptimizationMovementLedger() const override;
 
         /**
          * @brief Aggregate per-runner runtime state for prefix-cache/MTP probes.
+         * @param capture_policy Exact diagnostic ranges, forwarded unchanged to participants.
+         * @return Immutable combined cache and terminal-state evidence.
          */
-        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        PrefixRuntimeStateSnapshot prefixStateProbe(
+            const PrefixProbeCapturePolicy &capture_policy = PrefixProbeCapturePolicy::fromEnvironment()) const override;
 
         PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
@@ -1600,6 +1611,8 @@ namespace llaminar2
         void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:
+        /** @return The sole child publication root; duplicate authorities are fatal. */
+        const IInferenceRunner *moeOptimizationOwner() const;
         // =====================================================================
         // Private Constructor (for createForTest)
         // =====================================================================

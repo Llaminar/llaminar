@@ -1,5 +1,19 @@
+/**
+ * @file Test__IKVCacheLogicalBlockIO.cpp
+ * @brief Native logical-block IO, ring cursor and grouped-publication contracts.
+ * Tests explicit storage operands; public format selection is integration-tested.
+ */
 #include <gtest/gtest.h>
 
+/**
+ * @brief These packed-operand tests select their physical K/V types explicitly.
+ *
+ * They prove the generic ring's lossless copy and the TQ tensor primitives, not
+ * the public compressed-cache policy. Runtime Q8/TQ selectors now use anchored
+ * keys; their factory/append/attention/prefix proofs live in the model-free
+ * CPUAttentionCacheSource integration suite. Do not use convenience policy
+ * aliases here: that would silently change the input codec being tested.
+ */
 #include "kernels/cpu/CPURingKVCache.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
@@ -722,7 +736,7 @@ TEST(Test__IKVCacheLogicalBlockIO, AllCPUFormatsGroupedVerifierAppendRuntimeMMat
 
 TEST(Test__IKVCacheLogicalBlockIO, SplitTQAsymmetricLogicalBlockRoundTripsRawBytes)
 {
-    CPURingKVCacheTQ cache(testMPI(), 1, 1, 4, 2, 64, DeviceId::cpu(),
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(testMPI(), 1, 1, 4, 2, 64, DeviceId::cpu(),
                            KVCacheLayoutMode::POSITION_MAJOR);
     const auto layout = cache.logicalBlockLayout(0, 3);
     ASSERT_EQ(layout.k_precision, ActivationPrecision::TQ8);

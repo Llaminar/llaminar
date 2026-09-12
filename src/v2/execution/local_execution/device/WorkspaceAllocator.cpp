@@ -1,6 +1,10 @@
 /**
  * @file WorkspaceAllocator.cpp
- * @brief Implementation of standalone workspace allocation
+ * @brief Bind graph-family workspaces through canonical physical admission.
+ *
+ * Concrete consumers declare participant-local requirements. Serial graph
+ * families merge those descriptors while concurrent members retain exclusive
+ * storage; PhysicalMemoryAuthority remains the sole physical allocation ledger.
  * @author David Sanftenberg
  * @date March 2026
  */
@@ -536,11 +540,11 @@ namespace llaminar2
                      * the correct semantic attention geometry.
                      *
                      * Use the declarative model axes for every participant.
-                     * AttentionComputeStage then takes the maximum of these
-                     * hints and its concrete stage-local head geometry, so
-                     * sharded and replicated variants both remain
-                     * authoritative without deriving semantics from a tensor
-                     * layout.
+                     * AttentionComputeStage resolves heads and head width
+                     * solely from its concrete local geometry; a generic
+                     * consumer can still use the declarative hints. The
+                     * serial-family merge combines actual sharded/replicated
+                     * members without inventing an oversized hybrid geometry.
                      */
                     binding.m = std::max(1, hints.batch_size);
                     binding.n = std::max(0, hints.n_heads);

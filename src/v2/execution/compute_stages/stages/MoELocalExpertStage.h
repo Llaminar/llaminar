@@ -471,6 +471,8 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
 
+            /** Immutable host return arithmetic; canonical rows retain original route IDs. */
+            MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
             const MoEOverlaySparseRows *input_rows = nullptr;
             std::shared_ptr<const MoEOverlaySparseRows> input_rows_lifetime;
             MoEOverlayReturnRows *output_rows = nullptr;
@@ -907,6 +909,7 @@ namespace llaminar2
         {
             size_t compact_row = 0; ///< Dense row in the selected compact family.
             size_t route_offset = 0; ///< Original-order local route within that row.
+            size_t input_entry = 0; ///< Exact CSR entry, retained even when other routes are filtered.
             int expert_id = -1;
             float weight = 0.0f;
         };
@@ -921,6 +924,13 @@ namespace llaminar2
 
         /** @brief Bind a private or serial-family compact tensor set at fixed capacity. */
         bool ensureCompactCapacity(size_t rows, int routing_top_k) const;
+        /** @return Whether compute must retain raw per-expert rows until publication. */
+        bool preservesCanonicalRouteRows() const noexcept
+        {
+            return params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes ||
+                   params_.cpu_canonical_route_return.has_value() ||
+                   params_.cpu_canonical_route_ticket_return.has_value();
+        }
         /**
          * @brief Execute packet preparation and GPU submission on the current thread.
          *

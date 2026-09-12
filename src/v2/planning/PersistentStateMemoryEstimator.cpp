@@ -78,6 +78,14 @@ namespace llaminar2
 
     } // namespace
 
+    bool PersistentStateMemoryEstimator::isFullAttentionLayer(
+        const ModelMemoryProfile &profile, int layer)
+    {
+        if (layer < 0 || layer >= profile.n_layers)
+            throw std::invalid_argument("KV layer classification index is outside the model");
+        return classifyLayer(profile, layer) == LayerStorageKind::FullAttention;
+    }
+
     PersistentStateEstimate PersistentStateMemoryEstimator::estimate(
         const ModelMemoryProfile &profile,
         DeviceId device,
@@ -93,6 +101,13 @@ namespace llaminar2
         bool mtp_enabled)
     {
         PersistentStateEstimate result;
+        // A main-model PP slice still uses the hybrid factory when its model
+        // has a GDN layer map, even when this particular slice contains only
+        // FA layers. The shifted predictor is a separate attention-only cache.
+        result.main_kv_family =
+            profile.gdn_conv_kernel_size > 0 && profile.gdn_state_size > 0 &&
+                    profile.full_attention_interval > 0
+                ? KVCacheFamily::Hybrid : KVCacheFamily::AttentionOnly;
         const int main_layer_count =
             std::max(0, profile.n_layers - profile.mtp_layer_count);
         const int first_main_layer =
@@ -106,8 +121,7 @@ namespace llaminar2
              layer <= last_main_layer;
              ++layer)
         {
-            if (classifyLayer(profile, layer) ==
-                LayerStorageKind::GDN)
+            if (!isFullAttentionLayer(profile, layer))
             {
                 ++result.main_gdn_layers;
             }
@@ -123,8 +137,7 @@ namespace llaminar2
                  layer < profile.n_layers;
                  ++layer)
             {
-                if (classifyLayer(profile, layer) ==
-                    LayerStorageKind::GDN)
+                if (!isFullAttentionLayer(profile, layer))
                 {
                     ++result.mtp_gdn_layers;
                 }
@@ -142,6 +155,7 @@ namespace llaminar2
          * must follow the geometry of its actual owner.
          */
         result.main_kv_cache_bytes = KVCacheMemoryEstimator::estimate(
+            result.main_kv_family,
             result.main_full_attention_layers,
             batch_size,
             max_seq_len,
@@ -150,6 +164,7 @@ namespace llaminar2
             kv_precision,
             device);
         result.mtp_kv_cache_bytes = KVCacheMemoryEstimator::estimate(
+            KVCacheFamily::AttentionOnly,
             result.mtp_full_attention_layers,
             batch_size,
             max_seq_len,

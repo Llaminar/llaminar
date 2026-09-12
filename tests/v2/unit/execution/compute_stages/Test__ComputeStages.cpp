@@ -346,6 +346,8 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
         compact_payload_local_bytes * static_cast<size_t>(compact_params.config.participant_count);
     EXPECT_EQ(compact_stage.estimatedMemoryBytes(),
               (compact_local_entries + compact_gathered_entries) * sizeof(uint64_t) +
+                  24u * sizeof(DeviceMoERebalanceMovementEdge) +
+                  12u * sizeof(DeviceMoERebalanceMovementWave) +
                   transfer_command_buffers * compact_plan_entries * sizeof(DeviceMoERebalancePlanEntry) +
                   transfer_command_buffers * sizeof(uint32_t) +
                   transfer_command_buffers * sizeof(DeviceMoERebalanceCommandBufferHeader) +
@@ -371,7 +373,15 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   compact_payload_gathered_bytes);
 
     const WorkspaceRequirements compact_reqs = compact_stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(compact_reqs.buffers.size(), 19u);
+    ASSERT_EQ(compact_reqs.buffers.size(), 21u);
+    const auto *journal_edges = compact_reqs.find("moe_rebalance_movement_edges_decode_rebalance");
+    const auto *journal_waves = compact_reqs.find("moe_rebalance_movement_waves_decode_rebalance");
+    ASSERT_NE(journal_edges, nullptr);
+    ASSERT_NE(journal_waves, nullptr);
+    // Two layers, four experts and three participants define this bounded
+    // history independently of the number of concurrent transfer lanes.
+    EXPECT_EQ(journal_edges->size_bytes, 24u * sizeof(DeviceMoERebalanceMovementEdge));
+    EXPECT_EQ(journal_waves->size_bytes, 12u * sizeof(DeviceMoERebalanceMovementWave));
     auto unmaterialized_compact_params = compact_params;
     unmaterialized_compact_params.local_transfer_slots = nullptr;
     const MoEDeviceRebalanceStage unmaterialized_compact_stage(
@@ -451,6 +461,8 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
         collective_payload_local_bytes * static_cast<size_t>(config.participant_count);
     EXPECT_EQ(transfer_stage.estimatedMemoryBytes(),
               (local_entries + gathered_entries) * sizeof(uint64_t) +
+                  24u * sizeof(DeviceMoERebalanceMovementEdge) +
+                  12u * sizeof(DeviceMoERebalanceMovementWave) +
                   transfer_command_buffers * plan_entries * sizeof(DeviceMoERebalancePlanEntry) +
                   transfer_command_buffers * sizeof(uint32_t) +
                   transfer_command_buffers * sizeof(DeviceMoERebalanceCommandBufferHeader) +
@@ -476,7 +488,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   collective_payload_gathered_bytes);
 
     const WorkspaceRequirements transfer_reqs = transfer_stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(transfer_reqs.buffers.size(), 19u);
+    ASSERT_EQ(transfer_reqs.buffers.size(), 21u);
     EXPECT_NE(
         transfer_reqs.find(
             "moe_rebalance_placement_plan_scratch_decode_rebalance"),
@@ -613,13 +625,13 @@ TEST_F(ComputeStagesTest,
 
     const auto requirements =
         DeviceMoERebalanceWorkspaceContract::requirements(binding);
-    ASSERT_EQ(requirements.buffers.size(), 19u);
+    ASSERT_EQ(requirements.buffers.size(), 21u);
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::logicalBytes(binding),
-        10498656u);
+        12412280u);
     EXPECT_EQ(
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding),
-        10500608u);
+        12413696u);
     EXPECT_EQ(
         requirements.total_bytes_with_alignment(),
         DeviceMoERebalanceWorkspaceContract::allocationBytes(binding));

@@ -21,6 +21,7 @@
 #include "../../../../utils/VerifierRowTestInventory.h"
 
 #include <array>
+#include <atomic>
 #include <vector>
 #include <cmath>
 #include <cstdint>
@@ -356,6 +357,9 @@ namespace llaminar2
             }
         }
 
+        /** @brief Select the two public representations of absolute positions. */
+        enum class RoPEPositionInput { Explicit, ContiguousOffset };
+
         /**
          * @brief Prove one native CPU RoPE format across the runtime-M inventory.
          *
@@ -367,7 +371,9 @@ namespace llaminar2
         template <ActivationPrecision Precision>
         void run_native_grouped_rope_format(
             const char *format_label,
-            Q16BlockSize q16_block_size = Q16BlockSize::BLOCK_32)
+            Q16BlockSize q16_block_size = Q16BlockSize::BLOCK_32,
+            RoPEPositionInput position_input = RoPEPositionInput::Explicit,
+            int rotary_dim = 0)
         {
             constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
             constexpr int n_heads = 4;
@@ -429,7 +435,7 @@ namespace llaminar2
                     ASSERT_TRUE(kernel.apply_tensor(
                         q_row.get(), k_row.get(), &positions[static_cast<size_t>(row)],
                         1, n_heads, n_kv_heads, head_dim, rope_theta,
-                        nullptr, -1, positions[static_cast<size_t>(row)], 0));
+                        nullptr, -1, positions[static_cast<size_t>(row)], rotary_dim));
                     std::memcpy(
                         static_cast<uint8_t *>(q_serial->raw_mutable_data()) +
                             static_cast<size_t>(row) * q_row_bytes,
@@ -440,12 +446,36 @@ namespace llaminar2
                         k_row->raw_data(), k_row_bytes);
                 }
 
+                if (position_input == RoPEPositionInput::ContiguousOffset)
+                {
+                    // Exercise the ordinary public API too: ignoring its offset
+                    // can agree with another broken implicit-position caller.
+                    auto q_implicit = make_native_rope_tensor<Precision>(
+                        q_shape, q_values.data(), q16_block_size);
+                    auto k_implicit = make_native_rope_tensor<Precision>(
+                        k_shape, k_values.data(), q16_block_size);
+                    std::memcpy(q_implicit->raw_mutable_data(), q_grouped->raw_data(),
+                                q_grouped->size_bytes());
+                    std::memcpy(k_implicit->raw_mutable_data(), k_grouped->raw_data(),
+                                k_grouped->size_bytes());
+                    ASSERT_TRUE(kernel.apply_tensor(
+                        q_implicit.get(), k_implicit.get(), nullptr, rows,
+                        n_heads, n_kv_heads, head_dim, rope_theta,
+                        nullptr, -1, positions.front(), rotary_dim));
+                    ASSERT_EQ(0, std::memcmp(q_implicit->raw_data(), q_serial->raw_data(),
+                                             q_serial->size_bytes()));
+                    ASSERT_EQ(0, std::memcmp(k_implicit->raw_data(), k_serial->raw_data(),
+                                             k_serial->size_bytes()));
+                }
+
                 PerfStatsCollector::reset();
                 ASSERT_TRUE(kernel.apply_verifier_rows_decode_equivalent(
-                    q_grouped.get(), k_grouped.get(), positions.data(),
+                    q_grouped.get(), k_grouped.get(),
+                    position_input == RoPEPositionInput::Explicit ? positions.data() : nullptr,
                     rows, n_heads, n_kv_heads, head_dim, rope_theta,
-                    nullptr, -1, positions.front(), 0));
-                expect_grouped_rope_counter(format_label, rows, head_dim);
+                    nullptr, -1, positions.front(), rotary_dim));
+                expect_grouped_rope_counter(
+                    format_label, rows, rotary_dim > 0 ? rotary_dim : head_dim);
                 expect_byte_exact_native(
                     q_grouped->raw_data(), q_serial->raw_data(), q_serial->size_bytes(),
                     std::string(format_label) + " grouped Q M=" + std::to_string(rows));
@@ -858,6 +888,145 @@ namespace llaminar2
             "Q16_1", Q16BlockSize::BLOCK_64);
         run_native_grouped_rope_format<ActivationPrecision::Q16_1>(
             "Q16_1", Q16BlockSize::BLOCK_128);
+    }
+
+    /**
+     * @brief Implicit absolute positions remain exact without fixed row buffers.
+     *
+     * The explicit serial witness catches ignored offsets; runtime M includes
+     * 16, 17 and 31 to expose historical four-element Q16 position storage.
+     * Native bytes include block scales/sums, not only dequantized values.
+     */
+    TEST_F(CPURoPEKernelTTest, ImplicitPositionsAllNativeFormatsAreByteExact)
+    {
+        ScopedPerfStats perfstats;
+        constexpr auto implicit = RoPEPositionInput::ContiguousOffset;
+        constexpr auto block32 = Q16BlockSize::BLOCK_32;
+        run_native_grouped_rope_format<ActivationPrecision::FP32>("FP32", block32, implicit);
+        run_native_grouped_rope_format<ActivationPrecision::FP32>("FP32", block32, implicit, 32);
+        run_native_grouped_rope_format<ActivationPrecision::BF16>("BF16", block32, implicit);
+        run_native_grouped_rope_format<ActivationPrecision::FP16>("FP16", block32, implicit);
+        run_native_grouped_rope_format<ActivationPrecision::Q8_1>("Q8_1", block32, implicit);
+        for (auto block : {block32, Q16BlockSize::BLOCK_64, Q16BlockSize::BLOCK_128})
+            run_native_grouped_rope_format<ActivationPrecision::Q16_1>("Q16_1", block, implicit);
+    }
+
+    /**
+     * @brief Absolute positions, not prefill chunk history, own every native byte.
+     *
+     * The 139/19 boundary reproduces real CPU prefix-restore token drift. Whole
+     * prefill, ordinary one-row decode, and irregular chunks must rotate the
+     * same original native operands identically, including quantization metadata.
+     * Partial FP32 rotation and every supported Q16 physical block are covered.
+     */
+    TEST_F(CPURoPEKernelTTest, PrefillPartitionsAllNativeFormatsAreByteExact)
+    {
+        const auto check = []<ActivationPrecision precision>(
+            const char *label, Q16BlockSize block = Q16BlockSize::BLOCK_32)
+        {
+            constexpr int rows = 158, heads = 4, kv_heads = 2, dimension = 128;
+            constexpr size_t q_width = heads * dimension, k_width = kv_heads * dimension;
+            const auto q_source = generate_random_fp32(rows * q_width, -128, 128);
+            const auto k_source = generate_random_fp32(rows * k_width, -128, 128);
+            for (const int rotary : {0, 32})
+            {
+                if constexpr (precision != ActivationPrecision::FP32)
+                    if (rotary != 0) continue; // Only FP32 advertises partial RoPE.
+                for (const int start : {0, 4096})
+                {
+                    std::array<int, rows> positions;
+                    std::iota(positions.begin(), positions.end(), start);
+                    auto q_whole = make_native_rope_tensor<precision>({rows, q_width}, q_source.data(), block);
+                    auto k_whole = make_native_rope_tensor<precision>({rows, k_width}, k_source.data(), block);
+                    const size_t q_bytes = q_whole->size_bytes() / rows;
+                    const size_t k_bytes = k_whole->size_bytes() / rows;
+                    CPURoPEKernelT<precision> kernel;
+                    ASSERT_TRUE(kernel.apply_tensor(q_whole.get(), k_whole.get(), positions.data(),
+                        rows, heads, kv_heads, dimension, 1000000.0f, nullptr, -1, start, rotary));
+                    for (const int chunk : {1, 7, 139})
+                    {
+                        SCOPED_TRACE(::testing::Message() << label << '/' << static_cast<int>(block)
+                            << '/' << start << '/' << rotary << '/' << chunk);
+                        for (int begin = 0; begin < rows; begin += chunk)
+                        {
+                            const int count = std::min(chunk, rows - begin);
+                            auto q = make_native_rope_tensor<precision>(
+                                {static_cast<size_t>(count), q_width}, q_source.data() + begin * q_width, block);
+                            auto k = make_native_rope_tensor<precision>(
+                                {static_cast<size_t>(count), k_width}, k_source.data() + begin * k_width, block);
+                            ASSERT_TRUE(kernel.apply_tensor(q.get(), k.get(), positions.data() + begin,
+                                count, heads, kv_heads, dimension, 1000000.0f, nullptr, -1, start + begin, rotary));
+                            expect_byte_exact_native(q->raw_data(),
+                                static_cast<const uint8_t *>(q_whole->raw_data()) + begin * q_bytes,
+                                count * q_bytes, "partitioned Q row=" + std::to_string(begin));
+                            expect_byte_exact_native(k->raw_data(),
+                                static_cast<const uint8_t *>(k_whole->raw_data()) + begin * k_bytes,
+                                count * k_bytes, "partitioned K row=" + std::to_string(begin));
+                            if (HasFailure()) break; // Preserve the first useful mismatch for each boundary.
+                        }
+                    }
+                }
+            }
+        };
+        check.template operator()<ActivationPrecision::FP32>("FP32");
+        check.template operator()<ActivationPrecision::BF16>("BF16");
+        check.template operator()<ActivationPrecision::FP16>("FP16");
+        check.template operator()<ActivationPrecision::Q8_1>("Q8_1");
+        for (const auto block : {Q16BlockSize::BLOCK_32, Q16BlockSize::BLOCK_64, Q16BlockSize::BLOCK_128})
+            check.template operator()<ActivationPrecision::Q16_1>("Q16_1", block);
+    }
+
+    /**
+     * @brief A caller-private angle table cannot be shared across an outer team.
+     *
+     * Position and head workshares have different cardinalities. Odd worker and
+     * head counts ensure a partial private angle table would be consumed by a
+     * different head partition, exposing that ownership error immediately.
+     */
+    TEST_F(CPURoPEKernelTTest, PrefillAnglesRespectExistingWorkerTeams)
+    {
+        const auto check = []<ActivationPrecision precision>()
+        {
+            constexpr int rows = 158, heads = 5, kv_heads = 2, dimension = 64;
+            using Native = typename CPURoPEKernelT<precision>::StorageType;
+            auto q_source = generate_random_fp32(rows * heads * dimension);
+            auto k_source = generate_random_fp32(rows * kv_heads * dimension);
+            std::array<int, rows> positions;
+            std::iota(positions.begin(), positions.end(), 139);
+            for (int rotary : {0, 32})
+            {
+                if constexpr (precision != ActivationPrecision::FP32)
+                    if (rotary != 0) continue;
+                auto q_expected = make_native_rope_tensor<precision>({rows, heads * dimension}, q_source.data());
+                auto k_expected = make_native_rope_tensor<precision>({rows, kv_heads * dimension}, k_source.data());
+                CPURoPEKernelT<precision> kernel;
+                ASSERT_TRUE(kernel.apply_typed(static_cast<Native *>(q_expected->raw_mutable_data()),
+                    static_cast<Native *>(k_expected->raw_mutable_data()), positions.data(),
+                    rows, heads, kv_heads, dimension, 1000000.0f, -1, rotary));
+                for (int workers : {1, 3, 7})
+                {
+                    SCOPED_TRACE(::testing::Message() << static_cast<int>(precision) << '/' << rotary << '/' << workers);
+                    auto q = make_native_rope_tensor<precision>({rows, heads * dimension}, q_source.data());
+                    auto k = make_native_rope_tensor<precision>({rows, kv_heads * dimension}, k_source.data());
+                    auto *q_data = static_cast<Native *>(q->raw_mutable_data());
+                    auto *k_data = static_cast<Native *>(k->raw_mutable_data());
+                    std::atomic<bool> valid{true};
+#pragma omp parallel num_threads(workers)
+                    {
+                        if (!kernel.apply_typed(q_data, k_data, positions.data(),
+                            rows, heads, kv_heads, dimension, 1000000.0f, -1, rotary))
+                            valid.store(false, std::memory_order_relaxed);
+                    }
+                    ASSERT_TRUE(valid.load());
+                    expect_byte_exact_native(q->raw_data(), q_expected->raw_data(), q->size_bytes(), "outer-team Q");
+                    expect_byte_exact_native(k->raw_data(), k_expected->raw_data(), k->size_bytes(), "outer-team K");
+                }
+            }
+        };
+        check.template operator()<ActivationPrecision::FP32>();
+        check.template operator()<ActivationPrecision::BF16>();
+        check.template operator()<ActivationPrecision::FP16>();
+        check.template operator()<ActivationPrecision::Q8_1>();
     }
 
     // =========================================================================

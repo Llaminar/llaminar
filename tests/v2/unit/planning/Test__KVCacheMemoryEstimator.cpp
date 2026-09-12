@@ -42,7 +42,7 @@ TEST(Test__KVCacheMemoryEstimator, CPUFP16OwnsOnlyKeyAndValueHorizons)
     const std::size_t expected =
         kEntries * 2 * kSequence * kHeads * kHeadDim * sizeof(std::uint16_t);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "fp16", DeviceId::cpu()),
         expected);
@@ -54,7 +54,7 @@ TEST(Test__KVCacheMemoryEstimator, CUDAFP16IncludesPermanentLinearizationHorizon
         kEntries * 4 * kSequence * kHeads * kHeadDim * sizeof(std::uint16_t) +
         gpuMetadata(2);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "fp16", DeviceId::cuda(0)),
         expected);
@@ -66,7 +66,7 @@ TEST(Test__KVCacheMemoryEstimator, ROCmFP16UsesWorkspaceScratch)
         kEntries * 2 * kSequence * kHeads * kHeadDim * sizeof(std::uint16_t) +
         gpuMetadata(2);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "fp16", DeviceId::rocm(0)),
         expected);
@@ -78,25 +78,24 @@ TEST(Test__KVCacheMemoryEstimator, LinearFP32ChangesPayloadWithoutDoublingMetada
         kEntries * 4 * kSequence * kHeads * kHeadDim * sizeof(float) +
         gpuMetadata(2);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "fp32", DeviceId::cuda(0)),
         expected);
 }
 
-TEST(Test__KVCacheMemoryEstimator, CPUQ8PricesPaddedPhysicalBlocks)
+TEST(Test__KVCacheMemoryEstimator, CPUQ8PricesNativeKeysValuesAndRequestBasis)
 {
-    constexpr std::size_t odd_kv_dim = 65;
-    constexpr std::size_t blocks_per_row =
-        (odd_kv_dim + Q8_1Block::BLOCK_SIZE - 1) /
-        Q8_1Block::BLOCK_SIZE;
     const std::size_t expected =
-        kEntries * 2 * kSequence * blocks_per_row * sizeof(Q8_1Block);
+        kEntries * kHeads * (kHeadDim * sizeof(float) + kSequence *
+            (sizeof(AttentionKeyQ8Block_64) + 2 * sizeof(Q8_1Block)));
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
-            kLayers, kBatch, kSequence, 1, odd_kv_dim,
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+            kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "q8_1", DeviceId::cpu()),
         expected);
+    EXPECT_THROW(KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,kLayers, kBatch, kSequence,
+        1, 65, "q8_1", DeviceId::cpu()), std::invalid_argument);
     EXPECT_FLOAT_EQ(
         KVCacheMemoryEstimator::getBytesPerElement("q8_1"),
         static_cast<float>(sizeof(Q8_1Block)) /
@@ -108,7 +107,7 @@ TEST(Test__KVCacheMemoryEstimator, CPUQ16UsesTheSelectedHeadBlock)
     const std::size_t expected =
         kEntries * 2 * kSequence * kHeads * sizeof(Q16_1Block_64);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "q16_1", DeviceId::cpu()),
         expected);
@@ -127,12 +126,12 @@ TEST(Test__KVCacheMemoryEstimator, GPUQ8PricesAQ8KeysValuesAnchorsAndTables)
         ring_bytes + anchor_bytes + gpuMetadata(3);
 
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "q8_1", DeviceId::cuda(0)),
         expected);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "q8_1", DeviceId::rocm(0)),
         expected);
@@ -148,7 +147,7 @@ TEST(Test__KVCacheMemoryEstimator,
          {DeviceId::cuda(0), DeviceId::rocm(0)})
     {
         const auto fp16 =
-            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
                 tokens,
                 kHeads,
                 kHeadDim,
@@ -158,7 +157,7 @@ TEST(Test__KVCacheMemoryEstimator,
         EXPECT_EQ(fp16.v_bytes, tokens * linear_row);
 
         const auto q8 =
-            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
                 tokens,
                 kHeads,
                 kHeadDim,
@@ -173,14 +172,14 @@ TEST(Test__KVCacheMemoryEstimator,
             tokens * kHeads * 2 * sizeof(Q8_1Block));
 
         const auto tq4 =
-            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
                 tokens,
                 kHeads,
                 kHeadDim,
                 "tq4",
                 device);
         const auto tq8 =
-            KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
                 tokens,
                 kHeads,
                 kHeadDim,
@@ -198,13 +197,54 @@ TEST(Test__KVCacheMemoryEstimator,
     }
 }
 
-TEST(Test__KVCacheMemoryEstimator, CPUTQ4IsTQ8KeysAndTQ4Values)
+/** @brief Hybrid Q8 admission follows linear native blocks, including row padding. */
+TEST(Test__KVCacheMemoryEstimator, HybridGPUQ8PricesItsConcreteLinearOwner)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int width : {64, 65, 128, 256})
+    for (const int heads : {1, 2, 3})
+    {
+        SCOPED_TRACE(::testing::Message() << device.to_string()
+            << " width=" << width << " heads=" << heads);
+        const size_t row = ((heads * width + 31u) / 32u) * sizeof(Q8_1Block);
+        const auto logical = KVCacheMemoryEstimator::estimateGPULogicalBlock(
+            KVCacheFamily::Hybrid, 64, heads, width, "q8_1", device);
+        EXPECT_EQ(logical.k_bytes, 64u * row);
+        EXPECT_EQ(logical.v_bytes, 64u * row);
+        EXPECT_EQ(KVCacheMemoryEstimator::estimate(KVCacheFamily::Hybrid,
+            kLayers, kBatch, kSequence, heads, width, "q8_1", device),
+            kEntries * (device.is_cuda() ? 4u : 2u) * kSequence * row + gpuMetadata(2));
+    }
+    // CPU hybrid and ordinary caches already share anchored AQ8 keys. Naming
+    // the family must not accidentally change their physical format or price.
+    EXPECT_EQ(KVCacheMemoryEstimator::estimate(KVCacheFamily::Hybrid,
+        kLayers, kBatch, kSequence, kHeads, kHeadDim, "q8_1", DeviceId::cpu()),
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
+        kLayers, kBatch, kSequence, kHeads, kHeadDim, "q8_1", DeviceId::cpu()));
+}
+
+/** @brief Unsupported hybrid codecs fail during admission, not construction. */
+TEST(Test__KVCacheMemoryEstimator, HybridRejectsUnimplementedTurboQuantFamilies)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const char *precision : {"tq4", "tq8"})
+    {
+        EXPECT_THROW(KVCacheMemoryEstimator::estimate(KVCacheFamily::Hybrid,
+            1, 1, 64, 1, 64, precision, device), std::invalid_argument);
+        if (device.is_gpu())
+            EXPECT_THROW(KVCacheMemoryEstimator::estimateGPULogicalBlock(
+                KVCacheFamily::Hybrid, 64, 1, 64, precision, device), std::invalid_argument);
+    }
+}
+
+TEST(Test__KVCacheMemoryEstimator, CPUTQ4IsAnchoredKeysAndTQ4Values)
 {
     const std::size_t expected =
         kEntries * kSequence * kHeads *
-        (sizeof(TQ8Block_64) + sizeof(TQ4Block_64));
+        (sizeof(AttentionKeyQ8Block_64) + sizeof(TQ4Block_64)) +
+        kEntries * kHeads * kHeadDim * sizeof(float);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "tq4", DeviceId::cpu()),
         expected);
@@ -227,12 +267,12 @@ TEST(Test__KVCacheMemoryEstimator, GPUTurboQuantIncludesBothRotationMatrices)
         common;
 
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "tq4", DeviceId::cuda(0)),
         tq4_expected);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             kLayers, kBatch, kSequence, kHeads, kHeadDim,
             "tq", DeviceId::rocm(0)),
         tq8_expected);
@@ -242,20 +282,20 @@ TEST(Test__KVCacheMemoryEstimator, GPUTurboQuantIncludesBothRotationMatrices)
 TEST(Test__KVCacheMemoryEstimator, ZeroGeometryOwnsNoPersistentCache)
 {
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             0, 1, 4096, 2, 64, "fp16", DeviceId::cuda(0)),
         0U);
     EXPECT_EQ(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             24, 0, 4096, 2, 64, "fp16", DeviceId::cuda(0)),
         0U);
 }
 
 TEST(Test__KVCacheMemoryEstimator, CPUSequencePayloadScalesExactly)
 {
-    const std::size_t bytes_2k = KVCacheMemoryEstimator::estimate(
+    const std::size_t bytes_2k = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         24, 1, 2048, 2, 64, "fp16", DeviceId::cpu());
-    const std::size_t bytes_4k = KVCacheMemoryEstimator::estimate(
+    const std::size_t bytes_4k = KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
         24, 1, 4096, 2, 64, "fp16", DeviceId::cpu());
     EXPECT_EQ(bytes_4k, bytes_2k * 2);
 }
@@ -263,19 +303,19 @@ TEST(Test__KVCacheMemoryEstimator, CPUSequencePayloadScalesExactly)
 TEST(Test__KVCacheMemoryEstimator, UnsupportedInputsFailClosed)
 {
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             1, 1, 64, 1, 64, "mystery", DeviceId::cpu()),
         std::invalid_argument);
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             1, 1, 64, 1, 64, "fp16", DeviceId::invalid()),
         std::invalid_argument);
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             1, 1, 64, 1, 64, "q16_1", DeviceId::cuda(0)),
         std::invalid_argument);
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             1, 1, 64, 1, 96, "tq4", DeviceId::rocm(0)),
         std::invalid_argument);
     EXPECT_THROW(
@@ -285,15 +325,15 @@ TEST(Test__KVCacheMemoryEstimator, UnsupportedInputsFailClosed)
         KVCacheMemoryEstimator::getBytesPerElement("tq4"),
         std::invalid_argument);
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
             64, 1, 64, "fp16", DeviceId::cpu()),
         std::invalid_argument);
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
             0, 1, 64, "fp16", DeviceId::cuda(0)),
         std::invalid_argument);
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheMemoryEstimator::estimateGPULogicalBlock(KVCacheFamily::AttentionOnly,
             64, 1, 64, "q16_1", DeviceId::rocm(0)),
         std::invalid_argument);
 }
@@ -302,7 +342,7 @@ TEST(Test__KVCacheMemoryEstimator, ImpossibleGeometryFailsOnOverflow)
 {
     constexpr int huge = std::numeric_limits<int>::max();
     EXPECT_THROW(
-        KVCacheMemoryEstimator::estimate(
+        KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
             huge, huge, huge, huge, huge,
             "fp32", DeviceId::cpu()),
         std::overflow_error);

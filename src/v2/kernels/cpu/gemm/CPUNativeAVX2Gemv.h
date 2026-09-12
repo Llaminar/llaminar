@@ -26,6 +26,7 @@
 #include "CPUNativeVNNIContributionContract.h"
 #include "CPUNativeVNNIFP16.h"
 #include "CPUNativeVNNIQ6Kernels.h"
+#include "CPUNativeVNNIMultiScaleKernels.h"
 #include "VNNIEmulation.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
@@ -265,6 +266,12 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate = false)
     {
+        if (packed.usesCompactMultiScale())
+        {
+            multi_scale::dispatch<8>(packed, std::array{A_q8}, std::array{C},
+                                     chunk, kb_start, kb_end, accumulate);
+            return;
+        }
         if (packed.usesQ6KNativeDualScale())
         {
             gemvQ6KNativeAVX2Chunk(
@@ -582,6 +589,12 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate)
     {
+        if (packed.usesCompactMultiScale())
+        {
+            multi_scale::dispatch<8>(packed, std::array{A_q8_row0, A_q8_row1},
+                                     std::array{C_row0, C_row1}, chunk, kb_start, kb_end, accumulate);
+            return;
+        }
         if (packed.usesQ6KNativeDualScale())
         {
             gemmQ6KNativeTwoRowsAVX2Chunk(

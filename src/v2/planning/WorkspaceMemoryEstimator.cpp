@@ -18,7 +18,7 @@
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "kernels/common/EmbeddingWorkspaceContract.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
-#include "kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
+#include "kernels/cuda/attention/CUDAFlashAttentionWorkspaceEnvelope.h"
 #include "kernels/kvcache/KVCacheWorkspaceContract.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmWorkspaceContract.h"
@@ -1222,7 +1222,7 @@ size_t exactAttentionWorkspaceBytes(
 
     if (geometry.device.is_cuda())
     {
-        const auto plan = cuda::fa2_policy::selectFA2PrefillParallelPlan({
+        const cuda::fa2_policy::FA2PrefillParallelGeometry current{
             .batch_size = geometry.batch_size,
             .query_rows = geometry.resident_graph_rows,
             .local_query_heads = local_query_heads,
@@ -1231,7 +1231,8 @@ size_t exactAttentionWorkspaceBytes(
             .sm_count = geometry.device_compute_units,
             .requested_axis =
                 attention::AttentionPrefillParallelAxis::GeometrySelected,
-        });
+        };
+        const auto plan = cuda::fa2_policy::selectFA2PrefillParallelPlan(current);
         if (!plan.valid)
         {
             throw std::runtime_error(
@@ -1240,6 +1241,19 @@ size_t exactAttentionWorkspaceBytes(
         partial_output = plan.partial_output_bytes;
         partial_m = plan.partial_m_bytes;
         partial_l = plan.partial_l_bytes;
+
+        // Physical admission consumes the same non-monotonic family envelope
+        // as AttentionComputeStage, before weights or captures own any bytes.
+        // The admitted query-row bound is independent of the full KV horizon:
+        // charging unadmitted larger buckets defeats resident-bucket selection.
+        const auto family = cuda::fa2_policy::
+            selectFA2GeometrySelectedWorkspaceEnvelope(current);
+        if (family.usesContextParallelism())
+        {
+            partial_output = std::max(partial_output, family.partial_output_bytes);
+            partial_m = std::max(partial_m, family.partial_m_bytes);
+            partial_l = std::max(partial_l, family.partial_l_bytes);
+        }
     }
     else if (geometry.device.is_rocm())
     {
@@ -1266,10 +1280,9 @@ size_t exactAttentionWorkspaceBytes(
         partial_m = plan.partial_m_bytes;
         partial_l = plan.partial_l_bytes;
 
-        auto family_geometry = current;
-        family_geometry.query_rows = geometry.max_context_rows;
+        // ROCm obeys the same admitted-query/full-context distinction as CUDA.
         const auto family = rocm::fa2_policy::
-            selectROCmFA2GeometrySelectedWorkspaceEnvelope(family_geometry);
+            selectROCmFA2GeometrySelectedWorkspaceEnvelope(current);
         if (family.valid && family.usesContextParallelism())
         {
             partial_output = std::max(

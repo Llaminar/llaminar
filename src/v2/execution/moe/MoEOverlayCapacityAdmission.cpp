@@ -678,10 +678,15 @@ namespace llaminar2
                 workspace == workspace_by_key.end()
                     ? 0u
                     : workspace->second);
+            const auto complete_bom = complete_builder.build();
+            if (!complete_bom.fits())
+                throw MoEOverlayCapacityExhausted(
+                    "ExpertOverlay fixed migration BOM exceeds " +
+                    budget.resourceId() + ": deficit_bytes=" +
+                    std::to_string(complete_bom.deficitBytes()));
             input.physical_budgets.emplace_back(
                 budget.resourceId(),
-                PhysicalMemoryAdmissionCertificate(
-                    complete_builder.build()));
+                PhysicalMemoryAdmissionCertificate(complete_bom));
         }
         if (input.physical_budgets.empty())
         {
@@ -817,6 +822,104 @@ namespace llaminar2
         return input;
     }
 
+    MoEOverlayResolvedCapacityPlan
+    MoEOverlayCapacityAdmission::resolveCapacity(
+        const MoERoutedExpertPlacementPlan &plan,
+        int num_experts,
+        const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
+        const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
+        const MoEOverlayCapacityAdmissionPolicy &policy)
+    {
+        // Validate the complete requested geometry before searching. In
+        // particular a missing workspace is not an out-of-memory condition.
+        if (policy.usesDeviceTransferDirectory() &&
+            !policy.device_rebalance_workspace_capacity)
+            throw std::invalid_argument("Native replica admission requires its workspace capacity");
+
+        const auto resolve_exact = [&](const MoEOverlayCapacityAdmissionPolicy &candidate)
+        {
+            return MoEOverlayCapacityResolver::resolve(buildResolverInput(
+                plan, num_experts, layer_weight_manifest, physical_budgets, candidate));
+        };
+        if (!policy.usesDeviceTransferDirectory())
+            return resolve_exact(policy);
+
+        const auto &requested_workspace = *policy.device_rebalance_workspace_capacity;
+        const auto maximum = requested_workspace.max_hot_replicas_per_participant;
+        if (maximum > static_cast<std::uint32_t>(std::max(0, num_experts)))
+            throw std::invalid_argument("Replica-cache upper bound exceeds the model expert count");
+        const auto &directory = policy.device_transfer_directory_capacity;
+        if (directory.active_slots !=
+                static_cast<std::uint64_t>(requested_workspace.num_layers) * std::max(1u, maximum) ||
+            static_cast<std::uint64_t>(directory.active_slots) + directory.staging_slots != directory.total_slots ||
+            requested_workspace.local_transfer_slot_count != directory.total_slots)
+            throw std::invalid_argument("Replica admission requires exact requested directory geometry");
+
+        const auto resolve_replica_count = [&](std::uint32_t count)
+        {
+            auto candidate = policy;
+            auto &workspace = *candidate.device_rebalance_workspace_capacity;
+            workspace.max_hot_replicas_per_participant = count;
+            // The rolling staging pool is independent of persistent replica
+            // residency. Resize only active slots, never transfer parallelism.
+            candidate.device_transfer_directory_capacity =
+                DeviceMoETransferSlotDirectory::planBufferedCapacity(
+                    static_cast<std::uint64_t>(workspace.num_layers) *
+                        std::max(1u, count),
+                    policy.device_transfer_directory_capacity.staging_slots,
+                    /*one already-combined staging pool=*/1u);
+            workspace.local_transfer_slot_count =
+                candidate.device_transfer_directory_capacity.total_slots;
+            workspace.collective_payload_slot_capacity = std::min(
+                requested_workspace.collective_payload_slot_capacity,
+                workspace.local_transfer_slot_count);
+            auto result = resolve_exact(candidate);
+            result.replica_cache_capacity = plan.replica_cache_capacity
+                ? plan.replica_cache_capacity
+                : std::optional<MoEOverlayReplicaCacheCapacity>{
+                      std::in_place, static_cast<int>(maximum), static_cast<int>(count)};
+            return result;
+        };
+
+        // Retained runners reuse their exact grant; a new free-memory sample
+        // must not renegotiate geometry embedded in retained prepared state.
+        if (plan.replica_cache_capacity)
+        {
+            if (maximum != static_cast<std::uint32_t>(plan.replica_cache_capacity->admitted()))
+                throw std::logic_error("Retained replica-cache policy differs from its admitted grant");
+            return resolve_replica_count(maximum);
+        }
+        try
+        {
+            return resolve_replica_count(maximum);
+        }
+        catch (const MoEOverlayCapacityExhausted &)
+        {
+            if (maximum <= 1u)
+                throw;
+        }
+
+        // An enabled cache always keeps at least one slot per layer. Prove
+        // that floor first: failure here is fatal, never static/off execution.
+        auto best = resolve_replica_count(1u);
+        std::uint32_t low = 2u;
+        std::uint32_t high = maximum - 1u;
+        while (low <= high)
+        {
+            const auto middle = low + (high - low) / 2u;
+            try
+            {
+                best = resolve_replica_count(middle);
+                low = middle + 1u;
+            }
+            catch (const MoEOverlayCapacityExhausted &)
+            {
+                high = middle - 1u;
+            }
+        }
+        return best;
+    }
+
     MoERoutedExpertPlacementPlan
     MoEOverlayCapacityAdmission::resolveAndInstall(
         const MoERoutedExpertPlacementPlan &plan,
@@ -825,13 +928,12 @@ namespace llaminar2
         const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
         const MoEOverlayCapacityAdmissionPolicy &policy)
     {
-        const auto input = buildResolverInput(
+        const auto capacity = resolveCapacity(
             plan,
             num_experts,
             layer_weight_manifest,
             physical_budgets,
             policy);
-        const auto capacity = MoEOverlayCapacityResolver::resolve(input);
         return MoEOverlayCapacityResolver::installResolvedQuotas(
             plan, capacity);
     }

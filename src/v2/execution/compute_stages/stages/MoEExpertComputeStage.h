@@ -109,6 +109,15 @@ namespace llaminar2
         explicit CPUGroupedMoESerialWorkspace(Config config);
         ~CPUGroupedMoESerialWorkspace();
 
+        /**
+         * @brief Price the exact payload allocated by this workspace before construction.
+         * @param config Same immutable geometry consumed by the constructor.
+         * @return FP32, Q8 and kernel-publication bytes, without allocating anything.
+         * @throws std::invalid_argument for incomplete geometry.
+         * @throws std::overflow_error for unrepresentable row or byte counts.
+         */
+        [[nodiscard]] static size_t plannedAllocationBytes(const Config &config);
+
         CPUGroupedMoESerialWorkspace(
             const CPUGroupedMoESerialWorkspace &) = delete;
         CPUGroupedMoESerialWorkspace &operator=(

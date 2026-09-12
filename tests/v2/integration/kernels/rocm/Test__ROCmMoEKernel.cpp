@@ -7241,6 +7241,20 @@ TEST(Test__ROCmMoEKernel,
     EXPECT_EQ(status.post_policy_load_max, 79u);
     EXPECT_EQ(status.accepted_load_spread_improvement_total, 42u);
     EXPECT_EQ(status.accepted_load_spread_improvement_max, 42u);
+    EXPECT_EQ(command_header.movement_decision.kind,
+              llaminar2::DeviceMoERebalanceMovementDecisionKind::NativeOwnershipSpread);
+    const auto &sealed_proof = command_header.movement_decision.load;
+    EXPECT_TRUE(sealed_proof.valid());
+    EXPECT_EQ(sealed_proof.accepted_spread_improvement, 42u);
+    EXPECT_EQ(sealed_proof.pre_wave_spread, 90u);
+    EXPECT_EQ(sealed_proof.post_wave_spread, 48u);
+    EXPECT_EQ(sealed_proof.pre_wave_total, 110u);
+    EXPECT_EQ(sealed_proof.post_wave_total, 110u);
+    EXPECT_EQ(sealed_proof.requested_payload_slots, 1u);
+    EXPECT_EQ(sealed_proof.minimum_improvement_per_slot, 30u);
+    EXPECT_EQ(sealed_proof.ownership_swap_accepts, 1u);
+    EXPECT_EQ(plan[0].activation_count, 30u);
+    EXPECT_EQ(plan[1].activation_count, 9u);
     EXPECT_EQ(status.payload_bucket_requested_slots, 1u)
         << "The reciprocal ownership pair is one concurrent source-lane slot, not two edges.";
     EXPECT_EQ(status.payload_bucket_slots, 1u);
@@ -9070,6 +9084,13 @@ TEST(Test__ROCmMoEKernel, ApplyReadyDeviceRebalanceWaveClearsAppliedCommandHeade
     EXPECT_EQ(apply_status.plan_entries_seen, 0u);
     EXPECT_EQ(apply_status.applied_arrivals, 0u);
     EXPECT_EQ(apply_status.changed_layers, 0u);
+
+    // A retained resident-only wave must not become physical movement merely
+    // because the instance has nonzero transfer storage capacity.
+    ASSERT_EQ(hipMemcpy(&result_state, d_controller_state, sizeof(result_state),
+                        hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(
+                  result_state.waves, 0, 1024).useful_payload_bytes_lower_bound, 0u);
 
     EXPECT_EQ(hipFree(d_plan_entries), hipSuccess);
     EXPECT_EQ(hipFree(d_command_headers), hipSuccess);
@@ -14202,6 +14223,11 @@ TEST(Test__ROCmMoEKernel,
                 command_buffer_count);
 
         occupants = transaction.next_occupants;
+        // Copy-complete leases are fixture inputs; the production apply kernel
+        // must author matching terminal movement evidence for this wave alone.
+        const auto movement = deviceMoERebalanceRequestMovementEvidence(
+            {&controller.waves[wave_index], 1}, 0, 1024);
+        ASSERT_EQ(movement.completed_payload_lower_bound, transaction.command_count);
         ASSERT_TRUE(model::validateSnapshot(
             runtime,
             occupants,
@@ -14267,6 +14293,11 @@ TEST(Test__ROCmMoEKernel,
             ASSERT_EQ(
                 controller.decode_apply_hits,
                 hits_before);
+            EXPECT_EQ(deviceMoERebalanceRequestMovementEvidence(
+                          {&controller.waves[wave_index], 1}, 0, 1024)
+                          .useful_payload_bytes_lower_bound,
+                      movement.useful_payload_bytes_lower_bound)
+                << "an empty final apply must not erase completed payload evidence";
         }
     }
 
@@ -28226,6 +28257,19 @@ TEST(
         "ROCm",
         llaminar2::DeviceId::rocm(0),
         rocmMoETestStream());
+}
+
+/** @brief Prove all-codebook copy bytes and the exact transient epoch lease. */
+TEST(Test__ROCmMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactBytes)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    llaminar2::test::runNativeVNNIExpertTransferGroupedParity(
+        "ROCm", llaminar2::DeviceId::rocm(0), rocmMoETestStream(),
+        llaminar2::test::NativeExpertTransferProofScope::CopyPublication);
 }
 
 /**

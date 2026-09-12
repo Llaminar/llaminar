@@ -2,6 +2,15 @@
  * @file KernelFactory.cpp
  * @brief Implementation of centralized kernel dispatch factory
  * @author David Sanftenberg
+ *
+ * Backend/format registrations construct typed production kernel interfaces;
+ * stages do not select concrete implementations themselves. RoPE exposes its
+ * native interface directly so ordinary and grouped position contracts cannot
+ * diverge through an adapter. Cache factories also bind their format metadata
+ * and canonical physical-memory reservation before inference begins.
+ * Bounded expert service measurements retain immutable prepared bytes while
+ * giving GPU probes independent execution bindings, never borrowing the live
+ * inference engine's stream, library handle, or scratch lifetime.
  */
 
 #include "KernelFactory.h"
@@ -9,6 +18,7 @@
 #include "../backends/GPUDeviceContextPool.h"
 #include "../planning/KVCacheMemoryEstimator.h"
 #include "../planning/PhysicalMemoryAuthority.h"
+#include "../execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "cpu/gemm/CPUPackedWeights.h"
 #include "PackedWeightsSerialization.h"
@@ -264,140 +274,8 @@ namespace llaminar
                 }
 #endif
 
-                // =========================================================================
-                // Adapter: CPURoPEKernelT<FP32> -> ITensorRoPE
-                // Only FP32 is supported through this interface (other precisions use
-                // their native typed kernels directly).
-                // =========================================================================
-                class RoPEKernelAdapter : public llaminar2::ITensorRoPE
-                {
-                public:
-                    bool supports_device(int device_idx) const override
-                    {
-                        return kernel_.supports_device(device_idx);
-                    }
-
-                    // Tensor-based interface (used by RoPEOpTyped)
-                    bool apply_tensor(
-                        llaminar2::TensorBase *Q,
-                        llaminar2::TensorBase *K,
-                        const int *position_ids,
-                        int seq_len,
-                        int n_heads,
-                        int n_kv_heads,
-                        int head_dim,
-                        float rope_theta,
-                        const llaminar2::IMPIContext *mpi_ctx,
-                        int device_idx,
-                        int pos_offset = 0,
-                        int rotary_dim = 0) override
-                    {
-                        (void)mpi_ctx;    // Not used in typed kernel
-                        (void)pos_offset; // CPU kernel doesn't need this optimization
-
-                        // Validate tensors are FP32
-                        if (!Q)
-                        {
-                            LOG_ERROR("[RoPEKernelAdapter] Q tensor is null");
-                            return false;
-                        }
-                        if (Q->native_type() != llaminar2::TensorType::FP32)
-                        {
-                            LOG_ERROR("[RoPEKernelAdapter] Q tensor must be FP32, got " << static_cast<int>(Q->native_type()));
-                            return false;
-                        }
-                        if (K && K->native_type() != llaminar2::TensorType::FP32)
-                        {
-                            LOG_ERROR("[RoPEKernelAdapter] K tensor must be FP32, got " << static_cast<int>(K->native_type()));
-                            return false;
-                        }
-
-                        // Get raw pointers from tensors
-                        float *Q_data = Q->mutable_data();
-                        float *K_data = K ? K->mutable_data() : nullptr;
-
-                        return kernel_.apply_typed(Q_data, K_data, position_ids,
-                                                   seq_len, n_heads, n_kv_heads, head_dim,
-                                                   rope_theta, device_idx, rotary_dim);
-                    }
-
-                private:
-                    llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::FP32> kernel_;
-                };
-
-                // =========================================================================
-                // Adapter: CPURoPEKernelT<Q8_1> -> ITensorRoPE
-                // =========================================================================
-                class Q8_1RoPEKernelAdapter : public llaminar2::ITensorRoPE
-                {
-                public:
-                    bool supports_device(int device_idx) const override
-                    {
-                        return kernel_.supports_device(device_idx);
-                    }
-
-                    // Tensor-based interface (used by RoPEOpTyped)
-                    bool apply_tensor(
-                        llaminar2::TensorBase *Q,
-                        llaminar2::TensorBase *K,
-                        const int *position_ids,
-                        int seq_len,
-                        int n_heads,
-                        int n_kv_heads,
-                        int head_dim,
-                        float rope_theta,
-                        const llaminar2::IMPIContext *mpi_ctx,
-                        int device_idx,
-                        int pos_offset = 0,
-                        int rotary_dim = 0) override
-                    {
-                        (void)mpi_ctx;    // Not used in typed kernel
-                        (void)pos_offset; // CPU kernel doesn't need this optimization
-
-                        // Validate tensors are Q8_1
-                        if (!Q)
-                        {
-                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Q tensor is null");
-                            return false;
-                        }
-                        if (Q->native_type() != llaminar2::TensorType::Q8_1)
-                        {
-                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Q tensor must be Q8_1, got " << static_cast<int>(Q->native_type()));
-                            return false;
-                        }
-                        if (K && K->native_type() != llaminar2::TensorType::Q8_1)
-                        {
-                            LOG_ERROR("[Q8_1RoPEKernelAdapter] K tensor must be Q8_1, got " << static_cast<int>(K->native_type()));
-                            return false;
-                        }
-
-                        // Cast to Q8_1Tensor to access Q8_1 blocks
-                        auto *Q_q8 = dynamic_cast<llaminar2::Q8_1Tensor *>(Q);
-                        auto *K_q8 = K ? dynamic_cast<llaminar2::Q8_1Tensor *>(K) : nullptr;
-
-                        if (!Q_q8)
-                        {
-                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Failed to cast Q to Q8_1Tensor");
-                            return false;
-                        }
-                        if (K && !K_q8)
-                        {
-                            LOG_ERROR("[Q8_1RoPEKernelAdapter] Failed to cast K to Q8_1Tensor");
-                            return false;
-                        }
-
-                        // Get Q8_1 block pointers
-                        llaminar2::Q8_1Block *Q_blocks = Q_q8->mutable_typed_data();
-                        llaminar2::Q8_1Block *K_blocks = K_q8 ? K_q8->mutable_typed_data() : nullptr;
-
-                        return kernel_.apply_typed(Q_blocks, K_blocks, position_ids,
-                                                   seq_len, n_heads, n_kv_heads, head_dim,
-                                                   rope_theta, device_idx, rotary_dim);
-                    }
-
-                private:
-                    llaminar2::CPURoPEKernelT<llaminar2::ActivationPrecision::Q8_1> kernel_;
-                };
+                // RoPE registrations return the native ITensorRoPE implementations
+                // directly, keeping position and grouped-row contracts single-source.
 
                 // =========================================================================
                 // Adapter: CPUSwiGLUKernelT<FP32> -> ITensorSwiGLU
@@ -3505,6 +3383,107 @@ namespace llaminar
             }
 
             std::shared_ptr<llaminar2::ITensorGemm>
+            KernelFactory::createExpertServiceExecutionView(
+                std::shared_ptr<llaminar2::ITensorGemm> source,
+                llaminar2::DeviceId device)
+            {
+                using namespace llaminar2;
+                MoEOverlayPreparedWeightSource prepared;
+                std::string error;
+                if (!resolveMoEOverlayPreparedWeightSource(
+                        source, device, prepared, &error))
+                    throw std::invalid_argument(error);
+
+                if (device.is_cpu())
+                {
+                    // Only the known immutable CPU expert implementations
+                    // satisfy this sharing contract. An arbitrary ITensorGemm
+                    // exporting a descriptor is not evidence of reentrancy.
+                    if (dynamic_cast<cpu::native_vnni::CPUNativeVNNIGemmKernel *>(source.get()))
+                        return source;
+                    if (auto floating = std::dynamic_pointer_cast<const gemm::FloatingPointGemmKernel>(source))
+                        return std::make_shared<gemm::FloatingPointGemmKernel>(std::move(floating));
+                    throw std::invalid_argument(
+                        "Expert service view requires a known prepared CPU kernel");
+                }
+
+                if (prepared.kind == MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeVnni)
+                {
+                    const auto &d = prepared.gpu_packed;
+                    const NativeVnniReusableDeviceAllocationFormat allocation{
+                        .payload_bytes_per_block = d.allocation_payload_bytes_per_block,
+                        .has_mins = d.allocation_has_mins,
+                        .has_emins = d.allocation_has_emins,
+                    };
+                    // Preserve both physical decoding and original arithmetic
+                    // provenance: a CPU-promoted expert can use normalized
+                    // codebook 19/23 without changing its source codebook.
+#ifdef HAVE_CUDA
+                    if (device.is_cuda())
+                    {
+                        const auto *original = dynamic_cast<cuda::CUDAQuantisedGemmKernel *>(source.get());
+                        if (!original || original->cuda_device_id() != device.gpu_ordinal())
+                            throw std::invalid_argument("Expert service view CUDA owner mismatch");
+                        return std::make_shared<cuda::CUDAQuantisedGemmKernel>(
+                            d.n, d.k, device.gpu_ordinal(), d.ptrs.d_vnni,
+                            static_cast<uint16_t *>(d.ptrs.d_scales),
+                            static_cast<uint16_t *>(d.ptrs.d_mins),
+                            static_cast<uint32_t *>(d.ptrs.d_emins),
+                            d.codebook_id, d.blocks_per_row, source,
+                            prepared.format.native_vnni, allocation);
+                    }
+#endif
+#ifdef HAVE_ROCM
+                    if (device.is_rocm())
+                    {
+                        const auto *original = dynamic_cast<rocm::ROCmQuantisedGemmKernel *>(source.get());
+                        if (!original || original->rocm_device_id() != device.gpu_ordinal())
+                            throw std::invalid_argument("Expert service view ROCm owner mismatch");
+                        return std::make_shared<rocm::ROCmQuantisedGemmKernel>(
+                            d.n, d.k, device.gpu_ordinal(), d.ptrs.d_vnni,
+                            d.ptrs.d_scales, d.ptrs.d_mins, d.ptrs.d_emins,
+                            d.codebook_id, d.blocks_per_row, source,
+                            prepared.format.native_vnni, allocation);
+                    }
+#endif
+                }
+                else if (prepared.kind == MoEOverlayPreparedWeightSourceKind::GpuContiguousFloating)
+                {
+                    const auto &d = prepared.floating;
+#ifdef HAVE_CUDA
+                    if (device.is_cuda())
+                    {
+                        const auto *original = dynamic_cast<cuda::CUDAFloatingPointGemmKernel *>(source.get());
+                        if (!original || original->cuda_device_id() != device.gpu_ordinal())
+                            throw std::invalid_argument("Expert service view CUDA floating owner mismatch");
+                        using Precision = cuda::CUDAFloatingPointGemmKernel::Precision;
+                        const auto precision = d.type == TensorType::FP32 ? Precision::FP32
+                                             : d.type == TensorType::FP16 ? Precision::FP16
+                                                                         : Precision::BF16;
+                        return std::make_shared<cuda::CUDAFloatingPointGemmKernel>(
+                            d.data, d.n, d.k, device.gpu_ordinal(), precision, source);
+                    }
+#endif
+#ifdef HAVE_ROCM
+                    if (device.is_rocm())
+                    {
+                        const auto *original = dynamic_cast<rocm::ROCmFloatingPointGemmKernel *>(source.get());
+                        if (!original || original->rocm_device_id() != device.gpu_ordinal())
+                            throw std::invalid_argument("Expert service view ROCm floating owner mismatch");
+                        using Precision = rocm::ROCmFloatingPointGemmKernel::Precision;
+                        const auto precision = d.type == TensorType::FP32 ? Precision::FP32
+                                             : d.type == TensorType::FP16 ? Precision::FP16
+                                                                         : Precision::BF16;
+                        return std::make_shared<rocm::ROCmFloatingPointGemmKernel>(
+                            d.data, d.n, d.k, device.gpu_ordinal(), precision, source);
+                    }
+#endif
+                }
+                throw std::invalid_argument(
+                    "Expert service view requires a compiled backend and supported prepared format");
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm>
             KernelFactory::createExpertGemmFromPackedWeights(
                 std::unique_ptr<llaminar2::IPackedWeights> packed_weights)
             {
@@ -3971,6 +3950,11 @@ namespace llaminar
             // KVCacheConfig estimation
             // ==========================================================================
 
+            /**
+             * @brief Contribute the concrete factory's KV BOM to physical admission.
+             * @return Persistent cache bytes, excluding separately owned GDN state.
+             * @throws std::invalid_argument for a non-storage precision or unsupported family.
+             */
             size_t KVCacheConfig::estimateBytes() const
             {
                 int effective_kv_heads = (local_n_kv_heads > 0) ? local_n_kv_heads : n_kv_heads;
@@ -4012,6 +3996,8 @@ namespace llaminar
                 }
 
                 return ::llaminar2::KVCacheMemoryEstimator::estimate(
+                    is_hybrid() ? ::llaminar2::KVCacheFamily::Hybrid
+                                : ::llaminar2::KVCacheFamily::AttentionOnly,
                     effective_layers, batch_size, max_seq_len,
                     effective_kv_heads, head_dim, prec_str, device);
             }
@@ -4221,7 +4207,8 @@ namespace llaminar
                         config.kv_head_start,
                         config.head_dim,
                         config.device,
-                        config.layout_mode);
+                        config.layout_mode,
+                        config.turboquant_ctx);
                 }
                 else
                 {
@@ -4241,7 +4228,8 @@ namespace llaminar
                         config.n_kv_heads,
                         config.head_dim,
                         config.device,
-                        config.layout_mode);
+                        config.layout_mode,
+                        config.turboquant_ctx);
                 }
             }
 
@@ -4491,7 +4479,7 @@ namespace llaminar
                                 config.kv_head_start, config.head_dim, config.device, config.layout_mode);
                             break;
                         case llaminar2::ActivationPrecision::Q8_1:
-                            cache = std::make_unique<llaminar2::CPUHybridRingKVCache<llaminar2::ActivationPrecision::Q8_1>>(
+                            cache = std::make_unique<llaminar2::CPUHybridRingKVCache<llaminar2::ActivationPrecision::AQ8, llaminar2::ActivationPrecision::Q8_1>>(
                                 hc, *config.mpi_ctx, config.num_layers, config.batch_size,
                                 config.max_seq_len, config.n_kv_heads, config.local_n_kv_heads,
                                 config.kv_head_start, config.head_dim, config.device, config.layout_mode);

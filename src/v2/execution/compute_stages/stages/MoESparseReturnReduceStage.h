@@ -1,6 +1,10 @@
 /**
  * @file MoESparseReturnReduceStage.h
  * @brief Graph-native sparse MoE return/reduce payload stage.
+ *
+ * Each boundary carries one exact transport, return-layout and consumer role.
+ * Canonical host rows are gathered into the existing packed publication bank;
+ * only the final reducer may apply weights and original-router arithmetic.
  */
 
 #pragma once
@@ -56,7 +60,10 @@ namespace llaminar2
             std::shared_ptr<const MoEOverlayReturnRows> outbound_rows_lifetime;
             MoEOverlayReturnRows *inbound_rows = nullptr;
             std::shared_ptr<MoEOverlayReturnRows> inbound_rows_lifetime;
+            /** Token output or packed canonical bank, selected by return_layout. */
             TensorBase *dense_output = nullptr;
+            /** Exact expected wire arithmetic; never infer it from packet arrival. */
+            MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
             /**
              * @brief Whether this rank owns the returned dense activation.
              *

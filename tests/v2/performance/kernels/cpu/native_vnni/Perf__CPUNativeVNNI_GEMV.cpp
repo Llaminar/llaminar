@@ -1879,30 +1879,12 @@ namespace
         packed.codebook_id = metadata->codebook_id;
         packed.is_asymmetric = metadata->is_asymmetric;
         packed.is_superblock = metadata->is_superblock;
-        packed.encoding = is_nibble_lut_format(metadata->codebook_id)
-                              ? CPUNativeVNNIEncoding::NibbleLUT
-                          : metadata->codebook_id == 8
-                              ? CPUNativeVNNIEncoding::Q6KNativeDualScale
-                              : CPUNativeVNNIEncoding::ExpandedInt8;
-        if (packed.usesNibbleLUT())
-        {
-            packed.data_stride = 1024;
-            packed.interleaved_block_stride =
-                packed.data_stride + 256 +
-                (packed.is_asymmetric ? 128 : 0);
-        }
-        else if (packed.usesQ6KNativeDualScale())
-        {
-            packed.data_stride = 1536;
-            packed.interleaved_block_stride = 1792;
-        }
-        else
-        {
-            packed.data_stride = 2048;
-            packed.interleaved_block_stride =
-                packed.data_stride + 256 +
-                (packed.is_asymmetric ? 128 : 0);
-        }
+        // Profiling must select the same physical representation as loading.
+        // Otherwise a new encoding silently measures an obsolete kernel.
+        packed.encoding = preparedEncodingForCodebook(metadata->codebook_id);
+        packed.data_stride = preparedDataStride(packed.encoding);
+        packed.interleaved_block_stride = preparedInterleavedBlockStride(
+            packed.encoding, packed.is_asymmetric);
 
         const size_t n_chunks =
             static_cast<size_t>(packed.N_padded / 64);
@@ -1953,7 +1935,7 @@ namespace
                 auto *const scales = reinterpret_cast<uint16_t *>(
                     block + packed.data_stride +
                     (packed.usesInlineCompensation() ? 128 : 0));
-                auto *const minima = packed.usesQ6KNativeDualScale()
+                auto *const minima = !packed.usesInlineCompensation()
                     ? reinterpret_cast<uint16_t *>(
                           block + packed.data_stride + 128)
                     : packed.is_asymmetric
@@ -1967,6 +1949,15 @@ namespace
                     scales[column] = one_fp16;
                     if (minima)
                         minima[column] = min_fp16;
+                    if (packed.usesCompactMultiScale())
+                    {
+                        // Both Q2_K minima are finite; all other compact
+                        // codebooks reserve these words as deterministic zero.
+                        reinterpret_cast<uint32_t *>(block + packed.data_stride + 256)[column] =
+                            metadata->has_emins
+                                ? static_cast<uint32_t>(min_fp16) | (static_cast<uint32_t>(min_fp16) << 16)
+                                : 0u;
+                    }
                 }
             }
         }

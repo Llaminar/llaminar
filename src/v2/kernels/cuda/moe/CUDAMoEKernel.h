@@ -215,7 +215,14 @@ namespace llaminar2
             DeviceMoEOverlayEpochControl *control,
             std::uint64_t *candidate_epoch,
             DeviceMoEOverlayEpochStatus *reservation_and_publication_status,
-            const DeviceMoERebalanceApplyStatus *apply_status) override;
+            const DeviceMoERebalanceApplyStatus *apply_status,
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            DeviceMoERebalanceCommandBufferHeader *command_headers,
+            std::uint32_t command_buffer_count,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            std::uint32_t plan_capacity,
+            std::uint64_t estimated_expert_bytes,
+            DeviceMoERebalanceMovementJournalView journal) override;
 
         /** @copydoc IMoEKernel::markMoEOverlayEpochCandidateReady */
         bool markMoEOverlayEpochCandidateReady(

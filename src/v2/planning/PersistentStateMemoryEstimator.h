@@ -11,6 +11,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "planning/KVCacheMemoryEstimator.h"
 
 #include <cstddef>
 #include <string>
@@ -24,6 +25,8 @@ namespace llaminar2
      */
     struct PersistentStateEstimate
     {
+        /** Main-cache construction identity, retained even for an FA-only PP slice. */
+        KVCacheFamily main_kv_family = KVCacheFamily::AttentionOnly;
         /** Complete persistent bytes owned by committed and shifted caches. */
         size_t kv_cache_bytes = 0;
         /** Persistent bytes owned only by the committed main-model cache. */
@@ -51,6 +54,15 @@ namespace llaminar2
     class PersistentStateMemoryEstimator
     {
     public:
+        /**
+         * @brief Query the same layer classification used for live KV admission.
+         * @param profile Compact model tensor/architecture inventory.
+         * @param layer Global layer index, including trailing MTP predictors.
+         * @return Whether this layer owns full-attention rather than GDN state.
+         * @throws std::invalid_argument for an index outside the model.
+         */
+        static bool isFullAttentionLayer(const ModelMemoryProfile &profile, int layer);
+
         /**
          * @brief Reproduce cache-owned persistent allocations for one device.
          *

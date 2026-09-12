@@ -1,6 +1,12 @@
 /**
  * @file MoEOverlayMPIResidencyProposalPublisher.cpp
  * @brief Private non-blocking MPI transport for canonical residency proposals.
+ *
+ * A persistent receive admits the maximum control payload before serving. MPI
+ * carries only the frozen sample's used bytes, preserving its real transaction
+ * boundaries without an extra size handshake or inference-side synchronization.
+ * Decoding transfers evidence into its own immutable physical-memory lease;
+ * rearming this mailbox cannot invalidate a retained proposal.
  */
 
 #include "MoEOverlayMPIResidencyProposalPublisher.h"
@@ -9,6 +15,7 @@
 
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "interfaces/IMPIContext.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -82,11 +89,20 @@ namespace llaminar2
 
         const std::size_t wire_bytes =
             moeOverlayDistributedResidencyProposalWireBytes(
-                config_.num_layers, config_.num_experts);
+                config_.num_layers, config_.num_experts,
+                config_.transaction_demand ? &config_.transaction_demand->capacity : nullptr);
         if (wire_bytes > static_cast<std::size_t>(INT_MAX))
         {
             throw std::overflow_error(
                 "ExpertOverlay proposal packet exceeds the MPI count ABI");
+        }
+        if (config_.transaction_demand)
+        {
+            if (!config_.transaction_demand->memory)
+                throw std::invalid_argument("ExpertOverlay transaction mailbox requires physical admission");
+            wire_claim_ = std::make_unique<PhysicalMemoryAllocationLease>(
+                config_.transaction_demand->memory->claimNewAllocation(
+                    DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace, wire_bytes));
         }
         wire_buffer_.resize(wire_bytes);
         send_requests_.resize(
@@ -253,8 +269,8 @@ namespace llaminar2
         if (isCoordinator() ||
             state_ !=
                 MoEOverlayMPIResidencyProposalPublisherState::AwaitingValidation ||
-            awaiting_validation_generation_ == 0u ||
-            histogram_generation != awaiting_validation_generation_ ||
+            !active_generation_ ||
+            histogram_generation != *active_generation_ ||
             acknowledgement_send_request_ != MPI_REQUEST_NULL)
         {
             ++stats_.validation_failures;
@@ -264,9 +280,8 @@ namespace llaminar2
             return false;
         }
 
-        acknowledgement_send_generation_ = histogram_generation;
         const int acknowledgement_result = MPI_Isend(
-            &acknowledgement_send_generation_,
+            &*active_generation_,
             1,
             MPI_UINT64_T,
             config_.coordinator_world_rank,
@@ -286,7 +301,6 @@ namespace llaminar2
             return false;
         }
 
-        awaiting_validation_generation_ = 0u;
         operation_started_at_ = std::chrono::steady_clock::now();
         state_ = MoEOverlayMPIResidencyProposalPublisherState::Acknowledging;
         ++stats_.acknowledgements_started;
@@ -303,7 +317,8 @@ namespace llaminar2
         std::ostringstream fatal;
         fatal << "Peer rejected authoritative proposal after semantic adoption"
               << " generation=" << histogram_generation
-              << " expected_generation=" << awaiting_validation_generation_
+              << " expected_generation="
+              << (active_generation_ ? std::to_string(*active_generation_) : "none")
               << " state=" << static_cast<int>(state_)
               << " reason="
               << (diagnostic.empty() ? "unspecified" : diagnostic);
@@ -337,16 +352,25 @@ namespace llaminar2
         }
         if (!proposal.valid() ||
             proposal.plan.num_layers != config_.num_layers ||
-            proposal.plan.num_experts != config_.num_experts)
+            proposal.plan.num_experts != config_.num_experts ||
+            static_cast<bool>(proposal.plan.histogram_window->transaction_demand) !=
+                config_.transaction_demand.has_value())
         {
             ++stats_.validation_failures;
             setError(
                 error,
-                "ExpertOverlay coordinator proposal does not match model geometry");
+                "ExpertOverlay coordinator proposal does not match model geometry or transaction evidence admission");
+            return false;
+        }
+        const auto packet_bytes = moeOverlayDistributedResidencyProposalWireBytes(proposal);
+        if (packet_bytes > wire_buffer_.size())
+        {
+            ++stats_.validation_failures;
+            setError(error, "ExpertOverlay proposal exceeds admitted mailbox capacity");
             return false;
         }
         if (!encodeMoEOverlayDistributedResidencyProposal(
-                proposal, wire_buffer_, error))
+                proposal, std::span(wire_buffer_).first(packet_bytes), error))
         {
             ++stats_.validation_failures;
             return false;
@@ -360,7 +384,7 @@ namespace llaminar2
             acknowledgement_receive_generations_.begin(),
             acknowledgement_receive_generations_.end(),
             0u);
-        publishing_generation_ =
+        active_generation_ =
             proposal.plan.histogram_window->generation;
         for (int rank = 0; rank < config_.mpi_context->world_size(); ++rank)
         {
@@ -395,7 +419,7 @@ namespace llaminar2
             }
             mpi_result = MPI_Isend(
                 wire_buffer_.data(),
-                static_cast<int>(wire_buffer_.size()),
+                static_cast<int>(packet_bytes),
                 MPI_BYTE,
                 rank,
                 kProposalPublicationTag,
@@ -417,7 +441,7 @@ namespace llaminar2
         state_ = MoEOverlayMPIResidencyProposalPublisherState::Publishing;
         ++stats_.publications_started;
         stats_.bytes_sent +=
-            static_cast<std::uint64_t>(wire_buffer_.size()) *
+            static_cast<std::uint64_t>(packet_bytes) *
             static_cast<std::uint64_t>(
                 config_.mpi_context->world_size() - 1);
         recordCounter("proposal_publications_started");
@@ -455,10 +479,11 @@ namespace llaminar2
 
         int complete = 0;
         int mpi_result = MPI_SUCCESS;
+        MPI_Status receive_status{};
         if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Receiving)
         {
             mpi_result = MPI_Test(
-                &receive_request_, &complete, MPI_STATUS_IGNORE);
+                &receive_request_, &complete, &receive_status);
         }
         else if (
             state_ ==
@@ -472,7 +497,7 @@ namespace llaminar2
         else
         {
             int sends_complete = 0;
-            int acknowledgements_complete = 0;
+            int acknowledgements_complete = 1;
             mpi_result = MPI_Testall(
                 static_cast<int>(send_requests_.size()),
                 send_requests_.data(),
@@ -480,12 +505,33 @@ namespace llaminar2
                 MPI_STATUSES_IGNORE);
             if (mpi_result == MPI_SUCCESS)
             {
-                mpi_result = MPI_Testall(
-                    static_cast<int>(
-                        acknowledgement_receive_requests_.size()),
-                    acknowledgement_receive_requests_.data(),
-                    &acknowledgements_complete,
-                    MPI_STATUSES_IGNORE);
+                // Validate each receipt exactly when MPI retires its request.
+                // A zero-length message must not masquerade as generation zero;
+                // null requests on subsequent polls already passed this check.
+                for (auto &request : acknowledgement_receive_requests_)
+                {
+                    if (request == MPI_REQUEST_NULL) continue;
+                    MPI_Status status{};
+                    int acknowledged = 0;
+                    mpi_result = MPI_Test(&request, &acknowledged, &status);
+                    if (mpi_result != MPI_SUCCESS) break;
+                    if (!acknowledged)
+                    {
+                        acknowledgements_complete = 0;
+                        continue;
+                    }
+                    int count = 0;
+                    mpi_result = MPI_Get_count(&status, MPI_UINT64_T, &count);
+                    if (mpi_result != MPI_SUCCESS) break;
+                    if (count != 1)
+                    {
+                        ++stats_.validation_failures;
+                        const std::string message = "ExpertOverlay proposal acknowledgement has invalid generation extent";
+                        fail(message, error);
+                        abortMoEOverlayMPI(private_communicator_, config_.mpi_context->rank(),
+                                           "proposal_acknowledgement_extent", message);
+                    }
+                }
             }
             complete = sends_complete && acknowledgements_complete;
         }
@@ -537,6 +583,8 @@ namespace llaminar2
 
         if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Publishing)
         {
+            if (!active_generation_)
+                return fail("ExpertOverlay publication completed without its generation identity", error);
             for (int rank = 0;
                  rank < config_.mpi_context->world_size();
                  ++rank)
@@ -545,14 +593,14 @@ namespace llaminar2
                     continue;
                 if (acknowledgement_receive_generations_[
                         static_cast<std::size_t>(rank)] !=
-                    publishing_generation_)
+                    *active_generation_)
                 {
                     ++stats_.validation_failures;
                     std::ostringstream diagnostic;
                     diagnostic
                         << "Proposal peer acknowledged the wrong generation"
                         << " peer_rank=" << rank
-                        << " expected_generation=" << publishing_generation_
+                        << " expected_generation=" << *active_generation_
                         << " received_generation="
                         << acknowledgement_receive_generations_[
                                static_cast<std::size_t>(rank)];
@@ -566,6 +614,7 @@ namespace llaminar2
                 ++stats_.acknowledgements_received;
             }
             state_ = MoEOverlayMPIResidencyProposalPublisherState::Idle;
+            active_generation_.reset();
             ++stats_.publications_completed;
             recordCounter("proposal_publications_completed");
             recordCounter(
@@ -579,7 +628,7 @@ namespace llaminar2
 
         if (state_ == MoEOverlayMPIResidencyProposalPublisherState::Acknowledging)
         {
-            if (acknowledgement_send_generation_ == 0u)
+            if (!active_generation_)
             {
                 ++stats_.validation_failures;
                 return fail(
@@ -589,21 +638,37 @@ namespace llaminar2
             state_ = MoEOverlayMPIResidencyProposalPublisherState::Idle;
             ++stats_.acknowledgements_completed;
             recordCounter("proposal_acknowledgements_completed");
-            acknowledgement_send_generation_ = 0u;
+            active_generation_.reset();
             if (error)
                 error->clear();
             return MoEOverlayResidencyWaveProgress::Ready;
         }
 
+        // Only the completed receive owns a meaningful status. Its byte count
+        // selects the compact packet; unused capacity may contain an older epoch.
+        int received_bytes = 0;
+        const int count_result = MPI_Get_count(&receive_status, MPI_BYTE, &received_bytes);
+        if (count_result != MPI_SUCCESS || received_bytes <= 0 ||
+            static_cast<std::size_t>(received_bytes) > wire_buffer_.size())
+        {
+            ++stats_.mpi_failures;
+            const auto message = count_result == MPI_SUCCESS
+                ? std::string("ExpertOverlay proposal receive has invalid compact extent")
+                : mpiError("MPI_Get_count proposal", count_result);
+            fail(message, error);
+            abortMoEOverlayMPI(private_communicator_, config_.mpi_context->rank(),
+                               "proposal_receive_extent", message);
+        }
         auto proposal =
             std::make_shared<MoEOverlayDistributedResidencyProposal>();
         std::string decode_error;
         if (!decodeMoEOverlayDistributedResidencyProposal(
-                wire_buffer_,
+                std::span(wire_buffer_).first(static_cast<std::size_t>(received_bytes)),
                 config_.num_layers,
                 config_.num_experts,
                 proposal.get(),
-                &decode_error))
+                &decode_error,
+                config_.transaction_demand ? &*config_.transaction_demand : nullptr))
         {
             ++stats_.validation_failures;
             fail(decode_error, error);
@@ -614,12 +679,12 @@ namespace llaminar2
                 decode_error);
         }
 
-        awaiting_validation_generation_ =
+        active_generation_ =
             proposal->plan.histogram_window->generation;
         state_ =
             MoEOverlayMPIResidencyProposalPublisherState::AwaitingValidation;
         ++stats_.windows_received;
-        stats_.bytes_received += wire_buffer_.size();
+        stats_.bytes_received += static_cast<std::uint64_t>(received_bytes);
         recordCounter("proposals_received");
         if (received_proposal)
             *received_proposal = std::move(proposal);
@@ -683,8 +748,7 @@ namespace llaminar2
                     "Failed to drain ExpertOverlay proposal readiness receive during runner shutdown");
             }
         }
-        awaiting_validation_generation_ = 0u;
-        acknowledgement_send_generation_ = 0u;
+        active_generation_.reset();
         state_ = MoEOverlayMPIResidencyProposalPublisherState::Stopped;
     }
 } // namespace llaminar2

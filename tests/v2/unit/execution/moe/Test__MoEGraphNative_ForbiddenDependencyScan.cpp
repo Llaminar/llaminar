@@ -2192,22 +2192,18 @@ namespace llaminar2::test
                   std::string::npos);
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, SparseReturnReduceDeclaresCombinedOutputCoherence)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, SparseReturnReduceDeclaresDestinationCoherence)
     {
         const fs::path root = findRepoRoot();
         const fs::path header_path = root / "src/v2/execution/compute_stages/stages/MoESparseReturnReduceStage.h";
         const fs::path impl_path = root / "src/v2/execution/compute_stages/stages/MoESparseReturnReduceStage.cpp";
-        const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
         ASSERT_TRUE(fs::exists(header_path)) << header_path;
         ASSERT_TRUE(fs::exists(impl_path)) << impl_path;
-        ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
 
         const std::string header_contents = readFile(header_path);
         const std::string impl_contents = readFile(impl_path);
-        const std::string graph_contents = readFile(graph_path);
         ASSERT_FALSE(header_contents.empty()) << header_path;
         ASSERT_FALSE(impl_contents.empty()) << impl_path;
-        ASSERT_FALSE(graph_contents.empty()) << graph_path;
 
         EXPECT_NE(header_contents.find("std::optional<BufferId> dense_output_buffer_id;"),
                   std::string::npos);
@@ -2219,10 +2215,9 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(impl_contents.find("contract.addInOut(*params_.dense_output_buffer_id);"),
                   std::string::npos);
-        EXPECT_TRUE(std::regex_search(
-            graph_contents,
-            std::regex(
-                R"(return_params\.dense_output_buffer_id\s*=\s*buffers\.idFor\(\s*BufferId::MOE_COMBINED_OUTPUT\s*\);)")));
+        // Concrete graph tests verify the actual pointer/BufferId pairing:
+        // canonical host returns write the route bank, not the final output.
+        // This source rule protects the infrastructure's output/inout protocol.
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, LocalExpertCapturesExactPinnedTransfersOnParticipantStream)
@@ -2349,7 +2344,7 @@ namespace llaminar2::test
             "compact_result = static_cast<const float *>(\n                family->pinned_transfer->data(",
             output_materialization);
         const size_t aggregation_complete = execute_body.find(
-            "output.live_row_count = output_input_rows_.size()",
+            "output.live_row_count = canonical_packet ? active_routes_.size() : output_input_rows_.size()",
             pinned_output_read);
         const size_t elapsed_service = execute_body.find(
             "service_completed_at - service_start",
@@ -2634,7 +2629,7 @@ namespace llaminar2::test
         EXPECT_LT(chunk_terminal, chunk_release);
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MTPSidecarMoERuntimeTableIsSeparateFromMainHistogram)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MTPSidecarTablesAreSeparateAndHostWorkIsExplicit)
     {
         const fs::path root = findRepoRoot();
         const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
@@ -2665,18 +2660,36 @@ namespace llaminar2::test
         const size_t histogram_binding =
             ffn_body.find("route_params.decode_histogram =");
         ASSERT_NE(histogram_binding, std::string::npos);
+        const size_t histogram_binding_end = ffn_body.find(';', histogram_binding);
+        ASSERT_NE(histogram_binding_end, std::string::npos);
         const std::string histogram_binding_body =
-            ffn_body.substr(histogram_binding, 220);
-        EXPECT_NE(histogram_binding_body.find("mtp_sidecar_context ||"),
+            ffn_body.substr(histogram_binding, histogram_binding_end - histogram_binding);
+        // Host work includes executed CPU sidecar rows. Native GPU state must
+        // still never mutate that host histogram from captured execution.
+        EXPECT_NE(histogram_binding_body.find("!device.is_cpu()"),
                   std::string::npos);
         EXPECT_NE(
             histogram_binding_body.find(
                 "device_side_graph_rebalance_candidate"),
             std::string::npos)
-            << "MTP sidecars and the captured device authority must both keep "
-               "host histogram mutation outside graph execution.";
+            << "The captured device authority must keep host histogram mutation "
+               "outside GPU graph execution.";
+        EXPECT_NE(histogram_binding_body.find("MoERebalanceRuntimeMode::Off"),
+                  std::string::npos);
         EXPECT_NE(histogram_binding_body.find("? nullptr"),
                   std::string::npos);
+        EXPECT_NE(ffn_body.find("route_params.host_routing_source = routed_histogram_source"),
+                  std::string::npos);
+
+        const auto orchestrator = readFile(root /
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(orchestrator.empty());
+        EXPECT_EQ(orchestrator.find("HostGroupedVerifierHistogramCommit"), std::string::npos)
+            << "Accepted-state publication must not rediscover or republish executed routing work";
+        const auto publishers = readFile(root /
+            "src/v2/execution/moe/IMoEGroupedVerifierHistogramPublisher.h");
+        ASSERT_FALSE(publishers.empty());
+        EXPECT_EQ(publishers.find("IMoEHostGroupedVerifierHistogramPublisher"), std::string::npos);
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -5206,13 +5219,13 @@ namespace llaminar2::test
         ASSERT_NE(embedded_cadence_append, std::string::npos);
         EXPECT_NE(
             dgo.find(
-                "ForwardExecutionRole::MainInference",
+                "ownsSerialDecodeCommitBoundary",
                 embedded_cadence_append),
             std::string::npos)
-            << "Only the ordinary main decode graph may acquire serial cadence ownership";
+            << "The typed commit contract must distinguish serial commits from speculative conditions";
         EXPECT_NE(
             dgo.find(
-                "ForwardExecutionPhase::Decode",
+                "input.state_transaction",
                 embedded_cadence_append),
             std::string::npos);
         EXPECT_NE(
@@ -8495,12 +8508,13 @@ namespace llaminar2::test
             << "The typed capacity must cross the helper, production create, prefill, and decode boundaries intact";
 
         EXPECT_NE(
-            abi.find("kVersion = 12u"),
+            abi.find("kVersion = 14u"),
             std::string::npos);
         EXPECT_NE(
-            abi.find("kPlanEntryBytes = 52u"),
+            abi.find("kPlanEntryBytes = 64u"),
             std::string::npos)
-            << "The ABI version bump must pin the expanded cross-domain route identity record.";
+            << "The ABI must retain sealed demand with the cross-domain route identity.";
+        EXPECT_NE(abi.find("kCommandHeaderBytes = 128u"), std::string::npos);
         EXPECT_NE(
             abi.find("kConfigBytes = 140u"),
             std::string::npos);
@@ -10212,13 +10226,21 @@ namespace llaminar2::test
             << "MoE prefix fingerprinting must separate portable placement keys "
                "from explicit invalidate-on-rebalance keys.";
 
-        const size_t movement = body.find("\"runtime_movement_epoch\"");
-        ASSERT_NE(movement, std::string::npos);
-        const size_t movement_guard = body.rfind("if (invalidate_on_rebalance)", movement);
-        ASSERT_NE(movement_guard, std::string::npos)
-            << "Runtime movement epochs should key prefix entries only for "
-               "--prefix-cache-moe-policy invalidate-on-rebalance.";
-        EXPECT_GT(movement_guard, policy);
+        // Key/epoch binding is owned by the fingerprint builder, not by a
+        // second stringly field authored in the orchestrator. Functional
+        // epoch/policy and publication-interleaving tests exercise this API.
+        EXPECT_EQ(body.find("\"runtime_movement_epoch\""), std::string::npos);
+        EXPECT_EQ(countOccurrences(body, "const uint64_t placement_epoch = moeRuntimeMovementEpoch();"), 1u);
+        const std::string fingerprint_source = readFile(
+            root / "src/v2/execution/prefix_cache/PrefixCacheFingerprint.cpp");
+        const size_t movement_guard = fingerprint_source.find(
+            "if (model_is_moe && moe_policy == PrefixCacheMoEPolicy::InvalidateOnRebalance)");
+        ASSERT_NE(movement_guard, std::string::npos);
+        EXPECT_NE(fingerprint_source.find(
+            "{\"runtime_movement_epoch\", std::to_string(placement_epoch)}",
+            movement_guard), std::string::npos)
+            << "Only invalidate-on-rebalance incorporates the single epoch "
+               "argument into the cache key.";
 
         const size_t total_rebalances = body.find("\"controller.total_rebalances\"");
         ASSERT_NE(total_rebalances, std::string::npos);
@@ -11117,12 +11139,14 @@ namespace llaminar2::test
         const size_t destroy = shutdown.find(
             "moe_overlay_device_controller_graph_service_.reset()");
         ASSERT_NE(drain, std::string::npos);
-        EXPECT_NE(
-            shutdown.find(
-                "MoEOverlayDeviceControllerDrainIntent::",
-                drain),
-            std::string::npos)
-            << "Terminal drain must retain its typed release/restore intent";
+        // Executable Unit/MPI tests own policy semantics. This wiring guard
+        // ensures the runner uses that authority-aware resolver instead of
+        // recreating an unconditional Dynamic => restore ternary here.
+        const size_t disposition = shutdown.find("modelContextOverlayDrainIntent(");
+        ASSERT_NE(disposition, std::string::npos);
+        EXPECT_LT(disposition, drain);
+        EXPECT_NE(shutdown.find("device_drain_intent", drain), std::string::npos)
+            << "Terminal drain must consume the model-retention policy result";
         ASSERT_NE(retain, std::string::npos);
         ASSERT_NE(destroy, std::string::npos);
         EXPECT_LT(drain, retain);

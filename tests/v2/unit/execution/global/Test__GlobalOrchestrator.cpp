@@ -593,6 +593,42 @@ namespace llaminar2::test
     // Construction Tests
     // =========================================================================
 
+    /** Global TP at the tail elects its topology leader, not the final MPI rank. */
+    TEST_F(Test__GlobalOrchestrator, RequestAuthorityIsTheVocabularyDomainLeader)
+    {
+        for (int rank = 0; rank != 4; ++rank)
+        {
+            MockMPIContext mpi(rank, 4);
+            auto topology = buildTwoStageTwoWayTPTopo();
+            auto runner = std::make_unique<MockDeviceRunner>();
+            GlobalOrchestrator orch(makeConfig(
+                std::move(topology), rank, 4, &mpi, std::move(runner)));
+            EXPECT_EQ(orch.requestAuthorityRank(), 2);
+            SamplingParams params;
+            params.temperature = 0.0f;
+            EXPECT_TRUE(orch.requiresMPICoordinatedDecodeSampling(params));
+            params.temperature = 0.7f;
+            EXPECT_FALSE(orch.requiresMPICoordinatedDecodeSampling(params));
+        }
+    }
+
+    /** Missing or duplicated terminal ownership must not select an arbitrary rank. */
+    TEST_F(Test__GlobalOrchestrator, RequestAuthorityRequiresExactlyOneVocabularyStage)
+    {
+        MockMPIContext mpi(0, 2);
+        for (const bool duplicate : {false, true})
+        {
+            auto topology = buildTwoStagePPTopo();
+            topology.stages[0].has_lm_head = duplicate;
+            topology.stages[1].has_lm_head = duplicate;
+            auto config = makeConfig(std::move(topology), 0, 2, &mpi,
+                                     std::make_unique<MockDeviceRunner>());
+            EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
+        }
+        MockDeviceRunner local;
+        EXPECT_FALSE(local.requestAuthorityRank().has_value());
+    }
+
     TEST_F(Test__GlobalOrchestrator, ConstructsSingleRankSingleStage)
     {
         MockMPIContext mpi(0, 1);

@@ -113,6 +113,9 @@ namespace llaminar2::cpu::fa2_policy
         BF16,
         Q16_1,
         Q8_1,
+        AQ8_Q8_1,
+        AQ8_TQ4,
+        AQ8_TQ8,
         TQ4_TQ4,
         TQ4_TQ8,
         TQ8_TQ4,
@@ -223,6 +226,9 @@ namespace llaminar2::cpu::fa2_policy
             return "q16_1";
         case CPUFA2KVStoragePair::Q8_1:
             return "q8_1";
+        case CPUFA2KVStoragePair::AQ8_Q8_1: return "aq8_q8_1";
+        case CPUFA2KVStoragePair::AQ8_TQ4: return "aq8_tq4";
+        case CPUFA2KVStoragePair::AQ8_TQ8: return "aq8_tq8";
         case CPUFA2KVStoragePair::TQ4_TQ4:
             return "tq4_tq4";
         case CPUFA2KVStoragePair::TQ4_TQ8:

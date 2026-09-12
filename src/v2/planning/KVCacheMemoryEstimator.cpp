@@ -206,27 +206,6 @@ namespace llaminar2
                 "linear GPU cache bytes");
         }
 
-        [[nodiscard]] std::size_t estimateCPUQ8(
-            std::size_t entry_count,
-            std::size_t max_seq_len,
-            std::size_t kv_dim)
-        {
-            const std::size_t blocks_per_row = ceilDivide(
-                kv_dim,
-                Q8_1Block::BLOCK_SIZE);
-            const std::size_t one_tensor = checkedMultiply(
-                checkedMultiply(
-                    max_seq_len,
-                    blocks_per_row,
-                    "Q8_1 blocks"),
-                sizeof(Q8_1Block),
-                "Q8_1 tensor bytes");
-            return checkedMultiply(
-                checkedMultiply(entry_count, 2, "Q8_1 tensor count"),
-                one_tensor,
-                "Q8_1 cache bytes");
-        }
-
         [[nodiscard]] std::size_t estimateCPUQ16(
             std::size_t entry_count,
             std::size_t max_seq_len,
@@ -256,38 +235,14 @@ namespace llaminar2
                 "Q16_1 cache bytes");
         }
 
-        [[nodiscard]] std::size_t estimateCPUTurboQuant(
-            std::size_t entry_count,
-            std::size_t max_seq_len,
-            std::size_t local_kv_heads,
-            int head_dim,
-            KVStorageFormat format)
-        {
-            const std::size_t k_block = tq8BlockBytes(head_dim);
-            const std::size_t v_block =
-                format == KVStorageFormat::TQ4
-                    ? tq4BlockBytes(head_dim)
-                    : tq8BlockBytes(head_dim);
-            const std::size_t position_bytes = checkedMultiply(
-                local_kv_heads,
-                checkedAdd(k_block, v_block, "TurboQuant K/V block bytes"),
-                "TurboQuant position bytes");
-            return checkedMultiply(
-                checkedMultiply(
-                    entry_count,
-                    max_seq_len,
-                    "TurboQuant position count"),
-                position_bytes,
-                "CPU TurboQuant cache bytes");
-        }
-
-        [[nodiscard]] std::size_t estimateGpuCompressed(
+        [[nodiscard]] std::size_t estimateCompressed(
             std::size_t layer_count,
             std::size_t batch_size,
             std::size_t max_seq_len,
             std::size_t local_kv_heads,
             int head_dim,
-            KVStorageFormat format)
+            KVStorageFormat format,
+            DeviceId device)
         {
             requireTurboQuantHeadDimension(head_dim);
             const std::size_t entry_count = checkedMultiply(
@@ -338,6 +293,9 @@ namespace llaminar2
                     "compressed anchor head bytes"),
                 "compressed anchor bytes");
             total = checkedAdd(total, anchor_bytes, "compressed payload plus anchors");
+            // CPU and GPU share the exact physical K/V codec BOM. Only GPU
+            // caches additionally own device metadata and rotation replicas.
+            if (device.is_cpu()) return total;
             total = checkedAdd(
                 total,
                 gpuMetadataBytes(entry_count, 3),
@@ -393,6 +351,7 @@ namespace llaminar2
 
     GPULogicalKVBlockEstimate
     KVCacheMemoryEstimator::estimateGPULogicalBlock(
+        KVCacheFamily family,
         int token_count,
         int n_kv_heads,
         int head_dim,
@@ -411,6 +370,9 @@ namespace llaminar2
         }
 
         const KVStorageFormat format = parseFormat(kv_precision);
+        if (family == KVCacheFamily::Hybrid &&
+            (format == KVStorageFormat::TQ4 || format == KVStorageFormat::TQ8))
+            throw std::invalid_argument("Hybrid GPU KV caches do not implement TurboQuant storage");
         const std::size_t tokens = static_cast<std::size_t>(token_count);
         const std::size_t heads = static_cast<std::size_t>(n_kv_heads);
         const std::size_t dimensions = static_cast<std::size_t>(head_dim);
@@ -440,6 +402,17 @@ namespace llaminar2
         case KVStorageFormat::TQ4:
         case KVStorageFormat::TQ8:
         {
+            if (family == KVCacheFamily::Hybrid)
+            {
+                // Hybrid GPU caches serialize their native linear Q8_1 rows;
+                // unlike attention-only caches they have no AQ8 request anchor.
+                const std::size_t row_bytes = checkedMultiply(
+                    ceilDivide(kv_dim, Q8_1Block::BLOCK_SIZE),
+                    sizeof(Q8_1Block), "hybrid Q8_1 row bytes");
+                result.k_bytes = result.v_bytes = checkedMultiply(
+                    tokens, row_bytes, "hybrid Q8_1 logical payload");
+                break;
+            }
             const std::size_t key_position_bytes = checkedMultiply(
                 heads,
                 aq8KeyBlockBytes(head_dim),
@@ -492,6 +465,7 @@ namespace llaminar2
     }
 
     std::size_t KVCacheMemoryEstimator::estimate(
+        KVCacheFamily family,
         int n_layers,
         int batch_size,
         int max_seq_len,
@@ -507,6 +481,9 @@ namespace llaminar2
         }
         requireSupportedDevice(device);
         const KVStorageFormat format = parseFormat(kv_precision);
+        if (family == KVCacheFamily::Hybrid &&
+            (format == KVStorageFormat::TQ4 || format == KVStorageFormat::TQ8))
+            throw std::invalid_argument("Hybrid KV caches do not implement TurboQuant storage");
         const std::size_t layers = static_cast<std::size_t>(n_layers);
         const std::size_t batches = static_cast<std::size_t>(batch_size);
         const std::size_t sequence = static_cast<std::size_t>(max_seq_len);
@@ -530,15 +507,15 @@ namespace llaminar2
             return estimateLinearCache(
                 entry_count, sequence, kv_dim, sizeof(std::uint16_t), device);
         case KVStorageFormat::Q8_1:
-            return device.is_cpu()
-                       ? estimateCPUQ8(entry_count, sequence, kv_dim)
-                       : estimateGpuCompressed(
-                             layers,
-                             batches,
-                             sequence,
-                             heads,
-                             head_dim,
-                             format);
+            if (family == KVCacheFamily::Hybrid && device.is_gpu())
+            {
+                // Charge the concrete linear-cache owner: CUDA retains its
+                // linearization horizons; ROCm borrows them from workspace.
+                return estimateLinearCache(entry_count, sequence,
+                    ceilDivide(kv_dim, Q8_1Block::BLOCK_SIZE),
+                    sizeof(Q8_1Block), device);
+            }
+            return estimateCompressed(layers, batches, sequence, heads, head_dim, format, device);
         case KVStorageFormat::Q16_1:
             if (!device.is_cpu())
             {
@@ -549,20 +526,7 @@ namespace llaminar2
                 entry_count, sequence, heads, head_dim);
         case KVStorageFormat::TQ4:
         case KVStorageFormat::TQ8:
-            return device.is_cpu()
-                       ? estimateCPUTurboQuant(
-                             entry_count,
-                             sequence,
-                             heads,
-                             head_dim,
-                             format)
-                       : estimateGpuCompressed(
-                             layers,
-                             batches,
-                             sequence,
-                             heads,
-                             head_dim,
-                             format);
+            return estimateCompressed(layers, batches, sequence, heads, head_dim, format, device);
         }
         throw std::logic_error("Unreachable KV-cache storage format");
     }

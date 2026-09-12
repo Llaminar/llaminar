@@ -27,14 +27,22 @@ namespace llaminar2::test
     class KVCacheTestWorkspaceBinding
     {
     public:
+        /**
+         * @brief Bind the consumer's complete declared workspace before capture.
+         * @param consumer Cache or associated attention consumer, borrowed.
+         * @param device Device owning the workspace allocation.
+         * @param query_rows Immutable attention geometry; caches ignore this hint.
+         * @throws std::runtime_error If allocation or binding is incomplete.
+         */
         KVCacheTestWorkspaceBinding(
             IWorkspaceConsumer &consumer,
-            DeviceId device)
+            DeviceId device,
+            int query_rows = 1)
             : consumer_(&consumer)
         {
             const WorkspaceRequirements requirements =
                 consumer.getWorkspaceRequirements(
-                    /*m=*/1,
+                    query_rows,
                     /*n=*/0,
                     /*k=*/0);
             workspace_ = std::make_unique<DeviceWorkspaceManager>(
@@ -53,6 +61,7 @@ namespace llaminar2::test
             }
         }
 
+        /** @brief Unbind borrowed pointers before destroying their storage. */
         ~KVCacheTestWorkspaceBinding()
         {
             if (consumer_)

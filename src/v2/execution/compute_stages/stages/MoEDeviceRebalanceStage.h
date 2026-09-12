@@ -153,6 +153,10 @@ namespace llaminar2
             DeviceMoERebalanceWorkspaceContract::WS_COMMAND_HEADER;
         static constexpr const char *WS_CONTROLLER_STATE =
             DeviceMoERebalanceWorkspaceContract::WS_CONTROLLER_STATE;
+        static constexpr const char *WS_MOVEMENT_WAVES =
+            DeviceMoERebalanceWorkspaceContract::WS_MOVEMENT_WAVES;
+        static constexpr const char *WS_MOVEMENT_EDGES =
+            DeviceMoERebalanceWorkspaceContract::WS_MOVEMENT_EDGES;
         static constexpr const char *WS_PLACEMENT_PLAN_SCRATCH =
             DeviceMoERebalanceWorkspaceContract::WS_PLACEMENT_PLAN_SCRATCH;
         static constexpr const char *WS_LLEP_LAYER_PLANS =
@@ -289,6 +293,11 @@ namespace llaminar2
         size_t traceHistogramLayerCount() const { return histogramLayerCount(); }
         size_t traceLocalHistogramEntries() const { return localHistogramEntries(); }
         size_t traceGatheredHistogramEntries() const { return gatheredHistogramEntries(); }
+        /**
+         * @return Exact prebound journal storage and canonical capacities.
+         * This projects pointer metadata only; it never reads device-owned state.
+         */
+        DeviceMoERebalanceMovementJournalView movementJournalView() const;
         /**
          * @brief Return the completion records owned by this stage phase.
          *

@@ -3796,6 +3796,14 @@ namespace llaminar2
             req.target_ptr = dst_ptr;
         }
 
+        if (src.is_gpu())
+        {
+            // The tensor event is the only authority for the source value.
+            // The transport's exact source stream must acquire it before any
+            // DMA or collective reads the activation (including GPU-to-CPU).
+            requireDeviceInput(tensor, src, requireTransferStream(
+                src, "TransferEngine::transferActivation source admission"));
+        }
         auto result = execute(req);
 
         if (result.success)
@@ -3851,6 +3859,9 @@ namespace llaminar2
         }
         if (bytes == 0)
             return TransferResult::ok(TransferMethod::NOOP);
+        if (bytes > src->size_bytes() || bytes > dst->size_bytes())
+            return TransferResult::fail(TransferMethod::NOOP,
+                                        "activation copy exceeds tensor storage");
 
         // ----------------------------------------------------------------------
         // Host or mapped destination: a plain host-side copy is correct and
@@ -3925,7 +3936,10 @@ namespace llaminar2
                 requireTransferStream(
                     dst_device,
                     "TransferEngine::copyActivation same-device copy");
-            if (!backend->deviceToDevice(
+            // Copy completion is not producer completion. Import the exact
+            // published generation before this separate stream reads it.
+            requireDeviceInput(src, src_device, destination_stream);
+            if (!backend->deviceCopyAsync(
                     dst_ptr,
                     src_ptr,
                     bytes,
@@ -3934,6 +3948,9 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "deviceToDevice failed on " + dst_device.toString());
             result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
+            // Republish the unchanged source after its last read, extending
+            // its storage lifetime through DMA without a host completion wait.
+            publishDeviceWrite(src, src_device, destination_stream);
         }
         else if (same_vendor_diff_gpu)
         {
@@ -3951,11 +3968,18 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "no collective backend supports peer copy " +
                                                 src_device.toString() + " -> " + dst_device.toString());
-            if (!backend->copy(dst_ptr, dst_device, src_ptr, src_device, bytes))
+            void *const source_stream = requireTransferStream(
+                src_device, "TransferEngine::copyActivation peer source");
+            void *const destination_stream = requireTransferStream(
+                dst_device, "TransferEngine::copyActivation peer destination");
+            requireDeviceInput(src, src_device, source_stream);
+            if (!backend->copyOnStreams(dst_ptr, dst_device, src_ptr, src_device,
+                                        bytes, source_stream, destination_stream))
                 return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
                                             "peer copy failed " + src_device.toString() +
                                                 " -> " + dst_device.toString());
             result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
+            publishDeviceWrite(src, src_device, source_stream);
         }
         else
         {
@@ -3976,6 +4000,7 @@ namespace llaminar2
                     requireTransferStream(
                         src_device,
                         "TransferEngine::copyActivation staged D2H");
+                requireDeviceInput(src, src_device, source_stream);
                 if (!src_backend->deviceToHost(
                         src_host,
                         src_dev,
@@ -4027,12 +4052,10 @@ namespace llaminar2
             dst->secondary_device_buffers_.erase(TensorBase::packDeviceId(dst_device));
         }
         /*
-         * copyActivation() currently completes its selected transport before
-         * returning. Publish a fresh backend event after that boundary rather
-         * than erasing completion metadata with a plain coherence transition.
-         * The event gives every later device consumer one uniform dependency
-         * contract regardless of whether the bytes arrived via intra-device,
-         * peer, or deliberately heterogeneous host-staged transport.
+         * Publish on the exact receiving stream. Same-device and same-vendor
+         * copies return after submission, not GPU completion; consumers acquire
+         * this event through their ordinary tensor input contract. Explicit
+         * CPU/cross-vendor host boundaries retain their host-observed transfer.
          */
         publishDeviceWrite(
             dst,
@@ -4131,12 +4154,16 @@ namespace llaminar2
                     req.source.device.toString() + " -> " +
                     req.target_device.toString());
         }
-        if (!backend->copy(
+        if (!backend->copyOnStreams(
                 req.target_ptr,
                 req.target_device,
                 req.source.device_ptr,
                 req.source.device,
-                req.source.size_bytes))
+                req.source.size_bytes,
+                requireTransferStream(req.source.device,
+                    "TransferEngine::executeDeviceToDeviceSameBackend source"),
+                requireTransferStream(req.target_device,
+                    "TransferEngine::executeDeviceToDeviceSameBackend destination")))
         {
             return TransferResult::fail(
                 req.method,

@@ -4,7 +4,9 @@
  *
  * This stage consumes already-addressed sparse rows, filters them through its
  * immutable participant mask, invokes only its prepared expert engines, and
- * aggregates the resulting rows for the explicit return collective. It owns no
+ * publishes the resulting rows for the explicit return collective. Canonical
+ * host returns retain raw expert rows and their original CSR slot identities,
+ * so movement cannot change the final fold's arithmetic order. It owns no
  * route selection or peer coordination, which keeps cross-tier ordering in the
  * graph and makes a participant's work independently observable.  The compact
  * route tensors may be stage-private or supplied by a serial graph-family
@@ -996,6 +998,17 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "MoELocalExpertStage cannot publish one CPU result through two canonical return authorities");
             }
+            if (!isValidMoEOverlayReturnLayout(params_.return_layout) ||
+                (params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes &&
+                 (!params_.device_id.is_cpu() || params_.cpu_canonical_route_return ||
+                  params_.cpu_canonical_route_ticket_return || !params_.output_rows ||
+                  params_.output_rows->row_capacity < entry_capacity ||
+                  !params_.serial_compact_buffer_arena ||
+                  !params_.serial_compact_buffer_arena->cpuCanonicalRoutes())))
+            {
+                throw std::invalid_argument(
+                    "Canonical host expert return requires one CPU raw-route arena and route-capacity output, without a second publication authority");
+            }
             if (params_.cpu_canonical_route_return)
             {
                 const auto &binding = *params_.cpu_canonical_route_return;
@@ -1233,8 +1246,7 @@ namespace llaminar2
         compute_params.routing_indices = compact_routing_indices_.get();
         compute_params.routing_weights = compact_routing_weights_.get();
         compute_params.output = compact_output_.get();
-        if (params_.cpu_canonical_route_return ||
-            params_.cpu_canonical_route_ticket_return)
+        if (preservesCanonicalRouteRows())
         {
             if (!compact_canonical_routes_)
             {
@@ -2470,16 +2482,14 @@ namespace llaminar2
             compact_routing_weights_ = family->routing_weights;
             compact_output_ = family->output;
             compact_canonical_routes_ =
-                (params_.cpu_canonical_route_return ||
-                 params_.cpu_canonical_route_ticket_return)
+                preservesCanonicalRouteRows()
                     ? arena.cpuCanonicalRoutes()
                     : nullptr;
             compact_capacity_ = family->row_capacity;
             compact_routing_top_k_ = arena.routingTopK();
             return compact_hidden_ && compact_routing_indices_ &&
                    compact_routing_weights_ && compact_output_ &&
-                   (!(params_.cpu_canonical_route_return ||
-                      params_.cpu_canonical_route_ticket_return) ||
+                   (!preservesCanonicalRouteRows() ||
                     compact_canonical_routes_);
         }
 
@@ -2582,6 +2592,7 @@ namespace llaminar2
         output.source_participant = input.target_participant;
         output.target_participant = input.source_participant;
         output.live_row_count = 0;
+        output.layout = params_.return_layout;
 
         const bool economy_timing_enabled =
             params_.overlay_participant_residency &&
@@ -2910,6 +2921,7 @@ namespace llaminar2
                 active_routes_.push_back(ActiveRoute{
                     .compact_row = compact_row,
                     .route_offset = local_route_count,
+                    .input_entry = static_cast<size_t>(entry),
                     .expert_id = expert_id,
                     .weight = weight,
                 });
@@ -3372,8 +3384,7 @@ namespace llaminar2
             compute_params.routing_indices = compact_routing_indices_.get();
             compute_params.routing_weights = compact_routing_weights_.get();
             compute_params.output = compact_output_.get();
-            if (params_.cpu_canonical_route_return ||
-                params_.cpu_canonical_route_ticket_return)
+            if (preservesCanonicalRouteRows())
             {
                 /*
                  * The grouped CPU kernel must preserve one raw expert row per
@@ -3645,6 +3656,8 @@ namespace llaminar2
         const bool publishes_canonical_routes =
             params_.cpu_canonical_route_return.has_value() ||
             params_.cpu_canonical_route_ticket_return.has_value();
+        const bool canonical_packet = params_.return_layout ==
+            MoEOverlayReturnLayout::CanonicalExpertRoutes;
         const float *compact_result = nullptr;
         if (usesDeferredCompletion())
         {
@@ -3691,7 +3704,7 @@ namespace llaminar2
         }
         else
         {
-            compact_result = publishes_canonical_routes
+            compact_result = preservesCanonicalRouteRows()
                                  ? compact_canonical_routes_->data()
                                  : compact_output_->data();
         }
@@ -3708,7 +3721,7 @@ namespace llaminar2
             canonical_publication_started{};
         std::chrono::steady_clock::time_point
             canonical_publication_completed{};
-        if (validate_finite_values && !publishes_canonical_routes)
+        if (validate_finite_values && !preservesCanonicalRouteRows())
         {
             for (size_t compact_row = 0;
                  compact_row < output_input_rows_.size();
@@ -3736,7 +3749,29 @@ namespace llaminar2
             }
         }
 
-        if (publishes_canonical_routes)
+        if (canonical_packet)
+        {
+            // Route filtering may remove earlier CSR entries. The retained
+            // input index, not the compact ordinal, names the original slot.
+            if (!input.original_route_slots_host || active_routes_.size() > output.row_capacity)
+                return fail_completed_packet();
+            for (const auto &route : active_routes_)
+                if (route.input_entry >= input.live_entry_count ||
+                    input.original_route_slots_host[route.input_entry] < 0)
+                    return fail_completed_packet();
+            const size_t width = static_cast<size_t>(params_.d_model);
+            for (size_t entry = 0; entry < active_routes_.size(); ++entry)
+            {
+                const auto &route = active_routes_[entry];
+                output.row_ids_host[entry] = input.original_route_slots_host[route.input_entry];
+                const size_t source_slot = route.compact_row *
+                    static_cast<size_t>(compact_execution_top_k_) + route.route_offset;
+                std::copy_n(compact_result + source_slot * width, width,
+                            output.output_rows_fp32 + entry * width);
+            }
+            output.layout = params_.return_layout;
+        }
+        else if (publishes_canonical_routes)
         {
             if (params_.cpu_canonical_route_ticket_return)
             {
@@ -4118,7 +4153,7 @@ namespace llaminar2
                     static_cast<size_t>(params_.d_model) * sizeof(float));
             }
         }
-        if (validate_finite_values && !publishes_canonical_routes)
+        if (validate_finite_values && !preservesCanonicalRouteRows())
         {
             for (size_t output_row = 0;
                  output_row < output_input_rows_.size();
@@ -4142,7 +4177,7 @@ namespace llaminar2
                 }
             }
         }
-        output.live_row_count = output_input_rows_.size();
+        output.live_row_count = canonical_packet ? active_routes_.size() : output_input_rows_.size();
 
         const auto service_completed_at =
             economy_timing_enabled || endpoint_detail_enabled

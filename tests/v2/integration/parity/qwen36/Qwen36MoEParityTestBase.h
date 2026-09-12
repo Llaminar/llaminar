@@ -6112,26 +6112,31 @@ namespace llaminar2::test::parity::qwen36
                << ", symmetric_kl<=" << max_symmetric_kl << ")";
     }
 
+    /**
+     * @brief Require finite native logits identical to the ordinary serial row.
+     * @param actual_logits Grouped verifier's selected vocabulary row.
+     * @param serial_logits Matching M=1 production row.
+     * @param vocab_size Positive full-row width.
+     * @param label Checkpoint identity included in failure diagnostics.
+     * @return Exact-byte success, or actionable finite/geometry/bit failure.
+     */
     inline ::testing::AssertionResult verifierLogitsByteIdentical(
         const float *actual_logits,
         const float *serial_logits,
         int vocab_size,
         const std::string &label)
     {
+        if (!actual_logits || !serial_logits || vocab_size <= 0)
+            return ::testing::AssertionFailure() << label << " missing native verifier row";
         const size_t count = static_cast<size_t>(vocab_size);
-        if (std::memcmp(actual_logits, serial_logits, count * sizeof(float)) == 0)
+        const auto byte_evidence = compareNativeVerifierRow(
+            {actual_logits, count}, {serial_logits, count});
+        if (byte_evidence.passed())
         {
             return ::testing::AssertionSuccess();
         }
 
-        size_t first_mismatch = 0;
-        while (first_mismatch < count &&
-               std::memcmp(actual_logits + first_mismatch,
-                           serial_logits + first_mismatch,
-                           sizeof(float)) == 0)
-        {
-            ++first_mismatch;
-        }
+        const size_t first_mismatch = byte_evidence.first_mismatch;
 
         uint32_t actual_bits = 0;
         uint32_t serial_bits = 0;
@@ -9556,6 +9561,8 @@ namespace llaminar2::test::parity::qwen36
                 PrefixCheckpointCaptureRequest{
                     .sequence_index = 0,
                     .logical_cached_tokens = verifier_base_cached_tokens,
+                    .maximum_main_append_tokens = verifier_row_count + 1,
+                    .maximum_shifted_append_tokens = verifier_row_count,
                 });
         ASSERT_TRUE(verifier_base.valid);
         ASSERT_TRUE(verifier_base.logical_checkpoint)
@@ -12100,6 +12107,8 @@ namespace llaminar2::test::parity::qwen36
                     PrefixCheckpointCaptureRequest{
                         .sequence_index = 0,
                         .logical_cached_tokens = accepted_cached_tokens,
+                        .maximum_main_append_tokens = 0,
+                        .maximum_shifted_append_tokens = 1,
                     });
                 ASSERT_TRUE(resident_sidecar_base.valid)
                     << "resident sidecar oracle could not archive its accepted-state base";

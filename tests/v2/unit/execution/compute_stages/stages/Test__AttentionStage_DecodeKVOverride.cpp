@@ -1,6 +1,6 @@
 /**
  * @file Test__AttentionStage_DecodeKVOverride.cpp
- * @brief Unit tests locking in the decode-mode KV cache override fix
+ * @brief Cache-backed and cacheless attention source ownership regressions.
  *
  * Regression tests for the bug where the forward graph cache reuses a graph
  * built during prefill (cached_tokens=0, K/V wired to activation scratch
@@ -10,7 +10,8 @@
  * override K/V from the KV cache at execute time in decode mode.
  *
  * Bug: short→clear→long→clear→short produces different decode tokens.
- * Fix: Override K/V from cache when effective_kv_len > seq_len.
+ * Cache-backed attention consumes the native cache in every phase, including
+ * cold prefill. Cacheless attention alone consumes explicit projection tensors.
  */
 
 #include <gtest/gtest.h>
@@ -304,7 +305,7 @@ namespace llaminar2
         // =============================================================================
 
         /**
-         * @test Decode mode: K/V overridden from cache even with read_kv_from_cache=false
+         * @test Decode always consumes the bound cache instead of stale projections.
          *
          * Scenario: Graph was built during prefill (cached_tokens=0).
          * params.K/V point to stale activation scratch buffers (all zeros).
@@ -339,7 +340,6 @@ namespace llaminar2
             params.workspace_mask = workspace_mask_.get();
             params.kv_cache = kv_cache_.get();
             params.layer_idx = layer_idx;
-            params.read_kv_from_cache = false; // NOT explicitly set — the fix must still override
             params.position_offset = cached_tokens - 1;
 
             auto stage = ComputeStageFactory::createAttentionCompute(params);
@@ -356,12 +356,12 @@ namespace llaminar2
         }
 
         /**
-         * @test Decode with read_kv_from_cache=true (GPU optimization path)
+         * @test A bound cache explicitly owns decode K/V operands.
          *
-         * Even when the explicit flag is set, the decode override should still work.
-         * This is the standard GPU path.
+         * Explicit projection tensors are not needed when the bound cache
+         * owns every K/V row. This applies equally to CPU and GPU readers.
          */
-        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_ExplicitReadFromCache)
+        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_CacheNeedsNoProjectionTensor)
         {
             const int layer_idx = 0;
             const int cached_tokens = 5;
@@ -370,8 +370,8 @@ namespace llaminar2
 
             AttentionComputeStage::Params params;
             params.Q = Q_.get();
-            params.K = stale_K_.get();
-            params.V = stale_V_.get();
+            params.K = nullptr;
+            params.V = nullptr;
             params.output = output_.get();
             params.batch_size = 1;
             params.seq_len = 1;
@@ -386,7 +386,6 @@ namespace llaminar2
             params.workspace_mask = workspace_mask_.get();
             params.kv_cache = kv_cache_.get();
             params.layer_idx = layer_idx;
-            params.read_kv_from_cache = true; // Explicit flag (GPU path)
             params.position_offset = cached_tokens - 1;
 
             auto stage = ComputeStageFactory::createAttentionCompute(params);
@@ -395,16 +394,17 @@ namespace llaminar2
             bool success = stage->execute(nullptr);
             ASSERT_TRUE(success);
             EXPECT_GT(outputAbsSum(), 0.0f)
-                << "Explicit read_kv_from_cache should use cache K/V";
+                << "The bound cache should own attention K/V";
         }
 
         /**
-         * @test Prefill mode: K/V are NOT overridden (effective_kv_len == seq_len)
+         * @test Cacheless prefill uses its explicitly supplied K/V tensors.
          *
-         * During prefill, the wired K/V are correct (they're the fresh projections
-         * for all tokens in the prompt). The override should NOT trigger.
+         * A cacheless stage has no append dependency and therefore uses its
+         * explicit operands. Cache-backed prefill has a separate native-source
+         * regression and cannot silently select this contract by query length.
          */
-        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_PrefillUsesWiredKV)
+        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_CachelessPrefillUsesWiredKV)
         {
             const int layer_idx = 0;
             const int seq_len = 4;
@@ -436,7 +436,7 @@ namespace llaminar2
             params.V = V_wired.get();
             params.output = output_prefill.get();
             params.batch_size = 1;
-            params.seq_len = seq_len; // Prefill: seq_len == kv_len
+            params.seq_len = seq_len; // Cacheless prefill: seq_len == kv_len
             params.kv_len = seq_len;
             params.n_heads = kNumHeads;
             params.n_kv_heads = kNumKVHeads;
@@ -446,9 +446,8 @@ namespace llaminar2
             params.workspace_scores = workspace_scores_.get();
             params.workspace_context = workspace_context_.get();
             params.workspace_mask = workspace_mask_.get();
-            params.kv_cache = kv_cache_.get();
+            params.kv_cache = nullptr;
             params.layer_idx = layer_idx;
-            params.read_kv_from_cache = false;
             params.position_offset = 0;
 
             auto stage = ComputeStageFactory::createAttentionCompute(params);
@@ -498,7 +497,6 @@ namespace llaminar2
                 params.workspace_mask = workspace_mask_.get();
                 params.kv_cache = kv_cache_.get();
                 params.layer_idx = layer_idx;
-                params.read_kv_from_cache = false;
                 params.position_offset = cached_tokens - 1;
                 return params;
             };
@@ -553,7 +551,6 @@ namespace llaminar2
                 params.workspace_mask = workspace_mask_.get();
                 params.kv_cache = kv_cache_.get();
                 params.layer_idx = layer_idx;
-                params.read_kv_from_cache = false;
                 params.position_offset = cached_tokens - 1;
 
                 auto stage = ComputeStageFactory::createAttentionCompute(params);
@@ -612,7 +609,7 @@ namespace llaminar2
          * When kv_cache is nullptr, the stage must use whatever K/V was wired
          * at graph construction time.
          */
-        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_NoCacheFallsBackToWiredKV)
+        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_CachelessUsesWiredKV)
         {
             // Create non-zero K/V (simulating activation buffers with real data)
             auto K_good = std::make_unique<FP32Tensor>(
@@ -660,9 +657,9 @@ namespace llaminar2
          * @test Cache has tokens but get_k/get_v returns nullptr
          *
          * Safety: if the cache reports tokens but the K/V pointers are bad,
-         * the stage should fall back to using wired K/V gracefully.
+         * the stage must fail instead of selecting unrelated wired K/V.
          */
-        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_CacheReturnsNullFallsBack)
+        TEST_F(Test__AttentionStage_DecodeKVOverride, AttentionCompute_CacheReturnsNullFailsClosed)
         {
             const int layer_idx = 0;
 
@@ -698,18 +695,18 @@ namespace llaminar2
             params.workspace_mask = workspace_mask_.get();
             params.kv_cache = kv_cache_.get();
             params.layer_idx = 99; // Out of range → cache returns nullptr for K/V
-            params.read_kv_from_cache = false;
             params.position_offset = 4;
 
             auto stage = ComputeStageFactory::createAttentionCompute(params);
             ASSERT_NE(stage, nullptr);
 
-            // The stage should handle this gracefully: NULL from cache means
-            // effective_kv_len defaults to seq_len (1), and wired K/V are used.
-            // The out-of-range layer also means get_cached_tokens returns 0,
-            // so effective_kv_len = params.seq_len = 1, which means no override.
+            // Valid-looking projections cannot repair a broken cache binding.
             bool success = stage->execute(nullptr);
-            EXPECT_TRUE(success) << "Stage should handle out-of-range cache layer gracefully";
+            EXPECT_FALSE(success) << "Invalid cache source must fail closed";
+
+            params.layer_idx = -1;
+            auto missing_layer = ComputeStageFactory::createAttentionCompute(params);
+            EXPECT_FALSE(missing_layer->execute(nullptr));
         }
 
     } // namespace

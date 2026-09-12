@@ -285,12 +285,19 @@ namespace llaminar2::test::parity::qwen35
          * The generator loads only the dense sidecar allocation and reuses the
          * authenticated main-model trajectory. The node-wide lease and final
          * NPY validation are owned by ParityTestBase.
+         * @param reference_step Main-model position in the authenticated pack.
+         * @param condition_tokens Inputs consumed by recursive MTP1..N rows.
+         * @param condition_token_override Actual MTP0 input when noncanonical.
+         * @return True after the additive FP32 branch is durably generated.
          */
         bool regeneratePyTorchMTPBranchSnapshots(
             int reference_step,
-            const std::vector<int32_t> &condition_tokens) override
+            const std::vector<int32_t> &condition_tokens,
+            std::optional<int32_t> condition_token_override) override
         {
-            if (reference_step < 0 || condition_tokens.empty() ||
+            if (reference_step < 0 ||
+                (condition_tokens.empty() && !condition_token_override) ||
+                (condition_token_override && *condition_token_override < 0) ||
                 condition_tokens.size() >= 15u ||
                 std::any_of(
                     condition_tokens.begin(),
@@ -311,14 +318,19 @@ namespace llaminar2::test::parity::qwen35
                           << request_path);
                 return false;
             }
-            request << "{\"" << reference_step << "\": [";
+            request << "{\"" << reference_step << "\": {\"condition_token\": ";
+            if (condition_token_override)
+                request << *condition_token_override;
+            else
+                request << "null";
+            request << ", \"draft_tokens\": [";
             for (size_t index = 0; index < condition_tokens.size(); ++index)
             {
                 if (index != 0u)
                     request << ", ";
                 request << condition_tokens[index];
             }
-            request << "]}\n";
+            request << "]}}\n";
             request.flush();
             if (!request.good())
             {

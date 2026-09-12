@@ -12,16 +12,33 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "tensors/Tensors.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+TEST(Test__NativeVnniFormatInfo, DestinationWindowRejectsOutOfRangeCoordinates)
+{
+    VnniPackContext context{};
+    context.N = 3;
+    context.blocks_per_row = 16;
+    context.destination_block_origin = 8;
+    context.destination_block_count = 2;
+    EXPECT_EQ(vnniLinearIdx(context, 2, 8), 2u);
+    EXPECT_EQ(vnniLinearIdx(context, 2, 9), 5u);
+    EXPECT_THROW(vnniLinearIdx(context, 0, 7), std::out_of_range);
+    EXPECT_THROW(vnniLinearIdx(context, 0, 10), std::out_of_range);
+    EXPECT_THROW(vnniLinearIdx(context, 3, 8), std::out_of_range);
+    EXPECT_THROW(vnniLinearIdx(context, -1, 8), std::out_of_range);
+}
 
 namespace
 {
@@ -80,6 +97,155 @@ namespace
         {"Q8_K", 21, 32, false, true, false,
          [] { return TestTensorFactory::createQ8_KRandom({2, 256}); }},
     };
+}
+
+TEST(Test__NativeVnniFormatInfo, AllFormatsWindowedPreparationMatchesWholeSource)
+{
+    for (const auto &format : kExpectations)
+    {
+        SCOPED_TRACE(format.name);
+        auto tensor = format.create();
+        const auto *source = dynamic_cast<const IINT8Unpackable *>(tensor.get());
+        ASSERT_NE(source, nullptr);
+        // Source row one and nonzero K origin catch either coordinate being
+        // accidentally reset while filling bounded streaming scratch.
+        std::array<uint8_t, 8 * 32> full_payload{};
+        std::array<uint16_t, 8> full_scale{}, full_min{};
+        std::array<uint32_t, 8> full_emin{};
+        VnniPackContext full{
+            .raw_bytes = nullptr, .N = 1, .K = 256,
+            .blocks_per_row = 8, .payload_bytes = format.payload_bytes,
+            .payload_array = full_payload.data(),
+            .scales_array = full_scale.data(), .mins_array = full_min.data(),
+            .emins_array = full_emin.data(),
+        };
+        for (int block = 0; block < 8; ++block)
+            source->packVnniBlock(full, 1, 0, block);
+        for (int first : {0, 3, 6})
+        {
+            std::array<uint8_t, 2 * 32> payload{};
+            std::array<uint16_t, 2> scale{}, minimum{};
+            std::array<uint32_t, 2> emin{};
+            auto window = full;
+            window.payload_array = payload.data();
+            window.scales_array = scale.data();
+            window.mins_array = minimum.data();
+            window.emins_array = emin.data();
+            window.destination_block_origin = first;
+            window.destination_block_count = 2;
+            for (int offset = 0; offset < 2; ++offset)
+                source->packVnniBlock(window, 1, 0, first + offset);
+            EXPECT_EQ(std::memcmp(payload.data(),
+                full_payload.data() + first * format.payload_bytes,
+                2 * format.payload_bytes), 0);
+            for (int offset = 0; offset < 2; ++offset)
+            {
+                EXPECT_EQ(scale[offset], full_scale[first + offset]);
+                EXPECT_EQ(minimum[offset], full_min[first + offset]);
+                EXPECT_EQ(emin[offset], full_emin[first + offset]);
+            }
+        }
+    }
+}
+
+TEST(Test__NativeVnniFormatInfo, ExpandedSingleScaleGridsRetainNativeScaleAndIntegers)
+{
+    using namespace cpu::native_vnni;
+    for (const auto &format : kExpectations)
+    {
+        if (!is_payload_decodable(format.codebook_id) ||
+            preparedEncodingForCodebook(format.codebook_id) !=
+                CPUNativeVNNIEncoding::ExpandedInt8)
+            continue;
+        SCOPED_TRACE(format.name);
+        auto tensor = format.create();
+        const auto *source = dynamic_cast<const IINT8Unpackable *>(tensor.get());
+        CPUNativeVNNIPackedWeights cpu;
+        ASSERT_TRUE(packWeightsCPUNativeVNNI(tensor.get(), cpu));
+        for (int row = 0; row < 2; ++row)
+        {
+            for (int block = 0; block < 8; ++block)
+            {
+                std::array<uint8_t, 32> payload{};
+                uint16_t scale = 0, minimum = 0;
+                VnniPackContext native{
+                    .raw_bytes = nullptr, .N = 1, .K = 256,
+                    .blocks_per_row = 8, .payload_bytes = format.payload_bytes,
+                    .payload_array = payload.data(), .scales_array = &scale,
+                    .mins_array = &minimum, .emins_array = nullptr,
+                    .destination_block_origin = block,
+                    .destination_block_count = 1,
+                };
+                source->packVnniBlock(native, row, 0, block);
+                std::array<int8_t, 32> values{};
+                decode_native_block(format.codebook_id, payload.data(), values.data());
+                EXPECT_EQ(cpu.chunkScales(0, block)[row], scale);
+                if (format.is_asymmetric)
+                    EXPECT_EQ(cpu.chunkMins(0, block)[row], minimum);
+                const auto *unit = cpu.interleavedBase() +
+                    block * cpu.interleaved_block_stride;
+                for (int value = 0; value < 32; ++value)
+                    EXPECT_EQ(static_cast<int8_t>(unit[(value / 4) * 256 + row * 4 + value % 4]),
+                              values[value]);
+            }
+        }
+    }
+}
+
+TEST(Test__NativeVnniFormatInfo, CompactMultiScaleRetainsNativePayloadAndEveryMetadataBit)
+{
+    using namespace cpu::native_vnni;
+    size_t covered = 0;
+    for (const auto &format : kExpectations)
+    {
+        if (!hasCompactMultiScaleVnniPayload(format.codebook_id))
+            continue;
+        ++covered;
+        SCOPED_TRACE(format.name);
+        auto tensor = format.create();
+        const auto *source = dynamic_cast<const IINT8Unpackable *>(tensor.get());
+        ASSERT_NE(source, nullptr);
+        CPUNativeVNNIPackedWeights packed;
+        // Source row one makes the destination row origin observably different.
+        ASSERT_TRUE(packWeightsCPUNativeVNNI(tensor.get(), packed, 1, 2));
+        ASSERT_TRUE(packed.usesCompactMultiScale());
+        EXPECT_FALSE(packed.usesInlineCompensation());
+        EXPECT_EQ(packed.data_stride, 1024);
+        EXPECT_EQ(packed.interleaved_block_stride, 1536);
+        EXPECT_EQ(packed.native_interleaved.size(), 8u * 1536u);
+        EXPECT_EQ(packed.preparedFootprint().weight_bytes_per_n_chunk_k_block, 1536u);
+        EXPECT_TRUE(packed.int8_flat.empty());
+        std::array<uint8_t, 8 * 16> payload{};
+        std::array<uint16_t, 8> scales{}, secondary{};
+        std::array<uint32_t, 8> emins{};
+        const VnniPackContext native{
+            .raw_bytes = nullptr, .N = 1, .K = 256, .blocks_per_row = 8,
+            .payload_bytes = format.payload_bytes, .payload_array = payload.data(),
+            .scales_array = scales.data(), .mins_array = secondary.data(),
+            .emins_array = emins.data(),
+        };
+        for (int block = 0; block < 8; ++block)
+            source->packVnniBlock(native, 1, 0, block);
+        for (int block = 0; block < 8; ++block)
+        {
+            EXPECT_EQ(packed.chunkScales(0, block)[0], scales[block]);
+            EXPECT_EQ(packed.chunkMins(0, block)[0], secondary[block]);
+            EXPECT_EQ(packed.chunkEffectiveMins(0, block)[0], emins[block]);
+            const uint8_t *unit = packed.interleavedBase() + block * 1536;
+            for (int column = 0; column < 64; ++column)
+                for (int byte = 0; byte < 16; ++byte)
+                    EXPECT_EQ(unit[(byte / 4) * 256 + column * 4 + byte % 4],
+                        column == 0 && byte < format.payload_bytes
+                            ? payload[block * format.payload_bytes + byte] : 0);
+            for (int column = 1; column < 64; ++column)
+            {
+                EXPECT_EQ(packed.chunkScales(0, block)[column], 0);
+                EXPECT_EQ(packed.chunkMins(0, block)[column], 0);
+                EXPECT_EQ(packed.chunkEffectiveMins(0, block)[column], 0u);
+            }
+        }
+    }
+    EXPECT_EQ(covered, 5u);
 }
 
 TEST(Test__NativeVnniFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCanonical)
@@ -198,8 +364,8 @@ TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCode
 
         const auto migrated = migrationStableDeviceVnniFormat(*source);
         const int expected_migrated_payload =
-            source->codebook_id == 8
-                ? 24
+            source->codebook_id == 8 || hasCompactMultiScaleVnniPayload(source->codebook_id)
+                ? source->payload_bytes
                 : (source->codebook_id == 0 ||
                            source->codebook_id == 4 ||
                            source->codebook_id == 5
@@ -216,9 +382,12 @@ TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCode
             expected_migrated_payload);
         EXPECT_EQ(migrated.codebook_id, expected_migrated_codebook);
         EXPECT_EQ(migrated.is_asymmetric, source->is_asymmetric);
-        EXPECT_FALSE(migrated.has_emins);
+        EXPECT_EQ(migrated.has_emins, source->has_emins);
         EXPECT_TRUE(deviceVnniExecutionCompatibleWithSource(
             *source, migrated.codebook_id));
+        if (source->codebook_id == 8 || hasCompactMultiScaleVnniPayload(source->codebook_id))
+            EXPECT_FALSE(deviceVnniExecutionCompatibleWithSource(
+                *source, kNativeVnniExpandedInt8MinCodebook));
 
         const auto allocation =
             reusableDeviceVnniAllocationFormat(*source);

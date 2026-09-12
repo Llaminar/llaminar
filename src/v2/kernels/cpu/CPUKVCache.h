@@ -1,12 +1,17 @@
 /**
  * @file CPUKVCache.h
  * @brief Shared CPU KV cache interface and precision→tensor mappings.
+ *
+ * Traits describe physical bytes, not user policy. Public compressed modes use
+ * AQ8 keys and independently selected native values. The ring owns the key
+ * basis and factory admission owns its complete physical-memory BOM.
  */
 
 #pragma once
 
 #include "../IKVCache.h" // Unified KVCache interface
 #include "../../tensors/Tensors.h"
+#include "../../tensors/AttentionKeyQ8Tensor.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/TensorLayout.h"
 #include "../../backends/DeviceId.h"
@@ -324,6 +329,19 @@ namespace llaminar2
             {
                 return ((static_cast<size_t>(head_dim) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE) * sizeof(Q8_1Block);
             }
+        };
+
+        template <>
+        struct CPUKVCacheTensor<ActivationPrecision::AQ8>
+        {
+            using Type = AttentionKeyQ8Tensor;
+            /** @brief Native row payload excludes the once-per-entry anchor. */
+            static size_t row_bytes(const Type *t, int kv_dim, int head_dim)
+            {
+                return static_cast<size_t>(kv_dim / head_dim) * t->block_bytes();
+            }
+            /** @brief Each complete KV head has one native scale/code block. */
+            static size_t head_bytes(const Type *t, int, int) { return t->block_bytes(); }
         };
 
         template <>

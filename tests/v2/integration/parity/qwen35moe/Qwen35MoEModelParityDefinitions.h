@@ -12,6 +12,7 @@
 #pragma once
 
 #include "../ModelParityDefinition.h"
+#include "../ProductionParityPrefixRestorePlan.h"
 
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 
@@ -57,6 +58,36 @@ namespace llaminar2::test::parity::qwen35moe
     inline constexpr int kQwen35MoEMovementProofInitialWindowRows =
         static_cast<int>(kQwen35MoEParityTokenIds.size());
 
+    /**
+     * @brief Resolve durable publication count from the generated evidence role.
+     *
+     * A movement-only cell proves an economically admitted physical publication,
+     * its topology-valid axes and independently checked promoted computation.
+     * Only an observed-speedup witness requires the longer four-publication
+     * convergence workload. Model size cannot promote an ordinary numerical
+     * cell into that workload: a smaller model may exhaust profitable moves
+     * before four waves, even though it has satisfied its movement contract.
+     *
+     * @param evidence Evidence role selected by the canonical matrix expander.
+     * @return Zero for Static/non-movement cells, one for movement-only proof,
+     *         or four for the matched observed-speedup witness.
+     * @throws std::invalid_argument for an unknown evidence enum value.
+     */
+    [[nodiscard]] inline constexpr std::uint64_t
+    qwen35MoEMinimumMovementPublications(ModelParityDynamicEvidence evidence)
+    {
+        switch (evidence)
+        {
+        case ModelParityDynamicEvidence::NotApplicable:
+            return 0u;
+        case ModelParityDynamicEvidence::EconomicMovement:
+            return 1u;
+        case ModelParityDynamicEvidence::EconomicMovementAndObservedSpeedup:
+            return 4u;
+        }
+        throw std::invalid_argument("Unknown Dynamic parity evidence role");
+    }
+
     /** @return An owning copy of the authenticated prompt tokenization. */
     inline std::vector<int> qwen35MoEParityTokenIds()
     {
@@ -89,6 +120,39 @@ namespace llaminar2::test::parity::qwen35moe
     /** Largest canonical parity decode horizon among the shared 35B/122B cells. */
     inline constexpr int kQwen35MoEMaximumParityDecodeForwards = 5;
 
+    /**
+     * @return Main-model routed-row bound for the complete MTP parity lifecycle.
+     *
+     * Configuration and evidence admission share this geometry. Count possible
+     * cache-seeding requests even when most are hits, and a full verifier for
+     * every adaptive-witness output in the all-rejected case. Sidecar rows do
+     * not advance the last main-layer histogram boundary. No acceptance rate,
+     * successful cache hit, or guessed cooldown is needed to retain the proof.
+     */
+    inline constexpr std::uint64_t
+    qwen35MoEMTPNumericalParityProtectedRoutedRows() noexcept
+    {
+        constexpr auto prompt = kQwen35MoEParityTokenIds.size();
+        constexpr auto decode = kQwen35MoEMaximumParityDecodeForwards;
+        constexpr std::uint64_t verifier = kModelParityRequiredMaximumMTPDepth + 1u;
+        constexpr std::array<std::uint64_t, 7> seed_requests = {
+            prompt,          // Fresh numerical prefill.
+            prompt,          // Ordinary decode prefix.
+            prompt,          // Independent native serial oracle.
+            prompt + decode, // Selected MTP checkpoint prefix.
+            prompt,          // Dynamic policy witness prefix.
+            prompt,          // Complete prefix-restore proof.
+            ProductionParityPrefixRestorePlan(prompt).routedRows(),
+                             // Partial proof's mandatory reseed and suffix.
+        };
+        std::uint64_t seeds = 0u;
+        for (const auto rows : seed_requests)
+            seeds += rows;
+        const auto serial = decode + verifier;
+        const auto dynamic_witness = 1u + (verifier + 1u) * verifier;
+        return seeds + decode + serial + verifier + dynamic_witness;
+    }
+
     /** @return Routed rows executed by one complete timing request. */
     inline constexpr std::uint64_t
     qwen35MoEConvergenceTimingRequestRoutedRows() noexcept
@@ -97,6 +161,21 @@ namespace llaminar2::test::parity::qwen35moe
                    kQwen35MoEConvergenceTimingPromptRows) +
                static_cast<std::uint64_t>(
                    kQwen35MoEConvergenceTimingDecodeForwards);
+    }
+
+    /**
+     * @return Maximum rows of one training request overlapping publication.
+     *
+     * Unlike the immutable timing cohort, training permits movement between
+     * its repeated prefixes. Every attempted restore can then be a legitimate
+     * cold prefill. The admission bound must include those rows, while the
+     * finite training horizon still counts only guaranteed cold work.
+     */
+    inline constexpr std::uint64_t
+    qwen35MoEConvergenceTrainingMaximumRoutedRows() noexcept
+    {
+        return static_cast<std::uint64_t>(kQwen35MoEConvergenceTimingDecodeForwards) *
+               (kQwen35MoEConvergenceTimingPromptRows + 1u);
     }
 
     /**
@@ -120,8 +199,9 @@ namespace llaminar2::test::parity::qwen35moe
      *
      * The shared speed-witness geometry serves both the 35B five-step parity
      * model and the 122B four-step model. Reserving the larger authenticated
-     * request keeps Dynamic maintenance live without allowing a new placement
-     * publication to invalidate the prefix between its seed and restore.
+     * request plus the mandatory partial-prefix reseed/suffix keeps Dynamic
+     * maintenance live without allowing a new placement publication to
+     * invalidate the prefix between its seed and restore.
      */
     inline constexpr std::uint64_t
     qwen35MoEMaximumNumericalParityRoutedRows() noexcept
@@ -129,7 +209,9 @@ namespace llaminar2::test::parity::qwen35moe
         return static_cast<std::uint64_t>(
                    kQwen35MoEParityTokenIds.size()) +
                static_cast<std::uint64_t>(
-                   kQwen35MoEMaximumParityDecodeForwards);
+                   kQwen35MoEMaximumParityDecodeForwards) +
+               ProductionParityPrefixRestorePlan(
+                   kQwen35MoEParityTokenIds.size()).routedRows();
     }
 
     /** @return Complete post-movement evidence protected in one epoch. */
@@ -143,26 +225,29 @@ namespace llaminar2::test::parity::qwen35moe
     /**
      * Fixed demand-bank width for the matched before/after speed witness.
      *
-     * The 57-row timing corpus and at most 14 numerical-parity rows must fit
-     * strictly inside one immutable epoch.
+     * The complete timing corpus and numerical/prefix proof must fit strictly
+     * inside one immutable epoch.
      * Three request-matched prefills give the latency gate an odd median and
      * six decode observations per side. Every 17-row prefill is necessarily
      * segmented across the production 16-row capture capacity, so shortening
      * the witness does not weaken its captured 16+1 execution proof. Request
      * admission is sequential, but the fourth asynchronous publication can
-     * complete while one already-admitted 19-row request is executing. The
-     * remaining rows therefore retain that exact overlap, the complete
+     * complete while one already-admitted training request is executing. Its
+     * repeated prefix may be invalidated and execute cold. The remaining rows
+     * therefore retain that maximum overlap, the complete
      * post-movement cohort, and the canonical prefix/decode proof strictly
      * below the next publication threshold.
-     * Movement-only cells use their separate shorter policy.
+     * Movement-only cells use their separate policy.
      */
-    inline constexpr int kQwen35MoEConvergenceHistogramWindowRows = 96;
+    inline constexpr int kQwen35MoEConvergenceHistogramWindowRows =
+        static_cast<int>(qwen35MoEConvergenceProtectedRoutedRows() +
+                         qwen35MoEConvergenceTrainingMaximumRoutedRows() + 1u);
 
     static_assert(
         static_cast<std::uint64_t>(
             kQwen35MoEConvergenceHistogramWindowRows) >
         qwen35MoEConvergenceProtectedRoutedRows() +
-            qwen35MoEConvergenceTimingRequestRoutedRows(),
+            qwen35MoEConvergenceTrainingMaximumRoutedRows(),
         "The convergence window must retain one in-flight request and the "
         "complete post-movement timing and numerical-parity proof");
     static_assert(kQwen35MoEConvergenceTimingWarmupRequests >= 0);
@@ -185,6 +270,7 @@ namespace llaminar2::test::parity::qwen35moe
             .transformer_layers = 40,
             .attention_heads = 16,
             .kv_heads = 2,
+            .prefix_state = ModelParityPrefixState::HybridRecurrent,
         };
     }
 
